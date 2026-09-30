@@ -32,9 +32,10 @@ from codai.compose import media
 
 router = APIRouter()
 
-# The name a hash is stored under, e.g. up-3f9c…-<12 hex>.mp4. The prefix keeps
-# uploads recognisable in the archive listing and in /v1/files URLs.
-_PREFIX = "up-"
+# The name a hash is stored under, e.g. up-<sha256>.mp4. The prefix keeps uploads
+# recognisable in the archive listing and in /v1/files URLs; media.blob_path()
+# resolves it back.
+_PREFIX = media.UPLOAD_PREFIX
 _MAX_BYTES = 2 << 30          # 2 GiB: a minute of 4K is ~400 MB
 
 
@@ -53,25 +54,10 @@ def _stored_name(hexhash: str, ext: str) -> str:
 
 
 def find_blob(hexhash: str) -> Optional[str]:
-    """The stored path for a hash, whatever extension it landed under."""
-    h = (hexhash or "").strip().lower()
-    if h.startswith("sha256:"):
-        h = h[7:]
-    if not h or not all(c in "0123456789abcdef" for c in h) or len(h) != 64:
-        return None
-    try:
-        d = _files_dir()
-    except HTTPException:
-        return None
-    try:
-        for name in os.listdir(d):
-            if name.startswith(_PREFIX + h):
-                p = os.path.join(d, name)
-                if os.path.isfile(p):
-                    return p
-    except OSError:
-        return None
-    return None
+    """The stored path for a hash, whatever extension it landed under. The lookup
+    itself lives in codai/compose/media.py so every endpoint that accepts a
+    ``sha256:`` id resolves it the same way."""
+    return media.blob_path(hexhash)
 
 
 def store(data: bytes, filename: str = "", content_type: str = "") -> dict:

@@ -665,3 +665,63 @@ def test_a_cloned_voice_profile_is_used_for_narration(tmp_path, files_dir, monke
     assert seen == [{"text": "in my own voice", "voice_name": "nextime", "speed": 0.9}]
     # The scene is as long as the cloned clip (0.6s) plus the default padding.
     assert doc["result"]["duration"] == pytest.approx(0.75, abs=0.1)
+
+
+# ================================== request 3: /v1/files in the extractors
+def test_the_extractors_accept_files_paths_and_upload_ids(tmp_path, files_dir):
+    """Characters and voice profiles are built from the user's own media. That
+    media is often already here (uploaded once), so these endpoints take the same
+    references composition does instead of forcing a base64 re-send."""
+    import base64
+    from codai.api.characters import _decode_source
+    from codai.api.voice_clone import _decode_audio, _decode_b64_or_url
+    from fastapi import HTTPException
+
+    png = Path(_png(tmp_path / "ref.png", 40, 40)).read_bytes()
+    wav = Path(_tone(tmp_path / "ref.wav", 0.3)).read_bytes()
+    # As /v1/files/upload would have stored them.
+    import hashlib
+    ph = hashlib.sha256(png).hexdigest()
+    ah = hashlib.sha256(wav).hexdigest()
+    (files_dir / f"up-{ph}.png").write_bytes(png)
+    (files_dir / f"up-{ah}.wav").write_bytes(wav)
+
+    for ref in (f"/v1/files/up-{ph}.png",
+                f"http://any-host.invalid/v1/files/up-{ph}.png",
+                f"sha256:{ph}", ph,
+                "data:image/png;base64," + base64.b64encode(png).decode(),
+                base64.b64encode(png).decode()):
+        assert _decode_source(ref) == png, ref
+
+    assert _decode_b64_or_url(f"sha256:{ah}") == wav
+    raw, ext = _decode_audio(f"/v1/files/up-{ah}.wav")
+    assert raw == wav and ext == ".wav"
+    # The extension comes from the content, not from the caller's claim.
+    _, ext = _decode_audio("data:audio/mpeg;base64," + base64.b64encode(wav).decode())
+    assert ext == ".wav"
+
+    # A path on the server is still not a reference a client may name.
+    for bad in ("/etc/passwd", "./secrets.json", "sha256:" + "f" * 64):
+        with pytest.raises(HTTPException) as e:
+            _decode_source(bad)
+        assert e.value.status_code == 400
+
+
+def test_a_character_is_saved_from_an_uploaded_image(tmp_path, files_dir, monkeypatch):
+    import hashlib
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import codai.api.characters as ch
+    monkeypatch.setattr(ch, "_chars_dir", lambda: str(tmp_path / "chars"))
+    app = FastAPI()
+    app.include_router(ch.router)
+    client = TestClient(app)
+    png = Path(_png(tmp_path / "face.png", 64, 64)).read_bytes()
+    h = hashlib.sha256(png).hexdigest()
+    (files_dir / f"up-{h}.png").write_bytes(png)
+    r = client.post("/v1/characters", json={"name": "ada", "description": "d",
+                                            "images": [{"label": "front",
+                                                        "data": f"sha256:{h}"}]})
+    assert r.status_code == 200, r.text
+    saved = tmp_path / "chars" / "ada" / "ref00.png"
+    assert saved.is_file() and saved.read_bytes() == png

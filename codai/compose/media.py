@@ -179,6 +179,54 @@ def local_path_for_files_url(ref: str) -> Optional[str]:
     return cand if os.path.isfile(cand) else None
 
 
+_SHA256 = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$", re.I)
+#: Uploads are stored in the output directory under this prefix (codai/api/uploads.py).
+UPLOAD_PREFIX = "up-"
+
+
+def blob_path(ref: str) -> Optional[str]:
+    """The stored path for a ``sha256:<hex>`` upload id, whatever extension it
+    landed under, or None when this install does not hold it."""
+    m = _SHA256.match((ref or "").strip())
+    if not m:
+        return None
+    h = m.group(1).lower()
+    base = files_dir()
+    if not base:
+        return None
+    try:
+        for name in os.listdir(base):
+            if name.startswith(UPLOAD_PREFIX + h):
+                p = os.path.join(base, name)
+                if os.path.isfile(p):
+                    return p
+    except OSError:
+        return None
+    return None
+
+
+def local_path(ref: str) -> Optional[str]:
+    """The local file a reference names, when this install already holds it: a
+    ``/v1/files/...`` path (or an absolute URL ending in one), or a ``sha256:``
+    id from ``/v1/files/upload``. None for anything that must be fetched."""
+    return local_path_for_files_url(ref) or blob_path(ref)
+
+
+def fetch_bytes(ref: str, timeout: float = 120.0, max_bytes: int = 2 << 30) -> bytes:
+    """The bytes behind ANY accepted media reference, for the endpoints that want
+    bytes rather than a path: a file this install holds (read from disk, never
+    over HTTP — a loopback fetch would need a token and would fail when the front
+    is bound elsewhere), a ``data:`` URI, base64, or a remote URL."""
+    local = local_path(ref)
+    if local:
+        with open(local, "rb") as f:
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise MediaError(f"{os.path.basename(local)}: larger than {max_bytes} bytes")
+        return data
+    return fetch(ref, timeout=timeout, max_bytes=max_bytes)
+
+
 def fetch(ref: str, timeout: float = 120.0, max_bytes: int = 2 << 30) -> bytes:
     """The bytes behind a media reference (URL / data URI / base64)."""
     if not ref:
@@ -208,7 +256,7 @@ def resolve(ref: str, workdir: str, name_hint: str = "media",
     """A media reference → a local file path, downloading into ``workdir`` when
     the reference is remote or inline. Files this install already holds are used
     where they are."""
-    local = local_path_for_files_url(ref)
+    local = local_path(ref)
     if local:
         return local
     data = fetch(ref, timeout=timeout)

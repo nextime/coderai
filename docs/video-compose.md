@@ -182,6 +182,26 @@ The body may also be JSON (`{"file": "<base64 or data: URI>"}`) or the raw bytes
 with a `Content-Type`. Video, image and audio only; the type is decided by the
 content, not by the client's claim.
 
+## The same references elsewhere
+
+The extractors that build characters and voice profiles from a user's own media
+resolve their media fields through the same resolver, so they accept everything
+compose does — a `/v1/files/...` path, an absolute URL of one, a `sha256:` upload
+id, a `data:` URI, raw base64, a remote URL:
+
+* `POST /v1/characters` (each reference image), `PATCH /v1/characters/{name}`
+  (`add_images`)
+* `POST /v1/characters/extract` (`images`, `videos`)
+* `POST /v1/audio/voices`, `POST /v1/audio/voices/extract` (`audio`, `video`)
+
+Upload the clip once and pass the path; a 100 MB source no longer has to travel
+as base64 (a third larger) on every call. A file this install holds is read from
+disk rather than fetched over HTTP — a loopback request would need a token and
+would fail when the front is bound elsewhere. A bare path on the server is still
+refused: a client cannot name files on this machine. Audio clips are now stored
+under the extension their *content* implies rather than the one the caller
+claimed.
+
 ## Notes for operators
 
 * **ffmpeg is required** (the published images have it, with libass for the

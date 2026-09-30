@@ -171,24 +171,32 @@ def _load_voice(name: str) -> Optional[dict]:
         return json.load(f)
 
 
-def _decode_audio(data: str) -> tuple[bytes, str]:
-    """Decode base64 audio data, return (bytes, ext)."""
-    if data.startswith('data:'):
-        mime, b64 = data.split(',', 1)
-        ext = '.' + mime.split('/')[1].split(';')[0]
-        return base64.b64decode(b64), ext
-    return base64.b64decode(data), '.wav'
-
-
 def _decode_b64_or_url(data: str) -> bytes:
-    if data.startswith('data:'):
-        _, b64 = data.split(',', 1)
-        return base64.b64decode(b64)
-    if data.startswith('http://') or data.startswith('https://'):
-        import urllib.request
-        with urllib.request.urlopen(data, timeout=60) as r:
-            return r.read()
-    return base64.b64decode(data)
+    """Source media as raw bytes, in any form the API accepts.
+
+    One resolver for every reference (codai/compose/media.py): a
+    ``/v1/files/...`` path or an absolute URL of one (read from disk, so a clip
+    uploaded once need not be re-sent as base64), a ``sha256:`` id from
+    ``/v1/files/upload``, a ``data:`` URI, raw base64, or a remote URL. A bare
+    path on this machine stays refused."""
+    from codai.compose import media as _media
+    try:
+        return _media.fetch_bytes(data)
+    except _media.MediaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _decode_audio(data: str) -> tuple[bytes, str]:
+    """The same, plus the extension to store the clip under — taken from the
+    content rather than from what the caller claimed (a ``data:audio/mpeg`` URI
+    holding a wav used to be written as .mpeg)."""
+    raw = _decode_b64_or_url(data)
+    from codai.compose import media as _media
+    hint = ""
+    if isinstance(data, str) and data.startswith("data:"):
+        hint = data[5:].split(",", 1)[0].split(";")[0]
+    ext = _media.ext_for(_media.sniff_mime(raw, hint))
+    return raw, (ext if ext != ".bin" else ".wav")
 
 
 #: F5-TTS prompts on the reference clip, and longer is NOT better: past roughly

@@ -160,12 +160,8 @@ def _save_character(name: str, description: str, images: List[CharacterImage]) -
 
     img_files = []
     for i, img in enumerate(images):
-        raw = img.data
-        if raw.startswith('data:'):
-            _, b64 = raw.split(',', 1)
-        else:
-            b64 = raw
-        img_bytes = base64.b64decode(b64)
+        # Any reference the API accepts, not only base64 (see _decode_source).
+        img_bytes = _decode_source(img.data)
         # Detect PNG vs JPEG from magic bytes
         ext = '.png' if img_bytes[:4] == b'\x89PNG' else '.jpg'
         fname = f"ref{i:02d}{ext}"
@@ -228,15 +224,19 @@ def _list_characters() -> list:
 
 
 def _decode_source(data: str) -> bytes:
-    """Decode base64 or URL source into raw bytes."""
-    if data.startswith('data:'):
-        _, b64 = data.split(',', 1)
-        return base64.b64decode(b64)
-    if data.startswith('http://') or data.startswith('https://'):
-        import urllib.request
-        with urllib.request.urlopen(data, timeout=60) as r:
-            return r.read()
-    return base64.b64decode(data)
+    """Source media as raw bytes, in any form the API accepts.
+
+    Everything goes through the one resolver (codai/compose/media.py), so these
+    endpoints take the same references as composition: a ``/v1/files/...`` path
+    or an absolute URL of one (read from disk — a client that uploaded its footage
+    once should not have to re-send it as base64), a ``sha256:`` id from
+    ``/v1/files/upload``, a ``data:`` URI, raw base64, or a remote URL. A bare
+    path on this machine is still refused: a client cannot name server files."""
+    from codai.compose import media as _media
+    try:
+        return _media.fetch_bytes(data)
+    except _media.MediaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _detect_faces_cv2(img_bytes: bytes):
@@ -487,12 +487,7 @@ async def patch_character(name: str, req: CharacterPatchRequest, _auth=Depends(_
     if req.add_images:
         next_i = len(img_files)
         for img in req.add_images:
-            raw = img.data
-            if raw.startswith('data:'):
-                _, b64 = raw.split(',', 1)
-            else:
-                b64 = raw
-            img_bytes = base64.b64decode(b64)
+            img_bytes = _decode_source(img.data)      # same references as elsewhere
             ext = '.png' if img_bytes[:4] == b'\x89PNG' else '.jpg'
             fname = f"ref{next_i:02d}{ext}"
             fpath = os.path.join(cdir, fname)
