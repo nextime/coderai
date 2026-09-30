@@ -1281,6 +1281,11 @@ def main():
     if global_file_path:
         set_video_file_path(global_file_path)
 
+    # Composition writes its artefacts where /v1/files reads (codai/compose).
+    from codai.api.compose import set_global_file_path as set_compose_file_path
+    if global_file_path:
+        set_compose_file_path(global_file_path)
+
     # Set audio_gen module global args
     from codai.api.audio_gen import set_global_args as set_audiogen_global_args, set_global_file_path as set_audiogen_file_path
     set_audiogen_global_args(global_args)

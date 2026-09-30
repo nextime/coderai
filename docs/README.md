@@ -24,6 +24,7 @@ reference; these are the deep dives.
 
 | Doc | Subject |
 |---|---|
+| [video-compose.md](video-compose.md) | `POST /v1/video/compose`: scenes → a finished, uploadable reel (narration timing, Ken Burns, ducked music, burned captions, thumbnail) and `/v1/files/upload` |
 | [ocr.md](ocr.md) | The `/v1/ocr` document-transcription subsystem |
 | [expressive-tts.md](expressive-tts.md) | Expressive text-to-speech |
 | [zimage-lora-training.md](zimage-lora-training.md) | LoRA training for image models |

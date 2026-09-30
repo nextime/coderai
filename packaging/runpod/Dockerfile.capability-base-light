@@ -27,6 +27,7 @@ ENV PYTHONUNBUFFERED=1 \
 # at install time; libgl/libglib for opencv.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
+        fonts-montserrat fonts-inter fonts-noto-core fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/coderai/app

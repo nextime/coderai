@@ -39,6 +39,13 @@ DEFAULT_STUDIO_ENDPOINTS = [
     "v1/video/dub",
     "v1/video/to3d",
     "v1/video/from3d",
+    # Server-side composition (codai/api/compose.py) and the media upload it
+    # references: a client discovers these the same way it discovers the rest.
+    "v1/video/compose",
+    "v1/video/compose/{id}",
+    "v1/video/compose/{id}/cancel",
+    "v1/files/upload",
+    "v1/files/blob/{hash}",
 ]
 
 

@@ -169,6 +169,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libvulkan1 \
       lm-sensors \
       espeak \
+      fonts-montserrat \
+      fonts-inter \
+      fonts-noto-core \
+      fonts-noto-cjk \
+      fonts-liberation \
       mesa-vulkan-drivers \
       pciutils \
       openssl \

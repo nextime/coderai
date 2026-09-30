@@ -65,4 +65,13 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "ze
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client espeak \
     && rm -rf /var/lib/apt/lists/* || true
 
+# Fonts for burned-in captions and overlays (codai/compose): Montserrat and
+# Inter are what the caption presets ask for by name, Noto (with CJK) is what
+# makes a non-Latin script render as glyphs instead of boxes. The base image
+# carried DejaVu only, so a request for "Montserrat" silently got DejaVu.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fonts-montserrat fonts-inter fonts-noto-core fonts-noto-cjk fonts-liberation \
+    && fc-cache -f >/dev/null 2>&1 \
+    && rm -rf /var/lib/apt/lists/* || true
+
 # ENTRYPOINT / EXPOSE / VOLUME / ENV / WORKDIR are inherited from the base image.

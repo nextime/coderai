@@ -199,6 +199,8 @@ from codai.api.images import router as images_router
 from codai.api.tts import router as tts_router
 from codai.api.text import router as text_router
 from codai.api.video import router as video_router
+from codai.api.compose import router as compose_router
+from codai.api.uploads import router as uploads_router
 from codai.api.audio_gen import router as audio_gen_router
 from codai.api.audio_stems import router as audio_stems_router
 from codai.api.audio_clean import router as audio_clean_router
@@ -691,6 +693,11 @@ app.include_router(images_router, tags=["Images"])
 app.include_router(tts_router, tags=["Audio"])
 app.include_router(text_router, tags=["Text"])
 app.include_router(video_router, tags=["Video"])
+# Composition and generic media uploads. Registered BEFORE the /v1/files/{filename}
+# download route defined further down so /v1/files/upload and /v1/files/blob/{hash}
+# are matched as themselves rather than as a filename.
+app.include_router(compose_router, tags=["Video"])
+app.include_router(uploads_router, tags=["Files"])
 app.include_router(audio_gen_router, tags=["Audio"])
 app.include_router(audio_stems_router, tags=["Audio"])
 app.include_router(audio_clean_router, tags=["Audio"])

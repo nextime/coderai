@@ -115,7 +115,16 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
                # is only meaningful locally. Forwarded, it would report the pod's
                # view of a config the pod does not have — the exact confusion it
                # was added to end.
-               "/v1/models/test/state")
+               "/v1/models/test/state",
+               # This install's own media store: an upload must land where THIS
+               # front serves /v1/files from, and the existence check answers for
+               # this store. Forwarding either would put the bytes on a pod that
+               # is gone an hour later.
+               "/v1/files/upload", "/v1/files/blob/{hash}")
+
+#: Paths that are this install's own, matched by prefix at run time (the literal
+#: route templates above are what the coverage test reads).
+_LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes
@@ -123,7 +132,11 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
 #: every step is placed by its OWN model's configuration. Forwarding the
 #: orchestration instead would move the logic to a pod and place every step by
 #: that pod's catalogue, which is the opposite of what these are for.
-_ORCHESTRATION_PREFIXES = ("/v1/pipelines", "/v1/characters", "/v1/environments")
+#: ``/v1/video/compose`` is one of these: it calls speech, music and transcription
+#: endpoints itself, and the visuals it was given may be files only this install
+#: holds. Forwarded to a video pod it would find neither the models nor the files.
+_ORCHESTRATION_PREFIXES = ("/v1/pipelines", "/v1/characters", "/v1/environments",
+                           "/v1/video/compose")
 
 #: `model` field in a multipart body, without paying for a full form parse.
 _MULTIPART_MODEL = re.compile(
@@ -505,7 +518,7 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         return None
     if not path.startswith("/v1/") or path in _SKIP_PATHS:
         return None
-    if path.startswith(_ORCHESTRATION_PREFIXES):
+    if path.startswith(_ORCHESTRATION_PREFIXES) or path.startswith(_LOCAL_PREFIXES):
         return None
     # A generated file is fetched from whichever remote rendered it.
     if path.startswith("/v1/files/"):
