@@ -205,6 +205,11 @@ Full guide: [`docs/cluster.md`](docs/cluster.md).
 - **Character Profiles**: Apply up to 6 saved character profiles for visual consistency. Pipelines with IP-Adapter (AnimateDiff and other SD-based video models) are conditioned directly. For the rest — Wan, CogVideoX, LTX, SVD, i.e. most video models — CoderAI renders an **identity keyframe** on the image endpoint (which does have real IP-Adapter) and runs the video as `ti2v` from that frame, so `character_profiles` locks a face on every model. Controlled by `keyframe_identity` (`auto` / `always` / `never`) with optional `keyframe_model` and `keyframe_steps`; combine with a per-character LoRA for the strongest consistency
 - **Environment Profiles**: Apply up to 6 saved environment profiles to condition the scene
 - **Multi-Character Dialog**: Assign spoken lines to individual characters — each line picks a character profile, voice profile or TTS voice ID, and text; lines are **voice-cloned with F5-TTS** from the named profile, mixed with correct timing (sequential or manual), and lip-synced via Wav2Lip
+- **Talking presenter**: a scene can be a character talking to camera, lip-synced to that
+  scene's narration — full screen, a bubble over the B-roll (captions move above it), or a
+  split screen; the face comes from a character profile, the motion from a short
+  identity-locked clip, a still or footage you supply. `POST /v1/video/talking-head` renders
+  one line for a preview. Any installed lip-sync engine (wav2lip, sadtalker, …) can be named
 - **Composition (reels)**: `POST /v1/video/compose` turns a list of **scenes** — narration plus visuals — into one finished, uploadable video: the scene's length comes from its narration, visuals are Ken-Burns'd or trimmed to fit, music is looped and ducked under the voice, captions are burned in with word timings (karaoke presets) inside the platforms' safe area, and a thumbnail, SRT/VTT and the narration track come back with it. Async jobs with stage/progress/cancel; a visual that fails to download becomes a gradient and a warning instead of a failed render. See [`docs/video-compose.md`](docs/video-compose.md)
 - **Lip Sync**: Wav2Lip and SadTalker. The Docker/OCI image ships both (launcher shims plus a dedicated lip-sync venv; checkpoints download on first use). A from-source install has no shims, so CoderAI falls back to a self-managed Wav2Lip that fetches and patches itself on first use. Either way, if lip sync can't run the response carries a `warnings` entry saying the audio was muxed without mouth sync — rather than passing off an unsynced video as a success
 
@@ -831,6 +836,8 @@ persisted per `config_id`, so the configs don't overwrite each other.
 | `POST /v1/video/generations` | Generate video (t2v/i2v/v2v/ti2v/interp) — supports `character_profiles`, `environment_profiles`, `dialogs` |
 | `POST /v1/video/compose` | Compose scenes into a finished reel (narration timing, visuals, ducked music, burned captions, thumbnail) — async job |
 | `GET /v1/video/compose/{id}` | Composition progress / result; `POST …/{id}/cancel` stops it |
+| `POST /v1/video/talking-head` | Lip-sync one line onto a character's face (preview); same job store |
+| `GET /v1/video/presenter/engines` | Which lip-sync engines this install has |
 | `POST /v1/video/upscale` | Upscale video |
 | `POST /v1/video/subtitle` | Generate/burn subtitles |
 | `POST /v1/video/interpolate` | Frame interpolation |

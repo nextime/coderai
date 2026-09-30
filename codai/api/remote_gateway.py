@@ -136,7 +136,8 @@ _LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob")
 #: endpoints itself, and the visuals it was given may be files only this install
 #: holds. Forwarded to a video pod it would find neither the models nor the files.
 _ORCHESTRATION_PREFIXES = ("/v1/pipelines", "/v1/characters", "/v1/environments",
-                           "/v1/video/compose")
+                           "/v1/video/compose", "/v1/video/talking-head",
+                           "/v1/video/presenter")
 
 #: `model` field in a multipart body, without paying for a full form parse.
 _MULTIPART_MODEL = re.compile(

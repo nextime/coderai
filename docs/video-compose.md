@@ -182,6 +182,78 @@ The body may also be JSON (`{"file": "<base64 or data: URI>"}`) or the raw bytes
 with a `Content-Type`. Video, image and audio only; the type is decided by the
 content, not by the client's claim.
 
+## The talking presenter
+
+A person talking to camera is the format most short videos use, and it is
+something only this server can assemble: composition synthesises the narration,
+so it holds the exact audio of every scene, and the lip-sync engines and
+identity-locked video generation are here too.
+
+```jsonc
+{
+  "presenter": {
+    "character": "nova",            // a saved character profile (its front reference is used)
+    "image": null,                  // or an explicit portrait (URL / /v1/files / data URI / base64)
+    "engine": "auto",               // auto | wav2lip | sadtalker | <any installed engine name>
+    "motion": "generate",           // generate: a short identity-locked clip per scene
+                                    // still: animate the portrait   src: use base_src
+    "base_src": null,
+    "prompt": "talking to the camera, natural head movement, soft studio light",
+    "layout": "full",               // full | pip | split
+    "position": "bottom-right",     // pip: top/bottom + left/right/center
+    "size": 0.38,                   // pip: bubble width as a fraction of the canvas
+    "shape": "circle",              // pip: circle | rounded | rect
+    "split": "bottom",              // split: which half the presenter takes
+    "border": {"color": "#FFFFFF", "width": 6},
+    "remove_background": false      // ignored (with a warning) when no matting is installed
+  },
+  "scenes": [
+    {"text": "Hi! Today: three hearts.", "visuals": [...]},                      // the default presenter
+    {"text": "Here's how they work.",    "visuals": [...], "presenter": false},  // B-roll only
+    {"text": "Follow for more!",         "visuals": [], "presenter": {"layout": "full"}}
+  ]
+}
+```
+
+* **Timing** is the scene's: the engine is driven by *that scene's* narration —
+  synthesised or supplied — and the clip is held to narration + padding (or
+  `min_duration`). Captions, music and ducking are unchanged.
+* **`engine: "auto"`** takes a video-driven engine (wav2lip) when there is a clip
+  to drive and a portrait engine (sadtalker) otherwise. Any other engine installed
+  under its own name can be named instead — no API change for a new one. Ask
+  `GET /v1/video/presenter/engines` what this install has.
+* **`layout`**: `full` replaces the scene's visuals (a scene may then have none);
+  `pip` composites a bubble over them inside the caption safe area — and captions
+  at the bottom move above it automatically; `split` stacks presenter and B-roll,
+  each filling its half. With a presenter, a scene's visuals are joined without a
+  transition *between them* and composited as one clip; without one, nothing
+  changes.
+* **Nothing fails the render**: no engine, no face, a crash, a failed composite —
+  each falls back to the scene's visuals (or a gradient when there are none) and
+  adds a warning naming the scene. `stage` is `presenter`, with
+  `message: "scene 2/6: lip-sync"`, and `result.scenes[i].presenter` is
+  `{"engine": …, "layout": …}` or `null`.
+* **Errors at submission**: `400` for an unknown character, an invalid layout,
+  position, size, shape, motion or a `pip` scene with no visuals; `501` when a
+  presenter is asked for and no lip-sync engine is installed, naming what to
+  install.
+* **GPU**: lip-sync is the only GPU step in a composition (the rest is ffmpeg), so
+  it takes a lease from the same scheduler ordinary model requests use instead of
+  fighting a generation for the card.
+
+### `POST /v1/video/talking-head`
+
+The presenter on its own, for a preview on a character page: a character (or a
+portrait), `text` synthesised with `voice` — or `audio` you already have — and the
+same job semantics as compose (same job store, so either status URL works). Capped
+at 15 s of audio. `result.video` as usual.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -X POST …/v1/video/talking-head \
+  -d '{"character":"nova","text":"Hi, I am Nova.","canvas":{"width":720,"height":720}}'
+# {"id":"cmp_…","status":"queued"}
+```
+
 ## The same references elsewhere
 
 The extractors that build characters and voice profiles from a user's own media
@@ -231,6 +303,7 @@ claimed.
 |---|---|
 | Endpoints, validation, job queue, orchestration | `codai/api/compose.py` |
 | Uploads (`/v1/files/upload`, `/v1/files/blob/{hash}`) | `codai/api/uploads.py` |
+| The talking presenter (engines, face, base clip) | `codai/compose/presenter.py` |
 | Reference resolving, probing, fonts | `codai/compose/media.py` |
 | Word timings, line breaking, ASS/SRT/VTT | `codai/compose/captions.py` |
 | The ffmpeg pipeline | `codai/compose/render.py` |

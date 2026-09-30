@@ -194,13 +194,19 @@ def break_lines(words: List[dict], max_words_per_line: int = 4,
         if not chunk:
             continue
         rows = [chunk[k:k + per_line] for k in range(0, len(chunk), per_line)]
-        out.append({
+        ev = {
             "start": chunk[0]["start"],
             "end": chunk[-1]["end"],
             "words": chunk,
             "rows": [[w["word"] for w in row] for row in rows],
             "text": " ".join(w["word"] for w in chunk),
-        })
+        }
+        # Words carry the margin their scene needs (a bottom presenter bubble);
+        # an event takes the largest of the ones it groups.
+        mv = max((int(w.get("margin_v") or 0) for w in chunk), default=0)
+        if mv:
+            ev["margin_v"] = mv
+        out.append(ev)
     return out
 
 
@@ -273,11 +279,14 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
     body = []
     for ev in events:
         rows = ev.get("rows") or [[w["word"] for w in ev.get("words", [])]]
+        # A scene with a presenter bubble at the bottom pushes its captions up:
+        # ASS takes a per-event MarginV, so only those events move.
+        mv = int(ev.get("margin_v") or 0)
         if not p["karaoke"]:
             text = "\\N".join(" ".join(_ass_escape(w.upper() if upper else w) for w in row)
                               for row in rows)
             body.append(f"Dialogue: 0,{_ass_time(ev['start'])},{_ass_time(ev['end'])},"
-                        f"cap,,0,0,0,,{text}")
+                        f"cap,,0,0,{mv},,{text}")
             continue
         # Karaoke: one event per word, the whole line drawn each time with the
         # active word in the highlight colour. Simpler than \k timings and it
@@ -299,7 +308,7 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
             if end <= start:
                 end = start + 0.04
             body.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},"
-                        f"cap,,0,0,0,,{{\\c{primary}}}" + "\\N".join(parts))
+                        f"cap,,0,0,{mv},,{{\\c{primary}}}" + "\\N".join(parts))
     return "\n".join(head + body) + "\n"
 
 

@@ -248,6 +248,148 @@ def build_visual(visual: dict, out_path: str, *, width: int, height: int, fps: i
     run(pre + ["-i", src, "-vf", vf] + common_out, cancel=cancel, log=log)
 
 
+def still_video(image: str, out_path: str, *, duration: float, width: int, height: int,
+                fps: int, cancel=None, log=None) -> str:
+    """A motionless clip of a portrait — what a video-driven lip-sync engine needs
+    when there is no footage to drive (and what a generated shot falls back to).
+    No Ken Burns: a presenter's head must not drift while it talks."""
+    run(["-loop", "1", "-i", image, "-t", f"{max(0.08, duration):.3f}",
+         "-vf", fit_filter(width, height, "cover") + f",fps={fps},format=yuv420p",
+         "-r", str(fps), "-an"] + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    return out_path
+
+
+def hold_to(src: str, out_path: str, *, duration: float, fps: int,
+            width: Optional[int] = None, height: Optional[int] = None,
+            fit: str = "cover", cancel=None, log=None) -> str:
+    """Make a clip exactly ``duration`` long, and the canvas's size when asked.
+
+    A lip-sync engine returns the length of the audio it was given and whatever
+    frame size it likes (SadTalker squares its output), while the scene is the
+    narration plus its padding at the canvas size — so: hold the final frame (what
+    a presenter does when they stop talking), trim if longer, and scale/crop to
+    the canvas."""
+    chain = [f"fps={fps}"]
+    if width and height:
+        chain.append(fit_filter(int(width), int(height), fit))
+    chain += [f"tpad=stop_mode=clone:stop_duration={max(0.05, duration):.3f}",
+              f"trim=0:{max(0.08, duration):.3f}", "setpts=PTS-STARTPTS",
+              "format=yuv420p"]
+    run(["-i", src, "-vf", ",".join(chain), "-an", "-r", str(fps)]
+        + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    return out_path
+
+
+# ------------------------------------------------------------ presenter layout
+#: The presenter bubble keeps the captions' safe area: clear of the platform UI.
+SAFE_X = 0.06
+SAFE_Y = 0.10
+
+
+def bubble_mask(path: str, w: int, h: int, shape: str = "circle",
+                border_width: int = 0, border_colour: str = "#FFFFFF") -> tuple:
+    """(mask, ring) PNGs for a picture-in-picture bubble.
+
+    The mask is greyscale — white where the presenter shows — and becomes the
+    clip's alpha; the ring is an RGBA outline drawn on top afterwards, so the
+    border is not eaten by the same mask that rounds the corners."""
+    from PIL import Image, ImageDraw
+    w, h = max(2, int(w)), max(2, int(h))
+    shape = (shape or "circle").lower()
+    radius = int(min(w, h) * 0.18)
+    mask = Image.new("L", (w, h), 0)
+    md = ImageDraw.Draw(mask)
+    if shape == "circle":
+        md.ellipse((0, 0, w - 1, h - 1), fill=255)
+    elif shape in ("rounded", "round"):
+        md.rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=255)
+    else:
+        md.rectangle((0, 0, w - 1, h - 1), fill=255)
+    mask_path = path + ".mask.png"
+    mask.save(mask_path)
+
+    ring_path = None
+    if border_width and border_width > 0:
+        col = (border_colour or "#FFFFFF").lstrip("#")
+        if len(col) == 3:
+            col = "".join(c * 2 for c in col)
+        rgb = tuple(int(col[i:i + 2], 16) for i in (0, 2, 4)) if len(col) == 6 else (255, 255, 255)
+        ring = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        rd = ImageDraw.Draw(ring)
+        bw = max(1, int(border_width))
+        box = (bw // 2, bw // 2, w - 1 - bw // 2, h - 1 - bw // 2)
+        if shape == "circle":
+            rd.ellipse(box, outline=rgb + (255,), width=bw)
+        elif shape in ("rounded", "round"):
+            rd.rounded_rectangle(box, radius=radius, outline=rgb + (255,), width=bw)
+        else:
+            rd.rectangle(box, outline=rgb + (255,), width=bw)
+        ring_path = path + ".ring.png"
+        ring.save(ring_path)
+    return mask_path, ring_path
+
+
+def bubble_geometry(width: int, height: int, size: float, position: str,
+                    shape: str = "circle") -> tuple:
+    """(w, h, x, y) of the bubble inside the safe area."""
+    size = max(0.1, min(0.95, float(size or 0.38)))
+    bw = int(round(width * size / 2) * 2)
+    bh = bw if (shape or "circle").lower() in ("circle", "rounded", "round")         else int(round(bw * height / max(1, width) / 2) * 2)
+    bh = min(bh, int(height * 0.8))
+    mx, my = int(width * SAFE_X), int(height * SAFE_Y)
+    pos = (position or "bottom-right").lower().replace("_", "-")
+    vert, _, horiz = pos.partition("-") if "-" in pos else (pos, "", "center")
+    x = {"left": mx, "center": (width - bw) // 2, "centre": (width - bw) // 2,
+         "right": width - bw - mx}.get(horiz, width - bw - mx)
+    y = {"top": my, "center": (height - bh) // 2, "centre": (height - bh) // 2,
+         "middle": (height - bh) // 2,
+         "bottom": height - bh - my}.get(vert, height - bh - my)
+    return bw, bh, max(0, x), max(0, y)
+
+
+def composite_pip(base: str, presenter: str, out_path: str, *, width: int, height: int,
+                  fps: int, size: float = 0.38, position: str = "bottom-right",
+                  shape: str = "circle", border: Optional[dict] = None,
+                  workdir: str = "", cancel=None, log=None) -> str:
+    """The presenter as a bubble over the scene's visuals."""
+    bw, bh, x, y = bubble_geometry(width, height, size, position, shape)
+    border = border or {}
+    mask, ring = bubble_mask(os.path.join(workdir or ".", f"bubble-{bw}x{bh}"), bw, bh,
+                             shape, int(border.get("width") or 0),
+                             border.get("color") or border.get("colour") or "#FFFFFF")
+    inputs = ["-i", base, "-i", presenter, "-i", mask]
+    graph = [f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+             f"crop={bw}:{bh},format=rgba[pv]",
+             "[2:v]format=gray[pm]",
+             "[pv][pm]alphamerge[pa]"]
+    top = "pa"
+    if ring:
+        inputs += ["-i", ring]
+        graph.append("[pa][3:v]overlay=0:0[pb]")
+        top = "pb"
+    graph.append(f"[0:v][{top}]overlay={x}:{y}:format=auto,format=yuv420p,fps={fps}[vout]")
+    run(inputs + ["-filter_complex", ";".join(graph), "-map", "[vout]", "-an"]
+        + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    return out_path
+
+
+def composite_split(base: str, presenter: str, out_path: str, *, width: int, height: int,
+                    fps: int, presenter_half: str = "bottom", cancel=None,
+                    log=None) -> str:
+    """Presenter and B-roll stacked, each filling its half."""
+    half = int(height / 2 / 2) * 2
+    fill = (f"scale={width}:{half}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{half},setsar=1")
+    top_in, bottom_in = ((1, 0) if (presenter_half or "bottom").lower() == "top"
+                         else (0, 1))
+    graph = [f"[{top_in}:v]{fill}[t]", f"[{bottom_in}:v]{fill}[b]",
+             f"[t][b]vstack=inputs=2,pad={width}:{height}:0:0,"
+             f"format=yuv420p,fps={fps}[vout]"]
+    run(["-i", base, "-i", presenter, "-filter_complex", ";".join(graph),
+         "-map", "[vout]", "-an"] + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    return out_path
+
+
 # --------------------------------------------------------------------- join
 def concat_clips(clips: List[str], out_path: str, workdir: str,
                  cancel: Optional[threading.Event] = None,

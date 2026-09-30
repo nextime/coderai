@@ -68,7 +68,8 @@ def set_global_file_path(path: str) -> None:
 _MAX_SCENES = 200
 _MAX_VISUALS_PER_SCENE = 12
 _JOB_HISTORY = 100
-_STAGES = ("queued", "narration", "captions", "visuals", "music", "render", "thumbnail")
+_STAGES = ("queued", "narration", "captions", "presenter", "visuals", "music",
+           "render", "thumbnail")
 
 
 # =============================================================================
@@ -111,6 +112,27 @@ class Scene(BaseModel):
     padding: float = 0.15
     visuals: List[Visual] = Field(default_factory=list)
     voice: Optional[VoiceSpec] = None       # per-scene override (a second speaker)
+    # A presenter block for this scene, or false to opt out of the request's one.
+    presenter: Optional[Any] = None
+    model_config = ConfigDict(extra="allow")
+
+
+class PresenterSpec(BaseModel):
+    """A character talking to camera, lip-synced to the scene's narration."""
+    character: Optional[str] = None          # a saved character profile
+    image: Optional[str] = None              # or an explicit portrait
+    engine: str = "auto"                     # auto | sadtalker | wav2lip | <installed name>
+    motion: str = "generate"                 # generate | still | src
+    base_src: Optional[str] = None           # clip to drive (motion=src)
+    prompt: Optional[str] = None             # for motion=generate
+    video_model: Optional[str] = None        # model for motion=generate (blank = default)
+    layout: str = "full"                     # full | pip | split
+    position: str = "bottom-right"           # pip
+    size: float = 0.38                       # pip: width as a fraction of the canvas
+    shape: str = "circle"                    # pip: circle | rounded | rect
+    split: str = "bottom"                    # split: which half the presenter takes
+    remove_background: bool = False
+    border: Optional[Dict[str, Any]] = None  # pip: {"color": …, "width": …}
     model_config = ConfigDict(extra="allow")
 
 
@@ -180,6 +202,7 @@ class ComposeRequest(BaseModel):
     transition: Dict[str, Any] = Field(default_factory=lambda: {"type": "none",
                                                                "duration": 0.3})
     music: Optional[MusicSpec] = None
+    presenter: Optional[PresenterSpec] = None
     captions: Optional[CaptionSpec] = None
     overlays: List[Overlay] = Field(default_factory=list)
     thumbnail: Optional[ThumbnailSpec] = None
@@ -361,9 +384,13 @@ def _validate(req: ComposeRequest) -> None:
             raise HTTPException(status_code=400, detail=(
                 f"scenes[{i}]: a scene with no text and no audio needs an explicit "
                 f"\"duration\""))
-        if not sc.visuals:
-            raise HTTPException(status_code=400,
-                                detail=f"scenes[{i}].visuals: at least one visual is required")
+        pres = presenter_for(sc, req)
+        if pres is not None:
+            _validate_presenter(pres, f"scenes[{i}].presenter" if sc.presenter else "presenter")
+        if not sc.visuals and not (pres and (pres.get("layout") or "full").lower() == "full"):
+            raise HTTPException(status_code=400, detail=(
+                f"scenes[{i}].visuals: at least one visual is required "
+                f"(a scene with no visuals needs a full-screen presenter)"))
         if len(sc.visuals) > _MAX_VISUALS_PER_SCENE:
             raise HTTPException(status_code=400, detail=(
                 f"scenes[{i}].visuals: at most {_MAX_VISUALS_PER_SCENE} per scene"))
@@ -412,6 +439,86 @@ def _validate(req: ComposeRequest) -> None:
         raise HTTPException(status_code=501, detail=(
             "narration needs a TTS model (engine=tts) or a saved voice profile "
             "(engine=clone) on this install; pass per-scene \"audio\" instead"))
+
+
+def presenter_for(scene: Scene, req: ComposeRequest) -> Optional[dict]:
+    """This scene's presenter block, or None.
+
+    A scene may override the request's presenter, or opt out with
+    ``"presenter": false`` — the sign-off is full screen, the middle is B-roll."""
+    own = scene.presenter
+    if own is False or (isinstance(own, str) and own.strip().lower() in ("false", "none", "off")):
+        return None
+    base = req.presenter.model_dump() if req.presenter else None
+    if own is None or own is True:
+        return dict(base) if base else None
+    if isinstance(own, dict):
+        merged = dict(base or {})
+        merged.update({k: v for k, v in own.items() if v is not None})
+        # A scene-level block with neither a character nor an image inherits the
+        # request's face rather than failing.
+        if not (merged.get("character") or merged.get("image")):
+            return None
+        return merged
+    return dict(base) if base else None
+
+
+def _validate_presenter(spec: dict, where: str) -> None:
+    layout = (spec.get("layout") or "full").lower()
+    if layout not in ("full", "pip", "split"):
+        raise HTTPException(status_code=400, detail=(
+            f"{where}.layout: expected full, pip or split (got {spec.get('layout')!r})"))
+    if layout == "pip":
+        pos = (spec.get("position") or "bottom-right").lower().replace("_", "-")
+        if pos not in ("top-left", "top-right", "bottom-left", "bottom-right",
+                       "bottom-center", "bottom-centre", "top-center", "top-centre",
+                       "center", "centre"):
+            raise HTTPException(status_code=400, detail=(
+                f"{where}.position: expected one of top-left, top-right, bottom-left, "
+                f"bottom-right, bottom-center (got {spec.get('position')!r})"))
+        try:
+            size = float(spec.get("size") if spec.get("size") is not None else 0.38)
+        except (TypeError, ValueError):
+            size = -1.0
+        if not (0.1 <= size <= 0.95):
+            raise HTTPException(status_code=400,
+                                detail=f"{where}.size: expected 0.1..0.95 (got {spec.get('size')!r})")
+        if (spec.get("shape") or "circle").lower() not in ("circle", "rounded", "round", "rect"):
+            raise HTTPException(status_code=400, detail=(
+                f"{where}.shape: expected circle, rounded or rect (got {spec.get('shape')!r})"))
+    if layout == "split" and (spec.get("split") or "bottom").lower() not in ("top", "bottom"):
+        raise HTTPException(status_code=400,
+                            detail=f"{where}.split: expected top or bottom")
+    if (spec.get("motion") or "generate").lower() not in ("generate", "still", "src"):
+        raise HTTPException(status_code=400, detail=(
+            f"{where}.motion: expected generate, still or src (got {spec.get('motion')!r})"))
+    if (spec.get("motion") or "generate").lower() == "src" and not spec.get("base_src"):
+        raise HTTPException(status_code=400,
+                            detail=f'{where}.base_src: required when motion is "src"')
+    char = (spec.get("character") or "").strip()
+    if not char and not (spec.get("image") or "").strip():
+        raise HTTPException(status_code=400,
+                            detail=f"{where}: needs a character or an image")
+    if char:
+        try:
+            from codai.api.characters import _load_character_meta
+            known = bool(_load_character_meta(char))
+        except Exception:
+            known = True          # cannot check → let the render warn instead
+        if not known:
+            raise HTTPException(status_code=400,
+                                detail=f"{where}.character: no character profile named {char!r}")
+    from codai.compose import presenter as _pres
+    want = (spec.get("engine") or "auto").strip()
+    if not _pres.engine_installed(want):
+        have = _pres.available_engines()
+        raise HTTPException(status_code=501, detail=(
+            f"{where}: lip-sync engine "
+            + (f"{want!r} is not installed" if want.lower() != "auto"
+               else "is not installed")
+            + (f" (installed: {', '.join(have)})" if have else
+               "; install the wav2lip or sadtalker shim (the published images ship both), "
+               "or drop the presenter block")))
 
 
 def _model_ids(mtype: str) -> List[str]:
@@ -483,6 +590,38 @@ def _await(loop, coro, timeout: float = 1800.0):
     """Run one of the API's coroutines from the render thread."""
     fut = asyncio.run_coroutine_threadsafe(coro, loop or _media_loop())
     return fut.result(timeout=timeout)
+
+
+class _Lease:
+    """A scheduler lease held across a blocking GPU step, released on close().
+
+    Lip-sync is the only GPU work in a composition; everything else is ffmpeg.
+    Taking a lease from the central scheduler means it queues with ordinary model
+    requests instead of fighting a generation for the card. A scheduler that
+    refuses (or is not there) is not a reason to fail: the step just runs."""
+
+    def __init__(self, loop, lease):
+        self._loop, self._lease = loop, lease
+
+    def close(self) -> None:
+        if self._lease is None:
+            return
+        try:
+            from codai.queue.manager import queue_manager
+            _await(self._loop, queue_manager.release(self._lease), timeout=60)
+        except Exception:
+            pass
+        self._lease = None
+
+
+def _gpu_lease(loop, model_key: str) -> _Lease:
+    try:
+        from codai.queue.manager import queue_manager
+        lease = _await(loop, queue_manager.acquire(
+            f"compose-{model_key}-{uuid.uuid4().hex[:8]}", model_key), timeout=3600)
+    except Exception:
+        lease = None
+    return _Lease(loop, lease)
 
 
 def _b64_to_file(b64: str, path: str) -> str:
@@ -653,6 +792,9 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
             starts.append(round(t, 3))
             t += d
 
+        # Clips are built one transition longer so the overlap is absorbed.
+        extra_t = tdur if ttype != "none" else 0.0
+
         # ---------------------------------------------------- 2. captions
         events: List[dict] = []
         if caps and caps.enabled:
@@ -676,22 +818,74 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                     except Exception as exc:
                         warn(f"scene {i}: word timestamps failed ({exc}); estimated instead")
                 span = max(0.2, scene_dur[i] - max(0.0, float(sc.padding or 0.0)))
-                words += (cap.align_words(text, stt, starts[i], span) if stt
-                          else cap.estimate_words(text, starts[i], span))
+                got = (cap.align_words(text, stt, starts[i], span) if stt
+                       else cap.estimate_words(text, starts[i], span))
+                # A presenter bubble at the bottom would sit on the captions:
+                # push this scene's lines above it (per-event ASS margin).
+                bump = _caption_margin_bump(presenter_for(sc, req), caps, canvas)
+                if bump:
+                    for w in got:
+                        w["margin_v"] = bump
+                words += got
             events = cap.break_lines(words, caps.max_words_per_line, caps.max_lines)
             if caps.font and not media.font_installed(caps.font):
                 warn(f"font {caps.font!r} is not installed; captions use the "
                      f"closest available family")
 
-        # ---------------------------------------------------- 3. visuals
+        # ------------------------------------------- 3. presenter (lip-sync)
+        # Built before the visuals because a full-screen presenter replaces them,
+        # and because it is the GPU part: it should not wait behind ffmpeg.
+        presenters: List[Optional[dict]] = [None] * n_scenes
+        want_pres = [presenter_for(sc, req) for sc in req.scenes]
+        if any(p is not None for p in want_pres):
+            from codai.compose import presenter as _pres
+            for i, sc in enumerate(req.scenes):
+                spec = want_pres[i]
+                if spec is None:
+                    continue
+                stage("presenter", 30.0 + 9.0 * i / max(1, n_scenes),
+                      f"scene {i + 1}/{n_scenes}: lip-sync")
+                if spec.get("remove_background"):
+                    warn(f"scene {i}: presenter.remove_background is not available on "
+                         f"this install; the presenter is composited as filmed")
+                try:
+                    presenters[i] = _pres.build_scene_presenter(
+                        spec, narration=scene_audio[i], duration=scene_dur[i] + extra_t,
+                        width=canvas.width, height=canvas.height, fps=canvas.fps,
+                        workdir=work, index=i, loop=loop, cancel=cancel, log=log,
+                        gpu_lease=lambda: _gpu_lease(loop, "lipsync"))
+                    presenters[i]["layout"] = (spec.get("layout") or "full").lower()
+                    presenters[i]["spec"] = spec
+                except rnd.Cancelled:
+                    raise
+                except Exception as exc:
+                    warn(f"scene {i}: presenter skipped ({exc}); the scene's visuals "
+                         f"are used instead")
+                    if not sc.visuals:
+                        # Nothing left to show: a gradient is the documented floor.
+                        sc.visuals = [Visual(type="gradient")]
+
+        # ---------------------------------------------------- 4. visuals
         clips: List[str] = []
         clip_durs: List[float] = []
         made = 0
         total_visuals = sum(len(sc.visuals) for sc in req.scenes)
-        extra = tdur if ttype != "none" else 0.0
         for i, sc in enumerate(req.scenes):
+            pres = presenters[i]
+            # A full-screen presenter IS the scene: no visuals are rendered.
+            if pres and pres["layout"] == "full":
+                stage("visuals", 40.0 + 28.0 * made / max(1, total_visuals or 1),
+                      f"scene {i + 1}/{n_scenes}: presenter (full screen)")
+                clips.append(pres["path"])
+                clip_durs.append(scene_dur[i] + extra_t)
+                continue
+            scene_clips: List[str] = []
             n = max(1, len(sc.visuals))
-            slot = scene_dur[i] / n
+            # With a presenter the scene is composited as ONE clip, so its visuals
+            # share the scene without a transition between them; without one they
+            # stay separate clips and transitions apply between every visual, as
+            # they always have.
+            slot = scene_dur[i] / n if pres else scene_dur[i] / n
             for j, v in enumerate(sc.visuals):
                 stage("visuals", 40.0 + 28.0 * made / max(1, total_visuals),
                       f"scene {i + 1}/{n_scenes}: visual {j + 1}/{n}")
@@ -710,7 +904,7 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 out = os.path.join(work, f"clip-{i}-{j}.mp4")
                 try:
                     rnd.build_visual(spec, out, width=canvas.width, height=canvas.height,
-                                     fps=canvas.fps, duration=slot + extra, fit=fit,
+                                     fps=canvas.fps, duration=slot + extra_t, fit=fit,
                                      index=made, workdir=work, cancel=cancel, log=log)
                 except rnd.Cancelled:
                     raise
@@ -718,11 +912,46 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                     warn(f"scene {i} visual {j}: render failed ({exc}); used gradient")
                     rnd.build_visual({"type": "gradient"}, out, width=canvas.width,
                                      height=canvas.height, fps=canvas.fps,
-                                     duration=slot + extra, fit=fit, index=made,
+                                     duration=slot + extra_t, fit=fit, index=made,
                                      workdir=work, cancel=cancel, log=log)
-                clips.append(out)
-                clip_durs.append(slot + extra)
+                scene_clips.append(out)
                 made += 1
+            if pres:
+                # One clip for the scene, then the bubble or the split over it.
+                joined = os.path.join(work, f"scene-{i}.mp4")
+                if len(scene_clips) == 1:
+                    joined = scene_clips[0]
+                else:
+                    rnd.concat_clips(scene_clips, joined, work, cancel=cancel, log=log)
+                comp = os.path.join(work, f"scene-{i}-pres.mp4")
+                spec = pres["spec"]
+                try:
+                    if pres["layout"] == "pip":
+                        rnd.composite_pip(joined, pres["path"], comp,
+                                          width=canvas.width, height=canvas.height,
+                                          fps=canvas.fps, size=spec.get("size", 0.38),
+                                          position=spec.get("position") or "bottom-right",
+                                          shape=spec.get("shape") or "circle",
+                                          border=spec.get("border"), workdir=work,
+                                          cancel=cancel, log=log)
+                    else:
+                        rnd.composite_split(joined, pres["path"], comp,
+                                            width=canvas.width, height=canvas.height,
+                                            fps=canvas.fps,
+                                            presenter_half=spec.get("split") or "bottom",
+                                            cancel=cancel, log=log)
+                    clips.append(comp)
+                except rnd.Cancelled:
+                    raise
+                except Exception as exc:
+                    warn(f"scene {i}: presenter could not be composited ({exc}); "
+                         f"the scene's visuals are used as they are")
+                    presenters[i] = None
+                    clips.append(joined)
+                clip_durs.append(scene_dur[i] + extra_t)
+            else:
+                clips.extend(scene_clips)
+                clip_durs.extend([slot + extra_t] * len(scene_clips))
 
         stage("visuals", 69.0, "joining the clips")
         silent = os.path.join(work, "video.mp4")
@@ -863,9 +1092,13 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                     result[kind] = publish(paths[kind], f"{job_id}.{kind}")
         if "narration" in want:
             result["narration"] = publish(narration, f"{job_id}_voice.wav")
-        result["scenes"] = [{"index": i, "start": starts[i],
-                             "end": round(starts[i] + scene_dur[i], 3)}
-                            for i in range(n_scenes)]
+        result["scenes"] = [
+            {"index": i, "start": starts[i],
+             "end": round(starts[i] + scene_dur[i], 3),
+             "presenter": ({"engine": presenters[i]["engine"],
+                            "layout": presenters[i]["layout"]}
+                           if presenters[i] else None)}
+            for i in range(n_scenes)]
         result["duration"] = total
 
         _update(job_id, status="done", stage="thumbnail", progress=100.0,
@@ -874,6 +1107,25 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
               f"{len(clips)} visuals", flush=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _caption_margin_bump(pres: Optional[dict], caps, canvas) -> int:
+    """How far up this scene's captions move, in canvas pixels.
+
+    Only a bottom bubble collides with bottom captions; a full-screen presenter or
+    a split layout does not, and centred captions are already above a bubble."""
+    if not pres or (pres.get("layout") or "full").lower() != "pip":
+        return 0
+    if (caps.position or "center").lower() != "bottom":
+        return 0
+    pos = (pres.get("position") or "bottom-right").lower()
+    if not pos.startswith("bottom"):
+        return 0
+    _, bh, _, y = rnd.bubble_geometry(canvas.width, canvas.height,
+                                      pres.get("size", 0.38), pos,
+                                      pres.get("shape") or "circle")
+    # Clear the bubble's top edge plus a little air.
+    return max(0, int(canvas.height - y + canvas.height * 0.02))
 
 
 def _output_dir() -> str:
@@ -951,6 +1203,124 @@ async def compose_cancel(job_id: str, _auth=Depends(_require_api_auth)):
     if not cancel_job(job_id):
         raise HTTPException(status_code=404, detail=f"unknown composition job {job_id!r}")
     return {"id": job_id, "status": "cancelled"}
+
+
+# =============================================================================
+# Talking head — the presenter on its own
+# =============================================================================
+
+class TalkingHeadRequest(BaseModel):
+    """A character saying one thing, for a preview on a character page."""
+    character: Optional[str] = None
+    image: Optional[str] = None
+    text: Optional[str] = None
+    audio: Optional[str] = None               # pre-rendered instead of text
+    voice: VoiceSpec = Field(default_factory=VoiceSpec)
+    engine: str = "auto"
+    motion: str = "still"                     # a preview does not need a generated shot
+    base_src: Optional[str] = None
+    prompt: Optional[str] = None
+    video_model: Optional[str] = None
+    canvas: Canvas = Field(default_factory=lambda: Canvas(width=720, height=720, fps=25))
+    output: OutputSpec = Field(default_factory=OutputSpec)
+    is_async: bool = Field(default=True, alias="async")
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
+#: A preview is a preview: a quarter-minute is plenty and keeps the GPU free.
+TALKING_HEAD_MAX_SECONDS = 15.0
+
+
+def _talking_head_spec(req: TalkingHeadRequest) -> ComposeRequest:
+    """A talking-head request IS a one-scene composition with a full-screen
+    presenter, no captions and no music — so it runs on exactly the same code."""
+    pres = {"character": req.character, "image": req.image, "engine": req.engine,
+            "motion": req.motion, "base_src": req.base_src, "prompt": req.prompt,
+            "video_model": req.video_model, "layout": "full"}
+    scene = {"text": req.text or "", "audio": req.audio,
+             "visuals": [], "padding": 0.05}
+    return ComposeRequest(canvas=req.canvas, voice=req.voice,
+                          presenter=PresenterSpec(**pres), scenes=[Scene(**scene)],
+                          captions=CaptionSpec(enabled=False), output=req.output,
+                          outputs=["video"], **{"async": req.is_async})
+
+
+@router.post("/v1/video/talking-head", summary="A character saying one line",
+             tags=["Video"])
+async def talking_head(req: TalkingHeadRequest, http_request: Request,
+                       _auth=Depends(_require_api_auth)):
+    """Lip-sync one line onto a character's face — the preview a character page
+    shows before anyone pays for a render.
+
+    Same job semantics as ``/v1/video/compose`` (and the same job store, so
+    ``GET /v1/video/compose/{id}`` works too): ``202 {id, status}`` then poll, or
+    ``"async": false`` to block. Text is synthesised with ``voice``; supply
+    ``audio`` instead to skip synthesis. Capped at 15 s of audio."""
+    if not (req.text or "").strip() and not req.audio:
+        raise HTTPException(status_code=400, detail="talking-head needs text or audio")
+    spec = _talking_head_spec(req)
+    _validate(spec)
+    if req.audio:
+        # A caller's clip is the one thing we can measure before rendering.
+        try:
+            import tempfile as _tf
+            with _tf.TemporaryDirectory() as td:
+                p = media.resolve(req.audio, td, "th-audio")
+                dur = media.duration_of(p)
+            if dur > TALKING_HEAD_MAX_SECONDS + 0.5:
+                raise HTTPException(status_code=400, detail=(
+                    f"audio is {dur:.1f}s; talking-head is capped at "
+                    f"{TALKING_HEAD_MAX_SECONDS:.0f}s (use /v1/video/compose for a full render)"))
+        except media.MediaError as exc:
+            raise HTTPException(status_code=400, detail=f"audio: {exc}")
+    try:
+        from codai.api.urlutils import get_base_url
+        base_url = get_base_url(http_request)
+    except Exception:
+        base_url = ""
+    rec = submit(spec, base_url)
+    if req.is_async:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202,
+                            content={"id": rec["id"], "status": "queued"})
+    job_id = rec["id"]
+    while True:
+        await asyncio.sleep(0.5)
+        cur = _get(job_id)
+        if cur is None:
+            raise HTTPException(status_code=500, detail="job disappeared")
+        if cur["status"] in ("done", "failed", "cancelled"):
+            if cur["status"] == "failed":
+                raise HTTPException(status_code=500,
+                                    detail=cur.get("error") or "talking-head failed")
+            return _public(cur)
+
+
+@router.get("/v1/video/talking-head/{job_id}", summary="Talking-head job status",
+            tags=["Video"])
+async def talking_head_status(job_id: str, _auth=Depends(_require_api_auth)):
+    """The same document as ``GET /v1/video/compose/{id}`` — one job store."""
+    return await compose_status(job_id, _auth)
+
+
+@router.post("/v1/video/talking-head/{job_id}/cancel",
+             summary="Cancel a talking-head job", tags=["Video"])
+async def talking_head_cancel(job_id: str, _auth=Depends(_require_api_auth)):
+    return await compose_cancel(job_id, _auth)
+
+
+@router.get("/v1/video/presenter/engines", summary="Installed lip-sync engines",
+            tags=["Video"])
+async def presenter_engines(_auth=Depends(_require_api_auth)):
+    """What a presenter can be driven with here — so a client can grey out the
+    feature instead of discovering a 501 at submission."""
+    from codai.compose import presenter as _pres
+    have = _pres.available_engines()
+    return {"engines": have, "available": bool(have),
+            "video_engines": [e for e in have if e in _pres.VIDEO_ENGINES],
+            "portrait_engines": [e for e in have if e in _pres.PORTRAIT_ENGINES],
+            "layouts": ["full", "pip", "split"],
+            "talking_head_max_seconds": TALKING_HEAD_MAX_SECONDS}
 
 
 @router.get("/v1/video/compose", summary="List composition jobs", tags=["Video"])

@@ -636,7 +636,11 @@ def test_compose_and_uploads_are_never_forwarded_to_a_remote():
     assert capability_for("/v1/video/compose") == "video"     # by prefix…
     for path in ("/v1/video/compose", "/v1/video/compose/cmp_1",
                  "/v1/video/compose/cmp_1/cancel", "/v1/files/upload",
-                 "/v1/files/blob/" + "a" * 64):
+                 "/v1/files/blob/" + "a" * 64,
+                 # A video pod has the lip-sync shims but not this install's
+                 # character profiles, so the presenter stays here too.
+                 "/v1/video/talking-head", "/v1/video/talking-head/cmp_1",
+                 "/v1/video/presenter/engines"):
         assert resolve_target(path, "POST", "", b"", "application/json") is None, path
 
 
@@ -725,3 +729,307 @@ def test_a_character_is_saved_from_an_uploaded_image(tmp_path, files_dir, monkey
     assert r.status_code == 200, r.text
     saved = tmp_path / "chars" / "ada" / "ref00.png"
     assert saved.is_file() and saved.read_bytes() == png
+
+
+# ============================================== request 4: talking presenter
+def _portrait(tmp_path, name="face.png", w=120, h=160):
+    """A portrait with something face-shaped in it (engines are stubbed, but the
+    compositing is real, so the pixels should differ from the background)."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (w, h), (30, 30, 40))
+    d = ImageDraw.Draw(img)
+    d.ellipse((w * 0.2, h * 0.1, w * 0.8, h * 0.7), fill=(230, 200, 180))
+    d.rectangle((w * 0.3, h * 0.7, w * 0.7, h), fill=(40, 90, 160))
+    p = tmp_path / name
+    img.save(str(p))
+    return str(p)
+
+
+def _stub_engine(monkeypatch, mod, engines=("wav2lip",), fail=False):
+    """Stand in for the GPU: a 'lip-synced' clip as long as the audio it is given."""
+    calls = []
+    monkeypatch.setattr(mod, "available_engines", lambda: list(engines))
+    monkeypatch.setattr(mod, "engine_installed", lambda name: bool(engines))
+
+    def fake_run(engine, face, audio, out, cancel=None, timeout=3600, log=None):
+        if fail:
+            calls.append({"engine": engine, "face": face, "audio_seconds": None})
+            raise mod.PresenterError("stub engine says no")
+        dur = media.duration_of(audio)
+        # The job's workdir is gone by the time a test looks, so record the fact
+        # that matters here: how long the audio it was driven with was.
+        calls.append({"engine": engine, "face": face, "audio_seconds": dur})
+        subprocess.run([media.ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", f"color=c=#8844aa:s=240x320:r=25:d={dur:.3f}",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", out], check=True)
+        return out
+
+    monkeypatch.setattr(mod, "run_engine", fake_run)
+    return calls
+
+
+def test_presenter_engines_are_reported_for_the_client(files_dir):
+    client, _ = _client(files_dir)
+    r = client.get("/v1/video/presenter/engines")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["layouts"] == ["full", "pip", "split"]
+    assert isinstance(d["engines"], list) and d["available"] == bool(d["engines"])
+    assert d["talking_head_max_seconds"] == 15.0
+
+
+def test_a_full_screen_presenter_replaces_the_scenes_visuals(tmp_path, files_dir,
+                                                             monkeypatch):
+    from codai.compose import presenter as pres
+    client, compose_mod = _client(files_dir)
+    calls = _stub_engine(monkeypatch, pres)
+    voice = _uri(_tone(tmp_path / "pv.wav", 1.0))
+    spec = {"canvas": {"width": 160, "height": 284, "fps": 24},
+            "presenter": {"image": _uri_file(_portrait(tmp_path)), "motion": "still",
+                          "layout": "full"},
+            "captions": {"enabled": False}, "outputs": ["video"],
+            "scenes": [{"text": "hi there", "audio": voice, "padding": 0.2,
+                        "visuals": []}]}
+    doc = _wait(client, client.post("/v1/video/compose", json=spec).json()["id"])
+    assert doc["status"] == "done", doc
+    assert doc["warnings"] == []
+    assert calls and calls[0]["engine"] == "wav2lip"
+    # It was driven by THIS scene's narration, and the clip is the scene's length.
+    assert calls[0]["audio_seconds"] == pytest.approx(1.0, abs=0.1)
+    assert doc["result"]["scenes"][0]["presenter"] == {"engine": "wav2lip", "layout": "full"}
+    vid = files_dir / doc["result"]["video"]["path"].split("/")[-1]
+    info = media.probe(str(vid))
+    assert (info["width"], info["height"]) == (160, 284)
+    assert info["duration"] == pytest.approx(1.2, abs=0.2)
+
+
+def _uri_file(path):
+    return _uri(Path(path))
+
+
+def test_a_pip_bubble_sits_in_the_safe_area_over_the_b_roll(tmp_path, files_dir,
+                                                            monkeypatch):
+    from codai.compose import presenter as pres
+    client, _ = _client(files_dir)
+    _stub_engine(monkeypatch, pres)
+    spec = {"canvas": {"width": 240, "height": 426, "fps": 24},
+            "presenter": {"image": _uri_file(_portrait(tmp_path)), "motion": "still",
+                          "layout": "pip", "position": "bottom-right", "size": 0.4,
+                          "shape": "circle", "border": {"color": "#FFFFFF", "width": 4}},
+            "captions": {"enabled": False}, "outputs": ["video"],
+            "scenes": [{"text": "over b-roll", "audio": _uri(_tone(tmp_path / "pb.wav", 0.8)),
+                        "visuals": [{"type": "color", "color": "#000000"}]}]}
+    doc = _wait(client, client.post("/v1/video/compose", json=spec).json()["id"])
+    assert doc["status"] == "done", doc
+    assert doc["result"]["scenes"][0]["presenter"]["layout"] == "pip"
+    vid = files_dir / doc["result"]["video"]["path"].split("/")[-1]
+    # The bubble is where the geometry says, and the corners of the canvas are not.
+    frame = tmp_path / "f.png"
+    subprocess.run([media.ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", "0.4", "-i", str(vid), "-frames:v", "1", str(frame)], check=True)
+    from PIL import Image
+    img = Image.open(frame).convert("RGB")
+    bw, bh, x, y = rnd.bubble_geometry(240, 426, 0.4, "bottom-right", "circle")
+    centre = img.getpixel((x + bw // 2, y + bh // 2))
+    assert sum(centre) > 60, centre                     # the presenter is drawn there
+    assert img.getpixel((4, 4)) == (0, 0, 0)            # the B-roll is untouched
+    # Safe area: the bubble never touches the edges.
+    assert x >= int(240 * 0.05) and (y + bh) <= 426 - int(426 * 0.09)
+
+
+def test_split_layout_stacks_presenter_and_b_roll(tmp_path, files_dir, monkeypatch):
+    from codai.compose import presenter as pres
+    client, _ = _client(files_dir)
+    _stub_engine(monkeypatch, pres)
+    spec = {"canvas": {"width": 240, "height": 426, "fps": 24},
+            "presenter": {"image": _uri_file(_portrait(tmp_path)), "motion": "still",
+                          "layout": "split", "split": "bottom"},
+            "captions": {"enabled": False}, "outputs": ["video"],
+            "scenes": [{"text": "half and half",
+                        "audio": _uri(_tone(tmp_path / "ps.wav", 0.8)),
+                        "visuals": [{"type": "color", "color": "#00FF00"}]}]}
+    doc = _wait(client, client.post("/v1/video/compose", json=spec).json()["id"])
+    assert doc["status"] == "done", doc
+    vid = files_dir / doc["result"]["video"]["path"].split("/")[-1]
+    frame = tmp_path / "fs.png"
+    subprocess.run([media.ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", "0.4", "-i", str(vid), "-frames:v", "1", str(frame)], check=True)
+    from PIL import Image
+    img = Image.open(frame).convert("RGB")
+    top = img.getpixel((120, 80))
+    bottom = img.getpixel((120, 340))
+    assert top[1] > 150 and top[0] < 100, top           # B-roll green on top
+    assert bottom != top                                # presenter below
+
+
+def test_a_scene_can_opt_out_and_another_can_override(tmp_path, files_dir, monkeypatch):
+    from codai.compose import presenter as pres
+    client, _ = _client(files_dir)
+    calls = _stub_engine(monkeypatch, pres)
+    face = _uri_file(_portrait(tmp_path))
+    spec = {"canvas": {"width": 160, "height": 284, "fps": 24},
+            "presenter": {"image": face, "motion": "still", "layout": "pip"},
+            "captions": {"enabled": False}, "outputs": ["video"],
+            "scenes": [
+                {"text": "hook", "audio": _uri(_tone(tmp_path / "a1.wav", 0.5)),
+                 "visuals": [{"type": "color", "color": "#111827"}]},
+                {"text": "b-roll only", "audio": _uri(_tone(tmp_path / "a2.wav", 0.5)),
+                 "visuals": [{"type": "gradient"}], "presenter": False},
+                {"text": "sign off", "audio": _uri(_tone(tmp_path / "a3.wav", 0.5)),
+                 "visuals": [], "presenter": {"layout": "full"}},
+            ]}
+    doc = _wait(client, client.post("/v1/video/compose", json=spec).json()["id"])
+    assert doc["status"] == "done", doc
+    layouts = [(s["presenter"] or {}).get("layout") for s in doc["result"]["scenes"]]
+    assert layouts == ["pip", None, "full"]
+    assert len(calls) == 2                       # the opted-out scene ran no engine
+
+
+def test_a_failing_engine_falls_back_to_the_visuals_with_a_warning(tmp_path, files_dir,
+                                                                   monkeypatch):
+    from codai.compose import presenter as pres
+    client, _ = _client(files_dir)
+    _stub_engine(monkeypatch, pres, fail=True)
+    spec = {"canvas": {"width": 160, "height": 284, "fps": 24},
+            "presenter": {"image": _uri_file(_portrait(tmp_path)), "motion": "still",
+                          "layout": "full"},
+            "captions": {"enabled": False}, "outputs": ["video"],
+            "scenes": [{"text": "still shipped",
+                        "audio": _uri(_tone(tmp_path / "pf.wav", 0.6)),
+                        "visuals": []}]}
+    doc = _wait(client, client.post("/v1/video/compose", json=spec).json()["id"])
+    assert doc["status"] == "done", doc          # a render is never lost to this
+    assert any("presenter skipped" in w for w in doc["warnings"]), doc["warnings"]
+    assert doc["result"]["scenes"][0]["presenter"] is None
+    vid = files_dir / doc["result"]["video"]["path"].split("/")[-1]
+    assert media.probe(str(vid))["has_video"]
+
+
+def test_bottom_captions_move_above_a_bottom_bubble(tmp_path, files_dir, monkeypatch):
+    from codai.compose import presenter as pres
+    client, compose_mod = _client(files_dir)
+    _stub_engine(monkeypatch, pres)
+    base = {"canvas": {"width": 240, "height": 426, "fps": 24},
+            "captions": {"enabled": True, "timing": "estimate", "position": "bottom",
+                         "font": "DejaVu Sans", "preset": "classic"},
+            "outputs": ["video", "srt"],
+            "scenes": [{"text": "words under the face",
+                        "audio": _uri(_tone(tmp_path / "pc.wav", 1.0)),
+                        "visuals": [{"type": "color", "color": "#101010"}]}]}
+    # The margin is computed from the presenter geometry; check the helper directly
+    # (the burned frame is pixels, the intent is a margin).
+    from codai.api.compose import _caption_margin_bump, CaptionSpec, Canvas
+    caps = CaptionSpec(position="bottom")
+    canvas = Canvas(width=240, height=426, fps=24)
+    bump = _caption_margin_bump({"layout": "pip", "position": "bottom-right",
+                                 "size": 0.4, "shape": "circle"}, caps, canvas)
+    assert bump > int(426 * 0.10)                 # higher than the normal safe margin
+    assert _caption_margin_bump({"layout": "pip", "position": "top-right"}, caps, canvas) == 0
+    assert _caption_margin_bump({"layout": "full"}, caps, canvas) == 0
+    assert _caption_margin_bump({"layout": "pip", "position": "bottom-right"},
+                                CaptionSpec(position="center"), canvas) == 0
+    # And the render still succeeds with the bump applied.
+    spec = dict(base)
+    spec["presenter"] = {"image": _uri_file(_portrait(tmp_path)), "motion": "still",
+                         "layout": "pip", "position": "bottom-right", "size": 0.4}
+    doc = _wait(client, client.post("/v1/video/compose", json=spec).json()["id"])
+    assert doc["status"] == "done", doc
+
+
+def test_presenter_specs_are_validated_and_a_missing_engine_is_501(tmp_path, files_dir,
+                                                                   monkeypatch):
+    from codai.compose import presenter as pres
+    client, _ = _client(files_dir)
+    _stub_engine(monkeypatch, pres)
+    face = _uri_file(_portrait(tmp_path))
+    scene = {"text": "x", "audio": _uri(_tone(tmp_path / "pv2.wav", 0.4)),
+             "visuals": [{"type": "color"}]}
+
+    def err(presenter, code=400):
+        r = client.post("/v1/video/compose",
+                        json={"scenes": [scene], "presenter": presenter,
+                              "captions": {"enabled": False}})
+        assert r.status_code == code, r.text
+        return r.json()["detail"]
+
+    assert "layout" in err({"image": face, "layout": "hologram"})
+    assert "position" in err({"image": face, "layout": "pip", "position": "middle-left"})
+    assert "size" in err({"image": face, "layout": "pip", "size": 2.0})
+    assert "shape" in err({"image": face, "layout": "pip", "shape": "star"})
+    assert "split" in err({"image": face, "layout": "split", "split": "left"})
+    assert "motion" in err({"image": face, "motion": "teleport"})
+    assert "base_src" in err({"image": face, "motion": "src"})
+    assert "needs a character or an image" in err({"layout": "full"})
+    assert "no character profile" in err({"character": "nobody-here"})
+    # A scene with no visuals and a pip presenter has nothing to composite onto.
+    r = client.post("/v1/video/compose",
+                    json={"scenes": [{"text": "x", "audio": scene["audio"], "visuals": []}],
+                          "presenter": {"image": face, "layout": "pip"},
+                          "captions": {"enabled": False}})
+    assert r.status_code == 400 and "full-screen presenter" in r.json()["detail"]
+    # No engine installed at all → 501 naming what to install.
+    monkeypatch.setattr(pres, "available_engines", lambda: [])
+    monkeypatch.setattr(pres, "engine_installed", lambda name: False)
+    d = err({"image": face, "layout": "full"}, code=501)
+    assert "wav2lip" in d and "sadtalker" in d
+
+
+def test_talking_head_is_a_one_scene_composition(tmp_path, files_dir, monkeypatch):
+    from codai.compose import presenter as pres
+    client, compose_mod = _client(files_dir)
+    calls = _stub_engine(monkeypatch, pres)
+    face = _uri_file(_portrait(tmp_path))
+    r = client.post("/v1/video/talking-head",
+                    json={"image": face, "audio": _uri(_tone(tmp_path / "th.wav", 1.0)),
+                          "canvas": {"width": 128, "height": 128, "fps": 24},
+                          "motion": "still"})
+    assert r.status_code == 202, r.text
+    job = r.json()["id"]
+    doc = _wait(client, job)
+    assert doc["status"] == "done", doc
+    assert len(calls) == 1
+    vid = files_dir / doc["result"]["video"]["path"].split("/")[-1]
+    info = media.probe(str(vid))
+    assert (info["width"], info["height"]) == (128, 128)
+    assert info["duration"] == pytest.approx(1.05, abs=0.2)
+    # The compose job store is the same store.
+    assert client.get(f"/v1/video/compose/{job}").json()["status"] == "done"
+    assert client.get(f"/v1/video/talking-head/{job}").json()["status"] == "done"
+    # Neither text nor audio is an error; too much audio is refused.
+    assert client.post("/v1/video/talking-head", json={"image": face}).status_code == 400
+    long_audio = _uri(_tone(tmp_path / "long_th.wav", 16.0))
+    r = client.post("/v1/video/talking-head", json={"image": face, "audio": long_audio})
+    assert r.status_code == 400 and "capped at 15s" in r.json()["detail"]
+
+
+def test_a_character_profile_supplies_the_face(tmp_path, files_dir, monkeypatch):
+    from codai.compose import presenter as pres
+    import codai.api.characters as ch
+    monkeypatch.setattr(ch, "_chars_dir", lambda: str(tmp_path / "chars"))
+    # Two references: the one labelled "front" is the one a presenter should use.
+    ch._save_character("nova", "host", [
+        ch.CharacterImage(label="side", data=_uri_file(_portrait(tmp_path, "side.png"))),
+        ch.CharacterImage(label="front", data=_uri_file(_portrait(tmp_path, "front.png",
+                                                                 130, 170))),
+    ])
+    work = str(tmp_path / "w")
+    face = pres.portrait_path({"character": "nova"}, work)
+    from PIL import Image
+    assert Image.open(face).size == (130, 170)      # the front reference
+    with pytest.raises(pres.PresenterError):
+        pres.portrait_path({"character": "ghost"}, work)
+
+
+def test_engine_selection_prefers_video_engines_for_a_clip(monkeypatch):
+    from codai.compose import presenter as pres
+    monkeypatch.setattr(pres, "available_engines", lambda: ["wav2lip", "sadtalker"])
+    assert pres.pick_engine("auto", has_base=True) == "wav2lip"
+    assert pres.pick_engine("auto", has_base=False) == "sadtalker"
+    assert pres.pick_engine("sadtalker", has_base=True) == "sadtalker"
+    monkeypatch.setattr(pres, "available_engines", lambda: ["sadtalker"])
+    assert pres.pick_engine("auto", has_base=True) == "sadtalker"
+    with pytest.raises(pres.PresenterError):
+        pres.pick_engine("wav2lip", has_base=True)
+    monkeypatch.setattr(pres, "available_engines", lambda: [])
+    with pytest.raises(pres.PresenterError):
+        pres.pick_engine("auto", has_base=False)

@@ -46,6 +46,10 @@ DEFAULT_STUDIO_ENDPOINTS = [
     "v1/video/compose/{id}/cancel",
     "v1/files/upload",
     "v1/files/blob/{hash}",
+    # The talking presenter (codai/compose/presenter.py).
+    "v1/video/talking-head",
+    "v1/video/talking-head/{id}",
+    "v1/video/presenter/engines",
 ]
 
 
