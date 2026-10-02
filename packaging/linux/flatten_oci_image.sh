@@ -123,8 +123,12 @@ def cfg(tag):
         # Deliberately stripped secrets are not a mismatch.
         "Env": sorted(e for e in (c.get("Env") or [])
                       if e.partition("=")[0] not in DROPPED),
-        "Entrypoint": c.get("Entrypoint"),
-        "Cmd": c.get("Cmd"),
+        # An EMPTY Entrypoint/Cmd and an ABSENT one are the same thing to `docker
+        # run`, and `docker import` cannot express "empty list": a base committed by
+        # the in-image upgrader carries `Cmd: []` (run_oci.sh passes --change "CMD
+        # []"), which comes back as null here and failed the check for nothing.
+        "Entrypoint": c.get("Entrypoint") or None,
+        "Cmd": c.get("Cmd") or None,
         "WorkingDir": c.get("WorkingDir") or "",
         "User": c.get("User") or "",
         "ExposedPorts": sorted((c.get("ExposedPorts") or {}).keys()),
