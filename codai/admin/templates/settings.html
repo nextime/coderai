@@ -1036,7 +1036,7 @@
 <!-- OCR (dedicated document OCR engines) -->
 <div class="card">
   <div class="card-title">OCR (document → text)</div>
-  <p class="form-hint" style="margin-bottom:.6rem">Dedicated OCR engines (detection + recognition), <b>not</b> a vision LLM — faithful text with bounding boxes and layout, batched on GPU. Serve <a href="https://github.com/PaddlePaddle/PaddleOCR" target="_blank" rel="noopener">PaddleOCR</a>, <a href="https://github.com/mindee/doctr" target="_blank" rel="noopener">docTR</a> or <a href="https://github.com/VikParuchuri/surya" target="_blank" rel="noopener">Surya</a>, selectable per request. Endpoints: <code>POST /v1/ocr</code>, <code>POST /v1/ocr/batch</code>. Heavy deps install out of band (<code>pip install -r requirements-ocr.txt</code> or <code>./build.sh … --ocr</code>); a missing engine returns HTTP 503.</p>
+  <p class="form-hint" style="margin-bottom:.6rem">Dedicated OCR engines (detection + recognition), <b>not</b> a vision LLM — faithful text with bounding boxes and layout, batched on GPU. Serve <a href="https://github.com/PaddlePaddle/PaddleOCR" target="_blank" rel="noopener">PaddleOCR</a>, <a href="https://github.com/mindee/doctr" target="_blank" rel="noopener">docTR</a> or <a href="https://github.com/VikParuchuri/surya" target="_blank" rel="noopener">Surya</a> — or <a href="https://huggingface.co/allenai/olmOCR-2-7B-1025" target="_blank" rel="noopener">olmOCR-2</a>, a document VLM, when a page beats them — selectable per request. Endpoints: <code>POST /v1/ocr</code>, <code>POST /v1/ocr/batch</code>. Heavy deps install out of band (<code>pip install -r requirements-ocr.txt</code> or <code>./build.sh … --ocr</code>); a missing engine returns HTTP 503.</p>
   <div class="form-row">
     <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
       <input type="checkbox" id="s-ocr-enabled" onchange="toggleOcrFields()">
@@ -1051,6 +1051,7 @@
           <option value="paddle">PaddleOCR</option>
           <option value="doctr">docTR</option>
           <option value="surya">Surya</option>
+          <option value="olmocr">olmOCR-2 (VLM)</option>
         </select>
       </div>
       <div class="form-group" style="flex:1;min-width:110px">
@@ -1064,6 +1065,14 @@
       <div class="form-group" style="flex:1;min-width:90px">
         <label class="form-label">Language</label>
         <input type="text" id="s-ocr-lang" class="form-input" placeholder="it">
+      </div>
+      <div class="form-group" style="flex:1;min-width:130px">
+        <label class="form-label">Retry cooldown (s)</label>
+        <input type="number" id="s-ocr-retry-cooldown" class="form-input" min="0" placeholder="60">
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">VLM engines' GPU share</label>
+        <input type="number" id="s-ocr-vlm-gmu" class="form-input" min="0" max="1" step="0.05" placeholder="0 = vLLM default">
       </div>
     </div>
 
@@ -1109,6 +1118,36 @@
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-surya-auto-build"><span>Auto-build on first use</span></label>
     </div>
     <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-sm" onclick="ocrBuildVenv('surya')">Build Surya venv now</button><span id="s-ocr-surya-build-status" class="form-hint"></span></div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">olmOCR-2 <span class="muted" style="font-weight:400">(document VLM)</span></div>
+    <p class="form-hint" style="margin:0 0 .4rem"><a href="https://huggingface.co/allenai/olmOCR-2-7B-1025" target="_blank" rel="noopener">allenai/olmOCR-2</a> (Apache-2.0) reads a whole page at once — equations as LaTeX, tables as HTML, reading order sorted — and is the one to reach for on old scans, maths and multi-column pages. It is a <b>vision model</b>, so it returns <b>no bounding boxes</b> and no layout regions: use paddle or Surya when you need those.</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-olmocr-enabled"><span>Enable</span></label>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Served by</label>
+        <select id="s-ocr-olmocr-serve" class="form-input">
+          <option value="model">coderai model (any GPU)</option>
+          <option value="vllm">coderai vLLM (CUDA)</option>
+          <option value="server">external OpenAI server</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Instances</label><input type="number" id="s-ocr-olmocr-instances" class="form-input" min="1" placeholder="1"></div>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-olmocr-retry-rotation"><span>Re-ask rotated pages</span></label>
+    </div>
+    <p class="form-hint" style="margin:0 0 .3rem"><b>coderai model</b>: register an olmOCR-2 checkpoint as a <i>vision</i> model (GGUF + mmproj, or HF) and name it below — it then gets VRAM accounting, eviction and the thermal governor like any other model, and works on Vulkan/ROCm. <b>vLLM</b> serves the HF id on its own instance (CUDA only). <b>External</b> attaches to a server already running it.</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">Model id <span class="muted">(coderai model mode)</span></label><input type="text" id="s-ocr-olmocr-model-id" class="form-input" placeholder="olmocr-2 (a vision model in models.json)"></div>
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">HF checkpoint <span class="muted">(vLLM / served name)</span></label><input type="text" id="s-ocr-olmocr-model" class="form-input" placeholder="allenai/olmOCR-2-7B-1025-FP8"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">Server URL <span class="muted">(external mode)</span></label><input type="text" id="s-ocr-olmocr-server-url" class="form-input" placeholder="http://127.0.0.1:8000/v1"></div>
+      <div class="form-group" style="flex:1;min-width:140px"><label class="form-label">API key <span class="muted">(opt)</span></label><input type="password" id="s-ocr-olmocr-api-key" class="form-input" placeholder=""></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Longest side (px)</label><input type="number" id="s-ocr-olmocr-longest-side" class="form-input" min="64" placeholder="1288"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Max tokens / page</label><input type="number" id="s-ocr-olmocr-max-tokens" class="form-input" min="64" placeholder="4096"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Temperature</label><input type="number" id="s-ocr-olmocr-temperature" class="form-input" min="0" max="2" step="0.1" placeholder="0.1"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Timeout (s)</label><input type="number" id="s-ocr-olmocr-timeout" class="form-input" min="1" placeholder="300"></div>
+    </div>
 
     <div class="card-title" style="font-size:13px;margin-top:.4rem">Stamp / signature detection</div>
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
@@ -1963,6 +2002,8 @@ async function loadSettings(){
     document.getElementById('s-ocr-dpi').value = ocr.dpi ?? 200;
     document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 4;
     document.getElementById('s-ocr-lang').value = ocr.lang ?? 'it';
+    document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
+    document.getElementById('s-ocr-vlm-gmu').value = ocr.vlm_gpu_memory_utilization ?? 0;
     document.getElementById('s-ocr-paddle-enabled').checked = ocr.paddle_enabled !== false;
     document.getElementById('s-ocr-paddle-use-gpu').checked = ocr.paddle_use_gpu !== false;
     document.getElementById('s-ocr-paddle-structure').checked = ocr.paddle_structure !== false;
@@ -1983,6 +2024,18 @@ async function loadSettings(){
     document.getElementById('s-ocr-surya-langs').value = ocr.surya_langs ?? 'it';
     document.getElementById('s-ocr-surya-venv').value = ocr.surya_venv ?? '';
     document.getElementById('s-ocr-surya-auto-build').checked = !!ocr.surya_auto_build;
+    document.getElementById('s-ocr-olmocr-enabled').checked = !!ocr.olmocr_enabled;
+    document.getElementById('s-ocr-olmocr-serve').value = ocr.olmocr_serve ?? 'model';
+    document.getElementById('s-ocr-olmocr-instances').value = ocr.olmocr_instances ?? 1;
+    document.getElementById('s-ocr-olmocr-retry-rotation').checked = ocr.olmocr_retry_rotation !== false;
+    document.getElementById('s-ocr-olmocr-model-id').value = ocr.olmocr_model_id ?? '';
+    document.getElementById('s-ocr-olmocr-model').value = ocr.olmocr_model ?? '';
+    document.getElementById('s-ocr-olmocr-server-url').value = ocr.olmocr_server_url ?? '';
+    document.getElementById('s-ocr-olmocr-api-key').value = ocr.olmocr_api_key ?? '';
+    document.getElementById('s-ocr-olmocr-longest-side').value = ocr.olmocr_longest_side ?? 1288;
+    document.getElementById('s-ocr-olmocr-max-tokens').value = ocr.olmocr_max_tokens ?? 4096;
+    document.getElementById('s-ocr-olmocr-temperature').value = ocr.olmocr_temperature ?? 0.1;
+    document.getElementById('s-ocr-olmocr-timeout').value = ocr.olmocr_timeout ?? 300;
     document.getElementById('s-ocr-detect-mode').value = ocr.detect_mode ?? 'off';
     document.getElementById('s-ocr-detect-model').value = ocr.detect_model_path ?? '';
     document.getElementById('s-ocr-detect-conf').value = ocr.detect_conf ?? 0.35;
@@ -2176,6 +2229,8 @@ async function saveSettings(silent){
       dpi: parseInt(document.getElementById('s-ocr-dpi').value) || 200,
       max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 4,
       lang: document.getElementById('s-ocr-lang').value.trim() || 'it',
+      build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
+      vlm_gpu_memory_utilization: parseFloat(document.getElementById('s-ocr-vlm-gmu').value) || 0,
       paddle_enabled: document.getElementById('s-ocr-paddle-enabled').checked,
       paddle_use_gpu: document.getElementById('s-ocr-paddle-use-gpu').checked,
       paddle_structure: document.getElementById('s-ocr-paddle-structure').checked,
@@ -2196,6 +2251,18 @@ async function saveSettings(silent){
       surya_langs: document.getElementById('s-ocr-surya-langs').value.trim() || 'it',
       surya_venv: document.getElementById('s-ocr-surya-venv').value.trim(),
       surya_auto_build: document.getElementById('s-ocr-surya-auto-build').checked,
+      olmocr_enabled: document.getElementById('s-ocr-olmocr-enabled').checked,
+      olmocr_serve: document.getElementById('s-ocr-olmocr-serve').value || 'model',
+      olmocr_instances: parseInt(document.getElementById('s-ocr-olmocr-instances').value) || 1,
+      olmocr_retry_rotation: document.getElementById('s-ocr-olmocr-retry-rotation').checked,
+      olmocr_model_id: document.getElementById('s-ocr-olmocr-model-id').value.trim(),
+      olmocr_model: document.getElementById('s-ocr-olmocr-model').value.trim(),
+      olmocr_server_url: document.getElementById('s-ocr-olmocr-server-url').value.trim(),
+      olmocr_api_key: document.getElementById('s-ocr-olmocr-api-key').value.trim(),
+      olmocr_longest_side: parseInt(document.getElementById('s-ocr-olmocr-longest-side').value) || 1288,
+      olmocr_max_tokens: parseInt(document.getElementById('s-ocr-olmocr-max-tokens').value) || 4096,
+      olmocr_temperature: parseFloat(document.getElementById('s-ocr-olmocr-temperature').value) || 0.1,
+      olmocr_timeout: parseFloat(document.getElementById('s-ocr-olmocr-timeout').value) || 300,
       detect_mode: document.getElementById('s-ocr-detect-mode').value || 'off',
       detect_model_path: document.getElementById('s-ocr-detect-model').value.trim(),
       detect_conf: parseFloat(document.getElementById('s-ocr-detect-conf').value) || 0.35,

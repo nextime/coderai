@@ -76,7 +76,7 @@ class ModelCapabilities:
 
     # Retrieval / document
     reranking: bool = False             # cross-encoder query↔document reranking (bge-reranker, …)
-    ocr: bool = False                   # optical character recognition (paddle/doctr/surya)
+    ocr: bool = False                   # optical character recognition (paddle/doctr/surya/olmocr)
 
     def to_list(self) -> List[str]:
         out = []

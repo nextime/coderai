@@ -275,13 +275,17 @@ registered in the embedding model category.
 
 ### Document OCR
 
-A dedicated OCR subsystem (`/v1/ocr`) — real OCR engines, **not** a VLM prompted to read:
+A dedicated OCR subsystem (`/v1/ocr`) — real OCR engines, **not** a VLM prompted to read,
+plus one purpose-trained document VLM for the pages they struggle with:
 
 - **Engines**: `doctr` (in-process), `paddle` (PaddleOCR + PP-Structure layout/tables, isolated
-  venv) and `surya` (opt-in, GPL; local, vLLM-served Surya-2, or an external llama-server)
+  venv), `surya` (opt-in, GPL; local, vLLM-served Surya-2, or an external llama-server) and
+  `olmocr` ([olmOCR-2](https://huggingface.co/allenai/olmOCR-2-7B-1025), Apache-2.0 — best
+  on old scans, maths and multi-column pages; served by one of your own models, coderai's
+  vLLM, or any OpenAI endpoint. Returns no bounding boxes.)
 - **Input**: images or PDFs (rasterised at a configurable DPI), single or batch
 - **Output**: full text plus per-page `lines[]` with bounding boxes and confidence,
-  `regions[]` (layout) and `tables[]`
+  `regions[]` (layout), `tables[]`, and `meta` where the engine reports page metadata
 - **Structured extraction**: `structured=true` runs a text model against a **schema** —
   a JSON document, not code — to return typed fields. Schemas are data-driven and stored in
   `<config>/ocr_schemas/`; built-ins cover `italian_sentenza`, `generic_document` and an
@@ -1168,7 +1172,9 @@ its hardware — running models that otherwise simply couldn't run on a single G
 - **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)** (Baidu),
   **[docTR](https://github.com/mindee/doctr)** (Mindee) and
   **[Surya](https://github.com/VikParuchuri/surya)** — the dedicated OCR engines behind
-  the `/v1/ocr` document-transcription subsystem (text + layout + structured extraction).
+  the `/v1/ocr` document-transcription subsystem (text + layout + structured extraction),
+  and **[olmOCR-2](https://huggingface.co/allenai/olmOCR-2-7B-1025)** (AllenAI) — the
+  document VLM option on the same endpoint.
 
 And the libraries, models and research CoderAI builds on:
 

@@ -50,6 +50,38 @@ class SuryaEngine(SubprocessOcrEngine):
             return {}
         return {"SURYA_INFERENCE_BACKEND": mode, "SURYA_INFERENCE_URL": url}
 
+    def prelaunch_vram_gb(self) -> float:
+        """In the served modes Surya rides a vLLM instance that grabs
+        gpu_memory_utilization × the whole card before it will start, so that much has to
+        be free FIRST. (A 3090 with 11.3 GB free against a 14.1 GB demand crash-looped
+        Surya-2 for hours: vLLM died on startup, the next OCR request tried again.)"""
+        if self._serve_mode() != "vllm":
+            return 0.0
+        try:
+            from codai.api.vllm_worker import planned_vram_gb
+            from codai.models.manager import get_active_vllm_config
+            vcfg = get_active_vllm_config()
+            return planned_vram_gb(vcfg, self._vlm_gmu()) if vcfg is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def _vlm_gmu(self):
+        """The OCR-side share of the card for this engine's vLLM (0/None = the backend's)."""
+        try:
+            v = float(getattr(self.cfg, "vlm_gpu_memory_utilization", 0.0) or 0.0)
+        except Exception:
+            v = 0.0
+        return v or None
+
+    def vram_gb(self) -> float:
+        """Per-instance footprint, for post-load eviction accounting and release reports.
+
+        In the served modes a worker only speaks HTTP to the shared vLLM — its own VRAM is
+        nil, and the instance's real cost is reported once through
+        :meth:`prelaunch_vram_gb` / the vLLM stop estimate. Counting a whole GB per
+        instance here asked to free 24 GB on a 24-instance pool."""
+        return 0.05 if self._serve_mode() in ("vllm", "llamacpp") else 1.0
+
     def load(self) -> None:
         if not self.cfg.surya_accept_license:
             raise OcrError(
@@ -67,7 +99,8 @@ class SuryaEngine(SubprocessOcrEngine):
             if vcfg is None:
                 raise OcrError("Surya vllm mode needs the vLLM backend configured", status=400)
             model = (getattr(self.cfg, "surya_model", "") or "datalab-to/surya-ocr-2").strip()
-            base = vllm_worker.ensure_service(vcfg, model_path=model, served_name=model)
+            base = vllm_worker.ensure_service(vcfg, model_path=model, served_name=model,
+                                              gpu_memory_utilization=self._vlm_gmu())
             self._server_url = base.rstrip("/") + "/v1"
         elif mode == "llamacpp":
             url = (getattr(self.cfg, "surya_server_url", "") or "").strip()

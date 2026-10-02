@@ -106,7 +106,7 @@ def _find(data: dict, model: str):
 #: catalogue to pin. A temporary entry gives them the same per-model placement —
 #: the alternative was moving the whole OCR capability, which is a production
 #: routing switch.
-_OCR_ENGINES = ("paddle", "doctr", "surya")
+_OCR_ENGINES = ("paddle", "doctr", "surya", "olmocr")
 
 
 def _pin_to_runpod(model: str, engine: str, vram: float, usd: float,

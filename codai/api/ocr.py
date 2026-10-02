@@ -18,7 +18,8 @@
 
 POST /v1/ocr — OCR an uploaded image or PDF with a purpose-built OCR engine
 (PaddleOCR / docTR / Surya), returning faithful text plus per-line boxes and layout.
-NOT a vision LLM. Structured-JSON extraction and stamp/signature detection are layered
+Those three are NOT vision LLMs; ``engine=olmocr`` additionally offers olmOCR-2, a
+document VLM for pages the detector-based engines read badly (it returns no boxes). Structured-JSON extraction and stamp/signature detection are layered
 on in later milestones (fields already accepted, no-op until then).
 """
 
@@ -60,7 +61,7 @@ def _ocr_config():
 @router.post("/v1/ocr", summary="OCR an image or PDF with a dedicated OCR engine")
 async def create_ocr(
     file: UploadFile = File(...),
-    engine: Optional[str] = Form(None),        # paddle|doctr|surya (default from config)
+    engine: Optional[str] = Form(None),        # paddle|doctr|surya|olmocr (default from config)
     dpi: Optional[int] = Form(None),           # PDF rasterisation DPI
     lang: Optional[str] = Form(None),          # reserved (per-engine language override)
     structured: Optional[bool] = Form(False),  # structured JSON extraction via text model

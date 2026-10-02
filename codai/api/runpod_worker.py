@@ -871,7 +871,7 @@ def pod_ocr_engine(requested: str) -> str:
     request asks for over its configured default.
     """
     r = (requested or "").strip().lower()
-    if r == "surya":
+    if r in ("surya", "olmocr"):
         return "doctr"
     return r if r in ("paddle", "doctr") else "doctr"
 
@@ -962,23 +962,25 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
         wanted = str((entry or {}).get("path") or "").strip().lower()
-        if wanted == "surya":
-            # Surya 0.22 is a VLM ("surya-ocr-2"), not a self-contained OCR
-            # library: it needs a server — vLLM, which it spawns IN DOCKER (a
-            # pod cannot), or llama-server on a GGUF, which the image does not
-            # ship. Locally it rides coderai's own vLLM engine; a pod has none.
-            # So a pod asked for surya serves the request with docTR, which is
-            # in the image and has passed — rather than loading surya, reaching
-            # inference, and dying on "docker binary not found".
-            print("[runpod] surya on a pod needs a VLM server the image does not "
+        if wanted in ("surya", "olmocr"):
+            # Surya 0.22 is a VLM ("surya-ocr-2") and olmOCR-2 is one outright,
+            # not a self-contained OCR library: both need a server — vLLM, which
+            # surya spawns IN DOCKER (a pod cannot), or llama-server on a GGUF,
+            # which the image does not ship. Locally they ride coderai's own vLLM
+            # engine; a pod has none. So a pod asked for either serves the request
+            # with docTR, which is in the image and has passed — rather than
+            # loading it, reaching inference, and dying on "docker binary not
+            # found". (An olmOCR pod would want olmocr_serve="server" pointed at a
+            # model server it can actually reach; nothing provisions one here.)
+            print(f"[runpod] {wanted} on a pod needs a VLM server the image does not "
                   "carry — this OCR request will be served by docTR", flush=True)
             wanted = "doctr"
-        if wanted not in ("paddle", "doctr", "surya"):
+        if wanted not in ("paddle", "doctr", "surya", "olmocr"):
             # The pod images ship docTR, the only engine that runs in-process.
             wanted = "doctr"
         env["CODERAI_OCR_DEFAULT_ENGINE"] = wanted
         # The subsystem flag is not enough: each engine has a gate of its own,
-        # and doctr and surya both default to off.
+        # and all but paddle default to off.
         env[f"CODERAI_OCR_{wanted.upper()}_ENABLED"] = "1"
         if wanted == "paddle":
             # The paddle image bakes it, because paddlepaddle brings its own

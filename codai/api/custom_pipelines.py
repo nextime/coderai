@@ -138,7 +138,7 @@ STEP_PARAMS = {
     "audio_cleanup":  [("audio","ref","Source audio"),("noise_reduction","checkbox","Reduce background noise"),("normalize","checkbox","Normalize levels"),("remove_hum","checkbox","Remove hum"),("repair_clicks","checkbox","Repair clicks")],
     "voice_clone":    [("text","textarea","Text to synthesize"),("voice_name","text","Voice profile name"),("ref_text","text","Reference transcript"),("speed","number","Speed","1.0")],
     "voice_convert":  [("source_audio","ref","Source audio"),("voice_name","text","Voice profile name"),("f0_condition","checkbox","Singing mode"),("pitch_shift","number","Pitch shift","0"),("diffusion_steps","number","Steps","10")],
-    "ocr":            [("image","ref","Document image/PDF ({{stepN.url}})"),("engine","select:paddle|doctr|surya","OCR engine","paddle"),("detect","select:off|layout|detector|both","Stamp/signature detect","off"),("structured","checkbox","Structured JSON extraction")],
+    "ocr":            [("image","ref","Document image/PDF ({{stepN.url}})"),("engine","select:paddle|doctr|surya|olmocr","OCR engine","paddle"),("detect","select:off|layout|detector|both","Stamp/signature detect","off"),("structured","checkbox","Structured JSON extraction")],
 }
 
 

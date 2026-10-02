@@ -1,18 +1,26 @@
 # OCR subsystem (dedicated OCR engines)
 
 CoderAI OCRs documents with **purpose-built OCR engines** (detection + recognition) —
-**not** a vision LLM. That means faithful transcription with per-line bounding boxes and
-layout, GPU batching, and no hallucinated text. Three engines are integrated and
-selectable per request:
+faithful transcription with per-line bounding boxes and layout, GPU batching, no
+hallucinated text — and, for the pages those read badly, one **document VLM**. Four
+engines are integrated and selectable per request:
 
 | engine | id | license | how it runs |
 |---|---|---|---|
 | [docTR](https://github.com/mindee/doctr) | `doctr` | Apache-2.0 | **in-process** (uses the main venv's torch); works on GPU. Recommended on new-CUDA boxes. |
 | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) + PP-Structure | `paddle` | Apache-2.0 | **isolated venv subprocess** (layout + tables) |
 | [Surya](https://github.com/VikParuchuri/surya) | `surya` | GPL (compatible with coderai's GPLv3) | **isolated venv subprocess**; best layout/reading-order; opt-in |
+| [olmOCR-2](https://huggingface.co/allenai/olmOCR-2-7B-1025) | `olmocr` | Apache-2.0 | **a document VLM**, served by a coderai model, coderai's vLLM, or any OpenAI endpoint. **No bounding boxes.** |
 
 Per document you get three outputs: **plain text**, **structured JSON fields**, and
 **stamp/signature flags**.
+
+**Which one?** `paddle`/`doctr`/`surya` give you boxes, layout regions and tables, which
+is what you want when something downstream has to point at a place on the page (redaction,
+stamp detection, a table's cells). `olmocr` gives you the best *reading* of a hard page —
+old scans, maths, multi-column, dense tables — and nothing positional. Stamp/signature
+detection in `layout` mode has nothing to work with under `olmocr`; `detector` mode (YOLO)
+still works, because it looks at the image, not the engine's output.
 
 ## Why isolated venvs for Paddle & Surya
 
@@ -70,10 +78,73 @@ on first use. In the OCI image these venvs are **baked in** at `/opt/coderai/pad
 self-contained; the engines prefer a baked venv, then `~/.coderai/<name>_venv`, then the
 config path. Surya loads only when `surya_accept_license` is set.
 
+## olmOCR-2 (`olmocr`) — the document VLM
+
+[olmOCR-2](https://huggingface.co/allenai/olmOCR-2-7B-1025) is AllenAI's Qwen2.5-VL-7B
+fine-tune for document transcription (Apache-2.0, 82.4 on olmOCR-bench). It reads a whole
+page at once and answers in its trained format: a YAML front matter block followed by the
+page as markdown, with equations as LaTeX and tables as HTML. coderai sends olmOCR's own
+"no-anchoring v4" prompt verbatim — paraphrasing it costs accuracy — renders the page at
+`olmocr_longest_side` (1288 px, what it was trained on), parses the front matter into the
+page's `meta`, and strips it from `text`. When the model reports the page rotated, coderai
+turns it and asks once more (`olmocr_retry_rotation`), which is what the olmOCR pipeline
+itself does.
+
+Three ways to serve it (`ocr.olmocr_serve`):
+
+| mode | what it means | needs |
+|---|---|---|
+| `model` (default) | the checkpoint is a **vision model in your models.json** and olmOCR goes through coderai's own model manager — VRAM accounting, eviction, quantisation and the thermal governor included. The only mode that works **without CUDA** (GGUF + mmproj on llama.cpp over Vulkan/ROCm). | `olmocr_model_id` |
+| `vllm` | coderai's vLLM backend serves `olmocr_model` on its own instance (continuous batching). CUDA only. | the vLLM backend configured |
+| `server` | attach to an OpenAI-compatible server already running it: `llama-server`, a remote vLLM, another coderai. | `olmocr_server_url` (+ `olmocr_api_key` if it wants one) |
+
+Fields: `olmocr_enabled`, `olmocr_serve`, `olmocr_model_id`, `olmocr_model`
+(default `allenai/olmOCR-2-7B-1025-FP8`), `olmocr_server_url`, `olmocr_api_key`,
+`olmocr_instances` (pages in flight), `olmocr_longest_side`, `olmocr_max_tokens`,
+`olmocr_temperature`, `olmocr_timeout`, `olmocr_retry_rotation`.
+
+```bash
+curl -F file=@scansione-1974.pdf -F engine=olmocr http://localhost:8776/v1/ocr
+```
+
+Each page's `meta` carries what the model reported: `primary_language`,
+`is_rotation_valid`, `rotation_correction`, `is_table`, `is_diagram` (plus
+`rotation_applied` when coderai re-asked a turned page). Engines that report no metadata
+omit the field entirely, so nothing else in the response shape changed.
+
+**A pod cannot serve it.** Like Surya-2, olmOCR needs a model server the RunPod OCR images
+do not carry, so a pod asked for `olmocr` serves the request with docTR and says so in the
+log. Point `olmocr_serve: "server"` at something the pod can reach if you want the real
+thing out there.
+
+## When an engine's server will not start
+
+The VLM engines (`surya` in `vllm` mode, `olmocr` in `vllm` mode) boot a vLLM instance
+that claims `gpu_memory_utilization` × the **whole card** before it will serve, and
+refuses to start when that much is not free. Two rules follow, both enforced by the pool:
+
+- **Room is made before the load, not after it.** The engine declares what it needs up
+  front (`prelaunch_vram_gb`) and the model manager evicts for it first. Evicting
+  afterwards is useless, because the load is what fails.
+- **A failed build is not retried on every request.** For `ocr.build_retry_cooldown_s`
+  (default 60 s) that engine fails fast with the reason the boot gave, instead of spending
+  ~35 s booting and dying again per request. Without this, a card 11 GB short of Surya-2's
+  demand produced 338 consecutive failed boots in one morning, each one a half-minute hang
+  for the caller.
+
+If you see `Free memory on device cuda:0 … is less than desired GPU memory utilization`,
+set **`ocr.vlm_gpu_memory_utilization`** (Settings → OCR → "VLM engines' GPU share"): the
+OCR VLM gets its own share of the card instead of the one `vllm.gpu_memory_utilization`
+asks for on behalf of an LLM — 0.35 is plenty for a 7B page model, where the LLM default
+of 0.9 (or 0.6) can be more than the card has left. Otherwise: give the card less other
+resident work, or serve the engine with `model`/`server` mode, which needs no instance of
+its own at all.
+
 ## Enable & configure
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,
-`default_engine`, `dpi`, `max_concurrency`, `lang`; per-engine `*_enabled` /
+`default_engine`, `dpi`, `max_concurrency`, `lang`, `build_retry_cooldown_s`,
+`vlm_gpu_memory_utilization`; per-engine `*_enabled` /
 `*_instances` / `*_use_gpu` / lang; `detect_mode` (+ `detect_model_path`, `detect_conf`);
 `extract_enabled` / `extract_model_id` / `extract_schema` / `extract_validate`.
 
@@ -92,7 +163,8 @@ GET/POST/DELETE /v1/ocr/schemas[/{name}]   manage extraction schemas
 ```
 
 Response: `{engine, num_pages, text, pages[], stamps[], signatures[], structured}`. Each
-page carries `lines[]` (text + bbox + conf), `regions[]` (layout), and `tables[]`. The
+page carries `lines[]` (text + bbox + conf), `regions[]` (layout), `tables[]`, and
+`meta` when the engine reports page metadata (olmOCR does; the others do not). The
 `ocr` **pipeline step type** chains OCR with `text_gen` in custom pipelines.
 
 ```bash

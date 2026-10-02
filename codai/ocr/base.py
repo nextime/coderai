@@ -16,7 +16,7 @@
 
 """OCR engine interface + shared result types + input loading.
 
-Every OCR engine (PaddleOCR, docTR, Surya) subclasses :class:`OcrEngine` and returns
+Every OCR engine (PaddleOCR, docTR, Surya, olmOCR-2) subclasses :class:`OcrEngine` and returns
 :class:`OcrPage` objects. The rest of the subsystem (manager, API, detection,
 extraction) speaks only these types, so engines stay interchangeable.
 """
@@ -78,9 +78,13 @@ class OcrPage:
     lines: List[OcrLine] = field(default_factory=list)
     regions: List[OcrRegion] = field(default_factory=list)
     tables: List[Any] = field(default_factory=list)     # list of {bbox, html?, cells?}
+    #: Engine-reported page metadata, when the engine has any (olmOCR's front matter:
+    #: primary_language, is_rotation_valid, rotation_correction, is_table, is_diagram).
+    #: Omitted from the response when empty, so engines that report none are unchanged.
+    meta: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "index": self.index,
             "text": self.text,
             "width": self.width,
@@ -89,6 +93,9 @@ class OcrPage:
             "regions": [r.to_dict() for r in self.regions],
             "tables": self.tables,
         }
+        if self.meta:
+            out["meta"] = self.meta
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +137,22 @@ class OcrEngine(ABC):
     def vram_gb(self) -> float:
         """Rough VRAM footprint (GB) of one loaded instance, for eviction accounting."""
         return 1.0
+
+    def prelaunch_vram_gb(self) -> float:
+        """VRAM (GB) that must be FREE before :meth:`load` is even attempted.
+
+        Zero for engines that load weights into whatever room is left (paddle/docTR) —
+        they are evicted for after the fact, once their real footprint is known. Non-zero
+        for the ones that boot a server which claims a fixed share of the card up front
+        and refuses to start otherwise (the VLM engines on vLLM): for those, evicting
+        after the load attempt is too late, because the load attempt is what fails.
+
+        This is the total for the WHOLE POOL, not per instance: the engines that declare
+        it share one server between all their instances, so the pool asks for it once. (A
+        pool of 24 surya workers multiplied per instance would have asked for 200 GB.)
+        An engine that declares it is NOT also evicted for by :meth:`vram_gb` after the
+        load — the room has already been made."""
+        return 0.0
 
 
 # ---------------------------------------------------------------------------

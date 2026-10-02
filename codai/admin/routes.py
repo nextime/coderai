@@ -3870,6 +3870,20 @@ def build_settings_dict(c, gpu_cards):
             "surya_serve": c.ocr.surya_serve,
             "surya_model": c.ocr.surya_model,
             "surya_server_url": c.ocr.surya_server_url,
+            "build_retry_cooldown_s": c.ocr.build_retry_cooldown_s,
+            "vlm_gpu_memory_utilization": c.ocr.vlm_gpu_memory_utilization,
+            "olmocr_enabled": c.ocr.olmocr_enabled,
+            "olmocr_instances": c.ocr.olmocr_instances,
+            "olmocr_serve": c.ocr.olmocr_serve,
+            "olmocr_model_id": c.ocr.olmocr_model_id,
+            "olmocr_model": c.ocr.olmocr_model,
+            "olmocr_server_url": c.ocr.olmocr_server_url,
+            "olmocr_api_key": c.ocr.olmocr_api_key,
+            "olmocr_longest_side": c.ocr.olmocr_longest_side,
+            "olmocr_max_tokens": c.ocr.olmocr_max_tokens,
+            "olmocr_temperature": c.ocr.olmocr_temperature,
+            "olmocr_timeout": c.ocr.olmocr_timeout,
+            "olmocr_retry_rotation": c.ocr.olmocr_retry_rotation,
             "detect_mode": c.ocr.detect_mode,
             "detect_model_path": c.ocr.detect_model_path,
             "detect_conf": c.ocr.detect_conf,
@@ -4549,6 +4563,13 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             except (TypeError, ValueError):
                 return cur
 
+        def _f(key, cur, lo=None):
+            try:
+                v = float(d.get(key, cur))
+                return max(lo, v) if lo is not None else v
+            except (TypeError, ValueError):
+                return cur
+
         if "enabled" in d: o.enabled = bool(d["enabled"])
         if "default_engine" in d: o.default_engine = (d.get("default_engine") or "paddle").strip()
         if "dpi" in d: o.dpi = _i("dpi", o.dpi, 36)
@@ -4580,6 +4601,20 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_serve" in d: o.surya_serve = (d.get("surya_serve") or "local").strip()
         if "surya_model" in d: o.surya_model = (d.get("surya_model") or "").strip()
         if "surya_server_url" in d: o.surya_server_url = (d.get("surya_server_url") or "").strip()
+        if "build_retry_cooldown_s" in d: o.build_retry_cooldown_s = _f("build_retry_cooldown_s", o.build_retry_cooldown_s, 0.0)
+        if "vlm_gpu_memory_utilization" in d: o.vlm_gpu_memory_utilization = _f("vlm_gpu_memory_utilization", o.vlm_gpu_memory_utilization, 0.0)
+        if "olmocr_enabled" in d: o.olmocr_enabled = bool(d["olmocr_enabled"])
+        if "olmocr_instances" in d: o.olmocr_instances = _i("olmocr_instances", o.olmocr_instances, 1)
+        if "olmocr_serve" in d: o.olmocr_serve = (d.get("olmocr_serve") or "model").strip().lower()
+        if "olmocr_model_id" in d: o.olmocr_model_id = (d.get("olmocr_model_id") or "").strip()
+        if "olmocr_model" in d: o.olmocr_model = (d.get("olmocr_model") or "").strip()
+        if "olmocr_server_url" in d: o.olmocr_server_url = (d.get("olmocr_server_url") or "").strip()
+        if "olmocr_api_key" in d: o.olmocr_api_key = (d.get("olmocr_api_key") or "").strip()
+        if "olmocr_longest_side" in d: o.olmocr_longest_side = _i("olmocr_longest_side", o.olmocr_longest_side, 64)
+        if "olmocr_max_tokens" in d: o.olmocr_max_tokens = _i("olmocr_max_tokens", o.olmocr_max_tokens, 64)
+        if "olmocr_temperature" in d: o.olmocr_temperature = _f("olmocr_temperature", o.olmocr_temperature, 0.0)
+        if "olmocr_timeout" in d: o.olmocr_timeout = _f("olmocr_timeout", o.olmocr_timeout, 1.0)
+        if "olmocr_retry_rotation" in d: o.olmocr_retry_rotation = bool(d["olmocr_retry_rotation"])
         # detection
         if "detect_mode" in d: o.detect_mode = (d.get("detect_mode") or "off").strip()
         if "detect_model_path" in d: o.detect_model_path = (d.get("detect_model_path") or "").strip()

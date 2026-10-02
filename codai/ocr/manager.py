@@ -16,6 +16,10 @@
 
 """OCR engine manager — per-engine instance pools for concurrent GPU OCR.
 
+An "instance" is one loaded engine; for the VLM engine (olmOCR) it is one in-flight
+request against the serving model, so the pool size still bounds that engine's
+concurrency.
+
 Each engine is loaded as N resident instances (``*_instances`` in
 :class:`~codai.config.OcrConfig`); pages are fanned across the pool so many documents
 OCR concurrently on one GPU. An engine instance handles one page at a time (OCR runtimes
@@ -24,6 +28,7 @@ bounds the whole subsystem.
 """
 
 import asyncio
+import time
 from typing import Dict, List, Optional
 
 from codai.ocr.base import OcrEngine, OcrPage, OcrError, load_pages
@@ -46,10 +51,16 @@ def _surya_factory(cfg):
     return SuryaEngine(cfg)
 
 
+def _olmocr_factory(cfg):
+    from codai.ocr.olmocr import OlmOcrEngine
+    return OlmOcrEngine(cfg)
+
+
 _ENGINE_FACTORIES = {
     "paddle": _paddle_factory,
     "doctr": _doctr_factory,
     "surya": _surya_factory,
+    "olmocr": _olmocr_factory,
 }
 
 
@@ -60,6 +71,8 @@ def _engine_enabled(cfg, name: str) -> bool:
         return bool(cfg.doctr_enabled)
     if name == "surya":
         return bool(cfg.surya_enabled and cfg.surya_accept_license)
+    if name == "olmocr":
+        return bool(getattr(cfg, "olmocr_enabled", False))
     return False
 
 
@@ -106,6 +119,14 @@ class _Pool:
         self._instances = []          # every created instance (for release_sync)
         self._built = False
         self._build_lock = asyncio.Lock()
+        self._fail_at = 0.0           # when the last build attempt failed
+        self._fail_err = None         # and why (re-raised during the cooldown)
+
+    def _cooldown_s(self) -> float:
+        try:
+            return max(0.0, float(getattr(self.cfg, "build_retry_cooldown_s", 60.0)))
+        except Exception:
+            return 60.0
 
     async def _ensure_built(self):
         if self._built:
@@ -113,19 +134,53 @@ class _Pool:
         async with self._build_lock:
             if self._built:
                 return
+            # A build that just failed is very unlikely to succeed on the next request a
+            # second later, and retrying is not free: a vLLM-backed engine spends ~35 s
+            # booting before it dies. Surya-2 did that 338 times in a row against a card
+            # that was 11 GB short — every one of those requests hung for half a minute
+            # and then failed anyway. Inside the cooldown, fail FAST with the same reason.
+            if self._fail_err is not None and (time.time() - self._fail_at) < self._cooldown_s():
+                left = int(self._cooldown_s() - (time.time() - self._fail_at))
+                raise OcrError(
+                    f"{self._fail_err} (retrying in {left}s — last attempt failed; "
+                    f"OCR engine '{self.name}' is in its build cooldown)",
+                    status=getattr(self._fail_err, "status", 503))
             factory = _ENGINE_FACTORIES[self.name]
             self._instances = []
-            for _ in range(self.size):
-                eng = factory(self.cfg)
-                # Load the first instance synchronously-in-thread so a missing
-                # dependency surfaces as OcrError(503) before we spawn the rest.
-                await asyncio.to_thread(eng.ensure_loaded)
-                # First instance: evict other models to make room (VRAM eviction), now
-                # that we know its real footprint. Mirrors the engine-load path.
-                if not self._instances:
-                    await asyncio.to_thread(_evict_for_ocr, self.size * eng.vram_gb())
-                self._instances.append(eng)
-                await self._q.put(eng)
+            try:
+                for _ in range(self.size):
+                    eng = factory(self.cfg)
+                    first = not self._instances
+                    need = 0.0
+                    if first:
+                        # Engines that boot a server claiming a fixed share of the card
+                        # (the VLM engines on vLLM) must have the room BEFORE they load —
+                        # the load is what fails otherwise. The figure covers the whole
+                        # pool, because those instances share one server.
+                        try:
+                            need = float(eng.prelaunch_vram_gb() or 0.0)
+                        except Exception:
+                            need = 0.0
+                        if need > 0:
+                            await asyncio.to_thread(_evict_for_ocr, need)
+                    # Load the first instance synchronously-in-thread so a missing
+                    # dependency surfaces as OcrError(503) before we spawn the rest.
+                    await asyncio.to_thread(eng.ensure_loaded)
+                    # First instance of an engine that did NOT reserve up front: evict for
+                    # its real footprint now that we know it (paddle/docTR), per instance.
+                    # Reserving again here would evict live models for memory the engine's
+                    # server has already taken.
+                    if first and need <= 0:
+                        await asyncio.to_thread(_evict_for_ocr, self.size * eng.vram_gb())
+                    self._instances.append(eng)
+                    await self._q.put(eng)
+            except Exception as e:
+                self.release_sync()
+                self._fail_at = time.time()
+                self._fail_err = e if isinstance(e, OcrError) else OcrError(
+                    f"OCR engine '{self.name}' failed to load: {e}", status=503)
+                raise self._fail_err
+            self._fail_err = None
             self._built = True
             print(f"[ocr] engine '{self.name}': {self.size} instance(s) ready")
 
@@ -153,6 +208,13 @@ class _Pool:
         await self._ensure_built()
         eng: OcrEngine = await self._q.get()
         try:
+            # Engines that call back into coderai's async API (olmOCR 'model' mode) run
+            # in a worker thread and need a live loop to hand the coroutine to; give them
+            # the app's own rather than letting them spin up a second one.
+            try:
+                eng._host_loop = asyncio.get_running_loop()
+            except Exception:
+                pass
             return await asyncio.to_thread(eng.recognize_image, image)
         finally:
             await self._q.put(eng)
@@ -212,6 +274,7 @@ class OcrManager:
         # above — it must be stopped explicitly. Do it here so on-request eviction can
         # reclaim it; the next OCR request re-boots it via ensure_service.
         freed += self._stop_surya_vllm()
+        freed += self._stop_olmocr_vllm()
         if freed:
             print(f"[ocr] released ~{freed:.1f} GB (pools + Surya vLLM torn down for VRAM eviction)")
         return freed
@@ -229,9 +292,32 @@ class OcrManager:
             if vcfg is None:
                 return 0.0
             model = (getattr(cfg, "surya_model", "") or "datalab-to/surya-ocr-2").strip()
-            return vllm_worker.stop_service_for(vcfg, model_path=model, served_name=model)
+            return vllm_worker.stop_service_for(
+                vcfg, model_path=model, served_name=model,
+                gpu_memory_utilization=float(getattr(cfg, "vlm_gpu_memory_utilization", 0.0) or 0.0) or None)
         except Exception as e:
             print(f"[ocr] Surya vLLM stop skipped: {e}")
+            return 0.0
+
+    def _stop_olmocr_vllm(self) -> float:
+        """Stop the managed olmOCR vLLM instance (olmocr_serve = "vllm"), for the same
+        reason Surya's needs stopping: its VRAM is the subprocess's, not a pool's."""
+        cfg = self._cfg
+        if cfg is None or (getattr(cfg, "olmocr_serve", "") or "").strip().lower() != "vllm":
+            return 0.0
+        try:
+            from codai.api import vllm_worker
+            from codai.models.manager import get_active_vllm_config
+            from codai.ocr.olmocr import DEFAULT_MODEL
+            vcfg = get_active_vllm_config()
+            if vcfg is None:
+                return 0.0
+            model = (getattr(cfg, "olmocr_model", "") or DEFAULT_MODEL).strip()
+            return vllm_worker.stop_service_for(
+                vcfg, model_path=model, served_name=model,
+                gpu_memory_utilization=float(getattr(cfg, "vlm_gpu_memory_utilization", 0.0) or 0.0) or None)
+        except Exception as e:
+            print(f"[ocr] olmOCR vLLM stop skipped: {e}")
             return 0.0
 
     @staticmethod
@@ -246,6 +332,11 @@ class OcrManager:
             cfg.doctr_det_arch, cfg.doctr_reco_arch,
             cfg.surya_enabled, cfg.surya_accept_license, cfg.surya_instances,
             cfg.surya_langs, cfg.surya_venv, cfg.surya_auto_build,
+            getattr(cfg, "olmocr_enabled", False), getattr(cfg, "olmocr_instances", 1),
+            getattr(cfg, "olmocr_serve", "model"), getattr(cfg, "olmocr_model", ""),
+            getattr(cfg, "olmocr_model_id", ""), getattr(cfg, "olmocr_server_url", ""),
+            getattr(cfg, "olmocr_longest_side", 1288),
+            getattr(cfg, "vlm_gpu_memory_utilization", 0.0),
         )
 
     def resolve_engine(self, requested: Optional[str]) -> str:

@@ -115,7 +115,8 @@ def resolve_service_key(cfg, model_path: Optional[str] = None):
 
 
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
-                served_name: Optional[str] = None, model_config: dict = None) -> list:
+                served_name: Optional[str] = None, model_config: dict = None,
+                gpu_memory_utilization: Optional[float] = None) -> list:
     mid = served_name or (getattr(cfg, "model_id", "vllm") or "vllm")
     cmd = [py, "-m", "vllm.entrypoints.openai.api_server",
            "--host", host, "--port", str(port),
@@ -124,7 +125,10 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     ctx = int(getattr(cfg, "ctx", 0) or 0)
     if ctx > 0:
         cmd += ["--max-model-len", str(ctx)]
-    gmu = float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
+    # A side job that serves its OWN small model on a shared card (the OCR VLM engines)
+    # passes its own share here, so it does not have to claim as much of the GPU as the
+    # LLM instance wants.
+    gmu = float(gpu_memory_utilization or 0) or float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
     if gmu > 0:
         cmd += ["--gpu-memory-utilization", str(gmu)]
     tp = int(getattr(cfg, "tensor_parallel_size", 0) or 0)
@@ -251,7 +255,8 @@ def _start_ray(cfg, py: str, env: dict):
 
 def ensure_service(cfg, model_path: Optional[str] = None,
                    served_name: Optional[str] = None,
-                   ready_timeout: float = 3600.0) -> str:
+                   ready_timeout: float = 3600.0,
+                   gpu_memory_utilization: Optional[float] = None) -> str:
     """Launch (or reuse) a vLLM OpenAI server for a model; return its base URL.
 
     ``model_path``/``served_name`` override the config (used by the OCR subsystem to serve
@@ -298,7 +303,8 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         url_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
         url = f"http://{url_host}:{port}"
         cmd = _launch_cmd(py, cfg, host, port, model, served_name,
-                          model_config=_model_config_for(resolved or model))
+                          model_config=_model_config_for(resolved or model),
+                          gpu_memory_utilization=gpu_memory_utilization)
 
         env = os.environ.copy()
         # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on
@@ -406,8 +412,28 @@ def is_running(cfg, model_path: Optional[str] = None, served_name: Optional[str]
         return bool(svc and svc["proc"].poll() is None)
 
 
+def planned_vram_gb(cfg, gpu_memory_utilization: Optional[float] = None) -> float:
+    """How much VRAM a vLLM instance started from ``cfg`` will claim on this box.
+
+    vLLM allocates ``gpu_memory_utilization`` × the card's TOTAL memory up front and
+    refuses to start when that much is not free — so this is also what must be freed
+    BEFORE launching it. Callers that boot vLLM for a side job (the OCR VLM engines) use
+    it to ask the model manager for room first; without that, Surya-2 crash-looped on a
+    3090 with 11 GB free against a 14 GB demand."""
+    gmu = float(gpu_memory_utilization or 0) or float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
+    if gmu <= 0:
+        return 4.6   # small VLM fallback estimate
+    try:
+        from codai.models.manager import multi_model_manager
+        total = multi_model_manager._total_vram_gb()
+    except Exception:
+        total = 24.0
+    return max(0.5, gmu * float(total or 24.0))
+
+
 def stop_service_for(cfg, model_path: Optional[str] = None,
-                     served_name: Optional[str] = None) -> float:
+                     served_name: Optional[str] = None,
+                     gpu_memory_utilization: Optional[float] = None) -> float:
     """Stop the vLLM service for ONE specific (model_path, served_name), if running.
 
     Used by the OCR subsystem as a VRAM releaser: the managed Surya-2 vLLM subprocess
@@ -422,16 +448,8 @@ def stop_service_for(cfg, model_path: Optional[str] = None,
         running = bool(svc and svc["proc"].poll() is None)
     if not running:
         return 0.0
-    gmu = float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
     stop_service(svc_key)
-    if gmu > 0:
-        try:
-            from codai.models.manager import multi_model_manager
-            total = multi_model_manager._total_vram_gb()
-        except Exception:
-            total = 24.0
-        return max(0.5, gmu * total)
-    return 4.6   # small VLM fallback estimate
+    return planned_vram_gb(cfg, gpu_memory_utilization)
 
 
 import atexit as _atexit

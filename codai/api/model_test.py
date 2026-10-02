@@ -561,7 +561,7 @@ def _remote_catalogue(url: str, api_key: str) -> list:
 #: OCR engines are selected by name, not registered in models.json like a model.
 #: Without this an OCR test answered "'surya' is not in the model list, so
 #: nothing can say where it should run" — true of the catalogue, and useless.
-_OCR_ENGINES = ("paddle", "doctr", "surya")
+_OCR_ENGINES = ("paddle", "doctr", "surya", "olmocr")
 
 
 def _describe(model: str):

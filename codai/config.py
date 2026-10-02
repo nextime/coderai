@@ -757,6 +757,10 @@ class OcrConfig:
     - ``doctr``   — Mindee docTR (Apache-2.0; pure-PyTorch; easy install)
     - ``surya``   — Surya (best layout/reading-order; LICENSE-GATED — GPL/commercial:
       only loaded when ``surya_accept_license`` is True)
+    - ``olmocr``  — olmOCR-2 (AllenAI, Apache-2.0): a document VLM, not a detector —
+      best transcription fidelity on hard pages (old scans, maths, tables, multi-column),
+      but NO bounding boxes. Served through coderai's own model manager, its vLLM
+      backend, or any OpenAI-compatible endpoint (``olmocr_serve``).
 
     Heavy OCR dependencies are installed out of band (optional) so the base image
     stays lean. Concurrency on a single GPU comes from loading multiple instances of
@@ -768,10 +772,21 @@ class OcrConfig:
     stamp/signature flags (``detect_*``).
     """
     enabled: bool = False
-    default_engine: str = "paddle"        # paddle|doctr|surya
+    default_engine: str = "paddle"        # paddle|doctr|surya|olmocr
     dpi: int = 200                        # PDF rasterisation DPI
     max_concurrency: int = 4             # global cap on in-flight OCR pages
     lang: str = "it"                     # default document language
+    # After an engine fails to come up, refuse that engine FAST for this long instead of
+    # re-attempting the load on every request (a vLLM-backed engine burns ~35s per failed
+    # boot; Surya-2 once did that 338 times in a row on a card that was 11 GB short).
+    build_retry_cooldown_s: float = 60.0
+    # The share of the card a VLM OCR engine's own vLLM instance claims (surya in vllm
+    # mode, olmocr in vllm mode). 0 = use vllm.gpu_memory_utilization, which is sized for
+    # serving an LLM and is far more than a 7B OCR model needs — on a shared card that is
+    # the difference between booting and "Free memory … is less than desired GPU memory
+    # utilization". 0.35 of a 24 GB card (8.4 GB) fits surya-2 / olmOCR-2 with their KV
+    # cache and leaves the resident engines where they are.
+    vlm_gpu_memory_utilization: float = 0.35
 
     # --- PaddleOCR / PP-Structure ---
     paddle_enabled: bool = True
@@ -807,6 +822,29 @@ class OcrConfig:
     surya_serve: str = "local"         # local | vllm | llamacpp
     surya_model: str = "datalab-to/surya-ocr-2"   # HF checkpoint for the served (vllm) backend
     surya_server_url: str = ""         # external OpenAI server URL (llamacpp/manual); blank = auto
+
+    # --- olmOCR-2 (AllenAI, Apache-2.0) --- a document VLM: whole-page transcription in
+    # reading order, equations as LaTeX, tables as HTML, no bounding boxes. Driven over an
+    # OpenAI chat endpoint with olmOCR's own prompt; see codai/ocr/olmocr.py.
+    olmocr_enabled: bool = False
+    olmocr_instances: int = 1            # in-flight pages against the serving model
+    # How it is served:
+    #   "model"  — through coderai's OWN model manager: olmocr_model_id names a VISION
+    #              model in models.json (GGUF+mmproj on llama.cpp, or HF/qwenvl). Gets
+    #              VRAM accounting, eviction and the thermal governor for free, and is the
+    #              only mode that works without CUDA.
+    #   "vllm"   — coderai's vLLM backend serves olmocr_model on its own instance.
+    #   "server" — attach to an OpenAI-compatible server already running it.
+    olmocr_serve: str = "model"          # model | vllm | server
+    olmocr_model_id: str = ""            # ("model" mode) a vision model id from models.json
+    olmocr_model: str = "allenai/olmOCR-2-7B-1025-FP8"   # ("vllm"/"server" mode) HF id / served name
+    olmocr_server_url: str = ""          # ("server" mode) OpenAI base URL of that model
+    olmocr_api_key: str = ""             # ("server" mode) bearer token, if it wants one
+    olmocr_longest_side: int = 1288      # page render size the model was trained on
+    olmocr_max_tokens: int = 4096        # a dense page runs long; this is the page budget
+    olmocr_temperature: float = 0.1
+    olmocr_timeout: float = 300.0        # per-page ceiling on the model call
+    olmocr_retry_rotation: bool = True   # re-ask once on a page the model reports rotated
 
     # --- stamp / signature detection ---  [O3]
     detect_mode: str = "off"             # off|layout|detector|both
@@ -1377,6 +1415,20 @@ class ConfigManager:
                 "surya_serve": self.config.ocr.surya_serve,
                 "surya_model": self.config.ocr.surya_model,
                 "surya_server_url": self.config.ocr.surya_server_url,
+                "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
+                "vlm_gpu_memory_utilization": self.config.ocr.vlm_gpu_memory_utilization,
+                "olmocr_enabled": self.config.ocr.olmocr_enabled,
+                "olmocr_instances": self.config.ocr.olmocr_instances,
+                "olmocr_serve": self.config.ocr.olmocr_serve,
+                "olmocr_model_id": self.config.ocr.olmocr_model_id,
+                "olmocr_model": self.config.ocr.olmocr_model,
+                "olmocr_server_url": self.config.ocr.olmocr_server_url,
+                "olmocr_api_key": self.config.ocr.olmocr_api_key,
+                "olmocr_longest_side": self.config.ocr.olmocr_longest_side,
+                "olmocr_max_tokens": self.config.ocr.olmocr_max_tokens,
+                "olmocr_temperature": self.config.ocr.olmocr_temperature,
+                "olmocr_timeout": self.config.ocr.olmocr_timeout,
+                "olmocr_retry_rotation": self.config.ocr.olmocr_retry_rotation,
                 "detect_mode": self.config.ocr.detect_mode,
                 "detect_model_path": self.config.ocr.detect_model_path,
                 "detect_conf": self.config.ocr.detect_conf,
@@ -1457,7 +1509,7 @@ class ConfigManager:
             # the three default to off. Enabling the subsystem alone got a pod as
             # far as "OCR engine 'surya' is not enabled" — a second refusal from
             # a second flag, one round later.
-            for name in ("paddle", "doctr", "surya"):
+            for name in ("paddle", "doctr", "surya", "olmocr"):
                 if _flag(f"CODERAI_OCR_{name.upper()}_ENABLED"):
                     setattr(self.config.ocr, f"{name}_enabled", True)
                 # Where that engine's interpreter lives. A pod image that ships
@@ -1465,8 +1517,17 @@ class ConfigManager:
                 # the subprocess engine runs it instead of trying to build a venv
                 # on a machine rented by the second.
                 venv = (_os.environ.get(f"CODERAI_OCR_{name.upper()}_VENV") or "").strip()
-                if venv:
+                if venv and hasattr(self.config.ocr, f"{name}_venv"):
                     setattr(self.config.ocr, f"{name}_venv", venv)
+            # olmOCR needs to be told WHERE its model is; a pod that carries no vLLM
+            # is given a server URL (or the id of a vision model it does hold).
+            for _env, _attr in (("CODERAI_OCR_OLMOCR_SERVE", "olmocr_serve"),
+                                ("CODERAI_OCR_OLMOCR_MODEL", "olmocr_model"),
+                                ("CODERAI_OCR_OLMOCR_MODEL_ID", "olmocr_model_id"),
+                                ("CODERAI_OCR_OLMOCR_SERVER_URL", "olmocr_server_url")):
+                _val = (_os.environ.get(_env) or "").strip()
+                if _val:
+                    setattr(self.config.ocr, _attr, _val)
             if _flag("CODERAI_OCR_SURYA_ACCEPT_LICENSE"):
                 # Surya is GPL and gated on an explicit acceptance. The pod
                 # inherits the decision made here; it cannot make it itself.
