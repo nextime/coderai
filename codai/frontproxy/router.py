@@ -48,6 +48,27 @@ def is_inference_path(path: str) -> bool:
     return p in _INFERENCE_PATHS
 
 
+# OCR is GPU work and contends for VRAM like any model, but it is deliberately NOT in
+# _INFERENCE_PATHS: it has no `model` field, it owns its own engine pools, and the
+# front's per-model queue / pin / spillover / keepalive machinery does not apply to it.
+# These are the paths that still have to take a turn at the shared-GPU swap gate.
+_OCR_GPU_PATHS = {
+    "/v1/ocr",
+    "/v1/ocr/batch",
+}
+
+
+def is_ocr_path(path: str) -> bool:
+    return path.split("?", 1)[0].rstrip("/") in _OCR_GPU_PATHS
+
+
+def is_gpu_inference_path(path: str) -> bool:
+    """POSTs that consume THIS box's GPU, and so must be serialized against whatever
+    model currently owns the card. A superset of :func:`is_inference_path` that adds OCR."""
+    p = path.split("?", 1)[0].rstrip("/")
+    return p in _INFERENCE_PATHS or p in _OCR_GPU_PATHS
+
+
 def is_admin_path(path: str) -> bool:
     p = path.split("?", 1)[0]
     return (p.startswith("/admin") or p.startswith("/login") or p.startswith("/logout")

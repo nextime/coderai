@@ -393,7 +393,8 @@ class FrontProxy:
         # direct proxy path, so brokered and direct requests share one queue.
         _qkey = None
         if (method.upper() == "POST" and _router.is_inference_path(path)
-                and self._task_kind(path) == "text"):
+                and self._task_kind(path) == "text"
+                and not self._computed_off_this_gpu(engine, model, path)):
             _qkey = self._queue_key(model)
             try:
                 await self.reqqueue.acquire(
@@ -546,7 +547,8 @@ class FrontProxy:
             pass
         _qkey = None
         if (method.upper() == "POST" and _is_infer
-                and self._task_kind(path) == "text"):
+                and self._task_kind(path) == "text"
+                and not self._computed_off_this_gpu(engine, model, path)):
             _qkey = self._queue_key(model)
             try:
                 await self.reqqueue.acquire(
@@ -1095,11 +1097,64 @@ class FrontProxy:
         except Exception:
             return None
 
-    def _swap_owner_key(self, engine, model: Optional[str]) -> str:
+    def _swap_owner_key(self, engine, model: Optional[str], path: Optional[str] = None) -> str:
         """The model identity that determines GPU residency for the swap gate. Same
         model → same owner (runs free); different model → a swap. Falls back to the
         engine name for inference without an explicit model."""
+        # All OCR shares ONE owner: the OCR subsystem holds one set of engine pools and
+        # does its own internal eviction between them, so for the purpose of "who owns
+        # the card" paddle and surya are the same tenant. (It also means the front need
+        # not read the `engine` form field out of a multipart body carrying a PDF.)
+        if path is not None and _router.is_ocr_path(path):
+            return "ocr"
         return self._queue_key(model) or getattr(engine, "name", "") or "?"
+
+    def _computed_off_this_gpu(self, engine, model: Optional[str], path: str) -> bool:
+        """True when this request will NOT be computed on this box's GPU — a cluster
+        node, a RunPod pod, or an external API endpoint does the work.
+
+        Such a request holds no local VRAM, so making it wait at the swap gate (or in
+        the local queue) would add latency and swaps for nothing."""
+        try:
+            if getattr(engine, "remote", False):
+                return True          # a cluster node: its cards are its own business
+            if (self._model_info(model).get("backend") or "").lower() == "runpod":
+                return True          # a rented GPU elsewhere
+            if _router.is_ocr_path(path) and self._ocr_is_external():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _ocr_is_external(self) -> bool:
+        """True when no ENABLED OCR engine would run on this box's GPU — every one of
+        them is served by an endpoint somewhere else.
+
+        Decided across all enabled engines rather than the one this request asked for:
+        the engine arrives as a multipart form field, and buffering a 100 MB PDF in the
+        front just to read it would cost more than the gate saves. Erring towards
+        gating is the safe direction — a needless turn costs latency, a missed turn
+        costs VRAM contention."""
+        try:
+            o = self.config.ocr
+        except Exception:
+            return False
+        local = []
+        if getattr(o, "paddle_enabled", False):
+            local.append(True)       # in-process / isolated venv: always this box
+        if getattr(o, "doctr_enabled", False):
+            local.append(True)
+        if getattr(o, "surya_enabled", False) and getattr(o, "surya_accept_license", False):
+            mode = (getattr(o, "surya_serve", "local") or "local").strip().lower()
+            external = mode == "llamacpp" and bool(
+                (getattr(o, "surya_server_url", "") or "").strip())
+            local.append(not external)
+        if getattr(o, "olmocr_enabled", False):
+            mode = (getattr(o, "olmocr_serve", "model") or "model").strip().lower()
+            external = mode == "server" and bool(
+                (getattr(o, "olmocr_server_url", "") or "").strip())
+            local.append(not external)
+        return bool(local) and not any(local)
 
     def _resident_on(self, engine, key: str) -> bool:
         """True when the model behind `key` is already loaded on `engine` (per
@@ -1183,13 +1238,17 @@ class FrontProxy:
     async def _swap_acquire(self, engine, model, path, method):
         """Acquire this engine's shared-GPU swap slot for a GPU-inference request.
         Returns a (gate, key) token for _swap_release, or None when no gate applies
-        (single-card engine or non-inference request)."""
-        if str(method).upper() != "POST" or not _router.is_inference_path(path):
+        (single-card engine, non-inference request, or work computed off this box)."""
+        if str(method).upper() != "POST" or not _router.is_gpu_inference_path(path):
+            return None
+        # RunPod, an external API or a cluster node computes it elsewhere: no local VRAM
+        # is involved, so there is nothing to serialize.
+        if self._computed_off_this_gpu(engine, model, path):
             return None
         gate = self._swap_gate_for(engine)
         if gate is None:
             return None
-        key = self._swap_owner_key(engine, model)
+        key = self._swap_owner_key(engine, model, path)
         # A model that is ALREADY resident on this engine needs no swap — its
         # own per-model queue governs its concurrency, and serializing it
         # behind the current GPU owner would block cross-model parallelism
@@ -1953,9 +2012,10 @@ class FrontProxy:
             try:
                 # 0. Shared-GPU swap gate: if a different model owns the card, wait
                 #    for the swap (keepalive so the client doesn't time out).
-                _gate = self._swap_gate_for(engine)
+                _gate = (None if self._computed_off_this_gpu(engine, model, path)
+                         else self._swap_gate_for(engine))
                 if _gate is not None:
-                    _skey = self._swap_owner_key(engine, model)
+                    _skey = self._swap_owner_key(engine, model, path)
                     _swap_acq = _asyncio.ensure_future(_gate.acquire(_skey))
                     while True:
                         try:
@@ -1966,7 +2026,7 @@ class FrontProxy:
                         except _asyncio.TimeoutError:
                             yield _ka("waiting for GPU (another model is finishing)")
                 # 1. Front per-model queue slot (text only) — keepalive while waiting.
-                if is_text:
+                if is_text and not self._computed_off_this_gpu(engine, model, path):
                     _qkey = self._queue_key(model)
                     _slot_held = False
                     # `on_busy`: if there is no free local slot RIGHT NOW, burst
@@ -2399,7 +2459,8 @@ class FrontProxy:
         # audio, embeddings…) pass through unqueued.
         _qkey = None
         if (method == "POST" and _router.is_inference_path(path)
-                and self._task_kind(path) == "text"):
+                and self._task_kind(path) == "text"
+                and not self._computed_off_this_gpu(engine, model, path)):
             _qkey = self._queue_key(model)
             _slot_held = False
             # `on_busy`: offload the moment there is no free local slot, rather
