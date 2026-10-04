@@ -53,15 +53,18 @@ class SuryaEngine(SubprocessOcrEngine):
     def prelaunch_vram_gb(self) -> float:
         """In the served modes Surya rides a vLLM instance that grabs
         gpu_memory_utilization × the whole card before it will start, so that much has to
-        be free FIRST. (A 3090 with 11.3 GB free against a 14.1 GB demand crash-looped
-        Surya-2 for hours: vLLM died on startup, the next OCR request tried again.)"""
+        be free FIRST — plus the ceiling's headroom, since our share is translated against
+        what others hold (see vllm_worker.effective_gmu). (A 3090 with 11.3 GB free against
+        a 14.1 GB demand crash-looped Surya-2 for hours: vLLM died on startup, the next OCR
+        request tried again. Then 3.6 GB of resident embedder did the same to a 0.35
+        share.)"""
         if self._serve_mode() != "vllm":
             return 0.0
         try:
-            from codai.api.vllm_worker import planned_vram_gb
+            from codai.api.vllm_worker import prelaunch_free_gb
             from codai.models.manager import get_active_vllm_config
             vcfg = get_active_vllm_config()
-            return planned_vram_gb(vcfg, self._vlm_gmu()) if vcfg is not None else 0.0
+            return prelaunch_free_gb(vcfg, self._vlm_gmu()) if vcfg is not None else 0.0
         except Exception:
             return 0.0
 

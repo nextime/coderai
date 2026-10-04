@@ -121,11 +121,21 @@ thing out there.
 
 The VLM engines (`surya` in `vllm` mode, `olmocr` in `vllm` mode) boot a vLLM instance
 that claims `gpu_memory_utilization` × the **whole card** before it will serve, and
-refuses to start when that much is not free. Two rules follow, both enforced by the pool:
+refuses to start when that much is not free. Three rules follow, all enforced by the pool:
 
 - **Room is made before the load, not after it.** The engine declares what it needs up
   front (`prelaunch_vram_gb`) and the model manager evicts for it first. Evicting
   afterwards is useless, because the load is what fails.
+- **The share is relative to what is free, not to the card.** `vlm_gpu_memory_utilization`
+  is the slice the OCR engine wants for *itself*, but vLLM's own flag is a fraction of
+  **total** card memory and every other process' allocation counts against it. So the
+  share is translated at launch: 0.35 on a 24 GB card with 3.6 GB of resident embedder
+  becomes `--gpu-memory-utilization 0.50`, a 12 GB budget of which 8.4 GB is actually the
+  engine's. Without the translation, 0.35 left surya-2 about 5 GB, and after weights,
+  activation peak at `max_model_len=18432` and CUDA graphs it reported
+  `Available KV cache memory: -2.81 GiB` and died — once every 20 minutes, for hours.
+  The translation is capped (0.92) so the driver keeps its room; when the cap would bite,
+  the evict-first pass above is what clears the card instead.
 - **A failed build is not retried on every request.** For `ocr.build_retry_cooldown_s`
   (default 60 s) that engine fails fast with the reason the boot gave, instead of spending
   ~35 s booting and dying again per request. Without this, a card 11 GB short of Surya-2's
@@ -140,11 +150,23 @@ of 0.9 (or 0.6) can be more than the card has left. Otherwise: give the card les
 resident work, or serve the engine with `model`/`server` mode, which needs no instance of
 its own at all.
 
+### A document is never refused because one engine is down
+
+`ocr.fallback_engines` (default `auto`) makes a failing engine hand the document to the
+other **enabled** engines rather than returning 503 — fewest-ways-to-fail first
+(`paddle`, `doctr`, `olmocr`, `surya`), since a transcription from the second-best engine
+beats no transcription. The response's `engine` field names the engine that actually read
+the pages, so a fallback is visible to the caller, and the reason the first choice failed
+is logged. This also covers a pool that is evicted *mid-document* by a model load: the
+failed pages are re-read by the next engine instead of failing the request. Set an
+explicit order (`"doctr, paddle"`) to override it, or `off` to get the original error
+back.
+
 ## Enable & configure
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,
 `default_engine`, `dpi`, `max_concurrency`, `lang`, `build_retry_cooldown_s`,
-`vlm_gpu_memory_utilization`; per-engine `*_enabled` /
+`vlm_gpu_memory_utilization`, `fallback_engines`; per-engine `*_enabled` /
 `*_instances` / `*_use_gpu` / lang; `detect_mode` (+ `detect_model_path`, `detect_conf`);
 `extract_enabled` / `extract_model_id` / `extract_schema` / `extract_validate`.
 

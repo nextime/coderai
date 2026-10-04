@@ -36,6 +36,18 @@ def _cfg(**kw):
     return c
 
 
+def _patch_vllm_worker(monkeypatch, fake):
+    """Swap in a fake vLLM worker for code that does ``from codai.api import vllm_worker``.
+
+    Patching sys.modules alone is not enough: once the real module has been imported by
+    anything (another test file, for instance), it is bound as an attribute of the
+    ``codai.api`` package and the from-import takes that attribute without consulting
+    sys.modules. Patch both, or the fake silently does not apply."""
+    import codai.api
+    monkeypatch.setitem(sys.modules, "codai.api.vllm_worker", fake)
+    monkeypatch.setattr(codai.api, "vllm_worker", fake, raising=False)
+
+
 # ------------------------------------------------------------ front matter
 def test_front_matter_split():
     meta, body = parse_front_matter(
@@ -312,19 +324,25 @@ def test_vllm_mode_serves_with_the_ocr_side_gpu_share(monkeypatch):
     """The OCR VLM gets its own share of the card, not the one sized for an LLM."""
     seen = {}
 
+    from codai.api.vllm_worker import GMU_CEILING
+    _headroom = 1.0 - GMU_CEILING      # the ceiling keeps room for the driver/fragmentation
+
     fake_worker = types.SimpleNamespace(
         ensure_service=lambda vcfg, model_path=None, served_name=None,
         gpu_memory_utilization=None: (
             seen.update(model=model_path, share=gpu_memory_utilization), "http://127.0.0.1:1/")[1],
         planned_vram_gb=lambda vcfg, share=None: (share or 0.9) * 24.0,
+        prelaunch_free_gb=lambda vcfg, share=None: ((share or 0.9) + _headroom) * 24.0,
     )
-    monkeypatch.setitem(sys.modules, "codai.api.vllm_worker", fake_worker)
+    _patch_vllm_worker(monkeypatch, fake_worker)
     monkeypatch.setattr("codai.models.manager.get_active_vllm_config",
                         lambda: types.SimpleNamespace(gpu_memory_utilization=0.9))
 
     cfg = _cfg(olmocr_serve="vllm", vlm_gpu_memory_utilization=0.35)
     eng = OlmOcrEngine(cfg)
-    assert eng.prelaunch_vram_gb() == pytest.approx(8.4)   # 0.35 of the card, not 0.9
+    # 0.35 of the card for itself (not the LLM's 0.9) PLUS the ceiling's headroom, because
+    # the share is translated against whatever else holds the card at launch.
+    assert eng.prelaunch_vram_gb() == pytest.approx((0.35 + _headroom) * 24.0)
     eng.load()
     assert seen["model"] == "allenai/olmOCR-2-7B-1025-FP8"
     assert seen["share"] == 0.35
@@ -335,7 +353,7 @@ def test_vllm_mode_serves_with_the_ocr_side_gpu_share(monkeypatch):
     assert OcrConfig().vlm_gpu_memory_utilization == 0.35
     # Set back to 0 it defers to whatever the vLLM backend itself is configured with.
     eng2 = OlmOcrEngine(_cfg(olmocr_serve="vllm", vlm_gpu_memory_utilization=0.0))
-    assert eng2.prelaunch_vram_gb() == pytest.approx(21.6)
+    assert eng2.prelaunch_vram_gb() == pytest.approx((0.9 + _headroom) * 24.0)
 
 
 def test_a_shared_server_is_reserved_for_ONCE_not_per_instance(monkeypatch):
@@ -423,7 +441,7 @@ def test_the_model_manager_can_evict_ocr_including_both_vlm_servers(monkeypatch)
         planned_vram_gb=lambda vcfg, share=None: 8.4,
         ensure_service=lambda *a, **k: "http://127.0.0.1:1/",
     )
-    monkeypatch.setitem(sys.modules, "codai.api.vllm_worker", fake_worker)
+    _patch_vllm_worker(monkeypatch, fake_worker)
     monkeypatch.setattr("codai.models.manager.get_active_vllm_config",
                         lambda: types.SimpleNamespace(gpu_memory_utilization=0.9))
 

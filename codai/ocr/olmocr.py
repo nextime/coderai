@@ -276,11 +276,14 @@ class OlmOcrEngine(OcrEngine):
         return v or None
 
     def _vllm_need(self) -> float:
+        # The engine's own share PLUS the headroom effective_gmu's ceiling reserves: our
+        # share is translated against whatever else holds the card, so a crowded card has
+        # to be cleared rather than clamped.
         try:
-            from codai.api.vllm_worker import planned_vram_gb
+            from codai.api.vllm_worker import prelaunch_free_gb
             from codai.models.manager import get_active_vllm_config
             vcfg = get_active_vllm_config()
-            return planned_vram_gb(vcfg, self._vlm_gmu()) if vcfg is not None else 0.0
+            return prelaunch_free_gb(vcfg, self._vlm_gmu()) if vcfg is not None else 0.0
         except Exception:
             return 0.0
 

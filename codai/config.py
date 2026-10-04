@@ -787,6 +787,13 @@ class OcrConfig:
     # utilization". 0.35 of a 24 GB card (8.4 GB) fits surya-2 / olmOCR-2 with their KV
     # cache and leaves the resident engines where they are.
     vlm_gpu_memory_utilization: float = 0.35
+    # When the chosen engine cannot serve a document, try these engines instead rather
+    # than failing the request: a 503 means a document nobody read, and that is strictly
+    # worse than a transcription from the second-best engine. "auto" = every other
+    # ENABLED engine, fewest-ways-to-fail first (paddle, doctr, olmocr, surya);
+    # "off"/"none" = no fallback (fail with the original error); or an explicit
+    # comma/space separated order.
+    fallback_engines: str = "auto"
 
     # --- PaddleOCR / PP-Structure ---
     paddle_enabled: bool = True
@@ -1417,6 +1424,7 @@ class ConfigManager:
                 "surya_server_url": self.config.ocr.surya_server_url,
                 "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
                 "vlm_gpu_memory_utilization": self.config.ocr.vlm_gpu_memory_utilization,
+                "fallback_engines": self.config.ocr.fallback_engines,
                 "olmocr_enabled": self.config.ocr.olmocr_enabled,
                 "olmocr_instances": self.config.ocr.olmocr_instances,
                 "olmocr_serve": self.config.ocr.olmocr_serve,

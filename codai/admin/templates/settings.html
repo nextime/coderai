@@ -1074,6 +1074,12 @@
         <label class="form-label">VLM engines' GPU share</label>
         <input type="number" id="s-ocr-vlm-gmu" class="form-input" min="0" max="1" step="0.05" placeholder="0 = vLLM default">
       </div>
+      <div class="form-group" style="flex:1;min-width:170px">
+        <label class="form-label">Fallback engines</label>
+        <input type="text" id="s-ocr-fallback" class="form-input" placeholder="auto">
+        <div class="form-hint">Tried when the chosen engine can't serve, so a document
+          is never refused: <code>auto</code>, <code>off</code>, or an explicit order.</div>
+      </div>
     </div>
 
     <div class="card-title" style="font-size:13px;margin-top:.4rem">PaddleOCR</div>
@@ -2004,6 +2010,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-lang').value = ocr.lang ?? 'it';
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
     document.getElementById('s-ocr-vlm-gmu').value = ocr.vlm_gpu_memory_utilization ?? 0;
+    document.getElementById('s-ocr-fallback').value = ocr.fallback_engines ?? 'auto';
     document.getElementById('s-ocr-paddle-enabled').checked = ocr.paddle_enabled !== false;
     document.getElementById('s-ocr-paddle-use-gpu').checked = ocr.paddle_use_gpu !== false;
     document.getElementById('s-ocr-paddle-structure').checked = ocr.paddle_structure !== false;
@@ -2231,6 +2238,7 @@ async function saveSettings(silent){
       lang: document.getElementById('s-ocr-lang').value.trim() || 'it',
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
       vlm_gpu_memory_utilization: parseFloat(document.getElementById('s-ocr-vlm-gmu').value) || 0,
+      fallback_engines: document.getElementById('s-ocr-fallback').value.trim() || 'auto',
       paddle_enabled: document.getElementById('s-ocr-paddle-enabled').checked,
       paddle_use_gpu: document.getElementById('s-ocr-paddle-use-gpu').checked,
       paddle_structure: document.getElementById('s-ocr-paddle-structure').checked,

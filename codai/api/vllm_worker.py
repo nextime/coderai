@@ -125,9 +125,7 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     ctx = int(getattr(cfg, "ctx", 0) or 0)
     if ctx > 0:
         cmd += ["--max-model-len", str(ctx)]
-    # A side job that serves its OWN small model on a shared card (the OCR VLM engines)
-    # passes its own share here, so it does not have to claim as much of the GPU as the
-    # LLM instance wants.
+    # Already absolute (resolve_gmu translated a side job's own-share if there was one).
     gmu = float(gpu_memory_utilization or 0) or float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
     if gmu > 0:
         cmd += ["--gpu-memory-utilization", str(gmu)]
@@ -302,9 +300,13 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         port = int(getattr(cfg, "port", 0) or 0) or _free_port()
         url_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
         url = f"http://{url_host}:{port}"
+        # Resolve the share HERE and remember it: what this instance actually reserved is
+        # what stopping it frees, and the eviction path has to be told the truth or it
+        # over- or under-evicts for the next model.
+        gmu = resolve_gmu(cfg, gpu_memory_utilization)
         cmd = _launch_cmd(py, cfg, host, port, model, served_name,
                           model_config=_model_config_for(resolved or model),
-                          gpu_memory_utilization=gpu_memory_utilization)
+                          gpu_memory_utilization=gmu)
 
         env = os.environ.copy()
         # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on
@@ -340,7 +342,8 @@ def ensure_service(cfg, model_path: Optional[str] = None,
                 ray.stop()
             raise
         threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()
-        _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray}
+        _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray,
+                              "gmu": gmu}
 
     def _tail_msg():
         # The last six lines of a vLLM crash are the wrapper's own traceback
@@ -412,6 +415,94 @@ def is_running(cfg, model_path: Optional[str] = None, served_name: Optional[str]
         return bool(svc and svc["proc"].poll() is None)
 
 
+# vLLM must not be told to budget the whole card: the driver context, fragmentation and
+# any allocation made between our measurement and its own need somewhere to live.
+GMU_CEILING = 0.92
+
+
+def _used_by_others_gb() -> float:
+    """VRAM (GB) currently held on this box by anything that is NOT the vLLM we are
+    about to launch — resident embedders, an LLM, another process' context."""
+    try:
+        from codai.models.manager import multi_model_manager
+        total = float(multi_model_manager._total_vram_gb() or 0.0)
+        free = float(multi_model_manager._get_free_vram_gb() or 0.0)
+        if total <= 0 or free >= 999.0:   # 999 = "unknown, assume enough"
+            return 0.0
+        return max(0.0, total - free)
+    except Exception:
+        return 0.0
+
+
+def resolve_gmu(cfg, gpu_memory_utilization: Optional[float] = None) -> float:
+    """The absolute ``--gpu-memory-utilization`` to launch with.
+
+    A side job (an OCR VLM engine) passes the share it wants for ITSELF, which has to be
+    translated against what else is on the card; the backend's own configured value is
+    already absolute and is used as-is."""
+    share = float(gpu_memory_utilization or 0)
+    if share > 0:
+        return effective_gmu(share)
+    return float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
+
+
+def effective_gmu(self_share: float) -> float:
+    """Translate "the share of the card I want for MYSELF" into the absolute
+    ``--gpu-memory-utilization`` vLLM wants.
+
+    vLLM's flag is a fraction of the card's TOTAL memory and every other process'
+    allocation counts against it: with 3.6 GB of bge-m3 resident on a 24 GB 3090,
+    ``0.35`` left surya-2 about 5 GB, and after weights (1.37) + activation peak at
+    ``max_model_len=18432`` + CUDA graphs (0.3) it reported ``Available KV cache memory:
+    -2.81 GiB`` and died — every 20 minutes, for hours. So add back what others hold:
+    0.35 of a card with 3.6 GB in use becomes 0.50, i.e. a 12 GB budget of which 8.4 GB
+    is actually ours. Capped at :data:`GMU_CEILING`; when the cap bites, the caller's
+    evict-first pass (``prelaunch_vram_gb``) is what makes room."""
+    try:
+        share = max(0.0, float(self_share or 0.0))
+    except Exception:
+        return 0.0
+    if share <= 0:
+        return 0.0
+    try:
+        from codai.models.manager import multi_model_manager
+        total = float(multi_model_manager._total_vram_gb() or 0.0)
+    except Exception:
+        total = 0.0
+    if total <= 0:
+        return min(share, GMU_CEILING)
+    used = _used_by_others_gb()
+    eff = share + (used / total)
+    if eff > GMU_CEILING:
+        print(f"[vllm] share {share:.2f} + {used:.1f} GB held by others exceeds the "
+              f"{GMU_CEILING:.2f} ceiling on a {total:.1f} GB card; clamping "
+              f"(eviction should have freed more)", flush=True)
+        eff = GMU_CEILING
+    if abs(eff - share) > 0.005:
+        print(f"[vllm] gpu-memory-utilization {share:.2f} (own share) -> {eff:.3f} "
+              f"absolute: {used:.1f} of {total:.1f} GB already in use", flush=True)
+    return eff
+
+
+def prelaunch_free_gb(cfg, gpu_memory_utilization: Optional[float] = None) -> float:
+    """How much VRAM must be FREE before launching this vLLM for the side-job share to
+    fit under :data:`GMU_CEILING` — i.e. what to ask the evictor for.
+
+    It is the engine's own need plus the headroom the ceiling reserves, so a crowded
+    card gets models evicted instead of :func:`effective_gmu` clamping and vLLM dying
+    on KV cache again."""
+    gmu = float(gpu_memory_utilization or 0) or float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
+    if gmu <= 0:
+        return planned_vram_gb(cfg, gpu_memory_utilization)
+    try:
+        from codai.models.manager import multi_model_manager
+        total = float(multi_model_manager._total_vram_gb() or 24.0)
+    except Exception:
+        total = 24.0
+    total = total or 24.0
+    return max(0.5, (min(gmu, GMU_CEILING) + (1.0 - GMU_CEILING)) * total)
+
+
 def planned_vram_gb(cfg, gpu_memory_utilization: Optional[float] = None) -> float:
     """How much VRAM a vLLM instance started from ``cfg`` will claim on this box.
 
@@ -446,9 +537,21 @@ def stop_service_for(cfg, model_path: Optional[str] = None,
     with _lock:
         svc = _services.get(svc_key)
         running = bool(svc and svc["proc"].poll() is None)
+        launched_gmu = float((svc or {}).get("gmu") or 0.0)
     if not running:
         return 0.0
     stop_service(svc_key)
+    # What it reserved is what we just freed. The share the caller passes is the engine's
+    # OWN share; the instance was launched with that plus whatever else held the card
+    # (effective_gmu), so reporting the caller's figure would under-count the release and
+    # send the eviction path looking for memory that is already free.
+    if launched_gmu > 0:
+        try:
+            from codai.models.manager import multi_model_manager
+            total = float(multi_model_manager._total_vram_gb() or 24.0)
+        except Exception:
+            total = 24.0
+        return max(0.5, launched_gmu * (total or 24.0))
     return planned_vram_gb(cfg, gpu_memory_utilization)
 
 

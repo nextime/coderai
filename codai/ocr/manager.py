@@ -282,8 +282,12 @@ class OcrManager:
     def _stop_surya_vllm(self) -> float:
         """Stop the managed Surya-2 vLLM subprocess (if this build serves Surya via vLLM).
         Returns estimated GB freed."""
+        # NOT gated on surya_serve being "vllm" right now: if the setting was changed
+        # while a service was up, the old subprocess is still holding its share of the
+        # card and skipping the stop would leak it until a restart. stop_service_for() is
+        # a no-op returning 0.0 when nothing is running, so asking is free.
         cfg = self._cfg
-        if cfg is None or (getattr(cfg, "surya_serve", "") or "").strip().lower() != "vllm":
+        if cfg is None:
             return 0.0
         try:
             from codai.api import vllm_worker
@@ -302,8 +306,8 @@ class OcrManager:
     def _stop_olmocr_vllm(self) -> float:
         """Stop the managed olmOCR vLLM instance (olmocr_serve = "vllm"), for the same
         reason Surya's needs stopping: its VRAM is the subprocess's, not a pool's."""
-        cfg = self._cfg
-        if cfg is None or (getattr(cfg, "olmocr_serve", "") or "").strip().lower() != "vllm":
+        cfg = self._cfg          # unconditional, for the reason in _stop_surya_vllm
+        if cfg is None:
             return 0.0
         try:
             from codai.api import vllm_worker
@@ -361,9 +365,27 @@ class OcrManager:
                 self._pools[name] = pool
             return pool
 
-    async def ocr_pages(self, images: List, engine: Optional[str] = None) -> (str, List[OcrPage]):
-        """OCR a list of PIL page images. Returns (engine_name, [OcrPage])."""
-        name = self.resolve_engine(engine)
+    def _fallback_order(self, failed: str) -> List[str]:
+        """Enabled engines to try after ``failed`` could not serve the document.
+
+        An OCR request that comes back 503 is a document nobody read — and the whole
+        point of having four engines is that a page can still be read when one of them
+        will not come up (a VLM engine whose vLLM cannot fit on the card, a venv that
+        needs rebuilding, a license flag). ``auto`` prefers the engines with the fewest
+        ways to fail over the ones with the best output, because the alternative to a
+        worse transcription here is no transcription."""
+        cfg = self._require_cfg()
+        raw = str(getattr(cfg, "fallback_engines", "auto") or "auto").strip().lower()
+        if raw in ("off", "none", "no", "false"):
+            return []
+        if raw in ("auto", "", "on", "true"):
+            names = ["paddle", "doctr", "olmocr", "surya"]
+        else:
+            names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
+        return [n for n in names
+                if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
+
+    async def _pages_with(self, name: str, images: List) -> List[OcrPage]:
         pool = await self._get_pool(name)
         sem = self._sem or asyncio.Semaphore(4)
 
@@ -374,7 +396,35 @@ class OcrManager:
                 return page
 
         pages = await asyncio.gather(*[_one(i, im) for i, im in enumerate(images)])
-        return name, list(pages)
+        return list(pages)
+
+    async def ocr_pages(self, images: List, engine: Optional[str] = None) -> (str, List[OcrPage]):
+        """OCR a list of PIL page images. Returns (engine_name, [OcrPage]).
+
+        The returned name is the engine that ACTUALLY read the pages, which is not
+        necessarily the one asked for: when an engine cannot serve, the remaining
+        enabled engines are tried in turn (see :meth:`_fallback_order`) rather than
+        failing the document. Callers surface the name, so a caller that cares can see
+        it fell back."""
+        name = self.resolve_engine(engine)
+        try:
+            return name, await self._pages_with(name, images)
+        except Exception as first:
+            chain = self._fallback_order(name)
+            if not chain:
+                raise
+            print(f"[ocr] engine '{name}' could not serve ({first}); "
+                  f"falling back to {' -> '.join(chain)}")
+            for alt in chain:
+                try:
+                    pages = await self._pages_with(alt, images)
+                except Exception as e:
+                    print(f"[ocr] fallback engine '{alt}' also failed: {e}")
+                    continue
+                print(f"[ocr] served by fallback engine '{alt}' instead of '{name}'")
+                return alt, pages
+            # Everything enabled is down: the original failure is the useful one.
+            raise first
 
     async def ocr_document(self, data: bytes, filename: str = "", content_type: str = "",
                            engine: Optional[str] = None, dpi: Optional[int] = None,

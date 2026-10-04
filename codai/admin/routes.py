@@ -3872,6 +3872,7 @@ def build_settings_dict(c, gpu_cards):
             "surya_server_url": c.ocr.surya_server_url,
             "build_retry_cooldown_s": c.ocr.build_retry_cooldown_s,
             "vlm_gpu_memory_utilization": c.ocr.vlm_gpu_memory_utilization,
+            "fallback_engines": c.ocr.fallback_engines,
             "olmocr_enabled": c.ocr.olmocr_enabled,
             "olmocr_instances": c.ocr.olmocr_instances,
             "olmocr_serve": c.ocr.olmocr_serve,
@@ -4603,6 +4604,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_server_url" in d: o.surya_server_url = (d.get("surya_server_url") or "").strip()
         if "build_retry_cooldown_s" in d: o.build_retry_cooldown_s = _f("build_retry_cooldown_s", o.build_retry_cooldown_s, 0.0)
         if "vlm_gpu_memory_utilization" in d: o.vlm_gpu_memory_utilization = _f("vlm_gpu_memory_utilization", o.vlm_gpu_memory_utilization, 0.0)
+        if "fallback_engines" in d: o.fallback_engines = (d.get("fallback_engines") or "auto").strip()
         if "olmocr_enabled" in d: o.olmocr_enabled = bool(d["olmocr_enabled"])
         if "olmocr_instances" in d: o.olmocr_instances = _i("olmocr_instances", o.olmocr_instances, 1)
         if "olmocr_serve" in d: o.olmocr_serve = (d.get("olmocr_serve") or "model").strip().lower()
