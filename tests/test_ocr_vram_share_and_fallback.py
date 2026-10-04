@@ -264,3 +264,155 @@ def test_a_healthy_engine_is_not_second_guessed(monkeypatch):
 def test_the_fallback_is_on_by_default():
     assert OcrConfig().fallback_engines == "auto"
     assert OcrConfig().vlm_gpu_memory_utilization == 0.35
+    assert OcrConfig().evict_drain_timeout_s == 60.0
+
+
+# ---------------------------------------------------- taking turns on the card
+def test_eviction_waits_for_an_in_flight_page_instead_of_killing_it(monkeypatch):
+    """A model load must not take OCR's VRAM out from under a page being recognised —
+    the handover happens at a page boundary, like the model manager's own clean swap."""
+    import threading
+    started = threading.Event()
+    finish = threading.Event()
+    torn = []
+
+    class _Slow:
+        def __init__(self, cfg):
+            pass
+
+        def prelaunch_vram_gb(self):
+            return 0.0
+
+        def vram_gb(self):
+            return 8.4
+
+        def ensure_loaded(self):
+            pass
+
+        def recognize_image(self, image):
+            started.set()
+            finish.wait(5.0)            # a page mid-recognition
+            return OcrPage(index=0, text="finished anyway")
+
+        def cleanup(self):
+            torn.append(1)
+
+    monkeypatch.setitem(ocr_manager_mod._ENGINE_FACTORIES, "paddle", _Slow)
+    monkeypatch.setattr(ocr_manager_mod, "_evict_for_ocr", lambda gb: None)
+    monkeypatch.setattr(
+        "codai.models.manager.multi_model_manager.register_external_vram_releaser",
+        lambda fn: None)
+
+    m = ocr_manager_mod.OcrManager()
+    m.configure(_cfg(default_engine="paddle", evict_drain_timeout_s=5.0))
+
+    async def _go():
+        task = asyncio.ensure_future(m.ocr_pages([_page()], engine="paddle"))
+        await asyncio.to_thread(started.wait, 5.0)
+        # The model manager's eviction thread arrives mid-page.
+        releaser = asyncio.ensure_future(asyncio.to_thread(m._release_vram, 999.0))
+        await asyncio.sleep(0.2)
+        assert not releaser.done()          # it is WAITING, not tearing down
+        assert not torn                     # nothing released yet
+        finish.set()                        # the page completes
+        freed = await releaser
+        name, pages = await task
+        return freed, name, pages
+
+    freed, name, pages = asyncio.run(_go())
+    assert pages[0].text == "finished anyway"   # the page was NOT lost
+    assert name == "paddle"                     # and no fallback was needed
+    assert torn and freed > 0                   # VRAM released after the drain
+
+
+def test_the_drain_has_a_budget_so_a_wedged_engine_cannot_block_a_load(monkeypatch):
+    import threading
+    started = threading.Event()
+    stuck = threading.Event()
+
+    class _Wedged:
+        def __init__(self, cfg):
+            pass
+
+        def prelaunch_vram_gb(self):
+            return 0.0
+
+        def vram_gb(self):
+            return 8.4
+
+        def ensure_loaded(self):
+            pass
+
+        def recognize_image(self, image):
+            started.set()
+            stuck.wait(30.0)
+            return OcrPage(index=0, text="late")
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(ocr_manager_mod._ENGINE_FACTORIES, "paddle", _Wedged)
+    monkeypatch.setattr(ocr_manager_mod, "_evict_for_ocr", lambda gb: None)
+    monkeypatch.setattr(
+        "codai.models.manager.multi_model_manager.register_external_vram_releaser",
+        lambda fn: None)
+
+    m = ocr_manager_mod.OcrManager()
+    m.configure(_cfg(default_engine="paddle", evict_drain_timeout_s=0.3))
+
+    async def _go():
+        task = asyncio.ensure_future(m.ocr_pages([_page()], engine="paddle"))
+        await asyncio.to_thread(started.wait, 5.0)
+        freed = await asyncio.to_thread(m._release_vram, 999.0)
+        stuck.set()
+        try:
+            await task
+        except Exception:
+            pass
+        return freed
+
+    assert asyncio.run(_go()) > 0        # gave up on the wedged page and freed the card
+
+
+def test_ocr_rebuilds_and_takes_its_turn_again_after_being_evicted(monkeypatch):
+    """Evicted is not dead: the next request rebuilds, so OCR and models can alternate
+    as many times as the traffic asks for."""
+    builds = []
+
+    class _Eng:
+        def __init__(self, cfg):
+            pass
+
+        def prelaunch_vram_gb(self):
+            return 0.0
+
+        def vram_gb(self):
+            return 8.4
+
+        def ensure_loaded(self):
+            builds.append(1)
+
+        def recognize_image(self, image):
+            return OcrPage(index=0, text="ok")
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(ocr_manager_mod._ENGINE_FACTORIES, "paddle", _Eng)
+    evicted_for = []
+    monkeypatch.setattr(ocr_manager_mod, "_evict_for_ocr",
+                        lambda gb: evicted_for.append(gb))
+    monkeypatch.setattr(
+        "codai.models.manager.multi_model_manager.register_external_vram_releaser",
+        lambda fn: None)
+
+    m = ocr_manager_mod.OcrManager()
+    m.configure(_cfg(default_engine="paddle", paddle_instances=1))
+
+    for _turn in range(3):
+        name, pages = asyncio.run(m.ocr_pages([_page()], engine="paddle"))
+        assert (name, pages[0].text) == ("paddle", "ok")
+        assert m._release_vram(999.0) > 0        # a model takes the card back
+
+    assert len(builds) == 3          # rebuilt for every turn, never permanently dead
+    assert len(evicted_for) == 3     # and asked for room each time, like any model

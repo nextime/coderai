@@ -780,6 +780,11 @@ class OcrConfig:
     # re-attempting the load on every request (a vLLM-backed engine burns ~35s per failed
     # boot; Surya-2 once did that 338 times in a row on a card that was 11 GB short).
     build_retry_cooldown_s: float = 60.0
+    # When a model load evicts OCR, wait up to this long for in-flight pages to finish
+    # before tearing the pool down — the clean swap the model manager does for a busy
+    # model, so OCR and models take turns at a page boundary instead of OCR losing the
+    # page it was mid-way through. 0 = tear down immediately.
+    evict_drain_timeout_s: float = 60.0
     # The share of the card a VLM OCR engine's own vLLM instance claims (surya in vllm
     # mode, olmocr in vllm mode). 0 = use vllm.gpu_memory_utilization, which is sized for
     # serving an LLM and is far more than a 7B OCR model needs — on a shared card that is
@@ -1423,6 +1428,7 @@ class ConfigManager:
                 "surya_model": self.config.ocr.surya_model,
                 "surya_server_url": self.config.ocr.surya_server_url,
                 "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
+                "evict_drain_timeout_s": self.config.ocr.evict_drain_timeout_s,
                 "vlm_gpu_memory_utilization": self.config.ocr.vlm_gpu_memory_utilization,
                 "fallback_engines": self.config.ocr.fallback_engines,
                 "olmocr_enabled": self.config.ocr.olmocr_enabled,

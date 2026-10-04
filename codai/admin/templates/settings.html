@@ -1074,6 +1074,12 @@
         <label class="form-label">VLM engines' GPU share</label>
         <input type="number" id="s-ocr-vlm-gmu" class="form-input" min="0" max="1" step="0.05" placeholder="0 = vLLM default">
       </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Evict drain (s)</label>
+        <input type="number" id="s-ocr-evict-drain" class="form-input" min="0" placeholder="60">
+        <div class="form-hint">How long a model load waits for in-flight pages to finish
+          before taking OCR's VRAM — a clean swap, not a kill.</div>
+      </div>
       <div class="form-group" style="flex:1;min-width:170px">
         <label class="form-label">Fallback engines</label>
         <input type="text" id="s-ocr-fallback" class="form-input" placeholder="auto">
@@ -2011,6 +2017,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
     document.getElementById('s-ocr-vlm-gmu').value = ocr.vlm_gpu_memory_utilization ?? 0;
     document.getElementById('s-ocr-fallback').value = ocr.fallback_engines ?? 'auto';
+    document.getElementById('s-ocr-evict-drain').value = ocr.evict_drain_timeout_s ?? 60;
     document.getElementById('s-ocr-paddle-enabled').checked = ocr.paddle_enabled !== false;
     document.getElementById('s-ocr-paddle-use-gpu').checked = ocr.paddle_use_gpu !== false;
     document.getElementById('s-ocr-paddle-structure').checked = ocr.paddle_structure !== false;
@@ -2239,6 +2246,7 @@ async function saveSettings(silent){
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
       vlm_gpu_memory_utilization: parseFloat(document.getElementById('s-ocr-vlm-gmu').value) || 0,
       fallback_engines: document.getElementById('s-ocr-fallback').value.trim() || 'auto',
+      evict_drain_timeout_s: parseFloat(document.getElementById('s-ocr-evict-drain').value) || 0,
       paddle_enabled: document.getElementById('s-ocr-paddle-enabled').checked,
       paddle_use_gpu: document.getElementById('s-ocr-paddle-use-gpu').checked,
       paddle_structure: document.getElementById('s-ocr-paddle-structure').checked,

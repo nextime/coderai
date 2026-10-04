@@ -28,6 +28,7 @@ bounds the whole subsystem.
 """
 
 import asyncio
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -121,6 +122,58 @@ class _Pool:
         self._build_lock = asyncio.Lock()
         self._fail_at = 0.0           # when the last build attempt failed
         self._fail_err = None         # and why (re-raised during the cooldown)
+        # In-flight page accounting, for the clean swap in drain_and_release(). Touched
+        # from the event loop (recognize) and READ from the model manager's eviction
+        # thread, so it is guarded by a threading primitive rather than an asyncio one.
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._draining = False
+
+    def _enter_page(self) -> None:
+        with self._inflight_lock:
+            self._inflight += 1
+            self._idle.clear()
+
+    def _leave_page(self) -> None:
+        with self._inflight_lock:
+            self._inflight = max(0, self._inflight - 1)
+            if self._inflight == 0:
+                self._idle.set()
+
+    def _drain_timeout_s(self) -> float:
+        try:
+            return max(0.0, float(getattr(self.cfg, "evict_drain_timeout_s", 60.0)))
+        except Exception:
+            return 60.0
+
+    def drain_and_release(self) -> float:
+        """Let in-flight pages finish, THEN tear the pool down. Returns GB freed.
+
+        This is the OCR side of the clean swap the model manager already does for a busy
+        model (``release_idle_vram`` waits for a request boundary rather than evicting
+        mid-request). Tearing the pool down under a page that is being recognised loses
+        that page — and the caller's whole document — which is exactly what must not
+        happen when OCR and a model take turns on one card. Bounded by
+        ``ocr.evict_drain_timeout_s`` so a wedged engine cannot block the load forever."""
+        self._draining = True
+        try:
+            budget = self._drain_timeout_s()
+            with self._inflight_lock:
+                busy = self._inflight
+            if busy and budget > 0:
+                print(f"[ocr] engine '{self.name}': {busy} page(s) in flight — waiting up "
+                      f"to {budget:.0f}s for a clean swap before releasing VRAM")
+                if not self._idle.wait(budget):
+                    with self._inflight_lock:
+                        stuck = self._inflight
+                    print(f"[ocr] engine '{self.name}': {stuck} page(s) still in flight "
+                          f"after {budget:.0f}s — releasing anyway (those pages will be "
+                          f"re-read by the fallback engine)")
+            return self.release_sync()
+        finally:
+            self._draining = False
 
     def _cooldown_s(self) -> float:
         try:
@@ -134,6 +187,13 @@ class _Pool:
         async with self._build_lock:
             if self._built:
                 return
+            # A release is draining right now: let it finish before rebuilding, or we
+            # would re-evict the model that just took its turn and load into VRAM the
+            # drain is still about to free. Taking turns means waiting for the handover.
+            _waited = 0.0
+            while self._draining and _waited < self._drain_timeout_s() + 5.0:
+                await asyncio.sleep(0.05)
+                _waited += 0.05
             # A build that just failed is very unlikely to succeed on the next request a
             # second later, and retrying is not free: a vLLM-backed engine spends ~35 s
             # booting before it dies. Surya-2 did that 338 times in a row against a card
@@ -207,6 +267,7 @@ class _Pool:
     async def recognize(self, image) -> OcrPage:
         await self._ensure_built()
         eng: OcrEngine = await self._q.get()
+        self._enter_page()
         try:
             # Engines that call back into coderai's async API (olmOCR 'model' mode) run
             # in a worker thread and need a live loop to hand the coroutine to; give them
@@ -217,6 +278,7 @@ class _Pool:
                 pass
             return await asyncio.to_thread(eng.recognize_image, image)
         finally:
+            self._leave_page()
             await self._q.put(eng)
 
 
@@ -261,12 +323,17 @@ class OcrManager:
     def _release_vram(self, needed_gb: float = 999.0) -> float:
         """External VRAM releaser (called as ``fn(needed_gb)`` from the model manager's
         eviction path, SYNC). Tears down every built OCR pool and returns the estimated
-        GB freed. Pools rebuild lazily on the next OCR request. ``needed_gb`` is advisory
-        — OCR pools are all-or-nothing per engine, so we release everything held."""
+        GB freed. Pools rebuild lazily on the next OCR request, so OCR takes its turn on
+        the card again like any other model rather than staying dead for the rest of the
+        process' life. ``needed_gb`` is advisory — OCR pools are all-or-nothing per
+        engine, so we release everything held.
+
+        In-flight pages are allowed to FINISH first (see ``_Pool.drain_and_release``):
+        the handover is a clean swap at a page boundary, not a kill."""
         freed = 0.0
         for pool in list(self._pools.values()):
             try:
-                freed += pool.release_sync()
+                freed += pool.drain_and_release()
             except Exception:
                 pass
         # The managed Surya-2 vLLM subprocess isn't a manager-tracked model and its VRAM
