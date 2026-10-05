@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -2342,6 +2343,116 @@ def load_config(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError("config file must contain a JSON object")
     return {k: v for k, v in data.items() if k in CONFIG_FIELDS}
+
+
+# ---------------------------------------------------------------------------
+# Named configuration templates.
+#
+# A saved config is one JSON file, and --config/--save have always let you keep
+# several by juggling paths. A template is the same content under a NAME, in a
+# known place, with list/load/delete — so "the LongCat long-shot setup" or "the
+# quick 480p draft" is something you pick rather than a path you remember.
+#
+# They live beside the output tree (<out_dir>/templates/<name>.json) because that
+# is the directory the launcher already maps and persists; a template written to a
+# container-local path would vanish on the next run. Every key in CONFIG_FIELDS is
+# captured — a template is a complete configuration, not a patch.
+# ---------------------------------------------------------------------------
+
+TEMPLATE_DIR_NAME = "templates"
+
+
+def _safe_template_name(name: str) -> str:
+    """A template name reduced to something safe to use as a filename.
+
+    Names arrive from the CLI and from the browser, so this is a security boundary
+    as much as a tidiness one: no separators, no traversal, no leading dots."""
+    raw = (name or "").strip()
+    if not raw:
+        raise ValueError("template name is required")
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "-", raw).strip(". -")
+    cleaned = re.sub(r"-{2,}", "-", cleaned)
+    if not cleaned or cleaned in (".", ".."):
+        raise ValueError(f"template name {name!r} has no usable characters")
+    return cleaned[:80]
+
+
+def templates_dir(out_dir: str) -> Path:
+    return Path(out_dir or "./township_output").expanduser() / TEMPLATE_DIR_NAME
+
+
+def template_path(out_dir: str, name: str) -> Path:
+    return templates_dir(out_dir) / (_safe_template_name(name) + ".json")
+
+
+def list_templates(out_dir: str) -> list:
+    """Every saved template, newest first, with enough detail to choose between
+    them without opening each one."""
+    d = templates_dir(out_dir)
+    out = []
+    try:
+        entries = sorted(d.glob("*.json"))
+    except Exception:
+        return out
+    for f in entries:
+        item = {"name": f.stem, "saved_at": None, "video_model": None,
+                "image_model": None, "text_model": None, "options": 0}
+        try:
+            data = json.loads(f.read_text(encoding="utf-8")) or {}
+            meta = data.get("_template") or {}
+            item["saved_at"] = meta.get("saved_at")
+            item["options"] = len([k for k in data if k in CONFIG_FIELDS])
+            for k in ("video_model", "image_model", "text_model"):
+                item[k] = data.get(k)
+        except Exception as e:
+            item["error"] = str(e)[:120]
+        if not item["saved_at"]:
+            try:
+                item["saved_at"] = time.strftime("%Y-%m-%d %H:%M",
+                                                 time.localtime(f.stat().st_mtime))
+            except Exception:
+                pass
+        out.append(item)
+    out.sort(key=lambda i: (i.get("saved_at") or ""), reverse=True)
+    return out
+
+
+def save_template_dict(out_dir: str, name: str, cfg: dict) -> Path:
+    """Write a config dict as a named template. Returns the path written."""
+    target = template_path(out_dir, name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = {k: v for k, v in (cfg or {}).items() if k in CONFIG_FIELDS}
+    # Stamped so the picker can show when it was captured without statting the
+    # file, and so a template copied between machines keeps its own date.
+    data["_template"] = {"name": _safe_template_name(name),
+                         "saved_at": time.strftime("%Y-%m-%d %H:%M")}
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return target
+
+
+def save_template(out_dir: str, name: str, args) -> Path:
+    return save_template_dict(out_dir, name, config_from_args(args))
+
+
+def load_template(out_dir: str, name: str) -> dict:
+    """A template's options. Unknown keys (and the _template stamp) are dropped, so
+    one saved by another version stays usable."""
+    target = template_path(out_dir, name)
+    with open(target, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"template {name!r} does not contain a JSON object")
+    return {k: v for k, v in data.items() if k in CONFIG_FIELDS}
+
+
+def delete_template(out_dir: str, name: str) -> bool:
+    target = template_path(out_dir, name)
+    if not target.is_file():
+        return False
+    target.unlink()
+    return True
 
 
 # ===========================================================================
@@ -7314,8 +7425,17 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 <div style="display:flex;gap:.75rem;align-items:center;margin-top:.25rem;flex-wrap:wrap">
   <button class="btn btn-primary" type=submit id=start-btn>▶ Full run</button>
   <button class="btn btn-danger" type=button id=stop-btn onclick="stopRun()" style="display:none">■ Stop</button>
-  <button class="btn btn-secondary" type=button onclick="saveConfig()" title="Download the current options as a JSON config file you can reuse with --config / -c">💾 Save config</button>
+  <button class="btn btn-secondary" type=button onclick="saveConfig()" title="Save the current options as a JSON config file on the server, reusable with --config / -c">💾 Save config</button>
   <span id=status-pill class="status-pill status-idle">Idle</span>
+</div>
+<div style="display:flex;gap:.5rem;align-items:center;margin-top:.5rem;flex-wrap:wrap">
+  <span class=hint>Templates:</span>
+  <select id=tpl-select class="form-input" style="max-width:22rem"
+          title="Saved configurations. Loading one replaces every option on this page."></select>
+  <button class="btn btn-secondary" type=button onclick="tplLoad()" title="Apply this template to the current session, then reload the page to show it">📂 Load</button>
+  <button class="btn btn-secondary" type=button onclick="tplSave()" title="Save every option on this page as a named template">➕ Save as…</button>
+  <button class="btn btn-secondary" type=button onclick="tplDelete()" title="Delete the selected template">🗑 Delete</button>
+  <span class=hint id=tpl-hint></span>
 </div>
 <div style="margin-top:.6rem">
   <span class=hint>Run individual steps (each picks up where the last left off):</span><br>
@@ -7384,6 +7504,80 @@ async function saveConfig(){{
     appendLog('✗ Save failed: '+e);
   }}
 }}
+// ---- named configuration templates -------------------------------------
+// A template is a COMPLETE configuration, so loading one replaces every option
+// on this page; the server applies it to the live session and the page is
+// reloaded to render from it, which is the same path /save-config takes.
+async function tplRefresh(){{
+  const sel = document.getElementById('tpl-select');
+  if(!sel) return;
+  try {{
+    const r = await fetch('/templates');
+    const j = await r.json();
+    const list = j.templates || [];
+    const keep = sel.value;
+    sel.innerHTML = list.length
+      ? list.map(t => {{
+          const bits = [t.saved_at, t.video_model, (t.options||0)+' options']
+            .filter(Boolean).join(' · ');
+          return '<option value="'+t.name.replace(/"/g,'&quot;')+'">'
+                 + t.name + (bits ? '  —  ' + bits : '') + '</option>';
+        }}).join('')
+      : '<option value="">(no templates saved yet)</option>';
+    if(keep) sel.value = keep;
+    const hint = document.getElementById('tpl-hint');
+    if(hint) hint.textContent = list.length ? '' : 'in ' + (j.dir || '');
+  }} catch(e) {{ /* the picker is a convenience; never block the page */ }}
+}}
+async function tplSave(){{
+  const name = await uiPrompt('Save every option on this page as a template named:', '',
+    {{title:'Save template', okText:'Save'}});
+  if(name === null) return;
+  if(!name.trim()){{ appendLog('✗ A template needs a name'); return; }}
+  const fd = new FormData(document.getElementById('run-form'));
+  fd.set('template', name.trim());
+  try {{
+    const r = await fetch('/save-config',{{method:'POST',body:fd}});
+    const j = await r.json();
+    if(j.error){{ appendLog('✗ Save failed: '+j.error); return; }}
+    appendLog('✓ Saved template "'+j.template+'"  →  '+j.path);
+    await tplRefresh();
+    const sel = document.getElementById('tpl-select');
+    if(sel) sel.value = j.template;
+  }} catch(e) {{ appendLog('✗ Save failed: '+e); }}
+}}
+async function tplLoad(){{
+  const sel = document.getElementById('tpl-select');
+  const name = sel && sel.value;
+  if(!name){{ appendLog('✗ No template selected'); return; }}
+  if(!await uiConfirm('Load template "'+name+'"? It replaces every option on this page.',
+                      {{title:'Load template', okText:'Load'}})) return;
+  try {{
+    const fd = new FormData(); fd.set('name', name);
+    const r = await fetch('/templates/load',{{method:'POST',body:fd}});
+    const j = await r.json();
+    if(j.error){{ appendLog('✗ Load failed: '+j.error); return; }}
+    appendLog('✓ Loaded template "'+j.name+'" ('+j.options+' options) — reloading');
+    setTimeout(() => location.reload(), 400);
+  }} catch(e) {{ appendLog('✗ Load failed: '+e); }}
+}}
+async function tplDelete(){{
+  const sel = document.getElementById('tpl-select');
+  const name = sel && sel.value;
+  if(!name){{ appendLog('✗ No template selected'); return; }}
+  if(!await uiConfirm('Delete template "'+name+'"? This cannot be undone.',
+                      {{title:'Delete template', okText:'Delete'}})) return;
+  try {{
+    const fd = new FormData(); fd.set('name', name);
+    const r = await fetch('/templates/delete',{{method:'POST',body:fd}});
+    const j = await r.json();
+    if(j.error){{ appendLog('✗ Delete failed: '+j.error); return; }}
+    appendLog(j.deleted ? '✓ Deleted template "'+name+'"' : '• No such template');
+    await tplRefresh();
+  }} catch(e) {{ appendLog('✗ Delete failed: '+e); }}
+}}
+document.addEventListener('DOMContentLoaded', tplRefresh);
+
 function clearLog(){{ document.getElementById('log-box').innerHTML=''; }}
 
 let _es = null;
@@ -9505,6 +9699,11 @@ async function resetPrompts(ev){
                 html = _page("Prompts", _prompts_html(), "prompts")
                 self._send(200, "text/html; charset=utf-8", html)
 
+            elif path == "/templates":
+                import json as _j
+                self._send(200, "application/json",
+                           _j.dumps({"templates": list_templates(default_args.out_dir),
+                                     "dir": str(templates_dir(default_args.out_dir))}))
             elif path == "/status":
                 import json as _j
                 payload = _j.dumps({
@@ -10763,6 +10962,23 @@ async function resetPrompts(ev){
                     setattr(default_args, _k, _val)
                 _web_log(f"  ⚙ Settings applied (image model: "
                          f"{cfg.get('image_model') or 'auto'})")
+                # Saving as a NAMED TEMPLATE instead of a path. Handled here rather
+                # than in its own route so it reuses the identical form-to-config
+                # conversion above — a second copy of that mapping would drift.
+                tpl = _fv("template", "").strip()
+                if tpl:
+                    try:
+                        target = save_template_dict(default_args.out_dir, tpl, cfg)
+                    except Exception as e:
+                        self._send(400, "application/json",
+                                   _j.dumps({"error": f"cannot save template: {e}"}))
+                        return
+                    _web_log(f"  ⚙ Saved template '{tpl}'")
+                    self._send(200, "application/json",
+                               _j.dumps({"ok": True, "template": Path(target).stem,
+                                         "path": str(Path(target).resolve())}))
+                    return
+
                 # Resolve the target path. Relative paths land inside out_dir;
                 # the filename is sanitised to its basename for relative saves to
                 # avoid writing outside the output tree from the browser.
@@ -10782,6 +10998,53 @@ async function resetPrompts(ev){
                 except Exception as e:
                     self._send(500, "application/json",
                                _j.dumps({"error": f"cannot save: {e}"}))
+                return
+
+            if path in ("/templates/load", "/templates/delete"):
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+                nm = form.get("name")
+                nm = (nm if isinstance(nm, str) else (nm or b"").decode(
+                    errors="replace")).strip()
+                if not nm:
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "name is required"}))
+                    return
+                if path == "/templates/delete":
+                    try:
+                        gone = delete_template(default_args.out_dir, nm)
+                    except Exception as e:
+                        self._send(400, "application/json",
+                                   _j.dumps({"error": str(e)}))
+                        return
+                    _web_log(f"  ⚙ {'Deleted' if gone else 'No such'} template '{nm}'")
+                    self._send(200, "application/json",
+                               _j.dumps({"ok": bool(gone), "deleted": bool(gone)}))
+                    return
+                try:
+                    tcfg = load_template(default_args.out_dir, nm)
+                except FileNotFoundError:
+                    self._send(404, "application/json",
+                               _j.dumps({"error": f"no such template: {nm}"}))
+                    return
+                except Exception as e:
+                    self._send(400, "application/json", _j.dumps({"error": str(e)}))
+                    return
+                # Apply to the live session exactly as /save-config does, so the Run
+                # page (which renders from default_args) shows the template after a
+                # reload and every subsequent job uses it.
+                for _k, _val in tcfg.items():
+                    setattr(default_args, _k, _val)
+                _web_log(f"  ⚙ Loaded template '{nm}' ({len(tcfg)} options)")
+                self._send(200, "application/json",
+                           _j.dumps({"ok": True, "name": nm, "options": len(tcfg)}))
                 return
 
             if path == "/process":
@@ -11518,6 +11781,18 @@ OUTPUT LAYOUT
                         help="Save the selected generation options to a JSON config file "
                              "and exit (no generation is run). Combine with other flags to "
                              "capture them, then reuse later with --config.")
+    parser.add_argument("-T", "--template", default=None, metavar="NAME",
+                        help="Load a saved named template (see --save-template). Layered "
+                             "ON TOP of --config, and command-line arguments still win, so "
+                             "a template can be a base you tweak per run.")
+    parser.add_argument("--save-template", default=None, metavar="NAME",
+                        help="Save the selected options as a named template under "
+                             "<out-dir>/templates/ and exit. Captures the complete "
+                             "configuration, not a patch.")
+    parser.add_argument("--list-templates", action="store_true",
+                        help="List the saved templates for this output directory and exit.")
+    parser.add_argument("--delete-template", default=None, metavar="NAME",
+                        help="Delete a saved template and exit.")
     parser.add_argument("--base-url",  default="http://127.0.0.1:8776", metavar="URL",
                         help="CoderAI base URL (default: http://127.0.0.1:8776)")
     parser.add_argument("--api-key",   default=None, metavar="KEY",
@@ -11752,7 +12027,57 @@ OUTPUT LAYOUT
             parser.set_defaults(**cfg)
             _log(f"  Loaded {len(cfg)} option(s) from config: {pre.config}")
 
+    # A template layers over the config file, and explicit command-line arguments
+    # still override both. Resolved against the out_dir in force AFTER the config
+    # loaded, so a config that sets out_dir finds its own templates.
+    if pre.template:
+        _tpl_out = (getattr(pre, "out_dir", None)
+                    or (cfg.get("out_dir") if pre.config else None)
+                    or parser.get_default("out_dir"))
+        try:
+            tcfg = load_template(_tpl_out, pre.template)
+        except FileNotFoundError:
+            parser.error(f"no such template: {pre.template} "
+                         f"(looked in {templates_dir(_tpl_out)}; "
+                         f"--list-templates shows what is there)")
+        except Exception as e:
+            parser.error(f"cannot load template {pre.template}: {e}")
+        if tcfg:
+            parser.set_defaults(**tcfg)
+            _log(f"  Loaded {len(tcfg)} option(s) from template: {pre.template}")
+
     args = parser.parse_args()
+
+    # Template management runs before anything else and exits: these are
+    # housekeeping commands, not generation runs.
+    if args.list_templates:
+        items = list_templates(args.out_dir)
+        if not items:
+            _log(f"No templates in {templates_dir(args.out_dir)}")
+        else:
+            _log(f"Templates in {templates_dir(args.out_dir)}:")
+            for it in items:
+                bits = [b for b in (it.get("video_model"), it.get("image_model")) if b]
+                _log(f"  {it['name']:<28} {it.get('saved_at') or '':<17} "
+                     f"{it['options']:>3} options"
+                     + (f"   [{', '.join(bits)}]" if bits else "")
+                     + (f"   ⚠ {it['error']}" if it.get("error") else ""))
+        return
+    if args.delete_template:
+        try:
+            gone = delete_template(args.out_dir, args.delete_template)
+        except Exception as e:
+            parser.error(f"cannot delete template {args.delete_template}: {e}")
+        _log(f"{'✓ Deleted' if gone else '• No such'} template: {args.delete_template}")
+        return
+    if args.save_template:
+        try:
+            target = save_template(args.out_dir, args.save_template, args)
+        except Exception as e:
+            parser.error(f"cannot save template {args.save_template}: {e}")
+        _log(f"✓ Saved template '{args.save_template}' "
+             f"({len(config_from_args(args))} options) to {target}")
+        return
 
     # --save: capture the selected options to a config file and exit.
     if args.save:
