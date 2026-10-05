@@ -115,7 +115,9 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         if use_int8:
             # avatar-1.5 only: a pre-quantised DiT under base_model_int8/, loaded by the
             # repo's own helper rather than from_pretrained.
-            from longcat_video.modules.longcat_video_dit import load_quantized_dit
+            # It lives in the quantization module, not the DiT one, and it returns the
+            # AVATAR transformer — consistent with INT8 being an avatar-1.5-only build.
+            from longcat_video.modules.quantization import load_quantized_dit
             dit = load_quantized_dit(root, subfolder=LC.INT8_SUBDIR,
                                      cp_split_hw=_state.get("cp_split_hw"))
             log(f"loaded the INT8 DiT from {LC.INT8_SUBDIR}/")

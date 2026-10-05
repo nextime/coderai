@@ -790,6 +790,17 @@ class LongcatConfig:
     # work, and the manager's own busy signal cannot see it (the worker holds no model
     # pool), so this is what makes the handover a clean swap instead of a lost request.
     evict_drain_timeout_s: float = 300.0
+    # LoRA / QLoRA training. coderai does not implement the loop — SimpleTuner does, and
+    # it supports LongCat-Video natively including a quantised base — so it is driven out
+    # of a venv of its own (SimpleTuner pins its own torch and would fight the inference
+    # venv's). Blank = beside the inference venv as <venv>-train.
+    train_venv: str = ""
+    train_auto_build: bool = False
+    # int8-quanto | int4-quanto | fp8-torchao | "" (bf16). This is the QLoRA switch: the
+    # 13.6B transformer does not fit a consumer card at bf16 with optimiser state.
+    train_base_precision: str = "int8-quanto"
+    train_lora_rank: int = 8            # SimpleTuner's guidance for this model is 4-8
+    train_gradient_checkpointing: bool = True
     extra_args: str = ""                # appended to the service command line
     extra_env: str = ""                 # KEY=VALUE pairs for the service process
 
@@ -1435,6 +1446,11 @@ class ConfigManager:
                 "attention": self.config.longcat.attention,
                 "ready_timeout": self.config.longcat.ready_timeout,
                 "evict_drain_timeout_s": self.config.longcat.evict_drain_timeout_s,
+                "train_venv": self.config.longcat.train_venv,
+                "train_auto_build": self.config.longcat.train_auto_build,
+                "train_base_precision": self.config.longcat.train_base_precision,
+                "train_lora_rank": self.config.longcat.train_lora_rank,
+                "train_gradient_checkpointing": self.config.longcat.train_gradient_checkpointing,
                 "extra_args": self.config.longcat.extra_args,
                 "extra_env": self.config.longcat.extra_env,
             },

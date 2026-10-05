@@ -489,6 +489,144 @@ def progress(model_path: str, config: dict = None) -> dict:
         return {}
 
 
+# ── LoRA / QLoRA training ────────────────────────────────────────────────────
+
+_TRAIN_SCRIPT = _REPO_ROOT / "tools" / "longcat_train.py"
+_TRAIN_REQUIREMENTS = _REPO_ROOT / "requirements-longcat-train.txt"
+
+
+def resolve_train_venv(config: dict = None) -> Path:
+    """Where SimpleTuner lives. A venv of its OWN, not the inference one.
+
+    SimpleTuner pins its own torch; sharing the inference venv would have the two fight
+    over it and leave neither working."""
+    sec = _cfg_section()
+    configured = ((config or {}).get("longcat_train_venv") or "").strip()
+    if configured:
+        return Path(os.path.expanduser(configured))
+    if sec is not None and str(getattr(sec, "train_venv", "") or "").strip():
+        return Path(os.path.expanduser(str(sec.train_venv).strip()))
+    explicit = os.environ.get("CODERAI_LONGCAT_TRAIN_VENV")
+    if explicit:
+        return Path(os.path.expanduser(explicit))
+    # Beside the inference venv, clearly named.
+    inference = resolve_venv_dir(config)
+    return inference.parent / (inference.name + "-train")
+
+
+def _train_venv_ok(py: Path) -> bool:
+    try:
+        return subprocess.run([str(py), "-c", "import simpletuner"],
+                              capture_output=True, timeout=180).returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_train_built(config: dict = None) -> Path:
+    """The interpreter SimpleTuner runs under. Builds it only if allowed to."""
+    venv = resolve_train_venv(config)
+    py = _venv_python(venv)
+    if py.exists() and _train_venv_ok(py):
+        return py
+    sec = _cfg_section()
+    auto = bool(getattr(sec, "train_auto_build", False)) if sec is not None else False
+    if not auto:
+        raise RuntimeError(
+            f"LongCat LoRA training needs SimpleTuner, which is not in {venv}. "
+            f"coderai does not implement this training loop: LongCat's venv is "
+            f"standalone so it cannot reuse the shared trainer, and the upstream repo "
+            f"has no way to create trainable LoRA layers (only load_lora from a file, "
+            f"in its own key layout). Build it:\n"
+            f"  <python3.10> -m venv {venv}\n"
+            f"  {py} -m pip install -r {_TRAIN_REQUIREMENTS}\n"
+            f"…or set longcat.train_auto_build = true.")
+    py310 = _find_python310(config)
+    if not py310:
+        raise RuntimeError(
+            "longcat.train_auto_build is on but no Python 3.10 interpreter was found "
+            "(coderai's own is 3.13) — set longcat.python, or use the image.")
+    if not py.exists():
+        print(f"[longcat] creating the training venv at {venv} …", flush=True)
+        venv.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([py310, "-m", "venv", str(venv)], check=True)
+        py = _venv_python(venv)
+    subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
+    subprocess.run([str(py), "-m", "pip", "install", "-r", str(_TRAIN_REQUIREMENTS)],
+                   check=True)
+    if not _train_venv_ok(py):
+        raise RuntimeError(f"the training venv at {venv} was built but `import "
+                           f"simpletuner` still fails")
+    return py
+
+
+def train_lora(job: dict, workdir: str, on_progress=None) -> dict:
+    """Run one LoRA/QLoRA job. Returns SimpleTuner's result dict.
+
+    ``job`` is written to disk and the trainer appends JSON lines beside it, the same
+    protocol tools/lora_train_worker.py uses — so the existing job records, the progress
+    endpoint and the Tasks page need no changes.
+
+    GPU exclusivity is the CALLER's business: training wants the whole card, and the
+    model manager's releasers (including this module's) are what clear it."""
+    import json as _json
+
+    sec = _cfg_section()
+    py = ensure_train_built(job.get("request") or {})
+    work = Path(os.path.expanduser(workdir))
+    work.mkdir(parents=True, exist_ok=True)
+    job.setdefault("base_precision",
+                   str(getattr(sec, "train_base_precision", "") or "")
+                   if sec is not None else "")
+    job.setdefault("rank", int(getattr(sec, "train_lora_rank", 8) or 8)
+                   if sec is not None else 8)
+    job.setdefault("gradient_checkpointing",
+                   bool(getattr(sec, "train_gradient_checkpointing", True))
+                   if sec is not None else True)
+
+    job_path = work / "job.json"
+    job_path.write_text(_json.dumps(job, indent=2, default=str))
+    progress_path = str(job_path) + ".progress"
+    result_path = str(job_path) + ".result"
+
+    cmd = [str(py), str(_TRAIN_SCRIPT), "--job", str(job_path)]
+    print(f"[longcat] training: {' '.join(cmd)}", flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, cwd=str(_REPO_ROOT))
+    threading.Thread(target=_pump_logs, args=(proc, collections.deque(maxlen=20)),
+                     daemon=True).start()
+
+    seen = 0
+    while proc.poll() is None:
+        seen = _drain_progress(progress_path, seen, on_progress)
+        time.sleep(2)
+    _drain_progress(progress_path, seen, on_progress)
+
+    if not os.path.isfile(result_path):
+        raise RuntimeError(f"the trainer exited {proc.returncode} without writing a "
+                           f"result — see the [longcat] log above")
+    data = _json.loads(open(result_path).read() or "{}")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error") or "LongCat LoRA training failed")
+    return data.get("result") or {}
+
+
+def _drain_progress(path: str, seen: int, on_progress) -> int:
+    """Forward new JSON lines to the caller. Returns how many have been consumed."""
+    if not on_progress or not os.path.isfile(path):
+        return seen
+    import json as _json
+    try:
+        lines = open(path).read().splitlines()
+    except Exception:
+        return seen
+    for line in lines[seen:]:
+        try:
+            on_progress(**_json.loads(line))
+        except Exception:
+            pass
+    return len(lines)
+
+
 # ── model-manager integration ─────────────────────────────────────────────────
 
 class LongcatHandle:

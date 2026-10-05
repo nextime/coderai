@@ -444,6 +444,12 @@ class LoraTrainRequest(BaseModel):
     # Quantize the (large) video transformer to 4-bit for training (QLoRA). Lets a
     # 14B video model's LoRA fit on a consumer GPU. Ignored for image targets.
     quantize_4bit: Optional[bool] = True
+    # LongCat-Video (target "longcat") trains through SimpleTuner, which wants a
+    # captioned VIDEO dataset described by its own data-backend config. coderai will not
+    # synthesise one from `images`: a still-image dataset would train a different thing
+    # than a video LoRA, and silently so.
+    dataset_config: Optional[str] = None   # path to a SimpleTuner data-backend config
+    train_resolution: Optional[str] = None  # "480x832"; sides divisible by 16
     num_frames: Optional[int] = 1          # training video length (1 = stills-only)
     character: Optional[str] = None        # saved character profile to pull images from
     environment: Optional[str] = None      # OR saved environment profile to pull images from
@@ -1053,6 +1059,16 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
         _arch = _detect_arch(video_path, _target) or "wan"
         if _arch != "wan":
             print(f"  [lora] training a {_arch} adapter for {video_path}")
+            # Some architectures do not train in this process at all. LongCat-Video is
+            # the case: its venv is standalone (Python 3.10 / torch 2.6) so it cannot
+            # reuse this module the way the overlay trainer does, AND its repo has no way
+            # to create trainable LoRA layers — only load_lora() from a file, in its own
+            # key layout. SimpleTuner implements it properly, so coderai drives that.
+            from codai.api.lora_archs import external_trainer as _external
+            if _external(_arch):
+                return _train_externally(_arch, req, video_path, images,
+                                         instance_prompt, steps, rank, resolution,
+                                         lr, seed)
             # H3 and Krea 2 need diffusers >= 0.40 and this process has 0.38 — and
             # diffusers is imported once per process, so they train in the overlay
             # venv instead. LTX-2 needs nothing newer and stays in-process.
@@ -1868,6 +1884,56 @@ def _train_via_overlay(arch, req, base_path, images, instance_prompt,
         raise HTTPException(status_code=500,
                             detail=f"{arch} LoRA training failed: {out.get('error')}")
     return out["result"]
+
+
+def _train_externally(arch: str, req, base_path, images, instance_prompt,
+                      steps, rank, resolution, lr, seed):
+    """Hand a job to an external trainer that owns this architecture.
+
+    Only LongCat-Video today. Progress comes back on the same JSON-lines protocol the
+    overlay trainer uses, so _set_progress and the job records need no special case.
+
+    Note what is NOT done here: no images are re-encoded and no dataset is built in this
+    process. SimpleTuner wants a captioned video dataset with its own backend config, and
+    translating a list of stills into one silently would train something other than what
+    was asked for. The dataset path is the caller's, and its absence is an error."""
+    import tempfile
+    from codai.api import longcat_worker
+
+    dataset = (getattr(req, "dataset_config", None) or "").strip() \
+        if hasattr(req, "dataset_config") else ""
+    if not dataset:
+        raise RuntimeError(
+            f"{arch} LoRA training needs `dataset_config` — a path to a SimpleTuner "
+            f"data-backend config describing your captioned video clips (its quickstart "
+            f"suggests 50-100 clips of 10-30s). coderai will not invent one from the "
+            f"reference images: a still-image dataset would train a different thing "
+            f"than a video LoRA.")
+    if not os.path.isfile(os.path.expanduser(dataset)):
+        raise RuntimeError(f"dataset_config does not exist: {dataset}")
+
+    out_dir = os.path.join(_lora_dir(), getattr(req, "name", "longcat-lora"))
+    work = tempfile.mkdtemp(prefix="longcat-train-")
+    job = {
+        "arch": arch,
+        "request": {k: v for k, v in vars(req).items()
+                    if isinstance(v, (str, int, float, bool, type(None)))},
+        "base_path": base_path,
+        "output_dir": out_dir,
+        "dataset_config": os.path.expanduser(dataset),
+        "instance_prompt": instance_prompt,
+        "steps": int(steps), "rank": int(rank), "lr": float(lr), "seed": int(seed),
+        "resolution": getattr(req, "train_resolution", None) or "480x832",
+        "num_frames": int(getattr(req, "num_frames", 93) or 93),
+    }
+
+    def _progress(**kw):
+        _set_progress(step=kw.get("step"), total=kw.get("total"),
+                      message=kw.get("message") or kw.get("status") or "")
+
+    result = longcat_worker.train_lora(job, work, on_progress=_progress)
+    return {"path": result.get("path") or out_dir, "steps": int(steps),
+            "rank": int(rank), "arch": arch, "trainer": "simpletuner"}
 
 
 def _train_flow_dit(arch: str, req, base_path, images, instance_prompt,

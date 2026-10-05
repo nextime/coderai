@@ -201,8 +201,63 @@ The audio is resampled to 16 kHz (the encoder's rate) and embedded by the family
 encoder. `ref_img_index` (0–24; 30 reduces repeated actions) and `mask_frame_range` are
 set on the model entry.
 
+## LoRA / QLoRA training
+
+Supported, through **SimpleTuner**, which coderai drives. It does not train in-process,
+and the two reasons are worth knowing because they are not going to change on their own:
+
+1. LongCat's venv is standalone (Python 3.10, torch 2.6, transformers 4.41), so a trainer
+   there cannot import `codai.api.loras` the way the overlay trainer for H3/Krea does —
+   that venv inherits the parent's site-packages, this one deliberately does not.
+2. The upstream repo has **no way to create trainable LoRA layers**. Its DiT exposes
+   `load_lora()`, `enable_loras()` and `disable_all_loras()` and nothing that initialises
+   one, and the adapters it loads (`cfg_step_lora`, `refinement_lora`, `dmd_lora`) use its
+   own key layout. Hand-rolling that layout unverified would produce adapters the pipeline
+   cannot load — support in appearance only.
+
+Upstream's own refinement expert *is* a LoRA on the base model, so the architecture is
+well suited to this; it is the training-side plumbing that is missing, not the capability.
+
+```bash
+python3.10 -m venv ~/.coderai/longcat_venv-train
+~/.coderai/longcat_venv-train/bin/python -m pip install -r requirements-longcat-train.txt
+```
+
+A separate venv from the inference one: SimpleTuner pins its own torch and the two would
+fight. Then:
+
+```jsonc
+POST /v1/loras/train
+{
+  "name": "my-style",
+  "base_model": "meituan-longcat/LongCat-Video",
+  "target": "longcat",
+  "dataset_config": "/data/my-clips/simpletuner.json",
+  "steps": 800,
+  "rank": 8
+}
+```
+
+`dataset_config` is **required** and is a SimpleTuner data-backend config describing
+captioned video clips (its quickstart suggests 50–100 clips of 10–30 s). coderai will not
+synthesise one from the `images` field other targets use: a still-image dataset would
+train something other than a video LoRA, and silently.
+
+**QLoRA** is `longcat.train_base_precision` — `int8-quanto` (the default),
+`int4-quanto` or `fp8-torchao`, no extra installs. A 13.6B transformer plus optimiser
+state does not fit a consumer card at bf16, so the quantised base is the normal path
+rather than the exception. Batch size 1, gradient checkpointing on, rank 4–8.
+
+Two constraints are checked **before** a long run starts, because they are the VAE's and
+not preferences: `(num_frames - 1)` must be divisible by 4 — the same 4n+1 rule coderai
+already applies to Wan — and each side of the resolution must be divisible by 16.
+
+Progress arrives on the same job/JSON-lines protocol the other trainers use, so
+`/v1/loras/progress` and the Tasks page work unchanged.
+
 ## Not done yet
 
 - GGUF variants (they need the ComfyUI gguf loader)
-- LoRA/QLoRA training on top of it (feasible — upstream's own refinement expert is a LoRA)
 - **no generation has been verified against real weights**, avatar included
+- **no training run has been executed** — the SimpleTuner driver is wired and its config
+  and constraints are checked, but it has not been run against a real dataset

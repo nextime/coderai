@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# CoderAI — LoRA / QLoRA training for LongCat-Video, via SimpleTuner.
+#
+# coderai does NOT implement this training loop, for two reasons that are both hard:
+#
+#  1. LongCat's venv is standalone (Python 3.10, torch 2.6, transformers 4.41), so a
+#     trainer there cannot import codai.api.loras the way tools/lora_train_worker.py
+#     does — that overlay venv inherits the parent's site-packages; this one cannot.
+#  2. The upstream repo offers no way to CREATE LoRA layers. Its DiT has load_lora() and
+#     enable_loras() but nothing that initialises trainable ones, and the adapters it
+#     loads (cfg_step_lora, refinement_lora, dmd_lora) use its own key layout.
+#     Reimplementing that layout blind would produce adapters the pipeline cannot load.
+#
+# SimpleTuner implements LongCat-Video properly — `model_family: "longcat_video"`, LoRA
+# and quantised LoRA (int8-quanto / int4-quanto / fp8-torchao, no extra installs) — so
+# coderai generates its config and drives it.
+#
+# This is a SEPARATE venv from the inference one: SimpleTuner pins its own torch and
+# would otherwise fight requirements-longcat.txt.
+#
+#   python3.10 -m venv <dir> && <dir>/bin/python -m pip install -r this-file
+#   (or set longcat.train_auto_build = true)
+# ---------------------------------------------------------------------------
+simpletuner

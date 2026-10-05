@@ -71,10 +71,46 @@ ARCHS = {
         "shift": 3.0,
         "needs": "diffusers>=0.40 and access to the gated krea/Krea-2-* weights",
     },
+    "longcat": {
+        "label": "LongCat-Video DiT",
+        "kind": "video",
+        "detect": ("longcat",),
+        # Named for completeness, but NOT importable from diffusers: these classes live
+        # in the upstream repo's own `longcat_video` package. See `external` below.
+        "transformer": "LongCatVideoTransformer3DModel",
+        "vae": "AutoencoderKLWan",
+        "text_encoder": ("transformers", "UMT5EncoderModel"),
+        "module": "longcat_video.modules.longcat_video_dit",
+        "shift": 5.0,
+        # This architecture does NOT train through the shared in-process trainer, for two
+        # reasons that are both hard:
+        #
+        #  1. its venv is standalone — Python 3.10, torch 2.6, transformers 4.41 — so it
+        #     cannot import codai.api.loras the way tools/lora_train_worker.py does (that
+        #     overlay venv inherits the parent's site-packages; this one cannot);
+        #  2. the repo offers no way to CREATE LoRA layers. Its DiT has load_lora() and
+        #     enable_loras() but nothing to initialise trainable ones, and the adapters it
+        #     loads (cfg_step_lora, refinement_lora, dmd_lora) are in its own key layout.
+        #     Hand-rolling that layout would produce adapters the pipeline cannot load.
+        #
+        # SimpleTuner implements it properly (model_family "longcat_video", LoRA and
+        # quantised LoRA), so that is what coderai drives.
+        "external": "simpletuner",
+        "needs": ("the LongCat-Video venv plus SimpleTuner — coderai drives it rather "
+                  "than training in-process"),
+    },
 }
 
 #: What `target` may be on a train request.
-TARGETS = ("image", "video", "wan", "ltx2", "h3", "krea")
+TARGETS = ("image", "video", "wan", "ltx2", "h3", "krea", "longcat")
+
+#: Architectures trained by an external trainer rather than the shared in-process loop.
+EXTERNAL_TARGETS = tuple(k for k, v in ARCHS.items() if v.get("external"))
+
+
+def external_trainer(arch: str) -> str:
+    """Which external trainer this architecture needs, or "" for the in-process loop."""
+    return str((ARCHS.get(arch) or {}).get("external") or "")
 
 
 def detect_arch(model_path: str, target: str = "") -> Optional[str]:
@@ -111,6 +147,14 @@ def load_classes(arch: str):
     spec = ARCHS.get(arch)
     if not spec:
         raise RuntimeError(f"Unknown LoRA architecture '{arch}'")
+    if spec.get("external"):
+        # Its classes are not in diffusers and it does not train in this process at all;
+        # saying so here beats an AttributeError that reads like a diffusers version
+        # problem.
+        raise RuntimeError(
+            f"{spec['label']} does not train in this process — it needs "
+            f"{spec['external']} in the LongCat-Video venv ({spec.get('needs')}). "
+            f"coderai launches it; this code path is not the one that runs it.")
     import importlib
     diffusers = importlib.import_module("diffusers")
     missing = [n for n in (spec["transformer"], spec["vae"]) if not hasattr(diffusers, n)]
