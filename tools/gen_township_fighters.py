@@ -2376,29 +2376,62 @@ TEMPLATE_DIR_NAME = "templates"
 # Frame counts for LongCat are 4n+1: that is the VAE's rule, the same one Wan uses, and
 # a count that misses it is silently snapped or rejected.
 BUILTIN_TEMPLATES = {
+    # The two starters describe the same show rendered by models with opposite
+    # strengths. Only the settings that actually differ BY MODEL are listed: the
+    # character and environment stages are image-side work (the image model draws
+    # them, the video model never sees the pool), so their counts, reference-image
+    # budgets and LoRA settings are deliberately absent — a template that pinned
+    # them would reset an operator's pool size for no reason. keyframe_size IS
+    # listed, because a keyframe is the first frame the video model is conditioned
+    # on and has to match the clip's aspect.
     "Wan - many short scenes": {
         "video_model": None,          # blank = auto-select; this is the historical shape
+        "consistency": "keyframe",
         "fps": 8,
+        "playback_fps": 0,
+        "fps_multiplier": 0,
+        "upscale_factor": 0,
+        "matches": 6,
         "clip_min_frames": 50,
         "clip_max_frames": 70,
         "single_clip_max_frames": 50,
+        # Outcome stings are their own clips and go through the same video model:
+        # at 8fps, 96-150 frames is 12-19s.
+        "outcome_min_frames": 96,
+        "outcome_max_frames": 150,
         "video_size": "832x480",
+        "keyframe_size": "832x480",
         "short_min": 40.0, "short_max": 50.0,
         "long_min": 65.0, "long_max": 75.0,
     },
     "LongCat - few long scenes": {
         "video_model": "longcat",
+        "consistency": "keyframe",
         # LongCat's own rate. 8fps was a Wan-era compromise; at 15 the motion is what
         # the model was trained to produce.
         "fps": 15,
-        # 173 = 93 + 80 (two segments) ≈ 11.5s; 333 = 93 + 80x3 (four) ≈ 22s. Both 4n+1.
+        "playback_fps": 0,
+        # 15fps needs no frame interpolation to be watchable, where 8 did. Left off
+        # so a long run does not pay for a RIFE pass it does not need.
+        "fps_multiplier": 0,
+        "upscale_factor": 0,
+        # Each match is 2-4 long scenes instead of 6-8 short ones, but a scene is
+        # ~4x the frames, so a batch is tuned down to keep one sitting finite.
+        "matches": 3,
+        # 173 = 93 + 80 (two segments) ~ 11.5s; 333 = 93 + 80x3 (four) ~ 22s. Both 4n+1.
         # At these lengths a 40-50s short is 2-4 scenes rather than 6-8.
         "clip_min_frames": 173,
         "clip_max_frames": 333,
         # The client-side split is lifted for LongCat anyway (the server owns the segment
         # loop), but this keeps the number honest if the model is switched back.
         "single_clip_max_frames": 333,
+        # Outcomes follow the same rule as the clips: 93 is one whole segment and the
+        # shortest honest LongCat ask, 173 is two. The Wan-era 96/150 were neither
+        # 4n+1 nor segment-aligned, so the server had to round them.
+        "outcome_min_frames": 93,
+        "outcome_max_frames": 173,
         "video_size": "832x480",       # LongCat's 480p landscape
+        "keyframe_size": "832x480",
         "short_min": 40.0, "short_max": 50.0,
         "long_min": 65.0, "long_max": 75.0,
     },
@@ -6922,6 +6955,10 @@ def launch_web_ui(default_args):
   --belt:#e8b33c; --belt-hot:#f2c45c;
   --red-corner:#d7263d; --blue-corner:#2e86de;
   --good:#53c08a; --warn:#e8b33c; --bad:#e2605c;
+  /* Hues the page markup used to hardcode: a violet for wardrobe, a sage for
+     "already there", a tan for a warning panel, a deep green for a confirm. */
+  --violet:#7a3da8; --violet-text:#c79bf0; --sage:#9fdca0; --tan:#e0a060;
+  --good-deep:#2d7a4a;
   --r-sm:5px; --r-md:9px; --r-lg:14px;
   --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
@@ -6967,7 +7004,11 @@ label:first-child{margin-top:0}
 
 /* 16px fields everywhere — the old .85rem was cramped on a desktop too, not just
    a phone, and 16px is what stops iOS zooming on focus. */
-input[type=text],input[type=number],input[type=url],select,textarea{
+/* Match an input with no type= too: the wardrobe rows never declared one, and
+   [type=text] does not match a missing attribute, so those fields had been
+   rendering as white browser-default boxes on a dark page. */
+input:not([type]),input[type=text],input[type=number],input[type=url],
+input[type=search],input[type=password],select,textarea{
   background:var(--ink-2);border:1px solid var(--line);color:var(--text);
   padding:.5rem .6rem;border-radius:var(--r-sm);width:100%;font-size:16px;
   font-family:inherit;transition:border-color .12s,background .12s}
@@ -6976,8 +7017,8 @@ input[type=text],input[type=number],input[type=url],select,textarea{
    content and sit left, so a column of them lines up. */
 input[type=number]{font-family:var(--mono);font-variant-numeric:tabular-nums;
                    max-width:11rem}
-input:hover,select:hover,textarea:hover{border-color:var(--line-strong)}
-input:focus,select:focus,textarea:focus{border-color:var(--belt);background:#0a0e12;outline:none}
+input:not([type=checkbox]):hover,select:hover,textarea:hover{border-color:var(--line-strong)}
+input:not([type=checkbox]):focus,select:focus,textarea:focus{border-color:var(--belt);background:#0a0e12;outline:none}
 input::placeholder,textarea::placeholder{color:var(--text-faint)}
 select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--text-dim) 50%),linear-gradient(135deg,var(--text-dim) 50%,transparent 50%);
        background-position:calc(100% - 15px) 52%,calc(100% - 10px) 52%;
@@ -7091,16 +7132,174 @@ label .hint,label small{font-weight:400}
                  line-height:1;cursor:pointer;z-index:211;font-weight:700}
 .vlightbox-close:hover{color:var(--belt)}
 
+/* ── app shell ───────────────────────────────────────────────────
+   The old page was one 1180px column: a top nav, ten stacked setting cards, the
+   buttons that start a run, and then the log. Starting a render meant scrolling
+   past 66 settings to reach the button, and watching one meant scrolling to the
+   bottom and staying there. Three fixed regions fix that, and none of them move:
+   navigation on the left, the run controls in a bar at the top of the content,
+   and the log in a dock at the bottom that opens itself when a run begins.
+   ------------------------------------------------------------------------- */
+.shell{display:grid;grid-template-columns:234px minmax(0,1fr);min-height:100vh}
+
+.side{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+      background:var(--ink-2);border-right:1px solid var(--line);
+      display:flex;flex-direction:column;gap:.2rem;padding:.9rem .7rem}
+.brand{display:flex;align-items:baseline;gap:.4rem;font-size:1.02rem;font-weight:700;
+       color:var(--text);letter-spacing:-.015em;padding:.1rem .45rem .75rem;
+       text-decoration:none}
+.brand:hover{color:var(--text);text-decoration:none}
+.brand .brand-mark{font-size:1.1rem;color:var(--belt)}
+.brand b{font-weight:800}
+.brand i{font-style:normal;color:var(--text-faint);font-weight:500}
+
+.side-nav{display:flex;flex-direction:column;gap:.12rem}
+.side-nav a{display:flex;align-items:center;gap:.55rem;color:var(--text-dim);
+            padding:.42rem .45rem .42rem .6rem;border-radius:var(--r-sm);
+            font-size:.9rem;font-weight:500;border-left:2px solid transparent}
+.side-nav a:hover{background:var(--surface);color:var(--text);text-decoration:none}
+.side-nav a[aria-current="page"]{background:var(--surface);color:var(--text);
+                                 border-left-color:var(--belt);font-weight:650}
+.side-nav .nav-ico{width:1.1rem;text-align:center;flex:none;opacity:.95}
+
+/* Anything the sidebar carries below the links is live state, so it sits at the
+   bottom edge and stays in view while the form scrolls. */
+.side-foot{margin-top:auto;padding-top:.8rem;display:flex;flex-direction:column;gap:.5rem}
+.side-card{background:var(--surface);border:1px solid var(--line);
+           border-radius:var(--r-md);padding:.6rem .7rem}
+.side-card .sc-label{font-size:.72rem;color:var(--text-faint);font-weight:600;
+                     margin-bottom:.35rem}
+.side-meta{font-size:.72rem;color:var(--text-faint);font-family:var(--mono);
+           padding:0 .45rem;line-height:1.5;overflow-wrap:anywhere}
+
+.main{display:flex;flex-direction:column;min-width:0}
+.topbar{position:sticky;top:0;z-index:40;display:flex;align-items:center;
+        gap:.7rem;flex-wrap:wrap;padding:.6rem 1.3rem;
+        background:color-mix(in srgb,var(--ink) 92%,transparent);
+        backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+@supports not (backdrop-filter:blur(2px)){.topbar{background:var(--ink)}}
+.topbar h1{font-size:1.16rem;margin:0}
+.topbar-actions{margin-left:auto;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.content{padding:1.2rem 1.3rem 1.5rem;max-width:1240px;width:100%}
+
+/* A 66-setting form is shorter to read in two columns than one. Cards flow
+   row-major, and a card whose rows are already three wide claims the full width
+   rather than being squeezed. */
+.form-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:.85rem;align-items:start}
+@media (min-width:1220px){
+  .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .form-grid>.span2{grid-column:1/-1}
+}
+.form-grid>.card{margin-bottom:0}
+/* A card in the two-column grid is ~560px wide, so its inner rows have to answer
+   to the CARD's width, not the window's — otherwise a three-up row inside a
+   half-width card is unusable on a wide screen. */
+.card{container-type:inline-size}
+@container (max-width:560px){ .card .row3{grid-template-columns:repeat(2,minmax(0,1fr))} }
+@container (max-width:380px){ .card .row,.card .row3{grid-template-columns:minmax(0,1fr)} }
+/* A label that wraps to two lines must not push its field out of line with the
+   field beside it. */
+.row>div:not(.bottom),.row3>div:not(.bottom){display:flex;flex-direction:column;min-width:0}
+.row>.bottom,.row3>.bottom{align-self:end;padding-bottom:.45rem}
+.row>div>input,.row>div>select,.row>div>.pair,
+.row3>div>input,.row3>div>select,.row3>div>.pair{margin-top:auto}
+
+/* ── small parts, so the markup stops carrying its own styles ─────────────
+   The pages had ~270 inline style attributes, and 32 of them re-shrank a button
+   below the type scale it had just been given. These are the patterns they were
+   spelling out by hand. */
+.btn-sm{padding:.3rem .75rem;font-size:.82rem}
+.btn-xs{padding:.18rem .5rem;font-size:.75rem}
+.hstack{display:flex;align-items:center;gap:.45rem;flex-wrap:wrap}
+.hstack-tight{display:flex;align-items:center;gap:.3rem}
+.vstack{display:flex;flex-direction:column;gap:.4rem}
+.bar-split{display:flex;justify-content:space-between;align-items:center;gap:.7rem;flex-wrap:wrap}
+.pair{display:flex;gap:.4rem}
+.pair>input{min-width:0}
+.bottom{display:flex;align-items:flex-end}
+.grow{flex:1;min-width:0}
+.mt-1{margin-top:.3rem}.mt-2{margin-top:.4rem}.mt-3{margin-top:.5rem}
+.mt-4{margin-top:.6rem}.mt-5{margin-top:.8rem}.mt-6{margin-top:1.1rem}
+.mb-4{margin-bottom:.6rem}.mb-5{margin-bottom:.8rem}.mb-6{margin-bottom:1rem}
+.m0{margin:0}
+.t-dim{color:var(--text-dim)}
+.t-faint{color:var(--text-faint)}
+.t-link{color:var(--blue-corner)}
+.t-belt{color:var(--belt)}
+.t-good{color:var(--good)}
+.t-bad{color:var(--bad)}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.w-narrow{max-width:11rem}
+.w-mid{max-width:22rem}
+/* A fixed-width panel in a wrapping strip — profile and clip tiles. */
+.card-tile{width:230px;flex:none}
+.card-tile.card-tile-sm{width:215px}
+.tile-strip{display:flex;gap:.7rem;flex-wrap:wrap}
+.empty{color:var(--text-dim)}
+.rowline{padding:.25rem .4rem;border-bottom:1px solid var(--line)}
+.divide-top{border-top:1px solid var(--line);padding-top:.6rem;margin-top:.6rem}
+.clickable{cursor:pointer;font-weight:600}
+
+/* The per-stage buttons are a sequence, so they read as one strip under a single
+   label instead of seven loose buttons. */
+.steps{margin-top:.85rem;border-top:1px solid var(--line);padding-top:.7rem}
+.steps-label{display:block;font-size:.78rem;color:var(--text-faint);margin-bottom:.4rem}
+.steps-row{display:flex;gap:.35rem;flex-wrap:wrap}
+
+.side-status{font-size:.82rem;font-weight:600;color:var(--text-faint);white-space:pre-line;
+             line-height:1.35}
+.side-status.is-run{color:var(--good)}
+.side-status.is-done{color:var(--blue-corner)}
+
+/* ── log dock ─────────────────────────────────────────────── */
+.logdock{position:fixed;left:234px;right:0;bottom:0;z-index:45;background:var(--ink-2);
+         border-top:1px solid var(--line-strong);box-shadow:0 -12px 32px rgba(0,0,0,.5)}
+.logdock-bar{display:flex;align-items:center;gap:.6rem;padding:.4rem .95rem;
+             cursor:pointer;user-select:none;background:none;border:0;width:100%;
+             color:var(--text);font-family:inherit;text-align:left}
+.logdock-bar:hover{background:var(--surface)}
+.logdock-bar .ld-title{font-size:.84rem;font-weight:650}
+.logdock-bar .ld-chev{color:var(--text-faint);transition:transform .18s;font-size:.7rem}
+.logdock.open .ld-chev{transform:rotate(180deg)}
+.logdock-bar .ld-right{margin-left:auto;display:flex;align-items:center;gap:.5rem}
+.logdock-body{height:0;overflow:hidden;transition:height .18s ease}
+.logdock.open .logdock-body{height:min(40vh,360px)}
+.logdock #log-box{height:100%;border:0;border-radius:0;background:transparent;
+                  border-top:1px solid var(--line)}
+body.has-dock .content{padding-bottom:3.2rem}
+
 /* ── narrow screens ─────────────────────────────────────────────────────────── */
+/* Under ~900px the sidebar stops being a column and becomes a scrolling strip of
+   links above the content — a 234px rail would take a third of a phone. */
+@media (max-width:900px){
+  .shell{grid-template-columns:minmax(0,1fr)}
+  .side{position:static;height:auto;flex-direction:row;align-items:center;
+        gap:.6rem;overflow-x:auto;padding:.5rem .8rem;
+        border-right:0;border-bottom:1px solid var(--line)}
+  .brand{padding:0 .3rem 0 0;flex:none}
+  .brand i{display:none}
+  .side-nav{flex-direction:row;gap:.15rem}
+  .side-nav a{border-left:0;border-bottom:2px solid transparent;
+              border-radius:var(--r-sm) var(--r-sm) 0 0;white-space:nowrap}
+  .side-nav a[aria-current="page"]{border-left:0;border-bottom-color:var(--belt)}
+  .side-nav .nav-label{display:none}
+  .side-nav .nav-ico{font-size:1.05rem}
+  .side-foot{margin-top:0;padding-top:0;flex-direction:row;flex:none;margin-left:auto}
+  .side-card,.side-meta{display:none}
+  .logdock{left:0}
+}
 @media (max-width:640px){
-  .container{padding:.9rem}
-  h1{font-size:1.25rem}h2{font-size:1.02rem}
+  .container,.content{padding:.9rem}
+  h1,.topbar h1{font-size:1.18rem}h2{font-size:1.02rem}
+  .topbar{padding:.5rem .85rem}
+  .topbar-actions{margin-left:0;width:100%}
   .nav{padding:.55rem .85rem;gap:.5rem .9rem;flex-wrap:wrap;position:static}
   .row,.row3,.modal .row2{grid-template-columns:1fr}
   .modal{min-width:0;width:100%;padding:1.05rem}
-  .card[style*="width:230px"],.card[style*="width:215px"]{width:100%!important}
+  .card-tile{width:100%!important}
   .btn{padding:.6rem 1.05rem;font-size:.95rem}
   #log-box{height:min(46vh,300px)}
+  .logdock.open .logdock-body{height:min(38vh,280px)}
 }
 
 /* Someone who has asked for less motion should not get an infinitely animated
@@ -7119,7 +7318,7 @@ label .hint,label small{font-weight:400}
 <div class=modal-bg id=ui-modal>
   <div class=modal>
     <h3 id=ui-modal-title></h3>
-    <div id=ui-modal-body style="font-size:.86rem;color:#cfcfcf;white-space:pre-wrap"></div>
+    <div id=ui-modal-body style="font-size:.86rem;color:var(--text);white-space:pre-wrap"></div>
     <div id=ui-modal-input-wrap style="display:none;margin-top:.7rem">
       <input type=text id=ui-modal-input autocomplete=off>
     </div>
@@ -7225,29 +7424,77 @@ label .hint,label small{font-weight:400}
 })();
 </script>"""
 
-    def _page(title, body, active="run"):
+    def _page(title, body, active="run", actions="", aside="", dock=False):
         nav_items = [
-            ("run", "/", "▶ Run"),
-            ("characters", "/characters", "👤 Characters"),
-            ("environments", "/environments", "🏞 Environments"),
-            ("matches", "/matches", "🥊 Matches"),
-            ("wardrobe", "/wardrobe", "👕 Wardrobe"),
-            ("prompts", "/prompts", "✍ Prompts"),
+            ("run",          "/",             "▶",  "Run"),
+            ("characters",   "/characters",   "👤", "Characters"),
+            ("environments", "/environments", "🏞", "Environments"),
+            ("matches",      "/matches",      "🥊", "Matches"),
+            ("wardrobe",     "/wardrobe",     "👕", "Wardrobe"),
+            ("prompts",      "/prompts",      "✍",  "Prompts"),
         ]
-        # aria-current carries the active page: it drives the underline in the CSS and
-        # tells a screen reader which one you are on, where the old inline colour did
-        # neither.
+        # aria-current carries the active page: it drives the marker in the CSS and
+        # tells a screen reader which one you are on, where an inline colour did
+        # neither. The icon is decorative, so it is hidden from the reader and the
+        # label is what gets announced.
         nav = "".join(
-            f'<a href="{href}"{" aria-current=page" if k == active else ""}>{label}</a>'
-            for k, href, label in nav_items
+            f'<a href="{href}"{" aria-current=page" if k == active else ""}>'
+            f'<span class=nav-ico aria-hidden=true>{ico}</span>'
+            f'<span class=nav-label>{label}</span></a>'
+            for k, href, ico, label in nav_items
         )
+        # The dock is position:fixed, so it is emitted before the content and still
+        # draws at the bottom of the viewport. Emitting it first means the page's own
+        # script finds #log-box already parsed.
+        dock_block = """
+<div class=logdock id=logdock>
+  <div class=logdock-bar role=button tabindex=0 aria-expanded=false aria-controls=log-box
+       onclick="toggleDock()"
+       onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleDock();}">
+    <span class=ld-chev aria-hidden=true>▲</span>
+    <span class=ld-title>Log</span>
+    <span class=ld-right>
+      <span class=hint id=dock-hint></span>
+      <button class="btn btn-secondary btn-sm" type=button
+              onclick="event.stopPropagation();clearLog()">Clear</button>
+    </span>
+  </div>
+  <div class=logdock-body><div id=log-box></div></div>
+</div>
+<script>
+// Open state is remembered per browser, so an operator who keeps the log open
+// gets it open on the next page too. A run opens it by itself (see setStatus).
+function toggleDock(force){
+  const d=document.getElementById('logdock'); if(!d) return;
+  const open = (force===undefined) ? !d.classList.contains('open') : !!force;
+  d.classList.toggle('open', open);
+  d.querySelector('.logdock-bar').setAttribute('aria-expanded', open ? 'true':'false');
+  try{ localStorage.setItem('tf-dock', open?'1':'0'); }catch(e){}
+  if(open){ const b=document.getElementById('log-box'); if(b) b.scrollTop=b.scrollHeight; }
+}
+try{ if(localStorage.getItem('tf-dock')==='1') toggleDock(true); }catch(e){}
+</script>""" if dock else ""
         return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <link rel=icon type=image/x-icon href="/favicon.ico">
 <title>{title} — Township Fighters</title>
-<style>{_CSS}</style></head><body>
-<div class=nav><span>⚔ Township Fighters</span>{nav}</div>
-<div class=container>{body}</div>
+<style>{_CSS}</style></head><body{' class=has-dock' if dock else ''}>
+<div class=shell>
+  <aside class=side>
+    <a class=brand href="/"><span class="brand-mark" aria-hidden=true>⚔</span>
+       <span><b>Township</b> <i>Fighters</i></span></a>
+    <nav class=side-nav>{nav}</nav>
+    <div class=side-foot>{aside}</div>
+  </aside>
+  <main class=main>
+    <header class=topbar>
+      <h1>{title}</h1>
+      <div class=topbar-actions>{actions}</div>
+    </header>
+    {dock_block}
+    <div class=content>{body}</div>
+  </main>
+</div>
 {_modal_block}
 {_lightbox_block}
 </body></html>"""
@@ -7308,9 +7555,37 @@ label .hint,label small{font-weight:400}
             f'</div></div>'
             for col in OUTCOME_COLUMNS)
 
-        return f"""
-<h1>Run settings</h1>
+        _body = f"""
 <form id=run-form method=post action=/start>
+<div class=form-grid>
+<div class="card span2 card-live">
+  <div class=bar-split>
+    <h2>Templates <span class=hint>(a saved set of every option on this page)</span></h2>
+    <div class=hstack>
+      <select id=tpl-select title="Saved configurations. Loading one replaces every option on this page."></select>
+      <button class="btn btn-secondary btn-sm" type=button onclick="tplLoad()"
+              title="Apply this template to the current session, then reload the page to show it">📂 Load</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="tplSave()"
+              title="Save every option on this page as a named template">➕ Save as…</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="tplDelete()"
+              title="Delete the selected template">🗑 Delete</button>
+    </div>
+  </div>
+  <p class=hint id=tpl-hint></p>
+  <div class=steps>
+    <span class=steps-label>Run one stage — each picks up where the last left off</span>
+    <div class=steps-row>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('characters')">1 · Characters</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('environments')">2 · Environments</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('prompts')" title="Build the match plan + write all clip/outcome prompts (no keyframes, no video render). Matches appear on the Matches page.">3 · Match prompts</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('loras')">4 · LoRAs</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('video-loras')">4b · Video LoRAs</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('keyframes')">5 · Keyframes</button>
+      <button class="btn btn-secondary btn-sm" type=button onclick="runStep('videos')">6 · Render videos</button>
+    </div>
+  </div>
+</div>
+
 <div class=card>
   <h2>Connection</h2>
   <div class=row>
@@ -7322,6 +7597,16 @@ label .hint,label small{font-weight:400}
 </div>
 
 <div class=card>
+  <h2>Output</h2>
+  <div class=row>
+    <div><label>Output directory</label>
+         <input name=out_dir type=text value="{_v('out_dir','./township_output')}"></div>
+    <div><label>Region filter <span class=hint>(kampala, soweto, jinja… or blank)</span></label>
+         <input name=region type=text value="{_v('region') or ''}"></div>
+  </div>
+</div>
+
+<div class="card span2">
   <h2>Models <span class=hint>(blank = auto-select)</span></h2>
   <div class=row3>
     <div><label>Image model</label><input name=image_model type=text value="{_v('image_model') or ''}"></div>
@@ -7339,16 +7624,6 @@ label .hint,label small{font-weight:400}
   </div>
   <div style="margin-top:.6rem">
     <label><input type=checkbox name=no_llm{_c('no_llm')}> Disable LLM prompt generation</label>
-  </div>
-</div>
-
-<div class=card>
-  <h2>Output</h2>
-  <div class=row>
-    <div><label>Output directory</label>
-         <input name=out_dir type=text value="{_v('out_dir','./township_output')}"></div>
-    <div><label>Region filter <span class=hint>(kampala, soweto, jinja… or blank)</span></label>
-         <input name=region type=text value="{_v('region') or ''}"></div>
   </div>
 </div>
 
@@ -7371,7 +7646,7 @@ label .hint,label small{font-weight:400}
          <input name=num_fighters type=number min=0 max=99 value="{_v('num_fighters', 0)}"></div>
     <div><label>Reference images / character <span class=hint>(more = healthier LoRA)</span></label>
          <input name=char_refs type=number min=1 max=40 value="{_v('char_refs', 4)}"></div>
-    <div style="display:flex;align-items:flex-end">
+    <div class=bottom>
       <label><input type=checkbox name=include_female{_c('include_female')}> Include female fighters</label>
     </div>
   </div>
@@ -7399,7 +7674,7 @@ label .hint,label small{font-weight:400}
   </div>
 </div>
 
-<div class=card>
+<div class="card span2">
   <h2>Stage 3 — Videos</h2>
   <div class=row>
     <div><label>Number of fight matches</label>
@@ -7449,7 +7724,7 @@ label .hint,label small{font-weight:400}
   </select>
 </div>
 
-<div class=card>
+<div class="card span2">
   <h2>Character Consistency</h2>
   <p class=hint style="margin-bottom:.5rem">How fighters are kept looking the same across clips and matching their portraits. Stackable.</p>
   <label>Strategy</label>
@@ -7492,12 +7767,12 @@ label .hint,label small{font-weight:400}
     <details style="margin:.5rem 0 .2rem">
       <summary class=hint style="cursor:pointer">📐 Suggested training values (match steps to image count)</summary>
       <table style="width:100%;border-collapse:collapse;font-size:.74rem;margin-top:.4rem">
-        <thead><tr style="color:#aaa;text-align:left">
-          <th style="padding:.25rem .4rem;border-bottom:1px solid #333">Ref images</th>
-          <th style="padding:.25rem .4rem;border-bottom:1px solid #333">Train steps</th>
-          <th style="padding:.25rem .4rem;border-bottom:1px solid #333">LoRA weight</th>
+        <thead><tr style="color:var(--text-dim);text-align:left">
+          <th style="padding:.25rem .4rem;border-bottom:1px solid var(--line)">Ref images</th>
+          <th style="padding:.25rem .4rem;border-bottom:1px solid var(--line)">Train steps</th>
+          <th style="padding:.25rem .4rem;border-bottom:1px solid var(--line)">LoRA weight</th>
         </tr></thead>
-        <tbody style="color:#cfcfcf">
+        <tbody style="color:var(--text)">
           <tr><td style="padding:.22rem .4rem">4</td><td style="padding:.22rem .4rem">300–450</td><td style="padding:.22rem .4rem">0.70–0.85</td></tr>
           <tr><td style="padding:.22rem .4rem">10–15</td><td style="padding:.22rem .4rem">700–900</td><td style="padding:.22rem .4rem">0.80–1.00</td></tr>
           <tr><td style="padding:.22rem .4rem">20+</td><td style="padding:.22rem .4rem">1000–1500</td><td style="padding:.22rem .4rem">0.90–1.00</td></tr>
@@ -7552,7 +7827,7 @@ label .hint,label small{font-weight:400}
   </div>
 </div>
 
-<div class=card>
+<div class="card span2">
   <h2>Township Combat League upload</h2>
   <div class=row>
     <div><label>Server endpoint <span class=hint>(base URL, e.g. https://townshipcombatleague.com)</span></label>
@@ -7563,7 +7838,7 @@ label .hint,label small{font-weight:400}
   <div class=row style="margin-top:.4rem">
     <div><label>Fixture ID <span class=hint>(must already exist on the server)</span></label>
          <input name=upload_fixture_id type=text value="{_v('upload_fixture_id') or ''}"></div>
-    <div style="display:flex;align-items:flex-end">
+    <div class=bottom>
       <label style="display:flex;align-items:center;gap:.4rem;margin:0">
         <input type=checkbox name=upload_after_render{_c('upload_after_render')}>
         Also generate odds, pack ZIP &amp; upload after a full render</label></div>
@@ -7577,43 +7852,9 @@ label .hint,label small{font-weight:400}
   </details>
 </div>
 
+</div>
 <input type=hidden name=step id=step_field value="">
-<div style="display:flex;gap:.75rem;align-items:center;margin-top:.25rem;flex-wrap:wrap">
-  <button class="btn btn-primary" type=submit id=start-btn>▶ Full run</button>
-  <button class="btn btn-danger" type=button id=stop-btn onclick="stopRun()" style="display:none">■ Stop</button>
-  <button class="btn btn-secondary" type=button onclick="saveConfig()" title="Save the current options as a JSON config file on the server, reusable with --config / -c">💾 Save config</button>
-  <span id=status-pill class="status-pill status-idle">Idle</span>
-</div>
-<div style="display:flex;gap:.5rem;align-items:center;margin-top:.5rem;flex-wrap:wrap">
-  <span class=hint>Templates:</span>
-  <select id=tpl-select class="form-input" style="max-width:22rem"
-          title="Saved configurations. Loading one replaces every option on this page."></select>
-  <button class="btn btn-secondary" type=button onclick="tplLoad()" title="Apply this template to the current session, then reload the page to show it">📂 Load</button>
-  <button class="btn btn-secondary" type=button onclick="tplSave()" title="Save every option on this page as a named template">➕ Save as…</button>
-  <button class="btn btn-secondary" type=button onclick="tplDelete()" title="Delete the selected template">🗑 Delete</button>
-  <span class=hint id=tpl-hint></span>
-</div>
-<div style="margin-top:.6rem">
-  <span class=hint>Run individual steps (each picks up where the last left off):</span><br>
-  <div style="display:flex;gap:.4rem;margin-top:.35rem;flex-wrap:wrap">
-    <button class="btn btn-secondary" type=button onclick="runStep('characters')">1 · Characters</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('environments')">2 · Environments</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('prompts')" title="Build the match plan + write all clip/outcome prompts (no keyframes, no video render). Matches appear on the Matches page.">3 · Generate matches prompts</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('loras')">4 · Train LoRAs</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('video-loras')">4b · Train Video LoRAs</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('keyframes')">5 · Keyframes</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('videos')">6 · Render videos</button>
-  </div>
-</div>
 </form>
-
-<div style="margin-top:1.2rem">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem">
-    <h2>Log</h2>
-    <button class="btn btn-secondary" style="font-size:.75rem;padding:.2rem .6rem" onclick="clearLog()">Clear</button>
-  </div>
-  <div id=log-box></div>
-</div>
 
 <script>
 function toggleCharFields(){{
@@ -7737,6 +7978,7 @@ document.addEventListener('DOMContentLoaded', tplRefresh);
 function clearLog(){{ document.getElementById('log-box').innerHTML=''; }}
 
 let _es = null;
+let _wasRunning = false;
 function colorLine(t){{
   const low = t.toLowerCase();
   if(t.indexOf('▶')!==-1 || t.trim().startsWith('━'))
@@ -7761,12 +8003,22 @@ function setStatus(running, done, label){{
   const pill=document.getElementById('status-pill');
   const startBtn=document.getElementById('start-btn');
   const stopBtn=document.getElementById('stop-btn');
+  const side=document.getElementById('side-status');
+  const hint=document.getElementById('dock-hint');
   const lbl = label ? (' — '+label) : '';
   if(running){{ pill.className='status-pill status-run'; pill.textContent='Running…'+lbl; }}
   else if(done){{ pill.className='status-pill status-done'; pill.textContent='Done'+lbl; }}
   else{{ pill.className='status-pill status-idle'; pill.textContent='Idle'; }}
+  if(side){{
+    side.className = 'side-status' + (running?' is-run':done?' is-done':'');
+    side.textContent = running ? ('Running\n'+(label||'')) : (done?'Done':'Idle');
+  }}
+  if(hint) hint.textContent = running ? (label||'rendering') : '';
   startBtn.style.display = running ? 'none' : '';
   stopBtn.style.display  = running ? '' : 'none';
+  // A started run is the one moment the log is worth looking at, so it opens itself.
+  if(running && !_wasRunning) toggleDock(true);
+  _wasRunning = running;
   if(!running && _es){{ _es.close(); _es=null; }}
 }}
 function refreshStatus(){{
@@ -7807,6 +8059,28 @@ fetch('/status').then(r=>r.json()).then(d=>{{
   d.log.forEach(l=>appendLog(l));
 }});
 </script>"""
+
+        # The controls that start, stop and persist a run live in the sticky top bar
+        # rather than under 66 settings: they are reachable from anywhere on the page,
+        # and the pill next to them is the one piece of state worth reading first.
+        _actions = """
+<span id=status-pill class="status-pill status-idle">Idle</span>
+<button class="btn btn-secondary" type=button onclick="saveConfig()"
+        title="Save the current options as a JSON config file on the server, reusable with --config / -c">💾 Save config</button>
+<button class="btn btn-danger" type=button id=stop-btn onclick="stopRun()" style="display:none">■ Stop</button>
+<button class="btn btn-primary" type=submit form=run-form id=start-btn>▶ Full run</button>"""
+
+        # Mirrored into the sidebar so the stage being worked on stays visible while
+        # the form is scrolled, with the two paths a run actually writes to.
+        _aside = f"""
+<div class=side-card>
+  <div class=sc-label>Run status</div>
+  <div id=side-status class=side-status>Idle</div>
+</div>
+<div class=side-meta>{_html.escape(str(_v('base_url','http://127.0.0.1:8776')))}<br>
+{_html.escape(str(_v('out_dir','./township_output')))}</div>"""
+
+        return _body, _actions, _aside
 
     def _list_profiles(kind: str) -> list:
         """Return locally-saved profiles of a kind with their meta + image files."""
@@ -7887,7 +8161,7 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             if _vcur:
                 _vstate = ("#7ed87e", f"trained ✓ ({esc(_vslug)})", "Retrain")
             elif _vslugs:
-                _vstate = ("#d8b84a",
+                _vstate = ("var(--belt)",
                            "trained for: " + esc(", ".join(_vslugs))
                            + (f" — not for {esc(_vslug)}" if _vslug else ""),
                            "Train")
@@ -7948,8 +8222,8 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'<div class=card id="pf-{kind}-{esc(name)}">'
                 f'  <div class=pf-head>'
                 f'    <span class=pf-name>{esc(name)}'
-                + (' <span style="font-size:.66rem;font-weight:700;color:#1b1b1b;'
-                   'background:#d8b84a;border-radius:4px;padding:.05rem .4rem;'
+                + (' <span style="font-size:.66rem;font-weight:700;color:var(--surface);'
+                   'background:var(--belt);border-radius:4px;padding:.05rem .4rem;'
                    'vertical-align:middle">REFEREE</span>'
                    if (kind == "character" and _is_referee_meta(meta)) else '')
                 + f'</span>'
@@ -7967,50 +8241,50 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'  <textarea data-field=prompt rows=3>{esc(meta.get("prompt",""))}</textarea>'
                 f'  {extra_html}'
                 f'  <div class=pf-actions>'
-                f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'    <button class="btn btn-primary btn-sm" '
                 f'onclick="saveProfile(\'{kind}\',\'{esc(name)}\')">💾 Save</button>'
-                f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'    <button class="btn btn-danger btn-sm" '
                 f'onclick="delProfile(\'{kind}\',\'{esc(name)}\')">🗑 Remove</button>'
                 f'    <span class=pf-status></span>'
                 f'  </div>'
-                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
+                f'  <div class=pf-actions style="border-top:1px solid var(--line);padding-top:.6rem;margin-top:.6rem">'
                 f'    <label style="margin:0;font-size:.78rem">Add <input type=number data-regen=count '
                 f'value=4 min=1 max=8 style="width:54px;display:inline-block"> new ref(s)</label>'
                 f'    {guide_html}'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'    <button class="btn btn-secondary btn-sm" '
                 f'onclick="regenProfile(\'{kind}\',\'{esc(name)}\')">♻ Regenerate references</button>'
-                f'    <span class=pf-regen-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'    <span class=pf-regen-status style="font-size:.76rem;color:var(--blue-corner)"></span>'
                 f'  </div>'
                 f'  <div class=pf-actions style="padding-top:.5rem">'
                 f'    <label style="margin:0;font-size:.78rem">Or upload your own:</label>'
                 f'    <input type=file data-upload=files accept="image/*" multiple '
                 f'style="font-size:.76rem;width:auto;flex:1;min-width:160px">'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'    <button class="btn btn-secondary btn-sm" '
                 f'onclick="uploadRefs(\'{kind}\',\'{esc(name)}\')">⬆ Upload references</button>'
-                f'    <span class=pf-upload-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'    <span class=pf-upload-status style="font-size:.76rem;color:var(--blue-corner)"></span>'
                 f'  </div>'
-                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
+                f'  <div class=pf-actions style="border-top:1px solid var(--line);padding-top:.6rem;margin-top:.6rem">'
                 f'    <span style="font-size:.78rem;color:{"#7ed87e" if (_lora_map.get(name)) else "#888"}">'
                 f'Identity LoRA: {"trained ✓" if (_lora_map.get(name)) else "not trained"}</span>'
                 f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-lora=steps '
                 f'value={_def_lora_steps} min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
                 f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-lora=rank '
                 f'value={_def_lora_rank} min=2 max=128 style="width:54px;display:inline-block"></label>'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'    <button class="btn btn-secondary btn-sm" '
                 f'onclick="trainLora(\'{kind}\',\'{esc(name)}\')">🧠 {"Retrain" if (_lora_map.get(name)) else "Train"} image LoRA</button>'
-                f'    <span class=pf-lora-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'    <span class=pf-lora-status style="font-size:.76rem;color:var(--blue-corner)"></span>'
                 f'  </div>'
                 # Video (Wan) LoRA — separate, tagged with the current video model.
-                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
+                f'  <div class=pf-actions style="border-top:1px solid var(--line);padding-top:.6rem;margin-top:.6rem">'
                 f'    <span style="font-size:.78rem;color:{_vcolor}">Video LoRA: {_vlabel}</span>'
                 f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-vlora=steps '
                 f'value={_def_lora_steps} min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
                 f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-vlora=rank '
                 f'value={_def_lora_rank} min=2 max=128 style="width:54px;display:inline-block"></label>'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'    <button class="btn btn-secondary btn-sm" '
                 f'onclick="trainLora(\'{kind}\',\'{esc(name)}\',\'video\')">🎬 '
                 f'{_vbtn} video LoRA</button>'
-                f'    <span class=pf-vlora-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'    <span class=pf-vlora-status style="font-size:.76rem;color:var(--blue-corner)"></span>'
                 f'  </div>'
                 f'</div>'
             )
@@ -8018,7 +8292,7 @@ fetch('/status').then(r=>r.json()).then(d=>{{
         if cards:
             inner = "".join(cards)
         else:
-            inner = (f'<div class=card style="color:#666">No {label.lower()} found in '
+            inner = (f'<div class=card style="color:var(--text-faint)">No {label.lower()} found in '
                      f'<code>{esc(str(out_dir))}</code> yet. Generate some from the Run page first.</div>')
 
         script = """
@@ -8026,16 +8300,16 @@ fetch('/status').then(r=>r.json()).then(d=>{{
 async function saveProfile(kind,name){
   const root=document.getElementById('pf-'+kind+'-'+name);
   const st=root.querySelector('.pf-status');
-  st.style.color='#aaa'; st.textContent='Saving…';
+  st.style.color='var(--text-dim)'; st.textContent='Saving…';
   const fd=new FormData();
   fd.append('kind',kind); fd.append('name',name);
   root.querySelectorAll('[data-field]').forEach(el=>fd.append(el.getAttribute('data-field'),el.value));
   try{
     const r=await fetch('/profile/save',{method:'POST',body:fd});
     const j=await r.json();
-    if(j.error){st.style.color='#e07070'; st.textContent='✗ '+j.error; return;}
+    if(j.error){st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return;}
     st.style.color='#7ed87e'; st.textContent='✓ Saved'+(j.synced?' (synced to CoderAI)':'');
-  }catch(e){st.style.color='#e07070'; st.textContent='✗ '+e;}
+  }catch(e){st.style.color='var(--bad)'; st.textContent='✗ '+e;}
 }
 async function delProfile(kind,name){
   if(!(await uiConfirm('Remove "'+name+'" and all its images? This deletes the local profile'
@@ -8066,17 +8340,17 @@ async function regenProfile(kind,name){
   const fd=new FormData();
   fd.append('kind',kind); fd.append('name',name); fd.append('count',count);
   fd.append('guide', (guideEl && guideEl.checked) ? '1' : '0');
-  st.style.color='#aaa'; st.textContent='Starting…';
+  st.style.color='var(--text-dim)'; st.textContent='Starting…';
   let j;
   try{
     const r=await fetch('/profile/regenerate',{method:'POST',body:fd});
     j=await r.json();
-  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
-  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  }catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
   pollRegen(j.job_id, st);
 }
 function pollRegen(jobId, st){
-  st.style.color='#7ea8f7';
+  st.style.color='var(--blue-corner)';
   const poll=async()=>{
     let d;
     try{ d=await (await fetch('/job/'+jobId)).json(); }
@@ -8089,7 +8363,7 @@ function pollRegen(jobId, st){
       st.textContent='✓ added '+(d.added||0)+' image(s)'+(d.synced===false?' (local only)':'')+' — reloading…';
       setTimeout(()=>location.reload(),900);
     } else {
-      st.style.color='#e07070'; st.textContent='✗ '+(d.error||'failed');
+      st.style.color='var(--bad)'; st.textContent='✗ '+(d.error||'failed');
     }
   };
   setTimeout(poll,800);
@@ -8113,15 +8387,15 @@ async function trainLora(kind,name,target){
   fd.append('kind',kind); fd.append('name',name);
   fd.append('steps',steps); fd.append('rank',rank);
   fd.append('target',target);
-  st.style.color='#aaa'; st.textContent='Starting…';
+  st.style.color='var(--text-dim)'; st.textContent='Starting…';
   let j;
   try{ j=await (await fetch('/profile/train-lora',{method:'POST',body:fd})).json(); }
-  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
-  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
   pollTrain(j.job_id, st);
 }
 function pollTrain(jobId, st){
-  st.style.color='#7ea8f7';
+  st.style.color='var(--blue-corner)';
   const poll=async()=>{
     let d;
     try{ d=await (await fetch('/job/'+jobId)).json(); }
@@ -8132,7 +8406,7 @@ function pollTrain(jobId, st){
     else if(d.status==='done'){
       st.style.color='#7ed87e'; st.textContent='✓ LoRA trained — reloading…';
       setTimeout(()=>location.reload(),1000);
-    } else { st.style.color='#e07070'; st.textContent='✗ '+(d.error||'failed'); }
+    } else { st.style.color='var(--bad)'; st.textContent='✗ '+(d.error||'failed'); }
   };
   setTimeout(poll,900);
 }
@@ -8160,21 +8434,21 @@ async function uploadRefs(kind,name){
   const inp=root.querySelector('[data-upload=files]');
   const st=root.querySelector('.pf-upload-status');
   if(!inp||!inp.files||!inp.files.length){
-    st.style.color='#e07070'; st.textContent='Choose image file(s) first'; return;
+    st.style.color='var(--bad)'; st.textContent='Choose image file(s) first'; return;
   }
   const fd=new FormData();
   fd.append('kind',kind); fd.append('name',name);
   for(const f of inp.files) fd.append('files',f);
-  st.style.color='#aaa'; st.textContent='Uploading '+inp.files.length+' file(s)…';
+  st.style.color='var(--text-dim)'; st.textContent='Uploading '+inp.files.length+' file(s)…';
   try{
     const r=await fetch('/profile/upload-image',{method:'POST',body:fd});
     const j=await r.json();
-    if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+    if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
     st.style.color='#7ed87e';
     st.textContent='✓ added '+j.added+(j.rejected?(' ('+j.rejected+' skipped)'):'')
       +(j.synced===false?' (local only)':'')+' — reloading…';
     setTimeout(()=>location.reload(),800);
-  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
+  }catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; }
 }
 async function autogenProfile(kind){
   const root=document.getElementById('new-'+kind);
@@ -8182,11 +8456,11 @@ async function autogenProfile(kind){
   const roleEl=root.querySelector('[data-new=role]');
   const role=roleEl?roleEl.value:'fighter';
   const fd=new FormData(); fd.append('kind',kind); fd.append('role',role);
-  st.style.color='#aaa'; st.textContent='✨ Inventing '+(role==='referee'?'referee':kind)+'…';
+  st.style.color='var(--text-dim)'; st.textContent='✨ Inventing '+(role==='referee'?'referee':kind)+'…';
   let j;
   try{ const r=await fetch('/profile/autogen',{method:'POST',body:fd}); j=await r.json(); }
-  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
-  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
   const f=j.fields||{};
   Object.keys(f).forEach(k=>{
     const el=root.querySelector('[data-new='+k+']');
@@ -8198,19 +8472,19 @@ async function createProfile(kind){
   const root=document.getElementById('new-'+kind);
   const st=root.querySelector('.nf-status');
   const name=(root.querySelector('[data-new=name]').value||'').trim();
-  if(!name){ st.style.color='#e07070'; st.textContent='Enter a name first'; return; }
+  if(!name){ st.style.color='var(--bad)'; st.textContent='Enter a name first'; return; }
   const fd=new FormData();
   fd.append('kind',kind); fd.append('name',name);
   root.querySelectorAll('[data-new]').forEach(el=>{
     const k=el.getAttribute('data-new'); if(k!=='name') fd.append(k,el.value);
   });
-  st.style.color='#aaa'; st.textContent='Starting…';
+  st.style.color='var(--text-dim)'; st.textContent='Starting…';
   let j;
   try{
     const r=await fetch('/profile/create',{method:'POST',body:fd});
     j=await r.json();
-  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
-  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  }catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
   pollRegen(j.job_id, st);
 }
 </script>"""
@@ -8238,7 +8512,7 @@ async function createProfile(kind){
             f'  <label>Prompt <span class=hint>(drives image generation)</span></label>'
             f'  <textarea data-new=prompt rows=3></textarea>'
             f'  <div class=pf-actions style="margin-top:.5rem">'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             + (f'title="Pick fighter/referee above first, then auto-fill the form with '
                f'the text model" '
                if kind == "character" else 'title="Auto-fill the form with the text model" ')
@@ -8246,17 +8520,16 @@ async function createProfile(kind){
             f'    <label style="margin:0;font-size:.78rem">Generate <input type=number '
             f'data-new=count value=4 min=1 max=8 style="width:54px;display:inline-block"> '
             f'reference image(s)</label>'
-            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-primary btn-sm" '
             f'onclick="createProfile(\'{kind}\')">✅ Create {label[:-1].lower()}</button>'
-            f'    <span class="nf-status pf-regen-status" style="font-size:.76rem;color:#7ea8f7"></span>'
+            f'    <span class="nf-status pf-regen-status" style="font-size:.76rem;color:var(--blue-corner)"></span>'
             f'  </div>'
             f'  <p class=hint style="margin:.4rem 0 0">“Autogenerate” fills the fields '
             f'above with the text model so you can review and edit them before creating.</p>'
             f'</details>'
         )
-        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h1>{label}</h1>'
-                f'<a href="/{kind}s" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
+        _actions = f'<a href="/{kind}s" class="btn btn-secondary btn-sm">↻ Refresh</a>'
+        return (_actions, 
                 f'<p class=hint style="margin-bottom:.8rem">Edit a profile’s fields and Save, or '
                 f'Remove it entirely. Changes apply to the local output folder and are synced to CoderAI.</p>'
                 f'{new_form}{inner}{script}')
@@ -8335,7 +8608,7 @@ async function createProfile(kind){
                  f'onplay="window.showVid&&showVid(this)" '
                  f'title="Press play to enlarge" '
                  f'style="width:100%;height:{h}px;object-fit:cover;cursor:zoom-in;'
-                 f'border-radius:6px;background:#111"></video>')
+                 f'border-radius:6px;background:var(--ink-2)"></video>')
         # When enhanced variants exist, offer a selector to switch the source.
         sel = ""
         if len(variants) > 1:
@@ -8357,7 +8630,7 @@ async function createProfile(kind){
         return (f'<img src="{_esc(url)}?t={int(kf.stat().st_mtime)}" loading=lazy '
                 f'title="Keyframe preview (not yet rendered)" '
                 f'style="width:100%;height:{h}px;object-fit:cover;border-radius:6px;'
-                f'background:#111;opacity:.85">')
+                f'background:var(--ink-2);opacity:.85">')
 
     # Keyframes page: save the per-keyframe prompt overrides (empty box clears the
     # override → the prompt is auto-composed from wardrobe + environment again).
@@ -8370,12 +8643,12 @@ async function saveKfPrompts(ev, name){
   const fd=new FormData(); fd.append('mode','kfprompts'); fd.append('name',name);
   root.querySelectorAll('[data-kfclip]').forEach(el=>fd.append('kfclip_'+el.getAttribute('data-kfclip'), el.value));
   root.querySelectorAll('[data-kfoutc]').forEach(el=>fd.append('kfoutc_'+el.getAttribute('data-kfoutc'), el.value));
-  setSt('#aaa','Saving…');
+  setSt('var(--text-dim)','Saving…');
   try{
     const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
-    if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+    if(j.error){ setSt('var(--bad)','✗ '+j.error); return; }
     setSt('#7ed87e','✓ Saved — now Regenerate the keyframe(s)');
-  }catch(e){ setSt('#e07070','✗ '+e); }
+  }catch(e){ setSt('var(--bad)','✗ '+e); }
 }
 </script>"""
 
@@ -8392,10 +8665,10 @@ function _pollJob(jobId, setSt){
     try{ d=await (await fetch('/job/'+jobId)).json(); }
     catch(e){ setTimeout(poll,2000); return; }
     const pct=d.progress||0;
-    if(d.status==='queued'){ setSt('#7ea8f7', d._msg||'⏳ queued…'); setTimeout(poll,1200); }
-    else if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||('working… '+pct+'%'))+' ('+pct+'%)'); setTimeout(poll,1500); }
+    if(d.status==='queued'){ setSt('var(--blue-corner)', d._msg||'⏳ queued…'); setTimeout(poll,1200); }
+    else if(d.status==='running'){ setSt('var(--blue-corner)','⏳ '+(d._msg||('working… '+pct+'%'))+' ('+pct+'%)'); setTimeout(poll,1500); }
     else if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); setTimeout(()=>location.reload(),1200); }
-    else { setSt('#e07070','✗ '+(d.error||'failed')); }
+    else { setSt('var(--bad)','✗ '+(d.error||'failed')); }
   };
   setTimeout(poll,900);
 }
@@ -8482,13 +8755,13 @@ function _pollMatchBars(jobId, setSt, wrap){
     catch(e){ setTimeout(poll,2000); return; }
     _renderMatchBars(wrap, d, jobId);
     const pct=d.progress||0;
-    if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||'working…')+' ('+pct+'%)'); setTimeout(poll,1200); }
+    if(d.status==='running'){ setSt('var(--blue-corner)','⏳ '+(d._msg||'working…')+' ('+pct+'%)'); setTimeout(poll,1200); }
     else if(d.status==='done'){
-      if(d.cancelled){ setSt('#e0a060', (d._msg||'⏹ cancelled')+' — reloading…'); }
+      if(d.cancelled){ setSt('var(--tan)', (d._msg||'⏹ cancelled')+' — reloading…'); }
       else { setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); }
       setTimeout(()=>location.reload(),1600);
     }
-    else { setSt('#e07070','✗ '+(d.error||'failed')); }
+    else { setSt('var(--bad)','✗ '+(d.error||'failed')); }
   };
   setTimeout(poll,500);
 }
@@ -8523,11 +8796,11 @@ function startMatchCardMonitor(match){
       sawActive=true;
       let t='⏳ '+(running._msg||'rendering…')+' ('+(running.progress||0)+'%)';
       if(queued.length) t+=' · '+queued.length+' queued';
-      setSt('#7ea8f7',t);
+      setSt('var(--blue-corner)',t);
       setTimeout(tick,1500);
     } else if(queued.length){
       sawActive=true;
-      setSt('#7ea8f7','⏳ queued — '+queued.length+' waiting to start…');
+      setSt('var(--blue-corner)','⏳ queued — '+queued.length+' waiting to start…');
       setTimeout(tick,1500);
     } else {
       _cardMon.delete(match);
@@ -8553,13 +8826,13 @@ function startMatchMonitor(match, setSt){
       if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, running, running.job_id, queued); }
       let t='⏳ '+(running._msg||'working…')+' ('+(running.progress||0)+'%)';
       if(queued.length) t+=' · '+queued.length+' queued';
-      if(setSt) setSt('#7ea8f7',t);
+      if(setSt) setSt('var(--blue-corner)',t);
       setTimeout(tick,1200);
     } else if(queued.length){
       sawActive=true;
       // Nothing running yet: show the first queued job's bars + the rest behind it.
       if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, queued[0], queued[0].job_id, queued.slice(1)); }
-      if(setSt) setSt('#7ea8f7','⏳ queued — '+queued.length+' waiting to start…');
+      if(setSt) setSt('var(--blue-corner)','⏳ queued — '+queued.length+' waiting to start…');
       setTimeout(tick,1200);
     } else {
       _matchMonOn=false;
@@ -8628,18 +8901,18 @@ async function reMatch(ev, scope, params){
   const fd=new FormData(); fd.append('scope',scope);
   for(const k in params) fd.append(k, params[k]);
   if(isFull){ fd.append('package', fullPkg?'1':'0'); fd.append('upload', fullUpl?'1':'0'); }
-  setSt('#aaa','Starting…');
+  setSt('var(--text-dim)','Starting…');
   let j;
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
-  catch(e){ setSt('#e07070','✗ '+e); return; }
-  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  catch(e){ setSt('var(--bad)','✗ '+e); return; }
+  if(j.error){ setSt('var(--bad)','✗ '+j.error); return; }
   const det=document.getElementById('detail');
   const wrap=document.getElementById('match-progress');
   if(det && wrap){
     // Detail page: a SINGLE monitor drives the shared bars + status from the
     // server's job queue, so a second request submitted while one is running just
     // shows up as "queued" instead of fighting over the display.
-    setSt('#7ea8f7','✓ '+(j.queued_msg||'submitted')+' — '+(scope==='reassemble'?'assembling…':'queued/running…'));
+    setSt('var(--blue-corner)','✓ '+(j.queued_msg||'submitted')+' — '+(scope==='reassemble'?'assembling…':'queued/running…'));
     startMatchMonitor(det.getAttribute('data-match'), setSt);
   } else {
     _pollJob(j.job_id, setSt);
@@ -8671,15 +8944,15 @@ async function enhanceMatch(ev, target, match){
   const fd=new FormData(); fd.append('scope','enhance'); fd.append('match',match);
   fd.append('target',target); fd.append('upscale',up); fd.append('fps',fps);
   fd.append('final_fps',finalFps); fd.append('force',force?'1':'0');
-  setSt('#aaa','Starting…');
+  setSt('var(--text-dim)','Starting…');
   let j;
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
-  catch(e){ setSt('#e07070','✗ '+e); return; }
-  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  catch(e){ setSt('var(--bad)','✗ '+e); return; }
+  if(j.error){ setSt('var(--bad)','✗ '+j.error); return; }
   const det=document.getElementById('detail');
   const wrap=document.getElementById('match-progress');
   if(det && wrap){
-    setSt('#7ea8f7','✓ submitted — queued/running…');
+    setSt('var(--blue-corner)','✓ submitted — queued/running…');
     startMatchMonitor(det.getAttribute('data-match'), setSt);
   } else {
     _pollJob(j.job_id, setSt);
@@ -8703,8 +8976,8 @@ async function delVid(ev, scope, params){
   for(const k in params) fd.append(k, params[k]);
   let j;
   try{ j=await (await fetch('/matches/delete',{method:'POST',body:fd})).json(); }
-  catch(e){ setSt('#e07070','✗ '+e); return; }
-  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  catch(e){ setSt('var(--bad)','✗ '+e); return; }
+  if(j.error){ setSt('var(--bad)','✗ '+j.error); return; }
   if(scope==='match-purge'){
     setSt('#7ed87e','✓ match removed ('+(j.removed||0)+' file(s)) — returning to Matches…');
     setTimeout(()=>{ location.href = (window.ROOT_PATH||'') + '/matches'; },700);
@@ -8723,27 +8996,27 @@ async function saveMatch(ev, name){
   });
   root.querySelectorAll('[data-clip]').forEach(el=>fd.append('clip_'+el.getAttribute('data-clip'), el.value));
   root.querySelectorAll('[data-outc]').forEach(el=>fd.append('outc_'+el.getAttribute('data-outc'), el.value));
-  setSt('#aaa','Saving…');
+  setSt('var(--text-dim)','Saving…');
   try{
     const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
-    if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+    if(j.error){ setSt('var(--bad)','✗ '+j.error); return; }
     setSt('#7ed87e','✓ Saved');
-  }catch(e){ setSt('#e07070','✗ '+e); }
+  }catch(e){ setSt('var(--bad)','✗ '+e); }
 }
 // ── Township upload: generate odds + ZIP, then chunked upload with a bar ──
 function _upStatusEl(){ return document.querySelector('#detail .up-status'); }
 async function prepOdds(ev, name){
   const st=_upStatusEl();
   const setSt=(c,t)=>{ if(st){ st.style.color=c; st.textContent=t; } };
-  setSt('#aaa','🎲 Generating odds & packing ZIP…');
+  setSt('var(--text-dim)','🎲 Generating odds & packing ZIP…');
   const fd=new FormData(); fd.append('name',name);
   let j;
   try{ j=await (await fetch('/match/odds',{method:'POST',body:fd})).json(); }
-  catch(e){ setSt('#e07070','✗ '+e); return; }
-  if(j.error && !j.odds){ setSt('#e07070','✗ '+j.error); return; }
+  catch(e){ setSt('var(--bad)','✗ '+e); return; }
+  if(j.error && !j.odds){ setSt('var(--bad)','✗ '+j.error); return; }
   if(!j.ok){
     const why=j.error||(j.missing&&j.missing.length?('missing '+j.missing.join(', ')):'incomplete');
-    setSt('#e0a800','⚠ '+why);
+    setSt('var(--warn)','⚠ '+why);
   } else {
     setSt('#7ed87e','✓ Odds + ZIP ready');
   }
@@ -8760,12 +9033,12 @@ async function uploadMatch(ev, name){
   if(btn) btn.disabled=true;
   if(prog) prog.style.display='block';
   const setBar=(p,msg)=>{ if(bar) bar.style.width=p+'%'; if(pct) pct.textContent=p+'% '+(msg||''); };
-  setBar(0,'starting…'); setSt('#aaa','Uploading…');
+  setBar(0,'starting…'); setSt('var(--text-dim)','Uploading…');
   let j;
   try{ const fd=new FormData(); fd.append('name',name);
        j=await (await fetch('/match/upload',{method:'POST',body:fd})).json(); }
-  catch(e){ setSt('#e07070','✗ '+e); if(btn) btn.disabled=false; return; }
-  if(j.error){ setSt('#e07070','✗ '+j.error); if(btn) btn.disabled=false; return; }
+  catch(e){ setSt('var(--bad)','✗ '+e); if(btn) btn.disabled=false; return; }
+  if(j.error){ setSt('var(--bad)','✗ '+j.error); if(btn) btn.disabled=false; return; }
   // Poll the job for progress until done/error.
   const jid=j.job_id;
   while(true){
@@ -8775,7 +9048,7 @@ async function uploadMatch(ev, name){
     setBar(d.progress||0, d._msg||'');
     if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'uploaded')); setBar(100,'done');
       setTimeout(()=>location.reload(), 900); return; }
-    if(d.status==='error'){ setSt('#e07070','✗ '+(d.error||d._msg||'upload failed'));
+    if(d.status==='error'){ setSt('var(--bad)','✗ '+(d.error||d._msg||'upload failed'));
       if(btn) btn.disabled=false; return; }
   }
 }
@@ -8785,12 +9058,12 @@ async function saveOutputs(ev, fighter){
   const setSt=(c,t)=>{ st.style.color=c; st.textContent=t; };
   const fd=new FormData(); fd.append('mode','outputs'); fd.append('fighter',fighter);
   root.querySelectorAll('[data-out]').forEach(el=>fd.append('out_'+el.getAttribute('data-out'), el.value));
-  setSt('#aaa','Saving…');
+  setSt('var(--text-dim)','Saving…');
   try{
     const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
-    if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+    if(j.error){ setSt('var(--bad)','✗ '+j.error); return; }
     setSt('#7ed87e','✓ Saved');
-  }catch(e){ setSt('#e07070','✗ '+e); }
+  }catch(e){ setSt('var(--bad)','✗ '+e); }
 }
 // After a page reload, re-attach the progress display to an in-flight render
 // for the match being viewed (detail page) or a visible match card.
@@ -8827,7 +9100,7 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
         """Lightweight preview thumbnail: clip00 keyframe image if present, else
         a metadata-only poster of the short/first video. No full video load."""
         kf = out_dir / "videos" / "keyframes" / f"{mn}_clip00.png"
-        box = "width:128px;height:72px;object-fit:cover;border-radius:5px;background:#111;flex:none"
+        box = "width:128px;height:72px;object-fit:cover;border-radius:5px;background:var(--ink-2);flex:none"
         if kf.exists():
             url = "/media/" + str(kf.relative_to(out_dir)).replace("\\", "/")
             return f'<img src="{_esc(url)}" loading=lazy style="{box}">'
@@ -8838,7 +9111,7 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             url = "/media/" + str(vp.relative_to(out_dir)).replace("\\", "/")
             return f'<video src="{_esc(url)}" preload=metadata muted style="{box}"></video>'
         return (f'<div style="{box};display:flex;align-items:center;justify-content:center;'
-                f'color:#555;font-size:.7rem">no preview</div>')
+                f'color:var(--text-faint);font-size:.7rem">no preview</div>')
 
     def _matches_html():
         """Lightweight LIST of matches (with preview) — videos load on detail."""
@@ -8864,12 +9137,12 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'{n_out} outcome(s) · finals: {_esc(fin)}</div>'
                 f'    <div class=hint style="opacity:.6">{_esc(mn)}</div>'
                 f'  </div>'
-                f'  <span class=match-status style="font-size:.74rem;color:#7ea8f7"></span>'
-                f'  <a class="btn btn-primary" style="font-size:.8rem;padding:.35rem .9rem" '
+                f'  <span class=match-status style="font-size:.74rem;color:var(--blue-corner)"></span>'
+                f'  <a class="btn btn-primary btn-sm" '
                 f'href="/match?name={_esc(mn)}">Open ▸</a>'
-                f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
+                f'  <button class="btn btn-danger btn-sm" '
                 f'onclick="delVid(event,\'match\',{{match:\'{_esc(mn)}\'}})">🗑 Remove videos</button>'
-                f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
+                f'  <button class="btn btn-danger btn-sm" '
                 f'onclick="delVid(event,\'match-purge\',{{match:\'{_esc(mn)}\'}})" '
                 f'title="Remove this match completely — files, keyframes and plan entry">🧨 Remove</button>'
                 f'</div>'
@@ -8884,9 +9157,9 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'<div class=card style="display:flex;align-items:center;gap:.6rem;padding:.5rem .8rem">'
                 f'  <div style="flex:1"><span class=pf-name style="font-size:.9rem">{_esc(core)}</span>'
                 f'  <span class=hint> · {_esc(outcome)}</span></div>'
-                f'  <a class="btn btn-secondary" style="font-size:.78rem;padding:.25rem .7rem" '
+                f'  <a class="btn btn-secondary btn-xs" '
                 f'href="/media/videos/{_esc(p.name)}" target=_blank>▶ View</a>'
-                f'  <button class="btn btn-danger" style="font-size:.78rem;padding:.25rem .7rem" '
+                f'  <button class="btn btn-danger btn-xs" '
                 f'onclick="delVid(event,\'file\',{{file:\'{_esc(p.name)}\'}})">🗑</button>'
                 f'</div>'
                 for core, outcome, p in sorted(legacy_outcomes, key=lambda t: t[2].name)
@@ -8899,7 +9172,7 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             body += '<div class=section-title style="margin:.3rem 0 .4rem">Matches</div>' + match_rows
         body += leg_rows
         if not body:
-            body = ('<div class=card style="color:#666">No matches found yet. Render '
+            body = ('<div class=card style="color:var(--text-faint)">No matches found yet. Render '
                     'videos from the Run page first (or run the Videos step).</div>')
 
         # ── New-match form: pick two fighters + an environment, then either build
@@ -8932,14 +9205,14 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'{_nm_select("referee", _ref_opts, blank="(auto / any)")}</div>'
             '  </div>'
             '  <div class=pf-actions style="margin-top:.6rem">'
-            '    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            '    <button class="btn btn-secondary btn-sm" '
             'title="Pick a random fighter pairing + environment + referee from your '
             'existing profiles" onclick="autogenMatch()">✨ Autogenerate</button>'
-            '    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            '    <button class="btn btn-primary btn-sm" '
             'onclick="newMatch(\'full\')">🎬 Create whole match</button>'
-            '    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            '    <button class="btn btn-secondary btn-sm" '
             'onclick="newMatch(\'prompts\')">📝 Create prompts only</button>'
-            '    <span class="nm-status" style="font-size:.76rem;color:#7ea8f7"></span>'
+            '    <span class="nm-status" style="font-size:.76rem;color:var(--blue-corner)"></span>'
             '  </div>'
             '  <p class=hint style="margin:.5rem 0 0">“Whole match” runs text→image→video '
             'end-to-end (slow). “Prompts only” writes the clip + outcome prompts so you '
@@ -8951,11 +9224,11 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
 async function autogenMatch(){
   const root=document.getElementById('new-match');
   const st=root.querySelector('.nm-status');
-  st.style.color='#aaa'; st.textContent='✨ Picking a matchup…';
+  st.style.color='var(--text-dim)'; st.textContent='✨ Picking a matchup…';
   let j;
   try{ const r=await fetch('/matches/autogen',{method:'POST',body:new FormData()}); j=await r.json(); }
-  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
-  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
   const f=j.fields||{};
   ['f1','f2','env','referee'].forEach(k=>{
     const el=root.querySelector('[data-nm='+k+']');
@@ -8970,20 +9243,20 @@ async function newMatch(mode){
   const f2=root.querySelector('[data-nm=f2]').value;
   const env=root.querySelector('[data-nm=env]').value;
   const ref=root.querySelector('[data-nm=referee]').value;
-  if(!f1||!f2){ st.style.color='#e07070'; st.textContent='Pick two fighters'; return; }
-  if(f1===f2){ st.style.color='#e07070'; st.textContent='Pick two different fighters'; return; }
+  if(!f1||!f2){ st.style.color='var(--bad)'; st.textContent='Pick two fighters'; return; }
+  if(f1===f2){ st.style.color='var(--bad)'; st.textContent='Pick two different fighters'; return; }
   const fd=new FormData();
   fd.append('f1',f1); fd.append('f2',f2); fd.append('env',env); fd.append('mode',mode);
   fd.append('referee',ref);
-  st.style.color='#aaa'; st.textContent=(mode==='prompts'?'Writing prompts…':'Creating match…');
+  st.style.color='var(--text-dim)'; st.textContent=(mode==='prompts'?'Writing prompts…':'Creating match…');
   let j;
   try{ const r=await fetch('/matches/create',{method:'POST',body:fd}); j=await r.json(); }
-  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
-  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
   pollNewMatch(j.job_id, st);
 }
 function pollNewMatch(jobId, st){
-  st.style.color='#7ea8f7';
+  st.style.color='var(--blue-corner)';
   const poll=async()=>{
     let d;
     try{ d=await (await fetch('/job/'+jobId)).json(); }
@@ -8991,15 +9264,14 @@ function pollNewMatch(jobId, st){
     if(d.status==='queued'){ st.textContent=d._msg||'⏳ queued…'; setTimeout(poll,1300); }
     else if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('working… '+(d.progress||0)+'%')); setTimeout(poll,1500); }
     else if(d.status==='done'){ st.style.color='#7ed87e'; st.textContent='✓ '+(d._msg||'done')+' — reloading…'; setTimeout(()=>location.reload(),1400); }
-    else { st.style.color='#e07070'; st.textContent='✗ '+(d.error||'failed'); }
+    else { st.style.color='var(--bad)'; st.textContent='✗ '+(d.error||'failed'); }
   };
   setTimeout(poll,800);
 }
 </script>"""
 
-        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h1>Matches</h1>'
-                f'<a href="/matches" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
+        _actions = '<a href="/matches" class="btn btn-secondary btn-sm">↻ Refresh</a>'
+        return (_actions, 
                 f'<p class=hint style="margin-bottom:.8rem">Select a match to view, edit and '
                 f'regenerate its clips, finals and outcomes. Videos load on the detail page.</p>'
                 f'{new_match}{body}{_match_js}{new_match_js}')
@@ -9012,7 +9284,7 @@ function pollNewMatch(jobId, st){
 
         # ── Match detail ───────────────────────────────────────────────────────
         if not name or name not in matches:
-            return f'<div class=card style="color:#666">Match not found. {back}</div>'
+            return f'<div class=card style="color:var(--text-faint)">Match not found. {back}</div>'
         meta = fight_by_name.get(name, {})
         info = matches[name]
         finals = info.get("finals", {})
@@ -9094,19 +9366,19 @@ function pollNewMatch(jobId, st){
             else:
                 vid_html = (_kf_img_tag(kfp, 120)
                             or '<div class=hint>not rendered</div>')
-            rm_html = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
+            rm_html = (f'<button class="btn btn-danger btn-xs" '
                        f'onclick="delVid(event,\'clip\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">🗑</button>'
                        if vp else '')
             clip_tiles.append(
-                f'<div class=card style="width:230px">'
+                f'<div class="card card-tile">'
                 f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
                 f'<span>clip {idx:02d}</span>'
                 f'<span>'
-                f'<a href="#" style="color:#9fdca0" title="Rewrite ONLY this clip\'s prompt (text model). Afterwards regenerate its keyframe and re-render." '
+                f'<a href="#" style="color:var(--sage)" title="Rewrite ONLY this clip\'s prompt (text model). Afterwards regenerate its keyframe and re-render." '
                 f'onclick="reMatch(event,\'clip-prompt\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">prompt↻</a> '
-                f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
+                f'<a href="#" style="color:var(--violet-text)" title="Regenerate this keyframe (image model)" '
                 f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">kf↻</a> '
-                f'<a href="#" style="color:#7eb8f7" '
+                f'<a href="#" style="color:var(--blue-corner)" '
                 f'onclick="reMatch(event,\'clip\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">re-render</a> {rm_html}</span></div>'
                 f'  {vid_html}'
                 f'  <textarea data-clip="{idx}" rows=2 style="margin-top:.3rem">{_esc(c.get("prompt",""))}</textarea>'
@@ -9137,25 +9409,25 @@ function pollNewMatch(jobId, st){
                 vid = _vid_tag(p, 110, poster=kfp)
             else:
                 vid = (_kf_img_tag(kfp, 110) or '<div class=hint>not rendered</div>')
-            rm = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
+            rm = (f'<button class="btn btn-danger btn-xs" '
                   f'onclick="delVid(event,\'output\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">🗑</button>'
                   if p else '')
             act = "re-render" if p else "render"
             # Show the two-shot sequence (finish → victory) as a hint so it's clear
             # the outcome video is assembled from those clips.
             _roles = " → ".join(s.get("role", "?") for s in (o.get("shots") or []))
-            _seq = (f'<div class=hint style="font-size:.66rem;color:#8aa">{_esc(_roles)}</div>'
+            _seq = (f'<div class=hint style="font-size:.66rem;color:var(--text-faint)">{_esc(_roles)}</div>'
                     if _roles else '')
             return (
-                f'<div class=card style="width:215px">'
+                f'<div class="card card-tile card-tile-sm">'
                 f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
                 f'<span>{_esc(oc)}</span>'
                 f'<span>'
-                f'<a href="#" style="color:#9fdca0" title="Rewrite ONLY this outcome\'s prompts (finish + victory shots, text model). Afterwards regenerate its keyframes and re-render." '
+                f'<a href="#" style="color:var(--sage)" title="Rewrite ONLY this outcome\'s prompts (finish + victory shots, text model). Afterwards regenerate its keyframes and re-render." '
                 f'onclick="reMatch(event,\'outcome-prompt\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">prompt↻</a> '
-                f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
+                f'<a href="#" style="color:var(--violet-text)" title="Regenerate this keyframe (image model)" '
                 f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">kf↻</a> '
-                f'<a href="#" style="color:#7eb8f7" '
+                f'<a href="#" style="color:var(--blue-corner)" '
                 f'onclick="reMatch(event,\'outcome\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">{act}</a> {rm}</span></div>'
                 f'  {vid}{_seq}'
                 f'  <textarea data-outc="{_esc(fr)}|{_esc(oc)}" rows=2 style="margin-top:.3rem">{_esc(o.get("prompt",""))}</textarea>'
@@ -9166,7 +9438,7 @@ function pollNewMatch(jobId, st){
         for fr in out_fighters:
             tiles = [_otile(fr, oc) for oc in ("win", "ko_win", "retire")]
             outcome_groups.append(
-                f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:#bbb">'
+                f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:var(--text-dim)">'
                 f'{_esc(fr)}</div>'
                 f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">{"".join(tiles)}</div></div>'
             )
@@ -9176,7 +9448,7 @@ function pollNewMatch(jobId, st){
                            if oc == "draw"), f1 or (out_fighters[0] if out_fighters else ""))
         if draw_owner:
             outcome_groups.append(
-                f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:#bbb">'
+                f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:var(--text-dim)">'
                 f'Match result — draw <span style="font-weight:400">({_esc(draw_owner)})</span></div>'
                 f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">{_otile(draw_owner, "draw")}</div></div>'
             )
@@ -9194,12 +9466,12 @@ function pollNewMatch(jobId, st){
         # Badge shown in the header (clears automatically when the videos change,
         # because _sig_match goes false).
         if _uploaded:
-            _upload_badge = (f'<span id=upload-badge style="font-size:.74rem;color:#2ecc71;'
-                             f'border:1px solid #2ecc71;border-radius:10px;padding:.1rem .55rem">'
+            _upload_badge = (f'<span id=upload-badge style="font-size:.74rem;color:var(--good);'
+                             f'border:1px solid var(--good);border-radius:10px;padding:.1rem .55rem">'
                              f'✓ Uploaded · match #{_esc(_up.get("match_number") or "?")}</span>')
         elif _up.get("uploaded_at"):
-            _upload_badge = (f'<span id=upload-badge style="font-size:.74rem;color:#e0a800;'
-                             f'border:1px solid #e0a800;border-radius:10px;padding:.1rem .55rem" '
+            _upload_badge = (f'<span id=upload-badge style="font-size:.74rem;color:var(--warn);'
+                             f'border:1px solid var(--warn);border-radius:10px;padding:.1rem .55rem" '
                              f'title="Videos changed since the last upload — regenerate the ZIP and re-upload">'
                              f'⚠ Upload outdated</span>')
         else:
@@ -9211,24 +9483,24 @@ function pollNewMatch(jobId, st){
             _ord = ["under", "over", "win1", "win2", "ko1", "ko2", "ret1", "ret2", "draw"]
             _odds_cells = "".join(
                 f'<div style="display:flex;justify-content:space-between;gap:.6rem;'
-                f'padding:.1rem .4rem;background:#1a1a1a;border-radius:4px">'
+                f'padding:.1rem .4rem;background:var(--surface);border-radius:4px">'
                 f'<span class=hint>{_esc(c)}</span><b>{_odds.get(c, "—")}</b></div>'
                 for c in _ord)
             _arb = _up.get("arbitrage_ok")
-            _arb_html = ('<span style="color:#2ecc71">✓ no arbitrage</span>' if _arb
-                         else '<span style="color:#e07070">✗ arbitrage check failed</span>')
+            _arb_html = ('<span style="color:var(--good)">✓ no arbitrage</span>' if _arb
+                         else '<span style="color:var(--bad)">✗ arbitrage check failed</span>')
             _odds_html = (
                 f'<div style="margin-top:.5rem"><div class=hint style="margin-bottom:.25rem">'
                 f'Odds {_arb_html}</div>'
                 f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.3rem">{_odds_cells}</div>'
-                + (f'<div class=hint style="margin-top:.3rem;color:#e0a800">ZIP missing: '
+                + (f'<div class=hint style="margin-top:.3rem;color:var(--warn)">ZIP missing: '
                    f'{_esc(", ".join(_up.get("missing", [])))}</div>' if _up.get("missing") else "")
                 + '</div>')
         else:
             _odds_html = '<div class=hint style="margin-top:.4rem">No odds generated yet.</div>'
 
         if not _cfg_ok:
-            _upload_cfg_hint = (f'<div class=hint style="margin-top:.4rem;color:#e0a800">'
+            _upload_cfg_hint = (f'<div class=hint style="margin-top:.4rem;color:var(--warn)">'
                                 f'Upload not configured (missing: {_esc(", ".join(_cfg_missing))}). '
                                 f'Set the server endpoint, token and fixture ID on the Run page.</div>')
         else:
@@ -9240,16 +9512,16 @@ function pollNewMatch(jobId, st){
             f'    <h2 style="margin:0">Township upload</h2>{_upload_badge}</div>'
             f'  {_odds_html}'
             f'  <div class=pf-actions style="margin-top:.6rem">'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="prepOdds(event,\'{_esc(name)}\')">🎲 {"Regenerate" if _odds else "Generate"} odds &amp; ZIP</button>'
-            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-primary btn-sm" '
             f'id=upload-btn onclick="uploadMatch(event,\'{_esc(name)}\')"'
             f'{"" if (_prepared and _cfg_ok) else " disabled"}>⬆ Upload to Township</button>'
-            f'    <span class="up-status" style="font-size:.78rem;color:#7ea8f7"></span>'
+            f'    <span class="up-status" style="font-size:.78rem;color:var(--blue-corner)"></span>'
             f'  </div>'
             f'  <div class=up-progress style="display:none;margin-top:.5rem">'
-            f'    <div style="height:8px;background:#222;border-radius:5px;overflow:hidden">'
-            f'      <div class=up-bar style="height:100%;width:0%;background:#7a3da8;transition:width .2s"></div></div>'
+            f'    <div style="height:8px;background:var(--line);border-radius:5px;overflow:hidden">'
+            f'      <div class=up-bar style="height:100%;width:0%;background:var(--violet);transition:width .2s"></div></div>'
             f'    <div class=up-pct class=hint style="margin-top:.2rem">0%</div>'
             f'  </div>'
             f'  {_upload_cfg_hint}'
@@ -9275,7 +9547,7 @@ function pollNewMatch(jobId, st){
             f'<div id=detail data-match="{_esc(name or "")}">{back}'
             f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
             f'<h1>🥊 {_esc(title)}</h1>'
-            f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
+            f'<span id=detail-status style="font-size:.8rem;color:var(--blue-corner)"></span></div>'
             # edit meta
             f'<div class=card>'
             f'  <div class=row3>'
@@ -9301,22 +9573,22 @@ function pollNewMatch(jobId, st){
             f'<div class=hint>{_detail_fps_hint}</div></div>'
             f'  </div>'
             f'  <div class=pf-actions style="margin-top:.6rem">'
-            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-primary btn-sm" '
             f'onclick="saveMatch(event,\'{_esc(name)}\')">💾 Save match</button>'
-            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem;background:#7a3da8;border-color:#7a3da8" '
+            f'    <button class="btn btn-primary btn-sm" style="background:var(--violet);border-color:var(--violet)" '
             f'onclick="reMatch(event,\'full\',{{match:\'{_esc(name)}\'}})" '
             f'title="Regenerate this whole match end to end: prompts → keyframes → clips → outcomes → finals. Uses text, image and video models.">♻ Regenerate whole match</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'replan\',{{match:\'{_esc(name)}\'}})" '
             f'title="Rebuild this match\'s clip list + prompts at the current fps (more, shorter clips at higher fps). No video model.">📝 Re-plan prompts</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'replan-outcomes\',{{match:\'{_esc(name)}\'}})" '
             f'title="Rewrite ONLY this match\'s outcome prompts (finish + victory shots). Fight-clip prompts are left untouched. No video model.">📝 Re-plan outcome prompts</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'match-clips\',{{match:\'{_esc(name)}\'}})">♻ Re-render all clips</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'outcomes\',{{match:\'{_esc(name)}\'}})">♻ Re-render all outcomes</button>'
             f'  </div>'
             # ── Whole-match finalize/package options (applied by Regenerate) ──
@@ -9330,20 +9602,20 @@ function pollNewMatch(jobId, st){
             f'    <span class=hint>↳ applied by “♻ Regenerate whole match”.</span>'
             f'  </div>'
             f'  <div class=pf-actions style="margin-top:.4rem">'
-            f'    <a class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem;text-decoration:none" '
+            f'    <a class="btn btn-secondary btn-sm" style="text-decoration:none" '
             f'href="/match/keyframes?name={_esc(name)}">🖼 Keyframes ▸</a>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'keyframes-missing\',{{match:\'{_esc(name)}\'}})">➕ Missing keyframes</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate keyframes</button>'
-            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-danger btn-sm" '
             f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear keyframes</button>'
-            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-danger btn-sm" '
             f'onclick="delVid(event,\'outputs\',{{match:\'{_esc(name)}\'}})" '
             f'title="Remove only this match\'s outcome videos (and their upscaled variants). Clips and finals are kept.">🗑 Remove outcome videos</button>'
-            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-danger btn-sm" '
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
-            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-danger btn-sm" '
             f'onclick="delVid(event,\'match-purge\',{{match:\'{_esc(name)}\'}})" '
             f'title="Remove this match completely — files, keyframes, and its entry in the plan">'
             f'🧨 Remove match completely</button>'
@@ -9365,13 +9637,13 @@ function pollNewMatch(jobId, st){
             f'  <label style="display:flex;align-items:center;gap:.35rem;font-size:.82rem;white-space:nowrap" '
             f'title="Re-run from the original video, overwriting any existing *_2x/_NxfpS file (otherwise an up-to-date enhanced file is skipped).">'
             f'<input type=checkbox id=enh-force> Force re-enhance</label>'
-            f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'  <button class="btn btn-secondary btn-sm" '
             f'onclick="enhanceMatch(event,\'finals\',\'{_esc(name)}\')">✨ Enhance finals</button>'
-            f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'  <button class="btn btn-secondary btn-sm" '
             f'onclick="enhanceMatch(event,\'outcomes\',\'{_esc(name)}\')">✨ Enhance outcomes</button>'
-            f'  <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'  <button class="btn btn-primary btn-sm" '
             f'onclick="enhanceMatch(event,\'all\',\'{_esc(name)}\')">✨ Enhance all</button>'
-            f'  <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'  <button class="btn btn-danger btn-sm" '
             f'onclick="delVid(event,\'enhanced\',{{match:\'{_esc(name)}\'}})" '
             f'title="Delete only the upscaled / higher-FPS versions (the *_2x / *_NxfpS files); originals are kept.">'
             f'🗑 Remove upscaled versions</button>'
@@ -9400,7 +9672,7 @@ function pollNewMatch(jobId, st){
         back = (f'<a href="/match?name={_esc(name or "")}" '
                 f'style="font-size:.85rem">‹ Back to match</a>')
         if not name or name not in matches:
-            return f'<div class=card style="color:#666">Match not found. {back}</div>'
+            return f'<div class=card style="color:var(--text-faint)">Match not found. {back}</div>'
         meta = fight_by_name.get(name, {})
         info = matches[name]
         kdir = vdir / "keyframes"
@@ -9428,14 +9700,14 @@ function pollNewMatch(jobId, st){
             else:
                 img = ('<div class=hint style="height:120px;display:flex;'
                        'align-items:center;justify-content:center;'
-                       'background:#1b1b1b;border-radius:6px">no keyframe</div>')
+                       'background:var(--surface);border-radius:6px">no keyframe</div>')
                 clr = ''
             return (
-                f'<div class=card style="width:215px">'
+                f'<div class="card card-tile card-tile-sm">'
                 f'  <div class=hint style="display:flex;justify-content:space-between;'
                 f'align-items:center;margin-bottom:.25rem">'
                 f'<span>{_esc(label)}</span>'
-                f'<span><a href="#" style="color:#c79bf0" '
+                f'<span><a href="#" style="color:var(--violet-text)" '
                 f'title="Regenerate this keyframe (image model)" '
                 f'onclick="reMatch(event,\'keyframe\',{regen_params})">↻ regenerate</a> '
                 f'{clr}</span></div>'
@@ -9516,7 +9788,7 @@ function pollNewMatch(jobId, st){
                         kf_text, f'data-kfoutc="{_esc(fr)}|{_esc(oc)}|{si}"'))
             out_groups.append(
                 f'<div style="margin-top:.5rem"><div class=hint '
-                f'style="font-weight:700;color:#bbb">{_esc(fr)}</div>'
+                f'style="font-weight:700;color:var(--text-dim)">{_esc(fr)}</div>'
                 f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;'
                 f'margin-top:.25rem">{"".join(tiles)}</div></div>')
         outcomes_html = ("".join(out_groups)
@@ -9527,7 +9799,7 @@ function pollNewMatch(jobId, st){
             f'<div style="display:flex;justify-content:space-between;'
             f'align-items:center;margin:.4rem 0">'
             f'<h1>🖼 Keyframes — {_esc(title)}</h1>'
-            f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
+            f'<span id=detail-status style="font-size:.8rem;color:var(--blue-corner)"></span></div>'
             f'<div class=card>'
             f'  <p class=hint style="margin:0 0 .5rem">Keyframes are the image→video '
             f'bridge stills. The text under each thumbnail is the <b>prompt used to '
@@ -9537,13 +9809,13 @@ function pollNewMatch(jobId, st){
             f'environment, so clothing colours and location stay consistent. After '
             f'regenerating, <b>Re-render</b> the matching clip on the match page.</p>'
             f'  <div class=pf-actions>'
-            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem;background:#2d7a4a;border-color:#2d7a4a" '
+            f'    <button class="btn btn-primary btn-sm" style="background:var(--good-deep);border-color:var(--good-deep)" '
             f'onclick="saveKfPrompts(event,\'{_esc(name)}\')">💾 Save keyframe prompts</button>'
-            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-primary btn-sm" '
             f'onclick="reMatch(event,\'keyframes-missing\',{{match:\'{_esc(name)}\'}})">➕ Generate missing</button>'
-            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-secondary btn-sm" '
             f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate all</button>'
-            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'    <button class="btn btn-danger btn-sm" '
             f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear all</button>'
             f'  </div>'
             f'</div>'
@@ -9582,9 +9854,9 @@ function pollNewMatch(jobId, st){
         for nm in sorted(wardrobe):
             o = wardrobe[nm]
             clash = color_of.get(nm) in clashes
-            warn = (' <span class=hint style="color:#e0a060">⚠ shares colour</span>'
+            warn = (' <span class=hint style="color:var(--tan)">⚠ shares colour</span>'
                     if clash else '')
-            bstyle = 'border-color:#e0a060;' if clash else ''
+            bstyle = 'border-color:var(--tan);' if clash else ''
             rows.append(
                 f'<div class=card style="display:flex;gap:.7rem;align-items:center;'
                 f'padding:.5rem .7rem">'
@@ -9598,8 +9870,8 @@ function pollNewMatch(jobId, st){
         clash_note = ''
         if clashes:
             clash_note = (
-                f'<div class=card style="border-color:#e0a060">'
-                f'<b style="color:#e0a060">⚠ {len(clashes)} colour clash'
+                f'<div class=card style="border-color:var(--tan)">'
+                f'<b style="color:var(--tan)">⚠ {len(clashes)} colour clash'
                 f'{"es" if len(clashes) > 1 else ""}</b> — two or more fighters '
                 f'share a colour, which makes the image model swap their kits in a '
                 f'match. Give them distinct colours, or hit '
@@ -9610,13 +9882,13 @@ function pollNewMatch(jobId, st){
             f'{clash_note}'
             f'<div style="display:flex;flex-direction:column;gap:.4rem">{rows_html}</div>'
             f'<div class=pf-actions style="margin-top:.7rem">'
-            f'  <button class="btn btn-primary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'  <button class="btn btn-primary btn-sm" '
             f'onclick="saveWardrobe(event)">💾 Save wardrobe</button>'
-            f'  <button class="btn btn-secondary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'  <button class="btn btn-secondary btn-sm" '
             f'onclick="reshuffleWardrobe(event)" '
             f'title="Give every fighter a distinct colour, keeping their garment">'
             f'🎨 Reshuffle distinct colours</button>'
-            f'  <span id=wf-status style="font-size:.8rem;color:#7ea8f7"></span>'
+            f'  <span id=wf-status style="font-size:.8rem;color:var(--blue-corner)"></span>'
             f'</div>'
             f'</div>'
         )
@@ -9632,14 +9904,14 @@ function _gatherWardrobe(){
 async function saveWardrobe(ev){
   const st=document.getElementById('wf-status');
   const set=(c,t)=>{st.style.color=c;st.textContent=t;};
-  set('#aaa','Saving…');
+  set('var(--text-dim)','Saving…');
   const fd=new FormData(); fd.append('wardrobe', JSON.stringify(_gatherWardrobe()));
   try{
     const j=await (await fetch('/wardrobe/save',{method:'POST',body:fd})).json();
-    if(j.error){ set('#e07070','✗ '+j.error); return; }
+    if(j.error){ set('var(--bad)','✗ '+j.error); return; }
     set('#7ed87e','✓ Saved — regenerate the match keyframes to apply');
     setTimeout(()=>location.reload(),900);
-  }catch(e){ set('#e07070','✗ '+e); }
+  }catch(e){ set('var(--bad)','✗ '+e); }
 }
 async function reshuffleWardrobe(ev){
   if(!(await uiConfirm('Give every fighter a distinct colour (keeping each garment)? '
@@ -9649,14 +9921,13 @@ async function reshuffleWardrobe(ev){
   const fd=new FormData(); fd.append('reshuffle','1');
   try{
     const j=await (await fetch('/wardrobe/save',{method:'POST',body:fd})).json();
-    if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+    if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
     location.reload();
-  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
+  }catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; }
 }
 </script>"""
 
-        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h1>👕 Wardrobe</h1></div>'
+        return ('', 
                 f'<p class=hint style="margin-bottom:.8rem">Each fighter\'s <b>locked '
                 f'outfit</b>. The same phrase is written into every keyframe of a match, '
                 f'so clothing colours stay consistent shot to shot. Include a colour '
@@ -9704,11 +9975,11 @@ async function reshuffleWardrobe(ev){
             f'  {outcome_blocks}'
             f'</div>'
             f'<div class=pf-actions>'
-            f'  <button class="btn btn-primary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'  <button class="btn btn-primary btn-sm" '
             f'onclick="savePrompts(event)">💾 Save prompts</button>'
-            f'  <button class="btn btn-secondary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'  <button class="btn btn-secondary btn-sm" '
             f'onclick="resetPrompts(event)">↺ Reset to defaults</button>'
-            f'  <span id=pf-status style="font-size:.8rem;color:#7ea8f7"></span>'
+            f'  <span id=pf-status style="font-size:.8rem;color:var(--blue-corner)"></span>'
             f'</div>'
             f'</div>'
         )
@@ -9730,13 +10001,13 @@ function _gatherPrompts(){
 async function savePrompts(ev){
   const st=document.getElementById('pf-status');
   const set=(c,t)=>{st.style.color=c;st.textContent=t;};
-  set('#aaa','Saving…');
+  set('var(--text-dim)','Saving…');
   const fd=new FormData(); fd.append('config', JSON.stringify(_gatherPrompts()));
   try{
     const j=await (await fetch('/prompts/save',{method:'POST',body:fd})).json();
-    if(j.error){ set('#e07070','✗ '+j.error); return; }
+    if(j.error){ set('var(--bad)','✗ '+j.error); return; }
     set('#7ed87e','✓ Saved — applied to future runs');
-  }catch(e){ set('#e07070','✗ '+e); }
+  }catch(e){ set('var(--bad)','✗ '+e); }
 }
 async function resetPrompts(ev){
   if(!(await uiConfirm('Reset all global prompts to the built-in defaults?',
@@ -9745,14 +10016,13 @@ async function resetPrompts(ev){
   const fd=new FormData(); fd.append('reset','1');
   try{
     const j=await (await fetch('/prompts/save',{method:'POST',body:fd})).json();
-    if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+    if(j.error){ st.style.color='var(--bad)'; st.textContent='✗ '+j.error; return; }
     location.reload();
-  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
+  }catch(e){ st.style.color='var(--bad)'; st.textContent='✗ '+e; }
 }
 </script>"""
 
-        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h1>Global prompts</h1></div>'
+        return ('', 
                 f'<p class=hint style="margin-bottom:.8rem">These templates drive how clip and '
                 f'outcome prompts are written for every match. Per-match prompts are edited on the '
                 f'Matches page. Changes apply to future runs/regenerations.</p>'
@@ -9819,19 +10089,24 @@ async function resetPrompts(ev){
                     self._send(404, "text/plain; charset=utf-8", b"no favicon")
 
             elif path in ("/", ""):
-                html = _page("Run", _run_page_html(default_args), "run")
+                _b, _a, _side = _run_page_html(default_args)
+                html = _page("Run settings", _b, "run",
+                             actions=_a, aside=_side, dock=True)
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/characters":
-                html = _page("Characters", _profiles_html("character"), "characters")
+                _a, _b = _profiles_html("character")
+                html = _page("Characters", _b, "characters", actions=_a)
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/environments":
-                html = _page("Environments", _profiles_html("environment"), "environments")
+                _a, _b = _profiles_html("environment")
+                html = _page("Environments", _b, "environments", actions=_a)
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/matches":
-                html = _page("Matches", _matches_html(), "matches")
+                _a, _b = _matches_html()
+                html = _page("Matches", _b, "matches", actions=_a)
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/match":
@@ -9848,11 +10123,13 @@ async function resetPrompts(ev){
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/wardrobe":
-                html = _page("Wardrobe", _wardrobe_html(), "wardrobe")
+                _a, _b = _wardrobe_html()
+                html = _page("Wardrobe", _b, "wardrobe", actions=_a)
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/prompts":
-                html = _page("Prompts", _prompts_html(), "prompts")
+                _a, _b = _prompts_html()
+                html = _page("Global prompts", _b, "prompts", actions=_a)
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/templates":

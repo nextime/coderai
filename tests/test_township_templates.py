@@ -289,3 +289,40 @@ def test_a_starter_is_a_partial_not_a_full_capture():
     for name, cfg in TW.BUILTIN_TEMPLATES.items():
         assert 0 < len(cfg) < len(TW.CONFIG_FIELDS) / 2, name
         assert set(cfg) <= set(TW.CONFIG_FIELDS), name
+
+
+def test_both_starters_cover_the_same_options():
+    """A starter that set a key its twin did not would leave that setting at whatever
+    the previous template put there — switching templates has to be deterministic."""
+    wan = set(TW.BUILTIN_TEMPLATES["Wan - many short scenes"])
+    lc = set(TW.BUILTIN_TEMPLATES["LongCat - few long scenes"])
+    assert wan == lc, wan ^ lc
+
+
+def test_the_starters_cover_the_outcome_clips_too():
+    """Outcome stings go through the same video model as the scenes, so a template
+    that only sized the scenes would leave them at the other model's frame counts."""
+    for cfg in TW.BUILTIN_TEMPLATES.values():
+        assert "outcome_min_frames" in cfg and "outcome_max_frames" in cfg
+        assert cfg["outcome_min_frames"] <= cfg["outcome_max_frames"]
+
+
+def test_the_longcat_outcomes_obey_the_vae_rule_as_well():
+    lc = TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]
+    for key in ("outcome_min_frames", "outcome_max_frames"):
+        assert (lc[key] - 1) % 4 == 0, key
+    # 93 is one whole LongCat segment: the shortest honest ask.
+    assert lc["outcome_min_frames"] == 93
+
+
+def test_the_starters_leave_the_image_side_stages_alone():
+    """Characters and environments are drawn by the IMAGE model; the video model never
+    sees the pool. A starter that pinned those would reset an operator's pool for no
+    reason. keyframe_size is the one exception — a keyframe is the frame the video
+    model is conditioned on, so it has to match the clip."""
+    image_side = {"num_fighters", "num_environments", "char_refs", "env_refs",
+                  "keyframe_steps", "image_model", "text_model", "lora_steps",
+                  "lora_rank", "lora_weight", "character_strength"}
+    for name, cfg in TW.BUILTIN_TEMPLATES.items():
+        assert not (set(cfg) & image_side), name
+        assert cfg["keyframe_size"] == cfg["video_size"], name
