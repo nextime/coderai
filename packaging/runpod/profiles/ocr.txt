@@ -27,3 +27,13 @@ jsonschema>=4.0.0
 # SuryaEngine still runs as a subprocess (it is a SubprocessOcrEngine), so the
 # pod points ocr.surya_venv at this interpreter rather than building one.
 surya-ocr==0.22.1
+
+# olmOCR-2 needs NOTHING here. It is a document VLM, not a library: it imports only
+# PIL and requests, and reaches its model one of three ways — coderai's own model
+# manager ("model"), coderai's vLLM engine ("vllm"), or any OpenAI-compatible
+# endpoint ("server"). A pod has no vLLM of its own and will not get one: that venv
+# is ~10.5 GB against a ~12 GB image ceiling, and it would be a second torch beside
+# the one docTR and Surya already need here. So on a pod olmOCR runs in "server"
+# mode against an endpoint the renting install configures — a vLLM pod, for
+# instance. runpod_worker seeds olmocr_serve/olmocr_server_url when they are set and
+# falls back to docTR only when they are not.

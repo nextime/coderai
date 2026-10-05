@@ -166,6 +166,26 @@ of 0.9 (or 0.6) can be more than the card has left. Otherwise: give the card les
 resident work, or serve the engine with `model`/`server` mode, which needs no instance of
 its own at all.
 
+### On a rented pod
+
+A pod image carries docTR and Surya in its venv and PaddleOCR in a baked one
+(`packaging/runpod/profiles/ocr.txt`, `ocr-paddle.*`). What it does **not** carry is a
+model server: Surya-2 and olmOCR-2 are VLMs, and locally they ride coderai's own vLLM
+engine. Baking that in would mean a second torch in the image — the vLLM venv alone is
+~10.5 GB against a ~12 GB ceiling — so it is deliberately absent.
+
+Those engines are still remotizable, through their **served** modes, which need nothing
+but HTTP: set `ocr.olmocr_serve = "server"` with `olmocr_server_url`, or
+`ocr.surya_serve = "llamacpp"` with `surya_server_url`, pointing at an endpoint the pod
+can reach — a vLLM pod, for instance. The renting install seeds the mode, the URL and the
+model ids to the pod, and pins `fallback_engines` to the engines the image actually has,
+so a failed page is never handed to one that cannot run there. Ask for a VLM engine with
+no server configured and the pod says so in its log and serves the request with docTR
+instead of dying at inference.
+
+Engine selection on a pod follows the usual `alias or path or id`, so an entry aliased
+`olmocr` over an HF repo path is recognised.
+
 ### A document is never refused because one engine is down
 
 `ocr.fallback_engines` (default `auto`) makes a failing engine hand the document to the

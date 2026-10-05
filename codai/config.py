@@ -1552,10 +1552,16 @@ class ConfigManager:
                     setattr(self.config.ocr, f"{name}_venv", venv)
             # olmOCR needs to be told WHERE its model is; a pod that carries no vLLM
             # is given a server URL (or the id of a vision model it does hold).
+            # Surya's served mode is seeded the same way, and so is the fallback
+            # chain: on a pod "auto" would hand a failed page to an engine the image
+            # cannot serve, so the renting install pins it to what is present.
             for _env, _attr in (("CODERAI_OCR_OLMOCR_SERVE", "olmocr_serve"),
                                 ("CODERAI_OCR_OLMOCR_MODEL", "olmocr_model"),
                                 ("CODERAI_OCR_OLMOCR_MODEL_ID", "olmocr_model_id"),
-                                ("CODERAI_OCR_OLMOCR_SERVER_URL", "olmocr_server_url")):
+                                ("CODERAI_OCR_OLMOCR_SERVER_URL", "olmocr_server_url"),
+                                ("CODERAI_OCR_SURYA_SERVE", "surya_serve"),
+                                ("CODERAI_OCR_SURYA_SERVER_URL", "surya_server_url"),
+                                ("CODERAI_OCR_FALLBACK_ENGINES", "fallback_engines")):
                 _val = (_os.environ.get(_env) or "").strip()
                 if _val:
                     setattr(self.config.ocr, _attr, _val)

@@ -886,6 +886,39 @@ def _surya_accepted() -> bool:
         return False
 
 
+def _ocr_cfg():
+    """This install's OcrConfig, or None. The pod has no config of its own — every
+    OCR setting it runs with is seeded from here."""
+    try:
+        from codai.admin.routes import config_manager
+        return getattr(getattr(config_manager, "config", None), "ocr", None)
+    except Exception:
+        return None
+
+
+def _ocr_external_server(engine: str):
+    """The off-box OpenAI-compatible endpoint configured for a VLM OCR engine, or "".
+
+    This is what decides whether a pod can actually serve surya/olmOCR. Both are VLMs
+    and need a model server: locally they ride coderai's own vLLM, which a pod has
+    none of, and baking one in would mean a SECOND torch in the image (the vLLM venv
+    alone is ~10.5 GB against a ~12 GB ceiling). But in the served modes the engine
+    only speaks HTTP — PIL and requests, both already in the image — so a pod CAN run
+    them when the operator has pointed them at a server, including at a vLLM pod."""
+    o = _ocr_cfg()
+    if o is None:
+        return ""
+    if engine == "olmocr":
+        mode = str(getattr(o, "olmocr_serve", "") or "").strip().lower()
+        url = str(getattr(o, "olmocr_server_url", "") or "").strip()
+        return url if (mode == "server" and url) else ""
+    if engine == "surya":
+        mode = str(getattr(o, "surya_serve", "") or "").strip().lower()
+        url = str(getattr(o, "surya_server_url", "") or "").strip()
+        return url if (mode == "llamacpp" and url) else ""
+    return ""
+
+
 def _plan(engine, image, args, mcfg, api_key, entry, served,
           seed_entries: list = None, capability: str = "") -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the models it must serve."""
@@ -961,20 +994,55 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
 
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
-        wanted = str((entry or {}).get("path") or "").strip().lower()
+        # Which engine this pod is for. An entry is routable by its ALIAS before its
+        # path (the `alias or path or id` convention used throughout the manager), and
+        # aliases are how one model carries several configs and how several models sit
+        # behind one endpoint — so an aliased OCR entry must not be misread as "no
+        # engine named that" and silently downgraded. Take the first candidate that
+        # names a real engine; fall back to the path, as before.
+        _cands = [str((entry or {}).get("alias") or "").strip().lower(),
+                  str(served or "").strip().lower(),
+                  str((entry or {}).get("path") or "").strip().lower()]
+        wanted = next((c for c in _cands if c in ("paddle", "doctr", "surya", "olmocr")),
+                      _cands[-1])
+        # Remember what was ASKED for: the licence decision below is made by asking
+        # for surya by name, and that has to survive a downgrade to docTR.
+        _asked = wanted
         if wanted in ("surya", "olmocr"):
-            # Surya 0.22 is a VLM ("surya-ocr-2") and olmOCR-2 is one outright,
-            # not a self-contained OCR library: both need a server — vLLM, which
-            # surya spawns IN DOCKER (a pod cannot), or llama-server on a GGUF,
-            # which the image does not ship. Locally they ride coderai's own vLLM
-            # engine; a pod has none. So a pod asked for either serves the request
-            # with docTR, which is in the image and has passed — rather than
-            # loading it, reaching inference, and dying on "docker binary not
-            # found". (An olmOCR pod would want olmocr_serve="server" pointed at a
-            # model server it can actually reach; nothing provisions one here.)
-            print(f"[runpod] {wanted} on a pod needs a VLM server the image does not "
-                  "carry — this OCR request will be served by docTR", flush=True)
-            wanted = "doctr"
+            # Surya 0.22 is a VLM ("surya-ocr-2") and olmOCR-2 is one outright, not a
+            # self-contained OCR library: both need a model server. Locally they ride
+            # coderai's own vLLM engine, which a pod has none of, and baking one in
+            # would put a SECOND torch in the image (the vLLM venv alone is ~10.5 GB
+            # against a ~12 GB ceiling).
+            #
+            # But in their SERVED modes these engines only speak HTTP, and PIL and
+            # requests are already in the image. So when the operator has pointed the
+            # engine at a reachable endpoint — including at a vLLM pod, which is the
+            # composition this is for — the pod runs the engine it was asked for, and
+            # the settings are seeded below. Only with nothing configured does it fall
+            # back, because loading a VLM with no server reaches inference and dies.
+            _srv = _ocr_external_server(wanted)
+            if _srv:
+                _o = _ocr_cfg()
+                if wanted == "olmocr":
+                    env["CODERAI_OCR_OLMOCR_SERVE"] = "server"
+                    env["CODERAI_OCR_OLMOCR_SERVER_URL"] = _srv
+                    for _v, _a in (("CODERAI_OCR_OLMOCR_MODEL", "olmocr_model"),
+                                   ("CODERAI_OCR_OLMOCR_MODEL_ID", "olmocr_model_id")):
+                        _val = str(getattr(_o, _a, "") or "").strip()
+                        if _val:
+                            env[_v] = _val
+                else:
+                    env["CODERAI_OCR_SURYA_SERVE"] = "llamacpp"
+                    env["CODERAI_OCR_SURYA_SERVER_URL"] = _srv
+                print(f"[runpod] {wanted} on a pod will use the configured server at "
+                      f"{_srv} (the image carries no VLM server of its own)", flush=True)
+            else:
+                print(f"[runpod] {wanted} on a pod needs a VLM server the image does "
+                      f"not carry and none is configured (set "
+                      f"ocr.{wanted}_server_url and the served mode) — this OCR "
+                      f"request will be served by docTR", flush=True)
+                wanted = "doctr"
         if wanted not in ("paddle", "doctr", "surya", "olmocr"):
             # The pod images ship docTR, the only engine that runs in-process.
             wanted = "doctr"
@@ -987,7 +1055,14 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             # CUDA runtime. Point the engine at that interpreter rather than
             # letting it try to build a venv on a rented machine.
             env["CODERAI_OCR_PADDLE_VENV"] = "/opt/coderai/venvs/paddleocr"
-        if wanted == "surya" or _surya_accepted():
+        # The fallback chain (ocr.fallback_engines) must not name an engine this image
+        # cannot serve: "auto" would send a failed page to surya/olmocr, which on a pod
+        # have no server unless one was seeded just above. Pin it to what is present.
+        _fb = ["doctr"] if wanted != "paddle" else ["paddle", "doctr"]
+        if wanted not in _fb:
+            _fb.insert(0, wanted)
+        env["CODERAI_OCR_FALLBACK_ENGINES"] = ",".join(_fb)
+        if _asked == "surya" or _surya_accepted():
             # Surya is GPL and gated on an explicit acceptance. The pod inherits
             # the decision made HERE — it cannot make it for itself, and asking
             # for surya by name is that decision.
