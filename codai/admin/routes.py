@@ -1757,8 +1757,72 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
 # A long backstop TTL re-scans occasionally even if mtimes somehow miss a change.
 import threading as _cache_thr
 _SCAN_TTL = 600.0
-_scan_state = {"data": None, "sig": None, "at": 0.0, "busy": False}
-_stats_state = {"data": None, "sig": None, "at": 0.0, "busy": False}
+_scan_state = {"data": None, "sig": None, "at": 0.0, "busy": False, "disk": "model-scan.json"}
+_stats_state = {"data": None, "sig": None, "at": 0.0, "busy": False, "disk": "model-stats.json"}
+
+# The in-process cache above is lost on every restart, so the FIRST read of the
+# models page after one pays the whole scan synchronously — which is exactly when
+# someone is sitting there waiting for the page. Persisting the last result means
+# that read is served from disk and revalidated in the background instead.
+# The file is a cache: a corrupt or absent one simply falls back to scanning.
+_DISK_CACHE_VERSION = 1
+
+
+def _disk_cache_path(state) -> str:
+    import os
+    name = state.get("disk")
+    if not name or config_manager is None:
+        return ""
+    base = getattr(config_manager, "config_dir", "") or ""
+    if not base:
+        return ""
+    return os.path.join(str(base), "cache", name)
+
+
+def _load_disk_cache(state) -> None:
+    """Seed the in-memory cache from disk, once per process."""
+    import json as _json
+    if state.get("disk_loaded"):
+        return
+    state["disk_loaded"] = True
+    path = _disk_cache_path(state)
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            blob = _json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(blob, dict) or blob.get("version") != _DISK_CACHE_VERSION:
+        return
+    if blob.get("data") is None:
+        return
+    state["data"] = blob["data"]
+    # The signature is deliberately NOT restored: it is a list of mtimes, and
+    # trusting it across a restart would serve a stale list without revalidating.
+    # Leaving it unset means the first read returns this instantly AND refreshes.
+    state["sig"] = None
+    state["at"] = 0.0
+
+
+def _save_disk_cache(state, data) -> None:
+    import json as _json, os, tempfile
+    path = _disk_cache_path(state)
+    if not path or data is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Written atomically: a half-written cache read by another process would
+        # just be discarded, but a rename keeps it from happening at all.
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            _json.dump({"version": _DISK_CACHE_VERSION, "data": data}, fh)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError, UnboundLocalError):
+            pass
 
 
 def _scan_signature():
@@ -1802,6 +1866,7 @@ def _scan_signature():
 
 def _cached(state, fn):
     import time as _t
+    _load_disk_cache(state)
     now = _t.time()
     sig = _scan_signature()
     fresh = (state["sig"] == sig and (now - state["at"]) < _SCAN_TTL)
@@ -1816,6 +1881,7 @@ def _cached(state, fn):
         state["sig"] = sig
         state["at"] = _t.time()
         state["force_sync"] = False
+        _save_disk_cache(state, state["data"])
         return state["data"]
     if not state["busy"]:                          # changed: refresh in background
         state["busy"] = True
@@ -1826,6 +1892,7 @@ def _cached(state, fn):
                 state["data"] = d
                 state["sig"] = _scan_signature()
                 state["at"] = _t.time()
+                _save_disk_cache(state, d)
             finally:
                 state["busy"] = False
         _cache_thr.Thread(target=_bg, daemon=True).start()

@@ -3034,7 +3034,62 @@ function resetWhisperServerBuilderDefaults(){
   if(serverPathInput && !serverPathInput.value.trim()) serverPathInput.value = defaultWhisperServerPath();
 }
 
-async function loadCachedModels(){
+// ── Model-list snapshot cache ────────────────────────────────────────────────
+// Opening this page costs two round trips and a full re-render before anything
+// appears, which on a large configuration is the whole reason it feels slow. The
+// last successful response is kept in sessionStorage, so a revisit paints from it
+// immediately and then revalidates in the background. The data is a listing of
+// what is on disk — a few seconds of staleness costs nothing, and the fresh
+// render replaces it in place.
+const _SNAP_KEY = 'coderai.models.snapshot.v1';
+const _SNAP_MAX_AGE = 5 * 60 * 1000;
+let _snapshotUsed = false;
+
+function _readSnapshot(){
+  try{
+    const raw = sessionStorage.getItem(_SNAP_KEY);
+    if(!raw) return null;
+    const snap = JSON.parse(raw);
+    if(!snap || !snap.at || (Date.now() - snap.at) > _SNAP_MAX_AGE) return null;
+    return snap;
+  }catch(e){ return null; }   // private mode / disabled storage: just skip it
+}
+
+function _writeSnapshot(d, whisperModels){
+  try{
+    sessionStorage.setItem(_SNAP_KEY, JSON.stringify({at: Date.now(), d, whisperModels}));
+  }catch(e){ /* quota exceeded — the page works without the snapshot */ }
+}
+
+async function _fetchModelData(){
+  // Both reads are served by the system worker and neither depends on the other,
+  // so they go out together instead of one after the other.
+  const [cr, models] = await Promise.all([
+    pageFetch('/admin/api/cached-models'),
+    pageFetch('/admin/api/models').then(r => r.ok ? r.json() : []).catch(() => []),
+  ]);
+  if(!cr.ok) throw new Error((await cr.json().catch(()=>({}))).detail || cr.statusText);
+  const d = await cr.json();
+  // Only whisper-server RUNNERS (they carry a model_path) belong in this card.
+  // A whisper MODEL config (a .gguf entry with backend=whisper-server but no
+  // model_path) is shown on the GGUF row instead, as that file's model config.
+  const whisperModels = (models || []).filter(m => m.backend === 'whisper-server' && m.model_path);
+  _writeSnapshot(d, whisperModels);
+  return {d, whisperModels};
+}
+
+// First paint calls this from three places (the snapshot paint, the engine-info
+// callback and refreshLocal). Collapsing the concurrent ones into a single
+// in-flight load means one fetch and one render instead of three; a call made
+// after it settles still refetches, which is what every post-action refresh needs.
+let _listPending = null;
+function loadCachedModels(){
+  if(_listPending) return _listPending;
+  _listPending = _loadCachedModelsImpl().finally(() => { _listPending = null; });
+  return _listPending;
+}
+
+async function _loadCachedModelsImpl(){
   _localModels = [];
   const hfEl   = document.getElementById('hf-models-list');
   const ggufEl = document.getElementById('gguf-models-list');
@@ -3045,14 +3100,20 @@ async function loadCachedModels(){
   const _firstLoad = !hfEl.dataset.loaded;
   if(_firstLoad) hfEl.innerHTML = ggufEl.innerHTML = '<span class="muted small">Loading…</span>';
   try{
-    const r = await pageFetch('/admin/api/cached-models');
-    if(!r.ok) throw new Error((await r.json()).detail||r.statusText);
-    const d = await r.json();
-    // Only whisper-server RUNNERS (they carry a model_path) belong in this card.
-    // A whisper MODEL config (a .gguf entry with backend=whisper-server but no
-    // model_path) is shown on the GGUF row instead, as that file's model config.
-    const whisperModels = (await pageFetch('/admin/api/models').then(r=>r.ok?r.json():[]))
-      .filter(m => m.backend === 'whisper-server' && m.model_path);
+    let _data = null;
+    if(!_snapshotUsed){
+      _snapshotUsed = true;
+      const snap = _readSnapshot();
+      if(snap){
+        // Paint what we had, then revalidate on the next tick (by then this call
+        // has settled, so the wrapper lets the refetch through).
+        _data = {d: snap.d, whisperModels: snap.whisperModels};
+        setTimeout(() => loadCachedModels(), 0);
+      }
+    }
+    if(!_data) _data = await _fetchModelData();
+    const d = _data.d;
+    const whisperModels = _data.whisperModels || [];
 
     // HF models
     const hf = d.hf||[];
@@ -3361,8 +3422,10 @@ function _quantBadge(modelId){
 }
 
 async function refreshLocal(){
-  await refreshLoadedStatus();
-  _quantSig = await refreshQuantJobs();
+  // The list renders loaded/quant badges, so it still waits for both — but they
+  // are independent of each other and no longer go out in a chain.
+  const [, sig] = await Promise.all([refreshLoadedStatus(), refreshQuantJobs()]);
+  _quantSig = sig;
   loadCacheStats();
   loadCachedModels();
 }
@@ -3382,8 +3445,11 @@ setInterval(async () => {
 // batch them through the engine (which was actually dragging the page back onto
 // the busy engine), so each call goes straight to its correct target.
 loadGlobalSettings();
-// Engine/card info first so per-model card tags render on first paint, then
-// re-render once it resolves (covers the fetch resolving after the list).
+// Paint the list from the last snapshot before anything goes over the network;
+// every call below revalidates it, and concurrent ones collapse into one fetch.
+loadCachedModels();
+// Engine/card info so per-model card tags render, re-rendering once it resolves
+// (covers the fetch resolving after the list).
 _loadEngineInfo().then(() => loadCachedModels());
 refreshLocal();
 pollDownloads();
