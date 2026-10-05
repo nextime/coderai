@@ -4121,23 +4121,57 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # coderai's request modes map onto upstream's three entry points. 'extend' is the
+    # existing VACE vocabulary for "continue from these frames", and LongCat serves it
+    # natively — generate_vc is pretrained for continuation, which is why it does not
+    # drift in colour or quality the way chained frame-tail conditioning does.
     mode = (request.mode or "t2v").lower()
-    if mode not in ("t2v", ""):
-        # Honest refusal beats a silent downgrade: the payload for these is designed but
-        # the worker does not implement them yet.
+    _task = {"t2v": "t2v", "": "t2v",
+             "i2v": "i2v", "ti2v": "i2v",
+             "extend": "vc", "vc": "vc", "v2v": "vc"}.get(mode)
+    if _task is None:
         raise HTTPException(status_code=400, detail=(
-            f"LongCat-Video mode '{mode}' is not implemented yet — this build supports "
-            f"text-to-video. Image-to-video, continuation and the avatar tasks are the "
-            f"next increment."))
+            f"LongCat-Video does not support mode '{mode}'. Use 't2v', 'i2v' or "
+            f"'extend' (continuation); the audio-driven avatar tasks are a separate "
+            f"increment."))
 
     payload = {
         "prompt": request.prompt or "",
         "quality": quality,
         "stage": stage,
         "model": model_path,
+        "task": _task,
         "num_frames": int(request.num_frames) if request.num_frames
                       else lc.DEFAULT_NUM_FRAMES,
     }
+    if request.negative_prompt:
+        payload["negative_prompt"] = request.negative_prompt
+
+    # i2v takes one conditioning image; coderai accepts it as init_image or image.
+    if _task == "i2v":
+        _first = request.init_image or request.image
+        if not _first:
+            raise HTTPException(status_code=400, detail=(
+                "mode 'i2v' needs init_image (or image)"))
+        payload["image"] = _as_b64(_first)
+
+    # Continuation takes the previous clip's tail — the same `cond_frames` field the VACE
+    # path uses, so a client that already chains clips needs no new vocabulary.
+    if _task == "vc":
+        if not request.cond_frames:
+            raise HTTPException(status_code=400, detail=(
+                "mode 'extend' needs cond_frames — the previous clip's last frames"))
+        payload["cond_frames_b64"] = [_as_b64(x) for x in request.cond_frames]
+
+    # Long video: ask for a duration or a segment count and the server owns the loop,
+    # rather than the caller chaining requests and tracking tails itself.
+    _segments = getattr(request, "num_segments", None)
+    if _segments:
+        payload["num_segments"] = int(_segments)
+    elif getattr(request, "duration_seconds", None):
+        payload["total_frames"] = int(float(request.duration_seconds) * lc.DEFAULT_FPS)
+    if getattr(request, "num_cond_frames", None):
+        payload["num_cond_frames"] = int(request.num_cond_frames)
     if not payload["prompt"]:
         raise HTTPException(status_code=400, detail="prompt is required")
     if request.width and request.height:
@@ -4195,6 +4229,10 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     frames_made = data.get("num_frames")
     fps_used = int(data.get("fps") or lc.DEFAULT_FPS)
     stages_run = data.get("stages") or list(stages)
+    if data.get("warning"):
+        # e.g. it yielded the GPU at a segment boundary and the video is shorter than
+        # asked for. The caller gets the video AND the reason, not a silent surprise.
+        warnings.append(str(data["warning"]))
     if not mp4_bytes:
         raise HTTPException(status_code=500, detail="LongCat-Video returned no video")
     print(f"  [longcat] {'+'.join(stages_run)}: {frames_made} frames "

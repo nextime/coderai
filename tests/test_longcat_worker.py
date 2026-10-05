@@ -273,10 +273,12 @@ def test_the_request_model_accepts_the_staging_fields():
     assert VideoGenerationRequest(model="m", prompt="p").quality is None
 
 
-def test_unimplemented_modes_are_refused_not_downgraded():
-    """Step 2 is t2v only. A silent downgrade would look like a quality bug."""
+def test_unsupported_modes_are_refused_not_downgraded():
+    """t2v, i2v and continuation are implemented; the audio-driven avatar tasks are not.
+    A silent downgrade to t2v would look like a quality bug rather than a gap."""
     src = (ROOT / "codai/api/video.py").read_text()
     fn = src[src.index("async def _generate_longcat"):]
     fn = fn[:fn.index("\nasync def ")]
-    assert "is not implemented yet" in fn
+    assert "does not support mode" in fn
     assert "status_code=400" in fn
+    assert "avatar" in fn.lower()          # named as the separate increment it is

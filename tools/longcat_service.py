@@ -62,6 +62,9 @@ _state = {
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
+# Set by POST /yield: stop at the next SEGMENT boundary and return what has been
+# generated, so another model can have the card without the request being lost.
+_yield_flag = threading.Event()
 
 
 def log(msg):
@@ -150,41 +153,145 @@ def unload(reason: str = ""):
         log(f"unloaded{f' ({reason})' if reason else ''}")
 
 
-def _apply_stage_lora(pipe, stage: str, checkpoint_dir: str):
-    """Fuse the LoRA a stage needs, or drop it for the base stage.
-
-    Stages 2 and 3 ARE their LoRAs — the distilled stage is 16 steps because of
-    cfg_step_lora, and refinement is 720p because of refinement_lora. Switching stage
-    without switching the adapter silently produces the wrong thing."""
-    want = {"distill": "distill", "refinement": "refinement"}.get(stage)
-    if _state["loaded_lora"] == want:
-        return
-    unload_fn = getattr(pipe, "unload_lora_weights", None)
-    if _state["loaded_lora"] is not None and callable(unload_fn):
-        unload_fn()
-    if want:
-        rel = LC.LORA_FILES[want]
-        path = os.path.join(os.path.expanduser(checkpoint_dir), rel)
-        load_fn = getattr(pipe, "load_lora_weights", None)
-        if not callable(load_fn):
-            raise RuntimeError(
-                f"stage '{stage}' needs {rel} but this pipeline exposes no "
-                f"load_lora_weights()")
-        load_fn(path)
-        log(f"stage '{stage}': fused {rel}")
-    _state["loaded_lora"] = want
+def torch_gc():
+    """What upstream calls between segments. The allocator holds onto a segment's
+    activations otherwise, and the next one starts that much closer to the ceiling."""
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
-# ── generation ────────────────────────────────────────────────────────────────
+def _frames_from_output(output):
+    """The pipeline returns ``method(...)[0]`` — an array of frames normalised to [0, 1],
+    NOT an object with a ``.frames`` attribute. Upstream converts with
+    ``(tensor * 255).clamp(0, 255).to(uint8)``; we go on to PIL because the refinement
+    stage takes PIL frames as its input and because that is what the muxer wants."""
+    import numpy as np
+    from PIL import Image
+    arr = np.asarray(output)
+    if arr.dtype != np.uint8:
+        arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
+    return [Image.fromarray(f).convert("RGB") for f in arr]
+
+
+def _resolution_name(height: int, width: int) -> str:
+    """generate_i2v and generate_vc take a resolution NAME, where generate_t2v takes
+    height/width. Mapping it here keeps that asymmetry out of the request payload."""
+    return "720p" if max(int(height or 0), int(width or 0)) > 1000 else "480p"
+
+
+def _one_pass(pipe, task: str, stage: str, ctx: dict, cond=None, log=print):
+    """One pipeline call: the first segment of a task, or a continuation of it.
+
+    ``cond`` is the previous segment's frames (PIL). When present the call is always
+    generate_vc, whatever the task started as — that is how a continuation continues."""
+    import torch
+
+    params = LC.stage_params(stage, ctx.get("num_inference_steps"),
+                             ctx.get("guidance_scale"))
+    common = {
+        "prompt": ctx["prompt"],
+        "num_frames": ctx["num_frames"],
+        "num_inference_steps": params["num_inference_steps"],
+        "guidance_scale": params["guidance_scale"],
+    }
+    if ctx.get("generator") is not None:
+        common["generator"] = ctx["generator"]
+    # The distilled stage is this FLAG, not a LoRA we fuse ourselves — upstream passes
+    # use_distill=True to the same method and the pipeline applies cfg_step_lora.
+    if stage == "distill":
+        common["use_distill"] = True
+    elif ctx.get("negative_prompt"):
+        # The distilled demos pass no negative prompt (guidance is 1.0, so it does
+        # nothing); the 50-step passes do.
+        common["negative_prompt"] = ctx["negative_prompt"]
+
+    if cond is not None:
+        kw = dict(common)
+        kw.update(video=cond, num_cond_frames=ctx["num_cond_frames"],
+                  resolution=ctx["resolution"], use_kv_cache=True,
+                  offload_kv_cache=bool(ctx.get("offload_kv_cache")))
+        if stage == "distill":
+            kw["enhance_hf"] = False
+        return pipe.generate_vc(**kw)[0]
+
+    if task == "i2v":
+        return pipe.generate_i2v(image=ctx["image"], resolution=ctx["resolution"],
+                                 **common)[0]
+    if task == "vc":
+        kw = dict(common)
+        kw.update(video=ctx["cond_video"], num_cond_frames=ctx["num_cond_frames"],
+                  resolution=ctx["resolution"], use_kv_cache=True,
+                  offload_kv_cache=bool(ctx.get("offload_kv_cache")))
+        if stage == "distill":
+            kw["enhance_hf"] = False
+        return pipe.generate_vc(**kw)[0]
+    return pipe.generate_t2v(height=ctx["height"], width=ctx["width"], **common)[0]
+
+
+def _run_segments(pipe, task: str, stage: str, ctx: dict, log=print):
+    """Generate ``num_segments`` segments, feeding each one's tail into the next.
+
+    This is upstream's loop: a call emits ``num_frames`` but its first
+    ``num_cond_frames`` re-render the previous segment's tail, so only the remainder is
+    new — ``all_generated_frames.extend(new_video[num_cond_frames:])`` — and the fresh
+    frames become the next call's conditioning. Native pretrained continuation is why
+    this does not drift in colour or quality the way chained frame-tail conditioning on
+    other models does.
+
+    Between segments is also the one safe point to hand the GPU over, so the yield flag
+    is checked here: a release that arrives mid-request costs at most one segment instead
+    of the whole generation."""
+    segments = max(1, int(ctx.get("num_segments") or 1))
+    k = int(ctx["num_cond_frames"])
+    acc: list = []
+    cur = ctx.get("cond_video")
+    first_is_continuation = cur is not None
+    yielded = 0
+
+    for index in range(segments):
+        with _lock:
+            _progress.update(segment=index + 1, segments=segments, step=0,
+                             steps=LC.stage_params(
+                                 stage, ctx.get("num_inference_steps"),
+                                 ctx.get("guidance_scale"))["num_inference_steps"])
+        out = _one_pass(pipe, task, stage, ctx,
+                        cond=cur if (index or first_is_continuation) else None, log=log)
+        new = _frames_from_output(out)
+        if index == 0 and not first_is_continuation:
+            acc.extend(new)
+        else:
+            acc.extend(new[k:])
+        cur = new
+        log(f"stage '{stage}' segment {index + 1}/{segments}: "
+            f"{len(acc)} frames so far")
+        torch_gc()
+        if index + 1 < segments and _yield_flag.is_set():
+            # Another model is waiting for the card. Stop at this boundary and return
+            # what exists: a shorter video plus a warning beats losing the request, and
+            # beats blocking the swap for the remaining segments.
+            yielded = segments - (index + 1)
+            log(f"yielding the GPU after segment {index + 1}/{segments} "
+                f"({yielded} not generated)")
+            break
+    return acc, yielded
+
 
 def _mux(frames, fps: int) -> bytes:
-    """Frames (PIL images) → mp4 bytes, via imageio-ffmpeg in the venv."""
+    """Frames (PIL) → mp4 bytes. Upstream writes with libx264 at crf 18 for the 480p
+    stages and crf 10 for refinement; this keeps 18 and lets the engine re-encode if a
+    model entry sets output_crf."""
     import imageio
     import numpy as np
     buf = io.BytesIO()
     writer = imageio.get_writer(buf, format="mp4", fps=int(fps), codec="libx264",
-                               quality=None, ffmpeg_params=["-crf", "18",
-                                                            "-pix_fmt", "yuv420p"])
+                                ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"])
     try:
         for f in frames:
             writer.append_data(np.asarray(f.convert("RGB")))
@@ -193,8 +300,43 @@ def _mux(frames, fps: int) -> bytes:
     return buf.getvalue()
 
 
+def _decode_image(data: str):
+    from PIL import Image
+    raw = data.split(",", 1)[1] if str(data).startswith("data:") else data
+    return Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
+
+
+def _encode_image(img) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _peak_vram_gb() -> float:
+    """The peak VRAM this process reached, in GB, or 0.0.
+
+    Reported back so the engine sizes future reservations from a MEASUREMENT instead of
+    an estimate. It has to come from in here: the pipeline loads lazily on the first
+    request, so a host-side free-VRAM delta would also be counting whatever else was
+    loading or evicting on the card. torch's own counter is this process's allocation —
+    reserved rather than allocated, because the caching allocator's arenas are what the
+    card is actually unable to give to anything else."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 0.0
+        return round(torch.cuda.max_memory_reserved() / (1024 ** 3), 2)
+    except Exception:
+        return 0.0
+
+
 def generate(body: dict) -> dict:
-    """One generation. Step 2 scope: text-to-video, one segment, single GPU."""
+    """One request: text-to-video, image-to-video or continuation, over N segments.
+
+    Tasks map to upstream's entry points — generate_t2v (height/width), generate_i2v
+    (image + resolution name) and generate_vc (conditioning video) — plus generate_refine
+    for the 720p stage, which takes the earlier stage's frames as ``stage1_video``.
+    """
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
@@ -205,6 +347,10 @@ def generate(body: dict) -> dict:
     if problems:
         raise ValueError("; ".join(problems))
 
+    task = (body.get("task") or "t2v").strip().lower()
+    if task not in ("t2v", "i2v", "vc"):
+        raise ValueError(f"unknown task {task!r}; expected t2v, i2v or vc")
+
     pipe = load_pipeline(checkpoint, body.get("source") or _state["source"],
                          body.get("dtype") or _state["dtype"],
                          body.get("offload") or "")
@@ -212,78 +358,100 @@ def generate(body: dict) -> dict:
     height = int(body.get("height") or LC.DEFAULT_BASE_SIZE[0])
     width = int(body.get("width") or LC.DEFAULT_BASE_SIZE[1])
     num_frames = int(body.get("num_frames") or LC.DEFAULT_NUM_FRAMES)
+    cond_frames = int(body.get("num_cond_frames") or LC.DEFAULT_COND_FRAMES)
+    if cond_frames >= num_frames:
+        raise ValueError(f"num_cond_frames ({cond_frames}) must be smaller than "
+                         f"num_frames ({num_frames}) — a segment would add nothing")
     fps = int(body.get("fps") or LC.DEFAULT_FPS)
-    seed = body.get("seed")
 
+    segments = body.get("num_segments")
+    if not segments and body.get("total_frames"):
+        segments = LC.segments_for(int(body["total_frames"]), num_frames, cond_frames)
+    segments = max(1, int(segments or 1))
+
+    image = None
+    if task == "i2v":
+        if not body.get("image"):
+            raise ValueError("task 'i2v' needs an image")
+        image = _decode_image(body["image"])
+    cond_video = None
+    if task == "vc":
+        if not body.get("cond_frames_b64"):
+            raise ValueError("task 'vc' needs cond_frames_b64 (the previous tail)")
+        cond_video = [_decode_image(x) for x in body["cond_frames_b64"]]
+        if len(cond_video) < cond_frames:
+            raise ValueError(f"task 'vc' needs at least {cond_frames} conditioning "
+                             f"frames, got {len(cond_video)}")
+
+    generator = None
+    if body.get("seed") is not None:
+        import torch
+        generator = torch.Generator(
+            device="cuda" if torch.cuda.is_available() else "cpu"
+        ).manual_seed(int(body["seed"]))
+
+    ctx = {
+        "prompt": prompt, "negative_prompt": body.get("negative_prompt") or "",
+        "height": height, "width": width, "num_frames": num_frames,
+        "num_cond_frames": cond_frames, "num_segments": segments,
+        "resolution": _resolution_name(height, width),
+        "num_inference_steps": body.get("num_inference_steps"),
+        "guidance_scale": body.get("guidance_scale"),
+        "offload_kv_cache": body.get("offload_kv_cache"),
+        "image": image, "cond_video": cond_video, "generator": generator,
+    }
+
+    _yield_flag.clear()
     frames = None
+    yielded = 0
     with _lock:
-        _progress.update(active=True, stage="", segment=0, segments=1, step=0, steps=0)
+        _progress.update(active=True, stage="", segment=0, segments=segments,
+                         step=0, steps=0)
     try:
         for stage in stages:
-            params = LC.stage_params(stage, body.get("num_inference_steps"),
-                                     body.get("guidance_scale"))
-            _apply_stage_lora(pipe, stage, checkpoint)
             with _lock:
-                _progress.update(stage=stage, step=0,
-                                 steps=params["num_inference_steps"])
-
-            def _cb(_pipe, step_index, _t, kw):
-                with _lock:
-                    _progress["step"] = int(step_index) + 1
-                return kw
-
-            call = {"prompt": prompt, "height": height, "width": width,
-                    "num_frames": num_frames, **params}
-            if seed is not None:
-                import torch
-                call["generator"] = torch.Generator(
-                    device="cuda" if torch.cuda.is_available() else "cpu"
-                ).manual_seed(int(seed))
-            # The refinement stage takes the PREVIOUS stage's frames as its input — that
-            # is what makes it a refinement and not a second generation.
+                _progress["stage"] = stage
             if stage == "refinement":
                 if frames is None:
                     raise ValueError(
-                        "the refinement stage needs frames from an earlier stage; run "
-                        "quality='best' or pass stage='base' first")
-                call["video"] = frames
-            try:
-                out = pipe(callback_on_step_end=_cb, **call)
-            except TypeError:
-                out = pipe(**call)          # a build without the callback hook
-            frames = getattr(out, "frames", out)
-            if frames and isinstance(frames[0], (list, tuple)):
-                frames = frames[0]
+                        "the refinement stage needs frames from an earlier stage — run "
+                        "quality='best', or pass stage='base' first and feed its frames "
+                        "back with stage='refinement'")
+                params = LC.stage_params(stage, body.get("num_inference_steps"),
+                                         body.get("guidance_scale"))
+                kw = {"prompt": prompt, "stage1_video": frames,
+                      "num_inference_steps": params["num_inference_steps"]}
+                if generator is not None:
+                    kw["generator"] = generator
+                if body.get("spatial_refine_only") is not None:
+                    kw["spatial_refine_only"] = bool(body["spatial_refine_only"])
+                if image is not None:
+                    kw["image"] = image
+                    kw["num_cond_frames"] = 1
+                log(f"stage 'refinement': refining {len(frames)} frames")
+                frames = _frames_from_output(pipe.generate_refine(**kw)[0])
+            else:
+                frames, yielded = _run_segments(pipe, task, stage, ctx, log=log)
             log(f"stage '{stage}': {len(frames)} frames")
     finally:
+        _yield_flag.clear()
         with _lock:
             _progress.update(active=False, stage="", step=0)
 
     if stages[-1] == "refinement":
         fps = int(body.get("fps") or 30)
     mp4 = _mux(frames, fps)
-    return {"mp4_b64": base64.b64encode(mp4).decode(), "num_frames": len(frames),
-            "fps": fps, "stages": list(stages), "segments": 1,
-            "vram_gb": _peak_vram_gb()}
-
-
-def _peak_vram_gb() -> float:
-    """The peak VRAM this process reached, in GB, or 0.0.
-
-    Reported back so the engine can size future reservations from a MEASUREMENT instead
-    of an estimate. It has to come from in here: the pipeline loads lazily on the first
-    request, and a host-side free-VRAM delta would also be counting whatever else was
-    loading or evicting on the card at the same time. torch's own peak counter is
-    exactly this process's allocation."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return 0.0
-        # reserved, not allocated: the caching allocator's arenas are what the card is
-        # actually unable to give to anything else.
-        return round(torch.cuda.max_memory_reserved() / (1024 ** 3), 2)
-    except Exception:
-        return 0.0
+    out = {"mp4_b64": base64.b64encode(mp4).decode(), "num_frames": len(frames),
+           "fps": fps, "stages": list(stages), "task": task,
+           "segments": max(1, segments - yielded), "vram_gb": _peak_vram_gb()}
+    if yielded:
+        out["warning"] = (f"stopped after {segments - yielded} of {segments} segments to "
+                          f"hand the GPU to another model; the video is shorter than "
+                          f"requested")
+    # The tail a caller needs to continue from here, so chaining requests does not mean
+    # re-deriving which frames overlap.
+    out["tail_b64"] = [_encode_image(f) for f in frames[-cond_frames:]]
+    return out
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -324,6 +492,12 @@ def make_handler():
             try:
                 if self.path.startswith("/generate"):
                     self._json(generate(self._read_json()))
+                elif self.path.startswith("/yield"):
+                    # Stop at the next segment boundary. The in-flight request still
+                    # returns — shorter, with a warning — so a swap costs one segment
+                    # rather than the whole generation.
+                    _yield_flag.set()
+                    self._json({"ok": True})
                 elif self.path.startswith("/unload"):
                     unload("requested")
                     self._json({"ok": True})

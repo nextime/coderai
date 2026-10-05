@@ -87,6 +87,21 @@ class VideoGenerationRequest(BaseModel):
     # 480p, a distilled 16-step pass, then a 720p refinement that takes the earlier
     # frames as input — so a caller either picks a preset and lets the server run the
     # stages, or drives one stage per request and keeps the intermediate frames.
+    # Long video. LongCat generates in segments whose first `num_cond_frames` re-render
+    # the previous segment's tail, so asking for a duration or a segment count lets the
+    # SERVER own the loop — a client no longer has to chain requests and track tails,
+    # which is what the VACE 'extend' path requires.
+    num_segments: Optional[int] = Field(None, description=(
+        "LongCat-Video: how many segments to generate. Each adds "
+        "(num_frames - num_cond_frames) new frames; ~11 segments is a minute. "
+        "Overrides `duration_seconds`."))
+    duration_seconds: Optional[float] = Field(None, description=(
+        "LongCat-Video: target length in seconds, converted to a segment count. "
+        "Ignored when `num_segments` is given."))
+    num_cond_frames: Optional[int] = Field(None, description=(
+        "LongCat-Video: how many frames of the previous segment each new segment "
+        "conditions on (default 13 of 93). More = stronger motion continuity, fewer "
+        "new frames per segment."))
     quality: Optional[str] = Field(None, description=(
         "LongCat-Video quality preset: 'draft' (base stage only, fastest), 'fast' "
         "(distilled, 16 steps — the default), 'best' (base + 720p refinement). Ignored "

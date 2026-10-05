@@ -556,6 +556,20 @@ def generate(model_name: str, payload: dict, config: dict = None,
 
 # ── eviction: giving the card back ───────────────────────────────────────────
 
+def _request_yield(key: str) -> bool:
+    """Ask a service to stop at its next segment boundary. Best-effort."""
+    import requests
+    with _lock:
+        svc = _services.get(key)
+        url = svc["url"] if svc else ""
+    if not url:
+        return False
+    try:
+        return bool(requests.post(url + "/yield", json={}, timeout=5).ok)
+    except Exception:
+        return False
+
+
 def _drain_timeout_s() -> float:
     sec = _cfg_section()
     try:
@@ -585,8 +599,14 @@ def release_vram(needed_gb: float = 999.0) -> float:
         return 0.0
     if busy:
         budget = _drain_timeout_s()
-        print(f"[longcat] {busy} generation(s) in flight — waiting up to {budget:.0f}s "
-              f"for a clean handover before releasing the card", flush=True)
+        # Ask the services to stop at their next SEGMENT boundary. Upstream already calls
+        # torch_gc() there, so it is a genuinely safe point, and it turns the wait from
+        # "however long the whole request takes" into "one more segment" — the in-flight
+        # request still returns, shorter, with a warning, instead of being lost.
+        for key in keys:
+            _request_yield(key)
+        print(f"[longcat] {busy} generation(s) in flight — asked them to yield at the "
+              f"next segment boundary, waiting up to {budget:.0f}s", flush=True)
         _idle.clear()
         if not _idle.wait(budget):
             print(f"[longcat] still busy after {budget:.0f}s — releasing anyway; the "
