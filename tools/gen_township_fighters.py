@@ -2362,6 +2362,68 @@ def load_config(path: str) -> dict:
 TEMPLATE_DIR_NAME = "templates"
 
 
+# Starter templates, written on first use and never overwritten afterwards. The two
+# describe the SAME show rendered by models with opposite strengths, which is the real
+# choice an operator makes here:
+#
+#   Wan     — 81-frame ceiling, no native continuation. A minute of video is therefore
+#             many short scenes, each a separate generation, chained from a frame tail.
+#   LongCat — pretrained on continuation at 15fps, 93 frames per segment, and the server
+#             runs the segment loop. A scene can run 12-22s in ONE request, so the same
+#             minute is a handful of long takes instead of a dozen cuts — and without the
+#             re-encoded joins and colour drift that chaining accumulates.
+#
+# Frame counts for LongCat are 4n+1: that is the VAE's rule, the same one Wan uses, and
+# a count that misses it is silently snapped or rejected.
+BUILTIN_TEMPLATES = {
+    "Wan - many short scenes": {
+        "video_model": None,          # blank = auto-select; this is the historical shape
+        "fps": 8,
+        "clip_min_frames": 50,
+        "clip_max_frames": 70,
+        "single_clip_max_frames": 50,
+        "video_size": "832x480",
+        "short_min": 40.0, "short_max": 50.0,
+        "long_min": 65.0, "long_max": 75.0,
+    },
+    "LongCat - few long scenes": {
+        "video_model": "longcat",
+        # LongCat's own rate. 8fps was a Wan-era compromise; at 15 the motion is what
+        # the model was trained to produce.
+        "fps": 15,
+        # 173 = 93 + 80 (two segments) ≈ 11.5s; 333 = 93 + 80x3 (four) ≈ 22s. Both 4n+1.
+        # At these lengths a 40-50s short is 2-4 scenes rather than 6-8.
+        "clip_min_frames": 173,
+        "clip_max_frames": 333,
+        # The client-side split is lifted for LongCat anyway (the server owns the segment
+        # loop), but this keeps the number honest if the model is switched back.
+        "single_clip_max_frames": 333,
+        "video_size": "832x480",       # LongCat's 480p landscape
+        "short_min": 40.0, "short_max": 50.0,
+        "long_min": 65.0, "long_max": 75.0,
+    },
+}
+
+
+def seed_builtin_templates(out_dir: str) -> list:
+    """Write any starter template that is not already there. Returns what it wrote.
+
+    Never overwrites: a template the operator has edited keeps their edits, even if it
+    carries a built-in name."""
+    written = []
+    for name, overrides in BUILTIN_TEMPLATES.items():
+        try:
+            target = template_path(out_dir, name)
+            if target.exists():
+                continue
+            save_template_dict(out_dir, name, overrides)
+            written.append(name)
+        except Exception:
+            # A starter template is a convenience; never let it stop the tool starting.
+            continue
+    return written
+
+
 def _safe_template_name(name: str) -> str:
     """A template name reduced to something safe to use as a filename.
 
@@ -6845,117 +6907,208 @@ def launch_web_ui(default_args):
     # ── HTML pages ──────────────────────────────────────────────────────────
 
     _CSS = """
+/* ── Township Combat League — operator console ───────────────────────────────
+   Palette comes from the subject: a ring at night. Cool graphite rather than a
+   tinted black, title-belt gold for the one primary action per view, and the two
+   corner colours as a SEMANTIC pair — every bout is fighter 1 vs fighter 2, so
+   red/blue carry meaning here instead of decorating.
+   Numbers are set in a monospace with tabular figures: frame counts, odds and
+   durations are scan-read and compared down a column.
+   ------------------------------------------------------------------------- */
+:root{
+  --ink:#13171c; --ink-2:#0d1116; --surface:#1b212a; --surface-2:#222a34;
+  --line:#2c3642; --line-strong:#3b4756;
+  --text:#e6eaf0; --text-dim:#9aa6b4; --text-faint:#6b7784;
+  --belt:#e8b33c; --belt-hot:#f2c45c;
+  --red-corner:#d7263d; --blue-corner:#2e86de;
+  --good:#53c08a; --warn:#e8b33c; --bad:#e2605c;
+  --r-sm:5px; --r-md:9px; --r-lg:14px;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+  --pad:1.1rem;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:#0f0f0f;color:#e0e0e0;min-height:100vh}
-a{color:#7eb8f7;text-decoration:none}a:hover{text-decoration:underline}
-h1{font-size:1.4rem;font-weight:700;margin-bottom:.75rem}
-h2{font-size:1.1rem;font-weight:600;margin-bottom:.5rem}
-.nav{background:#1a1a1a;border-bottom:1px solid #333;padding:.6rem 1.2rem;display:flex;gap:1.2rem;align-items:center}
-.nav span{font-weight:700;color:#f5a623;margin-right:.5rem}
-.container{max-width:960px;margin:0 auto;padding:1.2rem}
-.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:1rem;margin-bottom:1rem}
-label{display:block;font-size:.8rem;color:#aaa;margin-bottom:.2rem;margin-top:.6rem}
+html{-webkit-text-size-adjust:100%}
+body{font-family:var(--sans);background:var(--ink);color:var(--text);
+     min-height:100vh;line-height:1.5;
+     font-synthesis-weight:none;-webkit-font-smoothing:antialiased}
+a{color:var(--blue-corner);text-decoration:none}
+a:hover{color:#5aa5ea;text-decoration:underline;text-underline-offset:2px}
+
+/* One visible focus treatment for everything keyboard-reachable. */
+:focus-visible{outline:2px solid var(--belt);outline-offset:2px;border-radius:3px}
+
+h1{font-size:1.5rem;font-weight:650;letter-spacing:-.012em;margin-bottom:.8rem}
+h2{font-size:1.12rem;font-weight:600;letter-spacing:-.008em;margin-bottom:.55rem}
+
+/* Nav stays put: these pages scroll a long way and the operator switches often. */
+.nav{background:var(--ink-2);border-bottom:1px solid var(--line);
+     padding:.65rem 1.4rem;display:flex;gap:1.15rem;align-items:center;
+     position:sticky;top:0;z-index:50}
+.nav span{font-weight:700;color:var(--belt);margin-right:.4rem;letter-spacing:-.01em}
+.nav a{color:var(--text-dim);padding:.2rem 0;border-bottom:2px solid transparent}
+.nav a:hover{color:var(--text);text-decoration:none}
+.nav a[aria-current="page"]{color:var(--text);border-bottom-color:var(--belt)}
+
+.container{max-width:1180px;margin:0 auto;padding:1.4rem}
+
+/* Cards carry hierarchy rather than one uniform treatment: a plain panel is the
+   default, and only a panel holding live state gets a lift. */
+.card{background:var(--surface);border:1px solid var(--line);
+      border-radius:var(--r-md);padding:.95rem var(--pad);margin-bottom:.85rem}
+.card.card-live{border-color:var(--line-strong);
+                box-shadow:0 1px 0 rgba(255,255,255,.03) inset}
+
+/* The page carries ~66 settings, so vertical rhythm is a density decision, not a
+   taste one: tight enough to see a whole section at once, loose enough to group. */
+label{display:block;font-size:.84rem;color:var(--text-dim);
+      margin:.6rem 0 .2rem;font-weight:500;line-height:1.35}
 label:first-child{margin-top:0}
-input[type=text],input[type=number],input[type=url],select{
-  background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5rem;
-  border-radius:4px;width:100%;font-size:.85rem}
-input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
-.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.75rem}
-.hint{font-size:.72rem;color:#666;margin-top:.15rem}
-.btn{display:inline-block;padding:.45rem 1.1rem;border-radius:5px;border:none;
-     cursor:pointer;font-size:.9rem;font-weight:600}
-.btn-primary{background:#f5a623;color:#000}.btn-primary:hover{background:#e8960f}
-.btn-danger{background:#c0392b;color:#fff}.btn-danger:hover{background:#a93226}
-.btn-secondary{background:#2a2a2a;color:#ccc;border:1px solid #444}
-.btn-secondary:hover{background:#333}
-#log-box{background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:.75rem;
-         height:340px;overflow-y:auto;font-family:monospace;font-size:.78rem;
-         line-height:1.55;white-space:pre-wrap;word-break:break-all}
-#log-box .info{color:#9ad89a}#log-box .warn{color:#f5c842}#log-box .err{color:#e07070}
-#log-box .head{color:#f5a623;font-weight:700}
-.status-pill{display:inline-block;padding:.2rem .55rem;border-radius:10px;
-             font-size:.72rem;font-weight:700}
-.status-idle{background:#333;color:#888}
-.status-run{background:#1a4a1a;color:#7ed87e}
-.status-done{background:#1a1a4a;color:#7ea8f7}
-.section-title{font-size:.85rem;font-weight:700;color:#aaa;
-               text-transform:uppercase;letter-spacing:.05em;margin:1rem 0 .4rem}
+
+/* 16px fields everywhere — the old .85rem was cramped on a desktop too, not just
+   a phone, and 16px is what stops iOS zooming on focus. */
+input[type=text],input[type=number],input[type=url],select,textarea{
+  background:var(--ink-2);border:1px solid var(--line);color:var(--text);
+  padding:.5rem .6rem;border-radius:var(--r-sm);width:100%;font-size:16px;
+  font-family:inherit;transition:border-color .12s,background .12s}
+/* A frame count is three digits; stretching its box across half the viewport makes
+   the form longer to scan and harder to aim at. Numbers get a box the size of their
+   content and sit left, so a column of them lines up. */
+input[type=number]{font-family:var(--mono);font-variant-numeric:tabular-nums;
+                   max-width:11rem}
+input:hover,select:hover,textarea:hover{border-color:var(--line-strong)}
+input:focus,select:focus,textarea:focus{border-color:var(--belt);background:#0a0e12;outline:none}
+input::placeholder,textarea::placeholder{color:var(--text-faint)}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--text-dim) 50%),linear-gradient(135deg,var(--text-dim) 50%,transparent 50%);
+       background-position:calc(100% - 15px) 52%,calc(100% - 10px) 52%;
+       background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:1.9rem}
+input[type=checkbox]{width:1.05rem;height:1.05rem;accent-color:var(--belt);
+                     margin-right:.45rem;vertical-align:-2px;cursor:pointer}
+textarea{resize:vertical;min-height:3.2rem;line-height:1.5}
+
+.row{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}
+.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:.85rem}
+.hint{font-size:.76rem;color:var(--text-faint);margin-top:.2rem;line-height:1.4}
+/* A hint folded into a label should read as an aside, not a second heading. */
+label .hint,label small{font-weight:400}
+
+.btn{display:inline-flex;align-items:center;gap:.35rem;padding:.5rem 1.05rem;
+     border-radius:var(--r-sm);border:1px solid transparent;cursor:pointer;
+     font-family:inherit;font-size:.9rem;font-weight:600;line-height:1.3;
+     transition:background .12s,border-color .12s,transform .06s}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:var(--belt);color:#17120a}
+.btn-primary:hover{background:var(--belt-hot)}
+.btn-danger{background:var(--red-corner);color:#fff}
+.btn-danger:hover{background:#e8394f}
+.btn-secondary{background:var(--surface-2);color:var(--text);border-color:var(--line-strong)}
+.btn-secondary:hover{background:#2a333e;border-color:#4a5767}
+
+/* The log is the thing being watched during a render, so it gets the room. */
+#log-box{background:var(--ink-2);border:1px solid var(--line);border-radius:var(--r-md);
+         padding:.85rem;height:min(52vh,460px);overflow-y:auto;
+         font-family:var(--mono);font-size:.8rem;line-height:1.65;
+         white-space:pre-wrap;overflow-wrap:anywhere;scrollbar-width:thin}
+#log-box .info{color:var(--good)}
+#log-box .warn{color:var(--warn)}
+#log-box .err{color:var(--bad)}
+#log-box .head{color:var(--belt);font-weight:700}
+
+.status-pill{display:inline-flex;align-items:center;gap:.35rem;padding:.24rem .6rem;
+             border-radius:999px;font-size:.76rem;font-weight:650;
+             border:1px solid transparent}
+.status-pill::before{content:"";width:.45rem;height:.45rem;border-radius:999px;
+                     background:currentColor}
+.status-idle{background:#20262e;color:var(--text-faint);border-color:var(--line)}
+.status-run{background:rgba(83,192,138,.12);color:var(--good);border-color:rgba(83,192,138,.35)}
+.status-done{background:rgba(46,134,222,.12);color:var(--blue-corner);border-color:rgba(46,134,222,.35)}
+
+/* A group heading, not a tracked-out caps label: easier to read and it stops
+   every section shouting. */
+.section-title{font-size:.95rem;font-weight:650;color:var(--text);
+               letter-spacing:-.005em;margin:1.4rem 0 .5rem;
+               padding-bottom:.35rem;border-bottom:1px solid var(--line)}
+
 /* modal */
-.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;
-          align-items:center;justify-content:center}
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(6,9,12,.78);
+          backdrop-filter:blur(2px);z-index:100;align-items:center;justify-content:center;padding:1rem}
 .modal-bg.open{display:flex}
-.modal{background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:1.2rem;
-       min-width:340px;max-width:480px;width:90%}
-.modal h3{font-size:1rem;font-weight:700;margin-bottom:.75rem}
-.modal .row2{display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin:.5rem 0}
-.modal label{font-size:.8rem;color:#aaa;display:block;margin-bottom:.2rem}
-.modal select,.modal input{background:#111;border:1px solid #333;color:#e0e0e0;
-                            padding:.3rem .45rem;border-radius:4px;width:100%;font-size:.82rem}
-.progress-bar{background:#222;border-radius:4px;height:8px;margin:.6rem 0;overflow:hidden}
-.progress-fill{height:100%;background:#f5a623;border-radius:4px;transition:width .4s}
-.progress-fill.ok{background:#3a9d3a}
-.progress-fill.fail{background:#c0392b}
-.progress-fill.striped{background:repeating-linear-gradient(45deg,#f5a623,#f5a623 8px,#d98e0f 8px,#d98e0f 16px);animation:prgmove 1s linear infinite}
+.modal{background:var(--surface);border:1px solid var(--line-strong);
+       border-radius:var(--r-lg);padding:1.3rem;min-width:340px;max-width:520px;width:100%;
+       box-shadow:0 18px 50px rgba(0,0,0,.55)}
+.modal h3{font-size:1.05rem;font-weight:650;margin-bottom:.8rem}
+.modal .row2{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin:.6rem 0}
+.modal label{font-size:.84rem;color:var(--text-dim);display:block;margin-bottom:.25rem}
+.modal select,.modal input{background:var(--ink-2);border:1px solid var(--line);
+                           color:var(--text);padding:.45rem .55rem;
+                           border-radius:var(--r-sm);width:100%;font-size:16px}
+
+.progress-bar{background:#121922;border:1px solid var(--line);border-radius:999px;
+              height:9px;margin:.65rem 0;overflow:hidden}
+.progress-fill{height:100%;background:var(--belt);border-radius:999px;transition:width .4s}
+.progress-fill.ok{background:var(--good)}
+.progress-fill.fail{background:var(--red-corner)}
+.progress-fill.striped{background:repeating-linear-gradient(45deg,var(--belt),var(--belt) 8px,#c9931f 8px,#c9931f 16px);animation:prgmove 1s linear infinite}
 @keyframes prgmove{from{background-position:0 0}to{background-position:32px 0}}
-#match-progress{margin:.6rem 0}
+#match-progress{margin:.7rem 0}
 #match-progress.hidden{display:none}
-.prg-global .prg-label{font-size:.78rem;color:#bbb;margin-bottom:.1rem;font-weight:600}
-.prg-items{display:flex;flex-direction:column;gap:.15rem;margin-top:.5rem}
-.prg-item .prg-ilabel{font-size:.72rem;color:#999}
-.prg-item .progress-bar{height:6px;margin:.12rem 0}
-.job-status{font-size:.78rem;margin-top:.4rem;min-height:1.2rem}
-.job-status.done{color:#7ed87e}.job-status.error{color:#e07070}
+.prg-global .prg-label{font-size:.82rem;color:var(--text-dim);margin-bottom:.15rem;font-weight:600}
+.prg-items{display:flex;flex-direction:column;gap:.2rem;margin-top:.55rem}
+.prg-item .prg-ilabel{font-size:.76rem;color:var(--text-faint);font-family:var(--mono)}
+.prg-item .progress-bar{height:6px;margin:.15rem 0}
+.job-status{font-size:.82rem;margin-top:.45rem;min-height:1.2rem;color:var(--text-dim)}
+.job-status.done{color:var(--good)}
+.job-status.error{color:var(--bad)}
+
 /* profile editor */
-textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5rem;
-         border-radius:4px;width:100%;font-size:.85rem;font-family:inherit;
-         resize:vertical;min-height:3rem}
 .pf-head{display:flex;justify-content:space-between;align-items:center;gap:.6rem}
-.pf-name{font-weight:700;color:#f5a623;font-size:1.05rem}
-.pf-thumbs{display:flex;gap:.4rem;flex-wrap:wrap;margin:.5rem 0}
+.pf-name{font-weight:700;color:var(--belt);font-size:1.08rem;letter-spacing:-.01em}
+.pf-thumbs{display:flex;gap:.45rem;flex-wrap:wrap;margin:.6rem 0}
 .pf-thumb{position:relative;width:92px;height:92px}
-.pf-thumb img{width:92px;height:92px;object-fit:cover;border-radius:4px;background:#111;cursor:zoom-in}
-/* image lightbox (click a thumbnail to enlarge) */
-.lightbox-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:200;
+.pf-thumb img{width:92px;height:92px;object-fit:cover;border-radius:var(--r-sm);
+              background:var(--ink-2);cursor:zoom-in;border:1px solid var(--line)}
+.pf-thumb img:hover{border-color:var(--line-strong)}
+.pf-thumb-del{position:absolute;top:3px;right:3px;background:rgba(215,38,61,.92);color:#fff;
+              border:none;border-radius:3px;cursor:pointer;font-size:.7rem;
+              width:19px;height:19px;line-height:1;padding:0}
+.pf-thumb-del:hover{background:var(--red-corner)}
+.pf-status{font-size:.8rem;color:var(--good);min-height:1.1rem;margin-left:.5rem}
+.pf-actions{display:flex;gap:.55rem;align-items:center;margin-top:.75rem;flex-wrap:wrap}
+
+/* lightboxes */
+.lightbox-bg{display:none;position:fixed;inset:0;background:rgba(5,7,10,.92);z-index:200;
              align-items:center;justify-content:center;cursor:zoom-out;padding:1.5rem}
 .lightbox-bg.open{display:flex}
-.lightbox-bg img{max-width:95vw;max-height:95vh;object-fit:contain;border-radius:8px;
-                 box-shadow:0 0 40px rgba(0,0,0,.8)}
-/* video lightbox (a preview enlarges + centers when you press play) */
-.vlightbox-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:210;
+.lightbox-bg img{max-width:95vw;max-height:95vh;object-fit:contain;border-radius:var(--r-md);
+                 box-shadow:0 0 60px rgba(0,0,0,.85)}
+.vlightbox-bg{display:none;position:fixed;inset:0;background:rgba(5,7,10,.94);z-index:210;
               align-items:flex-start;justify-content:center;padding:3vh 1.5rem}
 .vlightbox-bg.open{display:flex}
-.vlightbox-bg video{max-width:92vw;max-height:90vh;width:auto;border-radius:10px;background:#000;
-                    box-shadow:0 12px 48px rgba(0,0,0,.7)}
-.vlightbox-close{position:fixed;top:.7rem;right:1.3rem;color:#fff;font-size:1.7rem;line-height:1;
-                 cursor:pointer;z-index:211;font-weight:700}
-.vlightbox-close:hover{color:#f5a623}
-.pf-thumb-del{position:absolute;top:2px;right:2px;background:rgba(192,57,43,.92);color:#fff;
-              border:none;border-radius:3px;cursor:pointer;font-size:.7rem;
-              width:18px;height:18px;line-height:1;padding:0}
-.pf-thumb-del:hover{background:#c0392b}
-.pf-status{font-size:.76rem;color:#7ed87e;min-height:1.1rem;margin-left:.5rem}
-.pf-actions{display:flex;gap:.5rem;align-items:center;margin-top:.7rem}
-/* ── mobile / narrow screens ─────────────────────────────────────────────── */
+.vlightbox-bg video{max-width:92vw;max-height:90vh;width:auto;border-radius:var(--r-md);
+                    background:#000;box-shadow:0 12px 48px rgba(0,0,0,.7)}
+.vlightbox-close{position:fixed;top:.6rem;right:1.3rem;color:#fff;font-size:1.8rem;
+                 line-height:1;cursor:pointer;z-index:211;font-weight:700}
+.vlightbox-close:hover{color:var(--belt)}
+
+/* ── narrow screens ─────────────────────────────────────────────────────────── */
 @media (max-width:640px){
-  .container{padding:.8rem}
-  h1{font-size:1.2rem}h2{font-size:1rem}
-  /* nav wraps instead of overflowing; gentler spacing */
-  .nav{padding:.55rem .8rem;gap:.5rem 1rem;flex-wrap:wrap}
-  /* multi-column form grids stack to a single column */
+  .container{padding:.9rem}
+  h1{font-size:1.25rem}h2{font-size:1.02rem}
+  .nav{padding:.55rem .85rem;gap:.5rem .9rem;flex-wrap:wrap;position:static}
   .row,.row3,.modal .row2{grid-template-columns:1fr}
-  /* modal must fit a 320px viewport */
-  .modal{min-width:0;width:94%;padding:1rem}
-  /* fixed-width tile cards become full-width so they don't leave dead space */
+  .modal{min-width:0;width:100%;padding:1.05rem}
   .card[style*="width:230px"],.card[style*="width:215px"]{width:100%!important}
-  /* 16px inputs stop iOS Safari from auto-zooming the page on focus */
-  input[type=text],input[type=number],input[type=url],select,textarea,
-  .modal select,.modal input{font-size:16px}
-  /* roomier, wrap-friendly tap targets */
-  .btn{padding:.55rem 1rem;font-size:.95rem}
-  .pf-actions{flex-wrap:wrap}
-  /* taller log box is awkward on small screens */
-  #log-box{height:240px}
+  .btn{padding:.6rem 1.05rem;font-size:.95rem}
+  #log-box{height:min(46vh,300px)}
+}
+
+/* Someone who has asked for less motion should not get an infinitely animated
+   progress bar. */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;
+                        transition-duration:.001ms!important}
+  .progress-fill.striped{background:var(--belt)}
 }
 """
 
@@ -7081,8 +7234,11 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
             ("wardrobe", "/wardrobe", "👕 Wardrobe"),
             ("prompts", "/prompts", "✍ Prompts"),
         ]
+        # aria-current carries the active page: it drives the underline in the CSS and
+        # tells a screen reader which one you are on, where the old inline colour did
+        # neither.
         nav = "".join(
-            f'<a href="{href}" style="{"color:#f5a623;font-weight:700" if k==active else ""}">{label}</a>'
+            f'<a href="{href}"{" aria-current=page" if k == active else ""}>{label}</a>'
             for k, href, label in nav_items
         )
         return f"""<!doctype html><html lang=en><head>
@@ -12072,6 +12228,16 @@ OUTPUT LAYOUT
             _log(f"  Loaded {len(tcfg)} option(s) from template: {pre.template}")
 
     args = parser.parse_args()
+
+    # Starter templates appear on first use so the Templates picker is never an empty
+    # box — and before the management commands below, so --list-templates shows them on
+    # a fresh install. Existing files are left alone, so an edited one keeps its edits.
+    try:
+        _seeded = seed_builtin_templates(args.out_dir)
+        if _seeded:
+            _log(f"  Added starter template(s): {', '.join(_seeded)}")
+    except Exception:
+        pass
 
     # Template management runs before anything else and exits: these are
     # housekeeping commands, not generation runs.

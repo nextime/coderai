@@ -225,3 +225,67 @@ def test_loading_a_template_asks_first():
     """It replaces every option on the page, which is not an undoable click."""
     seg = SRC[SRC.index("async function tplLoad()"):SRC.index("async function tplDelete()")]
     assert "uiConfirm" in seg
+
+
+# ---------------------------------------------------------------- starter templates
+def test_two_starters_ship_with_the_tool():
+    """The picker should never open empty, and the two describe the real choice: a model
+    with an 81-frame ceiling and no native continuation, versus one pretrained on it."""
+    assert set(TW.BUILTIN_TEMPLATES) == {"Wan - many short scenes",
+                                         "LongCat - few long scenes"}
+
+
+def test_the_starter_names_survive_sanitising():
+    """A built-in whose name changes when written would seed a duplicate every run."""
+    for name in TW.BUILTIN_TEMPLATES:
+        assert TW._safe_template_name(name) == name
+
+
+def test_seeding_writes_them_once_and_never_overwrites(tmp_path):
+    first = TW.seed_builtin_templates(str(tmp_path))
+    assert set(first) == set(TW.BUILTIN_TEMPLATES)
+    # An operator's edit must survive the next start.
+    TW.save_template_dict(str(tmp_path), "LongCat - few long scenes", {"fps": 99})
+    assert TW.seed_builtin_templates(str(tmp_path)) == []
+    assert TW.load_template(str(tmp_path), "LongCat - few long scenes")["fps"] == 99
+
+
+def test_seeding_runs_before_the_management_commands():
+    """--list-templates on a fresh install has to show the starters, so seeding cannot
+    sit after the commands that return early."""
+    seed_at = SRC.index("seed_builtin_templates(args.out_dir)")
+    list_at = SRC.index("if args.list_templates:")
+    assert seed_at < list_at
+
+
+def test_the_longcat_starter_asks_for_fewer_longer_scenes():
+    wan = TW.BUILTIN_TEMPLATES["Wan - many short scenes"]
+    lc = TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]
+    # Longer scenes…
+    assert lc["clip_min_frames"] > wan["clip_max_frames"]
+    # …at LongCat's own frame rate, not the Wan-era compromise.
+    assert lc["fps"] == 15 and wan["fps"] == 8
+    # …so the same 45s short needs far fewer of them.
+    scenes_wan = 45 / (wan["clip_max_frames"] / wan["fps"])
+    scenes_lc = 45 / (lc["clip_max_frames"] / lc["fps"])
+    assert scenes_lc < scenes_wan / 2
+
+
+def test_the_longcat_frame_counts_obey_the_vae_rule():
+    """(frames - 1) divisible by 4 — the same rule the server checks before a long run,
+    and the one LongCat's own 93-frame segment satisfies."""
+    lc = TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]
+    for key in ("clip_min_frames", "clip_max_frames", "single_clip_max_frames"):
+        assert (lc[key] - 1) % 4 == 0, key
+
+
+def test_the_longcat_starter_selects_the_model():
+    assert TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]["video_model"] == "longcat"
+
+
+def test_a_starter_is_a_partial_not_a_full_capture():
+    """Starters set the handful of options that differ; everything else stays at the
+    tool's defaults rather than freezing today's values into a shipped file."""
+    for name, cfg in TW.BUILTIN_TEMPLATES.items():
+        assert 0 < len(cfg) < len(TW.CONFIG_FIELDS) / 2, name
+        assert set(cfg) <= set(TW.CONFIG_FIELDS), name
