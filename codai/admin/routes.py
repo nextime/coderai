@@ -3873,6 +3873,9 @@ def build_settings_dict(c, gpu_cards):
             "build_retry_cooldown_s": c.ocr.build_retry_cooldown_s,
             "evict_drain_timeout_s": c.ocr.evict_drain_timeout_s,
             "vlm_gpu_memory_utilization": c.ocr.vlm_gpu_memory_utilization,
+            "vlm_max_num_batched_tokens": c.ocr.vlm_max_num_batched_tokens,
+            "vlm_max_num_seqs": c.ocr.vlm_max_num_seqs,
+            "vlm_max_model_len": c.ocr.vlm_max_model_len,
             "fallback_engines": c.ocr.fallback_engines,
             "olmocr_enabled": c.ocr.olmocr_enabled,
             "olmocr_instances": c.ocr.olmocr_instances,
@@ -4606,6 +4609,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "build_retry_cooldown_s" in d: o.build_retry_cooldown_s = _f("build_retry_cooldown_s", o.build_retry_cooldown_s, 0.0)
         if "vlm_gpu_memory_utilization" in d: o.vlm_gpu_memory_utilization = _f("vlm_gpu_memory_utilization", o.vlm_gpu_memory_utilization, 0.0)
         if "fallback_engines" in d: o.fallback_engines = (d.get("fallback_engines") or "auto").strip()
+        if "vlm_max_num_batched_tokens" in d: o.vlm_max_num_batched_tokens = _i("vlm_max_num_batched_tokens", o.vlm_max_num_batched_tokens, 0)
+        if "vlm_max_num_seqs" in d: o.vlm_max_num_seqs = _i("vlm_max_num_seqs", o.vlm_max_num_seqs, 0)
+        if "vlm_max_model_len" in d: o.vlm_max_model_len = _i("vlm_max_model_len", o.vlm_max_model_len, 0)
         if "evict_drain_timeout_s" in d: o.evict_drain_timeout_s = _f("evict_drain_timeout_s", o.evict_drain_timeout_s, 0.0)
         if "olmocr_enabled" in d: o.olmocr_enabled = bool(d["olmocr_enabled"])
         if "olmocr_instances" in d: o.olmocr_instances = _i("olmocr_instances", o.olmocr_instances, 1)

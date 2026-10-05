@@ -329,8 +329,9 @@ def test_vllm_mode_serves_with_the_ocr_side_gpu_share(monkeypatch):
 
     fake_worker = types.SimpleNamespace(
         ensure_service=lambda vcfg, model_path=None, served_name=None,
-        gpu_memory_utilization=None: (
-            seen.update(model=model_path, share=gpu_memory_utilization), "http://127.0.0.1:1/")[1],
+        gpu_memory_utilization=None, **kw: (
+            seen.update(model=model_path, share=gpu_memory_utilization, limits=kw),
+            "http://127.0.0.1:1/")[1],
         planned_vram_gb=lambda vcfg, share=None: (share or 0.9) * 24.0,
         prelaunch_free_gb=lambda vcfg, share=None: ((share or 0.9) + _headroom) * 24.0,
     )
@@ -338,19 +339,23 @@ def test_vllm_mode_serves_with_the_ocr_side_gpu_share(monkeypatch):
     monkeypatch.setattr("codai.models.manager.get_active_vllm_config",
                         lambda: types.SimpleNamespace(gpu_memory_utilization=0.9))
 
-    cfg = _cfg(olmocr_serve="vllm", vlm_gpu_memory_utilization=0.35)
+    cfg = _cfg(olmocr_serve="vllm", vlm_gpu_memory_utilization=0.60)
     eng = OlmOcrEngine(cfg)
-    # 0.35 of the card for itself (not the LLM's 0.9) PLUS the ceiling's headroom, because
-    # the share is translated against whatever else holds the card at launch.
-    assert eng.prelaunch_vram_gb() == pytest.approx((0.35 + _headroom) * 24.0)
+    # 0.60 of the card for itself (not the LLM's 0.9) PLUS the ceiling's headroom, which
+    # is what must be FREE before launching — vLLM reserves it up front.
+    assert eng.prelaunch_vram_gb() == pytest.approx((0.60 + _headroom) * 24.0)
     eng.load()
     assert seen["model"] == "allenai/olmOCR-2-7B-1025-FP8"
-    assert seen["share"] == 0.35
+    assert seen["share"] == 0.60
+    # …and it caps its own instance's batch, which is what sets the activation peak.
+    assert seen["limits"]["max_num_batched_tokens"] == 4096
+    assert seen["limits"]["max_num_seqs"] == 16
     assert eng._base == "http://127.0.0.1:1/v1"
 
-    # 0.35 is the shipped default, because 0.9 of the card for a 7B page model is what
-    # crash-looped Surya-2 on a box that had other work resident.
-    assert OcrConfig().vlm_gpu_memory_utilization == 0.35
+    # 0.60 is the shipped default: measured live, surya-ocr-2 needs ~11.1 GB before a
+    # single KV block, so the 0.35 this once shipped (8.4 GB of a 24 GB card) was under
+    # the floor and could not start at all.
+    assert OcrConfig().vlm_gpu_memory_utilization == 0.60
     # Set back to 0 it defers to whatever the vLLM backend itself is configured with.
     eng2 = OlmOcrEngine(_cfg(olmocr_serve="vllm", vlm_gpu_memory_utilization=0.0))
     assert eng2.prelaunch_vram_gb() == pytest.approx((0.9 + _headroom) * 24.0)
@@ -439,6 +444,7 @@ def test_the_model_manager_can_evict_ocr_including_both_vlm_servers(monkeypatch)
         stop_service_for=lambda vcfg, model_path=None, served_name=None,
         gpu_memory_utilization=None: (stopped.append((model_path, gpu_memory_utilization)), 8.4)[1],
         planned_vram_gb=lambda vcfg, share=None: 8.4,
+        prelaunch_free_gb=lambda vcfg, share=None: 0.0,
         ensure_service=lambda *a, **k: "http://127.0.0.1:1/",
     )
     _patch_vllm_worker(monkeypatch, fake_worker)
@@ -478,8 +484,8 @@ def test_the_model_manager_can_evict_ocr_including_both_vlm_servers(monkeypatch)
     freed = m._release_vram(999.0)
     assert len(released) == 2                  # both instances torn down
     assert freed >= 16.0                       # pool + BOTH vLLM services
-    assert ("datalab-to/surya-ocr-2", 0.35) in stopped
-    assert ("allenai/olmOCR-2-7B-1025-FP8", 0.35) in stopped
+    assert ("datalab-to/surya-ocr-2", 0.60) in stopped
+    assert ("allenai/olmOCR-2-7B-1025-FP8", 0.60) in stopped
     # And the pool rebuilds on the next request rather than staying dead.
     asyncio.run(m.ocr_pages([_page(64, 64)], engine="olmocr"))
     assert len(released) == 2

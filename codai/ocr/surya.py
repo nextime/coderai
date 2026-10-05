@@ -15,7 +15,7 @@ LICENSE: GPL (compatible with coderai's GPLv3). Enabled only when
 import os
 
 from codai.ocr.subprocess_engine import SubprocessOcrEngine, _resolve_venv_dir
-from codai.ocr.base import OcrError
+from codai.ocr.base import OcrError, vlm_serve_limits
 
 _REQ = os.path.join(os.path.dirname(__file__), "..", "..", "requirements-surya.txt")
 
@@ -103,7 +103,8 @@ class SuryaEngine(SubprocessOcrEngine):
                 raise OcrError("Surya vllm mode needs the vLLM backend configured", status=400)
             model = (getattr(self.cfg, "surya_model", "") or "datalab-to/surya-ocr-2").strip()
             base = vllm_worker.ensure_service(vcfg, model_path=model, served_name=model,
-                                              gpu_memory_utilization=self._vlm_gmu())
+                                              gpu_memory_utilization=self._vlm_gmu(),
+                                              **vlm_serve_limits(self.cfg))
             self._server_url = base.rstrip("/") + "/v1"
         elif mode == "llamacpp":
             url = (getattr(self.cfg, "surya_server_url", "") or "").strip()

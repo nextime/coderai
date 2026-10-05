@@ -237,3 +237,25 @@ def _rasterize_pdf(data: bytes, dpi: int) -> List["Any"]:
         return [im.convert("RGB") for im in convert_from_bytes(data, dpi=dpi)]
     except Exception as e:
         raise OcrError(f"failed to rasterise PDF (pdf2image): {e}", status=400)
+
+
+def vlm_serve_limits(cfg) -> dict:
+    """The serving limits a VLM OCR engine imposes on its own vLLM instance, as kwargs
+    for ``vllm_worker.ensure_service``.
+
+    Without these the engine inherits the vLLM BACKEND's settings, which are sized for
+    serving an LLM: ``ctx=18432`` here, and the activation peak vLLM profiles for that
+    batch size was 9.4 GB of the 11.1 GB footprint that left surya-ocr-2 unable to start
+    on a 24 GB card at all. Chunked prefill is on, so capping the tokens per batch cuts
+    the peak without capping the context a page may use. 0/absent = inherit."""
+    out = {}
+    for key, arg in (("vlm_max_num_batched_tokens", "max_num_batched_tokens"),
+                     ("vlm_max_num_seqs", "max_num_seqs"),
+                     ("vlm_max_model_len", "max_model_len")):
+        try:
+            v = int(getattr(cfg, key, 0) or 0)
+        except Exception:
+            v = 0
+        if v > 0:
+            out[arg] = v
+    return out

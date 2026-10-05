@@ -126,21 +126,23 @@ refuses to start when that much is not free. Three rules follow, all enforced by
 - **Room is made before the load, not after it.** The engine declares what it needs up
   front (`prelaunch_vram_gb`) and the model manager evicts for it first. Evicting
   afterwards is useless, because the load is what fails.
-- **The share is relative to what is free, not to the card.** `vlm_gpu_memory_utilization`
-  is the slice the OCR engine wants for *itself*, but vLLM's own flag is a fraction of
-  **total** card memory and every other process' allocation counts against it. So the
-  share is translated at launch: 0.35 on a 24 GB card with 3.6 GB of resident embedder
-  becomes `--gpu-memory-utilization 0.50`, a 12 GB budget of which 8.4 GB is actually the
-  engine's. Without the translation, 0.35 left surya-2 about 5 GB, and after weights,
-  activation peak at `max_model_len=18432` and CUDA graphs it reported
-  `Available KV cache memory: -2.81 GiB` and died — once every 20 minutes, for hours.
-  The translation is capped (0.92) so the driver keeps its room; when the cap would bite,
-  the evict-first pass above is what clears the card instead.
-- **A failed build is not retried on every request.** For `ocr.build_retry_cooldown_s`
-  (default 60 s) that engine fails fast with the reason the boot gave, instead of spending
-  ~35 s booting and dying again per request. Without this, a card 11 GB short of Surya-2's
-  demand produced 338 consecutive failed boots in one morning, each one a half-minute hang
-  for the caller.
+- **The share must cover the engine's whole footprint, not its weights.** Measured live
+  on a 24 GB 3090 (two boots of surya-ocr-2: a 9.57 GiB budget gave
+  `Available KV cache memory: -1.54 GiB`, a 14.31 GiB budget gave `+3.18 GiB`), the fixed
+  cost is **~11.1 GiB** — weights 1.37, CUDA graphs 0.30 and ~9.4 GiB of activation peak —
+  *before a single KV block*. `vlm_gpu_memory_utilization` is a fraction of the card's
+  TOTAL memory, so 0.35 of this card is 8.4 GiB: below the floor, and no amount of
+  eviction makes it start. Hence the **0.60** default (14.4 GiB → ~3 GiB of KV cache).
+  Nothing is added back for other residents — those two boots show vLLM charges only its
+  own allocations against `total × gmu` — so the figure is simply the share, and the
+  evict-first pass above is what guarantees it is free.
+- **The batched-token cap is the better lever.** That 9.4 GiB peak is profiled for the
+  batch size, and a VLM OCR engine otherwise inherits the *LLM* backend's `ctx` (18432
+  here). Chunked prefill is on, so `ocr.vlm_max_num_batched_tokens` (default 4096) and
+  `ocr.vlm_max_num_seqs` (16) shrink the peak **without** shrinking the context a page may
+  use; `ocr.vlm_max_model_len` (0 = inherit) is there if you want to cut that too. Lower
+  the peak enough and the engine fits in a far smaller share, which is what lets OCR and
+  an LLM sit on one card.
 
 If you see `Free memory on device cuda:0 … is less than desired GPU memory utilization`,
 set **`ocr.vlm_gpu_memory_utilization`** (Settings → OCR → "VLM engines' GPU share"): the
@@ -166,7 +168,9 @@ back.
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,
 `default_engine`, `dpi`, `max_concurrency`, `lang`, `build_retry_cooldown_s`,
-`vlm_gpu_memory_utilization`, `fallback_engines`; per-engine `*_enabled` /
+`vlm_gpu_memory_utilization`, `vlm_max_num_batched_tokens`, `vlm_max_num_seqs`,
+`vlm_max_model_len`, `fallback_engines`, `evict_drain_timeout_s`;
+per-engine `*_enabled` /
 `*_instances` / `*_use_gpu` / lang; `detect_mode` (+ `detect_model_path`, `detect_conf`);
 `extract_enabled` / `extract_model_id` / `extract_schema` / `extract_validate`.
 

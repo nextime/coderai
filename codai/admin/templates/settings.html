@@ -1074,6 +1074,21 @@
         <label class="form-label">VLM engines' GPU share</label>
         <input type="number" id="s-ocr-vlm-gmu" class="form-input" min="0" max="1" step="0.05" placeholder="0 = vLLM default">
       </div>
+      <div class="form-group" style="flex:1;min-width:160px">
+        <label class="form-label">VLM batched tokens</label>
+        <input type="number" id="s-ocr-vlm-mnbt" class="form-input" min="0" placeholder="4096">
+        <div class="form-hint">Caps the tokens per batch for a VLM engine's own vLLM.
+          This is what sets its activation peak — the reason a share that looks big
+          enough still cannot start. 0 = inherit the vLLM backend's.</div>
+      </div>
+      <div class="form-group" style="flex:1;min-width:140px">
+        <label class="form-label">VLM max seqs</label>
+        <input type="number" id="s-ocr-vlm-mns" class="form-input" min="0" placeholder="16">
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">VLM max model len</label>
+        <input type="number" id="s-ocr-vlm-mml" class="form-input" min="0" placeholder="0 = inherit">
+      </div>
       <div class="form-group" style="flex:1;min-width:150px">
         <label class="form-label">Evict drain (s)</label>
         <input type="number" id="s-ocr-evict-drain" class="form-input" min="0" placeholder="60">
@@ -2017,6 +2032,9 @@ async function loadSettings(){
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
     document.getElementById('s-ocr-vlm-gmu').value = ocr.vlm_gpu_memory_utilization ?? 0;
     document.getElementById('s-ocr-fallback').value = ocr.fallback_engines ?? 'auto';
+    document.getElementById('s-ocr-vlm-mnbt').value = ocr.vlm_max_num_batched_tokens ?? 4096;
+    document.getElementById('s-ocr-vlm-mns').value = ocr.vlm_max_num_seqs ?? 16;
+    document.getElementById('s-ocr-vlm-mml').value = ocr.vlm_max_model_len ?? 0;
     document.getElementById('s-ocr-evict-drain').value = ocr.evict_drain_timeout_s ?? 60;
     document.getElementById('s-ocr-paddle-enabled').checked = ocr.paddle_enabled !== false;
     document.getElementById('s-ocr-paddle-use-gpu').checked = ocr.paddle_use_gpu !== false;
@@ -2246,6 +2264,9 @@ async function saveSettings(silent){
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
       vlm_gpu_memory_utilization: parseFloat(document.getElementById('s-ocr-vlm-gmu').value) || 0,
       fallback_engines: document.getElementById('s-ocr-fallback').value.trim() || 'auto',
+      vlm_max_num_batched_tokens: parseInt(document.getElementById('s-ocr-vlm-mnbt').value) || 0,
+      vlm_max_num_seqs: parseInt(document.getElementById('s-ocr-vlm-mns').value) || 0,
+      vlm_max_model_len: parseInt(document.getElementById('s-ocr-vlm-mml').value) || 0,
       evict_drain_timeout_s: parseFloat(document.getElementById('s-ocr-evict-drain').value) || 0,
       paddle_enabled: document.getElementById('s-ocr-paddle-enabled').checked,
       paddle_use_gpu: document.getElementById('s-ocr-paddle-use-gpu').checked,

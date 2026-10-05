@@ -46,25 +46,28 @@ def test_an_empty_card_passes_the_share_through(monkeypatch):
     assert vllm_worker.effective_gmu(0.35) == pytest.approx(0.35, abs=1e-3)
 
 
-def test_the_share_grows_by_what_other_models_already_hold(monkeypatch):
-    """The actual regression: bge-m3 resident while surya tries to boot."""
-    _card(monkeypatch, total_gb=24.0, free_gb=24.0 - 3.6)
-    eff = vllm_worker.effective_gmu(0.35)
-    # 0.35 for us + 3.6/24 held by the embedder = a 12 GB budget, 8.4 GB of it ours.
-    assert eff == pytest.approx(0.35 + 3.6 / 24.0, abs=1e-3)
-    assert eff * 24.0 - 3.6 == pytest.approx(0.35 * 24.0, abs=0.05)
+def test_other_residents_do_not_inflate_the_share(monkeypatch):
+    """The share is what THIS instance may use, full stop.
+
+    It used to have other residents' usage added back, on the theory that vLLM charges
+    them against the budget. Two live boots said otherwise (the same 11.1 GB footprint at
+    two different budgets), and the add-back made the figure depend on unrelated models
+    while asking for share*total for this instance on top of what they held. The
+    evict-first pass clears the card instead."""
+    _card(monkeypatch, total_gb=24.0, free_gb=24.0 - 6.1)
+    assert vllm_worker.effective_gmu(0.60) == pytest.approx(0.60, abs=1e-3)
 
 
-def test_the_translation_is_capped_so_the_driver_keeps_its_room(monkeypatch):
-    _card(monkeypatch, total_gb=24.0, free_gb=2.0)       # 22 GB held by others
-    assert vllm_worker.effective_gmu(0.35) == pytest.approx(vllm_worker.GMU_CEILING)
+def test_the_share_is_capped_so_the_driver_keeps_its_room(monkeypatch):
+    _card(monkeypatch, total_gb=24.0, free_gb=24.0)
+    assert vllm_worker.effective_gmu(0.99) == pytest.approx(vllm_worker.GMU_CEILING)
 
 
-def test_an_unmeasurable_card_does_not_inflate_the_share(monkeypatch):
+def test_an_unmeasurable_card_still_passes_the_share_through(monkeypatch):
     from codai.models.manager import multi_model_manager
     monkeypatch.setattr(multi_model_manager, "_total_vram_gb", lambda: 24.0)
     monkeypatch.setattr(multi_model_manager, "_get_free_vram_gb", lambda: 999.0)
-    assert vllm_worker.effective_gmu(0.35) == pytest.approx(0.35, abs=1e-3)
+    assert vllm_worker.effective_gmu(0.60) == pytest.approx(0.60, abs=1e-3)
 
 
 def test_no_share_means_no_flag(monkeypatch):
@@ -73,32 +76,83 @@ def test_no_share_means_no_flag(monkeypatch):
     assert vllm_worker.effective_gmu(None) == 0.0
 
 
+# ---------------------------------------------------- footprint caps
+def test_the_vlm_engine_caps_its_own_vllms_batch(monkeypatch):
+    """The activation peak these cap IS what kept surya-ocr-2 from starting: 9.4 GB of an
+    11.1 GB footprint, profiled for the LLM backend's ctx=18432."""
+    from codai.ocr.base import vlm_serve_limits
+    assert vlm_serve_limits(OcrConfig()) == {
+        "max_num_batched_tokens": 4096, "max_num_seqs": 16}   # max_model_len 0 = inherit
+
+
+def test_zero_means_inherit_the_backends_value():
+    from codai.ocr.base import vlm_serve_limits
+    cfg = OcrConfig(vlm_max_num_batched_tokens=0, vlm_max_num_seqs=0, vlm_max_model_len=0)
+    assert vlm_serve_limits(cfg) == {}
+
+
+def test_an_explicit_model_len_is_passed_too():
+    from codai.ocr.base import vlm_serve_limits
+    cfg = OcrConfig(vlm_max_model_len=8192)
+    assert vlm_serve_limits(cfg)["max_model_len"] == 8192
+
+
+def test_the_caps_reach_the_launch_command(monkeypatch):
+    _card(monkeypatch)
+    cfg = type("C", (), {"model_id": "surya", "ctx": 18432, "max_num_seqs": 0,
+                         "gpu_memory_utilization": 0.9})()
+    cmd = vllm_worker._launch_cmd(
+        "py", cfg, "127.0.0.1", 1, "datalab-to/surya-ocr-2", "datalab-to/surya-ocr-2",
+        gpu_memory_utilization=0.60, max_num_batched_tokens=4096, max_num_seqs=16)
+    assert "--max-num-batched-tokens" in cmd
+    assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "4096"
+    assert cmd[cmd.index("--max-num-seqs") + 1] == "16"
+    assert cmd[cmd.index("--gpu-memory-utilization") + 1] == "0.6"
+    assert cmd[cmd.index("--max-model-len") + 1] == "18432"    # inherited
+
+
+def test_an_override_wins_over_the_backends_context(monkeypatch):
+    _card(monkeypatch)
+    cfg = type("C", (), {"model_id": "surya", "ctx": 18432, "gpu_memory_utilization": 0.9})()
+    cmd = vllm_worker._launch_cmd("py", cfg, "127.0.0.1", 1, "m", "m",
+                                  max_model_len=8192)
+    assert cmd[cmd.index("--max-model-len") + 1] == "8192"
+
+
+def test_the_shipped_share_clears_the_measured_footprint():
+    """0.35 of a 24 GB card is 8.4 GB against an 11.1 GB floor — below it, nothing starts.
+    0.60 is 14.4 GB, which left 3.18 GB of KV cache on the live card."""
+    share = OcrConfig().vlm_gpu_memory_utilization
+    assert share == 0.60
+    assert share * 24.0 > 11.1 + 2.0
+
+
 def test_the_backends_own_setting_is_already_absolute(monkeypatch):
     """Only a side job's share is translated; vllm.gpu_memory_utilization is not."""
     _card(monkeypatch, total_gb=24.0, free_gb=24.0 - 8.0)
     cfg = type("C", (), {"gpu_memory_utilization": 0.90})()
     assert vllm_worker.resolve_gmu(cfg, None) == pytest.approx(0.90)
-    assert vllm_worker.resolve_gmu(cfg, 0.35) == pytest.approx(0.35 + 8.0 / 24.0, abs=1e-3)
+    assert vllm_worker.resolve_gmu(cfg, 0.60) == pytest.approx(0.60, abs=1e-3)
 
 
 # ---------------------------------------------------- evict-first demand
 def test_the_evict_demand_covers_the_share_plus_the_ceilings_headroom(monkeypatch):
     _card(monkeypatch, total_gb=24.0, free_gb=24.0)
     cfg = type("C", (), {"gpu_memory_utilization": 0.0})()
-    need = vllm_worker.prelaunch_free_gb(cfg, 0.35)
-    # Enough free that 0.35 + used/total still lands under the ceiling.
-    assert need == pytest.approx((0.35 + (1.0 - vllm_worker.GMU_CEILING)) * 24.0, abs=0.05)
-    assert need > vllm_worker.planned_vram_gb(cfg, 0.35)
+    need = vllm_worker.prelaunch_free_gb(cfg, 0.60)
+    # The share itself plus the headroom the ceiling reserves.
+    assert need == pytest.approx((0.60 + (1.0 - vllm_worker.GMU_CEILING)) * 24.0, abs=0.05)
+    assert need > vllm_worker.planned_vram_gb(cfg, 0.60)
 
 
 def test_a_crowded_card_is_cleared_rather_than_clamped(monkeypatch):
     """When the demand is met, the translation fits — that is the point of the pairing."""
     _card(monkeypatch, total_gb=24.0, free_gb=24.0)
     cfg = type("C", (), {"gpu_memory_utilization": 0.0})()
-    need = vllm_worker.prelaunch_free_gb(cfg, 0.35)
+    need = vllm_worker.prelaunch_free_gb(cfg, 0.60)
     # Evictor honoured the demand exactly: `need` free, the rest held by others.
     _card(monkeypatch, total_gb=24.0, free_gb=need)
-    assert vllm_worker.effective_gmu(0.35) <= vllm_worker.GMU_CEILING + 1e-6
+    assert need <= 24.0 and vllm_worker.effective_gmu(0.60) * 24.0 <= need
 
 
 # ---------------------------------------------------- release accounting
@@ -112,16 +166,16 @@ def test_stopping_reports_what_was_reserved_not_the_engines_share(monkeypatch):
 
     stopped = []
     monkeypatch.setattr(vllm_worker, "stop_service", lambda k: stopped.append(k))
-    launched = vllm_worker.effective_gmu(0.35)          # 0.50 -> a 12 GB reservation
+    launched = vllm_worker.effective_gmu(0.60)          # 0.60 -> a 14.4 GB reservation
     monkeypatch.setitem(vllm_worker._services, "m|m",
                         {"proc": _Proc(), "port": 1, "url": "u", "ray": None,
                          "gmu": launched})
     cfg = type("C", (), {"model_path": "m", "gpu_memory_utilization": 0.0})()
     freed = vllm_worker.stop_service_for(cfg, model_path="m", served_name="m",
-                                         gpu_memory_utilization=0.35)
+                                         gpu_memory_utilization=0.10)
     assert stopped == ["m|m"]
-    assert freed == pytest.approx(launched * 24.0, abs=0.05)     # ~12 GB
-    assert freed > 0.35 * 24.0                                   # not the 8.4 GB share
+    assert freed == pytest.approx(launched * 24.0, abs=0.05)     # ~14.4 GB, what it took
+    assert freed > 0.10 * 24.0                      # not the (stale) share the caller passed
 
 
 def test_a_leftover_service_is_stopped_even_after_the_mode_changed(monkeypatch):
@@ -263,7 +317,6 @@ def test_a_healthy_engine_is_not_second_guessed(monkeypatch):
 
 def test_the_fallback_is_on_by_default():
     assert OcrConfig().fallback_engines == "auto"
-    assert OcrConfig().vlm_gpu_memory_utilization == 0.35
     assert OcrConfig().evict_drain_timeout_s == 60.0
 
 

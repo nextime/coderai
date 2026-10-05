@@ -787,11 +787,21 @@ class OcrConfig:
     evict_drain_timeout_s: float = 60.0
     # The share of the card a VLM OCR engine's own vLLM instance claims (surya in vllm
     # mode, olmocr in vllm mode). 0 = use vllm.gpu_memory_utilization, which is sized for
-    # serving an LLM and is far more than a 7B OCR model needs — on a shared card that is
-    # the difference between booting and "Free memory … is less than desired GPU memory
-    # utilization". 0.35 of a 24 GB card (8.4 GB) fits surya-2 / olmOCR-2 with their KV
-    # cache and leaves the resident engines where they are.
-    vlm_gpu_memory_utilization: float = 0.35
+    # serving an LLM. This is a fraction of the card's TOTAL memory, and it has to cover
+    # the engine's whole footprint, not just its weights: measured live on a 24 GB 3090,
+    # surya-ocr-2 needs ~11.1 GB before a single KV block (weights 1.37 + CUDA graphs 0.30
+    # + ~9.4 GB activation peak). 0.35 (8.4 GB) was therefore below the floor and could
+    # never start; 0.60 (14.4 GB) leaves ~3 GB of KV cache. The evict-first pass clears
+    # the card for it, so the figure does not have to allow for other residents.
+    vlm_gpu_memory_utilization: float = 0.60
+    # …and these bring the footprint itself down, which is the better lever. A VLM OCR
+    # engine otherwise inherits the LLM backend's ctx (18432 here), and the activation
+    # peak vLLM profiles for that size IS the 9.4 GB above. Chunked prefill is on, so
+    # capping the tokens per batch shrinks the peak WITHOUT shrinking the usable context.
+    # 0 = inherit the backend's value.
+    vlm_max_num_batched_tokens: int = 4096
+    vlm_max_num_seqs: int = 16
+    vlm_max_model_len: int = 0            # 0 = inherit vllm.ctx (a page needs far less)
     # When the chosen engine cannot serve a document, try these engines instead rather
     # than failing the request: a 503 means a document nobody read, and that is strictly
     # worse than a transcription from the second-best engine. "auto" = every other
@@ -1430,6 +1440,9 @@ class ConfigManager:
                 "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
                 "evict_drain_timeout_s": self.config.ocr.evict_drain_timeout_s,
                 "vlm_gpu_memory_utilization": self.config.ocr.vlm_gpu_memory_utilization,
+                "vlm_max_num_batched_tokens": self.config.ocr.vlm_max_num_batched_tokens,
+                "vlm_max_num_seqs": self.config.ocr.vlm_max_num_seqs,
+                "vlm_max_model_len": self.config.ocr.vlm_max_model_len,
                 "fallback_engines": self.config.ocr.fallback_engines,
                 "olmocr_enabled": self.config.ocr.olmocr_enabled,
                 "olmocr_instances": self.config.ocr.olmocr_instances,

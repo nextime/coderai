@@ -36,7 +36,7 @@ import json
 import threading
 from typing import Optional
 
-from codai.ocr.base import OcrEngine, OcrPage, OcrError
+from codai.ocr.base import OcrEngine, OcrPage, OcrError, vlm_serve_limits
 
 
 #: olmocr.prompts.build_no_anchoring_v4_yaml_prompt() — kept verbatim: the model was
@@ -245,7 +245,8 @@ class OlmOcrEngine(OcrEngine):
             raise OcrError("olmOCR vllm mode needs the vLLM backend configured", status=400)
         model = self._model_name()
         base = vllm_worker.ensure_service(vcfg, model_path=model, served_name=model,
-                                          gpu_memory_utilization=self._vlm_gmu())
+                                          gpu_memory_utilization=self._vlm_gmu(),
+                                          **vlm_serve_limits(self.cfg))
         self._base = base.rstrip("/") + "/v1"
 
     def cleanup(self) -> None:

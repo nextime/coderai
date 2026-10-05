@@ -116,19 +116,32 @@ def resolve_service_key(cfg, model_path: Optional[str] = None):
 
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
                 served_name: Optional[str] = None, model_config: dict = None,
-                gpu_memory_utilization: Optional[float] = None) -> list:
+                gpu_memory_utilization: Optional[float] = None,
+                max_model_len: Optional[int] = None,
+                max_num_batched_tokens: Optional[int] = None,
+                max_num_seqs: Optional[int] = None) -> list:
     mid = served_name or (getattr(cfg, "model_id", "vllm") or "vllm")
     cmd = [py, "-m", "vllm.entrypoints.openai.api_server",
            "--host", host, "--port", str(port),
            "--model", model_path,
            "--served-model-name", mid]
-    ctx = int(getattr(cfg, "ctx", 0) or 0)
+    # A side job serving a small model (the OCR VLM engines) overrides the context the
+    # LLM backend is configured with: it inherited ctx=18432, and the activation peak
+    # that size profiles for was 9.4 GiB of the 11.1 GiB that made surya-ocr-2 unable to
+    # start. A page is not an 18k-token conversation.
+    ctx = int(max_model_len or 0) or int(getattr(cfg, "ctx", 0) or 0)
     if ctx > 0:
         cmd += ["--max-model-len", str(ctx)]
     # Already absolute (resolve_gmu translated a side job's own-share if there was one).
     gmu = float(gpu_memory_utilization or 0) or float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
     if gmu > 0:
         cmd += ["--gpu-memory-utilization", str(gmu)]
+    # The profiling peak that decides whether the engine can start is driven by how many
+    # tokens may be in one batch, NOT by max_model_len (chunked prefill is on), so this
+    # is the lever that shrinks the footprint without shrinking the usable context.
+    mnbt = int(max_num_batched_tokens or 0)
+    if mnbt > 0:
+        cmd += ["--max-num-batched-tokens", str(mnbt)]
     tp = int(getattr(cfg, "tensor_parallel_size", 0) or 0)
     if tp > 0:
         cmd += ["--tensor-parallel-size", str(tp)]
@@ -140,7 +153,7 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
         executor = "ray"
     if executor:
         cmd += ["--distributed-executor-backend", executor]
-    mns = int(getattr(cfg, "max_num_seqs", 0) or 0)
+    mns = int(max_num_seqs or 0) or int(getattr(cfg, "max_num_seqs", 0) or 0)
     if mns > 0:
         cmd += ["--max-num-seqs", str(mns)]
     dtype = (getattr(cfg, "dtype", "") or "").strip()
@@ -254,7 +267,10 @@ def _start_ray(cfg, py: str, env: dict):
 def ensure_service(cfg, model_path: Optional[str] = None,
                    served_name: Optional[str] = None,
                    ready_timeout: float = 3600.0,
-                   gpu_memory_utilization: Optional[float] = None) -> str:
+                   gpu_memory_utilization: Optional[float] = None,
+                   max_model_len: Optional[int] = None,
+                   max_num_batched_tokens: Optional[int] = None,
+                   max_num_seqs: Optional[int] = None) -> str:
     """Launch (or reuse) a vLLM OpenAI server for a model; return its base URL.
 
     ``model_path``/``served_name`` override the config (used by the OCR subsystem to serve
@@ -306,7 +322,10 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         gmu = resolve_gmu(cfg, gpu_memory_utilization)
         cmd = _launch_cmd(py, cfg, host, port, model, served_name,
                           model_config=_model_config_for(resolved or model),
-                          gpu_memory_utilization=gmu)
+                          gpu_memory_utilization=gmu,
+                          max_model_len=max_model_len,
+                          max_num_batched_tokens=max_num_batched_tokens,
+                          max_num_seqs=max_num_seqs)
 
         env = os.environ.copy()
         # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on
@@ -437,9 +456,10 @@ def _used_by_others_gb() -> float:
 def resolve_gmu(cfg, gpu_memory_utilization: Optional[float] = None) -> float:
     """The absolute ``--gpu-memory-utilization`` to launch with.
 
-    A side job (an OCR VLM engine) passes the share it wants for ITSELF, which has to be
-    translated against what else is on the card; the backend's own configured value is
-    already absolute and is used as-is."""
+    A side job (an OCR VLM engine) passes the share it wants for ITSELF; the backend's
+    own configured value is used as-is. Both are fractions of the card's TOTAL memory,
+    which is what the flag means — see :func:`effective_gmu` for why nothing is added
+    back for other residents any more."""
     share = float(gpu_memory_utilization or 0)
     if share > 0:
         return effective_gmu(share)
@@ -447,40 +467,43 @@ def resolve_gmu(cfg, gpu_memory_utilization: Optional[float] = None) -> float:
 
 
 def effective_gmu(self_share: float) -> float:
-    """Translate "the share of the card I want for MYSELF" into the absolute
-    ``--gpu-memory-utilization`` vLLM wants.
+    """The share this instance may use, clamped to :data:`GMU_CEILING`, plus a log line
+    naming what else is on the card.
 
-    vLLM's flag is a fraction of the card's TOTAL memory and every other process'
-    allocation counts against it: with 3.6 GB of bge-m3 resident on a 24 GB 3090,
-    ``0.35`` left surya-2 about 5 GB, and after weights (1.37) + activation peak at
-    ``max_model_len=18432`` + CUDA graphs (0.3) it reported ``Available KV cache memory:
-    -2.81 GiB`` and died — every 20 minutes, for hours. So add back what others hold:
-    0.35 of a card with 3.6 GB in use becomes 0.50, i.e. a 12 GB budget of which 8.4 GB
-    is actually ours. Capped at :data:`GMU_CEILING`; when the cap bites, the caller's
-    evict-first pass (``prelaunch_vram_gb``) is what makes room."""
+    Measured on a 24 GB 3090 (2026-10-05, two live boots of surya-ocr-2): budget
+    9.57 GiB gave ``Available KV cache memory: -1.54 GiB``, budget 14.31 GiB gave
+    ``+3.18 GiB`` — a fixed footprint of 11.11 and 11.13 GiB respectively. Two things
+    follow. First, vLLM charges only its OWN allocations against ``total × gmu``; if
+    other residents counted too, those two boots would imply wildly different activation
+    peaks (8.3 vs 3.6 GiB) instead of the same 11.1. So this function does NOT add back
+    what others hold: doing so made the budget depend on unrelated residents and asked
+    for ``share×total + used`` for this instance while ``used`` stayed held by someone
+    else. The card is cleared by the caller's evict-first pass
+    (:func:`prelaunch_free_gb`) instead, which is the honest mechanism.
+
+    Second, the share has to actually cover the footprint: 0.35 of this card is 8.4 GiB
+    against an 11.1 GiB floor, so it could never start, which is why ``0.35`` crash-looped
+    for hours and then appeared to "work" only when 6.1 GB of other residents inflated
+    the old add-back to 0.604. Hence the 0.60 default and the batched-token cap that
+    brings the 9.4 GiB activation peak down."""
     try:
         share = max(0.0, float(self_share or 0.0))
     except Exception:
         return 0.0
     if share <= 0:
         return 0.0
+    eff = min(share, GMU_CEILING)
     try:
         from codai.models.manager import multi_model_manager
         total = float(multi_model_manager._total_vram_gb() or 0.0)
     except Exception:
         total = 0.0
-    if total <= 0:
-        return min(share, GMU_CEILING)
-    used = _used_by_others_gb()
-    eff = share + (used / total)
-    if eff > GMU_CEILING:
-        print(f"[vllm] share {share:.2f} + {used:.1f} GB held by others exceeds the "
-              f"{GMU_CEILING:.2f} ceiling on a {total:.1f} GB card; clamping "
-              f"(eviction should have freed more)", flush=True)
-        eff = GMU_CEILING
-    if abs(eff - share) > 0.005:
-        print(f"[vllm] gpu-memory-utilization {share:.2f} (own share) -> {eff:.3f} "
-              f"absolute: {used:.1f} of {total:.1f} GB already in use", flush=True)
+    if total > 0:
+        used = _used_by_others_gb()
+        print(f"[vllm] gpu-memory-utilization {eff:.3f} = {eff * total:.1f} GB of a "
+              f"{total:.1f} GB card for this instance; {used:.1f} GB currently held by "
+              f"others (the evict-first pass should have cleared what it needed)",
+              flush=True)
     return eff
 
 
