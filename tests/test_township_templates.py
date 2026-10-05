@@ -192,6 +192,23 @@ def test_the_web_routes_exist(route):
     assert route in SRC
 
 
+def test_loading_persists_to_the_active_config():
+    """Live is not enough. The launcher starts the tool with
+    --config <out_dir>/township_config.json, so a load that only changed the session
+    would silently revert on the next restart — and _ref_gen_res_steps RE-READS that
+    file for keyframe_size/keyframe_steps, so a stale file makes those two options
+    disagree with the rest of the loaded template in the same session."""
+    seg = SRC[SRC.index('if path in ("/templates/load"'):SRC.index('if path == "/process":')]
+    assert "township_config.json" in seg
+    assert 'open(_ap, "w"' in seg
+    assert '"persisted"' in seg
+
+
+def test_a_failed_persist_is_reported_not_swallowed():
+    seg = SRC[SRC.index('if path in ("/templates/load"'):SRC.index('if path == "/process":')]
+    assert "could not write" in seg
+
+
 def test_loading_applies_to_the_live_session():
     """The Run page renders from default_args, so a load that only wrote a file would
     appear to do nothing until restart."""

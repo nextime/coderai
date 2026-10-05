@@ -11042,9 +11042,34 @@ async function resetPrompts(ev){
                 # reload and every subsequent job uses it.
                 for _k, _val in tcfg.items():
                     setattr(default_args, _k, _val)
-                _web_log(f"  ⚙ Loaded template '{nm}' ({len(tcfg)} options)")
+                # …and make it STICK, by writing the active config file too. Two reasons
+                # this is not optional:
+                #   1. the launcher starts the tool with --config <out_dir>/
+                #      township_config.json, so without this the template silently
+                #      reverts on the next restart;
+                #   2. _ref_gen_res_steps deliberately RE-READS that file from disk for
+                #      keyframe_size/keyframe_steps, so leaving it stale would have those
+                #      two options disagree with the rest of the loaded template in the
+                #      very same session.
+                _active = (getattr(default_args, "config", None)
+                           or str(Path(default_args.out_dir) / "township_config.json"))
+                _persisted = None
+                try:
+                    _ap = Path(_active)
+                    _ap.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_ap, "w", encoding="utf-8") as f:
+                        _j.dump(tcfg, f, indent=2, sort_keys=True)
+                        f.write("\n")
+                    _persisted = str(_ap)
+                except Exception as e:
+                    # The switch is already live; failing to persist is worth saying
+                    # out loud rather than silently reverting on the next restart.
+                    _web_log(f"  ⚠ Loaded '{nm}' live, but could not write {_active}: {e}")
+                _web_log(f"  ⚙ Loaded template '{nm}' ({len(tcfg)} options)"
+                         + (f" → {_persisted}" if _persisted else ""))
                 self._send(200, "application/json",
-                           _j.dumps({"ok": True, "name": nm, "options": len(tcfg)}))
+                           _j.dumps({"ok": True, "name": nm, "options": len(tcfg),
+                                     "persisted": _persisted}))
                 return
 
             if path == "/process":
