@@ -1633,6 +1633,9 @@ MAX_PLANNED_FRAMES = 480         # ceiling for a whole (possibly chained) clip
 # 'extend' conditioning. More frames = stronger motion-continuity (kills the
 # forward/rewind boomerang) but more conditioning cost; ~5 carries velocity well.
 VACE_TAIL_FRAMES = 5
+# LongCat-Video conditions a continuation on 13 of its 93 frames — the number its
+# continuation pretraining used. See tools/longcat_common.py (DEFAULT_COND_FRAMES).
+LONGCAT_COND_FRAMES = 13
 
 # Per fight-clip frame budget. Frame count (not seconds) is the real control: it's
 # the model's motion budget and is fps-independent, so a clip is CLIP_*_FRAMES
@@ -4334,8 +4337,18 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
 
     # Max frames per SINGLE model generation. A clip whose budget exceeds this is
     # rendered as several chained sub-renders and concatenated into ONE shot.
-    _chunk_max = max(8, min(int(single_clip_max_frames or SINGLE_CLIP_MAX_FRAMES),
-                            MODEL_MAX_FRAMES))
+    #
+    # LongCat-Video is the exception, and it is why this cap exists at all: it was
+    # pretrained on video CONTINUATION, so the server generates a long shot in segments
+    # itself — one request, native continuation, no re-encoded joins. Chaining it from
+    # here would reintroduce exactly the drift the cap works around, so the cap is
+    # lifted and the whole budget goes in one request.
+    _longcat = "longcat" in (video_model or "").lower()
+    if _longcat:
+        _chunk_max = 1 << 30
+    else:
+        _chunk_max = max(8, min(int(single_clip_max_frames or SINGLE_CLIP_MAX_FRAMES),
+                                MODEL_MAX_FRAMES))
 
     def _render_once(label, prompt, profiles, env, nf, out_path,
                      fighters=None, init_override=None, step_cb=None,
@@ -4456,12 +4469,23 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         # (real motion → carries velocity forward), the proper fix for the
         # single-frame "boomerang". Non-VACE models fall back to single last-frame
         # seeding + the forward-motion prompt nudge.
+        # Both VACE and LongCat continue from a frame TAIL rather than a single frame.
+        # The difference is what happens underneath: VACE is conditioned frame-tail
+        # extension bolted onto a t2v model, LongCat was pretrained on continuation —
+        # which is why its long output does not drift in colour or decay the way chained
+        # VACE parts do. Either way the tool passes the same tail.
         _vace = "vace" in (video_model or "").lower()
+        _tail_capable = _vace or _longcat
+        # How much tail to hand over. VACE's 5 frames were tuned for its conditioning;
+        # LongCat's own default is 13 of 93, which is what its continuation was trained
+        # with — handing it fewer would condition it on less than it expects.
+        _tail_frames = LONGCAT_COND_FRAMES if _longcat else VACE_TAIL_FRAMES
         _nparts = len(parts_plan)
         _budget = [p[1] for p in parts_plan]
         _log(f"    ↪ chaining {_nparts} parts {_budget} into one shot"
              + ("  [multi-shot sequence]" if segments and len(seglist) > 1 else "")
-             + ("  [VACE frame-tail extend]" if _vace else ""))
+             + ("  [LongCat native continuation]" if _longcat
+                else "  [VACE frame-tail extend]" if _vace else ""))
         tmpd = tempfile.mkdtemp(prefix="twshot_")
         parts, prev_last, prev_tail = [], None, None
         try:
@@ -4485,9 +4509,9 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                     cond_frames = None
                 else:
                     seed_img = keyframe if pi == 0 else (prev_last or keyframe)
-                    cond_frames = prev_tail if (_vace and pi > 0) else None
+                    cond_frames = prev_tail if (_tail_capable and pi > 0) else None
                     if cond_frames:
-                        seed_img = None  # VACE conditions via the tail, not an init frame
+                        seed_img = None  # conditioned by the tail, not an init frame
                 if pi == 0 or anchored:
                     # First part, or a segment anchored to its own keyframe → render
                     # the shot's own prompt verbatim (a deliberate, freshly-composed
@@ -4517,7 +4541,8 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 parts.append(part_path)
                 # Prepare seeds for the NEXT part.
                 prev_last = _last_frame_png(part_path)
-                prev_tail = _last_frames_png(part_path, VACE_TAIL_FRAMES) if _vace else None
+                prev_tail = (_last_frames_png(part_path, _tail_frames)
+                             if _tail_capable else None)
                 if pi < _nparts - 1 and not prev_last and not prev_tail:
                     _log("    ⚠ could not read part's tail — next part falls "
                          "back to the clip keyframe (possible visible seam)")

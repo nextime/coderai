@@ -4138,15 +4138,21 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
             f"LongCat-Video does not support mode '{mode}'. Use 't2v', 'i2v', "
             f"'extend' (continuation), or 'at2v'/'ai2v' (audio-driven avatar)."))
 
+    # num_frames is the PER-CALL count (93 by default). A caller asking for more than
+    # one call's worth gets the segment loop, server-side: the alternative is every
+    # client reimplementing the chaining that LongCat does natively and better.
+    _want = int(request.num_frames) if request.num_frames else lc.DEFAULT_NUM_FRAMES
+    _per_call = min(_want, lc.DEFAULT_NUM_FRAMES)
     payload = {
         "prompt": request.prompt or "",
         "quality": quality,
         "stage": stage,
         "model": model_path,
         "task": _task,
-        "num_frames": int(request.num_frames) if request.num_frames
-                      else lc.DEFAULT_NUM_FRAMES,
+        "num_frames": _per_call,
     }
+    if _want > _per_call:
+        payload["total_frames"] = _want
     if request.negative_prompt:
         payload["negative_prompt"] = request.negative_prompt
 
@@ -4202,6 +4208,7 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     _segments = getattr(request, "num_segments", None) or model_cfg.get("num_segments")
     if _segments:
         payload["num_segments"] = int(_segments)
+        payload.pop("total_frames", None)
     elif getattr(request, "duration_seconds", None):
         payload["total_frames"] = int(float(request.duration_seconds) * lc.DEFAULT_FPS)
     _cond = getattr(request, "num_cond_frames", None) or model_cfg.get("num_cond_frames")
