@@ -785,14 +785,18 @@ class OcrConfig:
     # model, so OCR and models take turns at a page boundary instead of OCR losing the
     # page it was mid-way through. 0 = tear down immediately.
     evict_drain_timeout_s: float = 60.0
-    # The share of the card a VLM OCR engine's own vLLM instance claims (surya in vllm
-    # mode, olmocr in vllm mode). 0 = use vllm.gpu_memory_utilization, which is sized for
-    # serving an LLM. This is a fraction of the card's TOTAL memory, and it has to cover
-    # the engine's whole footprint, not just its weights: measured live on a 24 GB 3090,
-    # surya-ocr-2 needs ~11.1 GB before a single KV block (weights 1.37 + CUDA graphs 0.30
-    # + ~9.4 GB activation peak). 0.35 (8.4 GB) was therefore below the floor and could
-    # never start; 0.60 (14.4 GB) leaves ~3 GB of KV cache. The evict-first pass clears
-    # the card for it, so the figure does not have to allow for other residents.
+    # The STARTING share of the card a VLM OCR engine's own vLLM instance asks for
+    # (surya in vllm mode, olmocr in vllm mode); 0 = use vllm.gpu_memory_utilization.
+    # It is a fraction of the card's TOTAL memory and has to cover the engine's whole
+    # footprint, not just its weights: measured live, surya-ocr-2 on a 24 GB 3090 needs
+    # ~10.9 GB before a single KV block (weights 1.37 + CUDA graphs 0.05 + ~9.4 GB of
+    # vision-encoder profiling peak), so the 0.35 this once shipped (8.4 GB) was under
+    # the floor and could never start. 0.60 is a reasonable opening bid for a 7B VLM —
+    # but it is NOT a measurement of your model on your card, and it does not have to be:
+    # when vLLM reports the budget cannot hold the cache, the launcher escalates the
+    # share, re-evicts for the larger figure and remembers what booted, keyed by
+    # model+card+limits (see vllm_worker.ensure_service). Any model, any card, any
+    # request mix converges on a share that fits.
     vlm_gpu_memory_utilization: float = 0.60
     # …and these bring the footprint itself down, which is the better lever. A VLM OCR
     # engine otherwise inherits the LLM backend's ctx (18432 here), and the activation

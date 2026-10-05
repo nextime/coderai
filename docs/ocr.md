@@ -126,23 +126,31 @@ refuses to start when that much is not free. Three rules follow, all enforced by
 - **Room is made before the load, not after it.** The engine declares what it needs up
   front (`prelaunch_vram_gb`) and the model manager evicts for it first. Evicting
   afterwards is useless, because the load is what fails.
-- **The share must cover the engine's whole footprint, not its weights.** Measured live
-  on a 24 GB 3090 (two boots of surya-ocr-2: a 9.57 GiB budget gave
-  `Available KV cache memory: -1.54 GiB`, a 14.31 GiB budget gave `+3.18 GiB`), the fixed
-  cost is **~11.1 GiB** — weights 1.37, CUDA graphs 0.30 and ~9.4 GiB of activation peak —
-  *before a single KV block*. `vlm_gpu_memory_utilization` is a fraction of the card's
-  TOTAL memory, so 0.35 of this card is 8.4 GiB: below the floor, and no amount of
-  eviction makes it start. Hence the **0.60** default (14.4 GiB → ~3 GiB of KV cache).
-  Nothing is added back for other residents — those two boots show vLLM charges only its
-  own allocations against `total × gmu` — so the figure is simply the share, and the
-  evict-first pass above is what guarantees it is free.
-- **The batched-token cap is the better lever.** That 9.4 GiB peak is profiled for the
-  batch size, and a VLM OCR engine otherwise inherits the *LLM* backend's `ctx` (18432
-  here). Chunked prefill is on, so `ocr.vlm_max_num_batched_tokens` (default 4096) and
-  `ocr.vlm_max_num_seqs` (16) shrink the peak **without** shrinking the context a page may
-  use; `ocr.vlm_max_model_len` (0 = inherit) is there if you want to cut that too. Lower
-  the peak enough and the engine fits in a far smaller share, which is what lets OCR and
-  an LLM sit on one card.
+- **The share is a starting point, and the launcher measures the rest.** An engine's real
+  footprint is not knowable up front. Measured live on a 24 GB 3090, surya-ocr-2 needs
+  **~10.9 GiB before a single KV block** (weights 1.37, CUDA graphs 0.05, and ~9.4 GiB of
+  *vision-encoder profiling* peak); `vlm_gpu_memory_utilization` is a fraction of the
+  card's TOTAL memory, so the 0.35 this once shipped was 8.4 GiB — under the floor, unable
+  to start whatever else was resident. Rather than trusting a constant, when vLLM reports
+  that the budget cannot hold the cache the launcher **escalates the share, re-evicts for
+  the larger figure, retries, and records what booted**, keyed by model + card + context +
+  batch limits (`~/.coderai/vllm_gmu_learned.json`). A different model, a bigger card or
+  different limits rediscover their own value; the recorded one is reused on later starts,
+  and a configured share lower than what is known to work is ignored. Nothing is added
+  back for other residents — vLLM charges only its own allocations against `total × gmu` —
+  so the evict-first pass is what guarantees the room.
+
+- **The batch limits shrink the footprint a little; the encoder is what dominates.**
+  `ocr.vlm_max_num_batched_tokens` (default 4096), `ocr.vlm_max_num_seqs` (16) and
+  `ocr.vlm_max_model_len` (0 = inherit) stop a VLM OCR engine inheriting the *LLM*
+  backend's sizing, and chunked prefill means capping tokens-per-batch costs no usable
+  context. Measured effect on surya-ocr-2, though: the footprint fell only 11.13 → 10.88
+  GiB, **all of it from capturing fewer CUDA graphs** (0.30 → 0.05). The ~9.4 GiB peak did
+  not move, because for this model vLLM sizes its encoder cache at 114,688 tokens and
+  profiles it *with one video item at maximum feature size*. Capping the multimodal limits
+  would collapse that — and would also stop the instance serving video at all, so it is
+  not done by default. Set it yourself via `vllm.extra_args` if that instance only ever
+  sees still pages.
 
 If you see `Free memory on device cuda:0 … is less than desired GPU memory utilization`,
 set **`ocr.vlm_gpu_memory_utilization`** (Settings → OCR → "VLM engines' GPU share"): the

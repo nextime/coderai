@@ -20,7 +20,9 @@ the OCR subsystem to serve Surya2 (a VLM) for :mod:`codai.ocr.surya`.
 """
 
 import collections
+import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -264,13 +266,13 @@ def _start_ray(cfg, py: str, env: dict):
     return cluster, address
 
 
-def ensure_service(cfg, model_path: Optional[str] = None,
-                   served_name: Optional[str] = None,
-                   ready_timeout: float = 3600.0,
-                   gpu_memory_utilization: Optional[float] = None,
-                   max_model_len: Optional[int] = None,
-                   max_num_batched_tokens: Optional[int] = None,
-                   max_num_seqs: Optional[int] = None) -> str:
+def _ensure_service_once(cfg, model_path: Optional[str] = None,
+                         served_name: Optional[str] = None,
+                         ready_timeout: float = 3600.0,
+                         gmu_absolute: float = 0.0,
+                         max_model_len: Optional[int] = None,
+                         max_num_batched_tokens: Optional[int] = None,
+                         max_num_seqs: Optional[int] = None) -> str:
     """Launch (or reuse) a vLLM OpenAI server for a model; return its base URL.
 
     ``model_path``/``served_name`` override the config (used by the OCR subsystem to serve
@@ -316,10 +318,11 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         port = int(getattr(cfg, "port", 0) or 0) or _free_port()
         url_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
         url = f"http://{url_host}:{port}"
-        # Resolve the share HERE and remember it: what this instance actually reserved is
-        # what stopping it frees, and the eviction path has to be told the truth or it
-        # over- or under-evicts for the next model.
-        gmu = resolve_gmu(cfg, gpu_memory_utilization)
+        # The share is resolved by the caller (ensure_service, which may be escalating
+        # after a too-small budget) and remembered here: what this instance actually
+        # reserved is what stopping it frees, and the eviction path has to be told the
+        # truth or it over- or under-evicts for the next model.
+        gmu = float(gmu_absolute or 0.0)
         cmd = _launch_cmd(py, cfg, host, port, model, served_name,
                           model_config=_model_config_for(resolved or model),
                           gpu_memory_utilization=gmu,
@@ -392,6 +395,150 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         time.sleep(2)
     stop_service(svc_key)
     raise RuntimeError(f"vLLM for {svc_key} did not become ready in time" + _tail_msg())
+
+
+# A budget too small for the engine's own footprint. vLLM says this whatever the model,
+# card or context is, which is why the response is to measure rather than to guess.
+_KV_EXHAUSTED = re.compile(
+    r"No available memory for the cache blocks"
+    r"|Available KV cache memory: *-"
+    r"|less than desired GPU memory utilization",
+    re.IGNORECASE)
+
+# How much to add per attempt, and the most to try. Each attempt costs a real boot
+# (minutes for a VLM), so the steps are coarse.
+_GMU_ESCALATION_STEP = 0.12
+_GMU_MAX_ATTEMPTS = 4
+
+
+def _learned_gmu_path():
+    try:
+        from codai.platform_paths import legacy_style_config_dir
+        return legacy_style_config_dir() / "vllm_gmu_learned.json"
+    except Exception:
+        return None
+
+
+def _learned_gmu_key(cfg, model: str, ctx, mnbt) -> str:
+    """What a learned share is valid FOR.
+
+    The footprint depends on the model, how much memory the card has, and the limits it
+    was profiled under — so a value learned for surya-ocr-2 on a 24 GB card at ctx 18432
+    says nothing about olmOCR-2, or about the same model on a 48 GB card. Keying on all
+    of it is what keeps this generic instead of a number that happened to fit once."""
+    try:
+        from codai.models.manager import multi_model_manager
+        total = round(float(multi_model_manager._total_vram_gb() or 0.0), 1)
+    except Exception:
+        total = 0.0
+    return f"{model}|{total}|{int(ctx or 0)}|{int(mnbt or 0)}"
+
+
+def _load_learned_gmu(key: str) -> float:
+    p = _learned_gmu_path()
+    if not p:
+        return 0.0
+    try:
+        with open(p) as f:
+            return float((json.load(f) or {}).get(key) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _save_learned_gmu(key: str, gmu: float) -> None:
+    """Remember the share that actually booted, so the next start does not re-discover it.
+
+    Best-effort: a read-only config dir costs a few minutes of re-discovery, not a
+    failure."""
+    p = _learned_gmu_path()
+    if not p or gmu <= 0:
+        return
+    try:
+        data = {}
+        try:
+            with open(p) as f:
+                data = json.load(f) or {}
+        except Exception:
+            data = {}
+        if abs(float(data.get(key) or 0.0) - gmu) < 0.005:
+            return
+        data[key] = round(float(gmu), 3)
+        tmp = str(p) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp, p)
+        print(f"[vllm] learned gpu-memory-utilization {gmu:.3f} for {key}", flush=True)
+    except Exception as e:
+        print(f"[vllm] could not persist the learned share: {e}", flush=True)
+
+
+def ensure_service(cfg, model_path: Optional[str] = None,
+                   served_name: Optional[str] = None,
+                   ready_timeout: float = 3600.0,
+                   gpu_memory_utilization: Optional[float] = None,
+                   max_model_len: Optional[int] = None,
+                   max_num_batched_tokens: Optional[int] = None,
+                   max_num_seqs: Optional[int] = None) -> str:
+    """Launch (or reuse) a vLLM OpenAI server for a model; return its base URL.
+
+    The configured share is a STARTING POINT, not a verdict. An engine's real footprint
+    is not knowable up front — it depends on the model, the card, the context and the
+    multimodal limits it profiles for (surya-ocr-2 on a 24 GB 3090 needs ~10.9 GiB before
+    a single KV block, almost all of it the vision encoder's profiling peak; another model
+    or card is another number). So when vLLM reports the budget cannot hold the cache,
+    this escalates the share and tries again, asks the evictor for the larger figure
+    first, and REMEMBERS what worked, keyed by model+card+limits. That way any model,
+    on any card, serving any kind of request, converges on a share that fits instead of
+    depending on a constant somebody measured once.
+
+    ``model_path``/``served_name`` override the config (used by the OCR subsystem to serve
+    surya-2 on its own vLLM instance alongside any LLM instance)."""
+    start = resolve_gmu(cfg, gpu_memory_utilization)
+    ctx = int(max_model_len or 0) or int(getattr(cfg, "ctx", 0) or 0)
+    key = _learned_gmu_key(cfg, (served_name or model_path or "vllm"), ctx,
+                           max_num_batched_tokens)
+    learned = _load_learned_gmu(key)
+    if learned > start:
+        print(f"[vllm] starting at the learned share {learned:.3f} rather than "
+              f"{start:.3f} (it is what booted last time for {key})", flush=True)
+        start = learned
+    if start <= 0:
+        # No share configured anywhere: nothing to escalate, let vLLM use its own default.
+        return _ensure_service_once(
+            cfg, model_path, served_name, ready_timeout, 0.0,
+            max_model_len, max_num_batched_tokens, max_num_seqs)
+
+    gmu = min(start, GMU_CEILING)
+    last = None
+    for attempt in range(1, _GMU_MAX_ATTEMPTS + 1):
+        try:
+            url = _ensure_service_once(
+                cfg, model_path, served_name, ready_timeout, gmu,
+                max_model_len, max_num_batched_tokens, max_num_seqs)
+        except RuntimeError as exc:
+            last = exc
+            if not _KV_EXHAUSTED.search(str(exc)) or gmu >= GMU_CEILING - 1e-6:
+                raise
+            nxt = min(gmu + _GMU_ESCALATION_STEP, GMU_CEILING)
+            if nxt <= gmu + 1e-6:
+                raise
+            print(f"[vllm] {served_name or model_path}: a {gmu:.3f} budget cannot hold "
+                  f"the KV cache (attempt {attempt}/{_GMU_MAX_ATTEMPTS}); retrying at "
+                  f"{nxt:.3f} — the engine's footprint is larger than the configured "
+                  f"share, which is what this measures", flush=True)
+            # The bigger budget needs the room to exist before vLLM asks for it.
+            try:
+                from codai.models.manager import multi_model_manager
+                need = prelaunch_free_gb(cfg, nxt)
+                multi_model_manager._evict_models_for_vram(float(need))
+            except Exception as e:
+                print(f"[vllm] evict-before-retry skipped: {e}", flush=True)
+            gmu = nxt
+            continue
+        if attempt > 1 or abs(gmu - learned) > 0.005:
+            _save_learned_gmu(key, gmu)
+        return url
+    raise last if last is not None else RuntimeError("vLLM did not start")
 
 
 def stop_service(svc_key: str) -> None:
