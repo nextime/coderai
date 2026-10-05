@@ -77,6 +77,21 @@ if "${DK[@]}" exec "$NAME" /opt/coderai/lipsync_venv/bin/python -c "import torch
 else
   bad "lipsync venv" "python/torch import failed"
 fi
+echo "== LongCat-Video venv (py3.10 + its own torch 2.6/cu124) =="
+if "${DK[@]}" exec "$NAME" sh -lc "test -d /opt/coderai/longcat_venv"; then
+  # Its torch is NOT the main venv's: assert the version it pins, or a venv that was
+  # re-pointed at the wrong interpreter would pass a bare "import torch" while being
+  # unusable for LongCat.
+  if "${DK[@]}" exec "$NAME" /opt/coderai/longcat_venv/bin/python -c \
+      "import sys,torch,transformers; assert sys.version_info[:2]==(3,10), sys.version; assert torch.__version__.startswith('2.6'), torch.__version__; assert transformers.__version__.startswith('4.41'), transformers.__version__" >/dev/null 2>&1; then
+    ok "longcat venv imports py3.10 + torch 2.6 + transformers 4.41"
+  else
+    bad "longcat venv" "py3.10/torch-2.6/transformers-4.41 check failed"
+  fi
+else
+  echo "   (skipped: no longcat venv in this image)"
+fi
+
 # Repo code is bundled; weights are NOT (download on first lip-sync use).
 if "${DK[@]}" exec "$NAME" sh -lc "test -f /opt/coderai/Wav2Lip/inference.py && test -f /opt/coderai/SadTalker/inference.py"; then
   ok "lip-sync repo code present"

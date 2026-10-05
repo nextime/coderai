@@ -30,6 +30,9 @@ INCLUDE_TOOLS=1
 # halving the torch footprint. Repo code is bundled WITHOUT model weights — those
 # download on first lip-sync use into the /cache volume.
 LIPSYNC_VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
+# LongCat-Video rides the same standalone Python 3.10 as the lip-sync tools, in a venv
+# of its own (its torch 2.6+cu124 differs, so the venvs cannot be shared).
+LONGCAT_VENV="${CODERAI_LONGCAT_VENV:-$HOME/.coderai/longcat_venv}"
 WAV2LIP_DIR="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"
 SADTALKER_DIR="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"
 DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
@@ -383,25 +386,32 @@ prepare_venv_bundle() {
     fi
   fi
 
-  # Isolated lip-sync tools + ds4 engine. The two venvs share one standalone
-  # Python 3.10 (read from a venv's pyvenv.cfg `home`); it's bundled once and the
-  # venvs are re-pointed at it during the image build.
+  # Isolated lip-sync tools, LongCat-Video and the ds4 engine. The py3.10 venvs share
+  # one standalone Python 3.10 (read from whichever venv's pyvenv.cfg `home` is present);
+  # it's bundled once and every venv is re-pointed at it during the image build.
   if [[ "$INCLUDE_TOOLS" == "1" ]]; then
     local py310_dir=""
-    if [[ -f "$LIPSYNC_VENV/pyvenv.cfg" ]]; then
-      local home_bin
-      home_bin="$(sed -n 's/^home *= *//p' "$LIPSYNC_VENV/pyvenv.cfg" | head -1)"
-      [[ -n "$home_bin" ]] && py310_dir="$(dirname "$home_bin")"
-    fi
+    local _v
+    for _v in "$LIPSYNC_VENV" "$LONGCAT_VENV"; do
+      [[ -n "$py310_dir" ]] && break
+      if [[ -f "$_v/pyvenv.cfg" ]]; then
+        local home_bin
+        home_bin="$(sed -n 's/^home *= *//p' "$_v/pyvenv.cfg" | head -1)"
+        [[ -n "$home_bin" ]] && py310_dir="$(dirname "$home_bin")"
+      fi
+    done
     if [[ -n "$py310_dir" && -d "$py310_dir" ]]; then
       mkdir -p "$bundle/py310"
       rsync -a "$py310_dir/" "$bundle/py310/"
       echo "Bundled standalone Python 3.10 from: $py310_dir"
     else
-      echo "Warning: could not locate the py3.10 interpreter for the lip-sync venv" >&2
+      echo "Warning: could not locate a py3.10 interpreter (lip-sync / LongCat venvs)" >&2
     fi
     local _venv_excl=(--exclude '__pycache__' --exclude '*.pyc' --exclude 'pip/' --exclude '*.dist-info/RECORD')
     if [[ -d "$LIPSYNC_VENV" ]]; then rsync -a "${_venv_excl[@]}" "$LIPSYNC_VENV/" "$bundle/lipsync_venv/"; echo "Bundled shared lip-sync venv"; fi
+    # LongCat's venv carries its own torch 2.6+cu124; weights are NOT bundled (they
+    # download at runtime into the /cache volume, like every other model).
+    if [[ -d "$LONGCAT_VENV" ]]; then rsync -a "${_venv_excl[@]}" "$LONGCAT_VENV/" "$bundle/longcat_venv/"; echo "Bundled LongCat-Video venv"; fi
     # Repo CODE ONLY — checkpoints/weights are excluded and download at runtime.
     if [[ -d "$WAV2LIP_DIR" ]]; then rsync -a --exclude 'checkpoints/' --exclude 'face_detection/detection/sfd/*.pth' "$WAV2LIP_DIR/" "$bundle/Wav2Lip/"; echo "Bundled Wav2Lip code (no weights)"; fi
     if [[ -d "$SADTALKER_DIR" ]]; then rsync -a --exclude 'checkpoints/*' --exclude 'gfpgan/weights/*' "$SADTALKER_DIR/" "$bundle/SadTalker/"; echo "Bundled SadTalker code (no weights)"; fi

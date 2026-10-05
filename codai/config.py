@@ -744,6 +744,52 @@ class RunpodConfig:
 
 
 @dataclass
+class LongcatConfig:
+    """LongCat-Video (Meituan, 13.6B dense, MIT) — driven as a managed subprocess.
+
+    LongCat does text-to-video, image-to-video, video-continuation, long-video,
+    interactive and audio-driven avatar generation, in three coarse-to-fine stages
+    (base 480p → distilled LoRA → 720p refinement LoRA). There is no diffusers pipeline
+    for it (diffusers merged LongCat-*Image*, not the video model), so coderai drives the
+    upstream repo's own ``LongCatVideoPipeline`` out of an ISOLATED venv.
+
+    That venv is the strictest in the tree: Python 3.10, torch 2.6+cu124,
+    transformers 4.41 and numpy 1.26 — four simultaneous conflicts with the main venv
+    (3.13 / 2.11+cu130 / 5.x / 2.4). See requirements-longcat.txt.
+
+    coderai CANNOT build this venv by itself: every venv bootstrap in ``codai/`` uses
+    ``sys.executable -m venv``, which is 3.13. The image bundles a standalone 3.10
+    (shared with the lip-sync tools, at /opt/coderai/py310) and the built venv; on a
+    source install, point ``python`` at a 3.10 interpreter or build the venv by hand.
+
+    Like the other engines this serves MODELS FROM THE MODEL LIST: tag an entry
+    ``backend: "longcat"``. Per-model settings (variant, quantisation, segments,
+    context-parallel size) live on the entry; what is here is how to reach the runtime.
+    """
+    enabled: bool = False
+    # Point this at a LongCat service already running elsewhere (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building,
+    # downloading or launching anything locally. Blank = manage it here.
+    service_url: str = ""
+    venv: str = ""              # isolated venv dir; blank = auto (baked/cache/home)
+    python: str = ""            # a Python 3.10 interpreter for building the venv;
+                                # blank = the bundled /opt/coderai/py310, else PATH
+    auto_build: bool = False    # build the venv on first use (needs `python` above).
+                                # OFF by default: it pulls torch 2.6 + its CUDA runtime,
+                                # which is minutes and gigabytes on a first request.
+    host: str = "127.0.0.1"
+    port: int = 0               # 0 = pick a free port per service
+    gpu: str = ""               # CUDA device(s) (CUDA_VISIBLE_DEVICES); blank = all
+    # FlashAttention-2 is upstream's default but is a source build needing ninja and a
+    # CUDA toolchain; xformers ships a wheel and is what requirements-longcat.txt
+    # installs. "flash" assumes you installed flash-attn into the venv yourself.
+    attention: str = "xformers"         # xformers | flash | sdpa
+    ready_timeout: float = 1800.0       # a 13.6B DiT load is not quick
+    extra_args: str = ""                # appended to the service command line
+    extra_env: str = ""                 # KEY=VALUE pairs for the service process
+
+
+@dataclass
 class OcrConfig:
     """Dedicated OCR subsystem configuration.
 
@@ -911,6 +957,7 @@ class Config:
     k3: K3Config = field(default_factory=K3Config)
     ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
+    longcat: LongcatConfig = field(default_factory=LongcatConfig)
     runpod: RunpodConfig = field(default_factory=RunpodConfig)
     ocr: OcrConfig = field(default_factory=OcrConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
@@ -1104,6 +1151,7 @@ class ConfigManager:
                 k3=_dc(K3Config, config_data.get("k3", {})),
                 ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
                 vllm=_dc(VllmConfig, config_data.get("vllm", {})),
+                longcat=_dc(LongcatConfig, config_data.get("longcat", {})),
                 runpod=_dc(RunpodConfig, config_data.get("runpod", {})),
                 ocr=_dc(OcrConfig, config_data.get("ocr", {})),
                 compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
@@ -1369,6 +1417,20 @@ class ConfigManager:
                 "dist_init_addr": self.config.ktransformers.dist_init_addr,
                 "tp_size": self.config.ktransformers.tp_size,
                 "nodes": list(self.config.ktransformers.nodes or []),
+            },
+            "longcat": {
+                "enabled": self.config.longcat.enabled,
+                "service_url": self.config.longcat.service_url,
+                "venv": self.config.longcat.venv,
+                "python": self.config.longcat.python,
+                "auto_build": self.config.longcat.auto_build,
+                "host": self.config.longcat.host,
+                "port": self.config.longcat.port,
+                "gpu": self.config.longcat.gpu,
+                "attention": self.config.longcat.attention,
+                "ready_timeout": self.config.longcat.ready_timeout,
+                "extra_args": self.config.longcat.extra_args,
+                "extra_env": self.config.longcat.extra_env,
             },
             "vllm": {
                 "enabled": self.config.vllm.enabled,

@@ -3778,6 +3778,20 @@ def build_settings_dict(c, gpu_cards):
             "tp_size": c.ktransformers.tp_size,
             "nodes": list(c.ktransformers.nodes or []),
         },
+        "longcat": {
+            "enabled": c.longcat.enabled,
+            "service_url": c.longcat.service_url,
+            "venv": c.longcat.venv,
+            "python": c.longcat.python,
+            "auto_build": c.longcat.auto_build,
+            "host": c.longcat.host,
+            "port": c.longcat.port,
+            "gpu": c.longcat.gpu,
+            "attention": c.longcat.attention,
+            "ready_timeout": c.longcat.ready_timeout,
+            "extra_args": c.longcat.extra_args,
+            "extra_env": c.longcat.extra_env,
+        },
         "vllm": {
             "enabled": c.vllm.enabled,
             "service_url": c.vllm.service_url,
@@ -4398,6 +4412,28 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             from codai.cluster.multinode import parse_nodes
             c.ktransformers.nodes = parse_nodes(d.get("nodes"))
 
+    if "longcat" in data:
+        d = data["longcat"]
+        lc = c.longcat
+        lc.enabled = bool(d.get("enabled", lc.enabled))
+        for _k in ("service_url", "venv", "python", "gpu", "attention",
+                   "extra_args", "extra_env"):
+            if _k in d:
+                setattr(lc, _k, (d.get(_k) or "").strip())
+        if "host" in d: lc.host = (d.get("host") or "127.0.0.1").strip()
+        if "auto_build" in d: lc.auto_build = bool(d.get("auto_build"))
+        if "port" in d:
+            try:
+                lc.port = max(0, int(d.get("port") or 0))
+            except (TypeError, ValueError):
+                pass
+        if "ready_timeout" in d:
+            try:
+                lc.ready_timeout = max(0.0, float(d.get("ready_timeout") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        if lc.attention not in ("xformers", "flash", "sdpa"):
+            lc.attention = "xformers"
     if "vllm" in data:
         d = data["vllm"]
         if "service_url" in d:

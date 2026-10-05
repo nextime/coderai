@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# CoderAI — LongCat-Video (Meituan, 13.6B dense, MIT), ISOLATED venv on Python 3.10.
+#
+# This is the strictest isolation in the tree. LongCat pins FOUR things against the main
+# coderai venv at once, so nothing here can be relaxed into it:
+#
+#                 main venv          LongCat
+#   Python        3.13.x             3.10        (its pins do not resolve on 3.13)
+#   torch         2.11.x+cu130       2.6.0+cu124
+#   transformers  5.x                4.41.0      (a MAJOR version back)
+#   numpy         2.4.x              1.26.4
+#   opencv        opencv-contrib     opencv-python
+#
+# Installing it into the main venv would walk transformers and numpy backwards and break
+# the stack — the failure already recorded for parler-tts. coderai therefore runs it as a
+# managed subprocess (tools/longcat_service.py) out of this venv, the same shape as the
+# OCR Paddle/Surya engines, ktransformers/SGLang and vLLM.
+#
+# The interpreter is the standalone Python 3.10 already bundled for the lip-sync tools
+# (packaging/linux/build_oci_image.sh reads it out of the venv's pyvenv.cfg and ships it
+# as py310/). It CANNOT be built by coderai itself: every venv bootstrap in codai/ uses
+# `sys.executable -m venv`, which is 3.13. So:
+#
+#   /opt/coderai/py310/bin/python3.10 -m venv <dir>
+#   <dir>/bin/python -m pip install -r requirements-longcat.txt
+#   (or set longcat.auto_build = true to have coderai build it on first use, which still
+#    needs a 3.10 interpreter on PATH or at longcat.python)
+#
+# Always `python -m pip`, never the venv's pip script: a copied or re-pointed venv
+# carries a stale shebang and would install into the ORIGINAL interpreter.
+#
+# ATTENTION: this file is the single source of truth for the venv. Adding a dependency
+# here is not enough on its own — the image bundles the BUILT venv, so rebuild it locally
+# and re-run packaging/linux/build_oci_image.sh.
+# ---------------------------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+
+# Upstream's pins. transformers and numpy are the two that cannot move.
+transformers==4.41.0
+numpy==1.26.4
+diffusers==0.35.1
+einops==0.8.0
+ftfy==6.2.0
+loguru==0.7.2
+psutil==6.0.0
+av==12.0.0
+opencv-python==4.9.0.80
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+pyarrow==20.0.0
+
+# Attention backend. Upstream defaults to FlashAttention-2 but documents FA3 and xformers
+# as alternatives, and flash-attn==2.7.4.post1 is a SOURCE build needing ninja and a CUDA
+# toolchain — minutes of compile, and it fails outright on a host without nvcc wired up.
+# xformers ships a wheel for this torch, so it is the default here; set
+# longcat.attention = "flash" and install flash-attn by hand when the toolchain is there.
+xformers==0.0.29.post2
+
+# NOT installed: streamlit (upstream's demo UI — coderai serves the API itself).
