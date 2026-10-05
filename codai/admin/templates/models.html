@@ -3505,7 +3505,20 @@ async function freeDiskConfirm(idx){
       body: JSON.stringify({path:m.path, cache_type:m.cacheType, source_repo:repo})
     });
     const d = await r.json();
-    if(d.success) refreshLocal();
+    if(d.success){
+      // Say how much came back. Freeing 4 KB and freeing 400 GB used to look
+      // identical here, which is how an engine-owned 400 GB store survived three
+      // "successful" deletes.
+      const n = d.external_paths ? d.external_paths.length : 0;
+      const where = n ? ' (incl. ' + n + ' engine store' + (n > 1 ? 's' : '') + ')' : '';
+      if(!d.freed_bytes){
+        showAlert('Nothing was on disk for this model \u2014 freed 0 B. Its files may '
+                + 'live somewhere coderai has not been told about.');
+      } else {
+        showAlert('Freed ' + (d.freed_human || '0 B') + where + '.');
+      }
+      refreshLocal();
+    }
     else showAlert('Error: '+(d.detail||d.error||'Unknown'));
   }catch(e){showAlert('Error: '+e.message)}
 }

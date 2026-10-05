@@ -1663,9 +1663,36 @@ def _do_clear_cache(cache_type: str) -> dict:
 
 
 def _do_delete_model(model_id: str, cache_type: str) -> dict:
+    """Delete a model's files and report how many BYTES that freed.
+
+    The size matters as much as the success flag. colibri showed why: its weights
+    lived in an engine-owned directory while the HF cache held a 4 KB shell of the
+    same repo, so this deleted the shell, returned {"success": True}, and left
+    400 GB on disk — a true answer to a question nobody was asking. Every branch
+    now measures what it removed, and engine-owned stores are swept too.
+    """
     import os, shutil
     from codai.models.cache import get_all_cache_dirs, get_model_cache_dir
+    from codai.models import weight_stores
     caches = get_all_cache_dirs()
+
+    _cfg = getattr(config_manager, "config", None) if config_manager is not None else None
+
+    def _finish(result: dict, counted: int = 0) -> dict:
+        """Add the engine-owned stores to whatever the cache branch freed."""
+        extra, paths = weight_stores.purge_external_weights(model_id, _cfg)
+        total = int(counted) + int(extra)
+        result = dict(result)
+        result["freed_bytes"] = total
+        result["freed_human"] = weight_stores.human_bytes(total)
+        if paths:
+            result["external_paths"] = paths
+        # Anything removed at all is a success, even if the cache branch found
+        # nothing: the files are gone, which is what Free disk is for.
+        if paths and not result.get("success"):
+            result["success"] = True
+            result.pop("detail", None)
+        return result
 
     if cache_type == "hf":
         hf_dir = caches.get("huggingface")
@@ -1684,8 +1711,9 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
                 repo = next((r for r in info.repos if r.repo_id == model_id), None)
                 if repo:
                     hashes = [r.commit_hash for r in repo.revisions]
+                    freed = int(getattr(repo, "size_on_disk", 0) or 0)
                     info.delete_revisions(*hashes).execute()
-                    return {"success": True}
+                    return _finish({"success": True}, freed)
             except Exception:
                 pass
             finally:
@@ -1693,12 +1721,14 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
             # Fallback: remove the repo dir directly if it's still there.
             safe = model_id.replace("/", "--")
             d = os.path.join(hf_dir, f"models--{safe}")
+            freed = 0
             if os.path.exists(d):
+                freed = weight_stores.dir_size(d)
                 shutil.rmtree(d, ignore_errors=True)
             # Whether or not anything was on disk, the files are gone now — Free
             # disk is idempotent, so report success instead of a scary error.
-            return {"success": True}
-        return {"success": False, "detail": "HF cache directory not configured"}
+            return _finish({"success": True}, freed)
+        return _finish({"success": False, "detail": "HF cache directory not configured"})
 
     if cache_type == "gguf":
         gguf_dir = get_model_cache_dir()
@@ -1708,11 +1738,14 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
         else:
             fp = os.path.join(gguf_dir, model_id)
         if os.path.isfile(fp):
+            freed = os.path.getsize(fp)
             os.remove(fp)
-            return {"success": True}
-        return {"success": False, "detail": "File not found"}
+            return _finish({"success": True}, freed)
+        # A GGUF entry can still have engine-owned weights elsewhere (a repo that
+        # was fetched as a directory), so the sweep runs before we call it missing.
+        return _finish({"success": False, "detail": "File not found"})
 
-    return {"success": False, "detail": "Unknown cache_type"}
+    return _finish({"success": False, "detail": "Unknown cache_type"})
 
 
 # Cache scans walk the whole HF/GGUF cache on disk (huggingface_hub.scan_cache_dir
