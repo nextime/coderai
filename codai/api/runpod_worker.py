@@ -208,6 +208,9 @@ PUBLISHED_CAPABILITY_IMAGES = (
     "stt-nemo",      # NeMo Canary: large, and its own torch
     "stt-crisper",   # CrisperWhisper: transformers 4.46 AND torch 2.5
     "ocr-paddle",    # paddlepaddle-gpu: brings its own CUDA runtime
+    "video-longcat", # LongCat-Video: Python 3.10 + torch 2.6+cu124 + transformers 4.41,
+                     #   so TWO interpreters in one image (see its own Dockerfile). The
+                     #   plain 'video' image cannot serve it at all.
     # Text: a coderai pod that serves LLMs. Unlike a vLLM/llama.cpp pod it can be
     # SENT a local LoRA adapter, which is the only way a local text adapter runs
     # on RunPod. Build and push it with packaging/runpod before using it.
@@ -298,6 +301,14 @@ def model_capability(entry: dict, include_text: bool = False) -> str:
     explicit = str(entry.get("capability") or "").strip().lower()
     if explicit:
         return explicit
+    # A LongCat-Video model is a video model, but the 'video' image cannot serve it: its
+    # pipeline is not in diffusers and it needs its own Python 3.10 venv. Without this
+    # it would be placed on an image that boots, passes its health check, accepts the
+    # request and then has nothing to run it with — the same trap the OCR profile
+    # documents for Surya.
+    if str(entry.get("backend") or "").strip().lower() in (
+            "longcat", "longcat-video", "longcat_video"):
+        return "video-longcat"
     types = entry.get("model_types") or [entry.get("model_type") or ""]
     for mt in types:
         if mt in _LLM_MODEL_TYPES and not include_text:

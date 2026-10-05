@@ -271,6 +271,21 @@ def ensure_built(config: dict = None) -> Path:
 
 # ── service lifecycle ─────────────────────────────────────────────────────────
 
+def _visible_gpu_count(env: dict = None) -> int:
+    """How many CUDA devices this service will see, or 0 when it cannot be told.
+
+    Asking for more context-parallel ranks than there are GPUs fails inside NCCL with a
+    message about nothing in particular, so it is worth catching here."""
+    sel = str((env or os.environ).get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if sel:
+        return len([x for x in sel.split(",") if x.strip() != ""])
+    try:
+        from codai.models.gpu_query import visible_gpu_memory
+        return len(visible_gpu_memory() or [])
+    except Exception:
+        return 0
+
+
 def _free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
@@ -364,11 +379,32 @@ def ensure_service(model_path: str, config: dict = None,
             # The upstream pipeline exposes only the diffusers CPU-offload hooks; the
             # manager's other strategies have no equivalent here.
             offload = "model"
-        cmd = [str(py), str(_SERVICE_SCRIPT),
+        # Context parallelism: upstream splits the DiT's spatial dims across GPUs under
+        # torchrun, so cp_size > 1 means N processes, not N threads. Only rank 0 binds
+        # the port; the others take their jobs over a broadcast (see the service).
+        cp = 0
+        try:
+            cp = int(config.get("cp_size") or 0)
+        except (TypeError, ValueError):
+            cp = 0
+        if cp > 1:
+            visible = _visible_gpu_count(env)
+            if visible and cp > visible:
+                raise RuntimeError(
+                    f"cp_size is {cp} but only {visible} GPU(s) are visible to this "
+                    f"service — lower it, or widen longcat.gpu / gpu_device")
+            launcher = [str(py), "-m", "torch.distributed.run",
+                        f"--nproc_per_node={cp}", "--nnodes=1",
+                        "--rdzv-backend=c10d", "--rdzv-endpoint=127.0.0.1:0"]
+        else:
+            launcher = [str(py)]
+        cmd = launcher + [str(_SERVICE_SCRIPT),
                "--model", model_path,
                "--source", str(source),
                "--host", "127.0.0.1", "--port", str(port),
                "--dtype", str(config.get("dtype") or "bfloat16")]
+        if cp > 1:
+            cmd += ["--context-parallel-size", str(cp)]
         if offload:
             cmd += ["--offload", offload]
         if sec is not None and str(getattr(sec, "attention", "") or "").strip():

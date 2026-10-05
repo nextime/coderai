@@ -670,7 +670,12 @@ def make_handler():
         def do_POST(self):
             try:
                 if self.path.startswith("/generate"):
-                    self._json(generate(self._read_json()))
+                    job = self._read_json()
+                    if int(_state.get("cp_size") or 1) > 1:
+                        # Every rank must enter the same pipeline call, or the
+                        # collectives deadlock.
+                        cp_broadcast(job)
+                    self._json(generate(job))
                 elif self.path.startswith("/yield"):
                     # Stop at the next segment boundary. The in-flight request still
                     # returns — shorter, with a warning — so a swap costs one segment
@@ -693,6 +698,70 @@ def make_handler():
     return Handler
 
 
+# ── context parallelism ───────────────────────────────────────────────────────
+#
+# Upstream scales by splitting the DiT's spatial dimensions across GPUs: NCCL is
+# initialised BEFORE the model loads, `init_context_parallel(cp_size)` is called, the DiT
+# gets `cp_split_hw`, and every rank runs `pipe.to(local_rank)`. Only rank 0 writes the
+# output.
+#
+# That is awkward behind an HTTP service, and the awkwardness is the point: all ranks must
+# enter the same pipeline call together or the collectives deadlock. So rank 0 owns the
+# socket and BROADCASTS each job to the others, which sit in a loop waiting for one. A
+# rank-0-only server that just called generate() would hang on the first collective.
+
+_CP_SHUTDOWN = {"__shutdown__": True}
+
+
+def cp_init(cp_size: int):
+    """Initialise NCCL + context parallelism. Returns (rank, local_rank)."""
+    import torch
+    import torch.distributed as dist
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if cp_size <= 1:
+        return rank, local_rank
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    # Must happen before the DiT is built, which is why load_pipeline is not called
+    # until after this returns.
+    from longcat_video.context_parallel.context_parallel_util import (
+        init_context_parallel)
+    init_context_parallel(cp_size)
+    log(f"context parallel: rank {rank}/{dist.get_world_size()} "
+        f"(local_rank {local_rank}, cp_size {cp_size})")
+    return rank, local_rank
+
+
+def cp_broadcast(job):
+    """Send a job from rank 0 to every other rank, or receive one. Returns the job."""
+    import torch.distributed as dist
+    box = [job]
+    dist.broadcast_object_list(box, src=0)
+    return box[0]
+
+
+def cp_worker_loop():
+    """Ranks other than 0: wait for a job, run it, discard the result, repeat.
+
+    The result is discarded deliberately — rank 0's copy is the one that gets muxed and
+    returned. What matters here is entering the same collective."""
+    while True:
+        job = cp_broadcast(None)
+        if not job or job.get("__shutdown__"):
+            log("context-parallel worker shutting down")
+            return
+        try:
+            generate(job)
+        except Exception as exc:
+            # A failure on rank 0 raises there too; log and keep the loop alive so one
+            # bad request does not strand the group.
+            log(f"context-parallel worker error: {type(exc).__name__}: {exc}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="LongCat-Video generation service")
     ap.add_argument("--model", required=True, help="checkpoint directory")
@@ -702,24 +771,51 @@ def main(argv=None):
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--offload", default="", help="'' | model | sequential")
     ap.add_argument("--attention", default="xformers", help="xformers | flash | sdpa")
+    ap.add_argument("--context-parallel-size", type=int, default=1,
+                    help="GPUs to split the DiT across (launch under torchrun)")
     ap.add_argument("--preload", action="store_true",
                     help="load the checkpoint at startup instead of on first request")
     args = ap.parse_args(argv)
 
+    cp_size = max(1, int(args.context_parallel_size))
     _state.update(model=os.path.expanduser(args.model),
                   source=os.path.expanduser(args.source),
-                  dtype=args.dtype)
+                  dtype=args.dtype, cp_size=cp_size)
     # Upstream reads the attention backend from the model config; the env var is what its
     # modules honour, and leaving it unset means FlashAttention-2, which is not installed
     # by default (requirements-longcat.txt installs xformers instead).
     os.environ.setdefault("LONGCAT_ATTENTION", args.attention)
 
+    rank, _local = (0, 0)
+    if cp_size > 1:
+        # The repo checkout has to be importable before init_context_parallel.
+        src = _state["source"]
+        if src and src not in sys.path:
+            sys.path.insert(0, src)
+        rank, _local = cp_init(cp_size)
+        # Splitting height and width across the group is what cp_size buys; the DiT
+        # takes it at construction.
+        _state["cp_split_hw"] = cp_size
+
     if args.preload:
         load_pipeline(_state["model"], _state["source"], args.dtype, args.offload)
 
+    if rank != 0:
+        # No socket on these ranks: one job, one broadcast, every rank in the same call.
+        cp_worker_loop()
+        return
+
     server = ThreadingHTTPServer((args.host, args.port), make_handler())
-    log(f"serving on http://{args.host}:{args.port} (model={_state['model']})")
-    server.serve_forever()
+    log(f"serving on http://{args.host}:{args.port} (model={_state['model']}"
+        + (f", cp_size={cp_size}" if cp_size > 1 else "") + ")")
+    try:
+        server.serve_forever()
+    finally:
+        if cp_size > 1:
+            try:
+                cp_broadcast(dict(_CP_SHUTDOWN))
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

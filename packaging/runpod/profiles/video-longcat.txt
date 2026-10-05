@@ -1,0 +1,14 @@
+# LongCat-Video as a coderai pod.
+#
+# Nothing goes in the MAIN venv: LongCat runs in its own Python 3.10 venv with
+# torch 2.6+cu124, which the custom Dockerfile builds (see video-longcat.dockerfile).
+# The main venv only drives the subprocess and serves the API, so this profile is the
+# LIGHT core plus what coderai itself needs for /v1/video — nothing that pulls torch.
+#
+# The generic Dockerfile.capability cannot express this image: it is python:3.12 on the
+# cu128 torch index, and LongCat needs 3.10 on cu124. Hence the .dockerfile marker, the
+# same escape hatch the engines profile uses.
+#
+# Weights are NOT baked (the base repo is ~83 GB across variants); they download at
+# runtime into the pod's volume, like every other model.
+imageio[ffmpeg]>=2.33.0

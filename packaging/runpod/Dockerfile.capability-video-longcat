@@ -1,0 +1,65 @@
+# CoderAI LongCat-Video pod.
+#
+# LongCat pins Python 3.10 + torch 2.6.0+cu124 + transformers 4.41 + numpy 1.26 - four
+# conflicts with coderai's own 3.13 / 2.11 / 5.x / 2.4 - so it runs in an isolated venv
+# behind a managed subprocess. On a pod that means TWO interpreters in one image: the
+# light core (python:3.12, no torch) runs coderai, and a 3.10 venv runs the model.
+#
+# The generic Dockerfile.capability cannot express that - it is one interpreter on the
+# cu128 torch index - which is why this profile carries its own Dockerfile, the same
+# escape hatch the engines profile uses.
+#
+# `longcat_video` is a package INSIDE the upstream repo, not on PyPI, so the source is
+# cloned here. Weights are NOT baked: ~83 GB across variants, downloaded at runtime into
+# the pod's volume, like every other model.
+
+ARG CORE_BASE=coderai-capability-base-light:latest
+FROM ${CORE_BASE}
+
+ARG PROFILE=video-longcat
+ARG IMAGE_TAG=coderai-video-longcat:latest
+ARG LONGCAT_REF=main
+
+# Python 3.10 for the model's venv: the light core carries only its own 3.12.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      software-properties-common ca-certificates gnupg \
+ && add-apt-repository -y ppa:deadsnakes/ppa \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-venv python3.10-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# The venv, from the same requirements file a local install uses - one source of truth.
+COPY requirements-longcat.txt /tmp/requirements-longcat.txt
+RUN python3.10 -m venv /opt/coderai/longcat_venv \
+ && /opt/coderai/longcat_venv/bin/python -m pip install -U pip \
+ && /opt/coderai/longcat_venv/bin/python -m pip install -r /tmp/requirements-longcat.txt \
+ && /opt/coderai/longcat_venv/bin/python -c "import sys,torch,transformers; \
+      assert sys.version_info[:2]==(3,10), sys.version; \
+      assert torch.__version__.startswith('2.6'), torch.__version__; \
+      assert transformers.__version__.startswith('4.41'), transformers.__version__" \
+ && rm -rf /root/.cache/pip /tmp/requirements-longcat.txt
+
+# The pipeline code. Shallow, no history, no weights, no demo assets.
+RUN git clone --depth 1 --branch "${LONGCAT_REF}" \
+      https://github.com/meituan-longcat/LongCat-Video /opt/coderai/LongCat-Video \
+ && rm -rf /opt/coderai/LongCat-Video/.git /opt/coderai/LongCat-Video/assets \
+ && /opt/coderai/longcat_venv/bin/python -c \
+      "import sys; sys.path.insert(0,'/opt/coderai/LongCat-Video'); \
+       import longcat_video.pipeline_longcat_video"
+
+COPY . /opt/coderai/app
+WORKDIR /opt/coderai/app
+RUN python -c "import codai.api.app" \
+ && python -c "import importlib.util as u; \
+      s=u.spec_from_file_location('c','tools/longcat_common.py'); \
+      m=u.module_from_spec(s); s.loader.exec_module(m); \
+      assert m.source_problems('/opt/coderai/LongCat-Video') == []"
+
+ENV CODERAI_IMAGE_TAG=${IMAGE_TAG} \
+    CODERAI_LONGCAT_VENV=/opt/coderai/longcat_venv \
+    CODERAI_LONGCAT_SRC=/opt/coderai/LongCat-Video
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
+  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=4)"
+CMD ["/opt/coderai/boot.sh"]

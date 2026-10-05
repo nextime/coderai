@@ -126,13 +126,38 @@ returns — shorter, with a warning naming why — rather than failing. Bounded 
 Set `max_instances` on the entry to have video requests queue at the front as text does;
 without it, video passes through unqueued as it always has.
 
+## Multi-GPU
+
+`cp_size` on the model entry splits the DiT's spatial dimensions across that many GPUs.
+It is **N processes under torchrun**, not N threads: NCCL is initialised and
+`init_context_parallel()` called *before* the model loads (it is what makes the DiT split
+at all), and every rank must enter the same pipeline call or the collectives deadlock. So
+rank 0 owns the HTTP socket and broadcasts each job to the others, which wait in a loop
+for one. Asking for more ranks than there are visible GPUs is refused up front, because
+NCCL's own failure for that names nothing useful.
+
+`cp_size: 1` — the default — initialises no distributed group at all.
+
 ## Remote and scaled
 
 `longcat.service_url` (or `CODERAI_LONGCAT_SERVICE_URL`) points at a service running
 elsewhere — another host, a container, a rented pod — and coderai proxies to it without
 building or downloading anything. `distribute` fans independent generations across
-engines and nodes. A `video-longcat` RunPod capability image needs a custom Dockerfile
-(the generic one is python:3.12 + cu128, wrong on both axes) and is not built yet.
+engines and nodes.
+
+For rented GPUs there is a **`video-longcat`** capability image. The generic capability
+builder is python:3.12 on the cu128 torch index, so it cannot express this image at all —
+LongCat needs 3.10 on cu124, meaning two interpreters in one image: the light core runs
+coderai, a 3.10 venv runs the model. It therefore carries its own Dockerfile (the same
+escape hatch the `engines` profile uses), builds the venv from
+`requirements-longcat.txt` and asserts 3.10 / torch 2.6 / transformers 4.41 at build
+time, clones the pipeline source and checks it imports, and bakes **no weights**.
+
+A model with `backend: longcat` is routed to that image automatically — placing it on the
+plain `video` image would give a pod that boots, passes its health check, accepts the
+request and has nothing to generate with. Build it with
+`packaging/runpod/build_capability_image.sh video-longcat`, which runs the container and
+polls `/healthz` for 120 s before declaring success.
 
 ## Variants and the avatar families
 
@@ -179,7 +204,5 @@ set on the model entry.
 ## Not done yet
 
 - GGUF variants (they need the ComfyUI gguf loader)
-- context-parallel multi-GPU (`cp_size` is accepted but not yet acted on)
-- the `video-longcat` pod image
 - LoRA/QLoRA training on top of it (feasible — upstream's own refinement expert is a LoRA)
 - **no generation has been verified against real weights**, avatar included
