@@ -875,7 +875,8 @@ class CoderAIClient:
                    steps: int = 800, rank: int = 16,
                    resolution: int = 512, train_base_model: str = None,
                    target: str = "image", quantize_4bit: bool = True,
-                   wait: bool = True, session: str = None) -> dict:
+                   wait: bool = True, session: str = None,
+                   dataset_config: str = None) -> dict:
         """Train a per-character or per-environment LoRA on the server.
         Blocks until complete.
 
@@ -889,6 +890,11 @@ class CoderAIClient:
             body["session"] = session
         if target == "video":
             body["quantize_4bit"] = bool(quantize_4bit)
+        # A SimpleTuner data-backend config, for the architectures whose training the
+        # server hands to an external trainer (LongCat). Ignored by the in-process
+        # Wan path, so it is always safe to send.
+        if dataset_config:
+            body["dataset_config"] = str(dataset_config)
         if train_base_model:
             body["train_base_model"] = train_base_model
         if character:
@@ -2288,6 +2294,7 @@ CONFIG_FIELDS = [
     "lora_train_base_model",
     "no_env_loras", "env_lora_steps", "env_lora_rank", "env_lora_weight",
     "video_loras", "video_lora_scale", "video_size",
+    "dataset_frames", "dataset_min_clips",
     "clip_min_frames", "clip_max_frames", "single_clip_max_frames",
     "outcome_min_frames", "outcome_max_frames",
     "short_min", "short_max", "long_min", "long_max",
@@ -3865,10 +3872,184 @@ def stage_env_loras(client: CoderAIClient, image_model: str, out_dir: Path,
                                 "environment", lora_steps, lora_rank, train_base_model)
 
 
+# ── SimpleTuner video datasets, built from the clips this tool already rendered ──
+#
+# LongCat LoRA training goes through SimpleTuner, which wants a CAPTIONED VIDEO
+# dataset and refuses a folder of stills — correctly, since a still-image dataset
+# trains something other than a video LoRA. coderai will not invent one from a
+# character's reference images.
+#
+# This tool, though, has already produced exactly the corpus SimpleTuner asks for:
+# every clip it renders was rendered FROM a prompt, and that prompt is kept beside
+# it in videos/prompts.json. So the dataset is assembled from the render rather
+# than demanded from the operator.
+
+VIDEO_DATASET_DIR = "video_datasets"
+# SimpleTuner drops any clip shorter than video.min_frames, so the dataset is built
+# around one whole LongCat segment: 93 frames, and 4n+1 as the VAE requires.
+DATASET_FRAMES = 93
+# Enough clips that the adapter learns the subject rather than one camera move.
+# Upstream's quickstart suggests 50-100; this is a floor, not a target, because a
+# township render reaches it gradually and refusing at 49 would be useless.
+DATASET_MIN_CLIPS = 8
+
+
+def _is_longcat_model(model_id) -> bool:
+    return "longcat" in (model_id or "").lower()
+
+
+def _dataset_clip_sources(out_dir: Path) -> list:
+    """Every rendered clip paired with the prompt it was rendered from.
+
+    Read from the plan this tool writes, not guessed from filenames, so a caption is
+    always the text that actually produced those pixels. Post-processed derivatives
+    (``_2x``/``_2xfps``) are never picked up: they are upscaled and frame-interpolated
+    output, not what the model generated, and training on them would teach the
+    adapter the upscaler's artefacts."""
+    videos = Path(out_dir) / "videos"
+    plan_path = videos / "prompts.json"
+    if not plan_path.is_file():
+        return []
+    try:
+        plan = json.loads(plan_path.read_text())
+    except Exception:
+        return []
+    items = []
+    for match in plan.get("fight_plan") or []:
+        mname = match.get("match_name") or ""
+        for clip in match.get("clips") or []:
+            path = videos / f"{mname}_clip{int(clip.get('idx', 0)):02d}.mp4"
+            if path.is_file():
+                items.append({
+                    "path": path,
+                    "prompt": (clip.get("prompt") or "").strip(),
+                    "frames": int(clip.get("nf") or 0),
+                    "fighters": [f for f in (clip.get("fighters") or []) if f],
+                    "env": match.get("env") or "",
+                })
+    for oc in plan.get("outcome_plan") or []:
+        mname = oc.get("match_name") or ""
+        path = videos / f"{mname}_{oc.get('fighter')}_{oc.get('outcome')}.mp4"
+        if path.is_file():
+            # Both fighters are on screen in an outcome, so it is training data for
+            # either of them.
+            who = [w for w in (oc.get("fighter"), oc.get("opponent")) if w]
+            items.append({
+                "path": path,
+                "prompt": (oc.get("prompt") or "").strip(),
+                "frames": int(oc.get("nf") or 0),
+                "fighters": who,
+                "env": oc.get("env") or "",
+            })
+    return [i for i in items if i["prompt"]]
+
+
+def _dataset_select(items: list, kind: str, name: str) -> list:
+    if kind == "environment":
+        return [i for i in items if i["env"] == name]
+    return [i for i in items if name in i["fighters"]]
+
+
+def build_video_dataset(out_dir, kind: str, name: str, slug: str,
+                        num_frames: int = DATASET_FRAMES, resolution: int = 480,
+                        min_clips: int = DATASET_MIN_CLIPS):
+    """Write a SimpleTuner data-backend config for one profile; return its path.
+
+    Clips are SYMLINKED, not copied: a fighter appears in dozens of them and one
+    dataset per fighter would otherwise duplicate the entire render. Each symlink
+    gets a .txt caption beside it, which is what caption_strategy "textfile" reads.
+
+    Returns ``(None, reason)`` when there is nothing to train on yet, so the caller
+    can say which — no plan, no rendered clips, or clips too short for one segment.
+    """
+    sources = _dataset_clip_sources(out_dir)
+    if not sources:
+        return None, "no rendered clips yet (run the Videos step first)"
+    picked = _dataset_select(sources, kind, name)
+    if not picked:
+        return None, f"no rendered clips feature {name}"
+    long_enough = [i for i in picked if i["frames"] >= int(num_frames)]
+    if not long_enough:
+        longest = max(i["frames"] for i in picked)
+        return None, (f"all {len(picked)} clips are shorter than {num_frames} frames "
+                      f"(longest {longest}) — SimpleTuner would drop every one")
+    if len(long_enough) < max(1, int(min_clips)):
+        return None, (f"only {len(long_enough)} usable clip(s), need {min_clips} "
+                      f"— render more matches first")
+
+    root = Path(out_dir) / VIDEO_DATASET_DIR / f"{kind}_{name}__{slug}"
+    clips = root / "clips"
+    # Rebuilt from scratch each time: a stale symlink to a deleted render would make
+    # SimpleTuner fail deep inside its loader rather than here.
+    if clips.exists():
+        for old in clips.iterdir():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    clips.mkdir(parents=True, exist_ok=True)
+    (root / "cache" / "vae").mkdir(parents=True, exist_ok=True)
+    (root / "cache" / "text").mkdir(parents=True, exist_ok=True)
+
+    for n, item in enumerate(sorted(long_enough, key=lambda i: str(i["path"]))):
+        stem = clips / f"{n:04d}"
+        try:
+            stem.with_suffix(".mp4").symlink_to(item["path"].resolve())
+        except OSError:
+            import shutil
+            shutil.copy2(item["path"], stem.with_suffix(".mp4"))
+        stem.with_suffix(".txt").write_text(item["prompt"] + "\n", encoding="utf-8")
+
+    res = int(resolution)
+    backend = [
+        {
+            "id": f"township-{kind}-{name}",
+            "type": "local",
+            "dataset_type": "video",
+            "instance_data_dir": str(clips.resolve()),
+            "caption_strategy": "textfile",
+            "metadata_backend": "discovery",
+            "cache_dir_vae": str((root / "cache" / "vae").resolve()),
+            "resolution": res,
+            "resolution_type": "pixel_area",
+            "minimum_image_size": res,
+            "maximum_image_size": res,
+            "target_downsample_size": res,
+            "crop": False,
+            "repeats": 0,
+            "disabled": False,
+            "video": {"num_frames": int(num_frames), "min_frames": int(num_frames)},
+        },
+        {
+            # Exactly one text_embeds backend must carry default: true.
+            "id": "text-embeds",
+            "type": "local",
+            "dataset_type": "text_embeds",
+            "default": True,
+            "cache_dir": str((root / "cache" / "text").resolve()),
+            "disabled": False,
+            "write_batch_size": 128,
+        },
+    ]
+    cfg_path = root / "data_backend.json"
+    cfg_path.write_text(json.dumps(backend, indent=2) + "\n", encoding="utf-8")
+    # Kept beside it so a dataset can be traced back to the renders it came from.
+    (root / "manifest.json").write_text(json.dumps({
+        "kind": kind, "name": name, "model_slug": slug,
+        "num_frames": int(num_frames), "resolution": res,
+        "clips": [{"file": f"{n:04d}.mp4", "source": str(i["path"]), "frames": i["frames"]}
+                  for n, i in enumerate(sorted(long_enough, key=lambda i: str(i["path"])))],
+    }, indent=2) + "\n", encoding="utf-8")
+    return cfg_path, f"{len(long_enough)} clips"
+
+
 def _train_profile_video_loras(client: CoderAIClient, video_model: str, out_dir: Path,
                                names: list, kind: str,
                                lora_steps: int = 800, lora_rank: int = 16,
-                               quantize_4bit: bool = True) -> dict:
+                               quantize_4bit: bool = True,
+                               dataset_frames: int = DATASET_FRAMES,
+                               dataset_min_clips: int = DATASET_MIN_CLIPS,
+                               video_size: str = "832x480") -> dict:
     """Train one Wan video-DiT LoRA per profile of `kind`, against `video_model`.
 
     Returns the full nested map {name: {slug: path}}. Resumable: skips a profile
@@ -3900,6 +4081,23 @@ def _train_profile_video_loras(client: CoderAIClient, video_model: str, out_dir:
             _log(f"  [{i}/{len(names)}] {name}: reusing video LoRA for this model")
             continue
         lora_name = f"{spec['prefix']}{name}__{slug}"
+        # LongCat trains through SimpleTuner, which needs a captioned VIDEO dataset.
+        # Build it from the clips already rendered rather than asking the operator
+        # for one; a model whose trainer takes reference images needs none.
+        dataset = None
+        if _is_longcat_model(video_model):
+            try:
+                _res = (video_size or "832x480").lower().split("x")
+                _short = min(int(_res[0]), int(_res[1]))
+            except Exception:
+                _short = 480
+            dataset, why = build_video_dataset(
+                out_dir, kind, name, slug, num_frames=dataset_frames,
+                resolution=_short, min_clips=dataset_min_clips)
+            if dataset is None:
+                _log(f"  [{i}/{len(names)}] {name}: SKIPPED — {why}")
+                continue
+            _log(f"  [{i}/{len(names)}] {name}: dataset built from {why} → {dataset}")
         _log(f"  [{i}/{len(names)}] {name}: training video LoRA "
              f"({lora_steps} steps, rank {lora_rank}) — slow on large models…")
         try:
@@ -3907,7 +4105,8 @@ def _train_profile_video_loras(client: CoderAIClient, video_model: str, out_dir:
                 f"training {kind} video LoRA '{name}'",
                 client.train_lora, name=lora_name, base_model=video_model,
                 target="video", quantize_4bit=quantize_4bit,
-                steps=lora_steps, rank=lora_rank, **{kind: name},
+                steps=lora_steps, rank=lora_rank,
+                dataset_config=(str(dataset) if dataset else None), **{kind: name},
             )
             path = res.get("path")
             if path:
@@ -3927,18 +4126,24 @@ def _train_profile_video_loras(client: CoderAIClient, video_model: str, out_dir:
 
 def stage_video_loras(client: CoderAIClient, video_model: str, out_dir: Path,
                       char_names: list, lora_steps: int = 800, lora_rank: int = 16,
-                      quantize_4bit: bool = True) -> dict:
-    """Train one Wan video LoRA per fighter against the video model."""
+                      quantize_4bit: bool = True, dataset_frames: int = DATASET_FRAMES,
+                      dataset_min_clips: int = DATASET_MIN_CLIPS,
+                      video_size: str = "832x480") -> dict:
+    """Train one video LoRA per fighter against the video model."""
     return _train_profile_video_loras(client, video_model, out_dir, char_names,
-                                      "character", lora_steps, lora_rank, quantize_4bit)
+                                      "character", lora_steps, lora_rank, quantize_4bit,
+                                      dataset_frames, dataset_min_clips, video_size)
 
 
 def stage_env_video_loras(client: CoderAIClient, video_model: str, out_dir: Path,
                           env_names: list, lora_steps: int = 800, lora_rank: int = 16,
-                          quantize_4bit: bool = True) -> dict:
-    """Train one Wan video LoRA per environment against the video model."""
+                          quantize_4bit: bool = True, dataset_frames: int = DATASET_FRAMES,
+                          dataset_min_clips: int = DATASET_MIN_CLIPS,
+                          video_size: str = "832x480") -> dict:
+    """Train one video LoRA per environment against the video model."""
     return _train_profile_video_loras(client, video_model, out_dir, env_names,
-                                      "environment", lora_steps, lora_rank, quantize_4bit)
+                                      "environment", lora_steps, lora_rank, quantize_4bit,
+                                      dataset_frames, dataset_min_clips, video_size)
 
 
 def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: Path,
@@ -7797,6 +8002,12 @@ try{ if(localStorage.getItem('tf-dock')==='1') toggleDock(true); }catch(e){}
       <div><label>Video LoRA scale <span class=hint>(×char+env weight, video only)</span></label>
            <input name=video_lora_scale type=number min=0 max=2 step=0.05 value="{_v('video_lora_scale', 1.0)}"></div>
     </div>
+    <div class=row style="margin-top:.4rem">
+      <div><label>Training clip frames <span class=hint>(SimpleTuner/LongCat; 4n+1 — shorter renders are dropped)</span></label>
+           <input name=dataset_frames type=number min=5 max=333 value="{_v('dataset_frames', DATASET_FRAMES)}"></div>
+      <div><label>Minimum usable clips <span class=hint>(refuse to train a video LoRA on fewer)</span></label>
+           <input name=dataset_min_clips type=number min=1 max=500 value="{_v('dataset_min_clips', DATASET_MIN_CLIPS)}"></div>
+    </div>
     <div class=row3 style="margin-top:.4rem">
       <div><label>Clip min frames <span class=hint>(per fight clip)</span></label>
            <input name=clip_min_frames type=number min=8 max=480 value="{_v('clip_min_frames', 50)}"></div>
@@ -11603,6 +11814,10 @@ async function resetPrompts(ev){
             ns.env_lora_rank     = int(_fv("env_lora_rank", "16"))
             ns.env_lora_weight   = float(_fv("env_lora_weight", "0.8"))
             ns.video_lora_scale  = float(_fv("video_lora_scale", "1.0"))
+            ns.dataset_frames    = int(_fv("dataset_frames", str(DATASET_FRAMES))
+                                       or DATASET_FRAMES)
+            ns.dataset_min_clips = int(_fv("dataset_min_clips", str(DATASET_MIN_CLIPS))
+                                       or DATASET_MIN_CLIPS)
             ns.video_size        = _fv("video_size", "832x480") or "832x480"
             ns.clip_min_frames   = int(_fv("clip_min_frames", "50"))
             ns.clip_max_frames   = int(_fv("clip_max_frames", "70"))
@@ -11985,13 +12200,19 @@ async function resetPrompts(ev){
                              f"for {len(char_names)} fighter(s)…")
                     stage_video_loras(client, _vm, out_dir_r, char_names or [],
                                       lora_steps=getattr(args, "lora_steps", 800),
-                                      lora_rank=getattr(args, "lora_rank", 16))
+                                      lora_rank=getattr(args, "lora_rank", 16),
+                                      dataset_frames=getattr(args, "dataset_frames", DATASET_FRAMES),
+                                      dataset_min_clips=getattr(args, "dataset_min_clips", DATASET_MIN_CLIPS),
+                                      video_size=getattr(args, "video_size", "832x480"))
                 if not _no_env_loras and env_names:
                     _web_log(f"  Training environment VIDEO LoRAs ({_model_slug(_vm)}) "
                              f"for {len(env_names)} location(s)…")
                     stage_env_video_loras(client, _vm, out_dir_r, env_names or [],
                                           lora_steps=getattr(args, "env_lora_steps", 800),
-                                          lora_rank=getattr(args, "env_lora_rank", 16))
+                                          lora_rank=getattr(args, "env_lora_rank", 16),
+                                      dataset_frames=getattr(args, "dataset_frames", DATASET_FRAMES),
+                                      dataset_min_clips=getattr(args, "dataset_min_clips", DATASET_MIN_CLIPS),
+                                      video_size=getattr(args, "video_size", "832x480"))
 
         if getattr(args, "only_video_loras", False):
             _web_log("\n✓ Video LoRA step complete.")
@@ -12428,6 +12649,17 @@ OUTPUT LAYOUT
                                "so the long cut is always filled.")
     cons_grp.add_argument("--long-max", type=float, default=75.0, metavar="SEC",
                           help="Maximum duration (s) of the LONG final assembly (default: 75).")
+    cons_grp.add_argument(
+        "--dataset-frames", type=int, default=DATASET_FRAMES, metavar="N",
+        help="Frames per training clip when a video LoRA is trained through "
+             "SimpleTuner (LongCat). Clips shorter than this are dropped by the "
+             "loader, so it also decides which renders qualify. Must be 4n+1 "
+             f"(default {DATASET_FRAMES}, one whole LongCat segment).")
+    cons_grp.add_argument(
+        "--dataset-min-clips", type=int, default=DATASET_MIN_CLIPS, metavar="N",
+        help="Refuse to train a video LoRA on fewer than this many usable clips "
+             f"(default {DATASET_MIN_CLIPS}). Upstream suggests 50-100; this is a "
+             "floor so a part-rendered show does not silently train on three.")
     cons_grp.add_argument("--video-lora-scale", type=float, default=1.0, metavar="F",
                           help="Multiplier applied to the character + environment LoRA weights "
                                "at VIDEO render time only (keyframe LoRA weight is unaffected; "
@@ -12685,11 +12917,17 @@ OUTPUT LAYOUT
         if _vm and (char_names or []):
             stage_video_loras(client, _vm, out_dir, char_names or [],
                               lora_steps=getattr(args, "lora_steps", 800),
-                              lora_rank=getattr(args, "lora_rank", 16))
+                              lora_rank=getattr(args, "lora_rank", 16),
+                                      dataset_frames=getattr(args, "dataset_frames", DATASET_FRAMES),
+                                      dataset_min_clips=getattr(args, "dataset_min_clips", DATASET_MIN_CLIPS),
+                                      video_size=getattr(args, "video_size", "832x480"))
         if (_vm and not getattr(args, "no_env_loras", False) and (env_names or [])):
             stage_env_video_loras(client, _vm, out_dir, env_names or [],
                                   lora_steps=getattr(args, "env_lora_steps", 800),
-                                  lora_rank=getattr(args, "env_lora_rank", 16))
+                                  lora_rank=getattr(args, "env_lora_rank", 16),
+                                      dataset_frames=getattr(args, "dataset_frames", DATASET_FRAMES),
+                                      dataset_min_clips=getattr(args, "dataset_min_clips", DATASET_MIN_CLIPS),
+                                      video_size=getattr(args, "video_size", "832x480"))
         if getattr(args, "only_video_loras", False):
             _log("\n✓ Video LoRA training complete.")
             return

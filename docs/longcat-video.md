@@ -243,6 +243,30 @@ captioned video clips (its quickstart suggests 50–100 clips of 10–30 s). cod
 synthesise one from the `images` field other targets use: a still-image dataset would
 train something other than a video LoRA, and silently.
 
+**The township tool builds one for you.** It has already rendered the corpus SimpleTuner
+asks for — every clip it produces was rendered FROM a prompt, and that prompt is kept
+beside it in `videos/prompts.json` — so `tools/gen_township_fighters.py` assembles the
+dataset instead of asking for it. Train Video LoRAs (step 4b) against a LongCat model and
+it writes, per fighter and per location:
+
+```
+<out-dir>/video_datasets/character_<name>__<model-slug>/
+  clips/0000.mp4 -> ../../../videos/match_a_vs_b_clip03.mp4   (symlink)
+  clips/0000.txt                                              (its prompt)
+  cache/vae/  cache/text/
+  data_backend.json      <- this is the dataset_config that gets sent
+  manifest.json          <- which render each clip came from
+```
+
+Clips are symlinked rather than copied: a fighter appears in dozens of them, and one
+dataset per fighter would otherwise duplicate the entire render. Upscaled/interpolated
+derivatives (`_2x`, `_2xfps`) are never used — they are the post-processor's output, not
+the model's. Two knobs on the Run page govern it: **Training clip frames** (default 93,
+one whole LongCat segment, 4n+1) and **Minimum usable clips** (default 8). A clip shorter
+than the frame count is dropped by SimpleTuner's loader, so the tool filters on it first
+and refuses with a reason — "all 12 clips are shorter than 93 frames (longest 70)" —
+rather than handing over a dataset that would train on nothing.
+
 **QLoRA** is `longcat.train_base_precision` — `int8-quanto` (the default),
 `int4-quanto` or `fp8-torchao`, no extra installs. A 13.6B transformer plus optimiser
 state does not fit a consumer card at bf16, so the quantised base is the normal path
