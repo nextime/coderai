@@ -33,6 +33,9 @@ LIPSYNC_VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
 # LongCat-Video rides the same standalone Python 3.10 as the lip-sync tools, in a venv
 # of its own (its torch 2.6+cu124 differs, so the venvs cannot be shared).
 LONGCAT_VENV="${CODERAI_LONGCAT_VENV:-$HOME/.coderai/longcat_venv}"
+# …and its CODE: LongCatVideoPipeline lives in the repo's own `longcat_video` package,
+# not on PyPI, so the source is bundled like Wav2Lip/SadTalker. Weights are NOT.
+LONGCAT_SRC="${CODERAI_LONGCAT_SRC:-$HOME/.coderai/LongCat-Video}"
 WAV2LIP_DIR="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"
 SADTALKER_DIR="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"
 DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
@@ -412,6 +415,14 @@ prepare_venv_bundle() {
     # LongCat's venv carries its own torch 2.6+cu124; weights are NOT bundled (they
     # download at runtime into the /cache volume, like every other model).
     if [[ -d "$LONGCAT_VENV" ]]; then rsync -a "${_venv_excl[@]}" "$LONGCAT_VENV/" "$bundle/longcat_venv/"; echo "Bundled LongCat-Video venv"; fi
+    # LongCat repo CODE ONLY — the checkpoint (~83 GB across variants) downloads at
+    # runtime into the /cache volume, and assets/ is demo material.
+    if [[ -d "$LONGCAT_SRC" ]]; then
+      rsync -a --exclude 'weights/' --exclude '*.safetensors' --exclude '*.pth' \
+            --exclude 'assets/' --exclude '.git/' \
+            "$LONGCAT_SRC/" "$bundle/LongCat-Video/"
+      echo "Bundled LongCat-Video code (no weights)"
+    fi
     # Repo CODE ONLY — checkpoints/weights are excluded and download at runtime.
     if [[ -d "$WAV2LIP_DIR" ]]; then rsync -a --exclude 'checkpoints/' --exclude 'face_detection/detection/sfd/*.pth' "$WAV2LIP_DIR/" "$bundle/Wav2Lip/"; echo "Bundled Wav2Lip code (no weights)"; fi
     if [[ -d "$SADTALKER_DIR" ]]; then rsync -a --exclude 'checkpoints/*' --exclude 'gfpgan/weights/*' "$SADTALKER_DIR/" "$bundle/SadTalker/"; echo "Bundled SadTalker code (no weights)"; fi

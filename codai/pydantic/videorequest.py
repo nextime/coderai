@@ -83,6 +83,18 @@ class VideoGenerationRequest(BaseModel):
     end_image: Optional[str] = Field(None, description="Last frame, for 'interp' mode (base64 or URL).")
     video: Optional[str] = Field(None, description="Input video for v2v / audio manipulation (base64 or URL).")
     strength: Optional[float] = Field(None, description="Denoising strength for v2v (0–1).")
+    # LongCat-Video's coarse-to-fine stages. The model generates in three passes — base
+    # 480p, a distilled 16-step pass, then a 720p refinement that takes the earlier
+    # frames as input — so a caller either picks a preset and lets the server run the
+    # stages, or drives one stage per request and keeps the intermediate frames.
+    quality: Optional[str] = Field(None, description=(
+        "LongCat-Video quality preset: 'draft' (base stage only, fastest), 'fast' "
+        "(distilled, 16 steps — the default), 'best' (base + 720p refinement). Ignored "
+        "by other models."))
+    stage: Optional[str] = Field(None, description=(
+        "Run ONE LongCat-Video stage instead of a preset: 'base', 'distill' or "
+        "'refinement'. Overrides `quality`. For resumable per-stage generation; "
+        "'refinement' needs frames from an earlier stage."))
     cond_frames: Optional[List[str]] = Field(None, description=(
         "Ordered conditioning frames (base64/URL) for 'extend' mode on a VACE model: the tail "
         "of the previous clip. The model conditions on these (their real motion gives velocity) "

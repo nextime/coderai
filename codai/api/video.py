@@ -32,6 +32,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from typing import List, Optional
@@ -4091,6 +4092,154 @@ async def _generate_h3(request: VideoGenerationRequest, model_name: str,
     return resp
 
 
+async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
+                            model_cfg: dict, http_request, identity_note: str = "",
+                            model_key: str = "") -> VideoGenerationResponse:
+    """Generate with LongCat-Video through its isolated worker.
+
+    Step 2 scope: text-to-video, one segment, single GPU. i2v, continuation/long video and
+    the avatar variants slot into the same payload later.
+
+    Unlike the H3 worker path, this one reports progress and is cancellable: H3 calls
+    _vid_progress_reset() then _vid_progress_done() and never registers a task, so its
+    bar sits at 0 for the whole generation and /v1/tasks cannot stop it. The service here
+    exposes /progress and this polls it.
+    """
+    from codai.api import longcat_worker
+
+    warnings: list = []
+    if identity_note:
+        warnings.append(identity_note)
+
+    model_path = longcat_worker.resolve_model_path(model_name, model_cfg)
+    lc = longcat_worker.common()
+
+    quality = str(getattr(request, "quality", "") or model_cfg.get("quality") or "fast")
+    stage = str(getattr(request, "stage", "") or "")
+    try:
+        stages = lc.resolve_stages(quality, stage)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    mode = (request.mode or "t2v").lower()
+    if mode not in ("t2v", ""):
+        # Honest refusal beats a silent downgrade: the payload for these is designed but
+        # the worker does not implement them yet.
+        raise HTTPException(status_code=400, detail=(
+            f"LongCat-Video mode '{mode}' is not implemented yet — this build supports "
+            f"text-to-video. Image-to-video, continuation and the avatar tasks are the "
+            f"next increment."))
+
+    payload = {
+        "prompt": request.prompt or "",
+        "quality": quality,
+        "stage": stage,
+        "model": model_path,
+        "num_frames": int(request.num_frames) if request.num_frames
+                      else lc.DEFAULT_NUM_FRAMES,
+    }
+    if not payload["prompt"]:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if request.width and request.height:
+        payload["width"], payload["height"] = int(request.width), int(request.height)
+    if request.seed is not None:
+        payload["seed"] = int(request.seed)
+    if request.num_inference_steps:
+        payload["num_inference_steps"] = int(request.num_inference_steps)
+    if request.guidance_scale is not None:
+        payload["guidance_scale"] = float(request.guidance_scale)
+    for _k in ("dtype", "offload_strategy", "longcat_source"):
+        if model_cfg.get(_k):
+            payload["offload" if _k == "offload_strategy"
+                    else "source" if _k == "longcat_source" else _k] = str(model_cfg[_k])
+
+    # Total steps across the stages we are about to run, so the bar spans the whole
+    # request rather than restarting per stage.
+    _total = sum(lc.stage_params(s, request.num_inference_steps,
+                                 request.guidance_scale)["num_inference_steps"]
+                 for s in stages)
+    _vid_progress_reset(_total)
+
+    _stop = threading.Event()
+    _done_steps = {"base": 0}
+
+    def _poll():
+        """Mirror the service's progress onto the engine's bar, and carry cancellation
+        and the thermal gate across the process boundary."""
+        _seen_stage = ""
+        while not _stop.wait(2.0):
+            try:
+                p = longcat_worker.progress(model_path, model_cfg)
+                if not p or not p.get("active"):
+                    continue
+                st = str(p.get("stage") or "")
+                if st and st != _seen_stage:
+                    if _seen_stage:
+                        _done_steps["base"] += lc.STAGE_DEFAULTS.get(
+                            _seen_stage, (0, 0))[0]
+                    _seen_stage = st
+                _vid_progress_step(_done_steps["base"] + int(p.get("step") or 0))
+            except Exception:
+                pass
+
+    _poller = threading.Thread(target=_poll, daemon=True)
+    _poller.start()
+    try:
+        data = await asyncio.to_thread(longcat_worker.generate, model_name, payload,
+                                       model_cfg)
+    finally:
+        _stop.set()
+        _vid_progress_done()
+
+    mp4_bytes = base64.b64decode(data.get("mp4_b64") or "")
+    frames_made = data.get("num_frames")
+    fps_used = int(data.get("fps") or lc.DEFAULT_FPS)
+    stages_run = data.get("stages") or list(stages)
+    if not mp4_bytes:
+        raise HTTPException(status_code=500, detail="LongCat-Video returned no video")
+    print(f"  [longcat] {'+'.join(stages_run)}: {frames_made} frames "
+          f"({round((frames_made or 0) / max(1, fps_used), 2)}s @ {fps_used}fps), "
+          f"{len(mp4_bytes)/1e6:.1f} MB")
+
+    temps: list = []
+    try:
+        needs_post = any([
+            request.upscale_output, request.interpolate_output, request.add_audio,
+            request.tts_text, request.dialogs, request.lip_sync,
+            request.generate_subtitles, request.burn_subtitles,
+        ])
+        if needs_post:
+            mp4_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _postprocess_video, mp4_bytes, request, http_request, temps,
+                warnings)
+    finally:
+        for path in temps:
+            try:
+                if os.path.isfile(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+
+    result = _save_file(mp4_bytes, 'mp4', http_request)
+    try:
+        from codai.api.archive import archive_manager
+        asyncio.get_event_loop().create_task(asyncio.to_thread(
+            archive_manager.save_generation,
+            "video", "/v1/video/generations", request.model, request.prompt or "",
+            {"mode": mode, "stages": stages_run, "quality": quality,
+             "num_frames": frames_made, "fps": fps_used,
+             "width": payload.get("width"), "height": payload.get("height"),
+             "seed": request.seed},
+            [(mp4_bytes, "mp4")]))
+    except Exception:
+        pass
+
+    resp = VideoGenerationResponse(created=int(time.time()), data=[result])
+    if warnings:
+        resp.warnings = warnings
+    return resp
+
+
 async def _maybe_build_identity_keyframe(request: VideoGenerationRequest,
                                           http_request) -> Optional[str]:
     """Lock character identity on video models that have no IP-Adapter.
@@ -4256,6 +4405,31 @@ async def video_generations(request: VideoGenerationRequest,
     if _is_h3:
         return await _generate_h3(request, model_name, _model_cfg, http_request,
                                   _identity_note, model_key)
+
+    # LongCat-Video: no diffusers pipeline exists for it (diffusers merged LongCat-IMAGE,
+    # not the video model), and it pins Python 3.10 + torch 2.6 + transformers 4.41, so it
+    # runs in an isolated venv behind codai/api/longcat_worker.py. Branch before the
+    # loader for the same reason H3 does: the worker owns the weights, the VRAM
+    # reservation and the eviction hook.
+    #
+    # NOTE the config here. `model_info['config']` is build_runtime_kwargs output, which
+    # for a video model is a FIXED key list — `backend`, `alias`, `path` and every
+    # engine-specific key are absent, surviving only inside `_raw_cfg`. H3's detection
+    # therefore works by name only and its documented `backend: "h3"` switch is dead.
+    # Unwrap it so a backend pin and an alias actually reach the engine.
+    _lc_cfg = dict(_model_cfg or {})
+    _raw = (_model_cfg or {}).get('_raw_cfg')
+    if isinstance(_raw, dict):
+        for _k, _v in _raw.items():
+            _lc_cfg.setdefault(_k, _v)
+    try:
+        from codai.api import longcat_worker
+        _is_longcat = longcat_worker.is_longcat_model(model_name, _lc_cfg)
+    except Exception:
+        _is_longcat = False
+    if _is_longcat:
+        return await _generate_longcat(request, model_name, _lc_cfg, http_request,
+                                       _identity_note, model_key)
 
     # Refuse to load onto a poisoned CUDA context — it would just re-assert.
     if getattr(multi_model_manager, 'cuda_context_poisoned', False):
