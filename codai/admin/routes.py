@@ -2756,6 +2756,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # llama.cpp split mode over those devices: "" / "layer" | "row"
                 # (row = tensor parallel; see backends/vulkan.py).
                 "split_mode",
+                # LongCat-Video. The entry is rebuilt from scratch below, so a key
+                # missing from THIS list is silently dropped the next time the model is
+                # saved from the models page — which is why H3's documented h3_venv /
+                # in_process / dtype keys never survive a UI save.
+                "variant", "quality", "num_segments", "num_cond_frames", "cp_size",
+                "longcat_source", "longcat_venv", "ref_img_index", "mask_frame_range",
+                "use_int8", "use_distill", "offload_kv_cache",
                 ):
         if key in data:
             entry[key] = data[key]

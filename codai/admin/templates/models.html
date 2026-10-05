@@ -556,6 +556,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="k3">k3 (Kimi-K3 / kimi-k3-in-c)</option>
             <option value="kt">ktransformers (SGLang, CPU+GPU)</option>
             <option value="vllm">vLLM (high-concurrency, CUDA)</option>
+            <option value="longcat">LongCat-Video (isolated py3.10 venv, CUDA)</option>
             <option value="runpod">RunPod (remote cloud GPU — not stored locally)</option>
             <option value="host">Host (a machine of yours, set in Placement below)</option>
             <option value="wav2vec2">wav2vec2 / HF-ASR (speech-to-text)</option>
@@ -678,6 +679,50 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <span class="form-hint" style="font-size:11px"><code>{ray_address}</code>, <code>{head}</code> and <code>{port}</code> are filled in. The <code>coderai-vllm</code> image joins as a Ray worker when started with <code>CODERAI_RAY_ADDRESS</code>; every node must run the same vLLM build.</span>
         </div>
         <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Extra vLLM args</label><input type="text" id="cfg-vllm-extra" class="form-input" placeholder="--enable-prefix-caching"></div>
+      </div>
+      <div class="form-row" id="cfg-longcat-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">LongCat-Video <span class="muted" style="font-weight:400">— stages, segments and the isolated runtime</span></label>
+        <span class="form-hint" style="font-size:11px;margin-bottom:.4rem">Runs in an <b>isolated Python 3.10 venv</b> (torch 2.6+cu124, transformers 4.41) behind a managed subprocess, because those pin against the server's own 3.13 / 2.11 / 5.x. Blank fields inherit the global <b>Settings &rarr; LongCat</b> section. Generation is three coarse-to-fine stages; <b>Quality</b> picks which run. Long video is generated in <b>segments</b> whose first <i>conditioning frames</i> re-render the previous segment's tail, so each segment adds the remainder — ~11 segments is a minute at 15fps.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Variant</label>
+            <select id="cfg-longcat-variant" class="form-input">
+              <option value="bf16">bf16 — full weights (~27 GB)</option>
+              <option value="fp8">fp8 — e4m3 (~12-16 GB)</option>
+              <option value="int8">int8 — official, avatar-1.5 only</option>
+              <option value="gguf">gguf — 2-8 bit (ComfyUI layout)</option>
+            </select></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Default quality</label>
+            <select id="cfg-longcat-quality" class="form-input">
+              <option value="fast">fast — distilled, 16 steps</option>
+              <option value="draft">draft — base only</option>
+              <option value="best">best — base + 720p refinement</option>
+            </select></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Offload</label>
+            <select id="cfg-longcat-offload" class="form-input">
+              <option value="">none — all on the card</option>
+              <option value="model">model — per-module CPU offload</option>
+              <option value="sequential">sequential — lowest VRAM, slowest</option>
+            </select></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Segments <span class="muted">(blank = 1)</span></label><input type="number" id="cfg-longcat-segments" class="form-input" min="1" placeholder="1"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Conditioning frames</label><input type="number" id="cfg-longcat-cond-frames" class="form-input" min="1" placeholder="13"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Context-parallel GPUs</label><input type="number" id="cfg-longcat-cp" class="form-input" min="1" placeholder="1"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Repo checkout <span class="muted">(longcat_video package)</span></label><input type="text" id="cfg-longcat-source" class="form-input" placeholder="/opt/coderai/LongCat-Video"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Venv <span class="muted">(blank = global / bundled)</span></label><input type="text" id="cfg-longcat-venv" class="form-input" placeholder="/opt/coderai/longcat_venv"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Reference frame index <span class="muted">(avatar)</span></label><input type="number" id="cfg-longcat-ref-img" class="form-input" min="0" placeholder="0-24; 30 reduces repeats"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Mask frame range <span class="muted">(avatar)</span></label><input type="text" id="cfg-longcat-mask-range" class="form-input" placeholder="inherit"></div>
+          <div class="form-row" style="margin:0;align-self:end">
+            <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="cfg-longcat-int8"> <span class="form-label" style="margin:0">INT8 DiT</span></label>
+            <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="cfg-longcat-distill"> <span class="form-label" style="margin:0">Force distilled sampling</span></label>
+            <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="cfg-longcat-offload-kv"> <span class="form-label" style="margin:0">Offload KV cache</span></label>
+          </div>
+        </div>
+        <span class="form-hint" style="font-size:11px;margin-top:.4rem">INT8 is only supported by the official avatar-1.5 weights, which also <b>require</b> distilled sampling. Offloading the KV cache trades speed for VRAM across segments.</span>
       </div>
       <div class="form-row" id="cfg-kt-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">ktransformers / SGLang <span class="muted" style="font-weight:400">— per-model nodes</span></label>
@@ -4351,6 +4396,8 @@ function _applyCompat(){
   if (vrow) vrow.style.display = (backend === 'vllm') ? '' : 'none';
   const krow = document.getElementById('cfg-kt-row');
   if (krow) krow.style.display = (backend === 'kt') ? '' : 'none';
+  const lcrow = document.getElementById('cfg-longcat-row');
+  if (lcrow) lcrow.style.display = (backend === 'longcat') ? '' : 'none';
 }
 function _updateDistVisibility(){
   const on = !!(document.getElementById('cfg-dist-enabled') || {}).checked;
@@ -4380,6 +4427,22 @@ function _populateCluster(m, s){
   set('cfg-vllm-executor', v.distributed_executor_backend || ''); set('cfg-vllm-ray', v.ray_address || '');
   set('cfg-vllm-gmu', v.gpu_memory_utilization || ''); set('cfg-vllm-extra', v.extra_args || '');
   set('cfg-vllm-nodes', _nodesToLines(v.nodes, true));
+  // LongCat-Video. Read from the FLAT entry, not a nested block: these are per-model
+  // settings the worker reads off the entry, the same shape as the offload/quant fields.
+  set('cfg-longcat-variant', s.variant || 'bf16');
+  set('cfg-longcat-quality', s.quality || 'fast');
+  set('cfg-longcat-offload', s.offload_strategy || '');
+  set('cfg-longcat-segments', s.num_segments || '');
+  set('cfg-longcat-cond-frames', s.num_cond_frames || '');
+  set('cfg-longcat-cp', s.cp_size || '');
+  set('cfg-longcat-source', s.longcat_source || '');
+  set('cfg-longcat-venv', s.longcat_venv || '');
+  set('cfg-longcat-ref-img', (s.ref_img_index === 0 || s.ref_img_index) ? s.ref_img_index : '');
+  set('cfg-longcat-mask-range', s.mask_frame_range || '');
+  const _lcChk = (id, v) => { const e = document.getElementById(id); if (e) e.checked = !!v; };
+  _lcChk('cfg-longcat-int8', s.use_int8);
+  _lcChk('cfg-longcat-distill', s.use_distill);
+  _lcChk('cfg-longcat-offload-kv', s.offload_kv_cache);
   const k = s.kt || s.ktransformers || {};
   set('cfg-kt-nnodes', k.nnodes || ''); set('cfg-kt-tp', k.tp_size || ''); set('cfg-kt-dist', k.dist_init_addr || '');
   set('cfg-kt-extra', k.extra_args || ''); set('cfg-kt-nodes', _nodesToLines(k.nodes, false));
@@ -4404,6 +4467,25 @@ function _collectCluster(){
       min_items: num('cfg-dist-min'), chunk_seconds: num('cfg-dist-chunk'),
     },
   };
+  // LongCat-Video, flat on the entry. EVERY key here must also be in the whitelist in
+  // api_model_configure, or it is silently dropped on the next save from this page —
+  // which is exactly why H3's documented keys never survive.
+  if (backend === 'longcat') {
+    const chk = id => { const e = document.getElementById(id); return !!(e && e.checked); };
+    out.variant = val('cfg-longcat-variant') || 'bf16';
+    out.quality = val('cfg-longcat-quality') || 'fast';
+    out.offload_strategy = val('cfg-longcat-offload') || '';
+    out.num_segments = num('cfg-longcat-segments');
+    out.num_cond_frames = num('cfg-longcat-cond-frames');
+    out.cp_size = num('cfg-longcat-cp');
+    out.longcat_source = val('cfg-longcat-source');
+    out.longcat_venv = val('cfg-longcat-venv');
+    out.ref_img_index = num('cfg-longcat-ref-img');
+    out.mask_frame_range = val('cfg-longcat-mask-range');
+    out.use_int8 = chk('cfg-longcat-int8');
+    out.use_distill = chk('cfg-longcat-distill');
+    out.offload_kv_cache = chk('cfg-longcat-offload-kv');
+  }
   out.vllm = backend === 'vllm' ? {
     tensor_parallel_size: num('cfg-vllm-tp'), pipeline_parallel_size: num('cfg-vllm-pp'),
     distributed_executor_backend: val('cfg-vllm-executor'), ray_address: val('cfg-vllm-ray'),

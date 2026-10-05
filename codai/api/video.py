@@ -4165,13 +4165,18 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
 
     # Long video: ask for a duration or a segment count and the server owns the loop,
     # rather than the caller chaining requests and tracking tails itself.
-    _segments = getattr(request, "num_segments", None)
+    # The request wins; the model entry is the default. A knob set on the model page has
+    # to take effect without being repeated on every call.
+    _segments = getattr(request, "num_segments", None) or model_cfg.get("num_segments")
     if _segments:
         payload["num_segments"] = int(_segments)
     elif getattr(request, "duration_seconds", None):
         payload["total_frames"] = int(float(request.duration_seconds) * lc.DEFAULT_FPS)
-    if getattr(request, "num_cond_frames", None):
-        payload["num_cond_frames"] = int(request.num_cond_frames)
+    _cond = getattr(request, "num_cond_frames", None) or model_cfg.get("num_cond_frames")
+    if _cond:
+        payload["num_cond_frames"] = int(_cond)
+    if model_cfg.get("offload_kv_cache"):
+        payload["offload_kv_cache"] = True
     if not payload["prompt"]:
         raise HTTPException(status_code=400, detail="prompt is required")
     if request.width and request.height:
