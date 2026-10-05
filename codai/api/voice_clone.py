@@ -242,14 +242,30 @@ def _get_f5_engine():
         return _f5_engine
 
 
-def release_f5_engine() -> None:
-    """Drop the cached engine (VRAM eviction hook)."""
+def _free_vram_gb() -> float:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.mem_get_info()[0] / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def release_f5_engine(needed_gb: float = 0.0) -> float:
+    """Drop the cached engine (VRAM eviction hook).
+
+    The manager calls every external releaser as `fn(needed_gb)` and adds up what
+    they report, so this takes the argument and returns the VRAM delta it saw.
+    It used to take none, which made every call raise TypeError into the
+    manager's warning path — the engine was never actually released."""
     global _f5_engine, _f5_engine_device
     with _f5_lock:
         if _f5_engine is None:
-            return
+            return 0.0
         _f5_engine = None
         _f5_engine_device = None
+    before = _free_vram_gb()
     try:
         import gc
         import torch
@@ -258,7 +274,9 @@ def release_f5_engine() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
-    print("  [voice-clone] F5-TTS engine released", flush=True)
+    freed = max(0.0, _free_vram_gb() - before)
+    print(f"  [voice-clone] F5-TTS engine released ({freed:.1f} GB)", flush=True)
+    return freed
 
 
 # Caching the engine means it holds VRAM between requests, so let the model
