@@ -53,6 +53,12 @@ imageio==2.37.0
 imageio-ffmpeg==0.6.0
 pyarrow==20.0.0
 
+# Audio-driven avatar generation: the audio track is resampled to 16 kHz with librosa
+# and embedded by the family's encoder (chinese-wav2vec2-base for Avatar, whisper-large-v3
+# for Avatar-1.5). Upstream installs librosa and ffmpeg alongside the pins above; ffmpeg
+# comes from the image, imageio-ffmpeg covers the muxing.
+librosa==0.10.2.post1
+
 # Attention backend. Upstream defaults to FlashAttention-2 but documents FA3 and xformers
 # as alternatives, and flash-attn==2.7.4.post1 is a SOURCE build needing ninja and a CUDA
 # toolchain — minutes of compile, and it fails outright on a host without nvcc wired up.

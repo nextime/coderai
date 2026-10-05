@@ -62,6 +62,111 @@ STAGE_DEFAULTS = {
 }
 
 
+# ── variants ─────────────────────────────────────────────────────────────────
+# Which checkpoint family a model entry points at, and what each supports. Getting this
+# wrong is not a crash but a wrong answer: --use_int8 and the DMD distillation exist only
+# for avatar-v1.5, and asking for them elsewhere would silently load something else.
+VARIANTS = ("bf16", "fp8", "int8", "gguf")
+
+# The avatar families are separate HuggingFace repos with their own audio encoders.
+AVATAR_ENCODERS = {
+    "avatar": "chinese-wav2vec2-base",      # v1.0
+    "avatar-1.5": "whisper-large-v3",
+}
+
+# Only avatar-1.5 ships an INT8 DiT (under base_model_int8/) and the DMD LoRA, and its
+# distilled path is REQUIRED rather than optional.
+INT8_FAMILIES = ("avatar-1.5",)
+DMD_FAMILIES = ("avatar-1.5",)
+INT8_SUBDIR = "base_model_int8"
+DMD_LORA = "lora/dmd_lora.safetensors"
+DMD_NETWORK_DIM = 128
+DMD_NETWORK_ALPHA = 64
+
+# The avatar distilled pass is NOT the base model's: 8 steps against dmd_lora, where the
+# base model's is 16 against cfg_step_lora.
+AVATAR_STAGE_DEFAULTS = {
+    #            steps, text guidance, audio guidance
+    "base":        (50, 4.0, 4.0),
+    "distill":     (8, 1.0, 1.0),
+}
+
+AVATAR_TASKS = ("at2v", "ai2v")
+
+
+def family_of(model_path: str = "", variant: str = "") -> str:
+    """Which checkpoint family a path names: '', 'avatar' or 'avatar-1.5'.
+
+    Read from the path because the family IS the repo — meituan-longcat/LongCat-Video,
+    -Avatar and -Avatar-1.5 are three downloads with different audio encoders."""
+    h = str(model_path or "").lower().replace("_", "-")
+    if "avatar-1.5" in h or "avatar1.5" in h:
+        return "avatar-1.5"
+    if "avatar" in h:
+        return "avatar"
+    return ""
+
+
+def variant_problems(variant: str, family: str = "", use_int8: bool = False,
+                     use_distill: bool = False) -> list:
+    """Reasons this combination cannot be served, or [].
+
+    Checked before loading so an unsupported flag is an error the operator can act on,
+    not a silently different model."""
+    problems = []
+    v = (variant or "bf16").strip().lower()
+    if v not in VARIANTS:
+        problems.append(f"unknown variant {variant!r}; expected one of {VARIANTS}")
+    if v == "gguf":
+        problems.append(
+            "the GGUF variants are packaged for ComfyUI's gguf loader, which coderai "
+            "does not implement — use bf16, fp8, or the official int8 (avatar-1.5)")
+    if (v == "int8" or use_int8) and family not in INT8_FAMILIES:
+        problems.append(
+            f"INT8 weights exist only for {'/'.join(INT8_FAMILIES)}; this checkpoint "
+            f"reads as {family or 'the base model'}")
+    if use_distill and family and family not in DMD_FAMILIES:
+        problems.append(
+            f"the DMD distillation exists only for {'/'.join(DMD_FAMILIES)}; "
+            f"this checkpoint reads as {family}")
+    if family == "avatar-1.5" and not (use_distill or v == "int8"):
+        # Upstream states v1.5 requires distilled sampling.
+        problems.append(
+            "avatar-1.5 requires distilled sampling — set use_distill on the model "
+            "entry (its 8-step DMD pass is the supported path)")
+    return problems
+
+
+def avatar_stage_params(stage: str, steps=None, text_guidance=None,
+                        audio_guidance=None) -> dict:
+    """Steps and the TWO guidance scales the avatar pipeline takes."""
+    key = stage if stage in AVATAR_STAGE_DEFAULTS else "base"
+    base_steps, base_text, base_audio = AVATAR_STAGE_DEFAULTS[key]
+    return {
+        "num_inference_steps": int(steps) if steps else base_steps,
+        "text_guidance_scale": float(text_guidance) if text_guidance is not None
+                               else base_text,
+        "audio_guidance_scale": float(audio_guidance) if audio_guidance is not None
+                                else base_audio,
+    }
+
+
+def avatar_problems(checkpoint_dir: str, family: str, use_int8: bool = False,
+                    use_distill: bool = False) -> list:
+    """What an avatar checkpoint is missing for this configuration, or []."""
+    if not family:
+        return ["this checkpoint is not an avatar model (its path names no avatar "
+                "family) — the audio-driven tasks need LongCat-Video-Avatar or "
+                "-Avatar-1.5"]
+    root = os.path.expanduser(checkpoint_dir or "")
+    problems = []
+    if use_int8 and not os.path.isdir(os.path.join(root, INT8_SUBDIR)):
+        problems.append(f"use_int8 needs {INT8_SUBDIR}/ in {root}")
+    if use_distill and not os.path.isfile(os.path.join(root, DMD_LORA)):
+        problems.append(f"use_distill needs {DMD_LORA} in {root}")
+    return problems
+
+
 def resolve_stages(preset: str = "fast", stage: str = "") -> tuple:
     """Which stages one request runs.
 

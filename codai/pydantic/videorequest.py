@@ -102,6 +102,13 @@ class VideoGenerationRequest(BaseModel):
         "LongCat-Video: how many frames of the previous segment each new segment "
         "conditions on (default 13 of 93). More = stronger motion continuity, fewer "
         "new frames per segment."))
+    # The avatar pipeline takes TWO guidance scales where the base one takes a single
+    # guidance_scale: how hard to follow the prompt, and how hard to follow the audio.
+    text_guidance_scale: Optional[float] = Field(None, description=(
+        "LongCat-Video avatar: prompt adherence (default 4.0, or 1.0 distilled)."))
+    audio_guidance_scale: Optional[float] = Field(None, description=(
+        "LongCat-Video avatar: how closely the motion follows the audio "
+        "(default 4.0, or 1.0 distilled)."))
     quality: Optional[str] = Field(None, description=(
         "LongCat-Video quality preset: 'draft' (base stage only, fastest), 'fast' "
         "(distilled, 16 steps — the default), 'best' (base + 720p refinement). Ignored "

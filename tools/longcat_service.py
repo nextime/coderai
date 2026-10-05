@@ -58,7 +58,8 @@ LC = _load_common()
 _lock = threading.RLock()
 _state = {
     "pipe": None, "model": "", "source": "", "dtype": "bfloat16",
-    "loaded_lora": None,          # which stage's LoRA is currently fused
+    "family": "", "variant": "bf16", "use_int8": False, "use_distill": False,
+    "cp_split_hw": None, "audio_encoder": None,
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
@@ -107,11 +108,69 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         vae = AutoencoderKLWan.from_pretrained(root, subfolder="vae", torch_dtype=td)
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             root, subfolder="scheduler")
-        dit = LongCatVideoTransformer3DModel.from_pretrained(
-            root, subfolder="dit", torch_dtype=td)
+        family = LC.family_of(root)
+        use_int8 = bool(_state.get("use_int8"))
+        use_distill_lora = bool(_state.get("use_distill"))
 
-        pipe = LongCatVideoPipeline(tokenizer=tokenizer, text_encoder=text_encoder,
-                                    vae=vae, scheduler=scheduler, dit=dit)
+        if use_int8:
+            # avatar-1.5 only: a pre-quantised DiT under base_model_int8/, loaded by the
+            # repo's own helper rather than from_pretrained.
+            from longcat_video.modules.longcat_video_dit import load_quantized_dit
+            dit = load_quantized_dit(root, subfolder=LC.INT8_SUBDIR,
+                                     cp_split_hw=_state.get("cp_split_hw"))
+            log(f"loaded the INT8 DiT from {LC.INT8_SUBDIR}/")
+        else:
+            kw = {"torch_dtype": td}
+            if str(_state.get("variant") or "").lower() == "fp8":
+                # Community FP8 weights. The layouts differ between publishers (Kijai's
+                # scaled format is not the same as a plain e4m3 dump), so this loads it
+                # as the dtype it is and says so rather than pretending to normalise
+                # them: if a repo needs its own loader, the load fails here with the
+                # real reason instead of producing noise.
+                try:
+                    kw["torch_dtype"] = torch.float8_e4m3fn
+                    log("loading the DiT as float8_e4m3fn (community FP8 weights)")
+                except AttributeError:
+                    log("WARNING: this torch has no float8_e4m3fn — loading in "
+                        f"{dtype} instead")
+            dit = LongCatVideoTransformer3DModel.from_pretrained(
+                root, subfolder="dit", **kw)
+
+        if family:
+            # The avatar families are a DIFFERENT pipeline class with its own methods
+            # (generate_at2v / generate_ai2v / generate_avc) and two guidance scales.
+            from longcat_video.pipeline_longcat_video_avatar import (
+                LongCatVideoAvatarPipeline)
+            pipe = LongCatVideoAvatarPipeline(
+                tokenizer=tokenizer, text_encoder=text_encoder, vae=vae,
+                scheduler=scheduler, dit=dit)
+            _state["audio_encoder"] = _load_audio_encoder(root, family)
+            log(f"avatar family '{family}' "
+                f"(audio encoder: {LC.AVATAR_ENCODERS.get(family)})")
+        else:
+            pipe = LongCatVideoPipeline(tokenizer=tokenizer, text_encoder=text_encoder,
+                                        vae=vae, scheduler=scheduler, dit=dit)
+        _state["family"] = family
+
+        if use_distill_lora and family:
+            # The avatar distilled pass is dmd_lora at 8 steps — NOT the base model's
+            # cfg_step_lora at 16, which use_distill=True on the base pipeline applies
+            # internally.
+            try:
+                dit.load_lora(os.path.join(root, LC.DMD_LORA), name="dmd",
+                              lora_network_dim=LC.DMD_NETWORK_DIM,
+                              lora_network_alpha=LC.DMD_NETWORK_ALPHA)
+            except AttributeError:
+                # Older/newer builds name it differently; the enable step is what counts.
+                pass
+            if hasattr(dit, "enable_loras"):
+                dit.enable_loras(["dmd"])
+                log(f"enabled the DMD LoRA (dim={LC.DMD_NETWORK_DIM}, "
+                    f"alpha={LC.DMD_NETWORK_ALPHA})")
+            else:
+                raise RuntimeError(
+                    "use_distill needs the DiT's enable_loras() — this build of "
+                    "longcat_video does not expose it")
         # Offload is opt-in: the 13.6B DiT wants ~27 GB at bf16 and the reported peak for
         # a full profile is ~41.6 GB, so a smaller card needs it. Not every build of the
         # upstream pipeline exposes the diffusers hooks, hence the guarded calls.
@@ -130,9 +189,27 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                 pipe.to("cuda")
             else:
                 log("WARNING: no CUDA device visible — this will be extremely slow")
-        _state.update(pipe=pipe, model=root, source=src, dtype=dtype, loaded_lora=None)
+        _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
         return pipe
+
+
+def _load_audio_encoder(root: str, family: str):
+    """The family's audio encoder: chinese-wav2vec2-base for Avatar, whisper-large-v3 for
+    Avatar-1.5. Upstream ships it inside the checkpoint; fall back to the hub id."""
+    name = LC.AVATAR_ENCODERS.get(family)
+    if not name:
+        return None
+    local = os.path.join(os.path.expanduser(root), name)
+    path = local if os.path.isdir(local) else name
+    try:
+        from longcat_video.pipeline_longcat_video_avatar import get_audio_encoder
+        return get_audio_encoder(path, family)
+    except ImportError:
+        # The helper moved; the pipeline can still embed audio itself in that case.
+        log(f"WARNING: get_audio_encoder is not importable — relying on the "
+            f"pipeline's own audio embedding")
+        return None
 
 
 def unload(reason: str = ""):
@@ -140,7 +217,7 @@ def unload(reason: str = ""):
         if _state["pipe"] is None:
             return
         _state["pipe"] = None
-        _state["loaded_lora"] = None
+        _state["audio_encoder"] = None
         try:
             import torch
             import gc
@@ -211,6 +288,9 @@ def _one_pass(pipe, task: str, stage: str, ctx: dict, cond=None, log=print):
         # The distilled demos pass no negative prompt (guidance is 1.0, so it does
         # nothing); the 50-step passes do.
         common["negative_prompt"] = ctx["negative_prompt"]
+
+    if task in LC.AVATAR_TASKS:
+        return _avatar_pass(pipe, task, dict(ctx, stage=stage), cond=cond)
 
     if cond is not None:
         kw = dict(common)
@@ -330,6 +410,69 @@ def _peak_vram_gb() -> float:
         return 0.0
 
 
+def _audio_embedding(pipe, audio_b64: str, fps: int, family: str):
+    """Decode the audio track and embed it the way the avatar pipeline expects.
+
+    Upstream: librosa.load(..., sr=16000) then pipe.get_audio_embedding(speech, fps=…,
+    sample_rate=…, model_type=…). The 16 kHz is the encoder's rate, not a preference."""
+    import tempfile
+    import librosa
+    raw = audio_b64.split(",", 1)[1] if str(audio_b64).startswith("data:") else audio_b64
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+        fh.write(base64.b64decode(raw))
+        path = fh.name
+    try:
+        speech, sr = librosa.load(path, sr=16000)
+        device = 0
+        try:
+            import torch
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        except Exception:
+            pass
+        return pipe.get_audio_embedding(speech, fps=fps, device=device,
+                                        sample_rate=sr, model_type=family)
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+def _avatar_pass(pipe, task: str, ctx: dict, cond=None):
+    """One avatar call. at2v / ai2v to start, avc to continue.
+
+    The avatar pipeline takes TWO guidance scales (text and audio) where the base one
+    takes a single guidance_scale, and output_type='both' is what upstream asks for."""
+    params = LC.avatar_stage_params(ctx.get("stage") or "base",
+                                    ctx.get("num_inference_steps"),
+                                    ctx.get("text_guidance_scale"),
+                                    ctx.get("audio_guidance_scale"))
+    kw = {
+        "prompt": ctx["prompt"], "height": ctx["height"], "width": ctx["width"],
+        "num_frames": ctx["num_frames"], "audio_emb": ctx["audio_emb"],
+        "output_type": "both", **params,
+    }
+    if ctx.get("negative_prompt"):
+        kw["negative_prompt"] = ctx["negative_prompt"]
+    if ctx.get("generator") is not None:
+        kw["generator"] = ctx["generator"]
+    if ctx.get("use_distill"):
+        kw["use_distill"] = True
+
+    if cond is not None:
+        kw.update(video=cond, num_cond_frames=ctx["num_cond_frames"],
+                  use_kv_cache=True,
+                  offload_kv_cache=bool(ctx.get("offload_kv_cache")),
+                  enhance_hf=False)
+        for opt in ("ref_img_index", "mask_frame_range"):
+            if ctx.get(opt) is not None:
+                kw[opt] = ctx[opt]
+        return pipe.generate_avc(**kw)[0]
+    if task == "ai2v":
+        return pipe.generate_ai2v(image=ctx["image"], **kw)[0]
+    return pipe.generate_at2v(**kw)[0]
+
+
 def generate(body: dict) -> dict:
     """One request: text-to-video, image-to-video or continuation, over N segments.
 
@@ -348,9 +491,28 @@ def generate(body: dict) -> dict:
         raise ValueError("; ".join(problems))
 
     task = (body.get("task") or "t2v").strip().lower()
-    if task not in ("t2v", "i2v", "vc"):
-        raise ValueError(f"unknown task {task!r}; expected t2v, i2v or vc")
+    if task not in ("t2v", "i2v", "vc") + LC.AVATAR_TASKS:
+        raise ValueError(f"unknown task {task!r}; expected t2v, i2v, vc, "
+                         f"{' or '.join(LC.AVATAR_TASKS)}")
 
+    # Variant and family gating BEFORE loading: INT8 and the DMD distillation exist only
+    # for avatar-1.5, and asking for them elsewhere would quietly load something else.
+    family = LC.family_of(checkpoint)
+    variant = str(body.get("variant") or "bf16").strip().lower()
+    use_int8 = bool(body.get("use_int8")) or variant == "int8"
+    use_distill_lora = bool(body.get("use_distill"))
+    problems = LC.variant_problems(variant, family, use_int8, use_distill_lora)
+    if task in LC.AVATAR_TASKS:
+        problems += LC.avatar_problems(checkpoint, family, use_int8, use_distill_lora)
+    elif family:
+        problems.append(
+            f"this is the {family} checkpoint, which serves the audio-driven tasks "
+            f"({'/'.join(LC.AVATAR_TASKS)}); use the base LongCat-Video weights for "
+            f"'{task}'")
+    if problems:
+        raise ValueError("; ".join(problems))
+
+    _state.update(variant=variant, use_int8=use_int8, use_distill=use_distill_lora)
     pipe = load_pipeline(checkpoint, body.get("source") or _state["source"],
                          body.get("dtype") or _state["dtype"],
                          body.get("offload") or "")
@@ -374,6 +536,16 @@ def generate(body: dict) -> dict:
         if not body.get("image"):
             raise ValueError("task 'i2v' needs an image")
         image = _decode_image(body["image"])
+    audio_emb = None
+    if task in LC.AVATAR_TASKS:
+        if not body.get("audio"):
+            raise ValueError(f"task {task!r} needs an audio track")
+        audio_emb = _audio_embedding(pipe, body["audio"], fps, family)
+    if task == "ai2v":
+        if not body.get("image"):
+            raise ValueError("task 'ai2v' needs a reference image")
+        image = _decode_image(body["image"])
+
     cond_video = None
     if task == "vc":
         if not body.get("cond_frames_b64"):
@@ -399,6 +571,11 @@ def generate(body: dict) -> dict:
         "guidance_scale": body.get("guidance_scale"),
         "offload_kv_cache": body.get("offload_kv_cache"),
         "image": image, "cond_video": cond_video, "generator": generator,
+        "audio_emb": audio_emb, "use_distill": use_distill_lora,
+        "text_guidance_scale": body.get("text_guidance_scale"),
+        "audio_guidance_scale": body.get("audio_guidance_scale"),
+        "ref_img_index": body.get("ref_img_index"),
+        "mask_frame_range": body.get("mask_frame_range"),
     }
 
     _yield_flag.clear()
@@ -481,7 +658,9 @@ def make_handler():
         def do_GET(self):
             if self.path.startswith("/health"):
                 self._json({"ok": True, "loaded": _state["pipe"] is not None,
-                            "model": _state["model"], "stages": list(LC.STAGES)})
+                            "model": _state["model"], "stages": list(LC.STAGES),
+                            "family": _state.get("family") or "",
+                            "variant": _state.get("variant") or "bf16"})
             elif self.path.startswith("/progress"):
                 with _lock:
                     self._json(dict(_progress))

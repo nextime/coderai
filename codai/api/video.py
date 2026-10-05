@@ -4128,12 +4128,15 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     mode = (request.mode or "t2v").lower()
     _task = {"t2v": "t2v", "": "t2v",
              "i2v": "i2v", "ti2v": "i2v",
-             "extend": "vc", "vc": "vc", "v2v": "vc"}.get(mode)
+             "extend": "vc", "vc": "vc", "v2v": "vc",
+             # Audio-driven avatar: a different pipeline class upstream, with its own
+             # methods and two guidance scales. 'at2v' is audio+text, 'ai2v' adds a
+             # reference image.
+             "at2v": "at2v", "ai2v": "ai2v", "avatar": "at2v"}.get(mode)
     if _task is None:
         raise HTTPException(status_code=400, detail=(
-            f"LongCat-Video does not support mode '{mode}'. Use 't2v', 'i2v' or "
-            f"'extend' (continuation); the audio-driven avatar tasks are a separate "
-            f"increment."))
+            f"LongCat-Video does not support mode '{mode}'. Use 't2v', 'i2v', "
+            f"'extend' (continuation), or 'at2v'/'ai2v' (audio-driven avatar)."))
 
     payload = {
         "prompt": request.prompt or "",
@@ -4146,6 +4149,35 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     }
     if request.negative_prompt:
         payload["negative_prompt"] = request.negative_prompt
+
+    # The variant and its flags gate what can load at all: INT8 and the DMD
+    # distillation exist only for the avatar-1.5 weights. The service refuses an
+    # impossible combination rather than loading something else.
+    for _k in ("variant", "use_int8", "use_distill", "ref_img_index",
+               "mask_frame_range"):
+        if model_cfg.get(_k) not in (None, ""):
+            payload[_k] = model_cfg[_k]
+
+    # The avatar tasks need an audio track, and ai2v a reference image too.
+    if _task in ("at2v", "ai2v"):
+        # `audio_file` already means "existing audio, base64 or URL" on this request;
+        # `add_audio` is a BOOLEAN for the post-processing path and must not be used here.
+        _audio = request.audio_file
+        if not _audio:
+            raise HTTPException(status_code=400, detail=(
+                f"mode '{mode}' is audio-driven and needs an audio track in "
+                f"`audio_file` (base64 or URL)"))
+        payload["audio"] = _as_b64(_audio)
+        if getattr(request, "text_guidance_scale", None) is not None:
+            payload["text_guidance_scale"] = float(request.text_guidance_scale)
+        if getattr(request, "audio_guidance_scale", None) is not None:
+            payload["audio_guidance_scale"] = float(request.audio_guidance_scale)
+    if _task == "ai2v":
+        _ref = request.init_image or request.image
+        if not _ref:
+            raise HTTPException(status_code=400, detail=(
+                "mode 'ai2v' needs a reference image (init_image or image)"))
+        payload["image"] = _as_b64(_ref)
 
     # i2v takes one conditioning image; coderai accepts it as init_image or image.
     if _task == "i2v":

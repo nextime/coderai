@@ -134,10 +134,52 @@ building or downloading anything. `distribute` fans independent generations acro
 engines and nodes. A `video-longcat` RunPod capability image needs a custom Dockerfile
 (the generic one is python:3.12 + cu128, wrong on both axes) and is not built yet.
 
+## Variants and the avatar families
+
+The avatar weights are **a different pipeline** upstream
+(`LongCatVideoAvatarPipeline`), with its own methods and **two** guidance scales — how
+hard to follow the prompt, and how hard to follow the audio. Its distilled pass is also
+not the base model's: 8 steps against `dmd_lora`, where the base model's is 16 against
+`cfg_step_lora`.
+
+| | base | Avatar | Avatar-1.5 |
+|---|---|---|---|
+| audio encoder | — | chinese-wav2vec2-base | whisper-large-v3 |
+| modes | t2v, i2v, extend | at2v, ai2v | at2v, ai2v |
+| INT8 | no | no | **yes** (`base_model_int8/`) |
+| distilled | `cfg_step_lora`, 16 steps | no | **required**, `dmd_lora`, 8 steps |
+
+Unsupported combinations are **refused before loading** rather than quietly loading
+something else: INT8 or the DMD distillation on anything but avatar-1.5, avatar-1.5
+without distilled sampling, a base-model mode on avatar weights (or the reverse), and the
+GGUF variants, which need ComfyUI's gguf loader.
+
+FP8 loads the DiT as `float8_e4m3fn`. Community FP8 layouts differ between publishers
+(Kijai's scaled format is not a plain e4m3 dump), so if a repo needs its own loader the
+load fails with that reason instead of producing noise.
+
+Audio-driven generation:
+
+```jsonc
+POST /v1/video/generations
+{
+  "model": "longcat-avatar-15",
+  "mode": "ai2v",                 // at2v = audio+text; ai2v adds a reference image
+  "prompt": "a news anchor reading the headlines",
+  "audio_file": "<base64 or URL>",
+  "init_image": "<base64 or URL>",
+  "audio_guidance_scale": 4.0
+}
+```
+
+The audio is resampled to 16 kHz (the encoder's rate) and embedded by the family's
+encoder. `ref_img_index` (0–24; 30 reduces repeated actions) and `mask_frame_range` are
+set on the model entry.
+
 ## Not done yet
 
-- audio-driven avatar tasks; GGUF variants (they need the ComfyUI gguf loader)
+- GGUF variants (they need the ComfyUI gguf loader)
 - context-parallel multi-GPU (`cp_size` is accepted but not yet acted on)
 - the `video-longcat` pod image
 - LoRA/QLoRA training on top of it (feasible — upstream's own refinement expert is a LoRA)
-- **no generation has been verified against real weights**
+- **no generation has been verified against real weights**, avatar included
