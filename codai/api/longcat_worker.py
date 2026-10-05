@@ -75,6 +75,13 @@ DEFAULT_VRAM_GB = 24.0
 
 _lock = threading.RLock()
 _services: dict = {}          # key -> {"proc","port","url","meta"}
+# In-flight generations per service, and an event that is SET while nothing is running.
+# The model manager's own busy signal cannot see this work (acquire_stt_backend pops the
+# model pool, so _is_key_busy is always False for us), so the releaser does its own drain.
+_inflight: dict = {}
+_idle = threading.Event()
+_idle.set()
+_releaser_registered = False
 
 _common = None
 
@@ -476,6 +483,7 @@ def acquire(model_name: str, config: dict = None) -> LongcatHandle:
     model_path = resolve_model_path(model_name, cfg)
     key = service_key(model_path, cfg)
 
+    register_releaser()                          # both directions, from the first use
     url = ensure_service(model_path, cfg)        # idempotent; re-spawns on a new port
 
     def _loader():
@@ -490,6 +498,30 @@ def acquire(model_name: str, config: dict = None) -> LongcatHandle:
     return handle
 
 
+def _record_measurement(key: str, vram_gb: float) -> None:
+    """Write a measured footprint back, so the next reservation is not an estimate.
+
+    The 13.6B DiT is ~27 GB at bf16 and the reported peak for a full profile is ~41.6 GB,
+    but no official figure exists and it moves with the variant, the stage and the offload
+    mode. So the number is measured per service key — which includes config_id/variant,
+    because sibling configs are different residencies and an fp8 entry must not inherit a
+    bf16 measurement."""
+    if not vram_gb or vram_gb <= 0:
+        return
+    try:
+        from codai.models.manager import multi_model_manager
+        prev = float(multi_model_manager._measured_vram_gb.get(key) or 0.0)
+        # Keep the HIGH-WATER mark: a draft-preset run touches far less of the card than
+        # a 720p refinement, and reserving the smaller figure would under-evict for the
+        # bigger one later.
+        if vram_gb > prev + 0.05:
+            multi_model_manager._measured_vram_gb[key] = float(vram_gb)
+            print(f"[longcat] measured {vram_gb:.2f} GB for {key}"
+                  + (f" (was {prev:.2f})" if prev else ""), flush=True)
+    except Exception as e:
+        print(f"[longcat] could not record the measurement: {e}", flush=True)
+
+
 def generate(model_name: str, payload: dict, config: dict = None,
              timeout: float = 14400.0) -> dict:
     """Run one generation on the service. Returns its JSON response.
@@ -497,8 +529,18 @@ def generate(model_name: str, payload: dict, config: dict = None,
     The default timeout is four hours: a 720p refinement over many segments is measured in
     minutes per segment, and a timeout that fires mid-generation wastes all of it."""
     import requests
-    handle = acquire(model_name, config)
-    resp = requests.post(handle.url + "/generate", json=payload, timeout=timeout)
+    cfg = config or {}
+    handle = acquire(model_name, cfg)
+    key = handle.key
+    with _lock:
+        _inflight[key] = _inflight.get(key, 0) + 1
+    try:
+        resp = requests.post(handle.url + "/generate", json=payload, timeout=timeout)
+    finally:
+        with _lock:
+            _inflight[key] = max(0, _inflight.get(key, 1) - 1)
+            if _inflight[key] == 0:
+                _idle.set()
     if not resp.ok:
         try:
             detail = resp.json().get("error") or resp.text[:800]
@@ -508,7 +550,75 @@ def generate(model_name: str, payload: dict, config: dict = None,
     data = resp.json()
     if data.get("error"):
         raise RuntimeError(f"LongCat generation failed: {data['error']}")
+    _record_measurement(key, float(data.get("vram_gb") or 0.0))
     return data
+
+
+# ── eviction: giving the card back ───────────────────────────────────────────
+
+def _drain_timeout_s() -> float:
+    sec = _cfg_section()
+    try:
+        return max(0.0, float(getattr(sec, "evict_drain_timeout_s", 0) or 0)) or 300.0
+    except Exception:
+        return 300.0
+
+
+def release_vram(needed_gb: float = 999.0) -> float:
+    """External VRAM releaser: stop the services, letting in-flight work finish first.
+
+    Registered with the model manager so another model can take the card — the reverse
+    direction of acquire()'s eviction. The contract is ``fn(needed_gb) -> float``: safe to
+    call with nothing to free, and it must not raise (the manager swallows exceptions into
+    a warning, which is how voice_clone's zero-argument releaser has been silently failing).
+
+    The wait matters more here than anywhere else. A segment is ~80 new frames and minutes
+    of work, and the manager's own busy signal cannot see any of it: acquire_stt_backend
+    pops the model pool, so ``_is_key_busy`` is permanently False for this model and Pass 1
+    of release_idle_vram would tear the subprocess down mid-generation, losing the whole
+    request. Upstream already calls torch_gc() between segments, so a boundary exists;
+    until the segment loop lands, draining means waiting for the in-flight request."""
+    with _lock:
+        keys = list(_services.keys())
+        busy = sum(_inflight.get(k, 0) for k in keys)
+    if not keys:
+        return 0.0
+    if busy:
+        budget = _drain_timeout_s()
+        print(f"[longcat] {busy} generation(s) in flight — waiting up to {budget:.0f}s "
+              f"for a clean handover before releasing the card", flush=True)
+        _idle.clear()
+        if not _idle.wait(budget):
+            print(f"[longcat] still busy after {budget:.0f}s — releasing anyway; the "
+                  f"in-flight request will fail", flush=True)
+
+    freed = 0.0
+    try:
+        from codai.models.manager import multi_model_manager
+        for key in keys:
+            freed += float(multi_model_manager._measured_vram_gb.get(key) or 0.0) \
+                or DEFAULT_VRAM_GB
+    except Exception:
+        freed = float(len(keys)) * DEFAULT_VRAM_GB
+    for key in keys:
+        stop_service(key)
+    if freed:
+        print(f"[longcat] released ~{freed:.1f} GB (services stopped for VRAM "
+              f"eviction); they restart on the next request", flush=True)
+    return freed
+
+
+def register_releaser() -> None:
+    """Make LongCat's VRAM reclaimable by the model manager. Idempotent."""
+    global _releaser_registered
+    if _releaser_registered:
+        return
+    try:
+        from codai.models.manager import multi_model_manager
+        multi_model_manager.register_external_vram_releaser(release_vram)
+        _releaser_registered = True
+    except Exception as e:
+        print(f"[longcat] could not register the VRAM releaser: {e}", flush=True)
 
 
 import atexit as _atexit

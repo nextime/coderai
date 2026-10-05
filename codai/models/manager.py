@@ -3985,6 +3985,24 @@ class MultiModelManager:
         # ~128 GB on every request (needless churn) and mis-message CPU/disk offload.
         # Use the measured value if we have one, else a modest fixed reserve.
         try:
+            # LongCat-Video runs in an isolated-venv subprocess, so there is no torch
+            # object here to size and the checkpoint on disk is ~83 GB across variants —
+            # nothing like the footprint. Its key is longcat:<path>#<config_id|variant>,
+            # and the measurement the worker writes back after a load is the only honest
+            # figure: the 13.6B DiT is ~27 GB at bf16, but the real peak depends on the
+            # variant (bf16/fp8/int8), the stage and the offload mode, and no official
+            # number exists. Until measured, reserve the starting estimate.
+            if str(model_key or "").startswith("longcat:"):
+                measured = self._measured_vram_gb.get(model_key)
+                if not measured and resolved_name:
+                    measured = self._measured_vram_gb.get(resolved_name)
+                if measured:
+                    return float(measured)
+                try:
+                    from codai.api.longcat_worker import DEFAULT_VRAM_GB
+                    return float(DEFAULT_VRAM_GB)
+                except Exception:
+                    return 24.0
             if ds4_should_handle(model_key) or (resolved_name and ds4_should_handle(resolved_name)):
                 measured = self._measured_vram_gb.get(model_key)
                 if not measured and resolved_name:

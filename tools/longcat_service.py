@@ -263,7 +263,27 @@ def generate(body: dict) -> dict:
         fps = int(body.get("fps") or 30)
     mp4 = _mux(frames, fps)
     return {"mp4_b64": base64.b64encode(mp4).decode(), "num_frames": len(frames),
-            "fps": fps, "stages": list(stages), "segments": 1}
+            "fps": fps, "stages": list(stages), "segments": 1,
+            "vram_gb": _peak_vram_gb()}
+
+
+def _peak_vram_gb() -> float:
+    """The peak VRAM this process reached, in GB, or 0.0.
+
+    Reported back so the engine can size future reservations from a MEASUREMENT instead
+    of an estimate. It has to come from in here: the pipeline loads lazily on the first
+    request, and a host-side free-VRAM delta would also be counting whatever else was
+    loading or evicting on the card at the same time. torch's own peak counter is
+    exactly this process's allocation."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 0.0
+        # reserved, not allocated: the caching allocator's arenas are what the card is
+        # actually unable to give to anything else.
+        return round(torch.cuda.max_memory_reserved() / (1024 ** 3), 2)
+    except Exception:
+        return 0.0
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────

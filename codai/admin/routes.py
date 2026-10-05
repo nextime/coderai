@@ -3789,6 +3789,7 @@ def build_settings_dict(c, gpu_cards):
             "gpu": c.longcat.gpu,
             "attention": c.longcat.attention,
             "ready_timeout": c.longcat.ready_timeout,
+            "evict_drain_timeout_s": c.longcat.evict_drain_timeout_s,
             "extra_args": c.longcat.extra_args,
             "extra_env": c.longcat.extra_env,
         },
@@ -4430,6 +4431,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "ready_timeout" in d:
             try:
                 lc.ready_timeout = max(0.0, float(d.get("ready_timeout") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        if "evict_drain_timeout_s" in d:
+            try:
+                lc.evict_drain_timeout_s = max(0.0, float(d.get("evict_drain_timeout_s") or 0.0))
             except (TypeError, ValueError):
                 pass
         if lc.attention not in ("xformers", "flash", "sdpa"):

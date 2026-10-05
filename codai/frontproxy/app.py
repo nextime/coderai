@@ -393,7 +393,7 @@ class FrontProxy:
         # direct proxy path, so brokered and direct requests share one queue.
         _qkey = None
         if (method.upper() == "POST" and _router.is_inference_path(path)
-                and self._task_kind(path) == "text"
+                and self._queues_at_front(path, model)
                 and not self._computed_off_this_gpu(engine, model, path)):
             _qkey = self._queue_key(model)
             try:
@@ -547,7 +547,7 @@ class FrontProxy:
             pass
         _qkey = None
         if (method.upper() == "POST" and _is_infer
-                and self._task_kind(path) == "text"
+                and self._queues_at_front(path, model)
                 and not self._computed_off_this_gpu(engine, model, path)):
             _qkey = self._queue_key(model)
             try:
@@ -1096,6 +1096,28 @@ class FrontProxy:
             return gate
         except Exception:
             return None
+
+    def _queues_at_front(self, path: str, model) -> bool:
+        """Whether this request takes a slot in the front per-model queue.
+
+        Text always has, and video never did: every acquire site was guarded by
+        `_task_kind(path) == "text"`, so `max_instances` configured on a video model had
+        no effect at the front and nothing bounded concurrent generations but the engine
+        itself and the swap gate.
+
+        Video now queues when — and only when — the operator has set `max_instances` on
+        the entry. Queueing it unconditionally would change behaviour for every existing
+        video model and start returning 503 at `queue_max_size`, which is not something
+        to impose on deployments that never asked for it. Setting the field IS the ask."""
+        kind = self._task_kind(path)
+        if kind == "text":
+            return True
+        if kind != "video":
+            return False
+        try:
+            return bool(self._model_info(model).get("max_instances"))
+        except Exception:
+            return False
 
     def _swap_owner_key(self, engine, model: Optional[str], path: Optional[str] = None) -> str:
         """The model identity that determines GPU residency for the swap gate. Same
@@ -1998,7 +2020,6 @@ class FrontProxy:
         _MAX_TRIES = 6
         _RETRY = 5.0
         _RETRY_STATUS = {425, 429, 500, 502, 503, 504}
-        is_text = self._task_kind(path) == "text"
 
         async def _gen():
             _qkey = None
@@ -2026,7 +2047,8 @@ class FrontProxy:
                         except _asyncio.TimeoutError:
                             yield _ka("waiting for GPU (another model is finishing)")
                 # 1. Front per-model queue slot (text only) — keepalive while waiting.
-                if is_text and not self._computed_off_this_gpu(engine, model, path):
+                if (self._queues_at_front(path, model)
+                        and not self._computed_off_this_gpu(engine, model, path)):
                     _qkey = self._queue_key(model)
                     _slot_held = False
                     # `on_busy`: if there is no free local slot RIGHT NOW, burst
@@ -2459,7 +2481,7 @@ class FrontProxy:
         # audio, embeddings…) pass through unqueued.
         _qkey = None
         if (method == "POST" and _router.is_inference_path(path)
-                and self._task_kind(path) == "text"
+                and self._queues_at_front(path, model)
                 and not self._computed_off_this_gpu(engine, model, path)):
             _qkey = self._queue_key(model)
             _slot_held = False

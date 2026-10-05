@@ -785,6 +785,11 @@ class LongcatConfig:
     # installs. "flash" assumes you installed flash-attn into the venv yourself.
     attention: str = "xformers"         # xformers | flash | sdpa
     ready_timeout: float = 1800.0       # a 13.6B DiT load is not quick
+    # When another model needs the card, how long to let an in-flight generation finish
+    # before stopping the service anyway. A segment is ~80 new frames and minutes of
+    # work, and the manager's own busy signal cannot see it (the worker holds no model
+    # pool), so this is what makes the handover a clean swap instead of a lost request.
+    evict_drain_timeout_s: float = 300.0
     extra_args: str = ""                # appended to the service command line
     extra_env: str = ""                 # KEY=VALUE pairs for the service process
 
@@ -1429,6 +1434,7 @@ class ConfigManager:
                 "gpu": self.config.longcat.gpu,
                 "attention": self.config.longcat.attention,
                 "ready_timeout": self.config.longcat.ready_timeout,
+                "evict_drain_timeout_s": self.config.longcat.evict_drain_timeout_s,
                 "extra_args": self.config.longcat.extra_args,
                 "extra_env": self.config.longcat.extra_env,
             },
