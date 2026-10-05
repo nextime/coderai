@@ -64,11 +64,22 @@ def _free_port() -> int:
     return port
 
 
-def _pump_logs(proc, tail):
+def _pump_logs(proc, tail, meta: dict = None):
     for line in proc.stdout:
         line = line.rstrip()
         if line:
             tail.append(line)
+            # vLLM states how much of the budget was left for the cache. That figure is
+            # the only direct measurement of an engine's real footprint we ever get, so
+            # it is captured HERE as it streams — by the time the server is ready it has
+            # scrolled out of the 80-line tail behind vLLM's route listing.
+            if meta is not None and "kv_gib" not in meta:
+                m = _KV_REPORT.search(line)
+                if m:
+                    try:
+                        meta["kv_gib"] = float(m.group(1))
+                    except Exception:
+                        pass
             print(f"[vllm] {line}", flush=True)
 
 
@@ -363,9 +374,10 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
             if ray is not None:
                 ray.stop()
             raise
-        threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()
+        meta = {}
+        threading.Thread(target=_pump_logs, args=(proc, tail, meta), daemon=True).start()
         _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray,
-                              "gmu": gmu}
+                              "gmu": gmu, "meta": meta}
 
     def _tail_msg():
         # The last six lines of a vLLM crash are the wrapper's own traceback
@@ -410,6 +422,14 @@ _KV_EXHAUSTED = re.compile(
 _GMU_ESCALATION_STEP = 0.12
 _GMU_MAX_ATTEMPTS = 4
 
+# vLLM reports what was left for the cache; this is how that figure is read back.
+_KV_REPORT = re.compile(r"Available KV cache memory:\s*(-?[\d.]+)\s*GiB", re.IGNORECASE)
+# How much KV cache an instance should end up with, how much spare has to be on the table
+# before shrinking is worth a move, and the margin kept when proposing a smaller share.
+_TARGET_KV_GB = 2.0
+_SHRINK_MIN_SLACK_GB = 1.0
+_SHRINK_MARGIN = 0.03
+
 
 def _learned_gmu_path():
     try:
@@ -434,24 +454,31 @@ def _learned_gmu_key(cfg, model: str, ctx, mnbt) -> str:
     return f"{model}|{total}|{int(ctx or 0)}|{int(mnbt or 0)}"
 
 
-def _load_learned_gmu(key: str) -> float:
+def _load_learned(key: str) -> dict:
+    """``{"ok": share that booted, "failed": highest share that could not hold the cache}``
+
+    Both halves matter: ``ok`` lets a later start skip rediscovery (and lets a measured
+    share come DOWN below the configured bid), while ``failed`` is a floor that stops the
+    downward half ever proposing a budget already proven dead — which is what would
+    otherwise oscillate."""
     p = _learned_gmu_path()
     if not p:
-        return 0.0
+        return {}
     try:
         with open(p) as f:
-            return float((json.load(f) or {}).get(key) or 0.0)
+            rec = (json.load(f) or {}).get(key)
     except Exception:
-        return 0.0
+        return {}
+    if isinstance(rec, (int, float)):          # the flat format this used to write
+        return {"ok": float(rec)}
+    return rec if isinstance(rec, dict) else {}
 
 
-def _save_learned_gmu(key: str, gmu: float) -> None:
-    """Remember the share that actually booted, so the next start does not re-discover it.
-
-    Best-effort: a read-only config dir costs a few minutes of re-discovery, not a
-    failure."""
+def _save_learned(key: str, ok: float = None, failed: float = None) -> None:
+    """Record what booted and/or what was too small. Best-effort: a read-only config dir
+    costs a few minutes of re-discovery, not a failure."""
     p = _learned_gmu_path()
-    if not p or gmu <= 0:
+    if not p:
         return
     try:
         data = {}
@@ -460,16 +487,78 @@ def _save_learned_gmu(key: str, gmu: float) -> None:
                 data = json.load(f) or {}
         except Exception:
             data = {}
-        if abs(float(data.get(key) or 0.0) - gmu) < 0.005:
+        rec = data.get(key)
+        if isinstance(rec, (int, float)):
+            rec = {"ok": float(rec)}
+        if not isinstance(rec, dict):
+            rec = {}
+        before = dict(rec)
+        if ok is not None and ok > 0:
+            rec["ok"] = round(float(ok), 3)
+        if failed is not None and failed > 0:
+            rec["failed"] = round(max(float(failed), float(rec.get("failed") or 0.0)), 3)
+        if rec == before:
             return
-        data[key] = round(float(gmu), 3)
+        data[key] = rec
         tmp = str(p) + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2, sort_keys=True)
         os.replace(tmp, p)
-        print(f"[vllm] learned gpu-memory-utilization {gmu:.3f} for {key}", flush=True)
+        print(f"[vllm] learned {rec} for {key}", flush=True)
     except Exception as e:
         print(f"[vllm] could not persist the learned share: {e}", flush=True)
+
+
+def _starting_gmu(configured: float, rec: dict) -> float:
+    """Where to begin: what booted before if we know it, else the configured bid — never
+    at or below a share that has already failed."""
+    start = float(rec.get("ok") or 0.0) or float(configured or 0.0)
+    failed = float(rec.get("failed") or 0.0)
+    if failed > 0:
+        start = max(start, min(failed + _GMU_ESCALATION_STEP, GMU_CEILING))
+    return min(max(start, 0.0), GMU_CEILING)
+
+
+def _shrink_candidate(gmu: float, kv_gib: float, target_kv_gb: float,
+                      rec: dict) -> Optional[float]:
+    """A smaller share that would still leave ``target_kv_gb`` of cache, or None.
+
+    Escalation alone only ever ratchets upward, so an opening bid that is too generous
+    would have the engine sit on memory it does not use — 0.60 of this card when it needs
+    0.25 is 8 GB another model could have had. The successful boot reports the cache it
+    got, which gives the footprint directly: ``footprint = budget - kv``. Kept above any
+    share known to fail, and with a margin, so shrinking cannot trade a working budget
+    for a dead one."""
+    try:
+        from codai.models.manager import multi_model_manager
+        total = float(multi_model_manager._total_vram_gb() or 0.0)
+    except Exception:
+        return None
+    if total <= 0 or kv_gib is None:
+        return None
+    slack = float(kv_gib) - float(target_kv_gb)
+    if slack <= _SHRINK_MIN_SLACK_GB:          # not enough spare cache to be worth a move
+        return None
+    footprint = (gmu * total) - float(kv_gib)
+    if footprint <= 0:
+        return None
+    cand = ((footprint + float(target_kv_gb)) / total) + _SHRINK_MARGIN
+    floor = float(rec.get("failed") or 0.0)
+    if floor > 0:
+        cand = max(cand, min(floor + _GMU_ESCALATION_STEP, GMU_CEILING))
+    cand = min(max(cand, 0.05), GMU_CEILING)
+    if cand >= gmu - _SHRINK_MARGIN:           # not meaningfully smaller
+        return None
+    return round(cand, 3)
+
+
+def _service_meta(cfg, model_path=None, served_name=None) -> dict:
+    _resolved, svc_key = resolve_service_key(cfg, model_path)
+    if served_name:
+        svc_key = f"{svc_key}|{served_name}"
+    with _lock:
+        svc = _services.get(svc_key) or {}
+    return svc.get("meta") or {}
 
 
 def ensure_service(cfg, model_path: Optional[str] = None,
@@ -478,7 +567,8 @@ def ensure_service(cfg, model_path: Optional[str] = None,
                    gpu_memory_utilization: Optional[float] = None,
                    max_model_len: Optional[int] = None,
                    max_num_batched_tokens: Optional[int] = None,
-                   max_num_seqs: Optional[int] = None) -> str:
+                   max_num_seqs: Optional[int] = None,
+                   target_kv_gb: Optional[float] = None) -> str:
     """Launch (or reuse) a vLLM OpenAI server for a model; return its base URL.
 
     The configured share is a STARTING POINT, not a verdict. An engine's real footprint
@@ -493,22 +583,23 @@ def ensure_service(cfg, model_path: Optional[str] = None,
 
     ``model_path``/``served_name`` override the config (used by the OCR subsystem to serve
     surya-2 on its own vLLM instance alongside any LLM instance)."""
-    start = resolve_gmu(cfg, gpu_memory_utilization)
+    configured = resolve_gmu(cfg, gpu_memory_utilization)
     ctx = int(max_model_len or 0) or int(getattr(cfg, "ctx", 0) or 0)
     key = _learned_gmu_key(cfg, (served_name or model_path or "vllm"), ctx,
                            max_num_batched_tokens)
-    learned = _load_learned_gmu(key)
-    if learned > start:
-        print(f"[vllm] starting at the learned share {learned:.3f} rather than "
-              f"{start:.3f} (it is what booted last time for {key})", flush=True)
-        start = learned
-    if start <= 0:
-        # No share configured anywhere: nothing to escalate, let vLLM use its own default.
+    rec = _load_learned(key)
+    target_kv = float(target_kv_gb if target_kv_gb is not None else _TARGET_KV_GB)
+
+    if configured <= 0 and not rec:
+        # No share configured anywhere: nothing to size, let vLLM use its own default.
         return _ensure_service_once(
             cfg, model_path, served_name, ready_timeout, 0.0,
             max_model_len, max_num_batched_tokens, max_num_seqs)
 
-    gmu = min(start, GMU_CEILING)
+    gmu = _starting_gmu(configured, rec)
+    if rec and abs(gmu - configured) > 0.005:
+        print(f"[vllm] starting at {gmu:.3f} rather than the configured {configured:.3f} "
+              f"— measured previously for {key}: {rec}", flush=True)
     last = None
     for attempt in range(1, _GMU_MAX_ATTEMPTS + 1):
         try:
@@ -517,26 +608,39 @@ def ensure_service(cfg, model_path: Optional[str] = None,
                 max_model_len, max_num_batched_tokens, max_num_seqs)
         except RuntimeError as exc:
             last = exc
-            if not _KV_EXHAUSTED.search(str(exc)) or gmu >= GMU_CEILING - 1e-6:
+            if not _KV_EXHAUSTED.search(str(exc)):
                 raise
+            _save_learned(key, failed=gmu)
             nxt = min(gmu + _GMU_ESCALATION_STEP, GMU_CEILING)
-            if nxt <= gmu + 1e-6:
+            if gmu >= GMU_CEILING - 1e-6 or nxt <= gmu + 1e-6:
                 raise
             print(f"[vllm] {served_name or model_path}: a {gmu:.3f} budget cannot hold "
                   f"the KV cache (attempt {attempt}/{_GMU_MAX_ATTEMPTS}); retrying at "
-                  f"{nxt:.3f} — the engine's footprint is larger than the configured "
-                  f"share, which is what this measures", flush=True)
+                  f"{nxt:.3f} — the engine's footprint is larger than that share, which "
+                  f"is what this measures", flush=True)
             # The bigger budget needs the room to exist before vLLM asks for it.
             try:
                 from codai.models.manager import multi_model_manager
-                need = prelaunch_free_gb(cfg, nxt)
-                multi_model_manager._evict_models_for_vram(float(need))
+                multi_model_manager._evict_models_for_vram(
+                    float(prelaunch_free_gb(cfg, nxt)))
             except Exception as e:
                 print(f"[vllm] evict-before-retry skipped: {e}", flush=True)
             gmu = nxt
             continue
-        if attempt > 1 or abs(gmu - learned) > 0.005:
-            _save_learned_gmu(key, gmu)
+        # Booted. Record it, and see whether the cache it got says a smaller share would
+        # have done — escalation alone never gives memory back.
+        _save_learned(key, ok=gmu)
+        try:
+            kv = (_service_meta(cfg, model_path, served_name) or {}).get("kv_gib")
+            cand = _shrink_candidate(gmu, kv, target_kv, _load_learned(key))
+            if cand is not None:
+                print(f"[vllm] {served_name or model_path}: {kv:.2f} GiB of cache on a "
+                      f"{gmu:.3f} share leaves room to spare; {cand:.3f} would still "
+                      f"give ~{target_kv:.1f} GiB — using it from the next start",
+                      flush=True)
+                _save_learned(key, ok=cand)
+        except Exception as e:
+            print(f"[vllm] could not size down from the reported cache: {e}", flush=True)
         return url
     raise last if last is not None else RuntimeError("vLLM did not start")
 

@@ -43,8 +43,11 @@ def _cfg(**kw):
     return type("C", (), base)()
 
 
-def _launcher(monkeypatch, succeed_at: float = None, error=KV_ERR):
-    """Stub the one-shot launcher: record every share tried, fail until `succeed_at`."""
+def _launcher(monkeypatch, succeed_at: float = None, error=KV_ERR, kv_gib=None):
+    """Stub the one-shot launcher: record every share tried, fail until `succeed_at`.
+
+    `kv_gib` is what the booted engine reports as its remaining cache — the figure the
+    downward half reads back."""
     tried = []
 
     def _once(cfg, model_path=None, served_name=None, ready_timeout=3600.0,
@@ -56,6 +59,8 @@ def _launcher(monkeypatch, succeed_at: float = None, error=KV_ERR):
         raise RuntimeError(error)
 
     monkeypatch.setattr(vllm_worker, "_ensure_service_once", _once)
+    monkeypatch.setattr(vllm_worker, "_service_meta",
+                        lambda *a, **k: ({"kv_gib": kv_gib} if kv_gib is not None else {}))
     return tried
 
 
@@ -161,3 +166,70 @@ def test_an_unwritable_store_costs_rediscovery_not_a_failure(monkeypatch):
     url = vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
                                      gpu_memory_utilization=0.60)
     assert url == "http://127.0.0.1:1/" and len(tried) >= 2
+
+
+# ---------------------------------------------------------------- shrinking
+def test_a_share_with_cache_to_spare_comes_down_next_start(monkeypatch):
+    """Escalation only ratchets up; without this an over-generous opening bid would have
+    OCR sitting on memory another model could have used."""
+    _launcher(monkeypatch, succeed_at=0.0, kv_gib=8.0)   # 0.60*24 - 8.0 => 6.4 footprint
+    vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
+                               gpu_memory_utilization=0.60)
+    key = vllm_worker._learned_gmu_key(_cfg(), "m", 18432, None)
+    learned = vllm_worker._load_learned(key)["ok"]
+    assert learned < 0.60
+    # Still enough for the 2 GB target plus the margin, not a starved budget.
+    assert learned * 24.0 >= 6.4 + vllm_worker._TARGET_KV_GB
+
+    tried = _launcher(monkeypatch, succeed_at=0.0, kv_gib=2.2)
+    vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
+                               gpu_memory_utilization=0.60)
+    assert tried == [pytest.approx(learned, abs=1e-3)]   # started at the smaller share
+
+
+def test_a_tight_fit_is_left_alone(monkeypatch):
+    """Only clear slack is worth a move — shaving a nearly-exact budget risks a dead one."""
+    _launcher(monkeypatch, succeed_at=0.0, kv_gib=vllm_worker._TARGET_KV_GB + 0.2)
+    vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
+                               gpu_memory_utilization=0.60)
+    key = vllm_worker._learned_gmu_key(_cfg(), "m", 18432, None)
+    assert vllm_worker._load_learned(key)["ok"] == pytest.approx(0.60, abs=1e-3)
+
+
+def test_shrinking_never_proposes_a_share_already_proven_dead(monkeypatch):
+    """The anti-oscillation rule: a budget that failed is a floor for the downward half."""
+    # Fails at 0.60, boots at 0.72, and reports a lot of spare cache.
+    _launcher(monkeypatch, succeed_at=0.72, kv_gib=9.0)
+    vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
+                               gpu_memory_utilization=0.60)
+    key = vllm_worker._learned_gmu_key(_cfg(), "m", 18432, None)
+    rec = vllm_worker._load_learned(key)
+    assert rec["failed"] == pytest.approx(0.60, abs=1e-3)
+    assert rec["ok"] > 0.60      # never back down to or below the share that failed
+
+
+def test_no_reported_cache_means_no_change(monkeypatch):
+    _launcher(monkeypatch, succeed_at=0.0, kv_gib=None)
+    vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
+                               gpu_memory_utilization=0.60)
+    key = vllm_worker._learned_gmu_key(_cfg(), "m", 18432, None)
+    assert vllm_worker._load_learned(key)["ok"] == pytest.approx(0.60, abs=1e-3)
+
+
+def test_the_flat_format_this_used_to_write_still_loads(monkeypatch, tmp_path):
+    import json
+    key = vllm_worker._learned_gmu_key(_cfg(), "m", 18432, None)
+    (tmp_path / "vllm_gmu_learned.json").write_text(json.dumps({key: 0.72}))
+    assert vllm_worker._load_learned(key) == {"ok": 0.72}
+    tried = _launcher(monkeypatch, succeed_at=0.72, kv_gib=2.1)
+    vllm_worker.ensure_service(_cfg(), model_path="m", served_name="m",
+                               gpu_memory_utilization=0.60)
+    assert tried == [pytest.approx(0.72, abs=1e-3)]
+
+
+def test_the_measured_footprint_round_trips(monkeypatch):
+    """footprint = budget - cache, which is the whole basis for sizing down."""
+    cand = vllm_worker._shrink_candidate(0.60, 8.0, 2.0, {})
+    assert cand is not None
+    # 0.60*24 = 14.4 budget, 8.0 cache => 6.4 footprint; +2.0 target => 8.4/24 = 0.35
+    assert cand == pytest.approx(0.35 + vllm_worker._SHRINK_MARGIN, abs=0.01)

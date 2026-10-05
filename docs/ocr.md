@@ -136,9 +136,15 @@ refuses to start when that much is not free. Three rules follow, all enforced by
   the larger figure, retries, and records what booted**, keyed by model + card + context +
   batch limits (`~/.coderai/vllm_gmu_learned.json`). A different model, a bigger card or
   different limits rediscover their own value; the recorded one is reused on later starts,
-  and a configured share lower than what is known to work is ignored. Nothing is added
-  back for other residents — vLLM charges only its own allocations against `total × gmu` —
-  so the evict-first pass is what guarantees the room.
+  and a configured share lower than what is known to work is ignored. It also sizes
+  **down**: a successful boot reports the cache it got, and `footprint = budget - cache`
+  is the only direct measurement of an engine's real cost there is, so a share with
+  clear slack is recorded smaller for the next start (keeping ~2 GiB of cache, and
+  never at or below a share already proven too small — that floor is what stops it
+  oscillating). Over-provisioning therefore costs one boot, not the life of the
+  process. Nothing is added back for other residents — vLLM charges only its own
+  allocations against `total × gmu` — so the evict-first pass is what guarantees the
+  room.
 
 - **The batch limits shrink the footprint a little; the encoder is what dominates.**
   `ocr.vlm_max_num_batched_tokens` (default 4096), `ocr.vlm_max_num_seqs` (16) and
