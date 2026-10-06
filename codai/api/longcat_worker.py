@@ -131,8 +131,9 @@ def resolve_model_path(model_name: str, config: dict = None) -> str:
     for key in ("model_path", "path", "model_id", "repo_id"):
         value = cfg.get(key)
         if isinstance(value, str) and value.strip():
-            return os.path.expanduser(value.strip())
-    return model_name or "meituan-longcat/LongCat-Video"
+            return common().resolve_checkpoint(value.strip())
+    return common().resolve_checkpoint(
+        model_name or "meituan-longcat/LongCat-Video")
 
 
 def service_key(model_path: str, config: dict = None) -> str:

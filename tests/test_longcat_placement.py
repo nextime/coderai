@@ -127,6 +127,42 @@ def test_the_encoder_visits_the_card_to_encode_and_leaves_again(service):
     during = pipe.coresident[-1]
     assert during["text_encoder"] == "cuda", "it has to be on the card to encode"
     assert pipe.text_encoder.device == "cpu", "and has to go back afterwards"
+    assert pipe.dit.device == "cuda", "the DiT has to come back for the denoising loop"
+
+
+def test_the_dit_and_the_encoder_are_never_on_the_card_together(service):
+    """The whole point. 13.6 GB of INT8 DiT plus ~11 GB of UMT5-XXL is 24.8 GB on a
+    24 GB card: bringing the encoder over WITHOUT moving the DiT off is an OOM, and it
+    is the one this fixture failed to catch the first time. Peak must be max(), not sum.
+    """
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+
+    pipe.encode_prompt("two fighters circling", device="cuda")
+
+    for snapshot in pipe.coresident:
+        on_card = [name for name, dev in snapshot.items() if dev == "cuda"]
+        assert not ("dit" in on_card and "text_encoder" in on_card), (
+            f"both were resident at once: {snapshot}")
+
+
+def test_the_dit_comes_back_even_if_the_encode_fails(service):
+    """Otherwise a failed prompt leaves the DiT on the host and the next generation
+    runs at PCIe speed with no indication why."""
+
+    class Failing(FakePipeline):
+        def encode_prompt(self, prompt, device=None, **kwargs):
+            self._snapshot()
+            raise RuntimeError("bad prompt")
+
+    pipe = Failing()
+    service._place_pipeline(pipe, "model")
+
+    with pytest.raises(RuntimeError, match="bad prompt"):
+        pipe.encode_prompt("x")
+
+    assert pipe.dit.device == "cuda"
+    assert pipe.text_encoder.device == "cpu"
 
 
 def test_a_failed_encode_still_puts_the_encoder_back(service):

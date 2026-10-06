@@ -228,6 +228,44 @@ def duration_seconds(segments: int, fps: int = DEFAULT_FPS,
     return frames_for(segments, num_frames, cond_frames) / float(max(1, fps))
 
 
+def resolve_checkpoint(ref: str) -> str:
+    """A checkpoint reference resolved to a directory on disk.
+
+    models.json stores what the model page registered — "meituan-longcat/LongCat-Video",
+    a repo id, not a path. Everything downstream opens files BY PATH (config.json, the
+    VAE, the INT8 shards), so handing the id straight on made every load fail with
+    "checkpoint directory does not exist" before a byte was read.
+
+    Resolved against the HF hub cache by hand rather than through huggingface_hub, so
+    the server's 3.13 venv and the service's 3.10 venv cannot disagree about where the
+    weights are, and so a checkpoint that was never downloaded stays an error instead of
+    becoming a 74 GB download nobody asked for. An unresolvable reference is returned
+    unchanged, which leaves the existing "does not exist" message to name it.
+    """
+    import glob
+
+    if not ref:
+        return ref
+    path = os.path.expanduser(ref)
+    if os.path.isdir(path) or os.path.isabs(path) or "/" not in ref:
+        return path
+
+    roots = [os.environ[v] for v in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")
+             if os.environ.get(v)]
+    if os.environ.get("HF_HOME"):
+        roots.append(os.path.join(os.environ["HF_HOME"], "hub"))
+    roots.append(os.path.expanduser("~/.cache/huggingface/hub"))
+
+    folder = "models--" + ref.replace("/", "--")
+    for root in roots:
+        snaps = [d for d in glob.glob(os.path.join(root, folder, "snapshots", "*"))
+                 if os.path.isdir(d)]
+        if snaps:
+            # Newest wins, so a re-pulled revision beats a stale one left behind.
+            return max(snaps, key=os.path.getmtime)
+    return path
+
+
 def checkpoint_problems(checkpoint_dir: str, stages=()) -> list:
     """Human-readable reasons this directory cannot serve ``stages``, or [].
 

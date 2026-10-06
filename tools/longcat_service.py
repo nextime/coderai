@@ -360,7 +360,25 @@ def _place_pipeline(pipe, offload):
 
     inner = pipe.encode_prompt      # the bound method, before it is shadowed below
 
+    def _move_dit(device):
+        """The DiT and the LoRA networks hanging off it, the way upstream's to() does."""
+        if pipe.dit is None:
+            return
+        pipe.dit = pipe.dit.to(device, non_blocking=True)
+        if getattr(pipe.dit, "lora_dict", None):
+            for network in pipe.dit.lora_dict.values():
+                for lora in network.loras:
+                    lora.to(device, non_blocking=True)
+
     def encode_prompt(*args, **kwargs):
+        # They take TURNS. The INT8 DiT is 13.6 GB resident and the encoder is ~11 GB:
+        # bringing the encoder over while the DiT stays is 24.8 GB on a 24 GB card,
+        # which is the OOM that model offload exists to prevent. Peak is max(DiT,
+        # encoder), not their sum. The swap costs a round trip over PCIe, once per
+        # generation, against a denoising loop measured in minutes.
+        _move_dit("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
         pipe.text_encoder = pipe.text_encoder.to("cuda", non_blocking=True)
         try:
             return inner(*args, **kwargs)
@@ -370,11 +388,12 @@ def _place_pipeline(pipe, offload):
             pipe.text_encoder = pipe.text_encoder.to("cpu")
             gc.collect()
             torch.cuda.empty_cache()
+            _move_dit("cuda")
 
     # Set on the INSTANCE: all four generate_* methods call self.encode_prompt.
     pipe.encode_prompt = encode_prompt
-    log("offload: the DiT and VAE are resident; the text encoder (~11 GB) comes over "
-        "only to encode the prompt")
+    log("offload: the DiT and VAE are resident; the text encoder (~11 GB) and the DiT "
+        "swap places for encode_prompt so only one of them is ever on the card")
     return pipe
 
 
@@ -762,7 +781,7 @@ def generate(body: dict) -> dict:
         raise ValueError("prompt is required")
 
     stages = LC.resolve_stages(body.get("quality") or "fast", body.get("stage") or "")
-    checkpoint = body.get("model") or _state["model"]
+    checkpoint = LC.resolve_checkpoint(body.get("model") or _state["model"])
     problems = LC.checkpoint_problems(checkpoint, stages)
     if problems:
         raise ValueError("; ".join(problems))
