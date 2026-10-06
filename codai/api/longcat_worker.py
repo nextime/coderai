@@ -182,6 +182,13 @@ def resolve_source_dir(config: dict = None) -> Path:
     explicit = os.environ.get("CODERAI_LONGCAT_SRC")
     if explicit:
         return Path(os.path.expanduser(explicit))
+    # Vendored with coderai: third_party/longcat_video, MIT, pinned to a commit we
+    # tested against. Preferred over every fallback below so a fresh install — an
+    # image someone else pulls, a container, a pod — has the package already and
+    # never needs to clone an upstream repo. See third_party/README.md.
+    _vendored = Path(__file__).resolve().parents[2] / "third_party"
+    if (_vendored / "longcat_video").is_dir():
+        return _vendored
     if (_BAKED_SRC / "longcat_video").is_dir():
         return _BAKED_SRC
     return Path(os.path.expanduser("~/.coderai/LongCat-Video"))
