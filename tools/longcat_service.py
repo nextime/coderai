@@ -59,7 +59,7 @@ _lock = threading.RLock()
 _state = {
     "pipe": None, "model": "", "source": "", "dtype": "bfloat16",
     "family": "", "variant": "bf16", "use_int8": False, "use_distill": False,
-    "cp_split_hw": [1, 1], "audio_encoder": None,
+    "cp_split_hw": [1, 1], "audio_encoder": None, "base_model": "",
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
@@ -81,7 +81,10 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         if _state["pipe"] is not None:
             return _state["pipe"]
 
-        problems = LC.source_problems(source_dir) + LC.checkpoint_problems(checkpoint_dir)
+        _f = LC.family_of(checkpoint_dir)
+        problems = LC.source_problems(source_dir) + LC.checkpoint_problems(
+            checkpoint_dir, (), _f,
+            LC.shared_checkpoint(checkpoint_dir, _state.get("base_model") or ""))
         if problems:
             raise ValueError("; ".join(problems))
 
@@ -100,15 +103,22 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         td = {"bfloat16": torch.bfloat16, "float16": torch.float16,
               "float32": torch.float32}.get(str(dtype).lower(), torch.bfloat16)
         root = os.path.expanduser(checkpoint_dir)
+        family = LC.family_of(root)
+        # An avatar checkpoint ships a transformer and an audio encoder and nothing
+        # else — no tokenizer, no text_encoder, no vae. Upstream downloads the base
+        # repo alongside it and so do we: the shared components come from there, the
+        # scheduler and transformer from the avatar weights.
+        shared = LC.shared_checkpoint(root, _state.get("base_model") or "")
         log(f"loading from {root} (dtype={dtype}, offload={offload or 'none'}) …")
+        if family and shared != root:
+            log(f"family '{family}': tokenizer/text_encoder/vae from {shared}")
 
-        tokenizer = AutoTokenizer.from_pretrained(root, subfolder="tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(shared, subfolder="tokenizer")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            root, subfolder="text_encoder", torch_dtype=td)
-        vae = AutoencoderKLWan.from_pretrained(root, subfolder="vae", torch_dtype=td)
+            shared, subfolder="text_encoder", torch_dtype=td)
+        vae = AutoencoderKLWan.from_pretrained(shared, subfolder="vae", torch_dtype=td)
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             root, subfolder="scheduler")
-        family = LC.family_of(root)
         use_int8 = bool(_state.get("use_int8"))
         use_distill_lora = bool(_state.get("use_distill"))
 
@@ -143,7 +153,7 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                     log("WARNING: this torch has no float8_e4m3fn — loading in "
                         f"{dtype} instead")
             dit = LongCatVideoTransformer3DModel.from_pretrained(
-                root, subfolder="dit", **kw, **_dit_kwargs())
+                root, subfolder=LC.dit_subdir(family), **kw, **_dit_kwargs())
 
         if family:
             # The avatar families are a DIFFERENT pipeline class with its own methods
@@ -782,7 +792,10 @@ def generate(body: dict) -> dict:
 
     stages = LC.resolve_stages(body.get("quality") or "fast", body.get("stage") or "")
     checkpoint = LC.resolve_checkpoint(body.get("model") or _state["model"])
-    problems = LC.checkpoint_problems(checkpoint, stages)
+    _family = LC.family_of(checkpoint)
+    _shared = LC.shared_checkpoint(checkpoint, body.get("base_model")
+                                   or _state.get("base_model") or "")
+    problems = LC.checkpoint_problems(checkpoint, stages, _family, _shared)
     if problems:
         raise ValueError("; ".join(problems))
 
@@ -813,6 +826,8 @@ def generate(body: dict) -> dict:
     if problems:
         raise ValueError("; ".join(problems))
 
+    if body.get("base_model"):
+        _state["base_model"] = str(body["base_model"])
     _state.update(variant=variant, use_int8=use_int8, use_distill=use_distill_lora)
     pipe = load_pipeline(checkpoint, body.get("source") or _state["source"],
                          body.get("dtype") or _state["dtype"],
@@ -1073,6 +1088,9 @@ def main(argv=None):
     ap.add_argument("--offload", default="", help="'' | model | sequential")
     ap.add_argument("--attention", default="xformers",
                     help="xformers | flash | flash3 (falls back to what is installed)")
+    ap.add_argument("--base-model", default="",
+                    help="checkpoint holding tokenizer/text_encoder/vae for an avatar "
+                         "family; blank uses the upstream base repo")
     ap.add_argument("--bsa", default="off",
                     help="block-sparse attention: on | off | auto (auto stays off "
                          "when triton is missing instead of failing)")
@@ -1094,6 +1112,7 @@ def main(argv=None):
     # by default (requirements-longcat.txt installs xformers instead).
     os.environ.setdefault("LONGCAT_ATTENTION", args.attention)
     os.environ.setdefault("LONGCAT_BSA", args.bsa)
+    _state["base_model"] = args.base_model or ""
     # Validate both before anything slow happens: a bad value should not surface after
     # a multi-minute load.
     _bsa_enabled()

@@ -30,6 +30,19 @@ import os
 # from_pretrained call takes `checkpoint_dir` plus one of these subfolders.
 CHECKPOINT_SUBDIRS = ("tokenizer", "text_encoder", "vae", "scheduler", "dit")
 
+# The avatar checkpoints are a DiT and an audio encoder, nothing else: no tokenizer,
+# no text_encoder, no vae. Their README says so in its frontmatter
+# (`base_model: meituan-longcat/LongCat-Video`) and upstream's own instructions
+# download BOTH repos. So an avatar family borrows the shared components from the base
+# checkpoint and brings only its own transformer, scheduler and LoRA.
+SHARED_SUBDIRS = ("tokenizer", "text_encoder", "vae")
+AVATAR_OWN_SUBDIRS = ("scheduler",)
+# Their bf16 transformer is under base_model/, where the base checkpoint uses dit/.
+AVATAR_DIT_SUBDIR = "base_model"
+BASE_DIT_SUBDIR = "dit"
+# Where the shared components come from when none is configured.
+BASE_REPO = "meituan-longcat/LongCat-Video"
+
 # The two LoRAs that make stages 2 and 3 what they are, under `lora/`.
 LORA_FILES = {
     "distill": "lora/cfg_step_lora.safetensors",
@@ -266,7 +279,27 @@ def resolve_checkpoint(ref: str) -> str:
     return path
 
 
-def checkpoint_problems(checkpoint_dir: str, stages=()) -> list:
+def dit_subdir(family: str = "") -> str:
+    """Which subfolder holds the bf16 transformer for this family."""
+    return AVATAR_DIT_SUBDIR if family else BASE_DIT_SUBDIR
+
+
+def shared_checkpoint(checkpoint_dir: str = "", configured: str = "") -> str:
+    """Where tokenizer/text_encoder/vae come from.
+
+    For the base checkpoint that is itself. An avatar checkpoint does not ship them,
+    so it borrows them from the base weights — configured explicitly, or the upstream
+    repo id, which resolve_checkpoint() turns into a local snapshot.
+    """
+    if configured:
+        return resolve_checkpoint(configured)
+    if family_of(checkpoint_dir):
+        return resolve_checkpoint(BASE_REPO)
+    return checkpoint_dir
+
+
+def checkpoint_problems(checkpoint_dir: str, stages=(), family: str = "",
+                        shared_dir: str = "") -> list:
     """Human-readable reasons this directory cannot serve ``stages``, or [].
 
     Checked BEFORE loading: a missing subfolder otherwise surfaces minutes in, as a
@@ -278,9 +311,31 @@ def checkpoint_problems(checkpoint_dir: str, stages=()) -> list:
     root = os.path.expanduser(checkpoint_dir)
     if not os.path.isdir(root):
         return [f"checkpoint directory does not exist: {root}"]
-    for sub in CHECKPOINT_SUBDIRS:
-        if not os.path.isdir(os.path.join(root, sub)):
-            problems.append(f"missing {sub}/ in {root}")
+    if family:
+        # Its own parts…
+        for sub in AVATAR_OWN_SUBDIRS:
+            if not os.path.isdir(os.path.join(root, sub)):
+                problems.append(f"missing {sub}/ in {root}")
+        if not any(os.path.isdir(os.path.join(root, d))
+                   for d in (AVATAR_DIT_SUBDIR, INT8_SUBDIR)):
+            problems.append(
+                f"missing {AVATAR_DIT_SUBDIR}/ and {INT8_SUBDIR}/ in {root} — an "
+                f"avatar checkpoint needs at least one transformer")
+        # …and the shared ones, from wherever they were borrowed.
+        shared = os.path.expanduser(shared_dir or "")
+        if not shared or not os.path.isdir(shared):
+            problems.append(
+                f"the {family} checkpoint has no tokenizer/text_encoder/vae of its "
+                f"own and no base checkpoint was found to borrow them from "
+                f"(looked for {BASE_REPO})")
+        else:
+            for sub in SHARED_SUBDIRS:
+                if not os.path.isdir(os.path.join(shared, sub)):
+                    problems.append(f"missing {sub}/ in the base checkpoint {shared}")
+    else:
+        for sub in CHECKPOINT_SUBDIRS:
+            if not os.path.isdir(os.path.join(root, sub)):
+                problems.append(f"missing {sub}/ in {root}")
     for stage in stages:
         if stage == "distill":
             rel = LORA_FILES["distill"]

@@ -45,6 +45,7 @@ Per-model config keys (models.json entry, all optional)::
     "quality": "fast",             # draft | fast | best
     "offload_strategy": "",        # '' | model | sequential
     "bsa": "off",                  # block-sparse attention: on | off | auto
+    "base_model": "",              # avatar families borrow tokenizer/text_encoder/vae
     "cp_split_hw": "",             # context-parallel tile, e.g. "1x2"
     "used_vram_gb": 0,             # what to reserve before starting; 0 = measured
     "gpu_device": 0
@@ -494,6 +495,11 @@ def ensure_service(model_path: str, config: dict = None,
         split = str(config.get("cp_split_hw") or "").strip()
         if split:
             cmd += ["--cp-split-hw", split]
+        # An avatar checkpoint has no tokenizer/text_encoder/vae of its own; blank
+        # lets the service fall back to the upstream base repo.
+        base = str(config.get("base_model") or "").strip()
+        if base:
+            cmd += ["--base-model", base]
         if sec is not None and str(getattr(sec, "extra_args", "") or "").strip():
             import shlex
             cmd += shlex.split(str(sec.extra_args))
