@@ -4241,12 +4241,43 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     _stop = threading.Event()
     _done_steps = {"base": 0}
 
+    # Register like every other video path, so this generation appears on the Tasks
+    # page and can be cancelled there. It could not be before: the poll loop below
+    # claimed in its own docstring to "carry cancellation across the process
+    # boundary" and never did, so a LongCat render — the longest-running video job
+    # there is — was the only one nothing could stop.
+    _lc_steps = sum(lc.STAGE_DEFAULTS.get(_s, (0, 0))[0] for _s in stages) or 1
+    _tid = task_registry.register(
+        "video", title=(payload.get("prompt") or mode or "")[:80],
+        model=model_name or "", total=_lc_steps)
+    task_registry.start(_tid)
+    _cancelled = {"flag": False}
+
     def _poll():
         """Mirror the service's progress onto the engine's bar, and carry cancellation
-        and the thermal gate across the process boundary."""
+        across the process boundary.
+
+        The generation runs in another process, so cancelling cannot raise inside it:
+        stopping the SERVICE is what ends it, and the blocking generate() call then
+        returns with an error. That is also exactly what eviction does to it, so the
+        path is already exercised."""
         _seen_stage = ""
         while not _stop.wait(2.0):
             try:
+                if not _cancelled["flag"]:
+                    try:
+                        task_registry.raise_if_cancelled(_tid)
+                    except TaskCancelled:
+                        _cancelled["flag"] = True
+                        print(f"  [longcat] cancelled — stopping the service",
+                              flush=True)
+                        try:
+                            longcat_worker.stop_service(
+                                longcat_worker.service_key(model_path, model_cfg))
+                        except Exception as exc:                  # noqa: BLE001
+                            print(f"  [longcat] could not stop the service: {exc}",
+                                  flush=True)
+                        continue
                 p = longcat_worker.progress(model_path, model_cfg)
                 if not p or not p.get("active"):
                     continue
@@ -4256,7 +4287,9 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
                         _done_steps["base"] += lc.STAGE_DEFAULTS.get(
                             _seen_stage, (0, 0))[0]
                     _seen_stage = st
-                _vid_progress_step(_done_steps["base"] + int(p.get("step") or 0))
+                _step = _done_steps["base"] + int(p.get("step") or 0)
+                _vid_progress_step(_step)
+                task_registry.step(_tid, _step)
             except Exception:
                 pass
 
@@ -4265,9 +4298,20 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     try:
         data = await asyncio.to_thread(longcat_worker.generate, model_name, payload,
                                        model_cfg)
+    except Exception:
+        if _cancelled["flag"]:
+            task_registry.finish(_tid, "cancelled", "stopped on request")
+            raise HTTPException(status_code=499,
+                                detail="LongCat generation cancelled") from None
+        task_registry.finish(_tid, "error", "generation failed")
+        raise
     finally:
         _stop.set()
         _vid_progress_done()
+    if _cancelled["flag"]:
+        task_registry.finish(_tid, "cancelled", "stopped on request")
+        raise HTTPException(status_code=499, detail="LongCat generation cancelled")
+    task_registry.finish(_tid, "done")
 
     mp4_bytes = base64.b64decode(data.get("mp4_b64") or "")
     frames_made = data.get("num_frames")
