@@ -181,27 +181,77 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                 raise RuntimeError(
                     "use_distill needs the DiT's enable_loras() — this build of "
                     "longcat_video does not expose it")
-        # Offload is opt-in: the 13.6B DiT wants ~27 GB at bf16 and the reported peak for
-        # a full profile is ~41.6 GB, so a smaller card needs it. Not every build of the
-        # upstream pipeline exposes the diffusers hooks, hence the guarded calls.
-        placed = False
-        if offload in ("model", "sequential"):
-            fn = getattr(pipe, f"enable_{offload}_cpu_offload", None)
-            if callable(fn):
-                fn()
-                placed = True
-                log(f"{offload} CPU offload enabled")
-            else:
-                log(f"WARNING: this pipeline has no enable_{offload}_cpu_offload(); "
-                    f"loading fully on device instead")
-        if not placed:
-            if torch.cuda.is_available():
-                pipe.to("cuda")
-            else:
-                log("WARNING: no CUDA device visible — this will be extremely slow")
+        _place_pipeline(pipe, offload)
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
         return pipe
+
+
+def _place_pipeline(pipe, offload):
+    """Put the pipeline on the card, honouring the offload mode.
+
+    Upstream's LongCatVideoPipeline is a PLAIN OBJECT. Its docstring says "This model
+    inherits from [`DiffusionPipeline`]", but the class declaration inherits nothing, so
+    enable_model_cpu_offload() and enable_sequential_cpu_offload() do not exist on it.
+    Asking for either used to log a warning and then put everything on the card anyway —
+    which is how a 24 GB card came to be asked for ~45 GB, with the offload setting in
+    the model config doing nothing at all.
+
+    Full residency does not fit 24 GB even with an INT8 DiT: 13.6 GB of DiT, ~11.2 GB for
+    the UMT5-XXL encoder (5.6B, stored fp32, loaded bf16) and the VAE come to ~25 GB
+    before a single activation. But the encoder runs ONCE, to turn the prompt into
+    embeddings, and is dead weight for every denoising step after that. So offload keeps
+    it on the CPU and brings it over only for encode_prompt, which leaves the DiT — the
+    part that has to be fast — resident for the whole loop.
+    """
+    import gc
+    import torch
+
+    if not torch.cuda.is_available():
+        log("WARNING: no CUDA device visible — this will be extremely slow")
+        return pipe
+
+    if offload not in ("model", "sequential"):
+        pipe.to("cuda")
+        log("the whole pipeline is resident on the card")
+        return pipe
+    if offload == "sequential":
+        # Upstream has no per-submodule streaming to drive, and writing one would buy
+        # nothing here: the encoder is the only component that does not fit beside the
+        # DiT. Say what is actually being done rather than imply a deeper mode.
+        log("note: 'sequential' is served as model offload — the text encoder is the "
+            "only component that has to leave the card")
+
+    # Move everything EXCEPT the encoder, through upstream's own to() so the DiT's LoRA
+    # networks travel with it. Detaching the encoder first means it is never on the card
+    # and in host memory at the same time, which is the peak that has to be avoided.
+    encoder = pipe.text_encoder
+    pipe.text_encoder = None
+    try:
+        pipe.to("cuda")
+    finally:
+        pipe.text_encoder = encoder
+    if encoder is not None:
+        pipe.text_encoder = encoder.to("cpu")
+
+    inner = pipe.encode_prompt      # the bound method, before it is shadowed below
+
+    def encode_prompt(*args, **kwargs):
+        pipe.text_encoder = pipe.text_encoder.to("cuda", non_blocking=True)
+        try:
+            return inner(*args, **kwargs)
+        finally:
+            # finally, not just on success: leaving 11 GB stranded after a failed
+            # encode would make the retry the thing that OOMs.
+            pipe.text_encoder = pipe.text_encoder.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # Set on the INSTANCE: all four generate_* methods call self.encode_prompt.
+    pipe.encode_prompt = encode_prompt
+    log("offload: the DiT and VAE are resident; the text encoder (~11 GB) comes over "
+        "only to encode the prompt")
+    return pipe
 
 
 def _load_quantized_base_dit(root, subfolder, **kwargs):
