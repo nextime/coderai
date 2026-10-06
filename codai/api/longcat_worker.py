@@ -208,12 +208,33 @@ def _venv_ok(py: Path) -> bool:
     probe = ("import sys,torch,transformers;"
              "assert sys.version_info[:2]==(3,10);"
              "assert torch.__version__.startswith('2.6');"
-             "assert transformers.__version__.startswith('4.41')")
+             "assert transformers.__version__.startswith('4.41');"
+             "print(sys.version_info[0],sys.version_info[1],"
+             "torch.__version__,transformers.__version__)")
     try:
-        return subprocess.run([str(py), "-c", probe],
-                              capture_output=True, timeout=120).returncode == 0
-    except Exception:
+        # Importing torch 2.6 from a 6 GB venv takes ~106s on an IDLE machine and
+        # longer while the GPU box is busy, which is exactly when a generation is
+        # requested. The old 120s limit therefore expired under load, the timeout
+        # was caught as a failure, and a perfectly good venv was declared broken.
+        done = subprocess.run([str(py), "-c", probe], capture_output=True,
+                              text=True, timeout=900, env=_clean_py_env())
+    except subprocess.TimeoutExpired:
+        # NOT the same as a failed check: we could not finish asking. Saying the
+        # venv is wrong here is a lie, and it is the lie that sent three
+        # generations into a rebuild loop.
+        print(f"[longcat] the venv check at {py} did not finish in 900s — the box "
+              f"is probably loaded; treating it as unverified, not broken",
+              flush=True)
+        return None
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"[longcat] could not run the venv check: {exc}", flush=True)
         return False
+    if done.returncode == 0:
+        return True
+    detail = (done.stderr or done.stdout or "").strip().splitlines()
+    print(f"[longcat] the venv at {py.parent.parent} is not usable: "
+          f"{detail[-1] if detail else 'the probe failed with no output'}", flush=True)
+    return False
 
 
 def _clean_py_env() -> dict:
@@ -271,7 +292,11 @@ def ensure_built(config: dict = None) -> Path:
     """The interpreter the service runs under. Builds the venv only if allowed to."""
     venv = resolve_venv_dir(config)
     py = _venv_python(venv)
-    if py.exists() and _venv_ok(py):
+    # `is not False` on purpose: the check is tri-state. True is verified, False
+    # is a real mismatch, None means the probe could not finish (a loaded box —
+    # importing torch 2.6 takes ~106s idle). An unverified venv is used; only a
+    # verified-bad one is rebuilt.
+    if py.exists() and _venv_ok(py) is not False:
         return py
 
     sec = _cfg_section()
@@ -306,10 +331,11 @@ def ensure_built(config: dict = None) -> Path:
     _run_py310([str(py), "-m", "pip", "install", "-U", "pip"], "upgrading pip")
     _run_py310([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
                "installing requirements-longcat.txt")
-    if not _venv_ok(py):
+    if _venv_ok(py) is False:
         raise RuntimeError(
             f"the venv at {venv} was built but still does not report Python 3.10 with "
-            f"torch 2.6 / transformers 4.41")
+            f"torch 2.6 / transformers 4.41 — see the [longcat] line above for what "
+            f"it did report")
     return py
 
 
@@ -562,12 +588,27 @@ def resolve_train_venv(config: dict = None) -> Path:
     return inference.parent / (inference.name + "-train")
 
 
-def _train_venv_ok(py: Path) -> bool:
+def _train_venv_ok(py: Path):
+    """True / False / None, the same tri-state as _venv_ok and for the same reason:
+    importing simpletuner pulls its own torch, which is slow on a busy box, and a
+    timeout is not evidence that the venv is wrong."""
     try:
-        return subprocess.run([str(py), "-c", "import simpletuner"],
-                              capture_output=True, timeout=180).returncode == 0
-    except Exception:
+        done = subprocess.run([str(py), "-c", "import simpletuner"],
+                              capture_output=True, text=True, timeout=900,
+                              env=_clean_py_env())
+    except subprocess.TimeoutExpired:
+        print(f"[longcat] the training venv check at {py} did not finish in 900s — "
+              f"treating it as unverified, not broken", flush=True)
+        return None
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"[longcat] could not run the training venv check: {exc}", flush=True)
         return False
+    if done.returncode == 0:
+        return True
+    detail = (done.stderr or "").strip().splitlines()
+    print(f"[longcat] `import simpletuner` fails: "
+          f"{detail[-1] if detail else 'no output'}", flush=True)
+    return False
 
 
 def _venv_python_version(py: Path) -> tuple:
@@ -621,7 +662,7 @@ def ensure_train_built(config: dict = None) -> Path:
     """The interpreter SimpleTuner runs under. Builds it only if allowed to."""
     venv = resolve_train_venv(config)
     py = _venv_python(venv)
-    if py.exists() and _train_venv_ok(py):
+    if py.exists() and _train_venv_ok(py) is not False:
         return py
     sec = _cfg_section()
     auto = bool(getattr(sec, "train_auto_build", False)) if sec is not None else False
@@ -663,9 +704,9 @@ def ensure_train_built(config: dict = None) -> Path:
     _run_py310([str(py), "-m", "pip", "install", "-U", "pip"], "upgrading pip")
     _run_py310([str(py), "-m", "pip", "install", "-r", str(_TRAIN_REQUIREMENTS)],
                "installing requirements-longcat-train.txt")
-    if not _train_venv_ok(py):
+    if _train_venv_ok(py) is False:
         raise RuntimeError(f"the training venv at {venv} was built but `import "
-                           f"simpletuner` still fails")
+                           f"simpletuner` still fails — see the [longcat] line above")
     return py
 
 

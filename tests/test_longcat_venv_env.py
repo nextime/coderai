@@ -160,3 +160,59 @@ def test_the_builder_rebuilds_an_unusable_training_venv():
     body = body[:body.index("\ndef ")]
     assert "_venv_python_version(py)" in body
     assert "rmtree" in body, "an unusable venv must be replaced, not reused"
+
+
+# ── a slow check is not a broken venv ───────────────────────────────────────
+# Measured: importing torch 2.6 from the 6.2 GB inference venv takes ~106s on an
+# IDLE box, against a 120s limit. Under the load that accompanies an actual
+# generation request it expired, the TimeoutExpired was caught as a failure, and
+# three generations were told
+#   "the venv ... was built but still does not report Python 3.10 with torch 2.6"
+# about a venv holding exactly torch 2.6.0+cu124 and transformers 4.41.0.
+
+import subprocess as _sp
+
+
+def _probe(monkeypatch, outcome):
+    def fake(*a, **kw):
+        if outcome == "timeout":
+            raise _sp.TimeoutExpired(cmd="probe", timeout=900)
+        if outcome == "boom":
+            raise OSError("exec failed")
+        rc, err = (0, "") if outcome == "ok" else (1, "AssertionError\n")
+        return _sp.CompletedProcess(args=["probe"], returncode=rc, stdout="", stderr=err)
+    monkeypatch.setattr(lw.subprocess, "run", fake)
+
+
+@pytest.mark.parametrize("probe_fn", ["_venv_ok", "_train_venv_ok"])
+def test_a_timeout_is_unverified_not_broken(monkeypatch, probe_fn, tmp_path):
+    _probe(monkeypatch, "timeout")
+    assert getattr(lw, probe_fn)(tmp_path / "bin" / "python") is None
+
+
+@pytest.mark.parametrize("probe_fn", ["_venv_ok", "_train_venv_ok"])
+def test_a_real_mismatch_is_still_false(monkeypatch, probe_fn, tmp_path):
+    _probe(monkeypatch, "bad")
+    assert getattr(lw, probe_fn)(tmp_path / "bin" / "python") is False
+
+
+@pytest.mark.parametrize("probe_fn", ["_venv_ok", "_train_venv_ok"])
+def test_a_passing_probe_is_true(monkeypatch, probe_fn, tmp_path):
+    _probe(monkeypatch, "ok")
+    assert getattr(lw, probe_fn)(tmp_path / "bin" / "python") is True
+
+
+def test_the_timeout_is_long_enough_for_a_cold_torch_import():
+    """106s measured idle; 120 was the old limit."""
+    src = (ROOT / "codai" / "api" / "longcat_worker.py").read_text(encoding="utf-8")
+    assert "timeout=120" not in src, "the limit that caused this is back"
+    assert src.count("timeout=900") >= 2
+
+
+def test_unverified_venvs_are_used_rather_than_rebuilt():
+    """The tri-state only helps if the call sites respect it."""
+    src = (ROOT / "codai" / "api" / "longcat_worker.py").read_text(encoding="utf-8")
+    assert "_venv_ok(py) is not False" in src
+    assert "_train_venv_ok(py) is not False" in src
+    assert "if not _venv_ok(py)" not in src
+    assert "if not _train_venv_ok(py)" not in src
