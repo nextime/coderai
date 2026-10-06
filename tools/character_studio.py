@@ -50,7 +50,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,6 +71,18 @@ DEFAULT_OUT_DIR = os.environ.get("CODERAI_CHARACTER_OUT", "character_output")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+
+# Ceiling for a URL the operator pastes. A browser upload is bounded by the file
+# they picked; a URL is bounded by nothing until we say so.
+MAX_FETCH_MB = 256
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface redirects instead of following them, so each hop can be re-checked
+    against the address rules rather than only the URL that was typed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 DEFAULT_NEGATIVE = (
     "different person, face morphing, distorted face, extra fingers, blurry, "
@@ -398,6 +412,10 @@ class CharacterStudio:
         self.client = CoderAIClient(args.base_url, args.api_key)
         self.lock = threading.Lock()
         self.jobs: dict[str, dict[str, Any]] = {}
+        # Pasted links are fetched BY THIS PROCESS, so by default every hop has to
+        # resolve to a public address — otherwise a link is a way to make the studio
+        # read coderai on 127.0.0.1 or anything else on the LAN.
+        self.allow_private_fetch = bool(getattr(args, "allow_private_fetch", False))
 
     # ── local mirror of a profile ───────────────────────────────────────────
     def char_dir(self, name: str) -> Path:
@@ -946,6 +964,8 @@ textarea{min-height:80px;resize:vertical}
 .btn.secondary{background:#2a3548;color:var(--ink);border:1px solid var(--line)}
 .btn.bad{background:var(--bad);color:#fff}
 .drop{border:2px dashed var(--line);border-radius:14px;padding:22px;text-align:center;color:var(--muted);cursor:pointer;background:#0e141d}
+.urlrow{display:flex;gap:8px;margin-top:10px}
+.urlrow input{flex:1;min-width:0}
 .drop.hot{border-color:var(--accent);color:var(--ink)}
 .files{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
 .pill{display:inline-block;padding:4px 9px;background:#111925;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}
@@ -982,6 +1002,11 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
       <label>Source photos / videos</label>
       <div class="drop" id="drop">Drop files here, or click to choose<br><span class="muted">jpg &middot; png &middot; webp &middot; mp4 &middot; mov &middot; mkv &middot; webm</span></div>
       <input id="picker" type="file" multiple accept="image/*,video/*" style="display:none">
+      <div class="urlrow">
+        <input id="url-input" type="url" placeholder="…or paste a link to a photo of the fighter"
+               title="The studio downloads it and uses it exactly like a file you picked">
+        <button id="url-add" type="button" class="btn ghost">Add from link</button>
+      </div>
       <div class="files" id="filelist"></div>
       <div class="chk"><input id="with_voice" type="checkbox"><span>Also clone the voice from the same footage (needs a video/audio source)</span></div>
       <label>Sample frames locally for videos over (MB)</label>
@@ -1113,6 +1138,29 @@ async function uploadFile(file){
   renderFiles();
 }
 async function addFiles(list){for(const f of list){await uploadFile(f)}}
+
+// A pasted link is fetched by the STUDIO, not the browser: it lands in the same
+// uploads directory and is then indistinguishable from a file that was picked.
+async function addFromUrl(){
+  const box=$('url-input'); const url=(box.value||'').trim();
+  if(!url){box.focus(); return}
+  const short=url.split('/').pop().split('?')[0]||url;
+  const entry={name:short,bytes:0,status:'fetching…'};
+  pending.push(entry); renderFiles();
+  try{
+    const r=await fetch(ROOT_PATH+'/api/fetch-url',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url})});
+    const d=await r.json();
+    if(d.error) throw new Error(d.error);
+    entry.path=d.path; entry.name=d.name||short; entry.bytes=d.bytes; entry.status=fmtMB(d.bytes);
+    box.value='';
+  }catch(e){
+    entry.status='failed: '+e.message; logln('Fetch failed for '+url+': '+e.message);
+  }
+  renderFiles();
+}
+$('url-add').onclick=addFromUrl;
+$('url-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addFromUrl()}});
 
 $('drop').onclick=()=>$('picker').click();
 $('picker').onchange=e=>addFiles(e.target.files);
@@ -1330,6 +1378,109 @@ def make_handler(studio: CharacterStudio):
             log(f"[upload] {name} -> {dest} ({written/1e6:.1f} MB)")
             return {"path": str(dest), "name": name, "bytes": written}
 
+        def _fetch_url(self, url: str, allow_private: bool = False) -> dict[str, Any]:
+            """Download a picture (or clip) the operator pasted a link to.
+
+            It lands in the same uploads/ directory as a browser upload and is
+            returned in the same shape, so the rest of the pipeline — face
+            extraction, the profile, the keyframes — cannot tell the difference.
+
+            Fetching a URL the operator supplies means the SERVER makes the
+            request, with the server's network reach. That is a real hole on a box
+            that also runs coderai on 127.0.0.1 and whatever else is on the LAN, so
+            by default every hop must resolve to a public address. --allow-private-
+            fetch turns that off for people pulling from their own NAS, and makes
+            it their decision rather than a silent default.
+            """
+            import ipaddress
+            import socket
+
+            def _check_host(parsed):
+                if parsed.scheme not in ("http", "https"):
+                    raise ValueError(f"only http(s) URLs are supported, not {parsed.scheme!r}")
+                host = parsed.hostname
+                if not host:
+                    raise ValueError("no host in URL")
+                if allow_private:
+                    return
+                try:
+                    infos = socket.getaddrinfo(host, None)
+                except OSError as exc:
+                    raise ValueError(f"cannot resolve {host}: {exc}") from None
+                for info in infos:
+                    ip = ipaddress.ip_address(info[4][0])
+                    if (ip.is_private or ip.is_loopback or ip.is_link_local
+                            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                        raise ValueError(
+                            f"{host} resolves to {ip}, which is not a public address "
+                            f"(use --allow-private-fetch if that is deliberate)")
+
+            limit = int(MAX_FETCH_MB * 1024 * 1024)
+            target = url.strip()
+            resp = None
+            # Redirects are followed by hand so EVERY hop is checked — a public URL
+            # that 302s to 127.0.0.1 is the usual way around a check done once.
+            for _hop in range(5):
+                parsed = urllib.parse.urlparse(target)
+                _check_host(parsed)
+                req = urllib.request.Request(target, headers={
+                    "User-Agent": "coderai-character-studio",
+                    "Accept": "image/*,video/*;q=0.8,*/*;q=0.5",
+                })
+                opener = urllib.request.build_opener(_NoRedirect)
+                try:
+                    resp = opener.open(req, timeout=20)
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (301, 302, 303, 307, 308) and exc.headers.get("Location"):
+                        target = urllib.parse.urljoin(target, exc.headers["Location"])
+                        continue
+                    raise ValueError(f"{exc.code} {exc.reason}") from None
+                except urllib.error.URLError as exc:
+                    raise ValueError(f"could not fetch: {exc.reason}") from None
+                break
+            if resp is None:
+                raise ValueError("too many redirects")
+
+            with resp:
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                declared = int(resp.headers.get("Content-Length") or 0)
+                if declared and declared > limit:
+                    raise ValueError(f"{declared/1e6:.0f} MB exceeds the {MAX_FETCH_MB} MB limit")
+                # Prefer the URL's own extension; fall back to the content type, since
+                # plenty of image URLs carry no suffix at all.
+                name = os.path.basename(urllib.parse.urlparse(target).path) or "fetched"
+                suffix = Path(name).suffix.lower()
+                if suffix not in IMAGE_EXTS | VIDEO_EXTS:
+                    suffix = mimetypes.guess_extension(ctype) or ""
+                    if suffix == ".jpe":
+                        suffix = ".jpg"
+                    name = Path(name).stem + suffix
+                if suffix not in IMAGE_EXTS | VIDEO_EXTS:
+                    raise ValueError(
+                        f"that URL is {ctype or 'of unknown type'}, not a picture or a clip")
+
+                uploads = studio.out_dir / "uploads"
+                uploads.mkdir(parents=True, exist_ok=True)
+                dest = uploads / f"{uuid.uuid4().hex[:10]}_{safe_slug(Path(name).stem)}{suffix}"
+                written = 0
+                with dest.open("wb") as fh:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > limit:
+                            fh.close()
+                            dest.unlink(missing_ok=True)
+                            raise ValueError(
+                                f"the file is larger than the {MAX_FETCH_MB} MB limit")
+                        fh.write(chunk)
+            if not written:
+                dest.unlink(missing_ok=True)
+                raise ValueError("the URL returned an empty file")
+            log(f"[fetch] {target} -> {dest} ({written/1e6:.1f} MB)")
+            return {"path": str(dest), "name": name, "bytes": written}
+
         def _serve_media(self, rel: str) -> None:
             path = (studio.out_dir / urllib.parse.unquote(rel)).resolve()
             if not str(path).startswith(str(studio.out_dir.resolve())) or not path.is_file():
@@ -1375,7 +1526,12 @@ def make_handler(studio: CharacterStudio):
                     self._json(self._save_upload())
                     return
                 payload = self._read_json()
-                if path == "/api/extract":
+                if path == "/api/fetch-url":
+                    url = (payload.get("url") or "").strip()
+                    if not url:
+                        raise ValueError("a URL is required")
+                    self._json(self._fetch_url(url, allow_private=studio.allow_private_fetch))
+                elif path == "/api/extract":
                     self._json({"job_id": studio.start_job("extract", studio.extract_job, payload)})
                 elif path == "/api/video":
                     self._json({"job_id": studio.start_job("video", studio.video_job, payload)})
@@ -1586,6 +1742,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
     p_web.add_argument("--web-port", type=int, default=7791, help="Listen port")
     p_web.add_argument("--browser", action="store_true", help="Open a browser after startup")
+    p_web.add_argument("--allow-private-fetch", action="store_true",
+                       help="Let 'Add from link' reach private/loopback addresses. Off by "
+                            "default: the studio makes that request itself, so a link "
+                            "would otherwise be a way to pull from 127.0.0.1 or the LAN. "
+                            "Turn it on to fetch from your own NAS.")
 
     return parser
 
