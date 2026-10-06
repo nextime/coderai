@@ -6083,6 +6083,31 @@ def launch_web_ui(default_args):
                               wait=False, session=session)
                 if is_video:
                     kwargs["target"] = "video"
+                    # LongCat trains through SimpleTuner, which needs a captioned
+                    # VIDEO dataset. The batch stage (step 4b) builds one from the
+                    # rendered clips; this per-profile button has to do the same, or
+                    # the server refuses the job — which is exactly what it did.
+                    if _is_longcat_model(model):
+                        try:
+                            _res = (getattr(default_args, "video_size", "832x480")
+                                    or "832x480").lower().split("x")
+                            _short = min(int(_res[0]), int(_res[1]))
+                        except Exception:
+                            _short = 480
+                        _ds, _why = build_video_dataset(
+                            out_dir, kind, name, slug,
+                            num_frames=getattr(default_args, "dataset_frames",
+                                               DATASET_FRAMES),
+                            resolution=_short,
+                            min_clips=getattr(default_args, "dataset_min_clips",
+                                              DATASET_MIN_CLIPS))
+                        if _ds is None:
+                            raise RuntimeError(
+                                f"cannot train a LongCat video LoRA for '{name}': {_why}. "
+                                f"Render some match clips first (step 6) — the dataset is "
+                                f"built from the clips and the prompts they came from.")
+                        _web_log(f"    dataset: {_why} → {_ds}")
+                        kwargs["dataset_config"] = str(_ds)
                 else:
                     _tbm = getattr(default_args, "lora_train_base_model", None) or None
                     if _tbm:

@@ -164,3 +164,23 @@ def test_the_default_frame_count_obeys_the_vae_rule():
 ])
 def test_longcat_detection(model, expected):
     assert TW._is_longcat_model(model) is expected
+
+
+def test_both_training_paths_build_a_dataset_for_longcat():
+    """The batch stage (step 4b) and the per-profile Train button are separate code
+    paths. Only the first built a dataset, so training one fighter from the
+    Characters page still reached the server with no dataset_config and was
+    refused — the same error, from the button nobody had wired.
+    """
+    src = (ROOT / "tools" / "gen_township_fighters.py").read_text(encoding="utf-8")
+    # the batch stage
+    assert "dataset_config=(str(dataset) if dataset else None)" in src
+    # the per-profile button
+    assert 'kwargs["dataset_config"] = str(_ds)' in src
+    assert src.count("build_video_dataset(") >= 3   # definition + both call sites
+
+
+def test_the_per_profile_path_explains_what_to_do_when_it_cannot_build_one():
+    src = (ROOT / "tools" / "gen_township_fighters.py").read_text(encoding="utf-8")
+    assert "cannot train a LongCat video LoRA" in src
+    assert "Render some match clips first" in src
