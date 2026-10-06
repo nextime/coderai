@@ -114,3 +114,49 @@ def test_the_manual_instructions_name_the_right_version():
     body = src[src.index("def ensure_train_built("):]
     body = body[:body.index("\ndef ")]
     assert "python3.12+" in body and "python3.10> -m venv" not in body
+
+
+# ── a venv built by the wrong interpreter ───────────────────────────────────
+
+def _fake_venv(tmp_path, version):
+    (tmp_path / "bin").mkdir(parents=True)
+    (tmp_path / "pyvenv.cfg").write_text(
+        f"home = /somewhere/bin\ninclude-system-site-packages = false\n"
+        f"version = {version}\n")
+    return tmp_path / "bin" / "python"
+
+
+@pytest.mark.parametrize("version,expected", [
+    ("3.10.18", (3, 10)), ("3.13.5", (3, 13)), ("3.12.1", (3, 12)),
+])
+def test_a_venvs_version_is_read_from_its_config(tmp_path, version, expected):
+    """Read, not executed: the interpreter that built it may be gone, and a failed
+    exec would look the same as an incomplete venv."""
+    assert lw._venv_python_version(_fake_venv(tmp_path, version)) == expected
+
+
+def test_an_unreadable_venv_reports_nothing_rather_than_guessing(tmp_path):
+    (tmp_path / "bin").mkdir(parents=True)
+    assert lw._venv_python_version(tmp_path / "bin" / "python") == ()
+    (tmp_path / "pyvenv.cfg").write_text("home = /x\n")       # no version line
+    assert lw._venv_python_version(tmp_path / "bin" / "python") == ()
+
+
+def test_the_stale_venv_left_by_the_310_attempt_is_detected(tmp_path):
+    """The exact leftover: the failed 3.10 run created the directory, so creation
+    would be skipped and pip would install into 3.10 again, forever."""
+    v = lw._venv_python_version(_fake_venv(tmp_path, "3.10.18"))
+    assert v and not ((3, 12) <= v < (3, 15)), "this must be seen as unusable"
+
+
+def test_a_good_venv_is_left_alone(tmp_path):
+    v = lw._venv_python_version(_fake_venv(tmp_path, "3.13.5"))
+    assert (3, 12) <= v < (3, 15)
+
+
+def test_the_builder_rebuilds_an_unusable_training_venv():
+    src = (ROOT / "codai" / "api" / "longcat_worker.py").read_text(encoding="utf-8")
+    body = src[src.index("def ensure_train_built("):]
+    body = body[:body.index("\ndef ")]
+    assert "_venv_python_version(py)" in body
+    assert "rmtree" in body, "an unusable venv must be replaced, not reused"

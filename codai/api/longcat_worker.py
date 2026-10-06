@@ -570,6 +570,25 @@ def _train_venv_ok(py: Path) -> bool:
         return False
 
 
+def _venv_python_version(py: Path) -> tuple:
+    """(major, minor) of a venv's interpreter, or () if it cannot be determined.
+
+    Read from pyvenv.cfg rather than by running it: the venv may have been built by
+    an interpreter that is no longer there, and a failed exec would be
+    indistinguishable from a venv that is merely incomplete.
+    """
+    cfg = Path(py).parent.parent / "pyvenv.cfg"
+    try:
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() in ("version", "version_info"):
+                parts = value.strip().split(".")
+                return (int(parts[0]), int(parts[1]))
+    except (OSError, ValueError, IndexError):
+        pass
+    return ()
+
+
 def _find_train_python(config: dict = None) -> Optional[str]:
     """An interpreter SimpleTuner can be installed into.
 
@@ -622,6 +641,20 @@ def ensure_train_built(config: dict = None) -> Path:
             f"longcat.train_auto_build is on but no Python 3.12-3.14 was found for "
             f"SimpleTuner (this process is {sys.version_info.major}."
             f"{sys.version_info.minor}) — set longcat.train_python to one.")
+    # A venv left by an interpreter SimpleTuner cannot use is worse than no venv:
+    # creation is skipped because the directory exists, pip installs into the wrong
+    # Python, and it fails identically forever. Not hypothetical — the 3.10 attempt
+    # that produced "No matching distribution found for simpletuner" left exactly
+    # that behind.
+    existing = _venv_python_version(py) if venv.exists() else ()
+    if existing and not ((3, 12) <= existing < (3, 15)):
+        import shutil as _shutil
+        print(f"[longcat] the training venv at {venv} is Python "
+              f"{existing[0]}.{existing[1]}, which SimpleTuner cannot use — "
+              f"rebuilding it", flush=True)
+        _shutil.rmtree(venv, ignore_errors=True)
+        py = _venv_python(venv)
+
     if not py.exists():
         print(f"[longcat] creating the training venv at {venv} …", flush=True)
         venv.parent.mkdir(parents=True, exist_ok=True)
