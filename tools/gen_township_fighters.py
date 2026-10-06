@@ -813,6 +813,42 @@ def _is_fatal(err: Exception) -> bool:
 # CoderAI API client
 # ─────────────────────────────────────────────────────────────────────────────
 
+def resolve_api_key(args=None, out_dir=None):
+    """The Bearer token to talk to CoderAI with, from the first place that has one.
+
+    CoderAI gates every /v1 endpoint the same way, with no exemption for loopback —
+    so the bundled tools, which call 127.0.0.1 from inside the same container, need
+    a token exactly like a remote client does. The container launches this tool
+    without --api-key, which is why "train a video LoRA" came back as a bare 401.
+
+    Order: the running options (set by --api-key, by a saved config, or by the
+    Connection card) → the config file on disk → CODERAI_API_KEY in the
+    environment, which is how a launcher can supply it without a config edit.
+    """
+    key = (getattr(args, "api_key", None) or "").strip() if args is not None else ""
+    if key:
+        return key
+    candidates = []
+    if args is not None:
+        if getattr(args, "config", None):
+            candidates.append(getattr(args, "config"))
+        if getattr(args, "out_dir", None):
+            candidates.append(Path(args.out_dir) / "township_config.json")
+    if out_dir:
+        candidates.append(Path(out_dir) / "township_config.json")
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            with open(candidate, encoding="utf-8") as fh:
+                key = (json.load(fh).get("api_key") or "").strip()
+            if key:
+                return key
+        except (OSError, ValueError, TypeError):
+            pass
+    return (os.environ.get("CODERAI_API_KEY") or "").strip() or None
+
+
 class CoderAIClient:
     def __init__(self, base_url: str, api_key: Optional[str] = None, timeout: int = 7200):
         self.base = base_url.rstrip("/")
@@ -824,6 +860,12 @@ class CoderAIClient:
     def _post(self, path: str, body: dict, timeout: int = None) -> dict:
         r = self.session.post(f"{self.base}{path}", json=body,
                               timeout=timeout if timeout is not None else self.timeout)
+        if r.status_code == 401:
+            raise RuntimeError(
+                f"POST {path} → 401: CoderAI has authentication enabled and this tool "
+                f"has no API key. Put one in the Connection card on the Run page and "
+                f"press 'Save config' (or start it with --api-key, or set "
+                f"CODERAI_API_KEY).")
         if not r.ok:
             raise RuntimeError(f"POST {path} → {r.status_code}: {r.text[:400]}")
         return r.json()
@@ -5524,7 +5566,7 @@ def launch_web_ui(default_args):
         stem   = fpath.stem
         suffix = fpath.suffix
         client = CoderAIClient(default_args.base_url,
-                               getattr(default_args, 'api_key', None),
+                                   resolve_api_key(default_args),
                                timeout=7200)
 
         def _set_progress(pct, msg=""):
@@ -5643,7 +5685,7 @@ def launch_web_ui(default_args):
             size, _ref_steps = _ref_gen_res_steps(default_args)
 
             client = CoderAIClient(default_args.base_url,
-                                   getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
             _prog(8, "selecting image model…")
             model = getattr(default_args, "image_model", None)
             if not model:
@@ -5742,7 +5784,7 @@ def launch_web_ui(default_args):
             # Honour the Run-page resolution + steps (keyframe_size/keyframe_steps).
             size, _ref_steps = _ref_gen_res_steps(default_args)
             client = CoderAIClient(default_args.base_url,
-                                   getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
             _prog(8, "selecting image model…")
             model = getattr(default_args, "image_model", None)
             if not model:
@@ -5896,7 +5938,7 @@ def launch_web_ui(default_args):
             # ── Prompts-only: write the fight-clip + outcome prompts and stop. ────
             _prog(8, "preparing text model…")
             client = CoderAIClient(default_args.base_url,
-                                   getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
             text_model = None
             if not getattr(default_args, "no_llm", False):
                 try:
@@ -5987,7 +6029,7 @@ def launch_web_ui(default_args):
 
         try:
             client = CoderAIClient(default_args.base_url,
-                                   getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
             _prog(4, f"selecting {'video' if is_video else 'image'} model…")
             if is_video:
                 model = getattr(default_args, "video_model", None)
@@ -6356,7 +6398,7 @@ def launch_web_ui(default_args):
                     return
                 _prog(8, "preparing text model…")
                 client = CoderAIClient(default_args.base_url,
-                                       getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
                 # Auto-select a text model like a fresh run (config text_model is
                 # usually null) so prompts are LLM-generated, not static templates.
                 text_model = None
@@ -6437,7 +6479,7 @@ def launch_web_ui(default_args):
                     return
                 _prog(8, "preparing text model…")
                 client = CoderAIClient(default_args.base_url,
-                                       getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
                 text_model = None
                 if not getattr(default_args, "no_llm", False):
                     try:
@@ -6484,7 +6526,7 @@ def launch_web_ui(default_args):
                     return
                 _prog(8, "preparing text model…")
                 client = CoderAIClient(default_args.base_url,
-                                       getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
                 text_model = None
                 if not getattr(default_args, "no_llm", False):
                     try:
@@ -6558,7 +6600,7 @@ def launch_web_ui(default_args):
                     return
                 _prog(8, "preparing text model…")
                 client = CoderAIClient(default_args.base_url,
-                                       getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
                 text_model = None
                 if not getattr(default_args, "no_llm", False):
                     try:
@@ -6600,7 +6642,7 @@ def launch_web_ui(default_args):
 
             # ── Render scopes: need the video model + consistency settings ─────
             client = CoderAIClient(default_args.base_url,
-                                   getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
             _prog(5, "selecting video model…")
             video_model = getattr(default_args, "video_model", None)
             if not video_model:
@@ -8430,7 +8472,7 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             return _video_model_cache["id"]
         try:
             client = CoderAIClient(default_args.base_url,
-                                   getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
             vm = pick_model(client, "video", None)
         except Exception:
             vm = ""
@@ -10742,7 +10784,7 @@ async function resetPrompts(ev){
                                _j.dumps({"error": "invalid kind"})); return
                 existing = [p["name"] for p in _list_profiles(kind)]
                 client = CoderAIClient(default_args.base_url,
-                                       getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
                 text_model = None
                 if not getattr(default_args, "no_llm", False):
                     try:
@@ -11508,7 +11550,7 @@ async function resetPrompts(ev){
                 synced = True
                 try:
                     client = CoderAIClient(default_args.base_url,
-                                           getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
                     client.patch_profile(kind, name, add_images=added_uris)
                 except Exception:
                     synced = False
@@ -11545,7 +11587,7 @@ async function resetPrompts(ev){
 
                 base = out_dir / (kind + "s") / name
                 client = CoderAIClient(default_args.base_url,
-                                       getattr(default_args, "api_key", None))
+                                   resolve_api_key(default_args))
 
                 if path == "/profile/delete":
                     try:
