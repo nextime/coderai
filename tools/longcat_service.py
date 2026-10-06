@@ -562,13 +562,18 @@ def generate(body: dict) -> dict:
         raise ValueError(f"unknown task {task!r}; expected t2v, i2v, vc, "
                          f"{' or '.join(LC.AVATAR_TASKS)}")
 
-    # Variant and family gating BEFORE loading: INT8 and the DMD distillation exist only
-    # for avatar-1.5, and asking for them elsewhere would quietly load something else.
+    # Variant and family gating BEFORE loading, so an unsupported combination is an
+    # error rather than a quietly different model. INT8 is allowed wherever the
+    # weights exist — upstream ships them for avatar-1.5, and the model page can
+    # build them for anything else.
     family = LC.family_of(checkpoint)
     variant = str(body.get("variant") or "bf16").strip().lower()
     use_int8 = bool(body.get("use_int8")) or variant == "int8"
     use_distill_lora = bool(body.get("use_distill"))
-    problems = LC.variant_problems(variant, family, use_int8, use_distill_lora)
+    # The checkpoint is passed so a locally built base_model_int8/ counts as INT8
+    # being available, not just upstream's avatar-1.5 build.
+    problems = LC.variant_problems(variant, family, use_int8, use_distill_lora,
+                                   checkpoint_dir=checkpoint)
     if task in LC.AVATAR_TASKS:
         problems += LC.avatar_problems(checkpoint, family, use_int8, use_distill_lora)
     elif family:

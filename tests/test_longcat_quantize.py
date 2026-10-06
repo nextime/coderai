@@ -95,3 +95,50 @@ def test_quantising_is_not_the_default_anywhere():
     for path in (SERVICE, WORKER):
         src = path.read_text(encoding="utf-8")
         assert not re.search(r'use_int8["\']?\s*[:=]\s*True', src), path.name
+
+
+# ── the gate that decides whether INT8 may be SERVED ────────────────────────
+
+import sys as _sys
+_sys.path.insert(0, str(ROOT / "tools"))
+LC = pytest.importorskip("longcat_common")
+
+
+def _ckpt(tmp_path, with_int8=False):
+    if with_int8:
+        (tmp_path / LC.INT8_SUBDIR).mkdir(parents=True)
+    return str(tmp_path)
+
+
+def test_int8_is_refused_on_a_base_checkpoint_that_has_none(tmp_path):
+    """Upstream ships INT8 only for avatar-1.5, so without built weights this is a
+    request for something that does not exist."""
+    problems = LC.variant_problems("int8", "", checkpoint_dir=_ckpt(tmp_path))
+    assert problems and "Build INT8 weights" in problems[0]
+
+
+def test_int8_is_allowed_once_the_weights_have_been_built(tmp_path):
+    """The regression this guards: the quantise button produces base_model_int8/ for
+    a BASE checkpoint, and the gate used to reject it anyway because the family was
+    not avatar-1.5 — so the weights could be built and never served."""
+    assert LC.variant_problems("int8", "", checkpoint_dir=_ckpt(tmp_path, True)) == []
+
+
+def test_use_int8_follows_the_same_rule_as_the_variant(tmp_path):
+    assert LC.variant_problems("bf16", "", use_int8=True,
+                               checkpoint_dir=_ckpt(tmp_path)) != []
+    assert LC.variant_problems("bf16", "", use_int8=True,
+                               checkpoint_dir=_ckpt(tmp_path, True)) == []
+
+
+def test_upstreams_avatar_int8_still_needs_no_local_build():
+    assert LC.variant_problems("int8", "avatar-1.5") == []
+
+
+def test_bf16_is_never_gated(tmp_path):
+    assert LC.variant_problems("bf16", "", checkpoint_dir=_ckpt(tmp_path)) == []
+
+
+def test_the_service_passes_the_checkpoint_to_the_gate():
+    src = SERVICE.read_text(encoding="utf-8")
+    assert "checkpoint_dir=checkpoint" in src, "the gate cannot see the built weights"

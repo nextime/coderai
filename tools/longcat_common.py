@@ -108,7 +108,7 @@ def family_of(model_path: str = "", variant: str = "") -> str:
 
 
 def variant_problems(variant: str, family: str = "", use_int8: bool = False,
-                     use_distill: bool = False) -> list:
+                     use_distill: bool = False, checkpoint_dir: str = "") -> list:
     """Reasons this combination cannot be served, or [].
 
     Checked before loading so an unsupported flag is an error the operator can act on,
@@ -121,10 +121,18 @@ def variant_problems(variant: str, family: str = "", use_int8: bool = False,
         problems.append(
             "the GGUF variants are packaged for ComfyUI's gguf loader, which coderai "
             "does not implement — use bf16, fp8, or the official int8 (avatar-1.5)")
-    if (v == "int8" or use_int8) and family not in INT8_FAMILIES:
-        problems.append(
-            f"INT8 weights exist only for {'/'.join(INT8_FAMILIES)}; this checkpoint "
-            f"reads as {family or 'the base model'}")
+    if v == "int8" or use_int8:
+        # Upstream SHIPS int8 only for avatar-1.5 — but the model page can now build
+        # it for any checkpoint (tools/longcat_quantize.py), so what decides this is
+        # whether the weights are actually there, not which family wrote them.
+        built = bool(checkpoint_dir) and os.path.isdir(
+            os.path.join(os.path.expanduser(checkpoint_dir), INT8_SUBDIR))
+        if not built and family not in INT8_FAMILIES:
+            problems.append(
+                f"no {INT8_SUBDIR}/ in this checkpoint, and upstream ships INT8 only "
+                f"for {'/'.join(INT8_FAMILIES)} (this reads as "
+                f"{family or 'the base model'}) — use “Build INT8 weights” on the "
+                f"model page first")
     if use_distill and family and family not in DMD_FAMILIES:
         problems.append(
             f"the DMD distillation exists only for {'/'.join(DMD_FAMILIES)}; "
