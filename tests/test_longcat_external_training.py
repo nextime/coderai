@@ -113,3 +113,27 @@ def test_progress_from_the_worker_is_accepted(monkeypatch, dataset):
     loras._train_externally("longcat", _req(dataset_config=str(dataset)),
                             "/models/longcat", [], "p", 10, 4, "480x832", 1e-4, 1)
     assert got and got[0]["step"] == 3 and got[0]["total"] == 9
+
+
+# ── how SimpleTuner is actually invoked ─────────────────────────────────────
+
+def test_the_config_is_handed_over_the_way_simpletuner_reads_it():
+    """SimpleTuner takes no --config. Its loader picks a configuration BACKEND and
+    asks that backend where to look; the JSON one reads CONFIG_PATH and otherwise
+    defaults to ./config/config.json relative to cwd. Passing --config produced:
+
+        ValueError: JSON configuration file not found. Paths tried: config/config.json
+    """
+    src = (ROOT / "tools" / "longcat_train.py").read_text(encoding="utf-8")
+    assert '"--config", str(cfg_path)' not in src, "that argument is ignored"
+    assert 'env["CONFIG_PATH"] = str(cfg_path)' in src
+    assert 'env["SIMPLETUNER_CONFIG_BACKEND"] = "json"' in src
+    assert "env=env" in src, "the environment must reach the child"
+
+
+def test_the_config_is_also_written_where_the_default_lookup_finds_it():
+    """Belt and braces: if a loader change ignored CONFIG_PATH, the default
+    ./config/config.json is there too."""
+    src = (ROOT / "tools" / "longcat_train.py").read_text(encoding="utf-8")
+    assert 'fallback = workdir / "config"' in src
+    assert '(fallback / "config.json").write_text' in src

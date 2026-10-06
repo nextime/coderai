@@ -133,9 +133,27 @@ def main(argv=None) -> int:
                      + (f", base {cfg['base_model_precision']}"
                         if cfg.get("base_model_precision") else ", bf16 base"))
 
-        cmd = [sys.executable, "-m", "simpletuner.train", "--config", str(cfg_path)]
+        # SimpleTuner does NOT take --config. Its loader picks a configuration
+        # BACKEND and then asks that backend where to look; the JSON one reads
+        # CONFIG_PATH (a file, or a directory holding config.json) and otherwise
+        # defaults to ./config/config.json relative to the working directory —
+        # which is what produced
+        #   ValueError: JSON configuration file not found. Paths tried: config/config.json
+        # So the backend is named explicitly and the path handed over in the
+        # environment, rather than as an argument it ignores.
+        env = os.environ.copy()
+        env["SIMPLETUNER_CONFIG_BACKEND"] = "json"
+        env["CONFIG_PATH"] = str(cfg_path)
+        # Belt and braces: the default lookup is ./config/config.json relative to
+        # cwd, so the same file is placed there too. A loader change that ignored
+        # CONFIG_PATH would still find it.
+        fallback = workdir / "config"
+        fallback.mkdir(parents=True, exist_ok=True)
+        (fallback / "config.json").write_text(json.dumps(cfg, indent=2))
+
+        cmd = [sys.executable, "-m", "simpletuner.train"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, cwd=str(workdir))
+                                text=True, bufsize=1, cwd=str(workdir), env=env)
         total = int(cfg["max_train_steps"])
         last = -1
         tail = []
