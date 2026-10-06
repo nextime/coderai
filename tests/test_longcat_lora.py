@@ -126,27 +126,35 @@ def test_the_default_precision_is_quantised():
 
 
 # ---------------------------------------------------------------- the constraints
-@pytest.mark.parametrize("frames", [93, 89, 85, 5, 1])
+@pytest.mark.parametrize("frames", [89, 97, 105, 9, 1])
 def test_valid_frame_counts_pass(frames):
-    """(num_frames - 1) must be divisible by 4 — the VAE's rule, the same 4n+1 coderai
-    already applies to Wan."""
+    """(num_frames - 1) must be divisible by 8. SimpleTuner's rule is stricter than
+    generation's 4n+1 and it rounds down silently, so a clip length that is only
+    4n+1 has to be refused here with the reason."""
     assert T.frame_problems(frames, "480x832") == []
 
 
-@pytest.mark.parametrize("frames", [90, 92, 0, 2])
+@pytest.mark.parametrize("frames", [93, 85, 90, 92, 0, 2])
 def test_invalid_frame_counts_are_caught_before_the_run(frames):
     probs = T.frame_problems(frames, "480x832")
-    assert probs and "4n+1" in probs[0]
+    assert probs and "8n+1" in probs[0]
+
+
+def test_a_valid_clip_length_can_still_be_an_invalid_training_length():
+    """93 frames is what the generator produces and what the datasets hold; saying
+    only "invalid" about it sends you looking in the wrong place."""
+    probs = T.frame_problems(93, "480x832")
+    assert probs and "4n+1" in probs[0], "say why a good clip is a bad sample"
 
 
 def test_sides_must_clear_the_vae_stride():
-    assert T.frame_problems(93, "481x832")
-    assert T.frame_problems(93, "480x833")
-    assert T.frame_problems(93, "720x1280") == []
+    assert T.frame_problems(89, "481x832")
+    assert T.frame_problems(89, "480x833")
+    assert T.frame_problems(89, "720x1280") == []
 
 
 def test_a_malformed_resolution_is_reported():
-    assert T.frame_problems(93, "big")
+    assert T.frame_problems(89, "big")
 
 
 # ---------------------------------------------------------------- the venv
@@ -219,7 +227,11 @@ def test_the_trainer_reports_the_adapter_it_wrote():
 
 def test_a_nonzero_exit_is_a_failure_with_the_tail():
     src = (ROOT / "tools/longcat_train.py").read_text()
-    assert "SimpleTuner exited" in src and "Last output" in src
+    assert "SimpleTuner exited" in src
+    # the tail is kept bounded, and the error lines are picked out of it so the
+    # message says what went wrong instead of ending on a progress bar
+    assert "del tail[:-25]" in src
+    assert "_signal" in src
 
 
 def test_the_int8_loader_is_imported_from_the_right_module():

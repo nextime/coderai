@@ -44,7 +44,8 @@ def test_the_provenance_pins_a_commit():
 def test_nothing_compiled_or_heavy_was_vendored():
     """Source only: no weights, no wheels, no .so — it must stay reviewable and
     small enough to live in the repo."""
-    files = [p for p in (VENDOR / "longcat_video").rglob("*") if p.is_file()]
+    files = [p for p in (VENDOR / "longcat_video").rglob("*")
+             if p.is_file() and "__pycache__" not in p.parts]
     assert files, "nothing vendored"
     non_py = [p for p in files if p.suffix != ".py"]
     assert not non_py, f"non-source files vendored: {non_py[:5]}"
