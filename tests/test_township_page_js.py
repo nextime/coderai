@@ -92,3 +92,66 @@ def test_the_template_picker_is_filled_on_load(page):
     init = page.split("Restore state on page load", 1)
     assert len(init) == 2, "the page-load init block is gone"
     assert "tplRefresh();" in init[1][:600], "nothing fills the picker on load"
+
+
+# ── adding reference photos to a fighter ────────────────────────────────────
+# The page has had a file picker and a working /profile/upload-image endpoint all
+# along; what made it look missing is that the whole <script> was dead, so the
+# button did nothing. A link source now feeds the same endpoint.
+
+import json as _json
+import urllib.request as _urlreq
+
+
+def _post_form(path, fields, port=PORT):
+    """multipart/form-data without pulling in a dependency."""
+    boundary = "----codertest"
+    body = b""
+    for key, value in fields.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n"
+                 f"{value}\r\n").encode()
+    body += f"--{boundary}--\r\n".encode()
+    req = _urlreq.Request(f"http://127.0.0.1:{port}{path}", data=body, method="POST",
+                          headers={"Content-Type":
+                                   f"multipart/form-data; boundary={boundary}"})
+    try:
+        with _urlreq.urlopen(req, timeout=20) as r:
+            return _json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return _json.loads(exc.read())
+
+
+def test_the_characters_page_offers_both_sources(page):
+    """The picker was always there; the link input is the new half."""
+    import urllib.request
+    with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/characters", timeout=10) as r:
+        html = r.read().decode("utf-8", "replace")
+    assert "data-upload=files" in html, "the file picker is gone"
+    assert "data-upload=url" in html, "no way to paste a link"
+    assert "/profile/upload-image" in html
+
+
+@pytest.mark.parametrize("url,why", [
+    ("http://127.0.0.1:8776/favicon.ico", "coderai's own API is on loopback"),
+    ("http://10.0.0.5/photo.jpg", "a private LAN address"),
+    ("http://169.254.169.254/latest/", "the cloud metadata address"),
+])
+def test_a_pasted_link_cannot_reach_this_machine(page, url, why):
+    """The tool makes the request, so a link is otherwise a way into the host."""
+    got = _post_form("/profile/upload-image",
+                     {"kind": "character", "name": "nobody", "url": url})
+    assert "error" in got, f"{why}: expected a refusal, got {got}"
+    assert "not a public address" in got["error"], got["error"]
+
+
+def test_a_link_that_is_not_http_is_refused(page):
+    got = _post_form("/profile/upload-image",
+                     {"kind": "character", "name": "nobody", "url": "file:///etc/passwd"})
+    assert "error" in got and "http(s)" in got["error"], got
+
+
+def test_a_bad_profile_name_cannot_escape_the_output_tree(page):
+    for name in ("../../etc", "a/b", "a\\b"):
+        got = _post_form("/profile/upload-image",
+                         {"kind": "character", "name": name, "url": "https://example.com/a.jpg"})
+        assert got.get("error") == "invalid kind/name", (name, got)

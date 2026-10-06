@@ -705,6 +705,98 @@ def _ensure_in_coderai(client, kind: str, name: str, out_dir: Path) -> bool:
         return False
 
 
+PROFILE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+# A link the operator pastes is fetched by THIS process, so it needs a ceiling.
+MAX_FETCH_MB = 64
+
+
+def fetch_image_url(url: str, allow_private: bool = False) -> tuple:
+    """Download a picture from a pasted link. Returns (bytes, filename).
+
+    The request is made by the tool, with the tool's network reach — on this box
+    that includes coderai on 127.0.0.1 and the whole LAN. So every hop has to
+    resolve to a public address unless the operator opted out, redirects are
+    followed by hand so each one is re-checked, and the size is capped while
+    streaming rather than trusted from a header.
+    """
+    import ipaddress
+    import mimetypes as _mt
+    import socket
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    def _check(parsed):
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"only http(s) links are supported, not {parsed.scheme!r}")
+        host = parsed.hostname
+        if not host:
+            raise ValueError("no host in the link")
+        if allow_private:
+            return
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve {host}: {exc}") from None
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                raise ValueError(f"{host} resolves to {ip}, which is not a public "
+                                 f"address (use --allow-private-fetch if deliberate)")
+
+    limit = int(MAX_FETCH_MB * 1024 * 1024)
+    target = (url or "").strip()
+    resp = None
+    for _hop in range(5):
+        parsed = urllib.parse.urlparse(target)
+        _check(parsed)
+        req = urllib.request.Request(target, headers={
+            "User-Agent": "coderai-township", "Accept": "image/*,*/*;q=0.5"})
+        try:
+            resp = urllib.request.build_opener(_NoRedirect).open(req, timeout=20)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308) and exc.headers.get("Location"):
+                target = urllib.parse.urljoin(target, exc.headers["Location"])
+                continue
+            raise ValueError(f"{exc.code} {exc.reason}") from None
+        except urllib.error.URLError as exc:
+            raise ValueError(f"could not fetch: {exc.reason}") from None
+        break
+    if resp is None:
+        raise ValueError("too many redirects")
+
+    with resp:
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        declared = int(resp.headers.get("Content-Length") or 0)
+        if declared and declared > limit:
+            raise ValueError(f"{declared/1e6:.0f} MB exceeds the {MAX_FETCH_MB} MB limit")
+        fname = os.path.basename(urllib.parse.urlparse(target).path) or "photo"
+        suffix = Path(fname).suffix.lower()
+        if suffix not in PROFILE_IMAGE_EXTS:
+            # Plenty of image URLs carry no extension; fall back to the type.
+            suffix = _mt.guess_extension(ctype) or ""
+            if suffix == ".jpe":
+                suffix = ".jpg"
+            fname = Path(fname).stem + suffix
+        if suffix not in PROFILE_IMAGE_EXTS:
+            raise ValueError(f"that link is {ctype or 'of unknown type'}, not a picture")
+        data = b""
+        while True:
+            chunk = resp.read(256 * 1024)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > limit:
+                raise ValueError(f"the picture is larger than the {MAX_FETCH_MB} MB limit")
+    if not data:
+        raise ValueError("the link returned an empty file")
+    return data, fname
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fatal-error detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8478,8 +8570,10 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'    <label style="margin:0;font-size:.78rem">Or upload your own:</label>'
                 f'    <input type=file data-upload=files accept="image/*" multiple '
                 f'style="font-size:.76rem;width:auto;flex:1;min-width:160px">'
+                f'    <input type=url data-upload=url placeholder="…or paste a link to a photo" '
+                f'style="font-size:.76rem;width:auto;flex:1;min-width:180px">'
                 f'    <button class="btn btn-secondary btn-sm" '
-                f'onclick="uploadRefs(\'{kind}\',\'{esc(name)}\')">⬆ Upload references</button>'
+                f'onclick="uploadRefs(\'{kind}\',\'{esc(name)}\')">⬆ Add references</button>'
                 f'    <span class=pf-upload-status style="font-size:.76rem;color:var(--blue-corner)"></span>'
                 f'  </div>'
                 f'  <div class=pf-actions style="border-top:1px solid var(--line);padding-top:.6rem;margin-top:.6rem">'
@@ -8651,14 +8745,19 @@ document.addEventListener('DOMContentLoaded', resumeActiveJobs);
 async function uploadRefs(kind,name){
   const root=document.getElementById('pf-'+kind+'-'+name);
   const inp=root.querySelector('[data-upload=files]');
+  const urlEl=root.querySelector('[data-upload=url]');
+  const url=urlEl ? (urlEl.value||'').trim() : '';
   const st=root.querySelector('.pf-upload-status');
-  if(!inp||!inp.files||!inp.files.length){
-    st.style.color='var(--bad)'; st.textContent='Choose image file(s) first'; return;
+  const nFiles=(inp&&inp.files)?inp.files.length:0;
+  if(!nFiles && !url){
+    st.style.color='var(--bad)'; st.textContent='Choose image file(s) or paste a link first'; return;
   }
   const fd=new FormData();
   fd.append('kind',kind); fd.append('name',name);
-  for(const f of inp.files) fd.append('files',f);
-  st.style.color='var(--text-dim)'; st.textContent='Uploading '+inp.files.length+' file(s)…';
+  for(const f of (inp&&inp.files?inp.files:[])) fd.append('files',f);
+  if(url) fd.append('url',url);
+  st.style.color='var(--text-dim)';
+  st.textContent='Adding '+(nFiles?nFiles+' file(s)':'')+((nFiles&&url)?' + ':'')+(url?'1 link':'')+'\u2026';
   try{
     const r=await fetch('/profile/upload-image',{method:'POST',body:fd});
     const j=await r.json();
@@ -11374,6 +11473,19 @@ async function resetPrompts(ev){
                 base = out_dir / (kind + "s") / name
                 base.mkdir(parents=True, exist_ok=True)
                 added_uris, rejected = [], 0
+                fetch_error = ""
+                # A pasted link is fetched HERE and then joins the uploaded files,
+                # so it goes through the same magic-byte check, the same reference
+                # numbering and the same sync to CoderAI.
+                _url = (fields.get("url") or "").strip()
+                if _url:
+                    try:
+                        _data, _fname = fetch_image_url(
+                            _url,
+                            allow_private=getattr(default_args, "allow_private_fetch", False))
+                        files = list(files) + [{"filename": _fname, "data": _data}]
+                    except Exception as e:
+                        fetch_error = str(e)
                 for f in files:
                     data = f.get("data") or b""
                     ext, mime = _img_ext(data)
@@ -11390,7 +11502,8 @@ async function resetPrompts(ev){
                         mime, __import__("base64").b64encode(data).decode()))
                 if not added_uris:
                     self._send(400, "application/json",
-                               _j.dumps({"error": "no valid image files uploaded"}))
+                               _j.dumps({"error": fetch_error
+                                         or "no valid image files uploaded"}))
                     return
                 synced = True
                 try:
@@ -12687,6 +12800,11 @@ OUTPUT LAYOUT
                              "Without this flag the script launches a web UI instead of processing.")
     parser.add_argument("--web-port", type=int, default=7788, metavar="PORT",
                         help="Port for the web UI (default: 7788, only used without --cli-mode).")
+    parser.add_argument("--allow-private-fetch", action="store_true",
+                        help="Let 'paste a link' on the Characters page reach private/"
+                             "loopback addresses. Off by default: the tool makes that "
+                             "request itself, so a link would otherwise be a way to pull "
+                             "from 127.0.0.1 or the LAN. Turn it on for your own NAS.")
     parser.add_argument("--browser", action="store_true",
                         help="Auto-open a web browser at the UI URL on startup. Off by default "
                              "(avoids spawning a terminal text browser on headless servers).")
