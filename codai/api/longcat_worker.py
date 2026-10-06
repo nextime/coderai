@@ -499,6 +499,7 @@ def progress(model_path: str, config: dict = None) -> dict:
 # ── LoRA / QLoRA training ────────────────────────────────────────────────────
 
 _TRAIN_SCRIPT = _REPO_ROOT / "tools" / "longcat_train.py"
+_QUANTIZE_SCRIPT = _REPO_ROOT / "tools" / "longcat_quantize.py"
 _TRAIN_REQUIREMENTS = _REPO_ROOT / "requirements-longcat-train.txt"
 
 
@@ -615,6 +616,57 @@ def train_lora(job: dict, workdir: str, on_progress=None) -> dict:
     if not data.get("ok"):
         raise RuntimeError(data.get("error") or "LongCat LoRA training failed")
     return data.get("result") or {}
+
+
+def quantize_int8(checkpoint_dir: str, workdir: str, on_progress=None,
+                  subfolder: str = "dit", overwrite: bool = False,
+                  config: dict = None) -> dict:
+    """Write an INT8 copy of a checkpoint's DiT beside the bf16 one.
+
+    Runs in the INFERENCE venv (it needs the upstream quantisation helpers and
+    torch 2.6), not the training one. Never automatic and never destructive: the
+    bf16 weights stay exactly where they were, and an existing base_model_int8/ is
+    left alone unless `overwrite` says otherwise.
+
+    Returns the worker's result dict: {"path": ..., "bytes": ...}.
+    """
+    import json as _json
+
+    py = ensure_built(config)
+    work = Path(os.path.expanduser(workdir))
+    work.mkdir(parents=True, exist_ok=True)
+    job = {
+        "checkpoint_dir": str(checkpoint_dir),
+        "source_dir": str(resolve_source_dir(config)),
+        "subfolder": subfolder,
+        "out_subfolder": "base_model_int8",
+        "overwrite": bool(overwrite),
+    }
+    job_path = work / "job.json"
+    job_path.write_text(_json.dumps(job, indent=2, default=str))
+    progress_path = str(job_path) + ".progress"
+    result_path = str(job_path) + ".result"
+
+    cmd = [str(py), str(_QUANTIZE_SCRIPT), "--job", str(job_path)]
+    print(f"[longcat] quantising: {' '.join(cmd)}", flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, cwd=str(_REPO_ROOT))
+    threading.Thread(target=_pump_logs, args=(proc, collections.deque(maxlen=20)),
+                     daemon=True).start()
+
+    seen = 0
+    while proc.poll() is None:
+        seen = _drain_progress(progress_path, seen, on_progress)
+        time.sleep(2)
+    _drain_progress(progress_path, seen, on_progress)
+
+    if not os.path.isfile(result_path):
+        raise RuntimeError(f"the quantiser exited {proc.returncode} without writing a "
+                           f"result — see the [longcat] log above")
+    data = _json.loads(open(result_path).read() or "{}")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error") or "LongCat INT8 quantisation failed")
+    return data
 
 
 def _drain_progress(path: str, seen: int, on_progress) -> int:

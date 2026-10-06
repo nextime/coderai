@@ -2233,6 +2233,73 @@ async def api_quantize_capabilities(username: str = Depends(require_admin)):
     }
 
 
+_longcat_quant_jobs: dict = {}
+
+
+def _model_backend(model_id: str) -> str:
+    """The configured backend for a model path, or ''."""
+    if config_manager is None:
+        return ""
+    for cat, entries in (config_manager.models_data or {}).items():
+        if not isinstance(entries, list):
+            continue
+        for m in entries:
+            if isinstance(m, dict) and (m.get("path") or m.get("id")) == model_id:
+                return str(m.get("backend") or "").strip().lower()
+    return ""
+
+
+def _longcat_checkpoint_dir(model_id: str) -> str:
+    """The local snapshot for a LongCat entry. Never downloads: quantising weights
+    that are not here yet is not a thing to start silently."""
+    import os as _os
+    if _os.path.isdir(_os.path.expanduser(model_id)):
+        return _os.path.expanduser(model_id)
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(model_id, local_files_only=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{model_id} is not downloaded yet — fetch the weights first "
+                   f"({type(exc).__name__})")
+
+
+def _start_longcat_quantize(model_id: str, overwrite: bool = False) -> dict:
+    """Kick off the INT8 build in the background and report it like any other job."""
+    import tempfile
+    import threading as _thr
+    from codai.api import longcat_worker
+
+    job = _longcat_quant_jobs.get(model_id)
+    if job and job.get("status") in ("running", "queued"):
+        return {"success": True, "job": job}
+
+    checkpoint = _longcat_checkpoint_dir(model_id)
+    job = {"model_id": model_id, "status": "running", "method": "int8",
+           "message": "starting", "step": 0, "total": 4}
+    _longcat_quant_jobs[model_id] = job
+
+    def _progress(**kw):
+        job["step"] = kw.get("step") or job.get("step")
+        job["total"] = kw.get("total") or job.get("total")
+        if kw.get("message"):
+            job["message"] = kw["message"]
+
+    def _run():
+        work = tempfile.mkdtemp(prefix="longcat-quant-")
+        try:
+            out = longcat_worker.quantize_int8(
+                checkpoint, work, on_progress=_progress, overwrite=overwrite)
+            job.update(status="done", path=out.get("path"), bytes=out.get("bytes"),
+                       message=out.get("skipped") or "done")
+        except Exception as exc:                              # noqa: BLE001
+            job.update(status="failed", message=f"{type(exc).__name__}: {exc}")
+
+    _thr.Thread(target=_run, daemon=True).start()
+    return {"success": True, "job": job}
+
+
 @router.post("/admin/api/model-quantize", summary="Quantize a model to fast-kernel 4-bit")
 async def api_model_quantize(request: Request, username: str = Depends(require_admin)):
     """Start (or report) an on-demand background GPTQ/AWQ quantization.
@@ -2248,6 +2315,13 @@ async def api_model_quantize(request: Request, username: str = Depends(require_a
     if not model_id:
         raise HTTPException(status_code=400, detail="path/model_id is required")
     method = (data.get("method") or "gptq").lower()
+    # LongCat is a video DiT, not a transformer GPTQ/AWQ can touch. Its INT8 build
+    # is upstream's own per-channel weight-only scheme, produced in LongCat's
+    # isolated venv — so the same button routes there for a longcat-backed model.
+    # Deliberately an action, never a default: it is lossy, slow, and the bf16
+    # weights are kept.
+    if method == "int8" or _model_backend(model_id) == "longcat":
+        return _start_longcat_quantize(model_id, bool(data.get("overwrite")))
     if method not in ("gptq", "awq"):
         raise HTTPException(status_code=400, detail="method must be 'gptq' or 'awq'")
     try:
@@ -2264,8 +2338,13 @@ async def api_quantize_status(model_id: str = "", username: str = Depends(requir
     """Status for one model's quant job (?model_id=...), or all jobs."""
     from codai.models import quant
     if model_id:
-        return {"job": quant.get_job(model_id.strip())}
-    return {"jobs": quant.all_jobs()}
+        mid = model_id.strip()
+        if mid in _longcat_quant_jobs:
+            return {"job": _longcat_quant_jobs[mid]}
+        return {"job": quant.get_job(mid)}
+    jobs = dict(quant.all_jobs() or {})
+    jobs.update(_longcat_quant_jobs)
+    return {"jobs": jobs}
 
 
 @router.get("/admin/api/model-loaded-status", summary="Model load status")

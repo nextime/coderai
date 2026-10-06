@@ -718,6 +718,10 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <div class="form-row" style="margin:0"><label class="form-label">Mask frame range <span class="muted">(avatar)</span></label><input type="text" id="cfg-longcat-mask-range" class="form-input" placeholder="inherit"></div>
           <div class="form-row" style="margin:0;align-self:end">
             <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="cfg-longcat-int8"> <span class="form-label" style="margin:0">INT8 DiT</span></label>
+            <button type="button" class="btn btn-secondary btn-sm" id="cfg-longcat-quant-btn"
+                    onclick="startLongcatQuantize()"
+                    title="Write an INT8 copy of this checkpoint's DiT beside the bf16 one. Lossy and slow, the original is kept, and nothing uses it until 'INT8 DiT' is ticked.">Build INT8 weights</button>
+            <span class="form-hint" id="cfg-longcat-quant-status" style="margin:0"></span>
             <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="cfg-longcat-distill"> <span class="form-label" style="margin:0">Force distilled sampling</span></label>
             <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="cfg-longcat-offload-kv"> <span class="form-label" style="margin:0">Offload KV cache</span></label>
           </div>
@@ -2861,6 +2865,58 @@ async function _quantGetCaps(){
     _quantCaps = j;
   }catch(e){ _quantCaps = {available:false, capabilities:{error:String(e)}}; }
   return _quantCaps;
+}
+
+// ── LongCat INT8 ────────────────────────────────────────────────────────────
+// A 13.6B bf16 DiT does not fit a 24 GB card and streams across PCIe every step.
+// The INT8 copy does fit. It is an ACTION rather than a default because it is
+// lossy and slow — and the bf16 weights are never replaced, so ticking "INT8 DiT"
+// off goes straight back to them.
+let _lcQuantPoll = null;
+
+function _renderLongcatQuant(job){
+  const el = document.getElementById('cfg-longcat-quant-status');
+  const btn = document.getElementById('cfg-longcat-quant-btn');
+  if(!el || !btn) return;
+  if(!job){ el.textContent=''; btn.disabled=false; return; }
+  if(job.status === 'running'){
+    btn.disabled = true;
+    const step = job.step ? ` (${job.step}/${job.total||4})` : '';
+    el.innerHTML = `<span style="color:var(--accent,#6366f1)">Quantizing${step} — ${esc(job.message||'')}</span>`;
+  } else if(job.status === 'failed'){
+    btn.disabled = false;
+    el.innerHTML = `<span style="color:var(--danger,#dc2626)">${esc(job.message||'failed')}</span>`;
+  } else {
+    btn.disabled = false;
+    const gb = job.bytes ? ` — ${(job.bytes/1e9).toFixed(1)} GB` : '';
+    el.innerHTML = `<span style="color:var(--ok,#16a34a)">INT8 weights ready${esc(gb)}. Tick “INT8 DiT” to use them.</span>`;
+  }
+}
+
+async function _pollLongcatQuant(path){
+  try{
+    const r = await fetch('/admin/api/quantize-status?model_id='+encodeURIComponent(path));
+    const d = await r.json();
+    _renderLongcatQuant(d.job);
+    if(d.job && d.job.status === 'running') return;
+  }catch(e){ /* keep the last state rather than blanking it */ }
+  if(_lcQuantPoll){ clearInterval(_lcQuantPoll); _lcQuantPoll = null; }
+}
+
+async function startLongcatQuantize(){
+  // Same hidden field the GPTQ button reads — the model being configured.
+  const path = (document.getElementById('cfg-path')||{}).value || '';
+  if(!path){ showAlert('No model selected.'); return; }
+  _renderLongcatQuant({status:'running', message:'starting'});
+  try{
+    const r = await fetch('/admin/api/model-quantize', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: path, method: 'int8'})});
+    const d = await r.json();
+    if(d.detail || d.error){ _renderLongcatQuant({status:'failed', message:d.detail||d.error}); return; }
+    _renderLongcatQuant(d.job);
+    if(!_lcQuantPoll) _lcQuantPoll = setInterval(()=>_pollLongcatQuant(path), 3000);
+  }catch(e){ _renderLongcatQuant({status:'failed', message:String(e)}); }
 }
 
 function _renderQuantStatus(job, caps){

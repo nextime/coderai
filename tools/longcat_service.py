@@ -113,14 +113,22 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         use_distill_lora = bool(_state.get("use_distill"))
 
         if use_int8:
-            # avatar-1.5 only: a pre-quantised DiT under base_model_int8/, loaded by the
-            # repo's own helper rather than from_pretrained.
-            # It lives in the quantization module, not the DiT one, and it returns the
-            # AVATAR transformer — consistent with INT8 being an avatar-1.5-only build.
-            from longcat_video.modules.quantization import load_quantized_dit
-            dit = load_quantized_dit(root, subfolder=LC.INT8_SUBDIR,
-                                     cp_split_hw=_state.get("cp_split_hw"))
-            log(f"loaded the INT8 DiT from {LC.INT8_SUBDIR}/")
+            # A pre-quantised DiT under base_model_int8/ — either shipped by upstream
+            # (avatar-1.5) or produced here by the quantise action on the model page.
+            #
+            # Upstream's own loader hardcodes the AVATAR transformer class, which is
+            # correct for its avatar-only INT8 build but wrong for a quantised BASE
+            # checkpoint. So the avatar families keep using it, and the base family
+            # gets the same procedure against the base class.
+            if family:
+                from longcat_video.modules.quantization import load_quantized_dit
+                dit = load_quantized_dit(root, subfolder=LC.INT8_SUBDIR,
+                                         cp_split_hw=_state.get("cp_split_hw"))
+            else:
+                dit = _load_quantized_base_dit(
+                    root, LC.INT8_SUBDIR, cp_split_hw=_state.get("cp_split_hw"))
+            log(f"loaded the INT8 DiT from {LC.INT8_SUBDIR}/"
+                + (f" (avatar family '{family}')" if family else " (base)"))
         else:
             kw = {"torch_dtype": td}
             if str(_state.get("variant") or "").lower() == "fp8":
@@ -194,6 +202,63 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
         return pipe
+
+
+def _load_quantized_base_dit(root, subfolder, **kwargs):
+    """Load an INT8-quantised BASE DiT.
+
+    The same procedure as upstream's ``load_quantized_dit`` — build the model from
+    the saved config, swap every non-skipped Linear for its QuantizedLinear, then
+    load the sharded state dict — but instantiating LongCatVideoTransformer3DModel
+    instead of the avatar class upstream hardcodes. Its quantisation helpers are
+    reused as-is so the weight layout cannot drift from what wrote it.
+    """
+    import json as _json
+    import torch.nn as _nn
+    from safetensors.torch import load_file as _load_file
+    from longcat_video.modules.quantization import QuantizedLinear, DEFAULT_SKIP_PATTERNS
+    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+
+    qdir = os.path.join(root, subfolder)
+    with open(os.path.join(qdir, "config.json"), encoding="utf-8") as fh:
+        config = _json.load(fh)
+    for drop in ("_class_name", "architectures", "_diffusers_version", "model_max_length"):
+        config.pop(drop, None)
+    config.update({k: v for k, v in kwargs.items() if v is not None})
+
+    model = LongCatVideoTransformer3DModel(**config)
+
+    replace = {}
+    for name, module in model.named_modules():
+        if isinstance(module, _nn.Linear) and not any(
+                pat in name for pat in DEFAULT_SKIP_PATTERNS):
+            replace[name] = QuantizedLinear(module.in_features, module.out_features,
+                                            bias=module.bias is not None)
+    for name, ql in replace.items():
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], ql)
+
+    index_path = os.path.join(qdir, "quantized_model.safetensors.index.json")
+    state = {}
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as fh:
+            index = _json.load(fh)
+        for shard in sorted(set(index["weight_map"].values())):
+            state.update(_load_file(os.path.join(qdir, shard)))
+    else:
+        for shard in sorted(f for f in os.listdir(qdir) if f.endswith(".safetensors")):
+            state.update(_load_file(os.path.join(qdir, shard)))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        log(f"WARNING: {len(missing)} missing tensors in the INT8 DiT "
+            f"(first: {missing[:3]})")
+    if unexpected:
+        log(f"WARNING: {len(unexpected)} unexpected tensors in the INT8 DiT "
+            f"(first: {unexpected[:3]})")
+    return model
 
 
 def _load_audio_encoder(root: str, family: str):
