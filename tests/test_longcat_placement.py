@@ -165,3 +165,76 @@ def test_no_cuda_is_reported_not_silently_tolerated(service, monkeypatch):
     service._place_pipeline(pipe, "model")
 
     assert pipe.dit.device == "cpu"
+
+
+# ---------------------------------------------------------------- attention backend
+# The checkpoint config asks for FlashAttention-2; the venv installs xformers, because
+# flash-attn is a source build. Upstream's attention raises on anything unselected, and
+# the --attention setting was written to the environment and never read — so the config
+# won and imported a module that is not there.
+
+def _fake_find_spec(installed):
+    def find_spec(name, *a, **k):
+        return object() if name in installed else None
+    return find_spec
+
+
+@pytest.fixture
+def pick(service, monkeypatch):
+    import importlib.util
+
+    def choose(installed, want=None):
+        monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec(installed))
+        if want is None:
+            monkeypatch.delenv("LONGCAT_ATTENTION", raising=False)
+        else:
+            monkeypatch.setenv("LONGCAT_ATTENTION", want)
+        return service._attention_kwargs()
+    return choose
+
+
+def test_exactly_one_backend_is_ever_enabled(pick):
+    """Two enabled flags would silently take whichever branch is checked first."""
+    flags = pick({"xformers", "flash_attn"})
+    assert sum(bool(v) for v in flags.values()) == 1
+    assert set(flags) == {"enable_flashattn3", "enable_flashattn2", "enable_xformers"}
+
+
+def test_it_picks_what_is_installed_not_what_the_checkpoint_asks_for(pick):
+    """dit/config.json says enable_flashattn2: true and flash_attn is not in the venv."""
+    flags = pick({"xformers"})
+    assert flags["enable_xformers"] is True
+    assert flags["enable_flashattn2"] is False
+
+
+def test_an_explicit_choice_is_honoured_when_it_is_available(pick):
+    flags = pick({"xformers", "flash_attn"}, want="flash")
+    assert flags["enable_flashattn2"] is True
+    assert flags["enable_xformers"] is False
+
+
+def test_asking_for_a_backend_that_is_absent_falls_back(pick):
+    flags = pick({"xformers"}, want="flash")
+    assert flags["enable_xformers"] is True
+
+
+@pytest.mark.parametrize("alias", ["flashattn2", "flash2", "fa2"])
+def test_the_usual_names_for_flashattention_all_work(pick, alias):
+    """A config saying "flashattn2" should not silently land on xformers."""
+    flags = pick({"xformers", "flash_attn"}, want=alias)
+    assert flags["enable_flashattn2"] is True
+
+
+def test_no_backend_at_all_is_an_error_here_not_deep_in_the_first_step(pick):
+    """Upstream's message is "Unsupported attention operations." from inside attention,
+    48 blocks into a load that already cost minutes."""
+    with pytest.raises(RuntimeError, match="no usable attention backend"):
+        pick(set())
+
+
+def test_both_load_paths_get_the_backend(service):
+    """bf16 via from_pretrained and INT8 via the config dict — a fix to one only would
+    leave the other raising on the first attention call."""
+    src = SERVICE.read_text(encoding="utf-8")
+    body = src[src.index("def load_pipeline"):src.index("def _attention_kwargs")]
+    assert body.count("_attention_kwargs()") == 2

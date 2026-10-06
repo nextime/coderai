@@ -126,7 +126,8 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                                          cp_split_hw=_state.get("cp_split_hw"))
             else:
                 dit = _load_quantized_base_dit(
-                    root, LC.INT8_SUBDIR, cp_split_hw=_state.get("cp_split_hw"))
+                    root, LC.INT8_SUBDIR, cp_split_hw=_state.get("cp_split_hw"),
+                    **_attention_kwargs())
             log(f"loaded the INT8 DiT from {LC.INT8_SUBDIR}/"
                 + (f" (avatar family '{family}')" if family else " (base)"))
         else:
@@ -144,7 +145,7 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                     log("WARNING: this torch has no float8_e4m3fn — loading in "
                         f"{dtype} instead")
             dit = LongCatVideoTransformer3DModel.from_pretrained(
-                root, subfolder="dit", **kw)
+                root, subfolder="dit", **kw, **_attention_kwargs())
 
         if family:
             # The avatar families are a DIFFERENT pipeline class with its own methods
@@ -185,6 +186,53 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
         return pipe
+
+
+def _attention_kwargs():
+    """Which attention backend the DiT should be built with.
+
+    The checkpoint's own dit/config.json asks for FlashAttention-2, but the venv
+    installs xformers: flash-attn 2.7.4.post1 is a source build needing ninja and a
+    CUDA toolchain, so requirements-longcat.txt ships xformers instead. Upstream's
+    Attention has NO fallback — anything unselected hits
+    `raise RuntimeError("Unsupported attention operations.")` — and the --attention
+    setting was only ever written into the environment, never read. So the config won
+    and the first attention call imported a module that is not installed.
+
+    Pick from what is importable, preferring what was asked for.
+    """
+    import importlib.util
+
+    def have(mod):
+        try:
+            return importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            return False
+
+    backends = {
+        "flash3": ("flash_attn_interface", {"enable_flashattn3": True}),
+        "flash": ("flash_attn", {"enable_flashattn2": True}),
+        "xformers": ("xformers", {"enable_xformers": True}),
+    }
+    want = (os.environ.get("LONGCAT_ATTENTION") or "xformers").strip().lower()
+    want = {"flashattn2": "flash", "flash2": "flash", "fa2": "flash",
+            "flashattn3": "flash3", "fa3": "flash3"}.get(want, want)
+    order = [want] + [k for k in ("xformers", "flash", "flash3") if k != want]
+
+    off = {"enable_flashattn3": False, "enable_flashattn2": False,
+           "enable_xformers": False}
+    for name in order:
+        entry = backends.get(name)
+        if entry and have(entry[0]):
+            if name != want:
+                log(f"WARNING: attention '{want}' is not installed in this venv; "
+                    f"using '{name}'")
+            log(f"attention backend: {name}")
+            return dict(off, **entry[1])
+    raise RuntimeError(
+        "no usable attention backend: none of xformers, flash_attn or "
+        "flash_attn_interface is installed in the LongCat venv, and upstream's "
+        "attention has no fallback path")
 
 
 def _place_pipeline(pipe, offload):
