@@ -7767,7 +7767,8 @@ try{ if(localStorage.getItem('tf-dock')==='1') toggleDock(true); }catch(e){}
   <div class=bar-split>
     <h2>Templates <span class=hint>(a saved set of every option on this page)</span></h2>
     <div class=hstack>
-      <select id=tpl-select title="Saved configurations. Loading one replaces every option on this page."></select>
+      <select id=tpl-select class=w-mid
+              title="Saved configurations. Loading one replaces every option on this page."><option value="">Loading templates…</option></select>
       <button class="btn btn-secondary btn-sm" type=button onclick="tplLoad()"
               title="Apply this template to the current session, then reload the page to show it">📂 Load</button>
       <button class="btn btn-secondary btn-sm" type=button onclick="tplSave()"
@@ -8222,7 +8223,10 @@ function setStatus(running, done, label){{
   else{{ pill.className='status-pill status-idle'; pill.textContent='Idle'; }}
   if(side){{
     side.className = 'side-status' + (running?' is-run':done?' is-done':'');
-    side.textContent = running ? ('Running\n'+(label||'')) : (done?'Done':'Idle');
+    // '\\n' must survive into the JS as two characters: this block is emitted from
+    // a Python f-string, so a bare \\n here becomes a REAL newline inside the string
+    // literal and kills the whole <script> with a SyntaxError.
+    side.textContent = running ? ('Running\\n'+(label||'')) : (done?'Done':'Idle');
   }}
   if(hint) hint.textContent = running ? (label||'rendering') : '';
   startBtn.style.display = running ? 'none' : '';
@@ -8264,6 +8268,10 @@ async function stopRun(){{
 }}
 // Restore state on page load
 toggleConsFields();
+// Fill the template picker. Without this it renders as an empty box you cannot
+// choose anything from: tplRefresh() was only ever called AFTER a save or a
+// delete, so a freshly loaded page never listed what was already on disk.
+tplRefresh();
 fetch('/status').then(r=>r.json()).then(d=>{{
   setStatus(d.running,d.done,d.label);
   if(d.running) startSSE();
