@@ -142,3 +142,58 @@ def test_bf16_is_never_gated(tmp_path):
 def test_the_service_passes_the_checkpoint_to_the_gate():
     src = SERVICE.read_text(encoding="utf-8")
     assert "checkpoint_dir=checkpoint" in src, "the gate cannot see the built weights"
+
+
+# ── it must not take the machine down ───────────────────────────────────────
+# Measured: on a 54 GB host this filled RAM and all 4 GB of swap and had to be
+# killed to keep the server alive. The peak holds the bf16 model, the INT8 copy
+# and the state dict the save builds.
+
+import importlib.util as _ilu2
+
+_qspec = _ilu2.spec_from_file_location("lc_quant", SCRIPT)
+LQ = _ilu2.module_from_spec(_qspec)
+_qspec.loader.exec_module(LQ)
+
+
+def test_it_estimates_the_peak_from_the_weights_on_disk(tmp_path):
+    d = tmp_path / "dit"
+    d.mkdir()
+    # 8 GB of fp32 shards -> 4 GB bf16 -> 1.5x + 4 floor
+    (d / "a.safetensors").write_bytes(b"\0" * 1024)
+    size = 8 * 1024 ** 3
+    import os as _os
+    _os.truncate(d / "a.safetensors", size)
+    got = LQ._needed_gb(str(tmp_path), "dit")
+    assert abs(got - (4 * 1.5 + 4)) < 0.1, got
+
+
+def test_an_unreadable_checkpoint_does_not_block_the_run(tmp_path):
+    """0 means 'unknown', and unknown must not refuse."""
+    assert LQ._needed_gb(str(tmp_path), "nope") == 0.0
+
+
+def test_available_memory_is_read_from_the_kernel():
+    got = LQ._available_gb()
+    assert got >= 0.0
+    if got:
+        assert got < 10000, "that is not gigabytes"
+
+
+def test_the_job_refuses_rather_than_exhausting_the_host():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "not enough host memory to quantise" in src
+    assert "_available_gb()" in src and "_needed_gb(" in src
+    # and the operator can override it knowingly
+    assert "min_free_gb" in src
+
+
+def test_the_load_streams_instead_of_building_a_second_copy():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "low_cpu_mem_usage=True" in src
+
+
+def test_memory_is_released_between_the_phases():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert src.count("gc.collect()") >= 3
+    assert "del dit" in src
