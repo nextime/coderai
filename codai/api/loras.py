@@ -1912,7 +1912,10 @@ def _train_externally(arch: str, req, base_path, images, instance_prompt,
     if not os.path.isfile(os.path.expanduser(dataset)):
         raise RuntimeError(f"dataset_config does not exist: {dataset}")
 
-    out_dir = os.path.join(_lora_dir(), getattr(req, "name", "longcat-lora"))
+    # _lora_dir(name) already resolves the per-LoRA directory — and routes a
+    # non-main DDP rank to scratch. Joining the name onto it again would have
+    # written <loras>/<name>/<name> even once the missing argument was supplied.
+    out_dir = _lora_dir(getattr(req, "name", "longcat-lora"))
     work = tempfile.mkdtemp(prefix="longcat-train-")
     job = {
         "arch": arch,
