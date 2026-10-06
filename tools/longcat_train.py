@@ -73,6 +73,15 @@ def build_config(job: dict) -> dict:
         "validation_resolution": job.get("resolution") or "480x832",
         "validation_num_video_frames": int(job.get("num_frames") or 93),
         "tracker_project_name": "coderai-longcat-lora",
+        # SimpleTuner has no default for this — it is a REQUIRED argument, and
+        # omitting it fails at argparse with "the following arguments are
+        # required: --optimizer", long before anything is loaded.
+        #
+        # adamw_bf16 keeps the optimiser state in bf16 rather than fp32, which is
+        # what makes a 13.6B base trainable on one consumer card at all: Adam
+        # normally carries two fp32 moments per parameter. The quantised base
+        # (base_model_precision) covers the weights; this covers the state.
+        "optimizer": job.get("optimizer") or "adamw_bf16",
     }
     # QLoRA: the quantised base. Without it the 13.6B transformer plus optimiser state
     # does not fit a consumer card.
@@ -175,8 +184,14 @@ def main(argv=None) -> int:
                                   + (f", loss {loss.group(1)}" if loss else "")))
         rc = proc.wait()
         if rc != 0:
-            raise RuntimeError(f"SimpleTuner exited {rc}. Last output: "
-                               + " | ".join(tail[-6:]))
+            # The last few lines of a traceback are frame noise — the line that
+            # says what went wrong is usually further up. Prefer an exception or
+            # error line if one is in the tail; fall back to the raw end.
+            import re as _re
+            _signal = [t for t in tail
+                       if _re.search(r"(Error|error:|Exception|required:|No such|not found)", t)]
+            _detail = " | ".join((_signal or tail)[-4:])
+            raise RuntimeError(f"SimpleTuner exited {rc}: {_detail}")
 
         # The adapter SimpleTuner wrote. Reported as a path rather than moved: the
         # parent owns where a LoRA is registered.
