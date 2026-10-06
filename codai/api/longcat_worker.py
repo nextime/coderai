@@ -54,6 +54,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -215,8 +216,8 @@ def _venv_ok(py: Path) -> bool:
         return False
 
 
-def _py310_env() -> dict:
-    """Environment for spawning the standalone Python 3.10.
+def _clean_py_env() -> dict:
+    """Environment for spawning ANOTHER Python than this process's.
 
     Anything that points a Python at ANOTHER interpreter's files makes the child
     die at startup with "No module named 'encodings'" — PYTHONHOME is the usual
@@ -239,7 +240,7 @@ def _run_py310(cmd: list, what: str) -> None:
     first real failure here was a bare "returned non-zero exit status 1" while the
     reason — a fatal interpreter error — only reached the log by accident.
     """
-    proc = subprocess.run(cmd, env=_py310_env(), capture_output=True, text=True)
+    proc = subprocess.run(cmd, env=_clean_py_env(), capture_output=True, text=True)
     if proc.returncode == 0:
         return
     detail = ((proc.stderr or "") + ("\n" + proc.stdout if proc.stdout else "")).strip()
@@ -399,7 +400,7 @@ def ensure_service(model_path: str, config: dict = None,
         # Same sanitising as the venv build: this launches the 3.10 interpreter,
         # and a leaked PYTHONHOME/PYTHONPATH kills it before it prints anything
         # useful.
-        env = _py310_env()
+        env = _clean_py_env()
         try:
             from codai.models.cache import get_hf_hub_cache_dir
             hub = get_hf_hub_cache_dir()
@@ -569,6 +570,34 @@ def _train_venv_ok(py: Path) -> bool:
         return False
 
 
+def _find_train_python(config: dict = None) -> Optional[str]:
+    """An interpreter SimpleTuner can be installed into.
+
+    NOT the 3.10 the inference venv uses. That pin exists for LongCat itself
+    (torch 2.6+cu124, transformers 4.41); SimpleTuner requires >=3.12, so asking
+    pip for it under 3.10 yields "No matching distribution found for simpletuner"
+    — every release filtered out by Requires-Python, which reads like the package
+    does not exist.
+
+    coderai's own interpreter is 3.13 and satisfies it, which is why the training
+    venv — unlike the inference one — can be built without anything bundled.
+    """
+    sec = _cfg_section()
+    configured = (((config or {}).get("longcat_train_python") or "").strip()
+                  or (str(getattr(sec, "train_python", "") or "").strip()
+                      if sec is not None else "")
+                  or os.environ.get("CODERAI_LONGCAT_TRAIN_PYTHON") or "")
+    if configured and os.path.isfile(os.path.expanduser(configured)):
+        return os.path.expanduser(configured)
+    if (3, 12) <= sys.version_info[:2] < (3, 15):
+        return sys.executable
+    for name in ("python3.13", "python3.12", "python3.14"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 def ensure_train_built(config: dict = None) -> Path:
     """The interpreter SimpleTuner runs under. Builds it only if allowed to."""
     venv = resolve_train_venv(config)
@@ -584,18 +613,19 @@ def ensure_train_built(config: dict = None) -> Path:
             f"standalone so it cannot reuse the shared trainer, and the upstream repo "
             f"has no way to create trainable LoRA layers (only load_lora from a file, "
             f"in its own key layout). Build it:\n"
-            f"  <python3.10> -m venv {venv}\n"
+            f"  <python3.12+> -m venv {venv}\n"
             f"  {py} -m pip install -r {_TRAIN_REQUIREMENTS}\n"
             f"…or set longcat.train_auto_build = true.")
-    py310 = _find_python310(config)
-    if not py310:
+    train_py = _find_train_python(config)
+    if not train_py:
         raise RuntimeError(
-            "longcat.train_auto_build is on but no Python 3.10 interpreter was found "
-            "(coderai's own is 3.13) — set longcat.python, or use the image.")
+            f"longcat.train_auto_build is on but no Python 3.12-3.14 was found for "
+            f"SimpleTuner (this process is {sys.version_info.major}."
+            f"{sys.version_info.minor}) — set longcat.train_python to one.")
     if not py.exists():
         print(f"[longcat] creating the training venv at {venv} …", flush=True)
         venv.parent.mkdir(parents=True, exist_ok=True)
-        _run_py310([py310, "-m", "venv", str(venv)], "creating the LongCat training venv")
+        _run_py310([train_py, "-m", "venv", str(venv)], "creating the LongCat training venv")
         py = _venv_python(venv)
     _run_py310([str(py), "-m", "pip", "install", "-U", "pip"], "upgrading pip")
     _run_py310([str(py), "-m", "pip", "install", "-r", str(_TRAIN_REQUIREMENTS)],
@@ -639,7 +669,7 @@ def train_lora(job: dict, workdir: str, on_progress=None) -> dict:
     print(f"[longcat] training: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, cwd=str(_REPO_ROOT),
-                            env=_py310_env())
+                            env=_clean_py_env())
     threading.Thread(target=_pump_logs, args=(proc, collections.deque(maxlen=20)),
                      daemon=True).start()
 
@@ -691,7 +721,7 @@ def quantize_int8(checkpoint_dir: str, workdir: str, on_progress=None,
     print(f"[longcat] quantising: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, cwd=str(_REPO_ROOT),
-                            env=_py310_env())
+                            env=_clean_py_env())
     threading.Thread(target=_pump_logs, args=(proc, collections.deque(maxlen=20)),
                      daemon=True).start()
 

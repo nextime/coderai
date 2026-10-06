@@ -795,6 +795,10 @@ class LongcatConfig:
     # of a venv of its own (SimpleTuner pins its own torch and would fight the inference
     # venv's). Blank = beside the inference venv as <venv>-train.
     train_venv: str = ""
+    # SimpleTuner needs Python >=3.12 — the OPPOSITE of the 3.10 the inference venv
+    # pins — so the training venv is built with a different interpreter. Blank uses
+    # coderai's own (3.13), which satisfies it; set this only to override.
+    train_python: str = ""
     train_auto_build: bool = False
     # int8-quanto | int4-quanto | fp8-torchao | "" (bf16). This is the QLoRA switch: the
     # 13.6B transformer does not fit a consumer card at bf16 with optimiser state.
