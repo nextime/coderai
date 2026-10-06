@@ -18,8 +18,14 @@ This keeps the two from drifting again.
 import pathlib
 import re
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DOCKERFILE = ROOT / "packaging" / "linux" / "Dockerfile.oci"
+# BOTH can ship: build_oci_image.sh picks Dockerfile.oci-venv for a --venv build
+# and Dockerfile.oci otherwise. Checking only one is how gcc was added to the
+# file that was not being used, and the build came out without a compiler.
+DOCKERFILES = [ROOT / "packaging" / "linux" / "Dockerfile.oci",
+               ROOT / "packaging" / "linux" / "Dockerfile.oci-venv"]
 RUNPOD_VLLM_APT = ROOT / "packaging" / "runpod" / "profiles" / "vllm.apt"
 
 
@@ -29,22 +35,25 @@ def _runtime_stage(text: str) -> str:
     return text[starts[-1]:] if starts else text
 
 
-def test_the_shipped_stage_installs_a_c_compiler():
-    stage = _runtime_stage(DOCKERFILE.read_text(encoding="utf-8"))
+@pytest.mark.parametrize("dockerfile", DOCKERFILES, ids=lambda p: p.name)
+def test_the_shipped_stage_installs_a_c_compiler(dockerfile):
+    stage = _runtime_stage(dockerfile.read_text(encoding="utf-8"))
     assert re.search(r"^\s+gcc\s*\\?\s*$", stage, re.M), \
-        "no gcc in the runtime stage — Triton cannot build its driver module"
+        f"no gcc in {dockerfile.name}'s runtime stage — Triton cannot build its driver"
 
 
-def test_it_also_has_the_headers_the_compile_needs():
-    stage = _runtime_stage(DOCKERFILE.read_text(encoding="utf-8"))
+@pytest.mark.parametrize("dockerfile", DOCKERFILES, ids=lambda p: p.name)
+def test_it_also_has_the_headers_the_compile_needs(dockerfile):
+    stage = _runtime_stage(dockerfile.read_text(encoding="utf-8"))
     assert re.search(r"^\s+libc6-dev\s*\\?\s*$", stage, re.M), \
-        "gcc without libc6-dev cannot compile driver.c"
+        f"gcc without libc6-dev cannot compile driver.c ({dockerfile.name})"
 
 
-def test_the_reason_is_recorded_next_to_it():
+@pytest.mark.parametrize("dockerfile", DOCKERFILES, ids=lambda p: p.name)
+def test_the_reason_is_recorded_next_to_it(dockerfile):
     """A later cleanup would otherwise drop a compiler from a runtime image as
     obviously unnecessary."""
-    text = DOCKERFILE.read_text(encoding="utf-8")
+    text = dockerfile.read_text(encoding="utf-8")
     assert "Triton" in text and "runtime" in text.lower()
     assert "Failed to find C compiler" in text
 
