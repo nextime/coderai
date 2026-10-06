@@ -59,7 +59,7 @@ _lock = threading.RLock()
 _state = {
     "pipe": None, "model": "", "source": "", "dtype": "bfloat16",
     "family": "", "variant": "bf16", "use_int8": False, "use_distill": False,
-    "cp_split_hw": None, "audio_encoder": None,
+    "cp_split_hw": [1, 1], "audio_encoder": None,
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
@@ -125,9 +125,7 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                 dit = load_quantized_dit(root, subfolder=LC.INT8_SUBDIR,
                                          cp_split_hw=_state.get("cp_split_hw"))
             else:
-                dit = _load_quantized_base_dit(
-                    root, LC.INT8_SUBDIR, cp_split_hw=_state.get("cp_split_hw"),
-                    **_attention_kwargs())
+                dit = _load_quantized_base_dit(root, LC.INT8_SUBDIR, **_dit_kwargs())
             log(f"loaded the INT8 DiT from {LC.INT8_SUBDIR}/"
                 + (f" (avatar family '{family}')" if family else " (base)"))
         else:
@@ -145,7 +143,7 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                     log("WARNING: this torch has no float8_e4m3fn — loading in "
                         f"{dtype} instead")
             dit = LongCatVideoTransformer3DModel.from_pretrained(
-                root, subfolder="dit", **kw, **_attention_kwargs())
+                root, subfolder="dit", **kw, **_dit_kwargs())
 
         if family:
             # The avatar families are a DIFFERENT pipeline class with its own methods
@@ -186,6 +184,84 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
         return pipe
+
+
+def _cp_split_hw(cp_size=1, configured=None):
+    """The [h, w] split the DiT is built with.
+
+    Not optional: LongCatVideoTransformer3DModel.forward does
+    `if self.cp_split_hw[0] * self.cp_split_hw[1] > 1:` on every call, with no None
+    guard — yet upstream's own dit/config.json ships `"cp_split_hw": null`, so their
+    demo script must be passing the pair in. Loading straight from the config gives a
+    DiT that raises TypeError on the first forward. Without context parallelism the
+    pair is [1, 1], which is also what makes that branch fall through.
+    """
+    if configured:
+        pair = [int(v) for v in str(configured).replace("x", ",").split(",") if v.strip()]
+        if len(pair) != 2 or pair[0] < 1 or pair[1] < 1:
+            raise ValueError(f"cp_split_hw must be two positive integers, got {configured!r}")
+        if cp_size > 1 and pair[0] * pair[1] != cp_size:
+            raise ValueError(
+                f"cp_split_hw {pair[0]}x{pair[1]} multiplies to {pair[0] * pair[1]}, "
+                f"but cp_size is {cp_size} — every rank must own one tile")
+        return pair
+    if cp_size > 1:
+        # Width, because the latent is wider than it is tall at every preset.
+        return [1, int(cp_size)]
+    return [1, 1]
+
+
+def _bsa_enabled(setting=None):
+    """Whether to build the DiT with upstream's block-sparse attention.
+
+    At video token counts attention is the expensive part — ~37k tokens for 93 frames
+    at 480x832 — and the checkpoint carries bsa_params with sparsity 0.9375, roughly a
+    16x cut in attention work. It is pure Triton (no flash-attn), and it disables
+    itself for single-frame sampling inside Attention, so enabling it costs nothing on
+    the image path.
+
+    Off by default: it is an approximation, and a video model's artifacts show up as
+    temporal flicker rather than one soft frame.
+    """
+    import importlib.util
+
+    want = str(setting if setting is not None
+               else os.environ.get("LONGCAT_BSA") or "off").strip().lower()
+    if want in ("", "0", "off", "false", "no", "none"):
+        return False
+    if want not in ("1", "on", "true", "yes", "auto"):
+        raise ValueError(f"bsa must be on, off or auto; got {want!r}")
+    try:
+        if importlib.util.find_spec("triton") is None:
+            raise ImportError
+    except (ImportError, ValueError):
+        if want == "auto":
+            log("block-sparse attention: triton is not installed, staying off")
+            return False
+        raise RuntimeError(
+            "block-sparse attention needs triton, which is not installed in the "
+            "LongCat venv")
+    log("block-sparse attention: on")
+    return True
+
+
+def _dit_kwargs():
+    """Everything the DiT has to be CONSTRUCTED with, for either variant.
+
+    The bf16 path reads dit/config.json and the INT8 path reads the copy beside the
+    quantised weights, and both configs are wrong about this machine: they ask for
+    FlashAttention-2 that is not installed, and a null cp_split_hw the forward pass
+    dereferences. Build the overrides once so the two paths cannot drift.
+    """
+    kwargs = _attention_kwargs()
+    kwargs["cp_split_hw"] = _state.get("cp_split_hw") or [1, 1]
+    if _bsa_enabled():
+        # BSA replaces the dense path, so it must be the only backend left on.
+        kwargs.update(enable_flashattn3=False, enable_flashattn2=False,
+                      enable_xformers=False, enable_bsa=True)
+    else:
+        kwargs["enable_bsa"] = False
+    return kwargs
 
 
 def _attention_kwargs():
@@ -976,7 +1052,14 @@ def main(argv=None):
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--offload", default="", help="'' | model | sequential")
-    ap.add_argument("--attention", default="xformers", help="xformers | flash | sdpa")
+    ap.add_argument("--attention", default="xformers",
+                    help="xformers | flash | flash3 (falls back to what is installed)")
+    ap.add_argument("--bsa", default="off",
+                    help="block-sparse attention: on | off | auto (auto stays off "
+                         "when triton is missing instead of failing)")
+    ap.add_argument("--cp-split-hw", default="",
+                    help="context-parallel tile as HxW, e.g. 1x2; "
+                         "defaults to 1x<cp_size>")
     ap.add_argument("--context-parallel-size", type=int, default=1,
                     help="GPUs to split the DiT across (launch under torchrun)")
     ap.add_argument("--preload", action="store_true",
@@ -991,6 +1074,11 @@ def main(argv=None):
     # modules honour, and leaving it unset means FlashAttention-2, which is not installed
     # by default (requirements-longcat.txt installs xformers instead).
     os.environ.setdefault("LONGCAT_ATTENTION", args.attention)
+    os.environ.setdefault("LONGCAT_BSA", args.bsa)
+    # Validate both before anything slow happens: a bad value should not surface after
+    # a multi-minute load.
+    _bsa_enabled()
+    _state["cp_split_hw"] = _cp_split_hw(1, args.cp_split_hw)
 
     rank, _local = (0, 0)
     if cp_size > 1:
@@ -1000,8 +1088,10 @@ def main(argv=None):
             sys.path.insert(0, src)
         rank, _local = cp_init(cp_size)
         # Splitting height and width across the group is what cp_size buys; the DiT
-        # takes it at construction.
-        _state["cp_split_hw"] = cp_size
+        # takes it at construction — as a [h, w] PAIR, not the process count. The
+        # width is split by default because the latent is wider than it is tall at
+        # every preset; --cp-split-hw overrides it.
+        _state["cp_split_hw"] = _cp_split_hw(cp_size, args.cp_split_hw)
 
     if args.preload:
         load_pipeline(_state["model"], _state["source"], args.dtype, args.offload)

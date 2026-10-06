@@ -234,7 +234,9 @@ def test_no_backend_at_all_is_an_error_here_not_deep_in_the_first_step(pick):
 
 def test_both_load_paths_get_the_backend(service):
     """bf16 via from_pretrained and INT8 via the config dict — a fix to one only would
-    leave the other raising on the first attention call."""
+    leave the other raising on the first attention call. Both go through _dit_kwargs(),
+    which is where the backend is chosen."""
     src = SERVICE.read_text(encoding="utf-8")
-    body = src[src.index("def load_pipeline"):src.index("def _attention_kwargs")]
-    assert body.count("_attention_kwargs()") == 2
+    body = src[src.index("def load_pipeline"):src.index("def _cp_split_hw")]
+    assert body.count("_dit_kwargs()") == 2
+    assert "_attention_kwargs()" in src[src.index("def _dit_kwargs"):]

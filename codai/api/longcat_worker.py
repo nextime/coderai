@@ -44,6 +44,8 @@ Per-model config keys (models.json entry, all optional)::
     "variant": "bf16",             # bf16 | fp8 | int8
     "quality": "fast",             # draft | fast | best
     "offload_strategy": "",        # '' | model | sequential
+    "bsa": "off",                  # block-sparse attention: on | off | auto
+    "cp_split_hw": "",             # context-parallel tile, e.g. "1x2"
     "used_vram_gb": 0,             # what to reserve before starting; 0 = measured
     "gpu_device": 0
 """
@@ -482,6 +484,15 @@ def ensure_service(model_path: str, config: dict = None,
             cmd += ["--offload", offload]
         if sec is not None and str(getattr(sec, "attention", "") or "").strip():
             cmd += ["--attention", str(sec.attention).strip()]
+        # Per-model first, then the server-wide longcat section: a checkpoint that is
+        # too lossy under BSA has to be able to opt out on its own.
+        bsa = str(config.get("bsa") or
+                  (getattr(sec, "bsa", "") if sec is not None else "") or "").strip()
+        if bsa:
+            cmd += ["--bsa", bsa]
+        split = str(config.get("cp_split_hw") or "").strip()
+        if split:
+            cmd += ["--cp-split-hw", split]
         if sec is not None and str(getattr(sec, "extra_args", "") or "").strip():
             import shlex
             cmd += shlex.split(str(sec.extra_args))
