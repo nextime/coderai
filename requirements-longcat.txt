@@ -43,6 +43,13 @@ torchaudio==2.6.0
 transformers==4.41.0
 numpy==1.26.4
 diffusers==0.35.1
+
+# Not upstream's, but transformers falls back to low_cpu_mem_usage=False without it,
+# which materialises the whole fp32 UMT5-XXL text encoder (22 GB on disk) in host RAM
+# before casting it to bf16. With accelerate the shards are loaded straight onto meta
+# and filled in place: the 5-shard load went from ~4m50s to seconds of it, and the host
+# RAM spike goes away. It is also what diffusers wants for any device_map work later.
+accelerate==1.1.1
 einops==0.8.0
 ftfy==6.2.0
 loguru==0.7.2

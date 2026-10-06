@@ -185,3 +185,16 @@ def test_those_env_vars_are_the_ones_the_worker_reads():
 
 def test_the_image_answers_a_health_check():
     assert "HEALTHCHECK" in PODFILE and "/healthz" in PODFILE
+
+
+def test_accelerate_is_pinned_and_verified_in_the_image():
+    """Without accelerate, transformers falls back to low_cpu_mem_usage=False and
+    materialises the whole fp32 UMT5-XXL encoder in host RAM before casting it to
+    bf16 — a 22 GB spike and ~5 minutes of the load. A dep that is only installed by
+    hand comes back missing on the next rebuild, so the pin and both verifications
+    have to name it."""
+    reqs = (ROOT / "requirements-longcat.txt").read_text(encoding="utf-8")
+    assert "accelerate==" in reqs, "pin it, do not install it by hand"
+    assert "import accelerate" in PODFILE, "the pod build must fail loudly without it"
+    smoke = (ROOT / "packaging/linux/smoke_test_services.sh").read_text(encoding="utf-8")
+    assert "accelerate" in smoke, "the local image's venv check must cover it too"

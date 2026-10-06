@@ -1,43 +1,52 @@
-# CoderAI LongCat-Video pod.
-#
-# LongCat pins Python 3.10 + torch 2.6.0+cu124 + transformers 4.41 + numpy 1.26 - four
-# conflicts with coderai's own 3.13 / 2.11 / 5.x / 2.4 - so it runs in an isolated venv
-# behind a managed subprocess. On a pod that means TWO interpreters in one image: the
-# light core (python:3.12, no torch) runs coderai, and a 3.10 venv runs the model.
-#
-# The generic Dockerfile.capability cannot express that - it is one interpreter on the
-# cu128 torch index - which is why this profile carries its own Dockerfile, the same
-# escape hatch the engines profile uses.
-#
-# `longcat_video` is a package INSIDE the upstream repo, not on PyPI, so the source is
-# cloned here. Weights are NOT baked: ~83 GB across variants, downloaded at runtime into
-# the pod's volume, like every other model.
-
 ARG CORE_BASE=coderai-capability-base-light:latest
+ARG PY310_IMAGE=python:3.10-slim
+
+# ---------------------------------------------------------------- venv stage
+# The light core is DEBIAN (trixie), where Python 3.10 is not in the archive and the
+# deadsnakes PPA does not apply: PPAs are an Ubuntu mechanism and apt here has no
+# software-properties-common at all. So the interpreter comes from the official 3.10
+# image and the venv is built THERE, where its pip and headers live — the same shape as
+# packaging/linux/build_oci_image.sh, which bundles a standalone 3.10 and re-points the
+# venv at it.
+FROM ${PY310_IMAGE} AS longcatvenv
+COPY requirements-longcat.txt /tmp/requirements-longcat.txt
+RUN python -m venv /opt/coderai/longcat_venv \
+ && /opt/coderai/longcat_venv/bin/python -m pip install -U pip \
+ && /opt/coderai/longcat_venv/bin/python -m pip install -r /tmp/requirements-longcat.txt \
+ && /opt/coderai/longcat_venv/bin/python -c "import sys,torch,transformers; \
+      assert sys.version_info[:2]==(3,10), sys.version; \
+      assert torch.__version__.startswith('2.6'), torch.__version__; \
+      assert transformers.__version__.startswith('4.41'), transformers.__version__; \
+      import accelerate" \
+ && rm -rf /root/.cache/pip /tmp/requirements-longcat.txt
+
+# ---------------------------------------------------------------- runtime
 FROM ${CORE_BASE}
 
 ARG PROFILE=video-longcat
 ARG IMAGE_TAG=coderai-video-longcat:latest
 ARG LONGCAT_REF=main
 
-# Python 3.10 for the model's venv: the light core carries only its own 3.12.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      software-properties-common ca-certificates gnupg \
- && add-apt-repository -y ppa:deadsnakes/ppa \
- && apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3.10-venv python3.10-dev \
- && rm -rf /var/lib/apt/lists/*
+# The 3.10 interpreter plus the venv built against it. Copied in this direction because
+# a binary linked against the older image's glibc runs on the newer one, not the reverse.
+COPY --from=longcatvenv /usr/local /opt/coderai/py310
+COPY --from=longcatvenv /opt/coderai/longcat_venv /opt/coderai/longcat_venv
 
-# The venv, from the same requirements file a local install uses - one source of truth.
-COPY requirements-longcat.txt /tmp/requirements-longcat.txt
-RUN python3.10 -m venv /opt/coderai/longcat_venv \
- && /opt/coderai/longcat_venv/bin/python -m pip install -U pip \
- && /opt/coderai/longcat_venv/bin/python -m pip install -r /tmp/requirements-longcat.txt \
- && /opt/coderai/longcat_venv/bin/python -c "import sys,torch,transformers; \
+# A copied venv still records the interpreter path of the stage that built it, so its
+# bin/python is a dangling symlink here. Re-point it, exactly as the local image does for
+# the lip-sync venv, and verify rather than assume.
+RUN sed -i 's|^home *=.*|home = /opt/coderai/py310/bin|; \
+             s|^command *=.*|command = /opt/coderai/py310/bin/python3.10|' \
+        /opt/coderai/longcat_venv/pyvenv.cfg \
+ && for p in python python3 python3.10; do \
+      ln -sf /opt/coderai/py310/bin/python3.10 "/opt/coderai/longcat_venv/bin/$p"; \
+    done \
+ && /opt/coderai/longcat_venv/bin/python -c "import sys,torch; \
       assert sys.version_info[:2]==(3,10), sys.version; \
-      assert torch.__version__.startswith('2.6'), torch.__version__; \
-      assert transformers.__version__.startswith('4.41'), transformers.__version__" \
- && rm -rf /root/.cache/pip /tmp/requirements-longcat.txt
+      assert torch.__version__.startswith('2.6'), torch.__version__"
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 # The pipeline code. Shallow, no history, no weights, no demo assets.
 RUN git clone --depth 1 --branch "${LONGCAT_REF}" \
@@ -58,6 +67,11 @@ RUN python -c "import codai.api.app" \
 ENV CODERAI_IMAGE_TAG=${IMAGE_TAG} \
     CODERAI_LONGCAT_VENV=/opt/coderai/longcat_venv \
     CODERAI_LONGCAT_SRC=/opt/coderai/LongCat-Video
+
+# The entrypoint. The generic Dockerfile.capability copies this; a custom one has to do
+# it too, and forgetting it builds a perfectly good image whose container cannot start.
+COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
+RUN chmod +x /opt/coderai/boot.sh
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \

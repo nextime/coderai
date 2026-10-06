@@ -4237,6 +4237,12 @@ class MultiModelManager:
         candidates = []
         if resolved_name:
             candidates.append(resolved_name)
+        # --- LongCat: a known resident set, not a directory sum ---
+        _lc_gb = self._longcat_resident_gb(cfg, model_key, resolved_name, _load_bpe)
+        if _lc_gb > 0:
+            return _dbg_est("longcat-variant",
+                            _lc_gb + self._runtime_reserve_gb(cfg, model_key, _lc_gb))
+
         candidates.append(model_key)
         if ":" in model_key:
             candidates.append(model_key.split(":", 1)[1])
@@ -4278,6 +4284,113 @@ class MultiModelManager:
                 return _apply_factors(weights_gb) + self._config_lora_vram_gb(cfg)
 
         return 0
+
+    @staticmethod
+    def _safetensors_storage_bpe(directory: str) -> float:
+        """Bytes per element of the dominant dtype stored in a safetensors folder.
+
+        Read from the header — 8 bytes of length then that much JSON — so it costs
+        one small read per component and never touches the weights.
+        """
+        import glob
+        import json
+        import struct
+
+        widths = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4,
+                  "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+                  "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1}
+        files = sorted(glob.glob(os.path.join(directory, "*.safetensors")))
+        if not files:
+            return 0.0
+        totals = {}
+        try:
+            with open(files[0], "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                header = json.loads(fh.read(n))
+        except (OSError, ValueError, struct.error):
+            return 0.0
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            dtype = str(meta.get("dtype") or "")
+            shape = meta.get("shape") or []
+            count = 1
+            for dim in shape:
+                count *= int(dim)
+            totals[dtype] = totals.get(dtype, 0) + count
+        if not totals:
+            return 0.0
+        return float(widths.get(max(totals, key=totals.get), 0) or 0.0)
+
+    def _longcat_resident_gb(self, cfg: dict, model_key: str = "",
+                             resolved: str = "", load_bpe: float = 2.0) -> float:
+        """What a LongCat pipeline actually keeps on the card, or 0.0 if not LongCat.
+
+        The generic path sizes a model by summing its whole HF cache entry. For
+        LongCat that is ~74 GB — the bf16 DiT (51 GB, stored fp32), the INT8 DiT
+        sitting beside it (13.6 GB), and an fp32 UMT5-XXL text encoder (22 GB) —
+        so a 24 GB card was asked for 74.3 GB and everything else on the box was
+        evicted before every generation.
+
+        Only ONE DiT ever loads, chosen by ``variant``. Each component is scaled
+        from its own stored dtype, because a single ratio cannot serve both an
+        INT8 DiT that loads as-is and an fp32 encoder that is cast to bf16. And
+        under offload the DiT and the encoder take turns on the card (see
+        _place_pipeline in tools/longcat_service.py), so the peak is
+        max(DiT, encoder) + VAE rather than their sum.
+        """
+        import os
+
+        if str(cfg.get("backend") or "").strip().lower() != "longcat":
+            return 0.0
+        ref = str(cfg.get("path") or cfg.get("model_path") or resolved
+                  or model_key.split(":", 1)[-1] or "")
+        if not ref:
+            return 0.0
+        try:
+            from codai.api.longcat_worker import common
+            root = common().resolve_checkpoint(ref)
+        except Exception:
+            return 0.0
+        if not os.path.isdir(root):
+            return 0.0
+
+        def _resident_gb(sub):
+            """A component's size once loaded, from its size on disk."""
+            base = os.path.join(root, sub)
+            if not os.path.isdir(base):
+                return 0.0
+            total, seen = 0, set()
+            for dirpath, _dirs, files in os.walk(base):
+                for name in files:
+                    try:
+                        st = os.stat(os.path.join(dirpath, name))
+                    except OSError:
+                        continue
+                    if st.st_ino in seen:      # the hub links blobs into snapshots
+                        continue
+                    seen.add(st.st_ino)
+                    total += st.st_size
+            disk_gb = total / 1e9
+            stored = self._safetensors_storage_bpe(base)
+            if stored <= 0:
+                return disk_gb
+            if stored <= 1.0:
+                # Already quantised on disk (INT8, FP8): loaded as it is stored.
+                return disk_gb
+            return disk_gb * (float(load_bpe) / stored)
+
+        variant = str(cfg.get("variant") or "bf16").strip().lower()
+        dit = _resident_gb("base_model_int8" if variant == "int8" else "dit")
+        if dit <= 0:
+            return 0.0
+        vae = _resident_gb("vae")
+        encoder = _resident_gb("text_encoder")
+
+        offload = str(cfg.get("offload_strategy") or "").strip().lower()
+        if offload and offload != "none":
+            return max(dit, encoder) + vae
+        return dit + encoder + vae
 
     def _is_key_busy(self, key: str) -> bool:
         """True if any instance for this key is currently serving a request.
