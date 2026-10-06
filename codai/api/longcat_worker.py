@@ -215,6 +215,41 @@ def _venv_ok(py: Path) -> bool:
         return False
 
 
+def _py310_env() -> dict:
+    """Environment for spawning the standalone Python 3.10.
+
+    Anything that points a Python at ANOTHER interpreter's files makes the child
+    die at startup with "No module named 'encodings'" — PYTHONHOME is the usual
+    one, but PYTHONPATH, VIRTUAL_ENV and friends all leak the 3.13 runtime into a
+    3.10 process. coderai does not set them today; it is stripped anyway because
+    the failure mode is fatal, silent in the parent, and costs nothing to prevent.
+    """
+    env = os.environ.copy()
+    for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+                "VIRTUAL_ENV", "PYTHONNOUSERSITE", "PYTHONUSERBASE",
+                "__PYVENV_LAUNCHER__"):
+        env.pop(var, None)
+    return env
+
+
+def _run_py310(cmd: list, what: str) -> None:
+    """Run a step of the venv build, and RAISE WITH WHAT THE CHILD SAID.
+
+    subprocess.run(check=True) reports an exit status and nothing else, so the
+    first real failure here was a bare "returned non-zero exit status 1" while the
+    reason — a fatal interpreter error — only reached the log by accident.
+    """
+    proc = subprocess.run(cmd, env=_py310_env(), capture_output=True, text=True)
+    if proc.returncode == 0:
+        return
+    detail = ((proc.stderr or "") + ("\n" + proc.stdout if proc.stdout else "")).strip()
+    if len(detail) > 2000:
+        detail = detail[:1000] + "\n  …\n" + detail[-900:]
+    raise RuntimeError(
+        f"{what} failed (exit {proc.returncode}): {' '.join(str(c) for c in cmd)}\n"
+        f"{detail or '(the command produced no output)'}")
+
+
 def _find_python310(config: dict = None) -> Optional[str]:
     """A Python 3.10 interpreter to build the venv with.
 
@@ -261,14 +296,15 @@ def ensure_built(config: dict = None) -> Path:
     if not py.exists():
         print(f"[longcat] creating the venv at {venv} with {py310} …", flush=True)
         venv.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([py310, "-m", "venv", str(venv)], check=True)
+        _run_py310([py310, "-m", "venv", str(venv)], "creating the LongCat venv")
         py = _venv_python(venv)
     print("[longcat] installing torch 2.6+cu124 and the rest (several GB, this takes "
           "a while) …", flush=True)
     # Always `python -m pip`, never the venv's pip script: a copied or re-pointed venv
     # carries a stale shebang and would install into the ORIGINAL interpreter.
-    subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
-    subprocess.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)], check=True)
+    _run_py310([str(py), "-m", "pip", "install", "-U", "pip"], "upgrading pip")
+    _run_py310([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+               "installing requirements-longcat.txt")
     if not _venv_ok(py):
         raise RuntimeError(
             f"the venv at {venv} was built but still does not report Python 3.10 with "
@@ -360,7 +396,10 @@ def ensure_service(model_path: str, config: dict = None,
             else "127.0.0.1"
         url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}"
 
-        env = dict(os.environ)
+        # Same sanitising as the venv build: this launches the 3.10 interpreter,
+        # and a leaked PYTHONHOME/PYTHONPATH kills it before it prints anything
+        # useful.
+        env = _py310_env()
         try:
             from codai.models.cache import get_hf_hub_cache_dir
             hub = get_hf_hub_cache_dir()
@@ -556,11 +595,11 @@ def ensure_train_built(config: dict = None) -> Path:
     if not py.exists():
         print(f"[longcat] creating the training venv at {venv} …", flush=True)
         venv.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([py310, "-m", "venv", str(venv)], check=True)
+        _run_py310([py310, "-m", "venv", str(venv)], "creating the LongCat training venv")
         py = _venv_python(venv)
-    subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
-    subprocess.run([str(py), "-m", "pip", "install", "-r", str(_TRAIN_REQUIREMENTS)],
-                   check=True)
+    _run_py310([str(py), "-m", "pip", "install", "-U", "pip"], "upgrading pip")
+    _run_py310([str(py), "-m", "pip", "install", "-r", str(_TRAIN_REQUIREMENTS)],
+               "installing requirements-longcat-train.txt")
     if not _train_venv_ok(py):
         raise RuntimeError(f"the training venv at {venv} was built but `import "
                            f"simpletuner` still fails")
@@ -599,7 +638,8 @@ def train_lora(job: dict, workdir: str, on_progress=None) -> dict:
     cmd = [str(py), str(_TRAIN_SCRIPT), "--job", str(job_path)]
     print(f"[longcat] training: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, cwd=str(_REPO_ROOT))
+                            text=True, bufsize=1, cwd=str(_REPO_ROOT),
+                            env=_py310_env())
     threading.Thread(target=_pump_logs, args=(proc, collections.deque(maxlen=20)),
                      daemon=True).start()
 
@@ -650,7 +690,8 @@ def quantize_int8(checkpoint_dir: str, workdir: str, on_progress=None,
     cmd = [str(py), str(_QUANTIZE_SCRIPT), "--job", str(job_path)]
     print(f"[longcat] quantising: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, cwd=str(_REPO_ROOT))
+                            text=True, bufsize=1, cwd=str(_REPO_ROOT),
+                            env=_py310_env())
     threading.Thread(target=_pump_logs, args=(proc, collections.deque(maxlen=20)),
                      daemon=True).start()
 
