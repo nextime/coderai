@@ -205,17 +205,30 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
 
 
 def _load_quantized_base_dit(root, subfolder, **kwargs):
-    """Load an INT8-quantised BASE DiT.
+    """Load an INT8-quantised BASE DiT without ever holding the bf16 model.
 
-    The same procedure as upstream's ``load_quantized_dit`` — build the model from
-    the saved config, swap every non-skipped Linear for its QuantizedLinear, then
-    load the sharded state dict — but instantiating LongCatVideoTransformer3DModel
-    instead of the avatar class upstream hardcodes. Its quantisation helpers are
-    reused as-is so the weight layout cannot drift from what wrote it.
+    Same end state as upstream's ``load_quantized_dit`` — the model built from the
+    saved config, every non-skipped Linear swapped for its QuantizedLinear, the
+    sharded state dict loaded — but instantiating LongCatVideoTransformer3DModel
+    instead of the avatar class upstream hardcodes, and getting there without the
+    peak that makes the straightforward version unusable.
+
+    Upstream instantiates the model for real, accumulates every shard into one
+    dict, then copies that into the model: for a 13.6B DiT that is ~27 GB of bf16
+    Linears before a single int8 byte is read, plus the weights twice over. It
+    exhausts a 54 GB host. Here the skeleton is built on the meta device (no
+    allocation), and each shard is streamed in and assigned, so the peak is one
+    shard above the final INT8 size.
+
+    Its quantisation helpers are reused as-is so the weight layout cannot drift
+    from what wrote it.
     """
+    import gc
+    import itertools
     import json as _json
+    import torch
     import torch.nn as _nn
-    from safetensors.torch import load_file as _load_file
+    from safetensors import safe_open
     from longcat_video.modules.quantization import QuantizedLinear, DEFAULT_SKIP_PATTERNS
     from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
 
@@ -226,35 +239,58 @@ def _load_quantized_base_dit(root, subfolder, **kwargs):
         config.pop(drop, None)
     config.update({k: v for k, v in kwargs.items() if v is not None})
 
-    model = LongCatVideoTransformer3DModel(**config)
-
-    replace = {}
-    for name, module in model.named_modules():
-        if isinstance(module, _nn.Linear) and not any(
-                pat in name for pat in DEFAULT_SKIP_PATTERNS):
-            replace[name] = QuantizedLinear(module.in_features, module.out_features,
-                                            bias=module.bias is not None)
-    for name, ql in replace.items():
-        parts = name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], ql)
+    # The skeleton costs nothing on meta: shapes and module structure, no storage.
+    with torch.device("meta"):
+        model = LongCatVideoTransformer3DModel(**config)
+        replace = {}
+        for name, module in model.named_modules():
+            if isinstance(module, _nn.Linear) and not any(
+                    pat in name for pat in DEFAULT_SKIP_PATTERNS):
+                replace[name] = QuantizedLinear(module.in_features, module.out_features,
+                                                bias=module.bias is not None)
+        for name, ql in replace.items():
+            parts = name.split(".")
+            parent = model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, parts[-1], ql)
+    log(f"INT8 DiT: {len(replace)} quantised Linear layers")
 
     index_path = os.path.join(qdir, "quantized_model.safetensors.index.json")
-    state = {}
     if os.path.exists(index_path):
         with open(index_path, encoding="utf-8") as fh:
             index = _json.load(fh)
-        for shard in sorted(set(index["weight_map"].values())):
-            state.update(_load_file(os.path.join(qdir, shard)))
+        shards = sorted(set(index["weight_map"].values()))
     else:
-        for shard in sorted(f for f in os.listdir(qdir) if f.endswith(".safetensors")):
-            state.update(_load_file(os.path.join(qdir, shard)))
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        log(f"WARNING: {len(missing)} missing tensors in the INT8 DiT "
-            f"(first: {missing[:3]})")
+        shards = sorted(f for f in os.listdir(qdir) if f.endswith(".safetensors"))
+    if not shards:
+        raise RuntimeError(f"no INT8 shards in {qdir}")
+
+    known = set(model.state_dict().keys())
+    unexpected = []
+    for shard in shards:
+        with safe_open(os.path.join(qdir, shard), framework="pt", device="cpu") as fh:
+            part = {}
+            for key in fh.keys():
+                if key in known:
+                    part[key] = fh.get_tensor(key)
+                else:
+                    unexpected.append(key)
+        # assign=True hands the loaded tensor to the module instead of copying into
+        # storage the meta skeleton does not have.
+        model.load_state_dict(part, strict=False, assign=True)
+        del part
+        gc.collect()
+        log(f"INT8 DiT: loaded {shard}")
+
+    stranded = [name for name, t in itertools.chain(model.named_parameters(),
+                                                    model.named_buffers())
+                if t.is_meta]
+    if stranded:
+        raise RuntimeError(
+            f"{len(stranded)} tensors were not in the INT8 checkpoint and are still "
+            f"on the meta device (first: {stranded[:5]}) — the weights in {qdir} do "
+            f"not match this model config")
     if unexpected:
         log(f"WARNING: {len(unexpected)} unexpected tensors in the INT8 DiT "
             f"(first: {unexpected[:3]})")

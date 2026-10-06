@@ -36,9 +36,11 @@ def test_it_never_replaces_the_bf16_weights():
 
 def test_it_quantises_on_the_cpu():
     """The whole point is to make a model that does not fit the card — so getting
-    there must not need the card."""
+    there must not need the card. The streaming path reads tensors straight to CPU
+    and never touches CUDA."""
     src = SCRIPT.read_text(encoding="utf-8")
-    assert 'to("cpu")' in src
+    assert 'device="cpu"' in src
+    assert "cuda" not in src.lower()
 
 
 def test_an_existing_build_is_not_silently_redone():
@@ -180,20 +182,73 @@ def test_available_memory_is_read_from_the_kernel():
         assert got < 10000, "that is not gigabytes"
 
 
-def test_the_job_refuses_rather_than_exhausting_the_host():
+def test_the_job_still_checks_the_host_has_room():
     src = SCRIPT.read_text(encoding="utf-8")
-    assert "not enough host memory to quantise" in src
-    assert "_available_gb()" in src and "_needed_gb(" in src
-    # and the operator can override it knowingly
+    assert "not enough host memory" in src
+    assert "_available_gb()" in src
     assert "min_free_gb" in src
 
 
-def test_the_load_streams_instead_of_building_a_second_copy():
+def test_nothing_loads_the_weights_into_a_model():
+    """Superseded by the streaming rewrite: there is no load left to make cheap."""
     src = SCRIPT.read_text(encoding="utf-8")
-    assert "low_cpu_mem_usage=True" in src
+    assert "low_cpu_mem_usage" not in src
 
 
-def test_memory_is_released_between_the_phases():
+def test_memory_is_released_as_it_goes():
     src = SCRIPT.read_text(encoding="utf-8")
-    assert src.count("gc.collect()") >= 3
-    assert "del dit" in src
+    assert src.count("gc.collect()") >= 2
+    assert "del tensor" in src
+
+
+# ── the streaming rewrite ───────────────────────────────────────────────────
+# Materialising the model needed ~42 GB and exhausted a 54 GB host. The peak is
+# now one tensor plus the 4 GB shard being accumulated.
+
+def test_the_model_is_never_materialised():
+    src = SCRIPT.read_text(encoding="utf-8")
+    # matched as CALLS, so prose explaining what upstream does does not trip it
+    import re as _re
+    for call in ("from_pretrained", "quantize_model", "save_quantized_state_dict"):
+        assert not _re.search(r"^\s*(?:\w+\s*=\s*)?" + call + r"\(", src, _re.M), call
+
+
+def test_the_layout_is_learned_on_the_meta_device():
+    """Free: a 13.6B transformer costs no memory there, and it gives the exact set
+    of modules upstream would quantise rather than a guess from tensor shapes."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert 'torch.device("meta")' in src
+    assert "DEFAULT_SKIP_PATTERNS" in src, "upstream's skip list must still apply"
+
+
+def test_tensors_are_streamed_one_at_a_time():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "safe_open(" in src and "get_tensor(" in src
+
+
+def test_the_emitted_keys_match_what_the_loader_expects():
+    """load_quantized_dit builds QuantizedLinear modules whose buffers are named
+    weight_int8 / weight_scale / bias — the output has to use those exact names."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert '.weight_int8"' in src
+    assert '.weight_scale"' in src
+    assert "quantized_model.safetensors.index.json" in src
+    assert "quantization_config.json" in src
+
+
+def test_the_quantisation_matches_upstreams_arithmetic():
+    """Per-channel symmetric, /127, clamped — same as QuantizedLinear.from_linear."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "abs().amax(dim=1).clamp(min=1e-8) / 127.0" in src
+    assert "round().clamp(-128, 127)" in src
+
+
+def test_shards_are_capped_so_the_buffer_cannot_grow_unbounded():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "4 * 1024 * 1024 * 1024" in src
+    assert "_flush()" in src
+
+
+def test_the_memory_floor_is_now_a_sanity_check_not_the_constraint():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "or 8.0" in src, "the 42 GB ceiling should be gone"
