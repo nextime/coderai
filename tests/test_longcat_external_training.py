@@ -137,3 +137,61 @@ def test_the_config_is_also_written_where_the_default_lookup_finds_it():
     src = (ROOT / "tools" / "longcat_train.py").read_text(encoding="utf-8")
     assert 'fallback = workdir / "config"' in src
     assert '(fallback / "config.json").write_text' in src
+
+
+# ── two frame rules, not one ────────────────────────────────────────────────
+# Generation obeys the VAE's 4n+1 (93, 173, 333 are whole LongCat segments).
+# TRAINING is stricter: SimpleTuner's longcat_video family rounds DOWN to 8n+1
+# and says nothing, so a job asking for 93 trained at 89 and the config did not
+# say so. Our validator was checking the generation rule.
+
+import importlib.util as _ilu
+
+_spec = _ilu.spec_from_file_location("lc_train", ROOT / "tools" / "longcat_train.py")
+LT = _ilu.module_from_spec(_spec)
+sys.modules["lc_train"] = LT
+_spec.loader.exec_module(LT)
+
+
+@pytest.mark.parametrize("asked,expected", [
+    (93, 89),    # a whole LongCat segment — legal to GENERATE, not to train at
+    (173, 169),  # two segments
+    (333, 329),  # four
+    (89, 89), (97, 97), (105, 105),   # already 8n+1
+    (96, 89), (8, 1), (1, 1), (0, 1),
+])
+def test_the_training_frame_count_rounds_the_way_simpletuner_does(asked, expected):
+    assert LT.training_frames(asked) == expected
+
+
+def test_it_matches_simpletuners_own_formula():
+    """Mirrored from longcat_video/model.py: ((n - 1) // 8) * 8 + 1, floored at 1."""
+    for n in range(0, 400):
+        theirs = n if n % 8 == 1 else max(((n - 1) // 8) * 8 + 1, 1)
+        assert LT.training_frames(n) == max(theirs, 1), n
+
+
+def test_a_rounded_count_always_validates():
+    for n in (93, 173, 333, 96, 7):
+        assert LT.frame_problems(LT.training_frames(n), "480x832") == []
+
+
+def test_the_validator_now_states_the_training_rule():
+    problems = LT.frame_problems(93, "480x832")
+    assert problems and "8n+1" in problems[0]
+    assert "4n+1" in problems[0], "it should say why 93 looked valid"
+
+
+def test_resolution_is_still_checked():
+    assert LT.frame_problems(89, "481x832")
+    assert LT.frame_problems(89, "480x833")
+    assert LT.frame_problems(89, "nonsense")
+    assert LT.frame_problems(89, "480x832") == []
+
+
+def test_a_clip_length_is_not_rejected_merely_for_being_4n_plus_1():
+    """93 is what the dataset builder uses. Blocking it would stop a run that
+    previously worked; it is adjusted and reported instead."""
+    src = (ROOT / "tools" / "longcat_train.py").read_text(encoding="utf-8")
+    assert "is not 8n+1, which training requires" in src
+    assert 'job["num_frames"] = trains_at' in src

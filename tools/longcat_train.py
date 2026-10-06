@@ -71,7 +71,7 @@ def build_config(job: dict) -> dict:
         "learning_rate": float(job.get("lr") or 1e-4),
         "seed": int(job.get("seed") or 42),
         "validation_resolution": job.get("resolution") or "480x832",
-        "validation_num_video_frames": int(job.get("num_frames") or 93),
+        "validation_num_video_frames": training_frames(job.get("num_frames") or 93),
         "tracker_project_name": "coderai-longcat-lora",
         # SimpleTuner has no default for this — it is a REQUIRED argument, and
         # omitting it fails at argparse with "the following arguments are
@@ -93,16 +93,37 @@ def build_config(job: dict) -> dict:
     return cfg
 
 
-def frame_problems(num_frames: int, resolution: str) -> list:
-    """Constraints SimpleTuner's quickstart states, checked before a long run starts.
+def training_frames(num_frames: int) -> int:
+    """The frame count SimpleTuner will actually train at.
 
-    These are the VAE's, not preferences: ``(num_frames - 1)`` must be divisible by 4 —
-    the same 4n+1 rule coderai already applies to Wan — and each side must be divisible
-    by 16."""
+    TWO rules apply and they are not the same. Generation obeys the VAE's 4n+1 —
+    93, 173, 333 are whole LongCat segments. TRAINING is stricter: SimpleTuner's
+    longcat_video family rounds DOWN to 8n+1 (frames % 8 == 1) and says nothing,
+    so asking for 93 trains at 89 and the number in the config is not the number
+    that ran. Rounding here means the config states what will happen.
+    """
+    n = int(num_frames or 0)
+    if n < 1:
+        return 1
+    if n % 8 == 1:
+        return n
+    return max(((n - 1) // 8) * 8 + 1, 1)
+
+
+def frame_problems(num_frames: int, resolution: str) -> list:
+    """Constraints checked before a long run starts.
+
+    These are the model's, not preferences. Note the frame rule here is the
+    TRAINING one (8n+1), which is stricter than the 4n+1 the VAE imposes on
+    generation — see training_frames(). Each side of the resolution must be
+    divisible by 16."""
     problems = []
     n = int(num_frames or 0)
-    if n < 1 or (n - 1) % 4 != 0:
-        problems.append(f"num_frames must be 4n+1 (93, 89, 85 …); got {n}")
+    if n < 1 or (n - 1) % 8 != 0:
+        problems.append(
+            f"num_frames must be 8n+1 for training (89, 97, 105 …); got {n}. "
+            f"Generation's rule is 4n+1, which is looser — 93 is a valid clip "
+            f"length but not a valid training length.")
     try:
         w, h = (int(x) for x in str(resolution).lower().split("x"))
     except Exception:
@@ -128,6 +149,18 @@ def main(argv=None) -> int:
             fh.write(json.dumps(kw) + "\n")
 
     try:
+        # Round to the training rule BEFORE validating, so a clip length that is
+        # legal for generation (4n+1) does not block a run — it is adjusted and
+        # said out loud, rather than silently changed inside SimpleTuner.
+        asked = int(job.get("num_frames") or 93)
+        trains_at = training_frames(asked)
+        if trains_at != asked:
+            job["num_frames"] = trains_at
+            emit(message=f"{asked} frames is not 8n+1, which training requires — "
+                         f"using {trains_at} (generation's 4n+1 rule is looser)")
+            print(f"[longcat-train] num_frames {asked} -> {trains_at} (8n+1)",
+                  flush=True)
+
         problems = frame_problems(job.get("num_frames") or 93,
                                   job.get("resolution") or "480x832")
         if problems:
