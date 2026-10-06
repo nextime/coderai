@@ -158,9 +158,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CODERAI_HOST=0.0.0.0 \
     CODERAI_PORT=8776
 
+# gcc + libc6-dev are NOT for building this image: Triton (under vLLM) JIT-compiles
+# its CUDA driver module at RUNTIME, on the first engine start. Without a C compiler
+# it dies with
+#   RuntimeError: Failed to find C compiler. Please specify via CC environment
+#   variable or set triton.knobs.build.impl.
+# which surfaces as "vLLM exited (code 1) before becoming ready" — so every vLLM
+# engine, surya OCR included, silently fell back to another engine.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       ffmpeg \
+      gcc \
+      libc6-dev \
       git \
       libgomp1 \
       libgl1 \
