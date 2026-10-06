@@ -11864,8 +11864,22 @@ async function resetPrompts(ev){
                 try:
                     _ap = Path(_active)
                     _ap.parent.mkdir(parents=True, exist_ok=True)
+                    # MERGE into the existing config — never replace it. A template is
+                    # a partial: the LongCat starter carries 10 options, the config
+                    # carries ~60. Writing the template alone silently destroyed every
+                    # setting it does not mention, api_key and base_url included, and
+                    # the next request then failed with a bare 401.
+                    _merged = {}
+                    try:
+                        with open(_ap, encoding="utf-8") as _fh:
+                            _existing = _j.load(_fh)
+                        if isinstance(_existing, dict):
+                            _merged.update(_existing)
+                    except (OSError, ValueError):
+                        pass          # no readable config yet: the template IS the config
+                    _merged.update(tcfg)
                     with open(_ap, "w", encoding="utf-8") as f:
-                        _j.dump(tcfg, f, indent=2, sort_keys=True)
+                        _j.dump(_merged, f, indent=2, sort_keys=True)
                         f.write("\n")
                     _persisted = str(_ap)
                 except Exception as e:

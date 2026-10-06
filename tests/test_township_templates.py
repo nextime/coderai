@@ -326,3 +326,43 @@ def test_the_starters_leave_the_image_side_stages_alone():
     for name, cfg in TW.BUILTIN_TEMPLATES.items():
         assert not (set(cfg) & image_side), name
         assert cfg["keyframe_size"] == cfg["video_size"], name
+
+
+def test_loading_a_template_merges_into_the_config_instead_of_replacing_it(tmp_path):
+    """A template is a PARTIAL. Writing it over the config destroyed every setting
+    it does not mention.
+
+    This is not hypothetical: loading the LongCat starter turned a 60-key
+    township_config.json into its own 10 keys, taking api_key and base_url with it
+    — after which every call to CoderAI came back 401 with nothing to explain why.
+    """
+    cfg = tmp_path / "township_config.json"
+    cfg.write_text(json.dumps({
+        "api_key": "the-fighters-token", "base_url": "http://127.0.0.1:8776",
+        "image_model": "some/image-model", "matches": 6, "fps": 8,
+        "clip_min_frames": 50,
+    }))
+    template = {"video_model": "longcat", "fps": 15, "clip_min_frames": 173}
+
+    existing = json.loads(cfg.read_text())
+    merged = dict(existing)
+    merged.update(template)
+    cfg.write_text(json.dumps(merged))
+
+    got = json.loads(cfg.read_text())
+    # the template's values won…
+    assert got["video_model"] == "longcat"
+    assert got["fps"] == 15 and got["clip_min_frames"] == 173
+    # …and nothing it was silent about was lost.
+    assert got["api_key"] == "the-fighters-token"
+    assert got["base_url"] == "http://127.0.0.1:8776"
+    assert got["image_model"] == "some/image-model"
+    assert got["matches"] == 6
+
+
+def test_the_load_handler_merges_rather_than_dumping_the_template():
+    """Guards the actual code path: the bug was a bare json.dump(tcfg, ...)."""
+    src = (Path(__file__).resolve().parents[1] / "tools"
+           / "gen_township_fighters.py").read_text(encoding="utf-8")
+    assert "_j.dump(tcfg, f" not in src, "the template is being written over the config"
+    assert "_merged.update(tcfg)" in src
