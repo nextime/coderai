@@ -276,3 +276,91 @@ def test_both_load_paths_get_the_backend(service):
     body = src[src.index("def load_pipeline"):src.index("def _cp_split_hw")]
     assert body.count("_dit_kwargs()") == 2
     assert "_attention_kwargs()" in src[src.index("def _dit_kwargs"):]
+
+
+# ------------------------------------------------- one encode per request, not per segment
+# _run_segments calls generate_t2v once PER SEGMENT and each calls self.encode_prompt.
+# A one-minute video at 15 fps is 12 segments, so that was 12 identical encodes — and
+# under offload, 12 round trips of ~35 GB over PCIe for an answer that cannot change.
+
+def test_the_same_prompt_is_encoded_once(service):
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+
+    for _ in range(12):                       # twelve segments, one prompt
+        out = pipe.encode_prompt("a boxer", device="cuda")
+
+    assert pipe.encode_calls == ["a boxer"], "encoded once per request, not per segment"
+    assert out == ("embeds", "mask")
+
+
+def test_the_encoder_stays_off_the_card_after_the_first_segment(service):
+    """The point of caching here: for the rest of a long generation the card holds
+    nothing but the DiT and the VAE."""
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+    pipe.encode_prompt("a boxer", device="cuda")
+    visits_after_first = len([d for d in pipe.text_encoder.history if d == "cuda"])
+
+    for _ in range(11):
+        pipe.encode_prompt("a boxer", device="cuda")
+
+    assert len([d for d in pipe.text_encoder.history if d == "cuda"]) == visits_after_first
+    assert pipe.dit.device == "cuda"
+
+
+def test_a_different_prompt_is_encoded_again(service):
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+
+    pipe.encode_prompt("a boxer", device="cuda")
+    pipe.encode_prompt("a dancer", device="cuda")
+    pipe.encode_prompt("a boxer", device="cuda")
+
+    assert pipe.encode_calls == ["a boxer", "a dancer"]
+
+
+def test_differing_keyword_arguments_are_not_conflated(service):
+    """Same text, different guidance or sequence length is a different encode."""
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+
+    pipe.encode_prompt("a boxer", device="cuda", max_sequence_length=512)
+    pipe.encode_prompt("a boxer", device="cuda", max_sequence_length=226)
+
+    assert len(pipe.encode_calls) == 2
+
+
+def test_the_cache_is_bounded(service):
+    """A long-lived service must not accumulate embeddings for every prompt it sees."""
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+
+    for i in range(10):
+        pipe.encode_prompt(f"prompt {i}", device="cuda")
+    pipe.encode_prompt("prompt 0", device="cuda")      # evicted by now
+
+    assert len(pipe.encode_calls) == 11
+
+
+def test_caching_also_applies_without_offload(service):
+    """Fully resident still runs 12 redundant encodes otherwise."""
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, None)
+
+    for _ in range(5):
+        pipe.encode_prompt("a boxer", device="cuda")
+
+    assert pipe.encode_calls == ["a boxer"]
+    assert pipe.text_encoder.device == "cuda", "nothing was offloaded"
+
+
+def test_an_unhashable_argument_still_encodes(service):
+    """A dict or tensor among the arguments must not break the call, just skip the cache."""
+    pipe = FakePipeline()
+    service._place_pipeline(pipe, "model")
+
+    pipe.encode_prompt("a boxer", device="cuda", extra={"weights": [1, 2]})
+    pipe.encode_prompt("a boxer", device="cuda", extra={"weights": [1, 2]})
+
+    assert len(pipe.encode_calls) == 2

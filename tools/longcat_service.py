@@ -34,6 +34,7 @@ Endpoints:
 """
 
 import argparse
+import collections
 import contextlib
 import base64
 import importlib.util
@@ -322,6 +323,80 @@ def _attention_kwargs():
 
 
 @contextlib.contextmanager
+def _wrap_encode_prompt(pipe, swap: bool):
+    """Encode a prompt at most once per request, and (when offloading) swap for it.
+
+    _run_segments calls generate_t2v once PER SEGMENT, and every one of those calls
+    self.encode_prompt — so a one-minute video at 15 fps is 12 segments and was 12
+    identical encodes. Under offload each of those also moved the 13.6 GB DiT off the
+    card and the ~11 GB encoder on and back: about 35 GB over PCIe per segment, for an
+    answer that cannot change, since the prompt is the same every time.
+
+    The embeddings are a few MB, so they are cached on the arguments that produce them.
+    Segment 2 onward then never touches the encoder at all, which means the card holds
+    nothing but the DiT and VAE for the whole of a long generation.
+    """
+    import gc
+    import torch
+
+    inner = pipe.encode_prompt      # the bound method, before it is shadowed below
+    cache = collections.OrderedDict()
+
+    def _move_dit(device):
+        """The DiT and the LoRA networks hanging off it, the way upstream's to() does."""
+        if pipe.dit is None:
+            return
+        pipe.dit = pipe.dit.to(device, non_blocking=True)
+        if getattr(pipe.dit, "lora_dict", None):
+            for network in pipe.dit.lora_dict.values():
+                for lora in network.loras:
+                    lora.to(device, non_blocking=True)
+
+    def encode_prompt(*args, **kwargs):
+        # Pass through verbatim: naming the first parameters here would bake in an
+        # assumption about upstream's signature that the avatar pipeline need not share.
+        def _hashable(v):
+            return tuple(v) if isinstance(v, (list, set)) else v
+        try:
+            key = (tuple(_hashable(a) for a in args),
+                   tuple(sorted((k, _hashable(v)) for k, v in kwargs.items())))
+            hash(key)
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+        except TypeError:
+            key = None          # an unhashable argument: encode, do not cache
+
+        if swap:
+            # They take TURNS. The INT8 DiT is 13.6 GB resident and the encoder is
+            # ~11 GB: bringing the encoder over while the DiT stays is 24.8 GB on a
+            # 24 GB card, which is the OOM that model offload exists to prevent.
+            _move_dit("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            pipe.text_encoder = pipe.text_encoder.to("cuda", non_blocking=True)
+        try:
+            out = inner(*args, **kwargs)
+        finally:
+            if swap:
+                # finally, not just on success: leaving 11 GB stranded after a failed
+                # encode would make the retry the thing that OOMs, and a DiT left on
+                # the host would run every later segment at PCIe speed.
+                pipe.text_encoder = pipe.text_encoder.to("cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
+                _move_dit("cuda")
+        if key is not None:
+            cache[key] = out
+            while len(cache) > 4:       # a few MB each; bounded for a long-lived service
+                cache.popitem(last=False)
+        return out
+
+    # Set on the INSTANCE: all four generate_* methods call self.encode_prompt.
+    pipe.encode_prompt = encode_prompt
+    return pipe
+
+
 def _bsa_for(pipe, ctx):
     """Run this pass with block-sparse attention only if the geometry allows it.
 
@@ -380,6 +455,8 @@ def _place_pipeline(pipe, offload):
 
     if offload not in ("model", "sequential"):
         pipe.to("cuda")
+        # Still worth caching: 12 segments would otherwise run 12 identical encodes.
+        _wrap_encode_prompt(pipe, swap=False)
         log("the whole pipeline is resident on the card")
         return pipe
     if offload == "sequential":
@@ -401,40 +478,7 @@ def _place_pipeline(pipe, offload):
     if encoder is not None:
         pipe.text_encoder = encoder.to("cpu")
 
-    inner = pipe.encode_prompt      # the bound method, before it is shadowed below
-
-    def _move_dit(device):
-        """The DiT and the LoRA networks hanging off it, the way upstream's to() does."""
-        if pipe.dit is None:
-            return
-        pipe.dit = pipe.dit.to(device, non_blocking=True)
-        if getattr(pipe.dit, "lora_dict", None):
-            for network in pipe.dit.lora_dict.values():
-                for lora in network.loras:
-                    lora.to(device, non_blocking=True)
-
-    def encode_prompt(*args, **kwargs):
-        # They take TURNS. The INT8 DiT is 13.6 GB resident and the encoder is ~11 GB:
-        # bringing the encoder over while the DiT stays is 24.8 GB on a 24 GB card,
-        # which is the OOM that model offload exists to prevent. Peak is max(DiT,
-        # encoder), not their sum. The swap costs a round trip over PCIe, once per
-        # generation, against a denoising loop measured in minutes.
-        _move_dit("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-        pipe.text_encoder = pipe.text_encoder.to("cuda", non_blocking=True)
-        try:
-            return inner(*args, **kwargs)
-        finally:
-            # finally, not just on success: leaving 11 GB stranded after a failed
-            # encode would make the retry the thing that OOMs.
-            pipe.text_encoder = pipe.text_encoder.to("cpu")
-            gc.collect()
-            torch.cuda.empty_cache()
-            _move_dit("cuda")
-
-    # Set on the INSTANCE: all four generate_* methods call self.encode_prompt.
-    pipe.encode_prompt = encode_prompt
+    _wrap_encode_prompt(pipe, swap=True)
     log("offload: the DiT and VAE are resident; the text encoder (~11 GB) and the DiT "
         "swap places for encode_prompt so only one of them is ever on the card")
     return pipe
