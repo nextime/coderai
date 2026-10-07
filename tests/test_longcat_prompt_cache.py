@@ -369,6 +369,15 @@ def test_a_lazily_realised_quantised_encoder_is_never_swapped(SVC):
     assert "_encoder_is_quantised(pipe)" in wrap
 
 
+def test_a_hit_without_an_explicit_device_follows_the_pipeline(SVC):
+    """encode_prompt's signature defaults device to None. A cached tuple left on the
+    CPU would then meet a DiT on the card."""
+    wrap = SERVICE.read_text(encoding="utf-8")
+    wrap = wrap[wrap.index("def _wrap_encode_prompt("):]
+    wrap = wrap[:wrap.index("\n@contextlib")]
+    assert 'kwargs.get("device") or getattr(pipe, "device", None)' in wrap
+
+
 def test_the_disk_cache_is_consulted_before_the_encoder_is_touched(SVC):
     """Order matters: in-memory, then disk, then encode. Realising the encoder before
     the disk lookup would spend the 11 GB this feature exists to save."""

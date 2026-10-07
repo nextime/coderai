@@ -683,7 +683,11 @@ def _wrap_encode_prompt(pipe, swap: bool, cache=None, lazy=None):
                 log(f"prompt cache: cannot key this call ({type(exc).__name__}: {exc})")
                 disk_key = None
         if disk_key is not None:
-            hit = cache.get(disk_key, device=kwargs.get("device"),
+            # Upstream's callers always pass device, but its signature defaults it to
+            # None, and a cached tuple left on the CPU would then meet a DiT on the
+            # card. Fall back the way _get_t5_prompt_embeds would.
+            hit = cache.get(disk_key,
+                            device=kwargs.get("device") or getattr(pipe, "device", None),
                             dtype=kwargs.get("dtype"))
             if hit is not None:
                 log("prompt cache hit — the text encoder is not needed for this request")
