@@ -2942,7 +2942,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "variant", "quality", "num_segments", "num_cond_frames", "cp_size",
                 "longcat_source", "longcat_venv", "ref_img_index", "mask_frame_range",
                 "use_int8", "use_distill", "offload_kv_cache",
-                ):
+                
+                    # LongCat component quantisation, block-sparse attention, the base
+                    # checkpoint an avatar family borrows from, and the CP tile.
+                    "text_encoder_quant", "bsa", "base_model", "cp_split_hw",):
         if key in data:
             entry[key] = data[key]
     # Work-parallel fan-out over engines and nodes (codai/cluster/fanout.py).

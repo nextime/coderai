@@ -45,7 +45,15 @@ RUN sed -i 's|^home *=.*|home = /opt/coderai/py310/bin|; \
       assert sys.version_info[:2]==(3,10), sys.version; \
       assert torch.__version__.startswith('2.6'), torch.__version__"
 
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+# gcc and libc6-dev are RUNTIME requirements here, not build ones: Triton compiles its
+# CUDA driver module the first time it is used, and block-sparse attention (longcat.bsa)
+# is pure Triton. Without them a pod fails with "Failed to find C compiler" on the first
+# denoising step — the same way Surya did in the local image before v0.2.62.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git \
+      ca-certificates \
+      gcc \
+      libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # The pipeline code. Shallow, no history, no weights, no demo assets.

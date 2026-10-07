@@ -39,6 +39,13 @@ FIELDS = {
     "cfg-longcat-int8": "use_int8",
     "cfg-longcat-distill": "use_distill",
     "cfg-longcat-offload-kv": "offload_kv_cache",
+    # Quantising the text encoder is what decides whether the pipeline can stay
+    # resident on a 24 GB card; BSA whether attention is sparse; base_model where an
+    # avatar family borrows tokenizer/text_encoder/vae; cp_split_hw the CP tile.
+    "cfg-longcat-te-quant": "text_encoder_quant",
+    "cfg-longcat-bsa": "bsa",
+    "cfg-longcat-base-model": "base_model",
+    "cfg-longcat-cp-split": "cp_split_hw",
 }
 
 

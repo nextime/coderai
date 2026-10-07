@@ -25,7 +25,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # and Dockerfile.oci otherwise. Checking only one is how gcc was added to the
 # file that was not being used, and the build came out without a compiler.
 DOCKERFILES = [ROOT / "packaging" / "linux" / "Dockerfile.oci",
-               ROOT / "packaging" / "linux" / "Dockerfile.oci-venv"]
+               ROOT / "packaging" / "linux" / "Dockerfile.oci-venv",
+               # The LongCat pod image too: block-sparse attention is pure Triton, so a
+               # pod without a compiler dies on the first denoising step. Its bases
+               # (capability-base-light) carry no compiler, so it must add its own.
+               ROOT / "packaging" / "runpod" / "Dockerfile.capability-video-longcat"]
 RUNPOD_VLLM_APT = ROOT / "packaging" / "runpod" / "profiles" / "vllm.apt"
 
 

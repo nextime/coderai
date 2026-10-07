@@ -704,9 +704,26 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <option value="sequential">sequential — lowest VRAM, slowest</option>
             </select></div>
         </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Text encoder</label>
+            <select id="cfg-longcat-te-quant" class="form-input">
+              <option value="">bf16 — ~11 GB, needs offload</option>
+              <option value="int8">int8 — ~5.6 GB, stays resident</option>
+              <option value="nf4">nf4 — ~2.8 GB, stays resident</option>
+              <option value="fp4">fp4 — ~2.8 GB, stays resident</option>
+            </select></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Block-sparse attention</label>
+            <select id="cfg-longcat-bsa" class="form-input">
+              <option value="">off — dense attention</option>
+              <option value="on">on — needs sides /64 and 16n+13 frames</option>
+              <option value="auto">auto — on when triton is available</option>
+            </select></div>
+        </div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-top:.5rem">
           <div class="form-row" style="margin:0"><label class="form-label">Segments <span class="muted">(blank = 1)</span></label><input type="number" id="cfg-longcat-segments" class="form-input" min="1" placeholder="1"></div>
           <div class="form-row" style="margin:0"><label class="form-label">Conditioning frames</label><input type="number" id="cfg-longcat-cond-frames" class="form-input" min="1" placeholder="13"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Base checkpoint <span class="muted">(avatar only)</span></label><input type="text" id="cfg-longcat-base-model" class="form-input" placeholder="meituan-longcat/LongCat-Video"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">CP tile <span class="muted">(HxW)</span></label><input type="text" id="cfg-longcat-cp-split" class="form-input" placeholder="1x2"></div>
           <div class="form-row" style="margin:0"><label class="form-label">Context-parallel GPUs</label><input type="number" id="cfg-longcat-cp" class="form-input" min="1" placeholder="1"></div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.5rem">
@@ -4567,6 +4584,10 @@ function _populateCluster(m, s){
   set('cfg-longcat-variant', s.variant || 'bf16');
   set('cfg-longcat-quality', s.quality || 'fast');
   set('cfg-longcat-offload', s.offload_strategy || '');
+  set('cfg-longcat-te-quant', s.text_encoder_quant || '');
+  set('cfg-longcat-bsa', s.bsa || '');
+  set('cfg-longcat-base-model', s.base_model || '');
+  set('cfg-longcat-cp-split', s.cp_split_hw || '');
   set('cfg-longcat-segments', s.num_segments || '');
   set('cfg-longcat-cond-frames', s.num_cond_frames || '');
   set('cfg-longcat-cp', s.cp_size || '');
@@ -4610,6 +4631,10 @@ function _collectCluster(){
     out.variant = val('cfg-longcat-variant') || 'bf16';
     out.quality = val('cfg-longcat-quality') || 'fast';
     out.offload_strategy = val('cfg-longcat-offload') || '';
+    out.text_encoder_quant = val('cfg-longcat-te-quant') || '';
+    out.bsa = val('cfg-longcat-bsa') || '';
+    out.base_model = val('cfg-longcat-base-model') || '';
+    out.cp_split_hw = val('cfg-longcat-cp-split') || '';
     out.num_segments = num('cfg-longcat-segments');
     out.num_cond_frames = num('cfg-longcat-cond-frames');
     out.cp_size = num('cfg-longcat-cp');
