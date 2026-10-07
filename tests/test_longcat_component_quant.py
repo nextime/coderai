@@ -105,11 +105,19 @@ def test_a_quantised_encoder_is_never_offloaded():
 
 
 def test_quantisation_is_detected_from_the_model_not_the_config():
-    """A pipeline loaded quantised must not be offloaded by a config that changed since."""
+    """A pipeline loaded quantised must not be offloaded by a config that changed since.
+
+    The bitsandbytes module names live in _is_quantised_module, which _encoder_is_quantised
+    delegates to: a lazily realised encoder has to be asked the same question before it is
+    attached to a pipeline, and the two answers must not drift. Both are checked here so
+    neither can start consulting the config.
+    """
     src = SERVICE.read_text(encoding="utf-8")
-    body = src[src.index("def _encoder_is_quantised"):src.index("def _quant_config")]
+    body = src[src.index("def _is_quantised_module"):src.index("def _quant_config")]
     assert "Linear4bit" in body and "Linear8bitLt" in body
     assert "text_encoder_quant" not in body
+    delegating = src[src.index("def _encoder_is_quantised"):src.index("def _quant_config")]
+    assert "_is_quantised_module(" in delegating
 
 
 def test_missing_bitsandbytes_is_a_clear_error():

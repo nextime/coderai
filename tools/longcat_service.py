@@ -356,13 +356,12 @@ def _attention_kwargs():
         "attention has no fallback path")
 
 
-def _encoder_is_quantised(pipe) -> bool:
-    """Whether the text encoder carries bitsandbytes weights.
+def _is_quantised_module(encoder) -> bool:
+    """Whether this module carries bitsandbytes weights.
 
-    Asked of the MODEL rather than the config, so a pipeline that was loaded quantised
-    cannot be offloaded by a config that has since changed.
+    Its own function because a lazily realised encoder has to be asked the same
+    question before it is attached to a pipeline, and the two answers must not drift.
     """
-    encoder = getattr(pipe, "text_encoder", None)
     if encoder is None:
         return False
     if getattr(encoder, "is_quantized", False) or getattr(encoder, "is_loaded_in_4bit", False) \
@@ -373,6 +372,15 @@ def _encoder_is_quantised(pipe) -> bool:
         return False
     return any(type(m).__name__ in ("Linear4bit", "Linear8bitLt", "Params4bit")
                for m in walk())
+
+
+def _encoder_is_quantised(pipe) -> bool:
+    """Whether the pipeline's text encoder carries bitsandbytes weights.
+
+    Asked of the MODEL rather than the config, so a pipeline that was loaded quantised
+    cannot be offloaded by a config that has since changed.
+    """
+    return _is_quantised_module(getattr(pipe, "text_encoder", None))
 
 
 def _quant_config(kind: str, dtype):
@@ -587,14 +595,27 @@ class _LazyEncoder:
         self._build = build
         self._lock = threading.Lock()
         self.realised = False
+        # Where a realised encoder belongs, set by _place_pipeline once it knows the
+        # offload mode. It CANNOT be inferred here: placement happens at load time,
+        # when this holder is all there is, so the decision has to be remembered rather
+        # than re-derived on a miss.
+        self.device = "cpu"
 
     def realise(self, pipe):
-        """Build the encoder and attach it to the pipeline. Idempotent."""
+        """Build the encoder, place it, and attach it to the pipeline. Idempotent."""
         with self._lock:
             if pipe.text_encoder is not None:
                 return pipe.text_encoder
             log("prompt cache miss: building the text encoder now (deferred at load)")
-            pipe.text_encoder = self._build()
+            encoder = self._build()
+            # pipe.to("cuda") already ran, at load time, when there was no encoder to
+            # move. Without this the weights sit on the host while _get_t5_prompt_embeds
+            # sends it inputs on the card, and the first miss dies on a device mismatch.
+            # A quantised encoder is exempt: device_map put it on the card as it loaded,
+            # and bitsandbytes weights are not meant to be moved afterwards.
+            if self.device != "cpu" and not _is_quantised_module(encoder):
+                encoder = encoder.to(self.device, non_blocking=True)
+            pipe.text_encoder = encoder
             self.realised = True
             return pipe.text_encoder
 
@@ -768,6 +789,12 @@ def _place_pipeline(pipe, offload):
         log("WARNING: no CUDA device visible — this will be extremely slow")
         return pipe
 
+    def _lazy_goes_to(device):
+        """Remember where a lazily realised encoder belongs. No-op without one."""
+        lazy = _state.get("lazy_encoder")
+        if lazy is not None:
+            lazy.device = device
+
     # A quantised encoder is already on the card and must stay there: bitsandbytes
     # quantises as the weights land on CUDA and is not built to shuttle them back. It
     # is also small enough not to need to — which is the whole point of quantising it.
@@ -782,12 +809,16 @@ def _place_pipeline(pipe, offload):
         if pipe.vae is not None:
             pipe.vae = pipe.vae.to("cuda", non_blocking=True)
         pipe.device = "cuda"
+        _lazy_goes_to("cuda")
         _wrap_encode_prompt(pipe, swap=False, cache=_state.get("prompt_cache"),
                             lazy=_state.get("lazy_encoder"))
         return pipe
 
     if offload not in ("model", "sequential"):
         pipe.to("cuda")
+        # A deferred encoder was not here for that to(), so record where it belongs.
+        # Resident means resident: it goes to the card when a miss builds it.
+        _lazy_goes_to("cuda")
         # Still worth caching: 12 segments would otherwise run 12 identical encodes.
         _wrap_encode_prompt(pipe, swap=False, cache=_state.get("prompt_cache"),
                             lazy=_state.get("lazy_encoder"))
@@ -811,6 +842,9 @@ def _place_pipeline(pipe, offload):
         pipe.text_encoder = encoder
     if encoder is not None:
         pipe.text_encoder = encoder.to("cpu")
+    # Under offload the encoder lives on the host and the wrapper brings it over for
+    # the encode, so a deferred one is built there too — which is also the default.
+    _lazy_goes_to("cpu")
 
     _wrap_encode_prompt(pipe, swap=True, cache=_state.get("prompt_cache"),
                         lazy=_state.get("lazy_encoder"))

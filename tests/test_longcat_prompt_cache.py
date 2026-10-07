@@ -265,6 +265,76 @@ def test_realising_twice_builds_once(SVC):
     assert built == [1] and pipe.text_encoder == "encoder"
 
 
+def test_a_realised_encoder_lands_where_the_placement_already_happened(SVC):
+    """pipe.to("cuda") runs at LOAD time, when a deferred encoder is not there to be
+    moved. Without replaying that, the weights sit on the host while
+    _get_t5_prompt_embeds sends them inputs on the card, and the first miss dies on a
+    device mismatch — the bug that laziness introduces if placement is not remembered.
+    """
+    moved = []
+
+    class _Encoder:
+        def to(self, device, **kw):
+            moved.append(device)
+            return self
+
+    class _Pipe:
+        text_encoder = None
+
+    lazy = SVC._LazyEncoder(_Encoder)
+    lazy.device = "cuda"
+    lazy.realise(_Pipe())
+    assert moved == ["cuda"]
+
+
+def test_under_offload_it_is_built_on_the_host_where_it_belongs(SVC):
+    """The wrapper brings it over for the encode and takes it back. Building it on the
+    card would be the 24.8 GB peak that offload exists to prevent."""
+    moved = []
+
+    class _Encoder:
+        def to(self, device, **kw):
+            moved.append(device)
+            return self
+
+    class _Pipe:
+        text_encoder = None
+
+    lazy = SVC._LazyEncoder(_Encoder)      # cpu is the default
+    assert lazy.device == "cpu"
+    lazy.realise(_Pipe())
+    assert moved == []
+
+
+def test_a_quantised_encoder_is_not_moved_after_it_is_built(SVC):
+    """device_map put it on the card as it loaded; bitsandbytes weights are not meant
+    to be moved afterwards."""
+    moved = []
+
+    class _Encoder:
+        is_loaded_in_4bit = True
+
+        def to(self, device, **kw):
+            moved.append(device)
+            return self
+
+    class _Pipe:
+        text_encoder = None
+
+    lazy = SVC._LazyEncoder(_Encoder)
+    lazy.device = "cuda"
+    lazy.realise(_Pipe())
+    assert moved == []
+
+
+def test_placement_is_recorded_by_the_function_that_knows_the_mode(SVC):
+    """It cannot be re-derived on a miss: by then the offload argument is long gone."""
+    src = SERVICE.read_text(encoding="utf-8")
+    place = src[src.index("def _place_pipeline("):src.index("def _load_quantized_base_dit(")]
+    assert place.count("_lazy_goes_to(") == 4, "each branch must say where it belongs"
+    assert '_lazy_goes_to("cpu")' in place and '_lazy_goes_to("cuda")' in place
+
+
 def test_it_is_not_a_transparent_proxy(SVC):
     """Upstream guards every use with `if self.text_encoder is not None`. A proxy that
     looked like a module would be moved to the card by pipe.to() and offloaded by
