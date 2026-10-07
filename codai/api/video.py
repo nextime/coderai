@@ -129,6 +129,18 @@ def _decode_b64_or_url(data: str) -> bytes:
     return base64.b64decode(data)
 
 
+def _as_b64(ref: str) -> str:
+    """Normalise a base64 / data-URI / URL reference to plain base64.
+
+    Module level because more than one backend needs it: it lived inside
+    _generate_h3, and _generate_longcat referenced it across that scope — so every
+    LongCat path that carries an image, an audio track or conditioning frames raised
+    `NameError: name '_as_b64' is not defined`. Text-to-video was the only one that
+    never touched it, which is why it was the only one that worked.
+    """
+    return base64.b64encode(_decode_b64_or_url(ref)).decode()
+
+
 def _pil_from_b64(data: str):
     from PIL import Image as PILImage
     return PILImage.open(io.BytesIO(_decode_b64_or_url(data))).convert("RGB")
@@ -3969,10 +3981,6 @@ async def _generate_h3(request: VideoGenerationRequest, model_name: str,
         warnings.append("MiniMax-H3 is guidance-distilled: negative_prompt ignored")
     if request.guidance_scale is not None:
         warnings.append("MiniMax-H3 is guidance-distilled: guidance_scale ignored")
-
-    def _as_b64(ref: str) -> str:
-        """Normalise a base64 / data-URI / URL reference to plain base64."""
-        return base64.b64encode(_decode_b64_or_url(ref)).decode()
 
     payload = {
         "prompt": request.prompt or "",
