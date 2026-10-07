@@ -123,7 +123,12 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         if _te_cfg is not None:
             # device_map is required for a quantised load: bitsandbytes quantises as the
             # weights land on the card.
-            te_kw.update(quantization_config=_te_cfg, device_map={"": 0})
+            # The worker masks the card with CUDA_VISIBLE_DEVICES, so the selected
+            # GPU is index 0 in this process — but read the current device rather than
+            # assume it, so this agrees with pipe.to("cuda") on any install.
+            te_kw.update(quantization_config=_te_cfg,
+                         device_map={"": torch.cuda.current_device()
+                                     if torch.cuda.is_available() else 0})
             log(f"text encoder: {te_quant} "
                 f"(~{11.0 * LC.component_quant_fraction(te_quant):.1f} GB instead of "
                 f"~11 GB at bf16 — the embedding table does not quantise) "

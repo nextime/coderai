@@ -24,8 +24,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 # ffmpeg for every audio/video path; git because a few ML packages still want it
 # at install time; libgl/libglib for opencv.
+# gcc and libc6-dev are RUNTIME requirements, not build ones. Triton compiles its CUDA
+# driver module the first time anything uses a Triton kernel, and this base carries
+# torch AND bitsandbytes (core.txt) — bitsandbytes reaches Triton's autotuner on import.
+# Without them the first quantised forward dies with "Failed to find C compiler", the
+# way Surya did locally before v0.2.62. Linking also needs libcuda.so, which the nvidia
+# container runtime provides on a pod.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
+        gcc \
+        libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Installing NPP is not enough: torch preloads its own nvidia libs and NPP is

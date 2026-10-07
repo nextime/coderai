@@ -29,7 +29,11 @@ DOCKERFILES = [ROOT / "packaging" / "linux" / "Dockerfile.oci",
                # The LongCat pod image too: block-sparse attention is pure Triton, so a
                # pod without a compiler dies on the first denoising step. Its bases
                # (capability-base-light) carry no compiler, so it must add its own.
-               ROOT / "packaging" / "runpod" / "Dockerfile.capability-video-longcat"]
+               ROOT / "packaging" / "runpod" / "Dockerfile.capability-video-longcat",
+               # The shared capability base: it carries torch and, via core.txt,
+               # bitsandbytes — which reaches Triton's autotuner on import. Every
+               # profile image built FROM it inherits the gap otherwise.
+               ROOT / "packaging" / "runpod" / "Dockerfile.capability-base"]
 RUNPOD_VLLM_APT = ROOT / "packaging" / "runpod" / "profiles" / "vllm.apt"
 
 
@@ -69,3 +73,17 @@ def test_the_runpod_vllm_profile_agrees():
     pkgs = [l.strip() for l in RUNPOD_VLLM_APT.read_text(encoding="utf-8").splitlines()
             if l.strip() and not l.strip().startswith("#")]
     assert "gcc" in pkgs
+
+def test_the_light_base_is_deliberately_left_without_one():
+    """capability-base-light ships no torch on purpose, so it has no Triton to build
+    for. Anything that adds its own torch there — the LongCat 3.10 venv — must bring
+    its own compiler, which is why Dockerfile.capability-video-longcat installs one
+    even though its parent does not.
+    """
+    light = (ROOT / "packaging" / "runpod" /
+             "Dockerfile.capability-base-light").read_text(encoding="utf-8")
+    assert "torch" not in light.split("FROM")[-1].lower() or "No torch here" in light
+    longcat = (ROOT / "packaging" / "runpod" /
+               "Dockerfile.capability-video-longcat").read_text(encoding="utf-8")
+    assert re.search(r"^\s+gcc\s*\\?\s*$", longcat, re.M), \
+        "the light base gives it nothing, so it must install its own"

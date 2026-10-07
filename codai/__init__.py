@@ -16,7 +16,7 @@
 
 # Canonical product version for CoderAI — single source of truth. Both the API
 # metadata and the admin web UI read from here.
-__version__ = "0.2.79"
+__version__ = "0.2.80"
 __tagline__ = "Complete orchestration, distribution and escalation of remotizable advanced inference."
 
 # Configure the CUDA caching allocator BEFORE torch is imported anywhere.
