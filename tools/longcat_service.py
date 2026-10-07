@@ -31,6 +31,7 @@ Endpoints:
     GET  /progress  → {"active", "stage", "segment", "segments", "step", "steps"}
     POST /generate  → {"mp4_b64", "num_frames", "fps", "stages", "segments"}
     POST /unload    → {"ok"}  (drops the pipeline, keeps the process)
+    GET  /prompt-cache → the disk prompt-embedding cache's stats, or {"enabled": false}
 """
 
 import argparse
@@ -63,6 +64,9 @@ _state = {
     "family": "", "variant": "bf16", "use_int8": False, "use_distill": False,
     "cp_split_hw": [1, 1], "audio_encoder": None, "base_model": "",
     "text_encoder_quant": "none",
+    # A _PromptCache when prompt_cache is configured, else None — which is also the
+    # switch that decides whether the text encoder is built lazily.
+    "prompt_cache": None, "lazy_encoder": None,
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
@@ -133,8 +137,21 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                 f"(~{11.0 * LC.component_quant_fraction(te_quant):.1f} GB instead of "
                 f"~11 GB at bf16 — the embedding table does not quantise) "
                 f"— resident, never offloaded")
-        text_encoder = UMT5EncoderModel.from_pretrained(
-            shared, subfolder="text_encoder", **te_kw)
+        def _build_text_encoder():
+            return UMT5EncoderModel.from_pretrained(
+                shared, subfolder="text_encoder", **te_kw)
+
+        # With the prompt cache on, the encoder is not built until something misses.
+        # ~11 GB and about a minute, skipped entirely for a prompt already encoded —
+        # which is the whole return on having a cache on disk rather than in memory.
+        if _state.get("prompt_cache") is not None:
+            _state["lazy_encoder"] = _LazyEncoder(_build_text_encoder)
+            text_encoder = None
+            log("text encoder: deferred — the prompt cache is on, so it is built only "
+                "on a miss")
+        else:
+            _state["lazy_encoder"] = None
+            text_encoder = _build_text_encoder()
         vae = AutoencoderKLWan.from_pretrained(shared, subfolder="vae", torch_dtype=td)
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             root, subfolder="scheduler")
@@ -385,7 +402,204 @@ def _quant_config(kind: str, dtype):
                               bnb_4bit_use_double_quant=True)
 
 
-def _wrap_encode_prompt(pipe, swap: bool):
+class _PromptCache:
+    """A disk cache of prompt embeddings, so the text encoder need not run — or load.
+
+    An encode is ~11 GB of weights and a GPU pass to produce a few MB of embeddings
+    that are a pure function of the prompt and the encoder. v0.2.76 made that once per
+    request instead of once per segment; this makes it once per *prompt, ever*.
+
+    The reason it is worth a disk format rather than a bigger in-memory cache is
+    LAZINESS: with a hit, the encoder is never built, which is ~11 GB of host RAM and
+    about a minute of load time. See ``_LazyEncoder``.
+
+    Entries are keyed by :func:`LC.prompt_cache_key` — the checkpoint, the dtype, the
+    encoder's quantisation and the call's own arguments — so a cache cannot serve a
+    bf16 pipeline with NF4 numbers. Tensors are stored on the CPU and moved on read.
+
+    Every failure here is a MISS, never an error: a cache that cannot be read must not
+    be able to break generation. The only exception is a write failing for lack of
+    space, which is logged once so a silently useless cache does not look like a
+    working one.
+    """
+
+    def __init__(self, directory: str, max_gb: float):
+        self.dir = directory
+        self.max_bytes = int(float(max_gb) * (1024 ** 3))
+        self._lock = threading.Lock()
+        self.stats = {"hits": 0, "misses": 0, "writes": 0, "evicted": 0, "errors": 0}
+        self._warned = False
+        os.makedirs(self.dir, exist_ok=True)
+
+    def _path(self, key: str) -> str:
+        return os.path.join(self.dir, f"{key}.pt")
+
+    def get(self, key: str, device=None, dtype=None):
+        """The cached embeddings moved onto `device`, or None for a miss."""
+        import torch
+
+        path = self._path(key)
+        try:
+            # torch.load with weights_only=True: these files are plain tensors, and a
+            # cache directory is not a place to accept a pickle from.
+            blob = torch.load(path, map_location="cpu", weights_only=True)
+        except FileNotFoundError:
+            with self._lock:
+                self.stats["misses"] += 1
+            return None
+        except Exception as exc:
+            # Truncated by a crash mid-write, or written by an incompatible torch.
+            log(f"prompt cache: ignoring unreadable entry ({type(exc).__name__}: {exc})")
+            with self._lock:
+                self.stats["errors"] += 1
+                self.stats["misses"] += 1
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+
+        try:
+            out = tuple(None if t is None
+                        else t.to(device=device, dtype=dtype) if dtype is not None
+                        and t.is_floating_point() else t.to(device=device)
+                        for t in blob)
+        except Exception as exc:
+            log(f"prompt cache: entry could not be placed ({type(exc).__name__}: {exc})")
+            with self._lock:
+                self.stats["errors"] += 1
+                self.stats["misses"] += 1
+            return None
+
+        with self._lock:
+            self.stats["hits"] += 1
+        # Touch it: eviction is LRU by mtime, and a hit is a use.
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return out
+
+    def put(self, key: str, value) -> None:
+        """Store one encode's output. Best effort; a failure is not an error."""
+        import torch
+
+        if not isinstance(value, (tuple, list)):
+            return
+        try:
+            on_cpu = [None if t is None else t.detach().to("cpu") for t in value]
+        except Exception:
+            return      # not a tuple of tensors: this pipeline returns something else
+
+        path = self._path(key)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            # Write then rename, so a reader never sees a half-written entry and a
+            # crash leaves a .tmp rather than a corrupt cache hit.
+            with open(tmp, "wb") as fh:
+                torch.save(on_cpu, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception as exc:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if not self._warned:
+                self._warned = True
+                log(f"prompt cache: cannot write to {self.dir} "
+                    f"({type(exc).__name__}: {exc}) — running without it")
+            with self._lock:
+                self.stats["errors"] += 1
+            return
+        with self._lock:
+            self.stats["writes"] += 1
+        self._evict()
+
+    def _evict(self) -> None:
+        """Drop the least recently used entries until the cache is under its cap."""
+        try:
+            entries = []
+            for name in os.listdir(self.dir):
+                if not name.endswith(".pt"):
+                    continue
+                full = os.path.join(self.dir, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, full))
+            total = sum(e[1] for e in entries)
+            if total <= self.max_bytes:
+                return
+            for _mtime, size, full in sorted(entries):
+                try:
+                    os.remove(full)
+                except OSError:
+                    continue
+                total -= size
+                with self._lock:
+                    self.stats["evicted"] += 1
+                if total <= self.max_bytes:
+                    break
+        except Exception as exc:
+            log(f"prompt cache: eviction failed ({type(exc).__name__}: {exc})")
+
+    def report(self) -> dict:
+        """Stats plus what is actually on disk, for /health and /prompt-cache."""
+        size = count = 0
+        try:
+            for name in os.listdir(self.dir):
+                if name.endswith(".pt"):
+                    try:
+                        size += os.path.getsize(os.path.join(self.dir, name))
+                        count += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        with self._lock:
+            stats = dict(self.stats)
+        stats.update(dir=self.dir, entries=count,
+                     size_mb=round(size / (1024 ** 2), 1),
+                     max_gb=round(self.max_bytes / (1024 ** 3), 2))
+        return stats
+
+
+class _LazyEncoder:
+    """Stands in for the text encoder until something actually needs it.
+
+    The point of the prompt cache is that a cached prompt costs no encoder at all, and
+    an encoder that is built anyway costs ~11 GB of host RAM and about a minute whether
+    or not it is used. So with the cache on, the encoder is not built at load time —
+    this holder is, and the first cache MISS realises it.
+
+    It is deliberately NOT a transparent proxy. Upstream guards every use with
+    ``if self.text_encoder is not None``, so a proxy that looked like a module would be
+    moved to the card by ``pipe.to()`` and offloaded by ``_place_pipeline`` — building
+    the very weights this exists to avoid. Instead ``pipe.text_encoder`` stays None and
+    this sits beside it in _state, which is why both of those paths already do the
+    right thing: they skip a None encoder.
+    """
+
+    def __init__(self, build):
+        self._build = build
+        self._lock = threading.Lock()
+        self.realised = False
+
+    def realise(self, pipe):
+        """Build the encoder and attach it to the pipeline. Idempotent."""
+        with self._lock:
+            if pipe.text_encoder is not None:
+                return pipe.text_encoder
+            log("prompt cache miss: building the text encoder now (deferred at load)")
+            pipe.text_encoder = self._build()
+            self.realised = True
+            return pipe.text_encoder
+
+
+def _wrap_encode_prompt(pipe, swap: bool, cache=None, lazy=None):
     """Encode a prompt at most once per request, and (when offloading) swap for it.
 
     _run_segments calls generate_t2v once PER SEGMENT, and every one of those calls
@@ -397,12 +611,16 @@ def _wrap_encode_prompt(pipe, swap: bool):
     The embeddings are a few MB, so they are cached on the arguments that produce them.
     Segment 2 onward then never touches the encoder at all, which means the card holds
     nothing but the DiT and VAE for the whole of a long generation.
+
+    With a `cache` (``prompt_cache: disk``) that memory lives across requests and across
+    restarts too, and `lazy` is the reason it is worth having: on a hit the encoder is
+    never built at all. The order is in-memory, then disk, then encode — cheapest first.
     """
     import gc
     import torch
 
     inner = pipe.encode_prompt      # the bound method, before it is shadowed below
-    cache = collections.OrderedDict()
+    mem = collections.OrderedDict()
 
     def _move_dit(device):
         """The DiT and the LoRA networks hanging off it, the way upstream's to() does."""
@@ -423,13 +641,44 @@ def _wrap_encode_prompt(pipe, swap: bool):
             key = (tuple(_hashable(a) for a in args),
                    tuple(sorted((k, _hashable(v)) for k, v in kwargs.items())))
             hash(key)
-            if key in cache:
-                cache.move_to_end(key)
-                return cache[key]
+            if key in mem:
+                mem.move_to_end(key)
+                return mem[key]
         except TypeError:
             key = None          # an unhashable argument: encode, do not cache
 
-        if swap:
+        # The disk cache next. Keyed by the shared helper rather than by the in-memory
+        # key, because that one includes `device` — which moves the embeddings without
+        # changing them, and would split one entry into one per device.
+        disk_key = None
+        if cache is not None:
+            try:
+                disk_key = LC.prompt_cache_key(
+                    checkpoint=_state.get("model") or "",
+                    dtype=_state.get("dtype") or "",
+                    text_encoder_quant=_state.get("text_encoder_quant") or "none",
+                    args=args, kwargs=kwargs)
+            except Exception as exc:
+                log(f"prompt cache: cannot key this call ({type(exc).__name__}: {exc})")
+                disk_key = None
+        if disk_key is not None:
+            hit = cache.get(disk_key, device=kwargs.get("device"),
+                            dtype=kwargs.get("dtype"))
+            if hit is not None:
+                log("prompt cache hit — the text encoder is not needed for this request")
+                if key is not None:
+                    mem[key] = hit
+                return hit
+
+        # A miss. If the encoder was deferred, this is the moment it has to exist.
+        if lazy is not None:
+            lazy.realise(pipe)
+
+        # Not just `swap`: a quantised encoder is resident by construction, and a
+        # lazily realised one can be quantised — bitsandbytes weights must not be
+        # shuttled to the host, so they never take turns even under offload.
+        if swap and pipe.text_encoder is not None \
+                and not _encoder_is_quantised(pipe):
             # They take TURNS. The INT8 DiT is 13.6 GB resident and the encoder is
             # ~11 GB: bringing the encoder over while the DiT stays is 24.8 GB on a
             # 24 GB card, which is the OOM that model offload exists to prevent.
@@ -437,10 +686,13 @@ def _wrap_encode_prompt(pipe, swap: bool):
             gc.collect()
             torch.cuda.empty_cache()
             pipe.text_encoder = pipe.text_encoder.to("cuda", non_blocking=True)
+            moved = True
+        else:
+            moved = False
         try:
             out = inner(*args, **kwargs)
         finally:
-            if swap:
+            if moved:
                 # finally, not just on success: leaving 11 GB stranded after a failed
                 # encode would make the retry the thing that OOMs, and a DiT left on
                 # the host would run every later segment at PCIe speed.
@@ -449,16 +701,16 @@ def _wrap_encode_prompt(pipe, swap: bool):
                 torch.cuda.empty_cache()
                 _move_dit("cuda")
         if key is not None:
-            cache[key] = out
-            while len(cache) > 4:       # a few MB each; bounded for a long-lived service
-                cache.popitem(last=False)
+            mem[key] = out
+            while len(mem) > 4:         # a few MB each; bounded for a long-lived service
+                mem.popitem(last=False)
+        if disk_key is not None:
+            cache.put(disk_key, out)
         return out
 
     # Set on the INSTANCE: all four generate_* methods call self.encode_prompt.
     pipe.encode_prompt = encode_prompt
     return pipe
-
-
 @contextlib.contextmanager
 def _bsa_for(pipe, ctx):
     """Run this pass with block-sparse attention only if the geometry allows it.
@@ -530,13 +782,15 @@ def _place_pipeline(pipe, offload):
         if pipe.vae is not None:
             pipe.vae = pipe.vae.to("cuda", non_blocking=True)
         pipe.device = "cuda"
-        _wrap_encode_prompt(pipe, swap=False)
+        _wrap_encode_prompt(pipe, swap=False, cache=_state.get("prompt_cache"),
+                            lazy=_state.get("lazy_encoder"))
         return pipe
 
     if offload not in ("model", "sequential"):
         pipe.to("cuda")
         # Still worth caching: 12 segments would otherwise run 12 identical encodes.
-        _wrap_encode_prompt(pipe, swap=False)
+        _wrap_encode_prompt(pipe, swap=False, cache=_state.get("prompt_cache"),
+                            lazy=_state.get("lazy_encoder"))
         log("the whole pipeline is resident on the card")
         return pipe
     if offload == "sequential":
@@ -558,7 +812,8 @@ def _place_pipeline(pipe, offload):
     if encoder is not None:
         pipe.text_encoder = encoder.to("cpu")
 
-    _wrap_encode_prompt(pipe, swap=True)
+    _wrap_encode_prompt(pipe, swap=True, cache=_state.get("prompt_cache"),
+                        lazy=_state.get("lazy_encoder"))
     log("offload: the DiT and VAE are resident; the text encoder (~11 GB) and the DiT "
         "swap places for encode_prompt so only one of them is ever on the card")
     return pipe
@@ -681,6 +936,10 @@ def unload(reason: str = ""):
             return
         _state["pipe"] = None
         _state["audio_encoder"] = None
+        # It holds a closure over the load arguments, and the pipeline it would have
+        # attached to is gone. The next load builds a fresh one; the DISK cache is
+        # untouched, which is the point of it being on disk.
+        _state["lazy_encoder"] = None
         try:
             import torch
             import gc
@@ -1136,7 +1395,16 @@ def make_handler():
                 self._json({"ok": True, "loaded": _state["pipe"] is not None,
                             "model": _state["model"], "stages": list(LC.STAGES),
                             "family": _state.get("family") or "",
-                            "variant": _state.get("variant") or "bf16"})
+                            "variant": _state.get("variant") or "bf16",
+                            "prompt_cache": (_state["prompt_cache"].report()
+                                             if _state.get("prompt_cache") else None),
+                            "text_encoder_loaded": (
+                                _state["pipe"] is not None
+                                and getattr(_state["pipe"], "text_encoder", None)
+                                is not None)})
+            elif self.path.startswith("/prompt-cache"):
+                cache = _state.get("prompt_cache")
+                self._json(cache.report() if cache else {"enabled": False})
             elif self.path.startswith("/progress"):
                 with _lock:
                     self._json(dict(_progress))
@@ -1251,6 +1519,15 @@ def main(argv=None):
     ap.add_argument("--text-encoder-quant", default="none",
                     help="none | int8 | nf4 | fp4 — quantise the UMT5-XXL text encoder "
                          "so it can stay resident instead of being offloaded")
+    ap.add_argument("--prompt-cache", default="off",
+                    help="off | disk — cache prompt embeddings on disk so a prompt is "
+                         "encoded once ever; with it on, the ~11 GB text encoder is "
+                         "built only when a prompt misses")
+    ap.add_argument("--prompt-cache-dir", default="",
+                    help="where to keep it; blank uses <coderai home>/prompt_cache/longcat")
+    ap.add_argument("--prompt-cache-max-gb", default="",
+                    help="size cap, least-recently-used evicted first "
+                         "(default 2 GB; entries are a few MB each)")
     ap.add_argument("--base-model", default="",
                     help="checkpoint holding tokenizer/text_encoder/vae for an avatar "
                          "family; blank uses the upstream base repo")
@@ -1281,6 +1558,22 @@ def main(argv=None):
     if _problems:
         raise SystemExit("; ".join(_problems))
     _state["text_encoder_quant"] = args.text_encoder_quant or "none"
+    _problems = LC.prompt_cache_problems(args.prompt_cache, args.prompt_cache_max_gb)
+    if _problems:
+        raise SystemExit("; ".join(_problems))
+    if str(args.prompt_cache or "off").strip().lower() == "disk":
+        _max_gb = (float(args.prompt_cache_max_gb)
+                   if str(args.prompt_cache_max_gb).strip()
+                   else LC.DEFAULT_PROMPT_CACHE_MAX_GB)
+        try:
+            _state["prompt_cache"] = _PromptCache(
+                LC.prompt_cache_dir(args.prompt_cache_dir), _max_gb)
+            log(f"prompt cache: {_state['prompt_cache'].dir} (cap {_max_gb:g} GB)")
+        except OSError as exc:
+            # A cache we cannot create is not a reason not to generate. Say so loudly
+            # once, then carry on with the encoder loaded the ordinary way.
+            log(f"WARNING: prompt cache unavailable ({exc}) — continuing without it")
+            _state["prompt_cache"] = None
     # Validate both before anything slow happens: a bad value should not surface after
     # a multi-minute load.
     _bsa_enabled()

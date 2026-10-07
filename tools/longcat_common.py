@@ -374,6 +374,95 @@ def component_quant_bpe(value: str):
     return COMPONENT_QUANTS.get(str(value or "none").strip().lower())
 
 
+# ── prompt-embedding cache ────────────────────────────────────────────────────
+#
+# The UMT5-XXL text encoder is ~11 GB and runs ONCE per request, to turn a prompt into
+# a few MB of embeddings. v0.2.76 stopped re-running it per segment; caching the result
+# on DISK stops re-running it per request, and — because the entry is keyed on
+# everything that can change the answer — lets the encoder be loaded LAZILY: a request
+# whose prompt is already cached never builds it at all, which is ~11 GB of host RAM
+# and a minute of load time that nothing has to spend.
+#
+# Off by default. Embeddings are derived data, but they are also several MB each and
+# live under the user's cache directory, so growing that is something to opt into.
+PROMPT_CACHE_MODES = ("off", "disk")
+
+# Each entry is prompt_embeds + mask + the negative pair, 512x4096 at bf16 ≈ 4 MB per
+# side. A cap rather than a count, because a long prompt list is the case that runs away.
+DEFAULT_PROMPT_CACHE_MAX_GB = 2.0
+
+# Bumped when the stored tuple's shape or the key's inputs change, so a cache written by
+# an older build is ignored rather than misread.
+PROMPT_CACHE_FORMAT = 1
+
+
+def prompt_cache_problems(mode: str, max_gb=None) -> list:
+    """Reasons this prompt-cache configuration cannot be used, or []."""
+    problems = []
+    m = str(mode or "off").strip().lower()
+    if m not in PROMPT_CACHE_MODES:
+        problems.append(f"prompt_cache must be one of {sorted(PROMPT_CACHE_MODES)}; "
+                        f"got {mode!r}")
+    if max_gb is not None and str(max_gb).strip() != "":
+        try:
+            if float(max_gb) <= 0:
+                problems.append(f"prompt_cache_max_gb must be positive; got {max_gb!r}")
+        except (TypeError, ValueError):
+            problems.append(f"prompt_cache_max_gb must be a number; got {max_gb!r}")
+    return problems
+
+
+def prompt_cache_key(*, checkpoint: str, dtype: str, text_encoder_quant: str,
+                     args: tuple = (), kwargs: dict = None) -> str:
+    """A stable filename-safe key for one encode_prompt call.
+
+    Keyed on everything that changes the EMBEDDINGS and nothing that does not. The
+    checkpoint and the encoder's quantisation are in here because an NF4 encoder does
+    not produce the bf16 encoder's numbers -- reusing one for the other would be a
+    silent quality change, which is worse than a cache miss. ``device`` is deliberately
+    excluded: it moves the result, it does not alter it.
+    """
+    import hashlib
+    import json as _json
+
+    def _plain(v):
+        """Reduce an argument to something JSON can hold, deterministically."""
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v
+        if isinstance(v, (list, tuple)):
+            return [_plain(x) for x in v]
+        if isinstance(v, set):
+            return sorted(_plain(x) for x in v)
+        if isinstance(v, dict):
+            return {str(k): _plain(v[k]) for k in sorted(v, key=str)}
+        # A torch.device, a torch.dtype, anything else: its repr is stable within a
+        # build, and `device` is dropped before we get here.
+        return repr(v)
+
+    kwargs = dict(kwargs or {})
+    kwargs.pop("device", None)
+    payload = {
+        "format": PROMPT_CACHE_FORMAT,
+        # basename, not the full path: the same checkpoint reached through a symlink or
+        # a differently-mounted hfcache is the same encoder.
+        "checkpoint": os.path.basename(os.path.normpath(str(checkpoint or ""))),
+        "dtype": str(dtype or ""),
+        "text_encoder_quant": str(text_encoder_quant or "none").strip().lower(),
+        "args": _plain(list(args)),
+        "kwargs": _plain(kwargs),
+    }
+    blob = _json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def prompt_cache_dir(configured: str = "") -> str:
+    """Where the prompt cache lives. Under the coderai cache root unless overridden."""
+    if str(configured or "").strip():
+        return os.path.expanduser(str(configured).strip())
+    root = os.environ.get("CODERAI_HOME") or os.path.join("~", ".coderai")
+    return os.path.expanduser(os.path.join(root, "prompt_cache", "longcat"))
+
+
 def dit_subdir(family: str = "") -> str:
     """Which subfolder holds the bf16 transformer for this family."""
     return AVATAR_DIT_SUBDIR if family else BASE_DIT_SUBDIR

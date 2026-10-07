@@ -47,6 +47,11 @@ Per-model config keys (models.json entry, all optional)::
     "bsa": "off",                  # block-sparse attention: on | off | auto
     "base_model": "",              # avatar families borrow tokenizer/text_encoder/vae
     "text_encoder_quant": "none",   # none | int8 | nf4 | fp4 (keeps it resident)
+    "prompt_cache": "off",         # off | disk — cache prompt embeddings between
+                                   #   requests; with it on the ~11 GB text encoder is
+                                   #   built only when a prompt misses
+    "prompt_cache_dir": "",        # blank = <coderai home>/prompt_cache/longcat
+    "prompt_cache_max_gb": 0,      # 0 = the service default (2 GB), LRU-evicted
     "cp_split_hw": "",             # context-parallel tile, e.g. "1x2"
     "used_vram_gb": 0,             # what to reserve before starting; 0 = measured
     "gpu_device": 0
@@ -508,6 +513,28 @@ def ensure_service(model_path: str, config: dict = None,
                    or "").strip()
         if te_q:
             cmd += ["--text-encoder-quant", te_q]
+        # The prompt cache makes an encode survive the request that paid for it, which
+        # is also what lets the encoder be built lazily. Per model, then server-wide:
+        # a checkpoint whose prompts never repeat gains nothing but the disk.
+        pc = str(config.get("prompt_cache") or
+                 (getattr(sec, "prompt_cache", "") if sec is not None else "")
+                 or "").strip()
+        if pc:
+            cmd += ["--prompt-cache", pc]
+        pc_dir = str(config.get("prompt_cache_dir") or
+                     (getattr(sec, "prompt_cache_dir", "") if sec is not None else "")
+                     or "").strip()
+        if pc_dir:
+            cmd += ["--prompt-cache-dir", pc_dir]
+        pc_max = (config.get("prompt_cache_max_gb")
+                  or (getattr(sec, "prompt_cache_max_gb", 0) if sec is not None else 0))
+        try:
+            if float(pc_max or 0) > 0:
+                cmd += ["--prompt-cache-max-gb", str(float(pc_max))]
+        except (TypeError, ValueError):
+            # A bad value is the service's to reject with a message naming the key,
+            # rather than this silently dropping it.
+            cmd += ["--prompt-cache-max-gb", str(pc_max)]
         if sec is not None and str(getattr(sec, "extra_args", "") or "").strip():
             import shlex
             cmd += shlex.split(str(sec.extra_args))
