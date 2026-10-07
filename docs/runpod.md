@@ -144,6 +144,11 @@ sync.) In `models.json` that is a `backend` pin plus a `runpod` block:
 | `max_pods` | `1` | Hard ceiling on concurrent pods for this model. |
 | `scale_up_inflight_per_pod` | `4` | Add a pod when in-flight requests per pod exceeds this. |
 | `idle_timeout_s` | `300` | Destroy a pod this long after its **last** request. |
+| `data_center` | — | Pin this model's pods to one RunPod data centre (region), e.g. `EU-RO-1`. Blank uses the account-wide setting. A network volume still wins over both: a volume lives in one region and a pod elsewhere cannot attach it. |
+| `schedule_enabled` | `false` | Apply the warm floor (`min_pods`/`keep_warm`) only inside a daily window. Outside it the floor is `0` and the warm pod is terminated, so a model used in office hours stops billing overnight. It does **not** block requests: one arriving out of hours cold-starts a pod exactly as `min_pods: 0` always has. Ignored unless both `schedule_start` and `schedule_end` are set. |
+| `schedule_start` / `schedule_end` | — | `HH:MM`. The start is inclusive, the end exclusive. An end **earlier** than the start runs overnight and belongs to the day it started on, so `22:00`–`06:00` on `fri` covers Friday night into Saturday morning. |
+| `schedule_days` | every day | Which days the window opens on: `0`=Mon … `6`=Sun, or names (`mon,tue`). Empty means every day. |
+| `schedule_tz` | server local | IANA zone for the window, e.g. `Europe/Rome`. An unknown name falls back to the server's local time rather than silently shifting to UTC. |
 | `boot_timeout_s` | `900` | Give up if the pod never exposes its port. The port appears only *after* the image is pulled, so this covers the download — 15 GB at a cold machine's ~25 MB/s is ten minutes. |
 | `load_timeout_s` | `600` | Give up if the server never answers `/v1/models`. |
 
@@ -430,6 +435,7 @@ Admin API:
 | `GET /admin/api/runpod/gpu-types` | Live GPU catalogue + prices |
 | `GET /admin/api/runpod/status` | Pools, pods and their states |
 | `GET /admin/api/runpod/stats` | Cost tiles + per-model spend |
+| `GET /v1/runpod/spend` | The same pods, ledger, caps and schedule status over the **served** API, for an external monitor. Needs an API key marked `admin` (Admin → Tokens); an ordinary key gets `403`. |
 | `GET /admin/api/runpod/pod-logs` | Container / vLLM log for one pod |
 
 ---

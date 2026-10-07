@@ -152,6 +152,23 @@ class RunpodModelConfig:
     # prefix/KV cache still holds its context. Off = always pick the least-loaded.
     sticky_sessions: bool = True
     idle_timeout_s: int = 300                # destroy a pod this long after its last request
+    # --- placement ---
+    # RunPod data centre (region) for this model's pods, e.g. "EU-RO-1". Blank
+    # falls back to the account-wide setting, and a network volume still wins
+    # over both: a volume lives in one region and a pod elsewhere cannot attach
+    # it. Pin a region for latency or for where the data is allowed to be.
+    data_center: str = ""
+    # --- warm-pod schedule ---
+    # When set, the warm floor (min_pods/keep_warm) only applies inside the
+    # window; outside it the floor is 0 and warm pods are terminated, so a model
+    # that is only used in office hours stops billing overnight. It does NOT
+    # block requests: one arriving outside the window still cold-starts a pod,
+    # exactly as min_pods=0 always has.
+    schedule_enabled: bool = False
+    schedule_days: list = field(default_factory=list)   # 0=Mon … 6=Sun; empty = every day
+    schedule_start: str = ""                 # "HH:MM" local to schedule_tz
+    schedule_end: str = ""                   # "HH:MM"; end <= start means overnight
+    schedule_tz: str = ""                    # IANA name; blank = the server's local zone
     # Boot budgets — bigger models need longer (image pull + weight download).
     # Until the pod exposes its port. The port appears only AFTER the image is
     # pulled, so this covers the download: 15 GB at a cold machine's ~25 MB/s
@@ -1301,6 +1318,124 @@ def _as_int(v, default=0):
         return default
 
 
+_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _parse_days(value) -> list:
+    """Normalise a weekday selection to a sorted list of 0=Mon … 6=Sun.
+
+    Accepts a list of ints or names, or a comma string of either ("mon,tue" or
+    "0,1"). Anything unrecognised is dropped rather than guessed at. An empty
+    result means "every day" to every caller.
+    """
+    if value in (None, ""):
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = set()
+    for raw in items:
+        tok = str(raw).strip().lower()
+        if not tok:
+            continue
+        if tok.isdigit():
+            n = int(tok)
+            if 0 <= n <= 6:
+                out.add(n)
+            continue
+        for i, name in enumerate(_DAY_NAMES):
+            if tok.startswith(name):
+                out.add(i)
+                break
+    return sorted(out)
+
+
+def _parse_hhmm(value) -> str:
+    """Normalise "8:5", "08:05", "0805" to "08:05"; "" when it is not a time."""
+    tok = str(value or "").strip()
+    if not tok:
+        return ""
+    if ":" not in tok and tok.isdigit() and len(tok) in (3, 4):
+        tok = tok.zfill(4)[:-2] + ":" + tok.zfill(4)[-2:]
+    parts = tok.split(":")
+    if len(parts) != 2:
+        return ""
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except (TypeError, ValueError):
+        return ""
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return ""
+    return f"{h:02d}:{m:02d}"
+
+
+def _schedule_zone(name: str):
+    """The tzinfo for a schedule, or None for the server's local time."""
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        # An unknown zone must not silently move the window to UTC: fall back to
+        # local time, which is what a blank setting means.
+        return None
+
+
+def schedule_state(cfg: "RunpodModelConfig", now: float = None) -> dict:
+    """Where a pool's warm-pod schedule stands right now.
+
+    Returns ``{enabled, in_window, next_change, window, days, tz}``; ``in_window``
+    is True whenever the schedule is off, so every caller can treat it as "may I
+    keep a pod warm?" without special-casing.
+    """
+    import datetime as _dt
+    state = {"enabled": bool(getattr(cfg, "schedule_enabled", False)),
+             "in_window": True, "next_change": None,
+             "window": "", "days": list(getattr(cfg, "schedule_days", []) or []),
+             "tz": getattr(cfg, "schedule_tz", "") or ""}
+    if not state["enabled"]:
+        return state
+    start, end = cfg.schedule_start, cfg.schedule_end
+    state["window"] = f"{start}-{end}"
+    zone = _schedule_zone(cfg.schedule_tz)
+    ts = time.time() if now is None else now
+    local = _dt.datetime.fromtimestamp(ts, zone) if zone else _dt.datetime.fromtimestamp(ts)
+    sh, sm = (int(x) for x in start.split(":"))
+    eh, em = (int(x) for x in end.split(":"))
+    s_min, e_min = sh * 60 + sm, eh * 60 + em
+    cur = local.hour * 60 + local.minute
+    days = state["days"]
+    overnight = e_min <= s_min
+
+    def _day_allowed(d):
+        return (not days) or (d in days)
+
+    # The day a window is attributed to is the day it STARTS on, so an overnight
+    # Fri 22:00-06:00 belongs to Friday and runs into Saturday morning.
+    if overnight:
+        inside = ((cur >= s_min and _day_allowed(local.weekday()))
+                  or (cur < e_min and _day_allowed((local.weekday() - 1) % 7)))
+    else:
+        inside = s_min <= cur < e_min and _day_allowed(local.weekday())
+    state["in_window"] = inside
+
+    # Next boundary: scan minute boundaries forward a week at most. Cheap, and
+    # immune to the DST and overnight edge cases a closed form gets wrong.
+    step = _dt.timedelta(minutes=1)
+    probe = local.replace(second=0, microsecond=0)
+    for _ in range(8 * 24 * 60):
+        probe = probe + step
+        p_cur = probe.hour * 60 + probe.minute
+        if overnight:
+            p_in = ((p_cur >= s_min and _day_allowed(probe.weekday()))
+                    or (p_cur < e_min and _day_allowed((probe.weekday() - 1) % 7)))
+        else:
+            p_in = s_min <= p_cur < e_min and _day_allowed(probe.weekday())
+        if p_in != inside:
+            state["next_change"] = probe.isoformat(timespec="minutes")
+            break
+    return state
+
+
 def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     """Build a RunpodModelConfig from a model entry's ``runpod`` dict (or {})."""
     b = block or {}
@@ -1376,6 +1511,16 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.max_workers = max(1, _as_int(b.get("max_workers"), cfg.max_workers))
     cfg.cost_limit_usd = _as_float(b.get("cost_limit_usd"), cfg.cost_limit_usd)
     cfg.cost_period = (b.get("cost_period") or cfg.cost_period).strip().lower()
+    cfg.data_center = (b.get("data_center") or "").strip().upper()
+    cfg.schedule_enabled = _as_bool(b.get("schedule_enabled"), cfg.schedule_enabled)
+    cfg.schedule_days = _parse_days(b.get("schedule_days"))
+    cfg.schedule_start = _parse_hhmm(b.get("schedule_start"))
+    cfg.schedule_end = _parse_hhmm(b.get("schedule_end"))
+    cfg.schedule_tz = (b.get("schedule_tz") or "").strip()
+    # A schedule with no usable window would silently pin the floor to 0 forever;
+    # treat it as "no schedule" instead, so the model keeps the behaviour it had.
+    if cfg.schedule_enabled and not (cfg.schedule_start and cfg.schedule_end):
+        cfg.schedule_enabled = False
     return cfg
 
 
@@ -1777,6 +1922,8 @@ class RunpodPodPool:
         self._cv = threading.Condition(threading.RLock())
         self._provisioning = False
         self._closed = False
+        # One log line per window transition, not one every scaler tick.
+        self._sched_closed_logged = False
 
     # -- cost ------------------------------------------------------------- #
     def live_cost_usd(self) -> float:
@@ -1908,7 +2055,10 @@ class RunpodPodPool:
                 print(f"[runpod] direct_tcp on a {plan.get('engine')} image: plain "
                       f"HTTP — that image cannot take a certificate; the bearer "
                       f"token travels unencrypted", flush=True)
-        dc = getattr(self.account, "data_center", "") or ""
+        # Region precedence: the volume's data centre (a pod elsewhere simply
+        # cannot attach it) > this model's setting > the account default.
+        dc = (self.mcfg.data_center
+              or getattr(self.account, "data_center", "") or "")
         last = None
         for i in range(start, len(ranked)):
             sel = ranked[i]
@@ -2311,6 +2461,18 @@ class RunpodPodPool:
         print(f"[runpod] pod {pod.pod_id} for {self.model_key!r} terminated ({reason}); "
               f"billed ~${cost:.3f}", flush=True)
 
+    def effective_min_pods(self) -> int:
+        """The warm floor that applies right now.
+
+        Outside a configured schedule window the floor is 0: the pool keeps
+        serving (a request still cold-starts a pod) but stops paying to hold one
+        ready. Inside the window, or with no schedule, it is the configured
+        min_pods.
+        """
+        if not getattr(self.mcfg, "schedule_enabled", False):
+            return self.mcfg.min_pods
+        return self.mcfg.min_pods if schedule_state(self.mcfg)["in_window"] else 0
+
     def maintain(self):
         """One scaler pass: reap idle/dead pods to min_pods, keep min warm."""
         now = time.time()
@@ -2318,7 +2480,19 @@ class RunpodPodPool:
             pods = list(self.pods)
         # Idle teardown (down to min_pods), only pods with no in-flight work.
         idle_to = self.mcfg.idle_timeout_s
-        keep_min = self.mcfg.min_pods
+        keep_min = self.effective_min_pods()
+        if keep_min < self.mcfg.min_pods:
+            # The window just closed. Do not wait out idle_timeout_s before
+            # releasing the pod that only existed to be warm — that is the whole
+            # point of scheduling it — but still never kill one mid-request.
+            idle_to = min(idle_to, 1) if idle_to else 1
+            if not self._sched_closed_logged:
+                print(f"[runpod] {self.model_key!r}: outside its warm-pod window "
+                      f"({schedule_state(self.mcfg).get('window')}) — warm floor 0",
+                      flush=True)
+                self._sched_closed_logged = True
+        else:
+            self._sched_closed_logged = False
         with self._cv:
             alive = [p for p in self.pods if p.healthy]
             for p in sorted(alive, key=lambda x: x.last_used):
@@ -2561,6 +2735,36 @@ def _all_pools_hourly_rate() -> float:
 def _all_pools_live_cost() -> float:
     with _pools_lock:
         return sum(p.live_cost_usd() for p in _pools.values())
+
+
+def pools_schedule_status() -> list:
+    """Per-pool warm-pod schedule: where each model stands right now.
+
+    This is the monitoring surface for the schedule — what is warm, what the
+    window is, whether we are inside it and when that next flips.
+    """
+    out = []
+    with _pools_lock:
+        pools = list(_pools.items())
+    for key, pool in pools:
+        cfg = pool.mcfg
+        st = schedule_state(cfg)
+        with pool._cv:
+            healthy = len([p for p in pool.pods if p.healthy])
+        out.append({
+            "model": key,
+            "enabled": st["enabled"],
+            "in_window": st["in_window"],
+            "window": st["window"],
+            "days": st["days"],
+            "tz": st["tz"] or "server local",
+            "next_change": st["next_change"],
+            "min_pods": cfg.min_pods,
+            "effective_min_pods": pool.effective_min_pods(),
+            "healthy_pods": healthy,
+            "data_center": cfg.data_center or "",
+        })
+    return out
 
 
 def pods_status() -> list:

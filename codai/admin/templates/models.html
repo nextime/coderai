@@ -918,6 +918,40 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </label>
             <span class="form-hint" style="font-size:11px">No cold-boot wait (image pull + weight download, minutes) — but it bills every hour of every day, including the ones nobody uses it. Off by default.</span>
           </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+              <input type="checkbox" id="cfg-rp-schedule-enabled" style="width:auto">
+              <span class="form-label" style="margin:0">Only keep it warm during these hours</span>
+            </label>
+            <span class="form-hint" style="font-size:11px">Outside the window the warm pod is terminated and billing stops. Requests still work — one arriving out of hours cold-starts a pod, exactly as it does with no warm pod at all.</span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">From</label><input type="time" id="cfg-rp-schedule-start" class="form-input"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">To</label><input type="time" id="cfg-rp-schedule-end" class="form-input"></div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Time zone</label>
+              <input type="text" id="cfg-rp-schedule-tz" class="form-input" placeholder="blank = server local, e.g. Europe/Rome">
+            </div>
+          </div>
+          <div class="form-row" style="margin:.4rem 0 0">
+            <label class="form-label">Days</label>
+            <div id="cfg-rp-schedule-days" style="display:flex;gap:.6rem;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="0" style="width:auto"> Mon</label>
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="1" style="width:auto"> Tue</label>
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="2" style="width:auto"> Wed</label>
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="3" style="width:auto"> Thu</label>
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="4" style="width:auto"> Fri</label>
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="5" style="width:auto"> Sat</label>
+              <label style="display:flex;align-items:center;gap:.25rem;font-size:12px"><input type="checkbox" value="6" style="width:auto"> Sun</label>
+            </div>
+            <span class="form-hint" style="font-size:11px">None ticked = every day. An end earlier than the start runs overnight, and belongs to the day it starts on.</span>
+            <span class="form-hint" id="cfg-rp-schedule-status" style="font-size:11px"></span>
+          </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label class="form-label">Region (data centre)</label>
+            <input type="text" id="cfg-rp-data-center" class="form-input" placeholder="blank = the account setting, e.g. EU-RO-1">
+            <span class="form-hint" style="font-size:11px">Pin this model's pods to one RunPod data centre. A network volume still wins: a pod in another region cannot attach it.</span>
+          </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
             <div class="form-row" style="margin:0">
               <label class="form-label">Boot timeout (s)</label>
@@ -4847,6 +4881,23 @@ function _populateRunpod(s){
   set('cfg-rp-model-url', rp.model_url || '');
   chk('cfg-rp-url-tar', rp.model_url_is_tar);
   chk('cfg-rp-keep-warm', rp.keep_warm);
+  chk('cfg-rp-schedule-enabled', rp.schedule_enabled);
+  set('cfg-rp-schedule-start', rp.schedule_start || '');
+  set('cfg-rp-schedule-end', rp.schedule_end || '');
+  set('cfg-rp-schedule-tz', rp.schedule_tz || '');
+  set('cfg-rp-data-center', rp.data_center || '');
+  (function(){
+    // Days come back normalised to 0=Mon…6=Sun; an empty list means every day,
+    // which is shown as nothing ticked rather than everything.
+    var want = {};
+    (rp.schedule_days || []).forEach(function(d){ want[String(d)] = true; });
+    var box = document.getElementById('cfg-rp-schedule-days');
+    if (box) box.querySelectorAll('input[type=checkbox]').forEach(function(cb){
+      cb.checked = !!want[cb.value];
+    });
+    var st = document.getElementById('cfg-rp-schedule-status');
+    if (st) st.textContent = rp.schedule_status || '';
+  })();
   _updateRunpodSource();
   set('cfg-rp-api-key', rp.api_key || '');
   chk('cfg-rp-open', rp.allow_open_pod);
@@ -5036,6 +5087,15 @@ function _collectRunpod(){
     scale_up_inflight_per_pod: intOrU('cfg-rp-scale-up'),
     max_inflight_per_pod:      intOrU('cfg-rp-max-inflight'),
     sticky_sessions:    document.getElementById('cfg-rp-sticky').checked,
+    schedule_enabled:   document.getElementById('cfg-rp-schedule-enabled').checked,
+    schedule_start:     (val('cfg-rp-schedule-start') || '').trim(),
+    schedule_end:       (val('cfg-rp-schedule-end') || '').trim(),
+    schedule_tz:        (val('cfg-rp-schedule-tz') || '').trim(),
+    schedule_days:      Array.from(
+                          document.querySelectorAll('#cfg-rp-schedule-days input[type=checkbox]'))
+                          .filter(function(cb){ return cb.checked; })
+                          .map(function(cb){ return cb.value; }),
+    data_center:        (val('cfg-rp-data-center') || '').trim(),
   };
   return o;
 }

@@ -754,6 +754,71 @@ async def list_models():
     return ModelList(data=models)
 
 
+def _admin_scoped_token(request) -> str:
+    """The caller's bearer token when it carries the admin scope, else "".
+
+    BearerAuthMiddleware has already established that the request is authorised;
+    this is the narrower question of whether this particular key may read what
+    the install spends.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return ""
+    token = auth[7:].strip()
+    try:
+        # The live SessionManager is the one the admin app built; auth.py only
+        # defines the class. Imported lazily to keep app import order unchanged.
+        from codai.admin.routes import session_manager
+        if session_manager is None:
+            return ""
+        return token if session_manager.token_is_admin(token) else ""
+    except Exception:
+        return ""
+
+
+@app.get("/v1/runpod/spend", summary="RunPod spend and pod status", tags=["Core"])
+async def runpod_spend(request: Request):
+    """What the rented GPUs are costing, for an admin-scoped API key.
+
+    The same figures the admin page shows, served over the normal API so an
+    external monitor can poll them without an admin session. Ordinary keys are
+    refused: a key that may ask a model a question has no business reading the
+    account's spend.
+    """
+    if not _admin_scoped_token(request):
+        raise HTTPException(status_code=403,
+                            detail="this endpoint needs an admin-scoped API key")
+    from codai.api import runpod_worker, runpod_ledger
+    try:
+        pods = runpod_worker.pods_status()
+    except Exception:
+        pods = []
+    try:
+        ledger = runpod_ledger.totals()
+    except Exception:
+        ledger = {"per_model": {}, "global": {}}
+    try:
+        schedules = runpod_worker.pools_schedule_status()
+    except Exception:
+        schedules = []
+    live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods if p.get("healthy"))
+    live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
+    caps = {}
+    try:
+        from codai.config import config_manager
+        cfg = config_manager.config.runpod if config_manager and config_manager.config else None
+        if cfg is not None:
+            caps = {"global_max_hourly_usd": cfg.global_max_hourly_usd,
+                    "global_cost_limit_usd": cfg.global_cost_limit_usd,
+                    "global_cost_period": cfg.global_cost_period,
+                    "enabled": cfg.enabled}
+    except Exception:
+        caps = {}
+    return {"pods": pods, "ledger": ledger, "caps": caps, "schedules": schedules,
+            "live_hourly_usd": round(live_hourly, 4),
+            "live_uncommitted_usd": round(live_cost, 4)}
+
+
 @app.get("/coderai/capabilities", summary="Server capability document", tags=["Core"])
 async def get_broker_capabilities():
     """Return broker capability metadata."""

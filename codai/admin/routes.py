@@ -3089,7 +3089,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   # where the POD gets the weights
                   "source", "hf_repo", "model_url", "quantization",
                   "network_volume_id", "volume_mount_path", "volume_path",
-                  "venv_name", "slim_image"):
+                  "venv_name", "slim_image",
+                  # region + warm-pod schedule
+                  "data_center", "schedule_start", "schedule_end", "schedule_tz"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
@@ -3103,9 +3105,15 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             ct = None
         if ct:
             rpo["cloud_types"] = ct
+        # schedule_days: list of 0=Mon…6=Sun, or a comma string of those/names
+        sd = src.get("schedule_days")
+        if isinstance(sd, str):
+            sd = [d.strip() for d in sd.split(",") if d.strip()]
+        if isinstance(sd, list) and sd:
+            rpo["schedule_days"] = [str(d).strip().lower() for d in sd if str(d).strip()]
         # bools
         for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm",
-                  "model_url_is_tar", "venv_on_volume"):
+                  "model_url_is_tar", "venv_on_volume", "schedule_enabled"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")
@@ -4988,6 +4996,10 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
         ledger = runpod_ledger.totals()
     except Exception:
         ledger = {"per_model": {}, "global": {}}
+    try:
+        schedules = runpod_worker.pools_schedule_status()
+    except Exception:
+        schedules = []
     live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods if p.get("healthy"))
     live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
     cfg = config_manager.config.runpod if config_manager and config_manager.config else None
@@ -4998,6 +5010,7 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
                 "global_cost_period": cfg.global_cost_period,
                 "enabled": cfg.enabled}
     return {"success": True, "pods": pods, "ledger": ledger, "caps": caps,
+            "schedules": schedules,
             "live_hourly_usd": round(live_hourly, 4),
             "live_uncommitted_usd": round(live_cost, 4)}
 

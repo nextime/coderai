@@ -66,7 +66,8 @@ def register_admin_data(app: FastAPI, config_dir, config=None,
         for t in auth_data.get("tokens", []):
             out.append({"id": t["id"], "name": t["name"], "token": t["token"],
                         "provider": t["provider"], "created_at": t["created_at"],
-                        "last_used": t.get("last_used")})
+                        "last_used": t.get("last_used"),
+                        "admin": bool(t.get("admin"))})
         return JSONResponse(out)
 
     @app.post("/admin/api/tokens", include_in_schema=False)
@@ -80,6 +81,8 @@ def register_admin_data(app: FastAPI, config_dir, config=None,
             data = {}
         name = data.get("name")
         provider = data.get("provider", "openai")
+        # Admin scope lets this key read spend over the served API. Opt-in only.
+        is_admin = bool(data.get("admin"))
         if not name:
             return JSONResponse({"detail": "Token name is required"}, status_code=400)
         import secrets
@@ -94,13 +97,40 @@ def register_admin_data(app: FastAPI, config_dir, config=None,
                 "provider": provider,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "last_used": None,
+                "admin": is_admin,
             }
             tokens.append(new_token)
             return True, new_token
 
         nt = sm.update_auth_data(_mut)
         return JSONResponse({"token": nt["token"], "id": nt["id"],
-                             "name": nt["name"], "provider": nt["provider"]})
+                             "name": nt["name"], "provider": nt["provider"],
+                             "admin": bool(nt.get("admin"))})
+
+    @app.patch("/admin/api/tokens/{token_id}", include_in_schema=False)
+    async def _update_token(token_id: int, request: Request):
+        """Grant or revoke a token's admin scope."""
+        _u, err = _admin(request)
+        if err:
+            return err
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if "admin" not in data:
+            return JSONResponse({"detail": "nothing to change"}, status_code=400)
+        want = bool(data.get("admin"))
+
+        def _mut(auth_data):
+            for t in auth_data.get("tokens", []):
+                if t.get("id") == token_id:
+                    t["admin"] = want
+                    return True, True
+            return False, False
+
+        if not sm.update_auth_data(_mut):
+            return JSONResponse({"detail": "token not found"}, status_code=404)
+        return JSONResponse({"success": True, "id": token_id, "admin": want})
 
     @app.delete("/admin/api/tokens/{token_id}", include_in_schema=False)
     async def _delete_token(token_id: int, request: Request):
