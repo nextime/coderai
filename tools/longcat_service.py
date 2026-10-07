@@ -34,6 +34,7 @@ Endpoints:
 """
 
 import argparse
+import contextlib
 import base64
 import importlib.util
 import io
@@ -319,6 +320,39 @@ def _attention_kwargs():
         "no usable attention backend: none of xformers, flash_attn or "
         "flash_attn_interface is installed in the LongCat venv, and upstream's "
         "attention has no fallback path")
+
+
+@contextlib.contextmanager
+def _bsa_for(pipe, ctx):
+    """Run this pass with block-sparse attention only if the geometry allows it.
+
+    flash_attn_bsa_3d asserts the latent divides evenly by its 3D chunk, so a shape it
+    cannot tile — upstream's own default 480x832 among them — raises a bare
+    AssertionError out of the first denoising step. Turning the flag on in a config
+    must not break requests that work; falling back silently must not leave someone
+    wondering why nothing got faster. So: fall back, and say why.
+    """
+    blocks = [m for m in pipe.dit.modules() if getattr(m, "enable_bsa", False)] \
+        if getattr(pipe, "dit", None) is not None else []
+    problems = []
+    if blocks:
+        chunk = (blocks[0].bsa_params or {}).get("chunk_3d_shape_q")
+        problems = LC.bsa_problems(ctx.get("num_frames") or LC.DEFAULT_NUM_FRAMES,
+                                   ctx.get("height") or LC.DEFAULT_BASE_SIZE[0],
+                                   ctx.get("width") or LC.DEFAULT_BASE_SIZE[1],
+                                   chunk)
+    if not blocks or not problems:
+        yield bool(blocks)
+        return
+    log("WARNING: block-sparse attention is on but cannot tile this geometry, so this "
+        "pass runs dense attention instead — " + "; ".join(problems))
+    for m in blocks:
+        m.enable_bsa = False
+    try:
+        yield False
+    finally:
+        for m in blocks:
+            m.enable_bsa = True
 
 
 def _place_pipeline(pipe, offload):
@@ -924,7 +958,8 @@ def generate(body: dict) -> dict:
                 log(f"stage 'refinement': refining {len(frames)} frames")
                 frames = _frames_from_output(pipe.generate_refine(**kw)[0])
             else:
-                frames, yielded = _run_segments(pipe, task, stage, ctx, log=log)
+                with _bsa_for(pipe, ctx):
+                    frames, yielded = _run_segments(pipe, task, stage, ctx, log=log)
             log(f"stage '{stage}': {len(frames)} frames")
     finally:
         _yield_flag.clear()

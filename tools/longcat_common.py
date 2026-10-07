@@ -279,6 +279,59 @@ def resolve_checkpoint(ref: str) -> str:
     return path
 
 
+# The VAE's spatial stride (8) times the patch size (2): a latent cell per 16 pixels.
+VAE_SIDE_STRIDE = 16
+VAE_TEMPORAL_STRIDE = 4
+# What the checkpoint asks for when block-sparse attention is on.
+DEFAULT_BSA_CHUNK = (4, 4, 4)
+
+
+def bsa_problems(num_frames: int, height: int, width: int, chunk=None) -> list:
+    """Why block-sparse attention cannot run THIS geometry, or [].
+
+    flash_attn_bsa_3d tiles the latent into 3D chunks and asserts the latent divides
+    evenly by the chunk on every axis:
+
+        assert Tq % tq == 0 and Hq % hq == 0 and Wq % wq == 0
+
+    With the shipped chunk of (4, 4, 4) that means sides divisible by 64 — the VAE's
+    16-pixel latent cell times 4 — and a latent frame count divisible by 4, which puts
+    num_frames at 13, 29, 45, 61, 77, 93 … Upstream's own default 480x832 is NOT one of
+    them (480/16 = 30), which is presumably why the flag ships off: an AssertionError
+    out of the first denoising step says nothing about geometry.
+    """
+    tq, hq, wq = tuple(chunk or DEFAULT_BSA_CHUNK)
+    problems = []
+    try:
+        frames, h, w = int(num_frames), int(height), int(width)
+    except (TypeError, ValueError):
+        return ["block-sparse attention needs numeric num_frames/height/width"]
+
+    for name, value, need in (("height", h, hq), ("width", w, wq)):
+        cell = VAE_SIDE_STRIDE * need
+        if value % cell:
+            nearest = max(cell, round(value / cell) * cell)
+            problems.append(
+                f"{name} must be divisible by {cell} for block-sparse attention "
+                f"({VAE_SIDE_STRIDE}px latent cell x chunk {need}); got {value}, "
+                f"try {nearest}")
+
+    latent_t = (frames - 1) // VAE_TEMPORAL_STRIDE + 1
+    if (frames - 1) % VAE_TEMPORAL_STRIDE or latent_t % tq:
+        # latent depth is (F-1)/4 + 1, and it must divide by tq — which puts the valid
+        # frame counts at step*k + base, e.g. 13, 29, 45 … for a chunk of 4, NOT the
+        # step*k + 1 that the 4n+1 generation rule would suggest.
+        step = VAE_TEMPORAL_STRIDE * tq
+        base = step - VAE_TEMPORAL_STRIDE + 1
+        lower = ((frames - base) // step) * step + base if frames >= base else base
+        options = [n for n in (lower, lower + step) if n >= base]
+        problems.append(
+            f"num_frames must leave a latent depth divisible by {tq} for block-sparse "
+            f"attention ({step}n+1: 13, 29, 45, 61, 77, 93 …); got {frames}"
+            + (f", try {' or '.join(str(n) for n in options)}" if options else ""))
+    return problems
+
+
 def dit_subdir(family: str = "") -> str:
     """Which subfolder holds the bf16 transformer for this family."""
     return AVATAR_DIT_SUBDIR if family else BASE_DIT_SUBDIR

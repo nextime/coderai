@@ -136,3 +136,73 @@ def test_a_model_can_override_the_server_wide_setting(service):
     src = WORKER.read_text(encoding="utf-8")
     body = src[src.index('bsa = str(config.get("bsa")'):]
     assert body.index('config.get("bsa")') < body.index('getattr(sec, "bsa"')
+
+
+# ------------------------------------------------------------------ geometry
+# flash_attn_bsa_3d tiles the latent into 3D chunks and asserts it divides evenly:
+#   assert Tq % tq == 0 and Hq % hq == 0 and Wq % wq == 0
+# With the shipped (4,4,4) that is sides divisible by 64 and a latent depth divisible
+# by 4. Upstream's own default 480x832 fails it, which is how a bare AssertionError
+# came out of the first denoising step.
+
+@pytest.fixture
+def LC():
+    spec = importlib.util.spec_from_file_location(
+        "lc_common_bsa", ROOT / "tools" / "longcat_common.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("frames,h,w", [(93, 512, 832), (93, 448, 832), (29, 512, 832),
+                                        (13, 64, 64), (45, 512, 1280), (93, 704, 1280)])
+def test_a_tileable_geometry_passes(LC, frames, h, w):
+    assert LC.bsa_problems(frames, h, w) == []
+
+
+def test_the_shipped_default_geometry_is_not_tileable(LC):
+    """480/16 = 30, and 30 % 4 != 0. This is the real failure, reproduced."""
+    problems = LC.bsa_problems(93, 480, 832)
+    assert problems
+    assert any("height" in p and "64" in p for p in problems)
+
+
+def test_the_frame_count_we_tested_with_is_caught_too(LC):
+    """33 frames gives a latent depth of 9, and 9 % 4 != 0."""
+    problems = LC.bsa_problems(33, 512, 832)
+    assert any("num_frames" in p for p in problems)
+
+
+def test_the_message_suggests_something_that_actually_works(LC):
+    """"invalid" without a usable number means guessing at multiples of the VAE stride."""
+    import re
+    for frames, h, w in [(33, 480, 832), (50, 500, 900)]:
+        problems = LC.bsa_problems(frames, h, w)
+        suggested = [int(n) for p in problems for n in re.findall(r"try (\d+)", p)]
+        assert suggested, f"no suggestion for {frames} {h}x{w}"
+        # every suggested side must itself be tileable
+        for s in suggested:
+            assert s % 64 == 0 or ((s - 1) // 4 + 1) % 4 == 0, s
+
+
+def test_a_custom_chunk_changes_the_requirement(LC):
+    """The chunk comes from the checkpoint's bsa_params, not a constant here."""
+    assert LC.bsa_problems(93, 480, 832, chunk=(4, 2, 2)) == []   # 30 % 2 == 0
+    assert LC.bsa_problems(93, 480, 832, chunk=(4, 4, 4)) != []
+
+
+def test_non_numeric_geometry_is_reported_not_raised(LC):
+    assert LC.bsa_problems("x", None, 832)
+
+
+def test_the_service_falls_back_instead_of_asserting(service):
+    """Turning bsa on in a config must not break requests that already work: the pass
+    runs dense and logs why, rather than dying inside the first step."""
+    src = SERVICE.read_text(encoding="utf-8")
+    body = src[src.index("def _bsa_for"):src.index("def _place_pipeline")]
+    assert "LC.bsa_problems" in body
+    assert "enable_bsa = False" in body
+    assert "enable_bsa = True" in body, "it must be restored for the next request"
+    assert "WARNING" in body, "a silent fallback hides that nothing got faster"
+    # and it is actually applied around the generation
+    assert "with _bsa_for(pipe, ctx):" in src
