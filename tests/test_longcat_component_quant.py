@@ -50,17 +50,39 @@ def test_a_valid_setting_passes(LC):
 
 # ------------------------------------------------------------------ the arithmetic
 
-def test_quantising_the_encoder_is_what_makes_it_fit(LC):
-    """The whole justification, in numbers: 22 GB of fp32 on disk becomes 11 GB at bf16
-    and does not fit beside the DiT; at NF4 it does."""
-    disk_gb, load_bpe, stored_bpe = 22.0, 2.0, 4.0
-    bf16 = disk_gb * (load_bpe / stored_bpe)
-    nf4 = disk_gb * (LC.component_quant_bpe("nf4") / stored_bpe)
-    int8 = disk_gb * (LC.component_quant_bpe("int8") / stored_bpe)
-    dit, vae = 13.6, 0.25
-    assert dit + bf16 + vae > 23.5, "this is the configuration that OOMs"
-    assert dit + int8 + vae < 23.5
-    assert dit + nf4 + vae < 20
+def test_the_measured_fractions_are_used_not_the_bit_width(LC):
+    """MEASURED on a 3090, because bitsandbytes replaces Linear layers only.
+
+    UMT5-XXL has 144 of them; its 256k-token embedding table and one linear per layer
+    stay at the load dtype, leaving 6.13 GB that cannot shrink. The bits-per-weight
+    arithmetic predicted 2.8 GB for NF4 and the card showed 8.0 — so the estimate has
+    to come from the measurement, or it under-reserves by 3x and OOMs.
+    """
+    bf16 = 11.0
+    assert LC.component_quant_fraction("none") is None
+    nf4 = bf16 * LC.component_quant_fraction("nf4")
+    int8 = bf16 * LC.component_quant_fraction("int8")
+    assert 7.5 < nf4 < 8.5, nf4
+    assert 9.3 < int8 < 10.3, int8
+    # and the naive figure it replaced must not be what anyone reserves from: it is
+    # 2.75 GB against a measured 8.0, which is what would have under-reserved by ~3x
+    naive = 22.0 * LC.component_quant_bpe("nf4") / 4
+    assert nf4 > 2.5 * naive, f"measured {nf4:.1f} vs naive {naive:.1f}"
+
+
+def test_quantising_the_encoder_does_not_make_the_pipeline_fit_comfortably(LC):
+    """The conclusion the measurement forced: with a 13.6 GB INT8 DiT and a 0.25 GB VAE,
+    an NF4 encoder leaves ~1.4 GB for activations and an INT8 one does not fit at all.
+    Offload keeps 9.7 GB free, so it remains the better configuration on a 24 GB card.
+    """
+    dit, vae, usable, bf16 = 13.6, 0.25, 23.56, 11.0
+    nf4_total = dit + bf16 * LC.component_quant_fraction("nf4") + vae
+    int8_total = dit + bf16 * LC.component_quant_fraction("int8") + vae
+    assert int8_total > usable, "int8 encoder resident does not fit"
+    assert nf4_total < usable, "nf4 encoder resident does fit"
+    assert usable - nf4_total < 2.0, "but with almost no room for activations"
+    offloaded = dit + vae
+    assert usable - offloaded > 8, "offload has the headroom"
 
 
 # ------------------------------------------------------------------ the service

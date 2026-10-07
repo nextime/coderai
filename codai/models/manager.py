@@ -4392,13 +4392,14 @@ class MultiModelManager:
         te_quant = str(cfg.get("text_encoder_quant") or "none").strip().lower()
         try:
             from codai.api.longcat_worker import common as _lc_common
-            te_bpe = _lc_common().component_quant_bpe(te_quant)
+            te_fraction = _lc_common().component_quant_fraction(te_quant)
         except Exception:
-            te_bpe = None
-        if te_bpe is not None:
-            stored = self._safetensors_storage_bpe(os.path.join(root, "text_encoder"))
-            if stored > 0:
-                encoder = _resident_gb("text_encoder") * (te_bpe / float(load_bpe))
+            te_fraction = None
+        if te_fraction is not None:
+            # A MEASURED fraction of the bf16 size, not the bit width: bitsandbytes
+            # quantises Linear layers only, and this encoder's embedding table is 6 GB
+            # that stays put. The bits-per-weight figure was 3x too optimistic.
+            encoder = encoder * float(te_fraction)
             return dit + encoder + vae
 
         offload = str(cfg.get("offload_strategy") or "").strip().lower()

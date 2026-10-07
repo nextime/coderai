@@ -343,6 +343,23 @@ COMPONENT_QUANTS = {
     "fp4": 0.5,
 }
 
+# What a quantised component ACTUALLY costs, as a fraction of its bf16 size — MEASURED
+# on UMT5-XXL on a 3090, not derived from the bits per weight. bitsandbytes replaces
+# Linear layers only: 144 of them here, while the 256k-token embedding table and one
+# linear per layer stay at the load dtype. That leaves 6.13 GB unquantisable, so the
+# bits-per-weight arithmetic was ~3x too optimistic (it predicted 2.8 GB for NF4; the
+# card sees 8.0).
+COMPONENT_QUANT_RESIDENT_FRACTION = {
+    "int8": 0.89,       # 9.76 GB of an 11.0 GB bf16 encoder
+    "nf4": 0.73,        # 8.00 GB
+    "fp4": 0.73,
+}
+
+
+def component_quant_fraction(value: str):
+    """Fraction of the bf16 size a quantised component keeps, or None for no change."""
+    return COMPONENT_QUANT_RESIDENT_FRACTION.get(str(value or "none").strip().lower())
+
 
 def component_quant_problems(name: str, value: str) -> list:
     """Reasons this component cannot be quantised that way, or []."""

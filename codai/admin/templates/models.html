@@ -708,9 +708,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <div class="form-row" style="margin:0"><label class="form-label">Text encoder</label>
             <select id="cfg-longcat-te-quant" class="form-input">
               <option value="">bf16 — ~11 GB, needs offload</option>
-              <option value="int8">int8 — ~5.6 GB, stays resident</option>
-              <option value="nf4">nf4 — ~2.8 GB, stays resident</option>
-              <option value="fp4">fp4 — ~2.8 GB, stays resident</option>
+              <option value="int8">int8 — ~9.8 GB, too big to stay resident</option>
+              <option value="nf4">nf4 — ~8.0 GB, resident but tight</option>
+              <option value="fp4">fp4 — ~8.0 GB, resident but tight</option>
             </select></div>
           <div class="form-row" style="margin:0"><label class="form-label">Block-sparse attention</label>
             <select id="cfg-longcat-bsa" class="form-input">

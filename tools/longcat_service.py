@@ -125,8 +125,9 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
             # weights land on the card.
             te_kw.update(quantization_config=_te_cfg, device_map={"": 0})
             log(f"text encoder: {te_quant} "
-                f"(~{22.0 * LC.component_quant_bpe(te_quant) / 4:.1f} GB instead of "
-                f"~11 GB at bf16) — resident, never offloaded")
+                f"(~{11.0 * LC.component_quant_fraction(te_quant):.1f} GB instead of "
+                f"~11 GB at bf16 — the embedding table does not quantise) "
+                f"— resident, never offloaded")
         text_encoder = UMT5EncoderModel.from_pretrained(
             shared, subfolder="text_encoder", **te_kw)
         vae = AutoencoderKLWan.from_pretrained(shared, subfolder="vae", torch_dtype=td)
