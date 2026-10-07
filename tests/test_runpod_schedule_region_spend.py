@@ -230,3 +230,14 @@ def test_admin_scope_is_opt_in_at_creation():
     assert 'is_admin = bool(data.get("admin"))' in src
     assert '"admin": is_admin,' in src
     assert '@app.patch("/admin/api/tokens/{token_id}"' in src
+
+
+def test_the_admin_scope_is_settable_from_the_tokens_page():
+    """The API supports the flag; the page must actually expose it, or granting
+    it means hand-editing auth.json."""
+    html = (ROOT / "codai/admin/templates/tokens.html").read_text()
+    assert 'id="t-admin"' in html                      # opt-in at creation
+    assert "admin: document.getElementById('t-admin').checked" in html
+    assert "function setTokenAdmin" in html            # toggle on an existing one
+    assert "method:'PATCH'" in html
+    assert "${t.admin ? 'checked' : ''}" in html       # reflects current state

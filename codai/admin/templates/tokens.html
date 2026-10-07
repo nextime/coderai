@@ -15,7 +15,7 @@
 <div class="table-wrap">
   <table>
     <thead>
-      <tr><th>Name</th><th>Token</th><th>Format</th><th>Created</th><th>Last used</th><th></th></tr>
+      <tr><th>Name</th><th>Token</th><th>Format</th><th>Admin</th><th>Created</th><th>Last used</th><th></th></tr>
     </thead>
     <tbody id="tokens-body">
       <tr class="empty-row"><td colspan="6">No tokens — create one to get started</td></tr>
@@ -42,6 +42,13 @@
           <option value="anthropic">Anthropic</option>
           <option value="custom">Custom</option>
         </select>
+      </div>
+      <div class="form-row">
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+          <input type="checkbox" id="t-admin" style="width:auto">
+          <span class="form-label" style="margin:0">Admin scope</span>
+        </label>
+        <span class="form-hint">Lets this key read spend and pod status from <code>GET /v1/runpod/spend</code>. Off by default — an ordinary key can call the models but not see what the install costs.</span>
       </div>
       <div class="form-actions">
         <button class="btn btn-primary" onclick="createToken()">Generate</button>
@@ -104,11 +111,25 @@ async function loadTokens() {
         <td class="td-name">${esc(t.name)}</td>
         <td><code>${esc(t.token.substring(0,28))}…</code></td>
         <td><span class="badge badge-user">${esc(t.provider)}</span></td>
+        <td><label style="display:flex;align-items:center;gap:.3rem;cursor:pointer" title="Read spend over the served API">
+          <input type="checkbox" style="width:auto" ${t.admin ? 'checked' : ''} onchange="setTokenAdmin(${t.id}, this.checked)">
+        </label></td>
         <td class="mono small dim">${fmt(t.created_at)}</td>
         <td class="dim small">${t.last_used ? fmt(t.last_used) : 'Never'}</td>
         <td style="text-align:right"><button class="btn btn-danger btn-sm" onclick="delToken(${t.id})">Delete</button></td>
       </tr>`).join('');
   } catch {}
+}
+
+async function setTokenAdmin(id, want) {
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/tokens/' + id, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({admin: want})
+    });
+    if (!r.ok) { showAlert('Failed to change the admin scope'); }
+  } catch { showAlert('Failed to change the admin scope'); }
+  loadTokens();
 }
 
 async function createToken() {
@@ -117,7 +138,8 @@ async function createToken() {
   try {
     const r = await fetch(ROOT_PATH + '/admin/api/tokens', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, provider: document.getElementById('t-provider').value})
+      body: JSON.stringify({name, provider: document.getElementById('t-provider').value,
+                            admin: document.getElementById('t-admin').checked})
     });
     if (r.ok) {
       const d = await r.json();
