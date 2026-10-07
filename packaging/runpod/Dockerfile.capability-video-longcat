@@ -17,7 +17,7 @@ RUN python -m venv /opt/coderai/longcat_venv \
       assert sys.version_info[:2]==(3,10), sys.version; \
       assert torch.__version__.startswith('2.6'), torch.__version__; \
       assert transformers.__version__.startswith('4.41'), transformers.__version__; \
-      import accelerate" \
+      import accelerate, bitsandbytes" \
  && rm -rf /root/.cache/pip /tmp/requirements-longcat.txt
 
 # ---------------------------------------------------------------- runtime

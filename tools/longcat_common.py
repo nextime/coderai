@@ -332,6 +332,31 @@ def bsa_problems(num_frames: int, height: int, width: int, chunk=None) -> list:
     return problems
 
 
+# Weight quantisation for the pipeline COMPONENTS, as bytes per element once loaded.
+# The DiT has upstream's own INT8 path (base_model_int8/); these cover the components
+# that do not, the UMT5-XXL text encoder above all: at bf16 it is ~11 GB, which is 45%
+# of why a 13.6 GB INT8 DiT still does not fit a 24 GB card.
+COMPONENT_QUANTS = {
+    "none": None,       # load at the pipeline dtype
+    "int8": 1.0,
+    "nf4": 0.5,         # 4 bits plus absmax/quant-map overhead, which rounds to this
+    "fp4": 0.5,
+}
+
+
+def component_quant_problems(name: str, value: str) -> list:
+    """Reasons this component cannot be quantised that way, or []."""
+    v = str(value or "none").strip().lower()
+    if v not in COMPONENT_QUANTS:
+        return [f"{name} must be one of {sorted(COMPONENT_QUANTS)}; got {value!r}"]
+    return []
+
+
+def component_quant_bpe(value: str):
+    """Bytes per element for a quantised component, or None to keep the load dtype."""
+    return COMPONENT_QUANTS.get(str(value or "none").strip().lower())
+
+
 def dit_subdir(family: str = "") -> str:
     """Which subfolder holds the bf16 transformer for this family."""
     return AVATAR_DIT_SUBDIR if family else BASE_DIT_SUBDIR

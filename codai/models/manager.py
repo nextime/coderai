@@ -4387,6 +4387,20 @@ class MultiModelManager:
         vae = _resident_gb("vae")
         encoder = _resident_gb("text_encoder")
 
+        # A quantised text encoder is RESIDENT and much smaller, so it neither takes
+        # turns with the DiT nor costs its bf16 size.
+        te_quant = str(cfg.get("text_encoder_quant") or "none").strip().lower()
+        try:
+            from codai.api.longcat_worker import common as _lc_common
+            te_bpe = _lc_common().component_quant_bpe(te_quant)
+        except Exception:
+            te_bpe = None
+        if te_bpe is not None:
+            stored = self._safetensors_storage_bpe(os.path.join(root, "text_encoder"))
+            if stored > 0:
+                encoder = _resident_gb("text_encoder") * (te_bpe / float(load_bpe))
+            return dit + encoder + vae
+
         offload = str(cfg.get("offload_strategy") or "").strip().lower()
         if offload and offload != "none":
             return max(dit, encoder) + vae

@@ -83,10 +83,10 @@ if "${DK[@]}" exec "$NAME" sh -lc "test -d /opt/coderai/longcat_venv"; then
   # re-pointed at the wrong interpreter would pass a bare "import torch" while being
   # unusable for LongCat.
   if "${DK[@]}" exec "$NAME" /opt/coderai/longcat_venv/bin/python -c \
-      "import sys,torch,transformers,accelerate; assert sys.version_info[:2]==(3,10), sys.version; assert torch.__version__.startswith('2.6'), torch.__version__; assert transformers.__version__.startswith('4.41'), transformers.__version__" >/dev/null 2>&1; then
-    ok "longcat venv imports py3.10 + torch 2.6 + transformers 4.41 + accelerate"
+      "import sys,torch,transformers,accelerate,bitsandbytes; assert sys.version_info[:2]==(3,10), sys.version; assert torch.__version__.startswith('2.6'), torch.__version__; assert transformers.__version__.startswith('4.41'), transformers.__version__" >/dev/null 2>&1; then
+    ok "longcat venv imports py3.10 + torch 2.6 + transformers 4.41 + accelerate + bitsandbytes"
   else
-    bad "longcat venv" "py3.10/torch-2.6/transformers-4.41/accelerate check failed"
+    bad "longcat venv" "py3.10/torch-2.6/transformers-4.41/accelerate/bitsandbytes check failed"
   fi
 else
   echo "   (skipped: no longcat venv in this image)"

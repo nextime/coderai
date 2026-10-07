@@ -23,15 +23,20 @@ SERVICE = ROOT / "tools" / "longcat_service.py"
 class FakeModule:
     """Records every device it is moved to, in order."""
 
-    def __init__(self, name):
+    def __init__(self, name, children=()):
         self.name = name
         self.device = "cpu"
         self.history = ["cpu"]
+        self.children = list(children) or [self]
 
     def to(self, device, non_blocking=False):
         self.device = str(device)
         self.history.append(str(device))
         return self
+
+    def modules(self):
+        """nn.Module's walk, which _encoder_is_quantised uses to spot bnb layers."""
+        return iter(self.children)
 
 
 class FakePipeline:

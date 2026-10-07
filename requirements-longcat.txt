@@ -50,6 +50,13 @@ diffusers==0.35.1
 # and filled in place: the 5-shard load went from ~4m50s to seconds of it, and the host
 # RAM spike goes away. It is also what diffusers wants for any device_map work later.
 accelerate==1.1.1
+
+# Weight quantisation for the COMPONENTS, driven from the model config
+# (text_encoder_quant / vae_quant). The DiT has upstream's own INT8 path; the
+# UMT5-XXL text encoder does not, and at bf16 it is ~11 GB — 45% of why an INT8
+# DiT still does not fit a 24 GB card. NF4 puts it at ~2.8 GB. CUDA-only, which is
+# fine: these components only ever run on a card.
+bitsandbytes==0.45.5
 einops==0.8.0
 ftfy==6.2.0
 loguru==0.7.2

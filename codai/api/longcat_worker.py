@@ -46,6 +46,7 @@ Per-model config keys (models.json entry, all optional)::
     "offload_strategy": "",        # '' | model | sequential
     "bsa": "off",                  # block-sparse attention: on | off | auto
     "base_model": "",              # avatar families borrow tokenizer/text_encoder/vae
+    "text_encoder_quant": "none",   # none | int8 | nf4 | fp4 (keeps it resident)
     "cp_split_hw": "",             # context-parallel tile, e.g. "1x2"
     "used_vram_gb": 0,             # what to reserve before starting; 0 = measured
     "gpu_device": 0
@@ -500,6 +501,13 @@ def ensure_service(model_path: str, config: dict = None,
         base = str(config.get("base_model") or "").strip()
         if base:
             cmd += ["--base-model", base]
+        # Quantising the text encoder is what lets the whole pipeline stay resident on
+        # a 24 GB card; per model, because it trades prompt fidelity for the room.
+        te_q = str(config.get("text_encoder_quant") or
+                   (getattr(sec, "text_encoder_quant", "") if sec is not None else "")
+                   or "").strip()
+        if te_q:
+            cmd += ["--text-encoder-quant", te_q]
         if sec is not None and str(getattr(sec, "extra_args", "") or "").strip():
             import shlex
             cmd += shlex.split(str(sec.extra_args))

@@ -62,6 +62,7 @@ _state = {
     "pipe": None, "model": "", "source": "", "dtype": "bfloat16",
     "family": "", "variant": "bf16", "use_int8": False, "use_distill": False,
     "cp_split_hw": [1, 1], "audio_encoder": None, "base_model": "",
+    "text_encoder_quant": "none",
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
@@ -116,8 +117,18 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
             log(f"family '{family}': tokenizer/text_encoder/vae from {shared}")
 
         tokenizer = AutoTokenizer.from_pretrained(shared, subfolder="tokenizer")
+        te_quant = str(_state.get("text_encoder_quant") or "none").strip().lower()
+        te_kw = {"torch_dtype": td}
+        _te_cfg = _quant_config(te_quant, td)
+        if _te_cfg is not None:
+            # device_map is required for a quantised load: bitsandbytes quantises as the
+            # weights land on the card.
+            te_kw.update(quantization_config=_te_cfg, device_map={"": 0})
+            log(f"text encoder: {te_quant} "
+                f"(~{22.0 * LC.component_quant_bpe(te_quant) / 4:.1f} GB instead of "
+                f"~11 GB at bf16) — resident, never offloaded")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            shared, subfolder="text_encoder", torch_dtype=td)
+            shared, subfolder="text_encoder", **te_kw)
         vae = AutoencoderKLWan.from_pretrained(shared, subfolder="vae", torch_dtype=td)
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             root, subfolder="scheduler")
@@ -322,7 +333,52 @@ def _attention_kwargs():
         "attention has no fallback path")
 
 
-@contextlib.contextmanager
+def _encoder_is_quantised(pipe) -> bool:
+    """Whether the text encoder carries bitsandbytes weights.
+
+    Asked of the MODEL rather than the config, so a pipeline that was loaded quantised
+    cannot be offloaded by a config that has since changed.
+    """
+    encoder = getattr(pipe, "text_encoder", None)
+    if encoder is None:
+        return False
+    if getattr(encoder, "is_quantized", False) or getattr(encoder, "is_loaded_in_4bit", False) \
+            or getattr(encoder, "is_loaded_in_8bit", False):
+        return True
+    walk = getattr(encoder, "modules", None)
+    if not callable(walk):
+        return False
+    return any(type(m).__name__ in ("Linear4bit", "Linear8bitLt", "Params4bit")
+               for m in walk())
+
+
+def _quant_config(kind: str, dtype):
+    """A BitsAndBytesConfig for a component, or None to load at the pipeline dtype.
+
+    Quantised weights live on the CARD: bitsandbytes 4-bit params are quantised on
+    their first move to CUDA and are not meant to be shuttled back to host RAM. That
+    is the point here rather than a limitation — a ~2.8 GB NF4 encoder fits beside a
+    13.6 GB INT8 DiT, so nothing has to take turns at all.
+    """
+    bpe = LC.component_quant_bpe(kind)
+    if bpe is None:
+        return None
+    try:
+        import bitsandbytes  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            f"component quantisation {kind!r} needs bitsandbytes, which is not "
+            f"installed in this venv (it is pinned in requirements-longcat.txt)")
+    from transformers import BitsAndBytesConfig
+
+    kind = str(kind).strip().lower()
+    if kind == "int8":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type=kind,
+                              bnb_4bit_compute_dtype=dtype,
+                              bnb_4bit_use_double_quant=True)
+
+
 def _wrap_encode_prompt(pipe, swap: bool):
     """Encode a prompt at most once per request, and (when offloading) swap for it.
 
@@ -397,6 +453,7 @@ def _wrap_encode_prompt(pipe, swap: bool):
     return pipe
 
 
+@contextlib.contextmanager
 def _bsa_for(pipe, ctx):
     """Run this pass with block-sparse attention only if the geometry allows it.
 
@@ -451,6 +508,23 @@ def _place_pipeline(pipe, offload):
 
     if not torch.cuda.is_available():
         log("WARNING: no CUDA device visible — this will be extremely slow")
+        return pipe
+
+    # A quantised encoder is already on the card and must stay there: bitsandbytes
+    # quantises as the weights land on CUDA and is not built to shuttle them back. It
+    # is also small enough not to need to — which is the whole point of quantising it.
+    if _encoder_is_quantised(pipe):
+        log("text encoder is quantised and resident; nothing takes turns on the card")
+        if pipe.dit is not None:
+            pipe.dit = pipe.dit.to("cuda", non_blocking=True)
+            if getattr(pipe.dit, "lora_dict", None):
+                for network in pipe.dit.lora_dict.values():
+                    for lora in network.loras:
+                        lora.to("cuda", non_blocking=True)
+        if pipe.vae is not None:
+            pipe.vae = pipe.vae.to("cuda", non_blocking=True)
+        pipe.device = "cuda"
+        _wrap_encode_prompt(pipe, swap=False)
         return pipe
 
     if offload not in ("model", "sequential"):
@@ -905,6 +979,8 @@ def generate(body: dict) -> dict:
 
     if body.get("base_model"):
         _state["base_model"] = str(body["base_model"])
+    if body.get("text_encoder_quant"):
+        _state["text_encoder_quant"] = str(body["text_encoder_quant"])
     _state.update(variant=variant, use_int8=use_int8, use_distill=use_distill_lora)
     pipe = load_pipeline(checkpoint, body.get("source") or _state["source"],
                          body.get("dtype") or _state["dtype"],
@@ -1166,6 +1242,9 @@ def main(argv=None):
     ap.add_argument("--offload", default="", help="'' | model | sequential")
     ap.add_argument("--attention", default="xformers",
                     help="xformers | flash | flash3 (falls back to what is installed)")
+    ap.add_argument("--text-encoder-quant", default="none",
+                    help="none | int8 | nf4 | fp4 — quantise the UMT5-XXL text encoder "
+                         "so it can stay resident instead of being offloaded")
     ap.add_argument("--base-model", default="",
                     help="checkpoint holding tokenizer/text_encoder/vae for an avatar "
                          "family; blank uses the upstream base repo")
@@ -1191,6 +1270,11 @@ def main(argv=None):
     os.environ.setdefault("LONGCAT_ATTENTION", args.attention)
     os.environ.setdefault("LONGCAT_BSA", args.bsa)
     _state["base_model"] = args.base_model or ""
+    _problems = LC.component_quant_problems("text_encoder_quant",
+                                            args.text_encoder_quant)
+    if _problems:
+        raise SystemExit("; ".join(_problems))
+    _state["text_encoder_quant"] = args.text_encoder_quant or "none"
     # Validate both before anything slow happens: a bad value should not surface after
     # a multi-minute load.
     _bsa_enabled()
