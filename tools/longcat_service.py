@@ -266,12 +266,11 @@ def _dit_kwargs():
     """
     kwargs = _attention_kwargs()
     kwargs["cp_split_hw"] = _state.get("cp_split_hw") or [1, 1]
-    if _bsa_enabled():
-        # BSA replaces the dense path, so it must be the only backend left on.
-        kwargs.update(enable_flashattn3=False, enable_flashattn2=False,
-                      enable_xformers=False, enable_bsa=True)
-    else:
-        kwargs["enable_bsa"] = False
+    # BSA is ADDITIVE, not a replacement. _process_attn tests enable_bsa first, so it
+    # wins for self-attention on video — but _process_cross_attn has no BSA branch at
+    # all and ends in `raise RuntimeError("Unsupported attention operations.")`. Turning
+    # the dense backend off to "let BSA have it" kills every cross-attention call.
+    kwargs["enable_bsa"] = _bsa_enabled()
     return kwargs
 
 

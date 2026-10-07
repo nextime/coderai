@@ -96,18 +96,30 @@ def test_a_nonsense_value_is_rejected(service):
         service._bsa_enabled("sparse-ish")
 
 
-def test_bsa_replaces_the_dense_backend_rather_than_joining_it(service, monkeypatch):
-    """Attention checks enable_bsa first, so leaving xformers on too would be a silent
-    second opinion about which path is running."""
+def test_bsa_joins_the_dense_backend_rather_than_replacing_it(service, monkeypatch):
+    """BSA covers SELF-attention only. _process_cross_attn has no enable_bsa branch and
+    ends in `raise RuntimeError("Unsupported attention operations.")`, so turning the
+    dense backend off to let BSA have the field kills every cross-attention call — which
+    is exactly what happened on the first real run."""
     pytest.importorskip("triton")
     monkeypatch.setenv("LONGCAT_BSA", "on")
 
     kwargs = service._dit_kwargs()
 
     assert kwargs["enable_bsa"] is True
-    assert not kwargs["enable_xformers"]
-    assert not kwargs["enable_flashattn2"]
-    assert not kwargs["enable_flashattn3"]
+    assert (kwargs["enable_xformers"] or kwargs["enable_flashattn2"]
+            or kwargs["enable_flashattn3"]), "cross-attention still needs a dense path"
+
+
+def test_exactly_one_dense_backend_remains_under_bsa(service, monkeypatch):
+    pytest.importorskip("triton")
+    monkeypatch.setenv("LONGCAT_BSA", "on")
+
+    kwargs = service._dit_kwargs()
+
+    dense = sum(bool(kwargs[k]) for k in ("enable_xformers", "enable_flashattn2",
+                                          "enable_flashattn3"))
+    assert dense == 1
 
 
 def test_the_dit_kwargs_always_carry_a_usable_split(service):
