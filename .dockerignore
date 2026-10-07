@@ -50,3 +50,10 @@ tools/character_output
 
 # Claude Code local settings
 .claude
+
+# Local-only noise that must not reach a published image: build logs, the
+# empty dev marker, and a customer's integration requirements.
+logs
+video_editor_output
+.dev-code
+coderai-requirements.md
