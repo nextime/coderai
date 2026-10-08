@@ -243,3 +243,47 @@ def test_the_gui_emits_prefixed_urls_behind_a_sub_path_proxy():
     assert 'action="/coderai/login"' in html, "the login form would post outside the prefix"
     assert "/coderai/static/admin/" in html, "assets would 404 through the proxy"
     assert re.search(r"ROOT_PATH\s*=\s*['\"]/coderai", html), "JS fetches would miss the prefix"
+
+
+def test_a_fresh_install_gets_one_admin_and_is_not_locked_out():
+    """Enforcing tokens would otherwise brick a brand-new config dir: no token
+    means every /v1 call is refused and no user means nobody can log in to make
+    one. Nothing else auto-creates that first user."""
+    import json, pathlib, tempfile
+    from codai.admin.auth import SessionManager
+    from codai.api.app import _bootstrap_first_admin
+
+    d = tempfile.mkdtemp()
+    sm = SessionManager(pathlib.Path(d))
+    _bootstrap_first_admin(sm, d)
+    users = json.load(open(pathlib.Path(d) / "auth.json"))["users"]
+    assert [u["username"] for u in users] == ["admin"]
+    assert users[0]["role"] == "admin"
+    # A password printed to a container log is not a password.
+    assert users[0]["must_change_password"] is True
+
+
+def test_the_bootstrap_never_touches_an_existing_user():
+    import json, pathlib, tempfile
+    from codai.admin.auth import SessionManager
+    from codai.api.app import _bootstrap_first_admin
+
+    d = tempfile.mkdtemp()
+    sm = SessionManager(pathlib.Path(d))
+    _bootstrap_first_admin(sm, d)
+    before = json.load(open(pathlib.Path(d) / "auth.json"))["users"]
+    _bootstrap_first_admin(sm, d)
+    after = json.load(open(pathlib.Path(d) / "auth.json"))["users"]
+    assert len(after) == 1
+    assert before[0]["password_hash"] == after[0]["password_hash"]
+
+
+def test_coderai_locks_every_pod_it_rents():
+    """The operator never sets a pod's token: the pool generates one unless the
+    model explicitly opts out, so a pod is never open on a public proxy URL."""
+    src = (ROOT / "codai/api/runpod_worker.py").read_text()
+    assert 'self.api_key = "cra-" + secrets.token_urlsafe(32)' in src
+    assert 'allow_open_pod' in src
+    i = src.index('self.api_key = "cra-"')
+    guard = src[max(0, i - 200):i]
+    assert "allow_open_pod" in guard, "generation must be the default, not opt-in"

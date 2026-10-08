@@ -740,6 +740,49 @@ app.include_router(admin_router, tags=["Admin"])
 # Registering them here gives one image that is both the orchestrator and its GUI.
 # Guarded: a missing templates dir or config dir must not take the API down with
 # it, which is the same contract the front has.
+def _bootstrap_first_admin(sm, cfg_dir):
+    """Give a brand-new install one admin account, printed once.
+
+    Enforcing tokens (above) would otherwise lock out a fresh config dir
+    completely: no token means every /v1 call is refused, and no user means
+    nobody can log in to create one. Nothing auto-creates that first user, so
+    this does — with a random password, marked must-change — and says so in the
+    log. Idempotent: it never touches an existing user.
+    """
+    import secrets
+    try:
+        data = sm._load_auth_data()
+    except Exception:
+        return
+    if data.get("users"):
+        if not data.get("tokens"):
+            print("[api] no API tokens configured — /v1 requests will be refused; "
+                  "create one in Admin -> Tokens", flush=True)
+        return
+    password = secrets.token_urlsafe(18)
+    if not sm.create_user("admin", password, role="admin"):
+        return
+    # Force the change on first login: a password that was printed to a
+    # container log is not a password.
+    def _mark(auth_data):
+        for u in auth_data.get("users", []):
+            if u.get("username") == "admin":
+                u["must_change_password"] = True
+                return True, True
+        return False, False
+    try:
+        sm.update_auth_data(_mark)
+    except Exception:
+        pass
+    print("\n" + "=" * 72, flush=True)
+    print("[api] FIRST RUN: created the admin account for this install", flush=True)
+    print(f"[api]   username: admin", flush=True)
+    print(f"[api]   password: {password}", flush=True)
+    print("[api]   change it at /admin/change-password; this is printed once.", flush=True)
+    print(f"[api]   stored in {cfg_dir}/auth.json", flush=True)
+    print("=" * 72 + "\n", flush=True)
+
+
 def _ensure_session_manager():
     """Make sure API tokens are actually ENFORCED under a bare uvicorn start.
 
@@ -763,6 +806,7 @@ def _ensure_session_manager():
             or legacy_style_config_dir()
         _ar.init_session_manager(cfg_dir)
         print(f"[api] API tokens enforced from {cfg_dir}", flush=True)
+        _bootstrap_first_admin(_ar.session_manager, cfg_dir)
     except Exception as exc:
         print(f"[api] WARNING: could not initialise the session manager ({exc}); "
               f"set CODERAI_API_TOKEN to refuse unauthenticated /v1 requests",

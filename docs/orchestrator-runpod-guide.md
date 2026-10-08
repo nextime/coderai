@@ -66,9 +66,18 @@ curl -fsS http://127.0.0.1:8000/health      # same — the vLLM-convention alias
 curl -fsS http://127.0.0.1:8000/v1/models   # [] until you add models
 ```
 
-Then open `http://127.0.0.1:8000/admin`. It redirects to `/login`; the first
-credentials are created on first run and printed in the container log
-(`docker logs coderai`), and you are asked to change the password.
+Then open `http://127.0.0.1:8000/admin`. It redirects to `/login`. On a brand-new
+config directory the app creates one admin account at startup with a random
+password and prints it **once** — so read the log before you lose it:
+
+```bash
+docker logs coderai | grep -A4 'FIRST RUN'
+```
+
+You are forced to change it on first login: a password that was printed to a
+container log is not a password. Then create an API token (Admin → Tokens)
+before anything calls `/v1/*`, because with no token every API request is
+refused — correctly.
 
 ### Behind nginx, under a sub-path
 
@@ -245,6 +254,34 @@ because a volume lives in one region and a pod elsewhere cannot attach it.
 ---
 
 ## 4. A network volume, and one recipe per kind of model
+
+### You never configure a pod — CoderAI does
+
+This is the part worth being explicit about, because it is the easiest thing to
+get wrong: **you do not set anything up on a pod, and you do not send requests
+to one.** A pod is disposable. CoderAI rents it, configures it, routes to it and
+destroys it. Everything you set is on the *model*, here, in `models.json` or the
+model page.
+
+When CoderAI provisions a pod it sets, by itself:
+
+| on the pod | from where |
+|---|---|
+| its **bearer token** — a fresh `cra-…` per pool, so a pod is never open on a public proxy URL | generated unless you set `api_key`, or opt out with `allow_open_pod` |
+| **TLS**, when the path is direct TCP — a certificate from this install's own CA, which only this install verifies | automatic for CoderAI images |
+| which **models** to serve, and where to get the weights | `served_model`, `source`, `hf_repo`, `volume_path` |
+| the **engine** and its launch arguments, including `--tensor-parallel-size`, `--enable-lora` and the LoRA modules | `engine`, `gpu_count`, the adapters on the model |
+| its **admission limits** | `pod_max_parallel_requests`, `pod_queue_max_size` |
+| the **volume** mount | `network_volume_id`, `volume_mount_path` |
+| **teardown** — idle pods destroyed, and a reaper that kills tagged pods no live pool is tracking, so a crash cannot leave one billing | `idle_timeout_s`, automatic |
+
+So: no SSH into a pod, no editing config on a pod, no pointing a client at a pod
+URL. If you find yourself wanting to drive a pod directly to get throughput, the
+answer is `max_pods` and `scale_up_inflight_per_pod` instead — client-side
+concurrency against one pod produces 429s, not speed.
+
+The one thing to keep in your own hands is the **orchestrator's** front door:
+its API tokens (Admin → Tokens) and what your reverse proxy exposes.
 
 ### Put the weights on a volume — this is the single biggest lever
 
