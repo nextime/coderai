@@ -158,6 +158,15 @@ class RunpodModelConfig:
     # over both: a volume lives in one region and a pod elsewhere cannot attach
     # it. Pin a region for latency or for where the data is allowed to be.
     data_center: str = ""
+    # --- how hard the pod's own server may be driven ---
+    # A rented pod carries no config file, so these ride as env. The defaults
+    # (2 in flight, 6 queued) are sized for a shared workstation engine and
+    # throttle a dedicated A40 to a fraction of what vLLM's max_num_seqs would
+    # serve: the app's admission gate saturates long before the GPU does, and
+    # everything over the limit gets 429. Set these to roughly the remote
+    # engine's own batch width. 0 = leave the pod's defaults alone.
+    pod_max_parallel_requests: int = 0
+    pod_queue_max_size: int = 0
     # --- warm-pod schedule ---
     # When set, the warm floor (min_pods/keep_warm) only applies inside the
     # window; outside it the floor is 0 and warm pods are terminated, so a model
@@ -954,6 +963,13 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     env = {}
     if api_key:
         env["CODERAI_API_TOKEN"] = api_key
+    # How hard the pod's own server may be driven. Without this the pod runs the
+    # shared-workstation defaults and its admission gate, not its GPU, is the
+    # ceiling.
+    if getattr(mcfg, "pod_max_parallel_requests", 0):
+        env["CODERAI_SERVER_MAX_PARALLEL_REQUESTS"] = str(int(mcfg.pod_max_parallel_requests))
+    if getattr(mcfg, "pod_queue_max_size", 0):
+        env["CODERAI_SERVER_QUEUE_MAX_SIZE"] = str(int(mcfg.pod_queue_max_size))
     seeds = []
     if entry:
         kind, value = resolve_model_source(entry, mcfg)
@@ -1512,6 +1528,10 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.cost_limit_usd = _as_float(b.get("cost_limit_usd"), cfg.cost_limit_usd)
     cfg.cost_period = (b.get("cost_period") or cfg.cost_period).strip().lower()
     cfg.data_center = (b.get("data_center") or "").strip().upper()
+    cfg.pod_max_parallel_requests = max(0, _as_int(b.get("pod_max_parallel_requests"),
+                                                   cfg.pod_max_parallel_requests))
+    cfg.pod_queue_max_size = max(0, _as_int(b.get("pod_queue_max_size"),
+                                            cfg.pod_queue_max_size))
     cfg.schedule_enabled = _as_bool(b.get("schedule_enabled"), cfg.schedule_enabled)
     cfg.schedule_days = _parse_days(b.get("schedule_days"))
     cfg.schedule_start = _parse_hhmm(b.get("schedule_start"))

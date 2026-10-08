@@ -339,6 +339,18 @@ async def healthz():
     return {"ok": True, "pid": _os.getpid()}
 
 
+# Stock vLLM serves its readiness probe at /health, and clients written against
+# it hard-code that path: surya-ocr's vLLM client probes {service_url}/health and
+# declares the backend down on anything else, which left /v1/ocr permanently
+# "not ready" against a coderai front. Aliases, so both conventions work.
+# /v1/health is exempt from the Bearer check (see ratelimit._PROGRESS_PATHS):
+# a readiness probe that needs a token is not a readiness probe.
+@app.get("/health", include_in_schema=False)
+@app.get("/v1/health", include_in_schema=False)
+async def health_alias():
+    return await healthz()
+
+
 _ENGINE_VRAM_CACHE = {"at": 0.0, "vram": None, "names": {}}
 _ENGINE_VRAM_TTL = 4.0   # seconds
 

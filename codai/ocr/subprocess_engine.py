@@ -25,23 +25,30 @@ from codai.ocr.base import OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError
 _WORKER = os.path.join(os.path.dirname(__file__), "workers", "ocr_worker.py")
 
 
-def _resolve_venv_dir(configured: str, name: str) -> str:
+def _resolve_venv_dir(configured: str, name: str, baked_aliases: tuple = ()) -> str:
     """Resolve an isolated-venv directory for an OCR engine.
 
     Precedence: explicit config path > a venv BAKED into the image
-    (/opt/coderai/<name>) > a build on the PERSISTENT cache mount
-    (CODERAI_CACHE_DIR or /cache → <cache>/ocr/<name>, survives container restarts) >
-    ~/.coderai/<name> for host/source installs.
+    (/opt/coderai/<name>, or /opt/coderai/venvs/<alias>) > a build on the
+    PERSISTENT cache mount (CODERAI_CACHE_DIR or /cache → <cache>/ocr/<name>,
+    survives container restarts) > ~/.coderai/<name> for host/source installs.
 
     The order matters: a runtime-built venv must NOT land in the image's writable layer
     (lost on `coderai docker` restart) — it goes on the /cache mount, like the colibri/k3
     engines.
+
+    ``baked_aliases`` are the names the capability-image builder uses: a profile's
+    ``<profile>.venv-<alias>.txt`` becomes ``/opt/coderai/venvs/<alias>``, which is
+    NOT ``/opt/coderai/<engine>_venv``. Without them a baked venv is invisible and
+    the engine rebuilds it on the cache mount at first use — paying minutes (or,
+    on a pod, failing) for something already in the image.
     """
     if configured:
         return configured
-    baked = f"/opt/coderai/{name}"
-    if os.path.isdir(baked):
-        return baked
+    for baked in (f"/opt/coderai/{name}",
+                  *(f"/opt/coderai/venvs/{a}" for a in baked_aliases)):
+        if os.path.isdir(baked):
+            return baked
     cache = os.environ.get("CODERAI_CACHE_DIR") or ("/cache" if os.path.isdir("/cache") else "")
     if cache and os.path.isdir(cache):
         return os.path.join(cache, "ocr", name)

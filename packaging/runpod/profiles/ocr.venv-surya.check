@@ -1,0 +1,9 @@
+# Deep check for the surya venv: the vLLM-backed path must import, not just the
+# package. surya's vLLM client is what talks to the pod, and an import error
+# here is the difference between a working /v1/ocr and one that is never ready.
+import surya                                              # noqa
+from surya.common.surya.schema import TaskNames           # noqa
+from PIL import Image
+import PIL
+assert int(PIL.__version__.split(".")[0]) < 11, f"pillow {PIL.__version__} — surya caps <11"
+print("surya", getattr(surya, "__version__", "ok"), "pillow", PIL.__version__)

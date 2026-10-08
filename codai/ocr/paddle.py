@@ -23,7 +23,7 @@ class PaddleEngine(SubprocessOcrEngine):
     _worker_engine = "paddle"
 
     def _venv_dir(self) -> str:
-        return _resolve_venv_dir(self.cfg.paddle_venv, "paddle_venv")
+        return _resolve_venv_dir(self.cfg.paddle_venv, "paddle_venv", ("paddleocr", "paddle"))
 
     def _requirements(self) -> str:
         return os.path.abspath(_REQ)

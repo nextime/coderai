@@ -947,6 +947,19 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <span class="form-hint" style="font-size:11px">None ticked = every day. An end earlier than the start runs overnight, and belongs to the day it starts on.</span>
             <span class="form-hint" id="cfg-rp-schedule-status" style="font-size:11px"></span>
           </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Pod max parallel requests</label>
+              <input type="number" id="cfg-rp-pod-parallel" class="form-input" min="0" placeholder="0 = the pod's default (2)">
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Pod queue size</label>
+              <input type="number" id="cfg-rp-pod-queue" class="form-input" min="0" placeholder="0 = the pod's default (6)">
+            </div>
+          </div>
+          <div class="form-row" style="margin:.25rem 0 0">
+            <span class="form-hint" style="font-size:11px">How many requests the pod's own server admits at once. The defaults are sized for a shared workstation and will throttle a dedicated card long before its GPU is busy — everything over the limit gets a 429. Set these to roughly the remote engine's batch width (e.g. vLLM's <code>max_num_seqs</code>).</span>
+          </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label class="form-label">Region (data centre)</label>
             <input type="text" id="cfg-rp-data-center" class="form-input" placeholder="blank = the account setting, e.g. EU-RO-1">
@@ -4886,6 +4899,8 @@ function _populateRunpod(s){
   set('cfg-rp-schedule-end', rp.schedule_end || '');
   set('cfg-rp-schedule-tz', rp.schedule_tz || '');
   set('cfg-rp-data-center', rp.data_center || '');
+  set('cfg-rp-pod-parallel', rp.pod_max_parallel_requests != null ? rp.pod_max_parallel_requests : '');
+  set('cfg-rp-pod-queue', rp.pod_queue_max_size != null ? rp.pod_queue_max_size : '');
   (function(){
     // Days come back normalised to 0=Mon…6=Sun; an empty list means every day,
     // which is shown as nothing ticked rather than everything.
@@ -5096,6 +5111,8 @@ function _collectRunpod(){
                           .filter(function(cb){ return cb.checked; })
                           .map(function(cb){ return cb.value; }),
     data_center:        (val('cfg-rp-data-center') || '').trim(),
+    pod_max_parallel_requests: intOrU('cfg-rp-pod-parallel'),
+    pod_queue_max_size:        intOrU('cfg-rp-pod-queue'),
   };
   return o;
 }

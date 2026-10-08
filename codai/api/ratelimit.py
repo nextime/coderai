@@ -43,6 +43,10 @@ _PROGRESS_PATHS = {
     "/v1/video/progress",
     "/v1/audio/progress",
     "/v1/loras/progress",
+    # Readiness probes. vLLM-shaped clients (surya-ocr's among them) probe
+    # /health or /v1/health before sending anything and treat a 401 as "down",
+    # so these must answer without a token, exactly as /healthz does.
+    "/v1/health",
 }
 
 

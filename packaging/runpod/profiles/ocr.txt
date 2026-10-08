@@ -26,7 +26,8 @@ jsonschema>=4.0.0
 #
 # SuryaEngine still runs as a subprocess (it is a SubprocessOcrEngine), so the
 # pod points ocr.surya_venv at this interpreter rather than building one.
-surya-ocr==0.22.1
+# surya-ocr is NOT here: it caps pillow<11 against coderai's pillow>=12, and the
+# engine runs it in an isolated venv subprocess anyway. See ocr.venv-surya.txt.
 
 # olmOCR-2 needs NOTHING here. It is a document VLM, not a library: it imports only
 # PIL and requests, and reaches its model one of three ways — coderai's own model

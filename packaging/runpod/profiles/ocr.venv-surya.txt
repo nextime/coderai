@@ -1,0 +1,13 @@
+# Surya in its own venv, baked at /opt/coderai/venvs/surya (the OCR engine finds
+# it there — see codai/ocr/subprocess_engine._resolve_venv_dir).
+#
+# It CANNOT live in the main venv: surya-ocr caps pillow<11 and coderai needs
+# pillow>=12. Installing it alongside either breaks image loading or silently
+# downgrades pillow for everything else.
+#
+# This venv holds the surya CLIENT, which is also where it belongs in the split:
+# with surya_serve="vllm" the heavy model runs in vLLM on the GPU pod and this
+# side only renders, batches and post-processes. So the venv goes on the
+# ORCHESTRATOR image, never on the rented card.
+surya-ocr==0.22.1
+pillow<11

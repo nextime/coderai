@@ -1397,13 +1397,30 @@ def main():
     queue_manager.max_parallel_requests = config.server.max_parallel_requests
     # In an engine the front may override this engine's concurrency (per-engine
     # limit) via env, so a bigger card runs more in parallel than a smaller one.
-    _mp = os.environ.get("CODERAI_MAX_PARALLEL")
+    # On a RENTED POD the same knobs matter even more: the pod has no auth.json
+    # and no models.json to carry settings, so env is the only channel, and the
+    # defaults (2 in flight, 6 queued) throttle an A40 to a fraction of what
+    # vLLM's max_num_seqs would serve — the admission gate, not the GPU, becomes
+    # the ceiling and everything above it gets 429. CODERAI_SERVER_* are the
+    # documented names; CODERAI_MAX_PARALLEL stays as the front's existing one.
+    _mp = (os.environ.get("CODERAI_SERVER_MAX_PARALLEL_REQUESTS")
+           or os.environ.get("CODERAI_MAX_PARALLEL"))
     if _mp:
         try:
             queue_manager.max_parallel_requests = int(_mp)
             config.server.max_parallel_requests = int(_mp)
         except ValueError:
             pass
+    _qs = (os.environ.get("CODERAI_SERVER_QUEUE_MAX_SIZE")
+           or os.environ.get("CODERAI_QUEUE_MAX_SIZE"))
+    if _qs:
+        try:
+            queue_manager.max_size = int(_qs)
+            config.server.queue_max_size = int(_qs)
+        except ValueError:
+            pass
+    print(f"[queue] max_parallel_requests={queue_manager.max_parallel_requests} "
+          f"max_size={queue_manager.max_size}", flush=True)
 
     # RunPod: on the PRIMARY engine (which hosts runpod pods), start the scaler +
     # the independent stale-pod reaper as soon as RunPod is enabled — so pods

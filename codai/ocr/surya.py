@@ -25,7 +25,7 @@ class SuryaEngine(SubprocessOcrEngine):
     _worker_engine = "surya"
 
     def _venv_dir(self) -> str:
-        return _resolve_venv_dir(self.cfg.surya_venv, "surya_venv")
+        return _resolve_venv_dir(self.cfg.surya_venv, "surya_venv", ("surya",))
 
     def _requirements(self) -> str:
         return os.path.abspath(_REQ)

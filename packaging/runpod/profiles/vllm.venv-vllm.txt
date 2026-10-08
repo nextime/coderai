@@ -13,3 +13,9 @@ vllm==0.27.1+cu129
 torch==2.13.0+cu129
 torchvision==0.28.0+cu129
 torchaudio==2.11.0+cu129
+# torchcodec is a vLLM requirement (>=0.14) and PyPI's newest, 0.17.0, is built
+# against CUDA 13: it dlopens libnvrtc.so.13 while this venv has nvrtc 12.9, so
+# `import vllm.entrypoints.openai.api_server` dies even though `import vllm`
+# works. Pinned to the newest +cu129 build on torch's index. The same CUDA
+# 13-vs-12 trap as the torch pins above, one layer further down.
+torchcodec==0.16.0+cu129
