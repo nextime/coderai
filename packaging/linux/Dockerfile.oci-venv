@@ -151,6 +151,11 @@ WORKDIR /opt/coderai/app
 COPY . /opt/coderai/app
 COPY --from=build_meta /build-manifest.json /opt/coderai/BUILD-MANIFEST.json
 COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
+# The in-image code upgrader. Dockerfile.oci has always shipped it; this
+# venv-built variant did not, so `coderai-docker --upgrade` failed with
+# `stat /usr/local/bin/coderai-upgrade: no such file or directory` on every
+# image built this way — which is every image we actually publish.
+COPY packaging/linux/launcher/coderai-upgrade /usr/local/bin/coderai-upgrade
 COPY packaging/linux/launcher/with-env /usr/local/bin/with-env
 COPY packaging/linux/launcher/coderai-entrypoint /usr/local/bin/coderai-entrypoint
 COPY packaging/linux/launcher/wav2lip /usr/local/bin/wav2lip

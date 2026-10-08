@@ -69,6 +69,36 @@ docker run -d --name coderai --restart unless-stopped \
   ghcr.io/nextime/coderai:latest
 ```
 
+> ### ⚠ Your config file goes in a **subdirectory**, and this costs people hours
+>
+> The entrypoint does not use `$CODERAI_CONFIG_DIR` directly. It creates
+> **`$CODERAI_CONFIG_DIR/coderai/`** and symlinks `~/.coderai` to it, because the
+> app resolves its config from the HOME-style path
+> (`coderai-entrypoint` lines 49 and 70). So with the mount above, the file you
+> must edit is:
+>
+> ```
+> ~/coderai/config/coderai/config.json      ← the one that is read
+> ~/coderai/config/config.json              ← IGNORED. Silently.
+> ```
+>
+> Put settings in the parent and nothing happens: on first start the app writes
+> a **default** `coderai/config.json` with `backend: null`, `engine_specs: null`
+> and `engines: null`, reads that, and your carefully set `backend.type: "cpu"`
+> is never seen — so the engine auto-detects, finds no GPU and aborts with
+> `No supported backend detected`. It looks exactly like the front ignoring
+> `engine_specs`. It isn't; the file was never read.
+>
+> Verify which file is live before you debug anything else:
+>
+> ```bash
+> docker exec coderai sh -c 'readlink -f ~/.coderai; cat ~/.coderai/config.json'
+> ```
+>
+> The same applies to `auth.json`, `models.json` and the rest — they all live in
+> that subdirectory. Mounting your config directly at `/config/coderai` also
+> works and avoids the whole question.
+
 On a machine **with** a GPU add `--gpus all` (NVIDIA) or `--device /dev/dri`
 (AMD/Intel, Vulkan) and you are done.
 
