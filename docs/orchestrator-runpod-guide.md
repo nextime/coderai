@@ -88,6 +88,70 @@ location ^~ /coderai/ {
 `proxy_read_timeout` matters: a long render or a cold engine's first token can
 take minutes, and nginx's 60 s default will kill it mid-answer.
 
+**Three things will bite you on this path.**
+
+**1. `auth_basic` and Bearer tokens collide.** They are the same HTTP header.
+If you put `auth_basic` on `/coderai/`, nginx demands `Authorization: Basic …`
+and rejects a client that sends `Authorization: Bearer sk-coderai-…` with 401
+*before* the request ever reaches CoderAI. So basic-auth the **GUI** and leave
+the **API** on its own tokens:
+
+```nginx
+# The GUI: a browser, protected by basic auth.
+location ^~ /coderai/ {
+    auth_basic           "coderai";
+    auth_basic_user_file /etc/nginx/coderai.htpasswd;
+    proxy_pass           http://127.0.0.1:8000/;
+    proxy_set_header     Host               $host;
+    proxy_set_header     X-Forwarded-Prefix /coderai;
+    proxy_set_header     X-Forwarded-Proto  $scheme;
+    proxy_read_timeout   3600s;
+}
+
+# The API: no basic auth — CoderAI's own Bearer tokens guard it.
+location ^~ /coderai/v1/ {
+    auth_basic           off;
+    proxy_pass           http://127.0.0.1:8000/v1/;
+    proxy_set_header     Host               $host;
+    proxy_set_header     X-Forwarded-Prefix /coderai;
+    proxy_set_header     X-Forwarded-Proto  $scheme;
+    proxy_read_timeout   3600s;
+    proxy_buffering      off;     # or streamed responses arrive in one lump
+}
+```
+
+`proxy_buffering off` on the API path matters for streaming: with buffering on,
+nginx holds a token-by-token response and delivers it all at once.
+
+**2. Leave the readiness probes unauthenticated.** `/healthz`, `/health` and
+`/v1/health` must answer 200 without credentials. Every health checker — and
+surya-ocr's vLLM client — reads a 401 as *backend down*. They are deliberately
+exempt from the Bearer check inside CoderAI; do not put basic auth in front of
+them either.
+
+**3. Make sure your API tokens are actually enforced.** CoderAI's Bearer check
+falls **open** when it has no user database to check against and no
+`CODERAI_API_TOKEN` in the environment — reasonable on a loopback workstation,
+dangerous the moment the app is published. Before 0.2.83 a bare
+`uvicorn codai.api.app:app` start did not initialise that database, so `/v1/*`
+was served *without credentials*. From 0.2.83 the app initialises it from the
+config dir at import and logs `[api] API tokens enforced from <dir>`.
+
+Verify it yourself, from the host, before you expose anything:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/v1/models
+#   401  <- correct
+#   200  <- OPEN: upgrade to 0.2.83, or set CODERAI_API_TOKEN and restart
+```
+
+On an older image, `-e CODERAI_API_TOKEN=<something-long>` closes it: with an
+env token configured the middleware refuses anything that does not match.
+
+**The GUI itself works under a sub-path** — the login form posts to
+`/coderai/login`, assets resolve under `/coderai/static/admin/`, and the page's
+`ROOT_PATH` is `/coderai`, so no nginx rewriting is needed.
+
 ---
 
 ## 2. Point it at RunPod

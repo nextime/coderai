@@ -740,6 +740,38 @@ app.include_router(admin_router, tags=["Admin"])
 # Registering them here gives one image that is both the orchestrator and its GUI.
 # Guarded: a missing templates dir or config dir must not take the API down with
 # it, which is the same contract the front has.
+def _ensure_session_manager():
+    """Make sure API tokens are actually ENFORCED under a bare uvicorn start.
+
+    BearerAuthMiddleware falls open when admin.routes.session_manager is None and
+    no CODERAI_API_TOKEN is set: with no user database to check a token against
+    and no env token configured, it lets the request through rather than locking
+    out an install that has no auth at all. That is defensible on a loopback
+    workstation and dangerous for a GPU-less orchestrator started as
+    `uvicorn codai.api.app:app` and published through a reverse proxy — every
+    /v1/* call would be served without credentials.
+
+    main.py and build_system_app() both initialise it; a bare uvicorn start does
+    not. Do it here so the tokens on the Tokens page mean what they say.
+    """
+    try:
+        from codai.admin import routes as _ar
+        if _ar.session_manager is not None:
+            return
+        from codai.platform_paths import legacy_style_config_dir
+        cfg_dir = getattr(getattr(_ar, "config_manager", None), "config_dir", None) \
+            or legacy_style_config_dir()
+        _ar.init_session_manager(cfg_dir)
+        print(f"[api] API tokens enforced from {cfg_dir}", flush=True)
+    except Exception as exc:
+        print(f"[api] WARNING: could not initialise the session manager ({exc}); "
+              f"set CODERAI_API_TOKEN to refuse unauthenticated /v1 requests",
+              flush=True)
+
+
+_ensure_session_manager()
+
+
 def _register_local_ui_pages():
     try:
         from codai.frontproxy.ui_pages import register_ui_pages

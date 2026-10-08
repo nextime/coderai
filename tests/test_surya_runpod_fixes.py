@@ -198,3 +198,48 @@ def test_the_forwarded_prefix_middleware_is_installed():
     assert "class _ForwardedPrefixMiddleware" in src
     assert "app.add_middleware(_ForwardedPrefixMiddleware)" in src
     assert "x-forwarded-prefix" in src
+
+
+# ----------------------- exposed behind a proxy: tokens must be enforced
+def test_api_tokens_are_enforced_under_a_bare_uvicorn_start():
+    """BearerAuthMiddleware falls OPEN when admin.routes.session_manager is None
+    and no CODERAI_API_TOKEN is set. main.py initialises it; `uvicorn
+    codai.api.app:app` — the GPU-less orchestrator shape — did not, so every
+    /v1/* call was served without credentials once published through a proxy."""
+    import os, base64
+    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
+    from fastapi.testclient import TestClient
+    from codai.api.app import app
+    from codai.admin import routes as ar
+
+    assert ar.session_manager is not None, "importing the app must initialise it"
+    c = TestClient(app, raise_server_exceptions=False)
+    for hdr in ({}, {"Authorization": "Bearer sk-definitely-not-a-token"},
+                {"Authorization": "Basic " + base64.b64encode(b"g:p").decode()}):
+        assert c.get("/v1/models", headers=hdr).status_code == 401, hdr
+
+
+def test_readiness_probes_stay_open_when_tokens_are_enforced():
+    """A probe behind auth is not a probe: surya and every orchestrator health
+    check would read 401 as 'backend down'."""
+    import os
+    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
+    from fastapi.testclient import TestClient
+    from codai.api.app import app
+    c = TestClient(app, raise_server_exceptions=False)
+    for path in ("/healthz", "/health", "/v1/health"):
+        assert c.get(path).status_code == 200, path
+
+
+def test_the_gui_emits_prefixed_urls_behind_a_sub_path_proxy():
+    """Served at https://host/coderai/, every URL the page emits must carry the
+    prefix or the browser walks out of the deployment on the first click."""
+    import os, re
+    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
+    from fastapi.testclient import TestClient
+    from codai.api.app import app
+    c = TestClient(app, raise_server_exceptions=False)
+    html = c.get("/login", headers={"X-Forwarded-Prefix": "/coderai"}).text
+    assert 'action="/coderai/login"' in html, "the login form would post outside the prefix"
+    assert "/coderai/static/admin/" in html, "assets would 404 through the proxy"
+    assert re.search(r"ROOT_PATH\s*=\s*['\"]/coderai", html), "JS fetches would miss the prefix"
