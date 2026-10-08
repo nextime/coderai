@@ -159,44 +159,7 @@ def test_the_ocr_image_bakes_a_surya_venv():
 
 
 # ------------------------------------- bug 3: one image = orchestrator + GUI
-def test_the_light_app_serves_the_admin_gui_pages():
-    """admin_router is the admin API (POST /login, /admin/api/*). The GUI pages
-    were only on the front app, so a bare `uvicorn codai.api.app:app`
-    orchestrator answered 404 for /admin and 405 for GET /login."""
-    import os
-    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
-    from fastapi.testclient import TestClient
-    from codai.api.app import app
-    c = TestClient(app, raise_server_exceptions=False)
 
-    r = c.get("/admin", follow_redirects=False)
-    assert r.status_code in (200, 302, 303), f"/admin -> {r.status_code}"
-    r = c.get("/login", follow_redirects=False)
-    assert r.status_code == 200, f"GET /login -> {r.status_code} (405 = API only)"
-    for page in ("/admin/models", "/admin/runpod", "/admin/settings"):
-        assert c.get(page, follow_redirects=False).status_code in (200, 302, 303), page
-
-
-def test_the_gui_redirect_carries_the_forwarded_prefix():
-    """Served under /coderai/, the login redirect must point inside the prefix or
-    the browser leaves the deployment."""
-    import os
-    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
-    from fastapi.testclient import TestClient
-    from codai.api.app import app
-    c = TestClient(app, raise_server_exceptions=False)
-    r = c.get("/admin", headers={"X-Forwarded-Prefix": "/coderai"},
-              follow_redirects=False)
-    assert r.status_code in (302, 303)
-    assert r.headers.get("location", "").startswith("/coderai/"), r.headers.get("location")
-
-
-def test_the_api_survives_a_gui_registration_failure():
-    """A missing templates or config dir must not take the orchestrator down."""
-    src = (ROOT / "codai/api/app.py").read_text()
-    blk = src.split("def _register_local_ui_pages")[1].split("_register_local_ui_pages()")[0]
-    assert "except Exception" in blk
-    assert "the API is unaffected" in blk
 
 
 def test_the_forwarded_prefix_middleware_is_installed():
@@ -207,23 +170,6 @@ def test_the_forwarded_prefix_middleware_is_installed():
 
 
 # ----------------------- exposed behind a proxy: tokens must be enforced
-def test_api_tokens_are_enforced_under_a_bare_uvicorn_start():
-    """BearerAuthMiddleware falls OPEN when admin.routes.session_manager is None
-    and no CODERAI_API_TOKEN is set. main.py initialises it; `uvicorn
-    codai.api.app:app` — the GPU-less orchestrator shape — did not, so every
-    /v1/* call was served without credentials once published through a proxy."""
-    import os, base64
-    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
-    from fastapi.testclient import TestClient
-    from codai.api.app import app
-    from codai.admin import routes as ar
-
-    assert ar.session_manager is not None, "importing the app must initialise it"
-    c = TestClient(app, raise_server_exceptions=False)
-    for hdr in ({}, {"Authorization": "Bearer sk-definitely-not-a-token"},
-                {"Authorization": "Basic " + base64.b64encode(b"g:p").decode()}):
-        assert c.get("/v1/models", headers=hdr).status_code == 401, hdr
-
 
 def test_readiness_probes_stay_open_when_tokens_are_enforced():
     """A probe behind auth is not a probe: surya and every orchestrator health
@@ -237,51 +183,7 @@ def test_readiness_probes_stay_open_when_tokens_are_enforced():
         assert c.get(path).status_code == 200, path
 
 
-def test_the_gui_emits_prefixed_urls_behind_a_sub_path_proxy():
-    """Served at https://host/coderai/, every URL the page emits must carry the
-    prefix or the browser walks out of the deployment on the first click."""
-    import os, re
-    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
-    from fastapi.testclient import TestClient
-    from codai.api.app import app
-    c = TestClient(app, raise_server_exceptions=False)
-    html = c.get("/login", headers={"X-Forwarded-Prefix": "/coderai"}).text
-    assert 'action="/coderai/login"' in html, "the login form would post outside the prefix"
-    assert "/coderai/static/admin/" in html, "assets would 404 through the proxy"
-    assert re.search(r"ROOT_PATH\s*=\s*['\"]/coderai", html), "JS fetches would miss the prefix"
 
-
-def test_a_fresh_install_gets_one_admin_and_is_not_locked_out():
-    """Enforcing tokens would otherwise brick a brand-new config dir: no token
-    means every /v1 call is refused and no user means nobody can log in to make
-    one. Nothing else auto-creates that first user."""
-    import json, pathlib, tempfile
-    from codai.admin.auth import SessionManager
-    from codai.api.app import _bootstrap_first_admin
-
-    d = tempfile.mkdtemp()
-    sm = SessionManager(pathlib.Path(d))
-    _bootstrap_first_admin(sm, d)
-    users = json.load(open(pathlib.Path(d) / "auth.json"))["users"]
-    assert [u["username"] for u in users] == ["admin"]
-    assert users[0]["role"] == "admin"
-    # A password printed to a container log is not a password.
-    assert users[0]["must_change_password"] is True
-
-
-def test_the_bootstrap_never_touches_an_existing_user():
-    import json, pathlib, tempfile
-    from codai.admin.auth import SessionManager
-    from codai.api.app import _bootstrap_first_admin
-
-    d = tempfile.mkdtemp()
-    sm = SessionManager(pathlib.Path(d))
-    _bootstrap_first_admin(sm, d)
-    before = json.load(open(pathlib.Path(d) / "auth.json"))["users"]
-    _bootstrap_first_admin(sm, d)
-    after = json.load(open(pathlib.Path(d) / "auth.json"))["users"]
-    assert len(after) == 1
-    assert before[0]["password_hash"] == after[0]["password_hash"]
 
 
 def test_coderai_locks_every_pod_it_rents():
@@ -293,3 +195,28 @@ def test_coderai_locks_every_pod_it_rents():
     i = src.index('self.api_key = "cra-"')
     guard = src[max(0, i - 200):i]
     assert "allow_open_pod" in guard, "generation must be the default, not opt-in"
+
+
+def test_the_pod_app_does_not_serve_the_admin_gui():
+    """A pod image is not an orchestrator. codai.api.app is what a rented pod
+    runs, and /admin, /login and the rest of the GUI are NOT under the Bearer
+    middleware (it only guards /v1/*) — so registering them here would put an
+    admin login page on every pod's public address."""
+    src = (ROOT / "codai/api/app.py").read_text()
+    assert "register_ui_pages" not in src
+    assert "_bootstrap_first_admin" not in src, \
+        "a pod must not create admin accounts in its throwaway auth.json"
+    # And it must not force token enforcement either: that would break
+    # allow_open_pod, where the operator deliberately sends no token.
+    assert "init_session_manager" not in src
+
+
+def test_the_health_aliases_survive_the_revert():
+    """Bug 1 is a pod-side fix and stays: surya probes {service_url}/health."""
+    import os
+    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
+    from fastapi.testclient import TestClient
+    from codai.api.app import app
+    c = TestClient(app, raise_server_exceptions=False)
+    for path in ("/healthz", "/health", "/v1/health"):
+        assert c.get(path).status_code == 200, path
