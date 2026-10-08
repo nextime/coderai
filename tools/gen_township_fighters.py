@@ -2571,8 +2571,14 @@ BUILTIN_TEMPLATES = {
         # 4n+1 nor segment-aligned, so the server had to round them.
         "outcome_min_frames": 93,
         "outcome_max_frames": 173,
-        "video_size": "832x480",       # LongCat's 480p landscape
-        "keyframe_size": "832x480",
+        # 512, not LongCat's nominal 480p landscape: block-sparse attention tiles the
+        # latent into (4, 4, 4) chunks and asserts every axis divides evenly, so a side
+        # has to be a multiple of 64 (the VAE's 16px cell x 4). At 480 the flag is on
+        # and silently falls back to DENSE attention -- which at ~37k tokens is both
+        # much slower and what ran a 24GB card out of memory on the continuation pass.
+        # 832 already divides by 64; 512 is the nearest height that does.
+        "video_size": "832x512",
+        "keyframe_size": "832x512",
         "short_min": 40.0, "short_max": 50.0,
         "long_min": 65.0, "long_max": 75.0,
     },
