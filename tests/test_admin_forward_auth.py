@@ -68,11 +68,12 @@ def test_the_config_round_trips(tmp_path):
 # --------------------------------------------------------- the trust contract
 def test_both_checks_are_required_not_either():
     blk = UI.split("def _fa_trusted")[1].split("def _fa_identity")[0]
-    assert "peer not in trusted" in blk and "return False" in blk
+    assert "peer not in trusted" in blk
     assert "compare_digest" in blk, "the secret must not be compared with =="
-    # peer check and secret check are separate early returns, so neither alone
-    # can authenticate.
-    assert blk.count("return False") >= 2
+    # The peer check and the secret check are separate early returns, so neither
+    # alone can authenticate. Each refusal goes through _fa_reject, which returns
+    # False after saying why.
+    assert blk.count("_fa_reject(") >= 2
 
 
 def test_the_header_is_ignored_entirely_when_untrusted():

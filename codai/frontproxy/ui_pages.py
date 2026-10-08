@@ -29,6 +29,12 @@ from fastapi.staticfiles import StaticFiles
 
 
 _FA_WARNED = False
+# Rejected forward-auth attempts already reported, as {(peer, reason): monotonic}.
+# A refusal is a 302 to the login form and nothing else, which is indistinguishable
+# from "no session yet" -- so the one thing an operator needs is WHY. Bounded and
+# time-windowed: a misconfigured proxy must not be able to flood the log.
+_FA_REJECTS: dict = {}
+_FA_REJECT_WINDOW = 60.0
 
 
 def register_ui_pages(app: FastAPI, config_dir) -> bool:
@@ -95,17 +101,59 @@ def register_ui_pages(app: FastAPI, config_dir) -> bool:
             return None
         return cfg, secret
 
+    def _fa_peer_allowlist(cfg) -> list:
+        """The trusted-proxy list, with an env override.
+
+        CODERAI_ADMIN_FORWARD_AUTH could already be turned on from a unit file and
+        the secret supplied the same way, but the peer list could only come from
+        config.json -- so a container whose config is mounted read-only (or, as on
+        the Digesta host, whose config was written to a path the app does not read)
+        could enable the feature by env and then reject every request from its own
+        proxy, because the list in effect was still the default
+        ["127.0.0.1", "::1"]. Comma- or space-separated.
+        """
+        import os
+        raw = os.environ.get("CODERAI_ADMIN_FORWARD_AUTH_TRUSTED_PROXIES", "")
+        if raw.strip():
+            return [t for t in (x.strip() for x in raw.replace(",", " ").split()) if t]
+        return [str(t).strip() for t in (cfg.trusted_proxies or []) if str(t).strip()]
+
+    def _fa_reject(peer: str, reason: str) -> bool:
+        """Say once, per peer and reason, why a forward-auth attempt was refused."""
+        import time
+        now = time.monotonic()
+        key = (peer, reason)
+        last = _FA_REJECTS.get(key)
+        if last is not None and (now - last) < _FA_REJECT_WINDOW:
+            return False
+        if len(_FA_REJECTS) > 64:
+            _FA_REJECTS.clear()
+        _FA_REJECTS[key] = now
+        print(f"[front] admin forward-auth refused: {reason} "
+              f"(peer {peer or 'unknown'!r})", flush=True)
+        return False
+
     def _fa_trusted(request: Request, cfg, secret: str) -> bool:
-        """Both checks, or nothing: the immediate peer must be a trusted proxy
-        AND the shared secret must match. Either one alone is forgeable."""
+        """Both checks, or nothing: the peer must be a trusted proxy AND the shared
+        secret must match. Either one alone is forgeable.
+
+        The peer is ``request.client.host``, which uvicorn's ProxyHeadersMiddleware
+        has already rewritten from X-Forwarded-For -- so it is the address the proxy
+        reports, not the socket peer, and it is what the access log shows. That
+        matters for what belongs in trusted_proxies: on a container network the
+        value is the address the proxy is SNATed to, not 127.0.0.1, even though the
+        TCP connection into the front is over loopback.
+        """
         import hmac
         peer = (request.client.host if request.client else "") or ""
-        trusted = [str(t).strip() for t in (cfg.trusted_proxies or []) if str(t).strip()]
+        trusted = _fa_peer_allowlist(cfg)
         if peer not in trusted:
-            return False
+            return _fa_reject(peer, f"peer is not in trusted_proxies {trusted}")
         sent = request.headers.get(cfg.shared_secret_header.lower(), "") or ""
-        if not sent or not hmac.compare_digest(sent, secret):
-            return False
+        if not sent:
+            return _fa_reject(peer, f"no {cfg.shared_secret_header} header")
+        if not hmac.compare_digest(sent, secret):
+            return _fa_reject(peer, f"{cfg.shared_secret_header} does not match")
         return True
 
     def _fa_identity(request: Request):

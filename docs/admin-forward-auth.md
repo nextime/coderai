@@ -148,6 +148,74 @@ enforced). This forward-auth feature is independent of both.
 
 ---
 
+## Prod activation status — 08/10/2026 (code 0.2.87): one bug left
+
+Forward-auth has shipped (`admin.forward_auth` in config + `CODERAI_ADMIN_FORWARD_AUTH` /
+`CODERAI_ADMIN_FORWARD_AUTH_SECRET` env), `/v1/*` now enforces the bearer (401), and
+engine#0 starts clean GPU-less. The admin-GUI forward-auth is **almost working on the
+Digesta prod host**, with **one reproducible bug left, only on the rootless published-port
+path**.
+
+### Prod setup (rootless podman + quadlet)
+- Image `ghcr.io/nextime/coderai:latest`, in-image code upgraded to **0.2.87** with the
+  baked-in upgrader (`CODERAI_UPGRADE_REF=master` → fetched 0.2.87, `podman commit` back).
+  The upgrader also accepts **`CODERAI_UPGRADE_REF=production`** to track the `production`
+  branch — we used `master` only because `production` was lagging (0.2.65 at last check).
+  Say if prod should track `production` instead.
+- `admin.forward_auth`: `enabled`, `shared_secret` set, `admin_group=admins`,
+  `trusted_proxies=["127.0.0.1","::1","10.89.0.178"]`, `keep_local_login=true`.
+  **Note:** config-only `enabled:true` did **not** turn the feature on — setting the env
+  `CODERAI_ADMIN_FORWARD_AUTH=1` (+ `_SECRET`) in the quadlet was required. Worth checking
+  whether `enabled` from `config.json` alone is meant to suffice.
+- The container's own IP on `digesta-net` is pinned to `10.89.0.178`
+  (`Network=digesta-net:ip=10.89.0.178`), because rootless netavark SNATs host→published-port
+  traffic to the container's own eth0 IP.
+- Topology: host nginx → `127.0.0.1:8777` (published) → container internal nginx `:8776` →
+  front (uvicorn) `:18776`.
+
+### What works (0.2.87, tested from inside the container)
+- **Direct to the front** `127.0.0.1:18776/admin`, with `X-Coderai-Proxy-Secret` +
+  `X-Forwarded-User` + `X-Forwarded-Groups: admins` → **`200` + `Set-Cookie: session=…`**.
+  The front forward-auth logic is correct.
+- **Through the internal nginx** `127.0.0.1:8776/admin` (same headers, `X-Forwarded-Prefix:
+  /coderai`) → **also `200` + `Set-Cookie`**. So the internal nginx forwards the custom
+  headers to the front correctly (this hop was broken on 0.2.85/0.2.86; 0.2.87 fixed it).
+
+### The one bug
+- **Host → published port** `127.0.0.1:8777/admin` (same headers) → **`302` → `/coderai/login`,
+  no `Set-Cookie`**. SSO is not minted. This is the exact path the real host nginx uses, so
+  SSO cannot be switched on until it works here.
+
+### Why it's puzzling (for the maintainer)
+- The front's uvicorn **access log shows the client for host→8777 as `10.89.0.178`** — which
+  **is** in `trusted_proxies`.
+- The shared secret matches (sha256-verified; and the in-container `:8776` hop mints with the
+  same secret through the same internal nginx).
+- The internal nginx forwards the headers (proven by the minting `:8776` hop).
+- So the **only** difference between the minting `:8776` hop and the failing `:8777` hop is the
+  **source IP into the internal nginx**: `127.0.0.1` (in-container) vs `10.89.0.178` (host via
+  rootlessport). Both are in `trusted_proxies`, yet only the loopback one mints.
+
+### Likely area to check
+- How `_fa_trusted` resolves the **peer** for the published-port path vs what uvicorn logs as
+  the client. If the proxy-headers middleware (`--proxy-headers` / `--forwarded-allow-ips`)
+  computes `request.client.host` from `X-Forwarded-For` for the access log, but `_fa_trusted`
+  reads a **different** value (the raw socket peer, or a different XFF element), the two can
+  disagree — the log says `10.89.0.178` while the trust check sees something not in
+  `trusted_proxies`.
+- Less likely: the secret header dropped only on the rootlessport path (the `:8776` hop
+  forwards it fine).
+- Fastest confirmation: log, inside `_fa_trusted`, the actual `peer` value and whether the
+  secret header is present, for one host→8777 request.
+
+### Ops state
+GUI still behind nginx **basic-auth** on prod (not swapped to `auth_request`): swapping before
+host→8777 mints would lock everyone out (no coderai passwords; SSO would be the only way in).
+The Digesta side is ready — `GET /api/authz/coderai` returns `204` + `X-User` for a Digesta
+admin, `401` otherwise, for nginx `auth_request`.
+
+---
+
 ## As shipped (0.2.85)
 
 Config lives at `admin.forward_auth` in `config.json`, is editable from
@@ -204,3 +272,97 @@ bearer at all** — `GET /v1/models` answered 200 with no header on 0.2.83. Fixe
 in 0.2.84; the front now refuses `/v1` without credentials instead of falling
 open. That was the second item in the "not part of this request" note, and it
 was real.
+
+---
+
+## Answer to the 08/10/2026 report: found, and it is one cause, not two
+
+Both symptoms — `enabled: true` in `config.json` not switching the feature on, and
+host→`:8777` refusing to mint while in-container→`:8776` minted — are the **same**
+problem. Nothing is wrong with the trust logic.
+
+### 1. The peer checked against `trusted_proxies` is not the socket peer
+
+`_fa_trusted` reads `request.client.host`. uvicorn installs
+`ProxyHeadersMiddleware` **by default**, with `trusted_hosts="127.0.0.1"`. The
+internal nginx connects to the front over loopback, so that middleware trusts the
+hop and **rewrites `scope["client"]` from `X-Forwarded-For`** before any CoderAI
+middleware runs. Reproduced exactly (`tests/test_forward_auth_peer_trust.py`):
+
+| hop | nginx sends `X-Forwarded-For` | peer the app sees |
+|---|---|---|
+| in-container → `:8776` | `127.0.0.1` | `127.0.0.1` |
+| host → `:8777` | `10.89.0.178` | `10.89.0.178` |
+| real nginx → `:8777` | `203.0.113.5, 10.89.0.178` | `10.89.0.178` |
+
+So the access log and the trust check **do** agree — that was a correct
+observation, and it is why the rejection looked impossible. The peer really is
+`10.89.0.178`.
+
+### 2. …but the list it was compared against was the default
+
+`admin.forward_auth.trusted_proxies` defaults to `["127.0.0.1", "::1"]`. The
+config loader is fine — a `config.json` carrying `admin.forward_auth` round-trips
+correctly, and `enabled: true` from the file alone **does** suffice (verified; there
+is no second bug there). Which means: **the front was not reading your
+`config.json` at all.** That is exactly what "config-only `enabled: true` did not
+work, the env var was required" tells us, and it is the known path trap:
+
+> `coderai-entrypoint` creates `$CODERAI_CONFIG_DIR/coderai` and symlinks
+> `~/.coderai` to it. The app resolves config from the HOME-style path, so a
+> `config.json` at **`$CODERAI_CONFIG_DIR/config.json`** is silently ignored and a
+> default is written alongside it.
+
+With the feature forced on by env and the secret supplied by env, everything came
+from env — except `trusted_proxies`, which stayed at the default. Loopback is in
+that default; `10.89.0.178` is not. Hence: `:8776` mints, `:8777` does not.
+
+### The fix on your side
+
+Move the file to **`$CODERAI_CONFIG_DIR/coderai/config.json`** and your whole
+`admin.forward_auth` block takes effect — then you can drop
+`CODERAI_ADMIN_FORWARD_AUTH` / `_SECRET` from the quadlet entirely if you like.
+Check which file is live before anything else:
+
+```bash
+podman exec coderai sh -lc 'ls -l ~/.coderai/config.json; \
+  python3 -c "import json;print(json.load(open(\"$HOME/.coderai/config.json\")).get(\"admin\"))"'
+```
+
+### The fix on ours (0.2.88)
+
+- **`CODERAI_ADMIN_FORWARD_AUTH_TRUSTED_PROXIES`** (comma- or space-separated) now
+  overrides the list, so a unit file that can enable the feature and supply its
+  secret can also supply its peers. Enabling by env and then rejecting every
+  request from your own proxy was a gap in the contract, not a misuse. An unset or
+  blank value falls through to `config.json`.
+- **A refused attempt now says why**, once per peer and reason per 60s:
+
+  ```
+  [front] admin forward-auth refused: peer is not in trusted_proxies
+          ['127.0.0.1', '::1'] (peer '10.89.0.178')
+  [front] admin forward-auth refused: no X-Coderai-Proxy-Secret header (peer '10.89.0.178')
+  [front] admin forward-auth refused: X-Coderai-Proxy-Secret does not match (peer '10.89.0.178')
+  ```
+
+  The log never prints the secret or the value sent. This is the instrumentation
+  the report asked for, made permanent: a refusal is a 302 to the login form,
+  which is indistinguishable from "no session yet".
+- `_fa_trusted`'s docstring no longer says "immediate peer", because it is not —
+  believing it was is what made this look impossible.
+
+### What goes in `trusted_proxies`
+
+On a container network, the address the proxy is **SNATed to** — for you
+`10.89.0.178` — even though the TCP connection into the front is over loopback.
+Keeping `127.0.0.1` and `::1` as well is right: that is the in-container hop you
+test with.
+
+### Two answers to your questions
+
+- **Track `production`.** It was lagging when you looked; it now carries 0.2.88 and
+  will stay current. Use `CODERAI_UPGRADE_REF=production`.
+- **Switching nginx from basic-auth to `auth_request` is safe once host→8777
+  mints**, and you no longer have to choose: with `keep_local_login: true` the
+  password form stays as a loopback fallback, so a broken SSO cannot lock you out.
+  Verify the mint through the real path first, then swap.
