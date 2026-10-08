@@ -5,29 +5,44 @@ no GPU, point it at RunPod, register a handful of models, let them **scale**, an
 **watch what they cost**. Written for the Digesta deployment; nothing here is
 Digesta-specific.
 
-The shape of the thing: one small CoderAI process on your own host answers
-`/v1/*` and serves the admin GUI. It owns no GPU. When a request arrives for a
-model it rents a RunPod pod, waits for it to come up, proxies to it, load-balances
-across pods, destroys them when they go idle, and bills every hour into a local
-ledger with caps you set. Your callers only ever talk to the orchestrator.
+The shape of the thing: **one CoderAI install — the full image — on your own
+host** answers `/v1/*` and serves the admin GUI. It needs no GPU. When a request
+arrives for a model it rents a RunPod pod, waits for it to come up, proxies to
+it, load-balances across pods, destroys them when they go idle, and bills every
+hour into a local ledger with caps you set. Your callers only ever talk to the
+orchestrator; the pods are its business, not theirs.
 
 ```
- Digesta ──► CoderAI orchestrator (your host, no GPU) ──► RunPod pods (A40, …)
-             /v1/chat/completions                          vLLM / llama.cpp /
-             /v1/embeddings                                 a full CoderAI
-             /v1/ocr
-             /admin  (GUI)
+ Digesta ──► CoderAI orchestrator ─────────────────────► RunPod pods (A40, …)
+             ghcr.io/nextime/coderai                       ghcr.io/nextime/
+             (the FULL image, port 8776)                    coderai-<capability>
+             /v1/chat/completions                          or vLLM / llama.cpp
+             /v1/embeddings
+             /v1/ocr                                       rented, configured,
+             /admin  (GUI)                                  routed and destroyed
+                                                            BY the orchestrator
 ```
+
+Those two columns are different software with different jobs. You install the
+left one. You never install the right one.
 
 ---
 
 ## 1. Install
 
-Use the **light capability image**. It is torch-free, boots in seconds on a
-GPU-less host, and since 0.2.83 it serves the admin GUI as well as the API.
+> **Install the FULL image. Never a capability image.**
+>
+> `ghcr.io/nextime/coderai` is the orchestrator: it has the admin GUI, the
+> supervised engine, the RunPod pools, the ledger and the reaper.
+> `ghcr.io/nextime/coderai-<capability>` images are **pods** — what CoderAI
+> rents and launches *for* you. Running one by hand as your front is the single
+> most expensive wrong turn available here: a pod image has no GUI, and the
+> admin pages are not behind the API's bearer check, so it is not something to
+> expose either. You pull a capability image exactly never; CoderAI pulls them
+> on RunPod.
 
 ```bash
-docker pull ghcr.io/nextime/coderai-ocr:latest
+docker pull ghcr.io/nextime/coderai:latest
 ```
 
 Verify the signature before you run it — every published image is signed:
@@ -35,49 +50,74 @@ Verify the signature before you run it — every published image is signed:
 ```bash
 cosign verify \
   --key https://raw.githubusercontent.com/nextime/coderai/master/packaging/cosign.pub \
-  ghcr.io/nextime/coderai-ocr:latest
+  ghcr.io/nextime/coderai:latest
 ```
 
 Run it. Two mounts matter: a **config** directory (settings, model list, API
-tokens — keep it on persistent storage and back it up) and a **cache**
-directory (anything the orchestrator builds at runtime, such as an isolated
-engine venv; it must survive restarts or it gets rebuilt).
+tokens — keep it on persistent storage and back it up) and a **models/cache**
+directory. The full image listens on **8776**.
 
 ```bash
-mkdir -p ~/coderai/config ~/coderai/cache
+mkdir -p ~/coderai/config ~/coderai/models ~/coderai/cache
 
 docker run -d --name coderai --restart unless-stopped \
-  -p 8000:8000 \
+  -p 8776:8776 \
   -e CODERAI_CONFIG_DIR=/config \
-  -e CODERAI_CACHE_DIR=/cache \
   -v ~/coderai/config:/config \
+  -v ~/coderai/models:/models \
   -v ~/coderai/cache:/cache \
-  ghcr.io/nextime/coderai-ocr:latest
+  ghcr.io/nextime/coderai:latest
 ```
 
-The capability image listens on **8000**. (The full `ghcr.io/nextime/coderai`
-image listens on 8776 and expects a local GPU — do not use it for this job.)
+On a machine **with** a GPU add `--gpus all` (NVIDIA) or `--device /dev/dri`
+(AMD/Intel, Vulkan) and you are done.
+
+### On a host with no GPU
+
+This is the normal shape for an orchestrator, and it needs two settings — not
+because anything is broken, but because the defaults assume you have a card.
+
+In `<config>/config.json`:
+
+```json
+"backend":  { "type": "cpu" },
+"server":   { "engine_specs": [ { "name": "cpu", "backend": "cpu", "primary": true } ] }
+```
+
+Both matter, and here is exactly why:
+
+- **`backend.type` must be `cpu`, not `auto`.** With `auto`, `main.py` looks for
+  NVIDIA, then Vulkan, then OpenCL, and on finding none exits with
+  `Error: No supported backend detected`. Set explicitly to `cpu`, that search
+  is skipped entirely and the engine starts.
+- **`engine_specs` must name the engine explicitly.** Left to auto-detect, the
+  front creates a no-GPU engine named `cpu` but launches it with
+  `backend="auto"` (`engine_supervisor.py:311`) — which hits the abort above
+  regardless of what `backend.type` says. The log then reads `[cpu] Available
+  backends: {'cpu': True}` followed immediately by `No supported backend
+  detected`, which looks self-contradictory until you know that `[cpu]` is the
+  engine's *name* and `auto` was its *backend*. An explicit spec is what makes
+  the two agree.
+
+> **`server.engines = 0` does not mean "no engines".** It means **auto** — one
+> per detected GPU, minimum 1 (`config.py:70`). There is no setting for "no
+> local engine", and you do not want one: the RunPod pools, the scaler and the
+> stale-pod reaper all live *inside* the primary engine. One idle CPU engine is
+> not a workaround, it is the component that manages your pods.
+
+With those two settings the engine comes up, registers nothing locally, and
+every model you configure with `backend: runpod` is served from a rented pod.
 
 Check it:
 
 ```bash
-curl -fsS http://127.0.0.1:8000/healthz     # {"ok":true,"pid":…}
-curl -fsS http://127.0.0.1:8000/health      # same — the vLLM-convention alias
-curl -fsS http://127.0.0.1:8000/v1/models   # [] until you add models
+curl -fsS http://127.0.0.1:8776/healthz     # {"ok":true,"pid":…}
+curl -fsS http://127.0.0.1:8776/v1/models   # [] until you add models
 ```
 
-Then open `http://127.0.0.1:8000/admin`. It redirects to `/login`. On a brand-new
-config directory the app creates one admin account at startup with a random
-password and prints it **once** — so read the log before you lose it:
-
-```bash
-docker logs coderai | grep -A4 'FIRST RUN'
-```
-
-You are forced to change it on first login: a password that was printed to a
-container log is not a password. Then create an API token (Admin → Tokens)
-before anything calls `/v1/*`, because with no token every API request is
-refused — correctly.
+Then open `http://127.0.0.1:8776/admin`. It redirects to `/login`; sign in with
+the credentials from your config (`<config>/auth.json`), change the password,
+and create an API token (Admin → Tokens) before anything calls `/v1/*`.
 
 ### Behind nginx, under a sub-path
 
@@ -86,7 +126,7 @@ rewriting links:
 
 ```nginx
 location ^~ /coderai/ {
-    proxy_pass         http://127.0.0.1:8000/;
+    proxy_pass         http://127.0.0.1:8776/;
     proxy_set_header   Host              $host;
     proxy_set_header   X-Forwarded-Prefix /coderai;
     proxy_set_header   X-Forwarded-Proto $scheme;
@@ -110,7 +150,7 @@ the **API** on its own tokens:
 location ^~ /coderai/ {
     auth_basic           "coderai";
     auth_basic_user_file /etc/nginx/coderai.htpasswd;
-    proxy_pass           http://127.0.0.1:8000/;
+    proxy_pass           http://127.0.0.1:8776/;
     proxy_set_header     Host               $host;
     proxy_set_header     X-Forwarded-Prefix /coderai;
     proxy_set_header     X-Forwarded-Proto  $scheme;
@@ -120,7 +160,7 @@ location ^~ /coderai/ {
 # The API: no basic auth — CoderAI's own Bearer tokens guard it.
 location ^~ /coderai/v1/ {
     auth_basic           off;
-    proxy_pass           http://127.0.0.1:8000/v1/;
+    proxy_pass           http://127.0.0.1:8776/v1/;
     proxy_set_header     Host               $host;
     proxy_set_header     X-Forwarded-Prefix /coderai;
     proxy_set_header     X-Forwarded-Proto  $scheme;
@@ -149,7 +189,7 @@ config dir at import and logs `[api] API tokens enforced from <dir>`.
 Verify it yourself, from the host, before you expose anything:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/v1/models
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8776/v1/models
 #   401  <- correct
 #   200  <- OPEN: upgrade to 0.2.83, or set CODERAI_API_TOKEN and restart
 ```
@@ -436,9 +476,8 @@ special, configure it like any LLM above. The **native engine path** uses
 ```
 
 Then point the OCR engine at the orchestrator itself in **Settings → OCR**:
-`surya_serve: vllm`, `vllm.service_url: http://127.0.0.1:8000`. The Surya client
-runs in its own venv **on the orchestrator** (baked into `coderai-ocr` from
-0.2.83) and the model runs in vLLM on the pod. Keep `direct_tcp` so a slow page
+`surya_serve: vllm`, `vllm.service_url: http://127.0.0.1:8776`. The Surya client
+runs in its own venv **on the orchestrator** (the full image) and the model runs in vLLM on the pod. Keep `direct_tcp` so a slow page
 is not cut off at 100 s by RunPod's proxy, and set the pod admission numbers —
 this is the exact path that was measured at ~6 pages/s with the defaults while
 the GPU idled.
@@ -574,7 +613,7 @@ figures as JSON:
 
 ```bash
 curl -fsS -H "Authorization: Bearer sk-coderai-…" \
-     http://127.0.0.1:8000/v1/runpod/spend
+     http://127.0.0.1:8776/v1/runpod/spend
 ```
 
 ```json
@@ -614,22 +653,22 @@ Standard OpenAI shapes, plus OCR:
 
 ```bash
 # chat
-curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+curl -fsS http://127.0.0.1:8776/v1/chat/completions \
   -H "Authorization: Bearer sk-coderai-…" -H "Content-Type: application/json" \
   -d '{"model":"Qwen/Qwen3-8B-Instruct","messages":[{"role":"user","content":"ciao"}]}'
 
 # embeddings
-curl -fsS http://127.0.0.1:8000/v1/embeddings \
+curl -fsS http://127.0.0.1:8776/v1/embeddings \
   -H "Authorization: Bearer sk-coderai-…" -H "Content-Type: application/json" \
   -d '{"model":"BAAI/bge-m3","input":["una frase"]}'
 
 # OCR — multipart, not JSON
-curl -fsS http://127.0.0.1:8000/v1/ocr \
+curl -fsS http://127.0.0.1:8776/v1/ocr \
   -H "Authorization: Bearer sk-coderai-…" \
   -F file=@page.pdf -F engine=surya -F dpi=200
 
 # many files at once
-curl -fsS http://127.0.0.1:8000/v1/ocr/batch \
+curl -fsS http://127.0.0.1:8776/v1/ocr/batch \
   -H "Authorization: Bearer sk-coderai-…" \
   -F files=@a.pdf -F files=@b.pdf -F engine=surya
 ```
@@ -642,8 +681,7 @@ for it, or keep `min_pods: 1` during working hours (§5).
 ### The native Surya OCR engine
 
 `engine=surya` runs the Surya client in an isolated venv on the **orchestrator**
-and the model in vLLM on the pod. The venv is baked into the `coderai-ocr` image
-from 0.2.83 — it cannot share the main one, because Surya caps `pillow<11` while
+and the model in vLLM on the pod. The venv ships in the full image — it cannot share the main one, because Surya caps `pillow<11` while
 CoderAI needs `pillow>=12`. If you are on an older image you had to build it by
 hand into the cache mount; pull the new image and delete that workaround.
 
@@ -656,10 +694,10 @@ Surya's vLLM client probes `{service_url}/health`, which this app serves from
 
 ```bash
 docker logs --tail 200 coderai                     # provisioning, boots, caps, 429s
-curl -fsS localhost:8000/healthz                    # is the app alive
-curl -fsS localhost:8000/v1/models                  # is the model registered
+curl -fsS localhost:8776/healthz                    # is the app alive
+curl -fsS localhost:8776/v1/models                  # is the model registered
 curl -fsS -H "Authorization: Bearer <admin-key>" \
-     localhost:8000/v1/runpod/spend                 # pods, spend, schedules
+     localhost:8776/v1/runpod/spend                 # pods, spend, schedules
 ```
 
 | symptom | likely cause |
@@ -700,12 +738,12 @@ Type=exec
 # same name would otherwise make the next start fail on a name conflict.
 ExecStartPre=-/usr/bin/docker rm -f coderai
 ExecStart=/usr/bin/docker run --rm --name coderai \
-    -p 8000:8000 \
+    -p 8776:8776 \
     -e CODERAI_CONFIG_DIR=/config \
     -e CODERAI_CACHE_DIR=/cache \
     -v /srv/coderai/config:/config \
     -v /srv/coderai/cache:/cache \
-    ghcr.io/nextime/coderai-ocr:latest
+    ghcr.io/nextime/coderai:latest
 ExecStop=/usr/bin/docker stop -t 30 coderai
 Restart=always
 RestartSec=10
@@ -731,9 +769,9 @@ the unit from it, so there is no `docker run` line to keep in sync:
 Description=CoderAI RunPod orchestrator
 
 [Container]
-Image=ghcr.io/nextime/coderai-ocr:latest
+Image=ghcr.io/nextime/coderai:latest
 ContainerName=coderai
-PublishPort=8000:8000
+PublishPort=8776:8776
 Environment=CODERAI_CONFIG_DIR=/config
 Environment=CODERAI_CACHE_DIR=/cache
 Volume=%h/coderai/config:/config:Z
@@ -824,7 +862,7 @@ if [ x"$1" == x"docker" ] ; then
       echo "coderai: LIVE CODE (remove .dev-code to use the image's)"
    fi
 
-   coderai-docker --user --host 0.0.0.0 --port 8000 $devmap \
+   coderai-docker --user --host 0.0.0.0 --port 8776 $devmap \
                   --map /srv/data \
                   $detach
 else
@@ -873,7 +911,7 @@ you named explicitly is never silently replaced.
 deployment: seconds, no large transfer, and it works on a metered link. Pull a
 new image when the **dependencies** change substantially, when you want the
 signature of a published build, or when you want to be certain of what you are
-running — `--upgrade` mutates a tag in place, so after it, `coderai-ocr:latest`
+running — `--upgrade` mutates a tag in place, so after it, `coderai:latest`
 on your host is no longer byte-identical to the registry's. Record what you did.
 For an orchestrator fleet, pulling the signed image is the auditable path and
 `--upgrade` is the emergency one.
@@ -885,7 +923,7 @@ the image, not in the running process.
 
 | | |
 |---|---|
-| Image | `ghcr.io/nextime/coderai-ocr:latest` (GPU-less orchestrator + GUI), port 8000 |
+| Image | `ghcr.io/nextime/coderai:latest` — the orchestrator. Port **8776**. Capability images are pods; never install one by hand |
 | Config | `<config>/config.json`, `<config>/models.json`, `<config>/auth.json` |
 | Signing key | `packaging/cosign.pub` in the repo |
 | Full RunPod key reference | `docs/runpod.md` |
