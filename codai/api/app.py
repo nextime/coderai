@@ -831,9 +831,24 @@ async def runpod_spend(request: Request):
                     "enabled": cfg.enabled}
     except Exception:
         caps = {}
-    return {"pods": pods, "ledger": ledger, "caps": caps, "schedules": schedules,
+    try:
+        summary = runpod_worker.fleet_summary(pods)
+    except Exception:
+        summary = {}
+    return {"summary": summary, "pods": pods, "ledger": ledger, "caps": caps,
+            "schedules": schedules,
             "live_hourly_usd": round(live_hourly, 4),
             "live_uncommitted_usd": round(live_cost, 4)}
+
+
+@app.get("/v1/runpod/status", summary="RunPod fleet status", tags=["Core"])
+async def runpod_status(request: Request):
+    """How many pods are running, where, and which model — for an admin key.
+
+    The same document as /v1/runpod/spend; this is the name to poll when the
+    question is "what is the fleet doing" rather than "what is it costing".
+    """
+    return await runpod_spend(request)
 
 
 @app.get("/coderai/capabilities", summary="Server capability document", tags=["Core"])

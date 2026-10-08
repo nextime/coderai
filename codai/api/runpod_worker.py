@@ -1697,6 +1697,12 @@ class PodHandle:
     inflight: int = 0
     last_used: float = 0.0
     console_url: str = ""
+    #: Where this pod actually is and what it is. Reported to monitoring: the
+    #: region matters for latency and for where the data is allowed to live, and
+    #: "which model" is the first question anyone asks of a running fleet.
+    data_center: str = ""
+    cloud_type: str = ""
+    gpu_count: int = 1
 
 
 def _deploy_tag(account_cfg) -> str:
@@ -2261,7 +2267,10 @@ class RunpodPodPool:
             h = PodHandle(pod_id=pod_id, url=url, hourly_usd=sel["price"],
                           started_at=time.time(), gpu=sel["display_name"],
                           is_spot=sel["is_spot"], healthy=True, last_used=time.time(),
-                          console_url=console)
+                          console_url=console,
+                          data_center=(getattr(self, "_volume_dc", "") or dc or ""),
+                          cloud_type=str(sel.get("cloud_type") or ""),
+                          gpu_count=int(sel.get("gpu_count") or 1))
             with self._cv:
                 self.pods.append(h)
                 self._cv.notify_all()
@@ -2757,6 +2766,41 @@ def _all_pools_live_cost() -> float:
         return sum(p.live_cost_usd() for p in _pools.values())
 
 
+def fleet_summary(pods: list = None) -> dict:
+    """"How many, where, which model" — the questions asked of a running fleet.
+
+    Derived from pods_status() so there is one source of truth. Counts only
+    pods this install rented: one created by hand in the RunPod console is not
+    in the pools and is deliberately not counted here.
+    """
+    rows = pods_status() if pods is None else pods
+    ready = [p for p in rows if p.get("state") == "ready" and p.get("healthy")]
+    booting = [p for p in rows if p.get("state") != "ready"]
+
+    def _tally(key, src):
+        out = {}
+        for r in src:
+            k = str(r.get(key) or "") or "unknown"
+            out[k] = out.get(k, 0) + 1
+        return out
+
+    return {
+        "pods_total": len(rows),
+        "pods_ready": len(ready),
+        "pods_booting": len(booting),
+        "pods_unhealthy": len([p for p in rows
+                               if p.get("state") == "ready" and not p.get("healthy")]),
+        "gpus_in_use": sum(int(p.get("gpu_count") or 1) for p in ready),
+        "inflight": sum(int(p.get("inflight") or 0) for p in rows),
+        "by_model": _tally("model", rows),
+        "by_region": _tally("data_center", rows),
+        "by_gpu": _tally("gpu", rows),
+        "by_cloud_type": _tally("cloud_type", rows),
+        "spot_pods": len([p for p in rows if p.get("is_spot")]),
+        "hourly_usd": round(sum((p.get("hourly_usd") or 0.0) for p in ready), 4),
+    }
+
+
 def pools_schedule_status() -> list:
     """Per-pool warm-pod schedule: where each model stands right now.
 
@@ -2798,10 +2842,15 @@ def pods_status() -> list:
             for p in pool.pods:
                 out.append({
                     "model": key, "pod_id": p.pod_id, "gpu": p.gpu,
+                    "gpu_count": getattr(p, "gpu_count", 1),
                     "is_spot": p.is_spot, "healthy": p.healthy, "inflight": p.inflight,
                     "hourly_usd": p.hourly_usd, "uptime_s": int(now - p.started_at),
                     "live_cost_usd": round((now - p.started_at) / 3600.0 * p.hourly_usd, 4),
                     "console_url": p.console_url, "state": "ready",
+                    "data_center": getattr(p, "data_center", "") or "",
+                    "cloud_type": getattr(p, "cloud_type", "") or "",
+                    "pool": (pool.mcfg.pool or "") if getattr(pool, "mcfg", None) else "",
+                    "engine": (pool.mcfg.engine or "") if getattr(pool, "mcfg", None) else "",
                 })
     # Booting pods (created, not yet serving) — visible so a slow/failing boot is
     # obvious and its vLLM log is one click away.

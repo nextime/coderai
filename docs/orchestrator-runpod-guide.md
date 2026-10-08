@@ -661,8 +661,10 @@ provisioning stops rather than quietly continuing.
 uncommitted cost, per-model spend from the ledger, and — for scheduled models —
 whether each is inside its window and when that next flips.
 
-**The API, for your own monitoring.** `GET /v1/runpod/spend` returns the same
-figures as JSON:
+**The API, for your own monitoring.** `GET /v1/runpod/status` (or
+`/v1/runpod/spend` — the same document under two names, so pick the one that
+reads right where you call it) answers both "what is the fleet doing" and "what
+is it costing":
 
 ```bash
 curl -fsS -H "Authorization: Bearer sk-coderai-…" \
@@ -671,8 +673,19 @@ curl -fsS -H "Authorization: Bearer sk-coderai-…" \
 
 ```json
 {
-  "pods":   [{"model":"…","pod_id":"…","hourly_usd":1.09,"uptime_s":940,
-              "live_cost_usd":0.28,"healthy":true,"inflight":2}],
+  "summary": {
+    "pods_total": 3, "pods_ready": 2, "pods_booting": 1, "pods_unhealthy": 0,
+    "gpus_in_use": 2, "inflight": 2, "spot_pods": 1, "hourly_usd": 2.18,
+    "by_model":  {"datalab-to/surya-ocr-2": 2, "Qwen/Qwen3-8B-Instruct": 1},
+    "by_region": {"EU-SE-1": 2, "EU-RO-1": 1},
+    "by_gpu":    {"A40": 2, "A100": 1},
+    "by_cloud_type": {"SECURE": 3}
+  },
+  "pods": [{"model":"datalab-to/surya-ocr-2","pod_id":"x0nr…","state":"ready",
+            "healthy":true,"inflight":2,"gpu":"A40","gpu_count":1,
+            "data_center":"EU-SE-1","cloud_type":"SECURE","is_spot":false,
+            "pool":"","engine":"vllm","hourly_usd":1.09,"uptime_s":940,
+            "live_cost_usd":0.28,"console_url":"https://…"}],
   "ledger": {"per_model": {"…": {"day": 12.40}}, "global": {"day": 31.05}},
   "caps":   {"global_max_hourly_usd":20.0,"global_cost_limit_usd":40.0,
              "global_cost_period":"day","enabled":true},
@@ -682,6 +695,17 @@ curl -fsS -H "Authorization: Bearer sk-coderai-…" \
   "live_uncommitted_usd": 0.28
 }
 ```
+
+`summary` is derived from `pods`, so the two can never disagree. Three
+distinctions worth knowing when you build a dashboard on this:
+
+- **`pods_ready` vs `pods_total`** — a booting pod bills but serves nothing, so
+  `summary.hourly_usd` counts only pods that are actually serving. For real
+  spend use the ledger plus `live_uncommitted_usd`.
+- **`pods_unhealthy`** is a pod past boot that is failing its probe: it is
+  costing money and answering nothing. A non-zero value here is the thing to
+  alert on.
+- **`gpus_in_use`** counts cards, not pods, so a `gpu_count: 2` pod counts twice.
 
 This endpoint needs an **admin-scoped** API key — Admin → **Tokens**, tick
 *Admin scope* when generating it (or toggle it on an existing one). An ordinary
