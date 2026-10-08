@@ -731,6 +731,33 @@ from codai.api.model_test import router as model_test_router
 app.include_router(model_test_router, tags=["Models"])
 app.include_router(admin_router, tags=["Admin"])
 
+# The admin router is the admin *API* (POST /login, /admin/api/*). The GUI PAGES
+# — GET /admin, /login, /admin/models … — live in frontproxy/ui_pages.py and were
+# only ever registered on the front app. An install that runs this app directly
+# (a GPU-less RunPod orchestrator: `uvicorn codai.api.app:app`, no front, no
+# engines) therefore served the whole admin API with no way to reach it:
+# GET /admin answered 404 and GET /login 405, because only POST /login existed.
+# Registering them here gives one image that is both the orchestrator and its GUI.
+# Guarded: a missing templates dir or config dir must not take the API down with
+# it, which is the same contract the front has.
+def _register_local_ui_pages():
+    try:
+        from codai.frontproxy.ui_pages import register_ui_pages
+        # The same config dir every other entry point uses, so the GUI validates
+        # sessions against the one auth.json the admin API writes.
+        from codai.platform_paths import legacy_style_config_dir
+        from codai.admin import routes as _ar
+        cfg_dir = getattr(getattr(_ar, "config_manager", None), "config_dir", None) \
+            or legacy_style_config_dir()
+        if register_ui_pages(app, cfg_dir):
+            print(f"[api] admin GUI served locally from {cfg_dir}", flush=True)
+    except Exception as exc:
+        print(f"[api] admin GUI not served locally ({exc}); the API is unaffected",
+              flush=True)
+
+
+_register_local_ui_pages()
+
 
 @app.exception_handler(401)
 async def unauthorized_redirect(request: Request, exc: HTTPException):

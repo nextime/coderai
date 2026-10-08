@@ -150,3 +150,51 @@ def test_the_ocr_image_bakes_a_surya_venv():
     assert "pillow<11" in body, "without the cap the resolver may pull pillow 12 in"
     # The check must prove the pillow pin held, not just that surya imports.
     assert "pillow" in chk.read_text().lower()
+
+
+# ------------------------------------- bug 3: one image = orchestrator + GUI
+def test_the_light_app_serves_the_admin_gui_pages():
+    """admin_router is the admin API (POST /login, /admin/api/*). The GUI pages
+    were only on the front app, so a bare `uvicorn codai.api.app:app`
+    orchestrator answered 404 for /admin and 405 for GET /login."""
+    import os
+    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
+    from fastapi.testclient import TestClient
+    from codai.api.app import app
+    c = TestClient(app, raise_server_exceptions=False)
+
+    r = c.get("/admin", follow_redirects=False)
+    assert r.status_code in (200, 302, 303), f"/admin -> {r.status_code}"
+    r = c.get("/login", follow_redirects=False)
+    assert r.status_code == 200, f"GET /login -> {r.status_code} (405 = API only)"
+    for page in ("/admin/models", "/admin/runpod", "/admin/settings"):
+        assert c.get(page, follow_redirects=False).status_code in (200, 302, 303), page
+
+
+def test_the_gui_redirect_carries_the_forwarded_prefix():
+    """Served under /coderai/, the login redirect must point inside the prefix or
+    the browser leaves the deployment."""
+    import os
+    os.environ.setdefault("CODERAI_SKIP_HEAVY", "1")
+    from fastapi.testclient import TestClient
+    from codai.api.app import app
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.get("/admin", headers={"X-Forwarded-Prefix": "/coderai"},
+              follow_redirects=False)
+    assert r.status_code in (302, 303)
+    assert r.headers.get("location", "").startswith("/coderai/"), r.headers.get("location")
+
+
+def test_the_api_survives_a_gui_registration_failure():
+    """A missing templates or config dir must not take the orchestrator down."""
+    src = (ROOT / "codai/api/app.py").read_text()
+    blk = src.split("def _register_local_ui_pages")[1].split("_register_local_ui_pages()")[0]
+    assert "except Exception" in blk
+    assert "the API is unaffected" in blk
+
+
+def test_the_forwarded_prefix_middleware_is_installed():
+    src = (ROOT / "codai/api/app.py").read_text()
+    assert "class _ForwardedPrefixMiddleware" in src
+    assert "app.add_middleware(_ForwardedPrefixMiddleware)" in src
+    assert "x-forwarded-prefix" in src
