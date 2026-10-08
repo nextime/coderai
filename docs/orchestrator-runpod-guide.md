@@ -358,7 +358,208 @@ leave a machine billing forever. Pods it did not rent are never touched.
 
 ---
 
-## 8. Reference
+## 8. Keeping it running, and upgrading in place
+
+### Run it as a service — systemd
+
+The production host uses systemd. A plain unit for the orchestrator:
+
+```ini
+# /etc/systemd/system/coderai.service
+[Unit]
+Description=CoderAI RunPod orchestrator
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=exec
+# --rm + ExecStartPre makes a restart idempotent: a leftover container of the
+# same name would otherwise make the next start fail on a name conflict.
+ExecStartPre=-/usr/bin/docker rm -f coderai
+ExecStart=/usr/bin/docker run --rm --name coderai \
+    -p 8000:8000 \
+    -e CODERAI_CONFIG_DIR=/config \
+    -e CODERAI_CACHE_DIR=/cache \
+    -v /srv/coderai/config:/config \
+    -v /srv/coderai/cache:/cache \
+    ghcr.io/nextime/coderai-ocr:latest
+ExecStop=/usr/bin/docker stop -t 30 coderai
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now coderai
+systemctl status coderai
+journalctl -u coderai -f        # provisioning, boots, caps, 429s
+```
+
+With **podman** instead of docker, prefer a rootless quadlet — systemd generates
+the unit from it, so there is no `docker run` line to keep in sync:
+
+```ini
+# ~/.config/containers/systemd/coderai.container
+[Unit]
+Description=CoderAI RunPod orchestrator
+
+[Container]
+Image=ghcr.io/nextime/coderai-ocr:latest
+ContainerName=coderai
+PublishPort=8000:8000
+Environment=CODERAI_CONFIG_DIR=/config
+Environment=CODERAI_CACHE_DIR=/cache
+Volume=%h/coderai/config:/config:Z
+Volume=%h/coderai/cache:/cache:Z
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user start coderai
+loginctl enable-linger "$USER"   # or it stops when you log out
+```
+
+`Type=exec` with `--rm` (or the quadlet's own lifecycle) means the container is
+recreated on every start, so an image you just pulled is actually picked up —
+a `docker start` of an old container would not.
+
+### Run it as a service — sysvinit
+
+On a host without systemd, an init script does the same job. The one this
+project uses on its build machine (`/etc/init.d/coderai`) is worth copying as a
+pattern for two reasons it documents in its own comments:
+
+- **the container, not the launcher, is the source of truth** for "is it
+  running" — dockerd owns the container, so it outlives the shell that started
+  it, and `docker run --rm --name coderai` dies instantly on a name conflict if
+  you don't check;
+- a **boot-time shell has a different PATH** than your interactive one, so the
+  script spells out the path to its runner instead of relying on `.bashrc`.
+
+```sh
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          coderai
+# Required-Start:    $local_fs $remote_fs $network docker
+# Required-Stop:     $local_fs $remote_fs $network docker
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+### END INIT INFO
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+RUNAS=youruser
+CONTAINER=coderai
+CMD='/home/youruser/bin/coderai docker'
+. /lib/lsb/init-functions
+
+container_running() {
+    [ -n "$(docker ps --filter "name=^${CONTAINER}\$" --filter status=running \
+            --format '{{.ID}}' 2>/dev/null | head -n 1)" ]
+}
+case "$1" in
+    start)   container_running && { echo "already running"; exit 0; }
+             su - "$RUNAS" -c "$CMD -d" ;;
+    stop)    docker stop -t 30 "$CONTAINER" ;;
+    restart) "$0" stop; sleep 3; "$0" start ;;
+    status)  container_running && echo "RUNNING" || { echo "not running"; exit 3; } ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac
+```
+
+`update-rc.d coderai defaults` to enable it.
+
+### A wrapper script for the run line
+
+Rather than keep a long `docker run` in the unit, put it in one script the unit
+and you both call. The build machine's `~/bin/coderai` is the example — it
+wraps the host runner `coderai-docker`, and the parts worth stealing are:
+
+```bash
+#!/bin/bash
+# One place for the run line, so the init script, systemd and you agree.
+
+if [ x"$1" == x"docker" ] ; then
+   detach=""
+   [ x"$2" == x"-d" ] && detach="--detach"
+
+   # Live-code mode: with a flag FILE present, bind-mount the working tree over
+   # the image's copy so a restart picks up edits with no rebuild. A file, not
+   # an env var, because the init script launches this through `su -`, which
+   # does not carry the environment.
+   devmap=""
+   if [ -f /srv/coderai/.dev-code ] ; then
+      devmap="--map /srv/coderai/codai:/opt/coderai/app/codai"
+      echo "coderai: LIVE CODE (remove .dev-code to use the image's)"
+   fi
+
+   coderai-docker --user --host 0.0.0.0 --port 8000 $devmap \
+                  --map /srv/data \
+                  $detach
+else
+   # the same entry point without a container, for development
+   exec /srv/coderai/coderai "$@"
+fi
+```
+
+Two details that matter in production: a **flag file** rather than an
+environment variable, because a service manager's shell carries neither your
+env nor your PATH; and keeping the bind-mount list in one place, because a mount
+that exists in your manual run but not in the unit is a bug you only find after
+a reboot.
+
+### Upgrading in place, without pulling 25 GB
+
+The image can refresh **its own application code** from git instead of being
+replaced. `coderai-docker --upgrade` (the host runner) drives
+`coderai-upgrade` inside the container, which:
+
+1. shallow-clones the configured branch (default `production`);
+2. compares that tree's `codai/__init__.py __version__` with the version baked
+   into the image, and stops if the image is already current;
+3. replaces `/opt/coderai/app` with the fetched code;
+4. re-runs pip when the fetched code's declared dependencies changed, so new
+   packages land in the image's python env;
+5. exits `0` if it changed something, `10` if nothing was needed — and the host
+   runner `docker commit`s the container back onto **the same image tag** only
+   on `0`, so there is no Dockerfile rebuild and no extra overlay image.
+
+```bash
+coderai-docker --upgrade                      # to the production branch
+coderai-docker --upgrade --upgrade-ref v0.2.83
+coderai-docker --upgrade --force              # even if not strictly newer
+coderai-docker --upgrade --no-pip             # code only (offline host)
+coderai-docker --upgrade --ssh-key ~/.ssh/id_ed25519   # private repo over SSH
+```
+
+Knobs, all optional, passed as env by the runner: `CODERAI_UPGRADE_REPO`,
+`CODERAI_UPGRADE_REF`, `CODERAI_UPGRADE_FORCE`, `CODERAI_UPGRADE_SKIP_PIP`,
+`CODERAI_UPGRADE_SSH_KEY`. If the default remote is unreachable — expired
+certificate, DNS, an outage — it falls back to the public GitHub mirror; a repo
+you named explicitly is never silently replaced.
+
+**When to use which.** `--upgrade` is right for a code-only fix on a live
+deployment: seconds, no large transfer, and it works on a metered link. Pull a
+new image when the **dependencies** change substantially, when you want the
+signature of a published build, or when you want to be certain of what you are
+running — `--upgrade` mutates a tag in place, so after it, `coderai-ocr:latest`
+on your host is no longer byte-identical to the registry's. Record what you did.
+For an orchestrator fleet, pulling the signed image is the auditable path and
+`--upgrade` is the emergency one.
+
+Restart after an upgrade (`systemctl restart coderai`) — the code is swapped in
+the image, not in the running process.
+
+## 9. Reference
 
 | | |
 |---|---|
@@ -368,3 +569,5 @@ leave a machine billing forever. Pods it did not rent are never touched.
 | Full RunPod key reference | `docs/runpod.md` |
 | Remote execution / engines | `docs/remote-execution.md` |
 | Other capability images | `docs/install-from-packages.md` |
+| In-image upgrader | `packaging/linux/launcher/coderai-upgrade`, driven by `coderai-docker --upgrade` |
+| Host runner | `packaging/linux/run_oci.sh` (installed as `coderai-docker`) |
