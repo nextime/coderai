@@ -300,8 +300,22 @@ async def logout(request: Request):
         cookie = request.cookies.get(SESSION_COOKIE_NAME)
         session_manager.destroy_session(cookie)
 
-    response = RedirectResponse(url=_url(request, "/login"), status_code=302)
+    # With forward-auth the real session lives upstream, so returning to our own
+    # /login would be met by the proxy's headers and log the user straight back
+    # in. Send them to the upstream logout instead when one is configured.
+    _dest = _url(request, "/login")
+    try:
+        _fa = getattr(getattr(getattr(config_manager, "config", None), "admin", None),
+                      "forward_auth", None)
+        if _fa is not None and _fa.enabled and (_fa.post_logout_url or "").strip():
+            _dest = _fa.post_logout_url.strip()
+    except Exception:
+        pass
+    response = RedirectResponse(url=_dest, status_code=302)
     response.delete_cookie(SESSION_COOKIE_NAME)
+    # The middleware sets a plain "session" cookie for forward-authed users;
+    # clear that too or the next request walks back in with it.
+    response.delete_cookie("session")
     return response
 
 
@@ -3810,7 +3824,26 @@ def build_settings_dict(c, gpu_cards):
     """Pure ``Config`` → settings dict. Shared by the engine handler and the front
     proxy (which holds the same Config) so both serve an identical
     /admin/api/settings without the front having to round-trip to the engine."""
+    _fa = getattr(getattr(c, "admin", None), "forward_auth", None)
     return {
+        # Admin GUI forward-auth (SSO). The secret is reported as a boolean only
+        # — the page must be able to show that one is set without handing it to
+        # every browser that opens Settings.
+        "admin": {
+            "forward_auth": {
+                "enabled": bool(getattr(_fa, "enabled", False)),
+                "user_header": getattr(_fa, "user_header", ""),
+                "groups_header": getattr(_fa, "groups_header", ""),
+                "admin_group": getattr(_fa, "admin_group", ""),
+                "shared_secret_header": getattr(_fa, "shared_secret_header", ""),
+                "shared_secret_set": bool(getattr(_fa, "shared_secret", "")),
+                "trusted_proxies": list(getattr(_fa, "trusted_proxies", []) or []),
+                "auto_create_users": bool(getattr(_fa, "auto_create_users", True)),
+                "keep_local_login": bool(getattr(_fa, "keep_local_login", False)),
+                "admin_without_groups": bool(getattr(_fa, "admin_without_groups", False)),
+                "post_logout_url": getattr(_fa, "post_logout_url", ""),
+            }
+        },
         "server": {
             "host": c.server.host,
             "port": c.server.port,
@@ -4156,6 +4189,40 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
     data = await request.json()
     c = config_manager.config
     _settings_warnings: list = []
+
+    # Admin GUI: trusted forward-auth (SSO). Off by default; the API is never
+    # affected by it. Saved here so it can be switched from the Settings page
+    # as well as from config.json or the container's env.
+    if "admin" in data and isinstance(data["admin"], dict):
+        fa_in = data["admin"].get("forward_auth")
+        if isinstance(fa_in, dict):
+            fa = c.admin.forward_auth
+            for key in ("enabled", "auto_create_users", "keep_local_login",
+                        "admin_without_groups"):
+                if key in fa_in:
+                    setattr(fa, key, bool(fa_in[key]))
+            for key in ("user_header", "groups_header", "admin_group",
+                        "shared_secret_header", "post_logout_url"):
+                if key in fa_in and isinstance(fa_in[key], str) and fa_in[key].strip():
+                    setattr(fa, key, fa_in[key].strip())
+            # A blank secret in the payload means "leave it alone", so the page
+            # can render without echoing the secret back to the browser.
+            if isinstance(fa_in.get("shared_secret"), str) and fa_in["shared_secret"].strip():
+                fa.shared_secret = fa_in["shared_secret"].strip()
+            tp = fa_in.get("trusted_proxies")
+            if isinstance(tp, str):
+                tp = [x.strip() for x in tp.replace(";", ",").split(",") if x.strip()]
+            if isinstance(tp, list) and tp:
+                fa.trusted_proxies = [str(x).strip() for x in tp if str(x).strip()]
+            if fa.enabled and not fa.shared_secret:
+                _settings_warnings.append(
+                    "Forward-auth is enabled but has no shared secret, so it stays "
+                    "OFF: without one, anyone who can reach the port could send the "
+                    "identity header.")
+            if fa.enabled and not fa.trusted_proxies:
+                _settings_warnings.append(
+                    "Forward-auth has no trusted proxies, so it will refuse every "
+                    "request: the peer address is half of the trust check.")
 
     if "server" in data:
         srv = data["server"]

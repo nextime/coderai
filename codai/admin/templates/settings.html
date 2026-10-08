@@ -49,6 +49,50 @@
   </div>
   <div class="form-row" style="margin-top:.8rem;margin-bottom:0">
     <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-metrics-public"><span>Serve <code>/metrics</code> (Prometheus) without a credential</span></label>
+  </div>
+  <h3 style="margin-top:1.4rem">Single sign-on (trusted reverse proxy)</h3>
+  <div class="form-row" style="margin-bottom:0">
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-fa-enabled"><span>Accept an identity my reverse proxy has already authenticated</span></label>
+    <span class="form-hint">Off by default. When on, a request that arrives <b>from a trusted proxy</b> and carries <b>the right shared secret</b> is logged in as the user named in the identity header, with no password form. Both checks are required — either alone is forgeable — and anything missing fails closed. This is the <b>admin GUI only</b>: <code>/v1/*</code> keeps its API tokens whatever the proxy asserts.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.6rem">
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Identity header</label>
+      <input type="text" id="s-fa-user-header" class="form-input" placeholder="X-Forwarded-User">
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Groups header</label>
+      <input type="text" id="s-fa-groups-header" class="form-input" placeholder="X-Forwarded-Groups">
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Admin group</label>
+      <input type="text" id="s-fa-admin-group" class="form-input" placeholder="admins">
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Secret header</label>
+      <input type="text" id="s-fa-secret-header" class="form-input" placeholder="X-Coderai-Proxy-Secret">
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Shared secret</label>
+      <input type="password" id="s-fa-secret" class="form-input" placeholder="(unchanged)" autocomplete="new-password">
+      <span class="form-hint" id="s-fa-secret-state" style="font-size:11px"></span>
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Trusted proxies</label>
+      <input type="text" id="s-fa-trusted" class="form-input" placeholder="127.0.0.1, ::1">
+      <span class="form-hint" style="font-size:11px">The immediate peer address. Comma separated.</span>
+    </div>
+  </div>
+  <div class="form-row" style="margin-top:.6rem">
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-fa-autocreate"><span>Create the account on first sight</span></label>
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-fa-keep-local"><span>Keep the password form as a fallback</span></label>
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-fa-admin-nogroups"><span>Treat every forward-authed user as an admin when no groups header is sent</span></label>
+    <span class="form-hint">With the fallback off, the proxy is the only way in and <code>/login</code> refuses. The last option is explicit on purpose: guessing it either locks you out or hands admin to everyone upstream lets through.</span>
+  </div>
+  <div class="form-row" style="margin-top:.6rem;margin-bottom:0">
+    <label class="form-label">Logout goes to</label>
+    <input type="text" id="s-fa-post-logout" class="form-input" placeholder="https://your-sso/logout  (blank = this install's /login)">
+    <span class="form-hint">The real session lives upstream, so returning to our own login would just log you back in.</span>
     <span class="form-hint" style="font-size:11px">Off = a session, an API token or the cluster token is required. Exported: requests per key/model/kind/status/engine with wall time, engines and nodes up, VRAM, in-flight, RPC servers, discovery, RunPod spend.</span>
   </div>
   <div class="form-row" style="margin-top:1rem;margin-bottom:0">
@@ -1797,6 +1841,25 @@ async function loadSettings(){
     document.getElementById('s-key').value   = d.server?.https_key_path ?? '';
     document.getElementById('s-cert').value  = d.server?.https_cert_path ?? '';
     document.getElementById('s-metrics-public').checked = !!d.server?.metrics_public;
+    (function(){
+      const fa = (d.admin && d.admin.forward_auth) || {};
+      const set = (id,v)=>{ const e=document.getElementById(id); if(e) e.value = (v==null?'':v); };
+      const chk = (id,v)=>{ const e=document.getElementById(id); if(e) e.checked = !!v; };
+      chk('s-fa-enabled', fa.enabled);
+      set('s-fa-user-header', fa.user_header);
+      set('s-fa-groups-header', fa.groups_header);
+      set('s-fa-admin-group', fa.admin_group);
+      set('s-fa-secret-header', fa.shared_secret_header);
+      set('s-fa-trusted', (fa.trusted_proxies || []).join(', '));
+      chk('s-fa-autocreate', fa.auto_create_users);
+      chk('s-fa-keep-local', fa.keep_local_login);
+      chk('s-fa-admin-nogroups', fa.admin_without_groups);
+      set('s-fa-post-logout', fa.post_logout_url);
+      const st = document.getElementById('s-fa-secret-state');
+      if (st) st.textContent = fa.shared_secret_set
+        ? 'A secret is set. Leave blank to keep it.'
+        : 'No secret set — the feature stays OFF until one is.';
+    })();
     document.getElementById('s-queue-max').value = d.server?.queue_max_size ?? 6;
     document.getElementById('s-internal-port-base').value = d.server?.internal_port_base ?? 8780;
     // Default engine — surfaced when 2+ engines are running. Sourced from the
@@ -2084,6 +2147,22 @@ async function loadSettings(){
 async function saveSettings(silent){
   const strOrNull = id => document.getElementById(id).value.trim() || null;
   const data = {
+    admin: {
+      forward_auth: {
+        enabled:              document.getElementById('s-fa-enabled').checked,
+        user_header:          (document.getElementById('s-fa-user-header').value || '').trim(),
+        groups_header:        (document.getElementById('s-fa-groups-header').value || '').trim(),
+        admin_group:          (document.getElementById('s-fa-admin-group').value || '').trim(),
+        shared_secret_header: (document.getElementById('s-fa-secret-header').value || '').trim(),
+        // blank means "leave the stored secret alone" — the page never receives it
+        shared_secret:        (document.getElementById('s-fa-secret').value || '').trim(),
+        trusted_proxies:      (document.getElementById('s-fa-trusted').value || '').trim(),
+        auto_create_users:    document.getElementById('s-fa-autocreate').checked,
+        keep_local_login:     document.getElementById('s-fa-keep-local').checked,
+        admin_without_groups: document.getElementById('s-fa-admin-nogroups').checked,
+        post_logout_url:      (document.getElementById('s-fa-post-logout').value || '').trim(),
+      },
+    },
     server:{
       host: document.getElementById('s-host').value.trim() || '0.0.0.0',
       port: parseInt(document.getElementById('s-port').value) || 8000,

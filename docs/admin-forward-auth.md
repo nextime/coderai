@@ -1,6 +1,7 @@
 # Admin GUI: trusted forward-auth (reuse an upstream login)
 
-**Status: feature request / requirements.** This is what CoderAI needs to add so
+**Status: IMPLEMENTED in 0.2.85.** (Originally a feature request; the
+requirements below are what shipped, with the differences noted at the end.) This is what CoderAI needs to add so
 a reverse proxy that has *already* authenticated a user can hand that identity to
 CoderAI's admin GUI, instead of the user logging into CoderAI a second time.
 
@@ -143,3 +144,63 @@ are written up in `/AI/sentenze/coderai-surya-fix.md` and are **not** part of th
 request: engine#0 crash-looping GPU-less despite `backend.type=cpu` +
 `server.engine_specs`, and `/v1/*` serving `200` without a bearer (tokens not
 enforced). This forward-auth feature is independent of both.
+
+
+---
+
+## As shipped (0.2.85)
+
+Config lives at `admin.forward_auth` in `config.json`, is editable from
+**Settings → Single sign-on (trusted reverse proxy)**, and is **off by default**:
+
+```json
+"admin": {
+  "forward_auth": {
+    "enabled": false,
+    "user_header": "X-Forwarded-User",
+    "groups_header": "X-Forwarded-Groups",
+    "admin_group": "admins",
+    "shared_secret_header": "X-Coderai-Proxy-Secret",
+    "shared_secret": "",
+    "trusted_proxies": ["127.0.0.1", "::1"],
+    "auto_create_users": true,
+    "keep_local_login": false,
+    "admin_without_groups": false,
+    "post_logout_url": ""
+  }
+}
+```
+
+Env overrides for a unit file that must not edit a mounted config:
+`CODERAI_ADMIN_FORWARD_AUTH=1|0` and `CODERAI_ADMIN_FORWARD_AUTH_SECRET`. The env
+switch can turn it **off** as well as on.
+
+**Differences from the request, all deliberate:**
+
+- `shared_secret` is a config/env value, not only a header *name*. The request
+  named the header but not where the expected value comes from.
+- **Enabled with no secret stays OFF**, with one line in the log. Without a
+  secret there is nothing distinguishing the proxy from a client that sends the
+  header, so honouring it would be worse than not running the feature.
+- `admin_without_groups` is the explicit decision the request asked for: when
+  the proxy sends no groups header, `false` (default) makes the user a
+  non-admin, `true` makes every forward-authed user an admin.
+- The username from the header is validated (no slashes, ≤128 chars) before it
+  is used to look up or create an account.
+- An auto-created account gets a random 32-byte password nobody is told, and is
+  never asked to change it — it exists only to be reached through the proxy.
+- `GET /admin/api/settings` reports `shared_secret_set: true|false` and never
+  the secret, so opening Settings does not hand it to the browser. Saving with
+  the field blank keeps the stored value.
+- A real signed session is minted and injected into the current request, not
+  just a rendered page: the dashboard's own `/admin/api/*` calls authenticate by
+  session cookie, and a page whose AJAX 401s is not a working GUI.
+
+**Unchanged, as required:** `/v1/*` is untouched by this feature and keeps its
+bearer tokens; `/healthz`, `/health` and `/v1/health` stay credential-free.
+
+Separately, and found while testing this: the **front was not enforcing the API
+bearer at all** — `GET /v1/models` answered 200 with no header on 0.2.83. Fixed
+in 0.2.84; the front now refuses `/v1` without credentials instead of falling
+open. That was the second item in the "not part of this request" note, and it
+was real.

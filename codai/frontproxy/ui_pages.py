@@ -24,8 +24,11 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.responses import RedirectResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+
+_FA_WARNED = False
 
 
 def register_ui_pages(app: FastAPI, config_dir) -> bool:
@@ -53,6 +56,109 @@ def register_ui_pages(app: FastAPI, config_dir) -> bool:
         return False
     sm = SessionManager(cfg_path)
 
+    def _fa_cfg():
+        """The forward-auth settings, or None when the feature is off.
+
+        Read per request so toggling it in Settings takes effect without a
+        restart. Env wins over the file so a container can be switched from its
+        unit file without editing a mounted config:
+        CODERAI_ADMIN_FORWARD_AUTH=1|0 and CODERAI_ADMIN_FORWARD_AUTH_SECRET.
+        """
+        import os
+        cfg = None
+        try:
+            from codai.admin import routes as _ar
+            mgr = getattr(_ar, "config_manager", None)
+            cfg = getattr(getattr(mgr, "config", None), "admin", None)
+            cfg = getattr(cfg, "forward_auth", None)
+        except Exception:
+            cfg = None
+        if cfg is None:
+            return None
+        env_on = os.environ.get("CODERAI_ADMIN_FORWARD_AUTH", "")
+        enabled = cfg.enabled
+        if env_on != "":
+            enabled = env_on.strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return None
+        secret = os.environ.get("CODERAI_ADMIN_FORWARD_AUTH_SECRET", "") or cfg.shared_secret
+        if not secret:
+            # Enabled with no secret is not a configuration, it is an open door:
+            # anyone who can reach the port could send the header. Stay off and
+            # say so once.
+            global _FA_WARNED
+            if not _FA_WARNED:
+                print("[front] admin forward-auth is enabled but no shared secret is "
+                      "set — staying OFF (set admin.forward_auth.shared_secret or "
+                      "CODERAI_ADMIN_FORWARD_AUTH_SECRET)", flush=True)
+                _FA_WARNED = True
+            return None
+        return cfg, secret
+
+    def _fa_trusted(request: Request, cfg, secret: str) -> bool:
+        """Both checks, or nothing: the immediate peer must be a trusted proxy
+        AND the shared secret must match. Either one alone is forgeable."""
+        import hmac
+        peer = (request.client.host if request.client else "") or ""
+        trusted = [str(t).strip() for t in (cfg.trusted_proxies or []) if str(t).strip()]
+        if peer not in trusted:
+            return False
+        sent = request.headers.get(cfg.shared_secret_header.lower(), "") or ""
+        if not sent or not hmac.compare_digest(sent, secret):
+            return False
+        return True
+
+    def _fa_identity(request: Request):
+        """(username, is_admin) from a trusted proxy's headers, or (None, False).
+
+        Returns nothing at all unless the trust check passed, so a client that
+        sends X-Forwarded-User directly is simply ignored.
+        """
+        got = _fa_cfg()
+        if not got:
+            return None, False
+        cfg, secret = got
+        if not _fa_trusted(request, cfg, secret):
+            return None, False
+        user = (request.headers.get(cfg.user_header.lower(), "") or "").strip()
+        if not user or "/" in user or "\\" in user or len(user) > 128:
+            return None, False
+        groups_raw = request.headers.get(cfg.groups_header.lower(), None)
+        if groups_raw is None:
+            is_admin = bool(cfg.admin_without_groups)
+        else:
+            groups = {g.strip().lower() for g in str(groups_raw).replace(";", ",").split(",")}
+            is_admin = (cfg.admin_group or "").strip().lower() in groups
+        return user, is_admin
+
+    def _fa_login(request: Request):
+        """Establish a normal CoderAI session for a forward-authed user.
+
+        Returns the username, or None. Creates the account on first sight when
+        auto_create_users is on; otherwise the user must already exist, so an
+        upstream directory cannot mint CoderAI accounts by itself.
+        """
+        import secrets
+        user, is_admin = _fa_identity(request)
+        if not user:
+            return None, False
+        got = _fa_cfg()
+        cfg = got[0] if got else None
+        known = any(u.get("username") == user
+                    for u in (sm._load_auth_data().get("users") or []))
+        if not known:
+            if not (cfg and cfg.auto_create_users):
+                print(f"[front] forward-auth: refusing unknown user {user!r} "
+                      f"(auto_create_users is off)", flush=True)
+                return None, False
+            # A random password nobody is told: this account is only ever
+            # reached through the proxy.
+            sm.create_user(user, secrets.token_urlsafe(32),
+                           role="admin" if is_admin else "user")
+            print(f"[front] forward-auth: created user {user!r} "
+                  f"(admin={is_admin})", flush=True)
+        return user, is_admin
+
     def _user(request: Request) -> Optional[str]:
         """Locally validate whichever ``session``/``session_<port>`` cookie is
         present. Validation is by HMAC signature against the shared secret, so the
@@ -79,11 +185,56 @@ def register_ui_pages(app: FastAPI, config_dir) -> bool:
             return None, _to(request, "/admin")
         return u, None
 
+    # ------------------------------------------------------- forward auth (SSO)
+    # A session, not just a rendered page: the dashboard's own data calls go to
+    # /admin/api/*, which authenticate by session cookie. So mint the normal
+    # signed session, inject it into THIS request so those handlers see it, and
+    # set it on the response so the browser keeps it.
+    #
+    # /v1/* is explicitly excluded: this feature is GUI-only and must not change
+    # how the API authenticates.
+    @app.middleware("http")
+    async def _forward_auth_session(request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/v1/") or path in ("/healthz", "/health"):
+            return await call_next(request)
+        if _user(request):                      # already has a session of ours
+            return await call_next(request)
+        user, _is_admin = _fa_login(request)
+        if not user:
+            return await call_next(request)
+        cookie = sm.create_session(user)
+        if cookie.endswith(".MUST_CHANGE"):     # never force a password change
+            cookie = cookie[:-12]               # on an account reached via SSO
+        raw = [(k, v) for k, v in request.scope.get("headers", [])
+               if k.lower() != b"cookie"]
+        existing = request.headers.get("cookie", "")
+        merged = f"session={cookie}" + (f"; {existing}" if existing else "")
+        raw.append((b"cookie", merged.encode()))
+        request.scope["headers"] = raw
+        response = await call_next(request)
+        try:
+            response.set_cookie("session", cookie, httponly=True, samesite="lax",
+                                secure=request.url.scheme == "https", path="/")
+        except Exception:
+            pass
+        return response
+
     # ---------------------------------------------------------------- pages
     @app.get("/login", include_in_schema=False)
     async def _login_page(request: Request):
         if _user(request):
             return _to(request, "/admin")
+        got = _fa_cfg()
+        if got and not got[0].keep_local_login:
+            # The proxy is the only way in. Showing a password box here would
+            # invite someone to look for a way around the proxy.
+            return JSONResponse(
+                {"detail": "This install authenticates through its reverse proxy. "
+                           "Reach the GUI through it, or set "
+                           "admin.forward_auth.keep_local_login to allow the "
+                           "password form as a fallback."},
+                status_code=403)
         return _tmpl(request, "login.html", {"error": None})
 
     @app.get("/admin", include_in_schema=False)

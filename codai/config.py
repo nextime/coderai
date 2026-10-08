@@ -114,6 +114,47 @@ class ServerConfig:
 
 
 @dataclass
+class AdminForwardAuthConfig:
+    """Trust an identity a reverse proxy has already authenticated (SSO).
+
+    OFF by default and GUI-ONLY: it never changes how /v1/* authenticates.
+    When enabled, a request that comes from a trusted proxy AND carries the
+    right shared secret is logged in as the user named in ``user_header``,
+    with no password form. Both checks are required — a trusted header is a
+    forged-identity hole the moment it is honoured from anywhere else — and
+    anything missing fails CLOSED.
+    """
+    enabled: bool = False
+    user_header: str = "X-Forwarded-User"
+    groups_header: str = "X-Forwarded-Groups"
+    admin_group: str = "admins"
+    shared_secret_header: str = "X-Coderai-Proxy-Secret"
+    #: The expected value. Blank = the feature stays off however `enabled` is
+    #: set: without a secret there is nothing to distinguish the proxy from a
+    #: client that simply sends the header.
+    shared_secret: str = ""
+    trusted_proxies: list = field(default_factory=lambda: ["127.0.0.1", "::1"])
+    auto_create_users: bool = True
+    #: Leave the password form working (a fallback for loopback/direct access).
+    #: False = the proxy is the only way in.
+    keep_local_login: bool = False
+    #: What to do when the proxy sends no groups header at all. False (default)
+    #: = the user is a non-admin; True = every forward-authed user is an admin.
+    #: Explicit on purpose: guessing here either locks the operator out or hands
+    #: admin to everyone upstream lets through.
+    admin_without_groups: bool = False
+    #: Where a logout goes. The real session lives upstream, so returning to our
+    #: own login would just auto-log-in again.
+    post_logout_url: str = ""
+
+
+@dataclass
+class AdminConfig:
+    """Admin GUI settings."""
+    forward_auth: AdminForwardAuthConfig = field(default_factory=AdminForwardAuthConfig)
+
+
+@dataclass
 class BackendConfig:
     """Backend configuration."""
     type: str = "auto"
@@ -961,6 +1002,7 @@ class Config:
     version: str = "1.0"
     server: ServerConfig = field(default_factory=ServerConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
+    admin: AdminConfig = field(default_factory=AdminConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
     vulkan: VulkanConfig = field(default_factory=VulkanConfig)
@@ -1155,6 +1197,9 @@ class ConfigManager:
                 version=config_data.get("version", "1.0"),
                 server=_dc(ServerConfig, config_data.get("server", {})),
                 backend=_dc(BackendConfig, config_data.get("backend", {})),
+                admin=AdminConfig(forward_auth=_dc(
+                    AdminForwardAuthConfig,
+                    (config_data.get("admin") or {}).get("forward_auth", {}))),
                 models=_dc(ModelsConfig, config_data.get("models", {})),
                 offload=_dc(OffloadConfig, config_data.get("offload", {})),
                 vulkan=_dc(VulkanConfig, config_data.get("vulkan", {})),
@@ -1272,6 +1317,21 @@ class ConfigManager:
                 "isolate_gguf_engine": self.config.server.isolate_gguf_engine,
                 "engine_specs": self.config.server.engine_specs,
                 "default_engine": self.config.server.default_engine,
+            },
+            "admin": {
+                "forward_auth": {
+                    "enabled": self.config.admin.forward_auth.enabled,
+                    "user_header": self.config.admin.forward_auth.user_header,
+                    "groups_header": self.config.admin.forward_auth.groups_header,
+                    "admin_group": self.config.admin.forward_auth.admin_group,
+                    "shared_secret_header": self.config.admin.forward_auth.shared_secret_header,
+                    "shared_secret": self.config.admin.forward_auth.shared_secret,
+                    "trusted_proxies": self.config.admin.forward_auth.trusted_proxies,
+                    "auto_create_users": self.config.admin.forward_auth.auto_create_users,
+                    "keep_local_login": self.config.admin.forward_auth.keep_local_login,
+                    "admin_without_groups": self.config.admin.forward_auth.admin_without_groups,
+                    "post_logout_url": self.config.admin.forward_auth.post_logout_url,
+                },
             },
             "backend": {
                 "type": self.config.backend.type,
