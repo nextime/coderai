@@ -180,7 +180,228 @@ because a volume lives in one region and a pod elsewhere cannot attach it.
 
 ---
 
-## 4. Scale
+## 4. A network volume, and one recipe per kind of model
+
+### Put the weights on a volume — this is the single biggest lever
+
+**The weights are the cost, not the GPU.** A pod with no network volume
+downloads its model on **every cold start**, and you pay rental for all of it
+before it answers anything. A 15 GB repo at a cold machine's ~25 MB/s is ten
+minutes; a 150 GB MoE is one to two hours *per boot*. Attach a RunPod network
+volume, put the weights on it once, and a cold start becomes a mount.
+
+Create the volume in the RunPod console (Storage → Network Volume), **in the
+region you intend to rent in**, then give its id to the model:
+
+```json
+"runpod": {
+  "network_volume_id": "abc123xyz",
+  "volume_mount_path": "/workspace",
+  "volume_path": "models/Qwen3-8B-Instruct"
+}
+```
+
+- `network_volume_id` — the volume. Volumes are **Secure Cloud only**, so
+  naming one pins `cloud_types` to `["SECURE"]` automatically.
+- `volume_mount_path` — where it appears in the pod. `/workspace` by default.
+- `volume_path` — where the weights are **on** the volume, relative to the
+  mount (or absolute). Leave it unset and the engine downloads into the volume's
+  HF cache instead, which still beats the container disk because the next pod
+  reuses it.
+- `container_disk_gb` — grown automatically to fit the weights **unless** a
+  volume holds them. With a volume you can leave it at the default.
+
+**The region is not optional once a volume exists.** A volume lives in one data
+centre and a pod elsewhere cannot attach it, so the volume's region overrides
+both `data_center` and the account setting. If you want pods in two regions, you
+need a volume in each.
+
+A practical layout for a shared volume:
+
+```
+/workspace/
+  models/            weights, one directory per model
+  loras/             adapters (PEFT dirs, or GGUF-converted for llama.cpp)
+  hf/                HF cache for anything downloaded on demand
+  venvs/             engine venvs, when you use venv_on_volume
+```
+
+### Share one volume — and one pool — across models
+
+Two models naming the same `pool` share the **same pods** instead of renting a
+card each. This only works when the pod's server can serve more than one model:
+a **CoderAI pod** picks the model per request, while a vLLM pod is launched
+`--model X` and can only ever serve that one. So pool CoderAI-engine models
+(`engine: coderai`, e.g. the capability images) and leave vLLM/llama.cpp models
+on their own pods.
+
+```json
+"runpod": { "pool": "digesta-cpu-bound", "engine": "coderai", "max_pods": 3 }
+```
+
+With `venv_on_volume: true` the pod's Python dependencies live on the volume and
+a small image boots and uses them: the first pod builds the venv (a few
+minutes), every pod after skips both the multi-GB image pull and the install.
+Opt in per pool — it trades a fast pull for slower imports off network storage.
+
+### LLM — vLLM, for throughput
+
+```json
+{
+  "name": "Qwen/Qwen3-8B-Instruct",
+  "backend": "runpod",
+  "runpod": {
+    "mode": "pods", "engine": "vllm",
+    "served_model": "Qwen/Qwen3-8B-Instruct",
+    "network_volume_id": "abc123xyz",
+    "volume_path": "models/Qwen3-8B-Instruct",
+    "min_vram_gb": 48, "max_hourly_usd": 1.50, "gpu_count": 1,
+    "ctx": 32768,
+    "max_pods": 4, "scale_up_inflight_per_pod": 8, "idle_timeout_s": 300,
+    "pod_max_parallel_requests": 48, "pod_queue_max_size": 256,
+    "cost_limit_usd": 50, "cost_period": "day"
+  }
+}
+```
+
+`ctx` becomes vLLM's `--max-model-len`. For a model too big for one card, raise
+`gpu_count`: `min_vram_gb` is then checked against the **total**,
+`max_hourly_usd` against the **whole pod**, and vLLM is told to shard with
+`--tensor-parallel-size N`.
+
+### LLM — a GGUF on llama.cpp
+
+```json
+"runpod": {
+  "engine": "llamacpp",
+  "hf_gguf": "unsloth/Qwen3-8B-GGUF:Q4_K_M",
+  "network_volume_id": "abc123xyz",
+  "min_vram_gb": 24, "max_hourly_usd": 0.60
+}
+```
+
+`hf_gguf` is `repo:quant`. A local `/AI/…/foo.gguf` path means nothing on a
+rented machine — either publish it or put it on the volume and use
+`volume_path`.
+
+### Embeddings
+
+Small, fast, and usually the thing you want **warm** rather than cold — an
+embedding call that waits two minutes for a pod is useless in a RAG path.
+
+```json
+{
+  "name": "BAAI/bge-m3",
+  "backend": "runpod",
+  "runpod": {
+    "engine": "coderai", "image": "ghcr.io/nextime/coderai-embeddings:latest",
+    "served_model": "BAAI/bge-m3",
+    "network_volume_id": "abc123xyz", "volume_path": "models/bge-m3",
+    "min_vram_gb": 16, "max_hourly_usd": 0.40,
+    "pool": "digesta-small",
+    "min_pods": 1, "max_pods": 2,
+    "schedule_enabled": true,
+    "schedule_start": "08:00", "schedule_end": "20:00",
+    "schedule_days": "mon,tue,wed,thu,fri", "schedule_tz": "Europe/Rome",
+    "pod_max_parallel_requests": 16, "pod_queue_max_size": 64
+  }
+}
+```
+
+`min_pods: 1` with a schedule is the pattern: instant during working hours,
+nothing billed overnight.
+
+### OCR
+
+Two shapes. The **VLM path** is an ordinary chat model doing OCR — nothing
+special, configure it like any LLM above. The **native engine path** uses
+`/v1/ocr` with a real OCR engine:
+
+```json
+{
+  "name": "datalab-to/surya-ocr-2",
+  "backend": "runpod",
+  "runpod": {
+    "engine": "vllm",
+    "served_model": "datalab-to/surya-ocr-2",
+    "network_volume_id": "abc123xyz", "volume_path": "models/surya-ocr-2",
+    "min_vram_gb": 40, "max_hourly_usd": 1.20,
+    "direct_tcp": "auto",
+    "max_pods": 8, "scale_up_inflight_per_pod": 16,
+    "pod_max_parallel_requests": 48, "pod_queue_max_size": 256,
+    "cost_limit_usd": 100, "cost_period": "day"
+  }
+}
+```
+
+Then point the OCR engine at the orchestrator itself in **Settings → OCR**:
+`surya_serve: vllm`, `vllm.service_url: http://127.0.0.1:8000`. The Surya client
+runs in its own venv **on the orchestrator** (baked into `coderai-ocr` from
+0.2.83) and the model runs in vLLM on the pod. Keep `direct_tcp` so a slow page
+is not cut off at 100 s by RunPod's proxy, and set the pod admission numbers —
+this is the exact path that was measured at ~6 pages/s with the defaults while
+the GPU idled.
+
+For scanned-document throughput, **batching beats concurrency**: send
+`/v1/ocr/batch` with many files and let `scale_up_inflight_per_pod` add pods.
+
+### Engine pods — the very large MoE models
+
+`ds4`, `colibri`, `k3`, `kt` run through `ghcr.io/nextime/coderai-engines`. For
+these a volume is not an optimisation, it is a requirement: `colibri` and `k3`
+**never download** and fail outright without `volume_path`.
+
+```json
+"runpod": {
+  "engine": "ds4", "network_volume_id": "abc123xyz",
+  "volume_path": "models/DeepSeek-V4-Pro-Q4K.gguf",
+  "min_vram_gb": 80, "gpu_count": 2, "max_hourly_usd": 4.00
+}
+```
+
+### LoRA and QLoRA adapters
+
+Adapters are configured on the model entry (the LoRA section of the model page),
+and how they reach the pod depends on where they live:
+
+- **Portable** — an adapter the pod can resolve itself, i.e. a HuggingFace repo
+  id or a URL. It travels as a reference and the engine fetches it. For a vLLM
+  pod the orchestrator stages it and adds `--enable-lora --lora-modules
+  <name>=<path> --max-lora-rank 64` to the launch automatically.
+- **Local-only** — an adapter that exists only on your disk (one you trained
+  yourself). It cannot be resolved remotely, so the orchestrator **forces a
+  CoderAI pod** (`engine: coderai`) and sends it the adapter, because vLLM and
+  llama.cpp resolve adapters at launch and have no endpoint to receive one. The
+  provisioning log says so explicitly when it happens.
+
+The durable answer for adapters you train is the **volume**: put them under
+`/workspace/loras/<name>` and reference that path, and every pod has them with
+no transfer and no pod-type constraint.
+
+A QLoRA adapter is an ordinary PEFT adapter — what makes it QLoRA is that the
+*base* was quantised during training. Two things follow:
+
+- set the base model's `quantization` to match what the adapter was trained
+  against (e.g. `"quantization": "bitsandbytes"` for an nf4 base). An adapter
+  trained on an nf4 base and merged onto an fp16 base loads without error and
+  quietly degrades — there is no exception to catch, only worse output;
+- **llama.cpp takes exactly one adapter and it must be GGUF-converted.** A PEFT
+  safetensors directory is not loadable there. Use a CoderAI or vLLM pod for
+  PEFT adapters, or convert first.
+
+`max_lora_rank` defaults to 64 on the vLLM launch; a higher-rank adapter needs
+it raised through `docker_args`.
+
+### Sanity checklist before you add the tenth model
+
+- Does it name a volume, and is the volume in the region you rent in?
+- Is `max_hourly_usd` set, and does it account for `gpu_count`?
+- Is `cost_limit_usd` + `cost_period` set, so one model cannot eat the account?
+- Are the **pod** admission numbers set, or will it 429 at 16 concurrent?
+- Should it be warm during working hours (`min_pods` + a schedule) or cold?
+- If it shares a `pool`, is it a CoderAI-engine model? (vLLM pods cannot pool.)
+
+## 5. Scale
 
 Four numbers decide the shape of a pool:
 
@@ -234,7 +455,7 @@ every day.
 
 ---
 
-## 5. Watch the cost
+## 6. Watch the cost
 
 Three layers, and you want all three.
 
@@ -286,7 +507,7 @@ If the figures look low, check the console too.
 
 ---
 
-## 6. Calling it
+## 7. Calling it
 
 Standard OpenAI shapes, plus OCR:
 
@@ -315,7 +536,7 @@ curl -fsS http://127.0.0.1:8000/v1/ocr/batch \
 **The first request to a cold model is slow** — the pod has to be rented, the
 image pulled and the weights downloaded, which is minutes, covered by
 `boot_timeout_s` and `load_timeout_s`. Give your client a timeout that allows
-for it, or keep `min_pods: 1` during working hours (§4).
+for it, or keep `min_pods: 1` during working hours (§5).
 
 ### The native Surya OCR engine
 
@@ -330,7 +551,7 @@ Surya's vLLM client probes `{service_url}/health`, which this app serves from
 
 ---
 
-## 7. When something is wrong
+## 8. When something is wrong
 
 ```bash
 docker logs --tail 200 coderai                     # provisioning, boots, caps, 429s
@@ -358,7 +579,7 @@ leave a machine billing forever. Pods it did not rent are never touched.
 
 ---
 
-## 8. Keeping it running, and upgrading in place
+## 9. Keeping it running, and upgrading in place
 
 ### Run it as a service — systemd
 
@@ -559,7 +780,7 @@ For an orchestrator fleet, pulling the signed image is the auditable path and
 Restart after an upgrade (`systemctl restart coderai`) — the code is swapped in
 the image, not in the running process.
 
-## 9. Reference
+## 10. Reference
 
 | | |
 |---|---|
