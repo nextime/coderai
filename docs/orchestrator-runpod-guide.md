@@ -475,12 +475,35 @@ special, configure it like any LLM above. The **native engine path** uses
 }
 ```
 
-Then point the OCR engine at the orchestrator itself in **Settings → OCR**:
-`surya_serve: vllm`, `vllm.service_url: http://127.0.0.1:8776`. The Surya client
-runs in its own venv **on the orchestrator** (the full image) and the model runs in vLLM on the pod. Keep `direct_tcp` so a slow page
-is not cut off at 100 s by RunPod's proxy, and set the pod admission numbers —
-this is the exact path that was measured at ~6 pages/s with the defaults while
-the GPU idled.
+Then configure the OCR engine in **Settings → OCR** on the orchestrator:
+
+```json
+"ocr": {
+  "surya_serve": "vllm",
+  "surya_server_url": "",
+  "surya_auto_build": true
+}
+```
+
+`surya_serve: vllm` puts the model in vLLM on the pod and leaves the Surya
+**client** on the orchestrator. That client needs an isolated venv, because
+surya-ocr caps `pillow<11` and CoderAI needs `pillow>=12` — they cannot share
+one.
+
+**`surya_auto_build: true` is the setting people miss.** It defaults to
+**false**, so on first use the engine reports a missing venv instead of
+building one, and you end up installing it by hand. Switched on, the engine
+creates the venv from `requirements-surya.txt` on first use (a non-blocking
+build — the first request reports "building", later ones work) and puts it on
+the **persistent cache mount** at `<cache>/ocr/surya_venv`, so it survives
+restarts and is built once. If you would rather pre-build it, that is
+`python3 -m venv <cache>/ocr/surya_venv` plus
+`pip install -r requirements-surya.txt`; `ocr.surya_venv` overrides the
+location.
+
+Keep `direct_tcp` so a slow page is not cut off at 100 s by RunPod's proxy, and
+set the pod admission numbers — this is the exact path that was measured at
+~6 pages/s with the defaults while the GPU idled.
 
 For scanned-document throughput, **batching beats concurrency**: send
 `/v1/ocr/batch` with many files and let `scale_up_inflight_per_pod` add pods.
