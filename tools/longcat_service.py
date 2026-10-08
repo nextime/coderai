@@ -70,6 +70,13 @@ _state = {
 }
 _progress = {"active": False, "stage": "", "segment": 0, "segments": 0,
              "step": 0, "steps": 0}
+# Denoise-step bookkeeping for /progress. The vendored pipelines render their step
+# count onto a tqdm bar and nothing else, so until this was wired the bar the caller
+# polls reported 0/N for an entire render. ``offset`` is how many steps earlier
+# SEGMENTS of the current stage already contributed, so ``_progress["step"]`` counts
+# the stage end to end instead of restarting at every segment boundary;
+# ``pass_steps`` is one segment's step count, learnt from the first bar's total.
+_bar = {"offset": 0, "pass_steps": 0}
 # Set by POST /yield: stop at the next SEGMENT boundary and return what has been
 # generated, so another model can have the card without the request being lost.
 _yield_flag = threading.Event()
@@ -77,6 +84,58 @@ _yield_flag = threading.Event()
 
 def log(msg):
     print(f"[longcat] {msg}", flush=True)
+
+
+def _install_progress_bars() -> None:
+    """Teach the pipelines' denoising bars to publish their step count.
+
+    Upstream's generate_* methods drive a bare ``tqdm(total=len(timesteps),
+    desc="Denoising")`` and take no callback, so the only way to observe a step
+    without forking the vendored pipeline is to replace the ``tqdm`` the pipeline
+    module resolved at import time. Each module did ``from tqdm import tqdm``, so the
+    name has to be rebound on the MODULE -- patching ``tqdm.tqdm`` would be too late.
+
+    Only bars labelled "Denoising" are tracked: the pipelines use tqdm for nothing
+    else today, and a checkpoint-shard bar must not move the request's progress."""
+    import tqdm as _tqdm_mod
+
+    base = _tqdm_mod.tqdm
+
+    class _ProgressTqdm(base):
+        # Checked instead of class identity: this function builds a fresh subclass on
+        # every call, so identity would re-wrap an already-wrapped bar.
+        _lc_progress_bar = True
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._lc_track = str(kw.get("desc") or "") == "Denoising"
+            if not self._lc_track:
+                return
+            with _lock:
+                total = int(self.total or 0)
+                if total:
+                    _bar["pass_steps"] = total
+                segments = max(1, int(_progress.get("segments") or 1))
+                _progress["steps"] = total * segments
+                _progress["step"] = int(_bar["offset"])
+
+        def update(self, n=1):
+            ret = super().update(n)
+            if getattr(self, "_lc_track", False):
+                with _lock:
+                    _progress["step"] = int(_bar["offset"]) + int(self.n or 0)
+            return ret
+
+    patched = []
+    for name in ("longcat_video.pipeline_longcat_video",
+                 "longcat_video.pipeline_longcat_video_avatar"):
+        mod = sys.modules.get(name)
+        if mod is not None and not getattr(
+                getattr(mod, "tqdm", None), "_lc_progress_bar", False):
+            mod.tqdm = _ProgressTqdm
+            patched.append(name.rsplit(".", 1)[-1])
+    if patched:
+        log(f"progress: denoising bars instrumented ({', '.join(patched)})")
 
 
 # ── loading ───────────────────────────────────────────────────────────────────
@@ -226,6 +285,9 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                 raise RuntimeError(
                     "use_distill needs the DiT's enable_loras() — this build of "
                     "longcat_video does not expose it")
+        # Both pipeline modules are imported by now (the avatar one only for an
+        # avatar family), so this is the first point where the bars can be rebound.
+        _install_progress_bars()
         _place_pipeline(pipe, offload)
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
@@ -1097,10 +1159,15 @@ def _run_segments(pipe, task: str, stage: str, ctx: dict, log=print):
 
     for index in range(segments):
         with _lock:
-            _progress.update(segment=index + 1, segments=segments, step=0,
-                             steps=LC.stage_params(
-                                 stage, ctx.get("num_inference_steps"),
-                                 ctx.get("guidance_scale"))["num_inference_steps"])
+            # One segment's step count comes from the first bar's own total, which is
+            # authoritative (the avatar distilled pass is 8 steps, the base one 16).
+            # Before that bar exists, the stage default is the estimate.
+            per_pass = int(_bar["pass_steps"]) or int(LC.stage_params(
+                stage, ctx.get("num_inference_steps"),
+                ctx.get("guidance_scale"))["num_inference_steps"])
+            _bar["offset"] = index * per_pass
+            _progress.update(segment=index + 1, segments=segments,
+                             step=index * per_pass, steps=per_pass * segments)
         out = _one_pass(pipe, task, stage, ctx,
                         cond=cur if (index or first_is_continuation) else None, log=log)
         new = _frames_from_output(out)
@@ -1354,6 +1421,8 @@ def generate(body: dict) -> dict:
     frames = None
     yielded = 0
     with _lock:
+        _bar["offset"] = 0
+        _bar["pass_steps"] = 0
         _progress.update(active=True, stage="", segment=0, segments=segments,
                          step=0, steps=0)
     try:
@@ -1377,6 +1446,12 @@ def generate(body: dict) -> dict:
                 if image is not None:
                     kw["image"] = image
                     kw["num_cond_frames"] = 1
+                with _lock:
+                    # Refinement is one pass over the whole video, so the segment
+                    # offset from the stage before it must not carry over.
+                    _bar["offset"] = 0
+                    _progress.update(segment=1, segments=1, step=0,
+                                     steps=params["num_inference_steps"])
                 log(f"stage 'refinement': refining {len(frames)} frames")
                 frames = _frames_from_output(pipe.generate_refine(**kw)[0])
             else:
@@ -1386,6 +1461,7 @@ def generate(body: dict) -> dict:
     finally:
         _yield_flag.clear()
         with _lock:
+            _bar["offset"] = 0
             _progress.update(active=False, stage="", step=0)
 
     if stages[-1] == "refinement":

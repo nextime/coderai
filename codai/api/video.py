@@ -86,6 +86,16 @@ def _vid_progress_done():
     _vid_progress["active"] = False
     _vid_progress["phase"] = "idle"
 
+def _vid_progress_total(total: int):
+    """Correct the denominator mid-render, without resetting the bar.
+
+    Some paths only learn how much work there is after the worker has started -- a
+    LongCat request that asked for a duration rather than a segment count is told the
+    segment count by the service -- and restarting the bar there would throw away the
+    elapsed time the rate is derived from."""
+    _vid_progress["total"] = int(total)
+
+
 def _vid_progress_step(step: int):
     _vid_progress["current"] = step
     elapsed = time.monotonic() - _vid_progress["started_at"]
@@ -4240,10 +4250,22 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
                     else "source" if _k == "longcat_source" else _k] = str(model_cfg[_k])
 
     # Total steps across the stages we are about to run, so the bar spans the whole
-    # request rather than restarting per stage.
-    _total = sum(lc.stage_params(s, request.num_inference_steps,
-                                 request.guidance_scale)["num_inference_steps"]
-                 for s in stages)
+    # request rather than restarting per stage -- and across SEGMENTS, because a long
+    # video runs the generative stages once per segment. Counting a segment's worth
+    # made a four-segment render read 0/16 four times over instead of 0/64.
+    def _grand_total(segments: int) -> int:
+        segments = max(1, int(segments or 1))
+        return sum(
+            lc.stage_params(s, request.num_inference_steps,
+                            request.guidance_scale)["num_inference_steps"]
+            * (1 if s == "refinement" else segments)
+            for s in stages)
+
+    # Refinement is a single pass over the finished video, so it is not multiplied.
+    # The service owns the real segment count (it derives one from total_frames when
+    # the caller asked for a duration); the poll loop corrects this once it reports.
+    _segments_assumed = max(1, int(payload.get("num_segments") or 1))
+    _total = _grand_total(_segments_assumed)
     _vid_progress_reset(_total)
 
     _stop = threading.Event()
@@ -4254,7 +4276,7 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     # claimed in its own docstring to "carry cancellation across the process
     # boundary" and never did, so a LongCat render — the longest-running video job
     # there is — was the only one nothing could stop.
-    _lc_steps = sum(lc.STAGE_DEFAULTS.get(_s, (0, 0))[0] for _s in stages) or 1
+    _lc_steps = _total or 1
     _tid = task_registry.register(
         "video", title=(payload.get("prompt") or mode or "")[:80],
         model=model_name or "", total=_lc_steps)
@@ -4270,6 +4292,10 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
         returns with an error. That is also exactly what eviction does to it, so the
         path is already exercised."""
         _seen_stage = ""
+        # What the stage now running reports as its own total, segments included, so a
+        # finished stage contributes what it actually ran rather than a default.
+        _stage_total = 0
+        _live = {"segments": _segments_assumed, "total": _total}
         while not _stop.wait(2.0):
             try:
                 if not _cancelled["flag"]:
@@ -4292,12 +4318,21 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
                 st = str(p.get("stage") or "")
                 if st and st != _seen_stage:
                     if _seen_stage:
-                        _done_steps["base"] += lc.STAGE_DEFAULTS.get(
+                        _done_steps["base"] += _stage_total or lc.STAGE_DEFAULTS.get(
                             _seen_stage, (0, 0))[0]
                     _seen_stage = st
+                    _stage_total = 0
+                _stage_total = int(p.get("steps") or 0) or _stage_total
+                _segs_now = int(p.get("segments") or 0)
+                if _segs_now and _segs_now != _live["segments"]:
+                    _live["segments"] = _segs_now
+                    _live["total"] = _grand_total(_segs_now)
+                    _vid_progress_total(_live["total"])
+                # `step` counts the whole stage, every segment of it: the service adds
+                # the completed segments' offset before reporting the bar's position.
                 _step = _done_steps["base"] + int(p.get("step") or 0)
                 _vid_progress_step(_step)
-                task_registry.step(_tid, _step)
+                task_registry.step(_tid, _step, total=_live["total"])
             except Exception:
                 pass
 
