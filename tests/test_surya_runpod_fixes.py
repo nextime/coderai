@@ -149,7 +149,13 @@ def test_the_ocr_image_bakes_a_surya_venv():
     assert "surya-ocr==0.22.1" in body
     assert "pillow<11" in body, "without the cap the resolver may pull pillow 12 in"
     # The check must prove the pillow pin held, not just that surya imports.
-    assert "pillow" in chk.read_text().lower()
+    body = chk.read_text()
+    assert "pillow" in body.lower()
+    # And it must import module paths that actually exist in 0.22.1 — an
+    # invented one fails the build with ModuleNotFoundError at the deep check.
+    assert "from surya.detection import DetectionPredictor" in body
+    assert "from surya.recognition import RecognitionPredictor" in body
+    assert "surya.common.surya" not in body, "that module path does not exist"
 
 
 # ------------------------------------- bug 3: one image = orchestrator + GUI

@@ -1,9 +1,16 @@
-# Deep check for the surya venv: the vLLM-backed path must import, not just the
-# package. surya's vLLM client is what talks to the pod, and an import error
-# here is the difference between a working /v1/ocr and one that is never ready.
-import surya                                              # noqa
-from surya.common.surya.schema import TaskNames           # noqa
-from PIL import Image
+# Deep check for the surya venv. The generic step already proved `import surya`;
+# this proves the predictors the worker actually constructs are importable, and
+# that the pillow pin held — surya caps pillow<11 and a resolver that quietly
+# brought 12 in would break image loading at the first page, not here.
 import PIL
+from PIL import Image                                       # noqa
+
 assert int(PIL.__version__.split(".")[0]) < 11, f"pillow {PIL.__version__} — surya caps <11"
+
+# 0.17+ layout. codai/ocr/workers/ocr_worker.py falls back to the older
+# surya.model.* path at runtime, so only the modern one is required here.
+from surya.detection import DetectionPredictor              # noqa
+from surya.recognition import RecognitionPredictor          # noqa
+
+import surya
 print("surya", getattr(surya, "__version__", "ok"), "pillow", PIL.__version__)
