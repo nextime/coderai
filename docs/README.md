@@ -34,5 +34,6 @@ reference; these are the deep dives.
 
 | Doc | Subject |
 |---|---|
+| [orchestrator-runpod-guide.md](orchestrator-runpod-guide.md) | Install CoderAI as a **GPU-less RunPod orchestrator**: register models, scale pods, watch the cost. The operator's path for a host with no GPU |
 | [install-from-packages.md](install-from-packages.md) | `docker pull ghcr.io/nextime/coderai` — the full image and the nineteen capability images, Linux, Windows, offline |
 | [reverse-proxy-nginx.md](reverse-proxy-nginx.md) | nginx at root, on a subdomain, or under a sub-path |
