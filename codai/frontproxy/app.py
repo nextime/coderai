@@ -23,6 +23,18 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+#: /v1 paths that must answer WITHOUT credentials. Readiness probes first: a
+#: probe behind auth is read as "backend down" by every health checker, and
+#: surya-ocr's vLLM client probes {service_url}/health. The progress endpoints
+#: are polled by the browser mid-generation and carry no secrets.
+_API_AUTH_EXEMPT = {
+    "/v1/health",
+    "/v1/images/progress",
+    "/v1/video/progress",
+    "/v1/audio/progress",
+    "/v1/loras/progress",
+}
 from starlette.background import BackgroundTask
 
 from codai.frontproxy.registry import EngineRegistry
@@ -2777,9 +2789,87 @@ def _front_log_config(debug_web: bool):
 
 def build_app(config, config_dir=None) -> FastAPI:
     front = FrontProxy(config, config_dir=config_dir)
+    def _api_request_authorised(request) -> bool:
+        """True when this inbound /v1 request carries acceptable credentials.
+
+        Mirrors codai.api.ratelimit.BearerAuthMiddleware so the front and the
+        engine agree: the env token a capability image is locked with, the shared
+        cluster token a head presents, an API token from auth.json, or a
+        logged-in browser session. One difference on purpose: the front does NOT
+        fall open when nothing is configured. That fallback is why an exposed
+        orchestrator served /v1 to anyone.
+        """
+        import hmac as _hmac
+        import os
+        auth = request.headers.get("authorization", "") or ""
+        tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+
+        # In-process requests from the ASGI broker bridge carry no real token.
+        if request.scope.get("server") == ("internal", 80):
+            return True
+        # Requests the broker relays on behalf of an already-authenticated
+        # caller: the aisbf layer authenticated them, and the marker is the
+        # internal token, unforgeable by an external client.
+        _int = os.environ.get("CODERAI_INTERNAL_TOKEN") or getattr(front, "internal_token", "")
+        if _int and request.headers.get("x-coderai-broker-authed", "") == _int:
+            return True
+        if tok:
+            _env = os.environ.get("CODERAI_API_TOKEN", "")
+            if _env and _hmac.compare_digest(tok, _env):
+                return True
+            ccfg = getattr(config, "cluster", None)
+            shared = (getattr(ccfg, "token", "") or "") if ccfg is not None else ""
+            if not shared:
+                shared = os.environ.get("CODERAI_CLUSTER_TOKEN", "") or ""
+            if shared and _hmac.compare_digest(tok, shared):
+                return True
+        if not config_dir:
+            # No user database to check against and no env token matched. Refuse:
+            # an install with no credentials must not be an open relay.
+            return False
+        try:
+            from pathlib import Path as _Path
+            from codai.admin.auth import SessionManager as _SM
+            sm = _SM(_Path(config_dir))
+            if tok and sm.verify_token(tok):
+                return True
+            cookie = request.cookies.get("session", "") or ""
+            if cookie.endswith(".MUST_CHANGE"):
+                cookie = cookie[:-12]
+            if cookie and sm.validate_session(cookie):
+                return True
+        except Exception:
+            return False
+        return False
+
     app = FastAPI(title="CoderAI Front", docs_url=None, redoc_url=None,
                   openapi_url=None)
     app.state.front = front
+
+    # ---------------------------------------------------------------- API auth
+    # The front is the PUBLIC face, and until now it was not an enforcement
+    # point: it answers some /v1 paths from its own registry (/v1/models) and
+    # proxies the rest, so whether a request needed a token depended on which
+    # component happened to serve it. Reproduced on a published image with no
+    # Authorization header at all: GET /v1/models -> 200. Enforce here, with the
+    # same rules the engine uses, so the answer no longer depends on routing.
+    @app.middleware("http")
+    async def _api_bearer_gate(request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/v1/"):
+            return await call_next(request)
+        # Readiness and progress endpoints must answer without credentials: a
+        # probe that 401s is read as "backend down" by every health checker.
+        if path in _API_AUTH_EXEMPT:
+            return await call_next(request)
+        if _api_request_authorised(request):
+            return await call_next(request)
+        return JSONResponse(
+            {"error": {"message": "Missing or invalid API key. Send "
+                                  "'Authorization: Bearer <token>' — create one "
+                                  "in Admin -> Tokens.",
+                       "type": "invalid_request_error", "code": "invalid_api_key"}},
+            status_code=401, headers={"WWW-Authenticate": "Bearer"})
 
     @app.on_event("startup")
     async def _startup():
