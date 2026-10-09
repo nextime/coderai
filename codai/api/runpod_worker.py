@@ -42,6 +42,18 @@ class RunpodModelConfig:
     cloud_types: list = field(default_factory=lambda: ["SECURE"])   # allowed pools
     selection_criteria: str = "cheaper"      # cheaper | faster
     gpu_type: str = ""                       # explicit RunPod gpuTypeId (optional)
+    # Ordered PREFERENCE instead of a single card: tried best-first, and with
+    # allow_other_gpus the search falls through to anything else that fits.
+    # `gpu_type` above is folded in as a single-entry preference.
+    gpu_types: list = field(default_factory=list)
+    # When every preferred card is unavailable, may we rent a different one that
+    # still satisfies min_vram_gb and max_hourly_usd? OFF by default: a pinned
+    # card is sometimes pinned for a reason (an architecture a kernel needs, or
+    # a price), and silently renting something else would be a surprise. ON is
+    # what you want for "serve the request, A40 or not" — and then the VRAM
+    # floor and the $/hr ceiling are the real constraints, so check that
+    # something actually fits under them.
+    allow_other_gpus: bool = False
     min_vram_gb: float = 0.0
     max_hourly_usd: float = 0.0              # per-model $/hr GPU ceiling (0 = none)
     # GPUs per pod. RunPod rents multi-GPU pods, and a 154 GB model on one 80 GB
@@ -1366,6 +1378,43 @@ def _as_int(v, default=0):
 _DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
+def _parse_name_list(value) -> list:
+    """An ordered list of GPU names from a list or a comma string.
+
+    Comma only, not whitespace: a GPU display name has spaces in it ("NVIDIA
+    RTX A6000"), so splitting on those would turn one card into three.
+    """
+    if value in (None, ""):
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = []
+    for raw in items:
+        tok = str(raw).strip()
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _gpu_matches(gpu: dict, want: str) -> bool:
+    """Whether a catalogue entry is the card `want` names.
+
+    Exact on the id or the display name, case-insensitively, and tolerant of a
+    missing "NVIDIA " prefix so "A40" finds "NVIDIA A40". NOT a substring match:
+    "A40" would otherwise also match "NVIDIA RTX A4000", which is a 16 GB card
+    where someone asked for a 48 GB one.
+    """
+    w = (want or "").strip().lower()
+    if not w:
+        return False
+    for field_ in (gpu.get("id"), gpu.get("display_name")):
+        name = str(field_ or "").strip().lower()
+        if not name:
+            continue
+        if name == w or name.removeprefix("nvidia ") == w.removeprefix("nvidia "):
+            return True
+    return False
+
+
 def _parse_dc_list(value) -> list:
     """A region allow-list from a list or a comma/space string, order kept.
 
@@ -1530,6 +1579,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.network_volume_id = (b.get("network_volume_id") or "").strip()
     cfg.global_volume_id = (b.get("global_volume_id") or "").strip()
     cfg.data_centers = _parse_dc_list(b.get("data_centers"))
+    cfg.gpu_types = _parse_name_list(b.get("gpu_types"))
+    cfg.allow_other_gpus = _as_bool(b.get("allow_other_gpus"), cfg.allow_other_gpus)
     if cfg.network_volume_id:
         # RunPod offers network volumes on Secure Cloud only; leaving COMMUNITY
         # in the list just produces candidates the attach would reject.
@@ -1691,11 +1742,24 @@ def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
     # holds N times the VRAM, so both the ceiling and the VRAM floor are checked
     # against the pod, not the card — or a 4-GPU pod would pass a $1/hr ceiling
     # at $0.90 a card and bill $3.60.
-    explicit = (mcfg.gpu_type or getattr(account_cfg, "default_gpu_type", "") or "").strip()
+    # Preference, not a filter. The old single `gpu_type` was a hard filter, so
+    # "A40" meant "A40 or nothing" — and when RunPod had no A40 the request
+    # failed instead of taking a card that fit just as well.
+    prefer = ([p for p in (getattr(mcfg, "gpu_types", None) or []) if str(p).strip()]
+              or ([mcfg.gpu_type] if mcfg.gpu_type.strip() else [])
+              or ([getattr(account_cfg, "default_gpu_type", "")]
+                  if str(getattr(account_cfg, "default_gpu_type", "") or "").strip()
+                  else []))
+    allow_other = bool(getattr(mcfg, "allow_other_gpus", False))
 
-    cands = []   # (price, is_spot, cloud_type, gpu, on_demand_price)
+    cands = []   # (pref_rank, price, is_spot, cloud_type, gpu, on_demand_price)
     for g in catalog:
-        if explicit and g["id"] != explicit and g["display_name"] != explicit:
+        rank = len(prefer)
+        for idx_p, want in enumerate(prefer):
+            if _gpu_matches(g, want):
+                rank = idx_p
+                break
+        if prefer and rank == len(prefer) and not allow_other:
             continue
         mem = (g.get("memory_gb") or 0) * n
         if mcfg.min_vram_gb and mem < mcfg.min_vram_gb:
@@ -1712,26 +1776,31 @@ def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
                 price = price * n
                 if ceiling > 0 and price > ceiling:
                     continue
-                cands.append((price, is_spot, ct, g, (on_demand or price) * n))
+                cands.append((rank, price, is_spot, ct, g, (on_demand or price) * n))
     if not cands:
         raise RunpodError(
             f"RunPod: no GPU in pools {allowed} with ≥{mcfg.min_vram_gb}GB under "
             f"${ceiling}/hr (spot={'on' if mcfg.allow_spot else 'off'}"
-            + (f", gpu={explicit}" if explicit else "") + ").")
+            + (f", preferred={prefer}" if prefer else "")
+            + (", allow_other_gpus=off — set it to let another card that fits "
+               "serve the request" if prefer and not allow_other else "") + ").")
 
     if (mcfg.selection_criteria or "cheaper").lower() == "faster":
         # Reliability + throughput: SECURE before COMMUNITY, on-demand before spot,
         # more VRAM (throughput proxy) first, then cheapest.
         ct_rank = {"SECURE": 0, "COMMUNITY": 1}
-        cands.sort(key=lambda c: (ct_rank.get(c[2], 9), c[1] is True,
-                                  -(c[3].get("memory_gb") or 0), c[0]))
+        cands.sort(key=lambda c: (c[0], ct_rank.get(c[3], 9), c[2] is True,
+                                  -(c[4].get("memory_gb") or 0), c[1]))
     else:  # cheaper
-        cands.sort(key=lambda c: (c[0], c[1] is False))
+        cands.sort(key=lambda c: (c[0], c[1], c[2] is False))
+    # A preferred card always sorts ahead of a fallback, whatever the criteria:
+    # the point of naming one is to get it when it is there.
     return [{"gpu_type_id": g["id"],
              "display_name": (f"{n}x {g['display_name']}" if n > 1 else g["display_name"]),
              "memory_gb": (g.get("memory_gb") or 0) * n, "cloud_type": ct, "price": price,
-             "is_spot": is_spot, "bid": on_demand if is_spot else 0.0, "gpu_count": n}
-            for (price, is_spot, ct, g, on_demand) in cands]
+             "is_spot": is_spot, "bid": on_demand if is_spot else 0.0, "gpu_count": n,
+             "preferred": rank < len(prefer)}
+            for (rank, price, is_spot, ct, g, on_demand) in cands]
 
 
 def _select_gpu(client, mcfg: "RunpodModelConfig", account_cfg) -> dict:
@@ -2158,9 +2227,13 @@ class RunpodPodPool:
                     + str(self.model_key)[:20].replace("/", "_").replace(" ", "_")
                     + "-" + uuid.uuid4().hex[:6])
             _dc = sel.get("_dc") or self._data_center()
+            # Say so when this is not the card that was asked for. Renting a
+            # different GPU than the configuration names is correct here — it is
+            # what allow_other_gpus is for — but it must never be silent.
+            _alt = "" if sel.get("preferred", True) else " [FALLBACK — no preferred card available]"
             print(f"[runpod] provisioning pod for {self.model_key!r}: {sel['display_name']} "
                   f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr"
-                  + (f" in {_dc}" if _dc else " (region: RunPod's choice)"),
+                  + (f" in {_dc}" if _dc else " (region: RunPod's choice)") + _alt,
                   flush=True)
             try:
                 _disk_gb, _disk_note = disk_for(

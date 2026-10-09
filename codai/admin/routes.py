@@ -3105,7 +3105,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   "network_volume_id", "volume_mount_path", "volume_path",
                   "venv_name", "slim_image",
                   # region + warm-pod schedule
-                  "data_center", "schedule_start", "schedule_end", "schedule_tz"):
+                  "data_center", "schedule_start", "schedule_end", "schedule_tz",
+                  # a GLOBAL (region-independent) volume
+                  "global_volume_id"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
@@ -3119,6 +3121,20 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             ct = None
         if ct:
             rpo["cloud_types"] = ct
+        # Ordered lists: regions to try, and preferred GPUs. Order IS meaning
+        # here (it is the fallback order), so neither is sorted or upper-cased
+        # beyond what the region ids need. GPU names split on commas only —
+        # "NVIDIA RTX A6000" has spaces in it.
+        dcs = src.get("data_centers")
+        if isinstance(dcs, str):
+            dcs = [d.strip() for d in dcs.replace(",", " ").split() if d.strip()]
+        if isinstance(dcs, list) and dcs:
+            rpo["data_centers"] = [str(d).strip().upper() for d in dcs if str(d).strip()]
+        gts = src.get("gpu_types")
+        if isinstance(gts, str):
+            gts = [g.strip() for g in gts.split(",") if g.strip()]
+        if isinstance(gts, list) and gts:
+            rpo["gpu_types"] = [str(g).strip() for g in gts if str(g).strip()]
         # schedule_days: list of 0=Mon…6=Sun, or a comma string of those/names
         sd = src.get("schedule_days")
         if isinstance(sd, str):
@@ -3127,7 +3143,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             rpo["schedule_days"] = [str(d).strip().lower() for d in sd if str(d).strip()]
         # bools
         for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm",
-                  "model_url_is_tar", "venv_on_volume", "schedule_enabled"):
+                  "model_url_is_tar", "venv_on_volume", "schedule_enabled",
+                  # rent a different card when no preferred one is free, and let
+                  # a client lease warm pods
+                  "allow_other_gpus", "allow_client_scale"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")
@@ -3139,7 +3158,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   # how hard the POD's own server may be driven
                   "pod_max_parallel_requests", "pod_queue_max_size",
                   "boot_timeout_s", "load_timeout_s", "min_workers", "max_workers",
-                  "gpu_count"):
+                  "gpu_count", "client_scale_ttl_s"):
             v = src.get(k)
             if v not in (None, ""):
                 try:

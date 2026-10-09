@@ -608,6 +608,8 @@ Four numbers decide the shape of a pool:
 | `client_scale_ttl_s` | how long such a lease lasts unless renewed (default 1800). A lease that never expired would be a bill that never stopped. |
 | `data_centers` | several acceptable regions, tried in order on a capacity miss — how you say "anywhere in the EU". A single `data_center` pins one region; blank lets RunPod pick any region **on earth**. |
 | `global_volume_id` | a RunPod **global** volume (region-independent). Unlike `network_volume_id` it does NOT pin the pod's region, which is the only reason to use one. |
+| `gpu_types` | ordered GPU **preference**, best first (comma-separated; names have spaces, so commas only). |
+| `allow_other_gpus` | when no preferred card is free, rent another that still fits `min_vram_gb` and `max_hourly_usd`. Off by default. |
 
 **Then the two that are easy to miss**, and the reason a pod can look slow while
 its GPU is idle:
@@ -694,6 +696,44 @@ Caveats worth knowing before you rely on it:
 * GPU pods and GPU serverless only; CPU is not supported. And if the account
   balance reaches $0 the volume is flagged and permanently deleted after 15
   days.
+
+---
+
+### When the card you asked for is not available
+
+`gpu_type` is a **filter**, not a preference: `"NVIDIA A40"` has always meant
+"an A40 or nothing", so when RunPod has no A40 free the request fails rather
+than taking a card that would have served it just as well.
+
+To let it fall through:
+
+```json
+"gpu_types": "NVIDIA A40,NVIDIA RTX A6000",
+"allow_other_gpus": true,
+"min_vram_gb": 40,
+"max_hourly_usd": 1.20
+```
+
+* `gpu_types` is an ordered **preference**. A preferred card always ranks ahead
+  of a fallback, whatever `selection_criteria` says — the point of naming one is
+  to get it when it is there.
+* `allow_other_gpus` is what permits anything else. It is **off by default**: a
+  pinned card is sometimes pinned for a reason, and quietly renting a different
+  one would be a surprise on the invoice.
+* **`min_vram_gb` and `max_hourly_usd` are the real constraints** once the
+  fallback is on, and this is the part that catches people. With
+  `max_hourly_usd: 0.60`, an A40 at $0.59 fits and nothing else does — so the
+  fallback finds nothing and you are back where you started. Raise the ceiling
+  to the most you are willing to pay for the *alternative*, and keep
+  `min_vram_gb` honest so a cheap 16 GB card cannot win a job that needs 48.
+* A fallback is never silent. The provisioning line says
+  `[FALLBACK — no preferred card available]`, and each ranked option carries a
+  `preferred` flag.
+
+Name matching is exact on the id or display name, case-insensitive, and
+tolerates a missing `NVIDIA ` prefix — so `A40` finds `NVIDIA A40`. It is
+deliberately **not** a substring match: `A40` would otherwise also match
+`NVIDIA RTX A4000`, a 16 GB card, for a job that asked for 48.
 
 ---
 
