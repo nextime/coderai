@@ -2309,12 +2309,23 @@ class RunpodPodPool:
         with self._cv:
             if any(p.healthy for p in self.pods):
                 return
-        for _ in range(want):
-            try:
-                self._provision_one()
-            except Exception as exc:
-                print(f"[runpod] ensure_ready: {exc}", flush=True)
-                raise
+            # A pod takes MINUTES to answer its health probe, and it is not in
+            # self.pods until it does. Without this flag the 15 s scaler sees
+            # "0 healthy, floor 1" and rents a second one — two A40s where the
+            # configuration asked for one.
+            if self._provisioning:
+                return
+            self._provisioning = True
+        try:
+            for _ in range(want):
+                try:
+                    self._provision_one()
+                except Exception as exc:
+                    print(f"[runpod] ensure_ready: {exc}", flush=True)
+                    raise
+        finally:
+            with self._cv:
+                self._provisioning = False
 
     def _pick(self, healthy: list, affinity: str):
         """Which pod serves this request: the one that already holds the
@@ -2601,11 +2612,23 @@ class RunpodPodPool:
         # Keep min_pods warm.
         with self._cv:
             healthy_n = len([p for p in self.pods if p.healthy])
-        if healthy_n < keep_min and not self._closed:
+        if healthy_n < keep_min and not self._closed and not self._provisioning:
+            # One already on the way (from here, from ensure_ready, or from a
+            # sibling engine sharing this pool) is one pod, not none: topping up
+            # against a booting pod is how a warm floor of 1 became two.
+            if sibling_is_provisioning(str(self.model_key)):
+                return
+            with self._cv:
+                if self._provisioning:
+                    return
+                self._provisioning = True
             try:
                 self._provision_one()
             except Exception as exc:
                 print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
+            finally:
+                with self._cv:
+                    self._provisioning = False
 
     def close(self):
         self._closed = True
@@ -2949,7 +2972,13 @@ def set_client_pods(model: str, pods: int) -> dict:
     # Creating the pool is the point: asking for a warm floor on a model nobody
     # has called yet is exactly when it is worth pre-warming.
     pool = get_model_pod_pool(key, _model_entry(key), block)
-    return pool.set_client_floor(pods)
+    out = pool.set_client_floor(pods)
+    # Answer with the name the client asked about, not the internal pool key:
+    # several models may share one pool, and "pool:digesta-qwen38" is not
+    # something the caller sent or can look up.
+    out["pool"] = out["model"]
+    out["model"] = key
+    return out
 
 
 def pods_status() -> list:

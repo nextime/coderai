@@ -320,3 +320,41 @@ def test_a_client_lease_can_warm_at_boot_even_out_of_hours():
               schedule_start="08:00", schedule_end="20:00")
     p.set_client_floor(2)
     assert p.effective_min_pods() >= 2
+
+
+# ------------------------------------- not renting two pods for a floor of one
+
+def test_ensure_ready_marks_the_pool_as_provisioning():
+    """A pod is not in self.pods until it answers its health probe, minutes
+    later. Without this flag the 15 s scaler reads "0 healthy, floor 1" and
+    rents a second one — which is exactly what happened on the first live
+    boot: two A40s where the configuration asked for one."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def ensure_ready")[1].split("def _pick")[0]
+    assert "self._provisioning = True" in blk
+    assert "finally:" in blk and "self._provisioning = False" in blk
+    assert blk.index("if self._provisioning:") < blk.index("self._provisioning = True")
+
+
+def test_the_warm_top_up_does_not_stack_on_a_booting_pod():
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def maintain")[1].split("def close")[0]
+    assert "not self._provisioning" in blk
+    assert "sibling_is_provisioning" in blk
+
+
+def test_the_demand_path_already_had_the_guard_and_keeps_it():
+    """_should_grow has checked it all along; this pins that it still does, so
+    the two paths cannot drift apart again."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def _should_grow")[1].split("def _grow_in_background")[0]
+    assert "or self._provisioning" in blk
+
+
+def test_the_answer_names_the_model_the_client_asked_about():
+    """Models sharing a pool answer with the pool key otherwise, which the
+    caller never sent and cannot look up."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def set_client_pods")[1]
+    assert 'out["model"] = key' in blk
+    assert 'out["pool"]' in blk
