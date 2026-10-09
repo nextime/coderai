@@ -536,7 +536,12 @@ def test_a_surviving_pods_token_is_remembered_across_a_restart(tmp_path, monkeyp
     # The pod the dead process rented, with the token it was launched with.
     rw.register_pod("pod-survivor", "capability:embeddings",
                     "http://pod-a:8000", "cra-original")
-    monkeypatch.setattr(rw.os, "getpid", lambda: 424242)   # a NEW process
+    # A NEW process. Patching only os.getpid() used to stand in for this, but
+    # a pid is not an identity: inside a container the engine comes up as the
+    # same pid every boot, which is how a restart came to rent a second pod
+    # beside the one it already had. The nonce is what distinguishes them.
+    monkeypatch.setattr(rw, "_PROC_ID", "424242-aaaaaaaaaaaa")
+    monkeypatch.setattr(rw.os, "getpid", lambda: 424242)
 
     pod_id, url, key, rate = rw.find_shared_pod("capability:embeddings",
                                           api_key="cra-freshly-generated")

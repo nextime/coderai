@@ -471,3 +471,47 @@ def test_the_reaper_prunes_entries_for_pods_that_are_gone():
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def reap_orphans")[1].split("def _scaler_loop")[0]
     assert "known - live" in blk and "unregister_pod(gone)" in blk
+
+
+# ------------------------------- the pid in a container is not an identity
+
+def test_a_pod_from_a_previous_container_is_not_mistaken_for_ours():
+    """THE root cause of the repeated double-renting: inside a container the
+    engine comes up as the same pid every boot (74, on the production host), so
+    'pid == os.getpid()' read the PREVIOUS container's pod as our own and
+    skipped it — and the warm path rented another A40 beside it. Three restarts,
+    three extra A40s."""
+    import os
+    same_pid_other_process = {"pid": os.getpid(), "proc": "74-deadbeefcafe"}
+    assert rw._is_this_process(same_pid_other_process) is False
+    assert rw._is_this_process({"pid": os.getpid(), "proc": rw._PROC_ID}) is True
+
+
+def test_an_entry_from_before_the_nonce_falls_back_to_the_pid():
+    import os
+    assert rw._is_this_process({"pid": os.getpid()}) is True
+    assert rw._is_this_process({"pid": os.getpid() + 1}) is False
+
+
+def test_the_nonce_is_recorded_so_the_next_boot_can_tell():
+    import json
+    import tempfile
+    d = tempfile.mkdtemp()
+    saved = rw._pod_registry_path
+    rw._pod_registry_path = lambda: d + "/pods.json"
+    try:
+        rw.register_pod("p1", "pool:x", "", "tok")
+        rec = json.load(open(d + "/pods.json"))["p1"]
+        assert rec["proc"] == rw._PROC_ID
+        assert rec["pid"] == __import__("os").getpid()   # kept for compatibility
+    finally:
+        rw._pod_registry_path = saved
+
+
+def test_the_registry_helpers_no_longer_compare_pids_directly():
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    for fn, end in (("def sibling_is_provisioning", "def find_shared_pod"),
+                    ("def find_shared_pod", "def unregister_pod")):
+        blk = src.split(fn)[1].split(end)[0]
+        assert "_is_this_process(info)" in blk, fn
+        assert 'info.get("pid") == mine' not in blk, fn

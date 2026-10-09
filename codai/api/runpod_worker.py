@@ -3111,6 +3111,25 @@ def _registry_update(fn):
         return {}
 
 
+#: This process, distinctly. os.getpid() is NOT enough: inside a container the
+#: engine comes up as the same pid on every boot (74, here), so a pod registered
+#: by the PREVIOUS container read as "our own" and was skipped — the restart
+#: rented another A40 beside it, every time. Observed three times in a row.
+_PROC_ID = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def _is_this_process(info: dict) -> bool:
+    """Whether a registry entry was written by THIS process.
+
+    Falls back to the pid for an entry written before the nonce existed, which
+    is the old behaviour and no worse than it was.
+    """
+    proc = str(info.get("proc") or "")
+    if proc:
+        return proc == _PROC_ID
+    return info.get("pid") == os.getpid()
+
+
 def register_pod(pod_id: str, pool_key: str = "", url: str = "",
                  api_key: str = "", hourly_usd: float = 0.0) -> None:
     """Record a pod as owned by this deployment.
@@ -3128,7 +3147,8 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
     if not pod_id:
         return
     _registry_update(lambda d: d.__setitem__(
-        str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time(),
+        str(pod_id), {"pool": str(pool_key), "pid": os.getpid(),
+                      "proc": _PROC_ID, "at": time.time(),
                       "url": str(url or ""), "key": str(api_key or ""),
                       # So a pod adopted after a restart is still attributed its
                       # real $/hr instead of looking free.
@@ -3146,12 +3166,11 @@ def sibling_is_provisioning(pool_key: str) -> bool:
     data = _registry_update(lambda d: False)
     if not isinstance(data, dict):
         return False
-    mine = os.getpid()
     now = time.time()
     for info in data.values():
         if not isinstance(info, dict) or info.get("pool") != str(pool_key):
             continue
-        if info.get("pid") == mine or info.get("url"):
+        if _is_this_process(info) or info.get("url"):
             continue
         # Only while it could plausibly still be booting; a stale entry from a
         # dead process must not block provisioning forever.
@@ -3182,11 +3201,10 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
     data = _registry_update(lambda d: False)
     if not isinstance(data, dict):
         return None, "", ""
-    mine = os.getpid()
     for pod_id, info in data.items():
         if not isinstance(info, dict) or info.get("pool") != str(pool_key):
             continue
-        if info.get("pid") == mine:
+        if _is_this_process(info):
             continue                       # our own; the local pool handles it
         url = str(info.get("url") or "")
         if not url:
