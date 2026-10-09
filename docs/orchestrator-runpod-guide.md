@@ -681,12 +681,23 @@ Caveats worth knowing before you rely on it:
 * **It has to be created in the RunPod console** — Storage → **+ New volume** →
   **Global volume**. The public API still refuses: `POST /v2/network-volumes`
   allows only `STANDARD` and `HIGH_PERFORMANCE` and demands a `dataCenter`.
-* **Attaching is console-documented only.** No field appears in the Pod API
-  reference, and the v1 REST validator accepts unknown body keys silently — so
-  a wrong name cannot be caught by probing, it just yields a pod with no volume
-  that re-downloads its weights. coderai sends `globalNetworkVolumeId`,
-  overridable with `CODERAI_RUNPOD_GLOBAL_VOLUME_FIELD`. **Verify on the first
-  pod** that the weights are really at the mount.
+* **There is no API to attach one — at all, yet.** Probed 2026-10-09 against
+  every surface coderai can use, each with a body valid enough that the
+  extra-key check actually runs:
+
+  | surface | answer |
+  |---|---|
+  | `POST /v1/pods` (REST) | `key provided in request body which is not in input schema` |
+  | `podFindAndDeployOnDemand` (GraphQL) | field not defined by the input type |
+  | `POST /v2/pods` | `additional properties … not allowed` |
+  | templates (`mounts`) | every candidate key refused |
+
+  So `global_volume_id` is wired and inert: coderai sends
+  `globalNetworkVolumeId`, and when the API refuses it the create is **retried
+  without the field** rather than failing — the pod boots and downloads its
+  weights, and the reason is logged once per process. Set
+  `CODERAI_RUNPOD_GLOBAL_VOLUME_FIELD` the day RunPod publishes the real name
+  and it starts attaching with no code change.
 * **Read-heavy only.** No file locking, no atomic rename, eventual consistency,
   last-write-wins on concurrent writes. Fine for weights, adapters, tokenizers
   and configs; wrong for checkpoints — use a network volume to train.

@@ -301,3 +301,58 @@ def test_the_two_ordered_lists_keep_their_order_through_the_ui():
     block = src.split("# Per-model runpod block")[1].split("# Per-model `host` block")[0]
     seg = block.split('rpo["data_centers"]')[0][-500:] + block.split('rpo["data_centers"]')[1][:400]
     assert "sorted(" not in seg
+
+
+# ------- a configured global volume must not take every pod down with it
+
+def test_the_rejection_is_recognised_in_both_api_wordings():
+    from codai.api import runpod_client as rc
+    f = rc.GLOBAL_VOLUME_FIELD
+    assert rc._global_field_refused(
+        f'{{"error":"Extra input keys provided in request body",'
+        f'"problems":["key provided in request body which is not in input '
+        f'schema: \'{f}\'"]}}') is True
+    assert rc._global_field_refused(
+        f'{{"errors":["$: additional properties \'{f}\' not allowed"]}}') is True
+    assert rc._global_field_refused_gql(
+        f'RunPod GraphQL error: Field "{f}" is not defined by type '
+        f'"PodFindAndDeployOnDemandInput"') is True
+
+
+def test_an_unrelated_failure_is_not_mistaken_for_it():
+    """Otherwise a real error would be retried with the volume stripped and the
+    pod would come up silently wrong."""
+    from codai.api import runpod_client as rc
+    assert rc._global_field_refused('{"error":"no capacity for NVIDIA A40"}') is False
+    assert rc._global_field_refused('{"error":"additional properties \'foo\' '
+                                    'not allowed"}') is False
+    assert rc._global_field_refused_gql("RunPod GraphQL error: unauthorized") is False
+    assert rc._global_field_refused("") is False
+
+
+def test_both_create_paths_retry_without_the_field():
+    """REST and GraphQL are two code paths; a guard on one leaves the other
+    failing every pod."""
+    src = (ROOT / "codai/api/runpod_client.py").read_text()
+    assert src.count("_warn_global_volume_unsupported(global_volume_id)") == 2
+    assert src.count("pop(GLOBAL_VOLUME_FIELD, None)") == 2
+
+
+def test_the_warning_is_said_once_not_once_per_pod():
+    from codai.api import runpod_client as rc
+    saved = rc._GLOBAL_VOLUME_WARNED
+    rc._GLOBAL_VOLUME_WARNED = False
+    try:
+        rc._warn_global_volume_unsupported("gv-1")
+        assert rc._GLOBAL_VOLUME_WARNED is True
+        rc._warn_global_volume_unsupported("gv-1")    # must not print again
+    finally:
+        rc._GLOBAL_VOLUME_WARNED = saved
+
+
+def test_the_warning_says_what_to_do_about_it():
+    src = (ROOT / "codai/api/runpod_client.py").read_text()
+    blk = src.split("def _warn_global_volume_unsupported")[1].split("class ")[0]
+    assert "console-only" in blk
+    assert "CODERAI_RUNPOD_GLOBAL_VOLUME_FIELD" in blk
+    assert "download their weights" in blk    # names the real consequence

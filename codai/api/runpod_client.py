@@ -38,6 +38,42 @@ class RunpodError(RuntimeError):
     """A RunPod API call failed (network, auth, or GraphQL error)."""
 
 
+#: Said once per process, not once per pod: the scaler would otherwise repeat it
+#: every boot.
+_GLOBAL_VOLUME_WARNED = False
+
+
+def _global_field_refused(text: str) -> bool:
+    """Whether a create failed *because* of the global-volume field.
+
+    RunPod words it two ways — "not in input schema" (v1) and "additional
+    properties … not allowed" (v2) — and both name the field.
+    """
+    t = (text or "")
+    return GLOBAL_VOLUME_FIELD in t and (
+        "not in input schema" in t or "not allowed" in t or "Extra input keys" in t)
+
+
+def _global_field_refused_gql(text: str) -> bool:
+    """GraphQL's wording for an input field its schema does not define."""
+    t = (text or "")
+    return GLOBAL_VOLUME_FIELD in t and (
+        "is not defined by type" in t or "invalid value" in t or "Unknown" in t)
+
+
+def _warn_global_volume_unsupported(volume_id: str) -> None:
+    global _GLOBAL_VOLUME_WARNED
+    if _GLOBAL_VOLUME_WARNED:
+        return
+    _GLOBAL_VOLUME_WARNED = True
+    print(f"[runpod] global volume {volume_id!r} is configured but RunPod's API "
+          f"rejects {GLOBAL_VOLUME_FIELD!r}: global volumes are console-only for "
+          "now (checked against v1 REST, GraphQL, v2 pods and templates). Pods "
+          "will boot WITHOUT it and download their weights each time. Set "
+          "CODERAI_RUNPOD_GLOBAL_VOLUME_FIELD once RunPod publishes the field "
+          "name.", flush=True)
+
+
 def _mask(key: str) -> str:
     if not key:
         return "<none>"
@@ -288,7 +324,18 @@ class RunpodClient:
         mutation Deploy($input: {var_type}!) {{
           {mutation}(input: $input) {{ id imageName machineId }}
         }}"""
-        data = self._gql(q, {"input": common}, timeout=90.0)
+        try:
+            data = self._gql(q, {"input": common}, timeout=90.0)
+        except RunpodError as exc:
+            # Same guard as the REST path: GraphQL calls the global-volume field
+            # an undefined input field, and a configured global volume must not
+            # fail every create while RunPod keeps it console-only.
+            if not (global_volume_id and GLOBAL_VOLUME_FIELD in common
+                    and _global_field_refused_gql(str(exc))):
+                raise
+            _warn_global_volume_unsupported(global_volume_id)
+            common.pop(GLOBAL_VOLUME_FIELD, None)
+            data = self._gql(q, {"input": common}, timeout=90.0)
         node = data.get(mutation) or {}
         pod_id = node.get("id")
         if not pod_id:
@@ -330,10 +377,20 @@ class RunpodClient:
         if is_spot:
             body["interruptible"] = True
             body["bidPerGpu"] = float(bid_per_gpu)
-        r = requests.post(f"{rest}/pods", json=body,
-                          headers={"Authorization": f"Bearer {self._api_key}",
-                                   "Content-Type": "application/json"},
-                          timeout=90)
+        hdrs = {"Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json"}
+        r = requests.post(f"{rest}/pods", json=body, headers=hdrs, timeout=90)
+        # RunPod has no public API for attaching a GLOBAL volume yet: v1 REST,
+        # GraphQL, the v2 pods API and templates all reject the field (probed
+        # 2026-10-09). Sending it therefore fails the whole create — so a
+        # configured global volume must not take every pod down with it. Drop
+        # the field and rent the pod without it: the weights get downloaded
+        # instead of mounted, which is slower and costs bandwidth, and is far
+        # better than serving nothing. Said once per process, loudly.
+        if r.status_code >= 400 and global_volume_id and _global_field_refused(r.text):
+            _warn_global_volume_unsupported(global_volume_id)
+            body.pop(GLOBAL_VOLUME_FIELD, None)
+            r = requests.post(f"{rest}/pods", json=body, headers=hdrs, timeout=90)
         if r.status_code >= 400:
             raise RunpodError(f"RunPod REST create failed ({r.status_code}): "
                               f"{(r.text or '')[:400]}")
