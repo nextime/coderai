@@ -428,3 +428,46 @@ def test_the_registry_records_the_rate_so_adoption_can_read_it():
             rw._pod_health_ok = saved_health
     finally:
         rw._pod_registry_path = saved
+
+
+def test_the_warm_path_waits_for_a_pod_that_is_still_booting():
+    """A booting pod is registered with no URL, so there is nothing to adopt
+    yet — but it is one pod on the way, not none. An upgrade landing during the
+    ~6 minutes an image pull takes would otherwise rent a second one, and the
+    upgrade runs hourly."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    ready = src.split("def ensure_ready")[1].split("def _pick")[0]
+    assert "sibling_is_provisioning" in ready
+    assert ready.index("sibling_is_provisioning") < ready.index("self._provision_one()")
+
+
+def test_a_booting_pod_from_a_previous_process_counts():
+    """The whole point after a restart: the pid differs, so the entry is not
+    'ours', and it has no url yet."""
+    import json
+    import os
+    import tempfile
+    d = tempfile.mkdtemp()
+    saved = rw._pod_registry_path
+    rw._pod_registry_path = lambda: d + "/pods.json"
+    try:
+        json.dump({"p1": {"pool": "pool:x", "pid": os.getpid() + 1,
+                          "at": rw.time.time(), "url": "", "key": "k"}},
+                  open(d + "/pods.json", "w"))
+        assert rw.sibling_is_provisioning("pool:x") is True
+        # Stale beyond the grace must not block provisioning forever.
+        json.dump({"p1": {"pool": "pool:x", "pid": os.getpid() + 1,
+                          "at": rw.time.time() - rw.REAP_GRACE_SECONDS - 10,
+                          "url": "", "key": "k"}},
+                  open(d + "/pods.json", "w"))
+        assert rw.sibling_is_provisioning("pool:x") is False
+    finally:
+        rw._pod_registry_path = saved
+
+
+def test_the_reaper_prunes_entries_for_pods_that_are_gone():
+    """A terminated-but-registered id stays 'known', so it is shielded from
+    reaping and accumulates for the life of the install."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def reap_orphans")[1].split("def _scaler_loop")[0]
+    assert "known - live" in blk and "unregister_pod(gone)" in blk

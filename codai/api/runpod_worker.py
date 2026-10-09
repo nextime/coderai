@@ -2375,6 +2375,16 @@ class RunpodPodPool:
             # floor of one became two A40s at every boot.
             if self._adopt_shared_pod():
                 return
+            # Nothing ready to adopt — but a pod may be mid-boot, registered
+            # with no URL yet. That is one pod on the way, not none. It matters
+            # most right here: the warm floor is rebuilt at every boot, so an
+            # upgrade landing during the ~6 minutes a pod takes to pull its
+            # image would rent a second one, every time.
+            if sibling_is_provisioning(str(self.model_key)):
+                print(f"[runpod] a pod for {self.model_key!r} is already booting "
+                      f"— not renting another; the scaler will adopt it",
+                      flush=True)
+                return
             for _ in range(want):
                 try:
                     self._provision_one()
@@ -3259,6 +3269,12 @@ def reap_orphans() -> int:
         return 0
     known = _known_pod_ids()
     reaped = 0
+    # Drop registry entries for pods RunPod no longer has. They are shielded
+    # from reaping by being "known", and they accumulate for the life of the
+    # install — including pods terminated out of band.
+    live = {str(p.get("id")) for p in pods if p.get("id")}
+    for gone in (known - live):
+        unregister_pod(gone)
     for p in pods:
         pid, name = p.get("id"), (p.get("name") or "")
         status = str(p.get("status") or "").upper()
