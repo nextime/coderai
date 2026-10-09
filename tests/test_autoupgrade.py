@@ -198,3 +198,18 @@ def test_the_token_is_never_written_to_the_log():
     for line in SH.splitlines():
         if "say " in line or "tee -a" in line:
             assert "$ADMIN_TOKEN" not in line, line
+
+
+def test_the_runner_is_told_which_engine_to_use():
+    """run_oci.sh defaults to docker (ENGINE="${CONTAINER_ENGINE:-docker}"). On the
+    rootless-podman host this script exists for, not passing it would make every
+    tick look for a docker socket that is not there."""
+    assert 'CONTAINER_ENGINE="$ENGINE"' in SH
+    blk = SH.split('"$RUNNER" --upgrade')[0]
+    assert blk.rstrip().endswith('CODERAI_UPGRADE_REF="$UPGRADE_REF" \\') or \
+        'CONTAINER_ENGINE="$ENGINE" CODERAI_UPGRADE_REF' in SH
+
+
+def test_the_runner_default_really_is_docker():
+    """The premise above, asserted against the runner itself."""
+    assert 'ENGINE="${CONTAINER_ENGINE:-docker}"' in RUNNER

@@ -207,8 +207,12 @@ else
     "$ENGINE" tag "$IMAGE_TAG" "$ROLLBACK_TAG" >/dev/null 2>&1 \
         || say "WARN: could not tag the rollback point; continuing without one"
 
-    CODERAI_UPGRADE_REF="$UPGRADE_REF" "$RUNNER" --upgrade --upgrade-ref "$UPGRADE_REF" \
-        "$IMAGE_TAG" >>"$LOG" 2>&1
+    # CONTAINER_ENGINE is how the runner picks podman over its docker default. It
+    # has to be told: on a rootless-podman host the runner would otherwise look
+    # for a docker socket that is not there, and the upgrade would fail on every
+    # tick with nothing to show for it but a non-zero exit.
+    CONTAINER_ENGINE="$ENGINE" CODERAI_UPGRADE_REF="$UPGRADE_REF" \
+        "$RUNNER" --upgrade --upgrade-ref "$UPGRADE_REF" "$IMAGE_TAG" >>"$LOG" 2>&1
     rc=$?
     [ "$rc" -eq 0 ] || { say "FAIL: the upgrade run exited $rc; image left as it was"; exit 1; }
 
