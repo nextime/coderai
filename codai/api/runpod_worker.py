@@ -70,6 +70,9 @@ class RunpodModelConfig:
     # Attach a RunPod network volume to this pool's pods. Blank falls back to the
     # account-wide one. Weights, uploads and adapters on it outlive the pod.
     network_volume_id: str = ""
+    # Per-model override for the account's GLOBAL volume (see RunpodConfig).
+    # Region-independent, so it never pins the pod's data centre.
+    global_volume_id: str = ""
     volume_mount_path: str = ""              # blank = the account default
     volume_path: str = ""                    # weights already on the volume (file or dir)
     # Reach the pod at its public ip:port instead of through RunPod's HTTP proxy.
@@ -158,6 +161,12 @@ class RunpodModelConfig:
     # over both: a volume lives in one region and a pod elsewhere cannot attach
     # it. Pin a region for latency or for where the data is allowed to be.
     data_center: str = ""
+    # Several acceptable regions, tried in order on a capacity miss. This is how
+    # "anywhere in the EU" is said: a single data_center pins one region and a
+    # blank one lets RunPod pick ANY region on earth, which is the wrong answer
+    # for data that may not leave the EU. Ignored when a NETWORK volume is
+    # attached — that volume exists in one region and nothing else can reach it.
+    data_centers: list = field(default_factory=list)
     # --- how hard the pod's own server may be driven ---
     # A rented pod carries no config file, so these ride as env. The defaults
     # (2 in flight, 6 queued) are sized for a shared workstation engine and
@@ -764,6 +773,18 @@ def volume_for(mcfg: "RunpodModelConfig", account) -> tuple:
     return vol, mount.rstrip("/") or "/workspace"
 
 
+def global_volume_for(mcfg: "RunpodModelConfig", account) -> str:
+    """The GLOBAL volume id for this pool, or ''.
+
+    Deliberately separate from :func:`volume_for`: a global volume is
+    region-independent, so unlike a network volume it must NOT pin the pod's
+    data centre. Keeping them apart is what lets the scaler rent whichever
+    region has a card while the weights stay in one place.
+    """
+    return ((getattr(mcfg, "global_volume_id", "") or "").strip()
+            or (getattr(account, "global_volume_id", "") or "").strip())
+
+
 #: The dependency-free image that runs coderai from a venv on a volume.
 SLIM_POD_IMAGE = os.environ.get("CODERAI_SLIM_POD_IMAGE",
                                 f"{CAPABILITY_IMAGE_REPO}-slim:{CAPABILITY_IMAGE_TAG}")
@@ -1345,6 +1366,24 @@ def _as_int(v, default=0):
 _DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
+def _parse_dc_list(value) -> list:
+    """A region allow-list from a list or a comma/space string, order kept.
+
+    Order is the fallback order, so it is preserved rather than sorted: put the
+    region you prefer first and the scaler only moves on when it cannot get a
+    card there.
+    """
+    if value in (None, ""):
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).replace(",", " ").split()
+    out = []
+    for raw in items:
+        tok = str(raw).strip().upper()
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
 def _parse_days(value) -> list:
     """Normalise a weekday selection to a sorted list of 0=Mon … 6=Sun.
 
@@ -1489,6 +1528,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.docker_args = (b.get("docker_args") or "").strip()
     cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
     cfg.network_volume_id = (b.get("network_volume_id") or "").strip()
+    cfg.global_volume_id = (b.get("global_volume_id") or "").strip()
+    cfg.data_centers = _parse_dc_list(b.get("data_centers"))
     if cfg.network_volume_id:
         # RunPod offers network volumes on Secure Cloud only; leaving COMMUNITY
         # in the list just produces candidates the attach would reject.
@@ -2080,6 +2121,14 @@ class RunpodPodPool:
             env.update(volume_env(vol_mount))
             if getattr(self, "_volume_dc", None) is None:
                 self._volume_dc = self._data_center_for_volume(vol_id)
+        # A GLOBAL volume instead: same caches, no data-centre pinning. RunPod
+        # mounts it at /workspace by itself when it is the only volume, which is
+        # the mount the pod env already points at; with a network volume also
+        # attached it moves to /workspace-global, so attaching both and
+        # expecting /workspace to be the global one would be wrong.
+        global_vol = global_volume_for(self.mcfg, self.account)
+        if global_vol and not vol_id:
+            env.update(volume_env(vol_mount or GLOBAL_VOLUME_MOUNT))
         # Direct TCP puts nothing between here and the pod, so the pod brings
         # its own TLS: a certificate from this install's CA, sent like the
         # token. Only a coderai image knows what to do with it — vLLM's and
@@ -2108,8 +2157,10 @@ class RunpodPodPool:
             name = (f"coderai-{_deploy_tag(self.account)}-"
                     + str(self.model_key)[:20].replace("/", "_").replace(" ", "_")
                     + "-" + uuid.uuid4().hex[:6])
+            _dc = sel.get("_dc") or self._data_center()
             print(f"[runpod] provisioning pod for {self.model_key!r}: {sel['display_name']} "
-                  f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr",
+                  f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr"
+                  + (f" in {_dc}" if _dc else " (region: RunPod's choice)"),
                   flush=True)
             try:
                 _disk_gb, _disk_note = disk_for(
@@ -2122,8 +2173,9 @@ class RunpodPodPool:
                     cloud_type=sel["cloud_type"], container_disk_gb=_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],
-                    data_center_id=self._data_center(),
+                    data_center_id=(sel.get("_dc") or self._data_center()),
                     network_volume_id=vol_id,
+                    global_volume_id=global_vol,
                     volume_mount_path=(vol_mount or "/workspace"),
                     registry_auth_id=(self.mcfg.registry_auth_id
                                       or getattr(self.account, "registry_auth_id", "") or ""),
@@ -2235,6 +2287,27 @@ class RunpodPodPool:
                      hourly_usd=float(shared_rate or 0.0))
         return True
 
+    def _data_centers(self) -> list:
+        """Regions to try, in order. Always at least one entry.
+
+        A network volume overrides everything: it lives in one region and a pod
+        elsewhere cannot attach it. Otherwise the model's list, the model's
+        single setting, the account's list, the account's single setting, and
+        finally [""] — let RunPod choose, which is what blank has always meant.
+        """
+        pinned = getattr(self, "_volume_dc", "") or ""
+        if pinned:
+            return [pinned]
+        for src in (getattr(self.mcfg, "data_centers", None),
+                    [self.mcfg.data_center] if self.mcfg.data_center else None,
+                    getattr(self.account, "data_centers", None),
+                    [getattr(self.account, "data_center", "")]
+                    if getattr(self.account, "data_center", "") else None):
+            vals = [str(v).strip() for v in (src or []) if str(v).strip()]
+            if vals:
+                return vals
+        return [""]
+
     def _data_center(self) -> str:
         """Which RunPod region this pool's pods go to.
 
@@ -2248,9 +2321,7 @@ class RunpodPodPool:
         NameError, and the pool never recorded the pod it had just rented — so
         provisioning retried and the untracked A40 billed on.
         """
-        return (getattr(self, "_volume_dc", "")
-                or self.mcfg.data_center
-                or getattr(self.account, "data_center", "") or "")
+        return self._data_centers()[0]
 
     def _provision_one(self):
         """Create + boot one pod; append it healthy. Blocking (minutes).
@@ -2259,6 +2330,14 @@ class RunpodPodPool:
         from codai.api.runpod_client import RunpodClient, RunpodError, pod_console_url
         client = RunpodClient(self.account)
         ranked = _rank_gpus(client, self.mcfg, self.account)
+        # Each (card, region) pair is its own candidate, so the existing
+        # capacity fallback walks regions too: no A40 in the first EU region
+        # falls through to the next instead of failing the request.
+        dcs = self._data_centers()
+        if len(dcs) > 1:
+            ranked = [dict(sel, _dc=dc) for sel in ranked for dc in dcs]
+            print(f"[runpod] {len(dcs)} regions allowed for {self.model_key!r}: "
+                  f"{', '.join(dcs)}", flush=True)
         port = self.mcfg.port or 8000
         idx, attempts, last_exc = 0, 0, None
 
@@ -2338,7 +2417,7 @@ class RunpodPodPool:
                           started_at=time.time(), gpu=sel["display_name"],
                           is_spot=sel["is_spot"], healthy=True, last_used=time.time(),
                           console_url=console,
-                          data_center=self._data_center(),
+                          data_center=(sel.get("_dc") or self._data_center()),
                           cloud_type=str(sel.get("cloud_type") or ""),
                           gpu_count=int(sel.get("gpu_count") or 1))
             with self._cv:
@@ -3237,6 +3316,11 @@ def _known_pod_ids() -> set:
         ids.update(_provisioning_ids)
     ids.update(registered_pod_ids())
     return ids
+
+
+#: Where RunPod mounts a global volume when it is the only one attached. With a
+#: network volume beside it, RunPod moves the global one to /workspace-global.
+GLOBAL_VOLUME_MOUNT = "/workspace"
 
 
 #: Never reap a pod younger than this, whatever the registry says. Longer than

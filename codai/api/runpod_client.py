@@ -17,8 +17,21 @@ This module is pure transport: no scaling/policy logic (that lives in
 NEVER logged — only masked in error strings.
 """
 
+import os
 import time
 from typing import Optional
+
+
+#: Request field that attaches a GLOBAL volume (RunPod's region-independent
+#: storage, beta since Sept 2026). RunPod documents global volumes as console
+#: only — no field appears in the Pod API reference — and the v1 REST validator
+#: accepts unknown body keys silently, so this cannot be confirmed by probing:
+#: a wrong name yields a pod that boots with no volume and re-downloads its
+#: weights, which is expensive and invisible. Hence the override, so the name
+#: can be corrected without a release once RunPod publishes it. VERIFY on the
+#: first pod that the weights are actually at the mount before relying on it.
+GLOBAL_VOLUME_FIELD = os.environ.get("CODERAI_RUNPOD_GLOBAL_VOLUME_FIELD",
+                                     "globalNetworkVolumeId")
 
 
 class RunpodError(RuntimeError):
@@ -209,6 +222,7 @@ class RunpodClient:
                    volume_mount_path: str = "/workspace", env: Optional[dict] = None,
                    docker_args: str = "", is_spot: bool = False,
                    bid_per_gpu: float = 0.0, data_center_id: str = "",
+                   global_volume_id: str = "",
                    registry_auth_id: str = "",
                    entrypoint: Optional[list] = None,
                    start_cmd: Optional[list] = None,
@@ -261,6 +275,8 @@ class RunpodClient:
         # cold model download per pod and paying it once.
         if network_volume_id:
             common["networkVolumeId"] = network_volume_id
+        if global_volume_id:
+            common[GLOBAL_VOLUME_FIELD] = global_volume_id
         if is_spot:
             common["bidPerGpu"] = float(bid_per_gpu)
             mutation = "podRentInterruptable"
@@ -309,6 +325,8 @@ class RunpodClient:
             body["containerRegistryAuthId"] = registry_auth_id
         if network_volume_id:
             body["networkVolumeId"] = network_volume_id
+        if global_volume_id:
+            body[GLOBAL_VOLUME_FIELD] = global_volume_id
         if is_spot:
             body["interruptible"] = True
             body["bidPerGpu"] = float(bid_per_gpu)

@@ -606,6 +606,8 @@ Four numbers decide the shape of a pool:
 | `idle_timeout_s` | destroy a pod this long after its last request. |
 | `allow_client_scale` | let a client lease a warm floor up to `max_pods` through `POST /v1/runpod/scale`. Off by default. |
 | `client_scale_ttl_s` | how long such a lease lasts unless renewed (default 1800). A lease that never expired would be a bill that never stopped. |
+| `data_centers` | several acceptable regions, tried in order on a capacity miss — how you say "anywhere in the EU". A single `data_center` pins one region; blank lets RunPod pick any region **on earth**. |
+| `global_volume_id` | a RunPod **global** volume (region-independent). Unlike `network_volume_id` it does NOT pin the pod's region, which is the only reason to use one. |
 
 **Then the two that are easy to miss**, and the reason a pod can look slow while
 its GPU is idle:
@@ -647,6 +649,53 @@ cold-starts a pod, exactly as `min_pods: 0` always has. An end earlier than the
 start runs overnight and belongs to the day it started on, so `22:00`–`06:00` on
 `fri` covers Friday night into Saturday morning. Leave `schedule_days` empty for
 every day.
+
+### Weights in one place, pods in any region
+
+A **network volume** lives in exactly one data centre and a pod elsewhere
+cannot attach it, so `network_volume_id` also decides where every pod runs —
+coderai pins it for you and says so (`volume … is in X — pinning pods there`).
+That is the right trade when you want fast starts in one region.
+
+A **global volume** (RunPod beta, Sept 2026) is region-independent storage
+backed by object storage. Store the weights once and rent a card wherever one
+is free:
+
+```json
+"global_volume_id": "gv-abc123",
+"data_centers": "EU-RO-1,EU-FR-1,EUR-NO-1,EUR-IS-3"
+```
+
+`data_centers` is the other half, and it matters more than it looks. A single
+`data_center` pins one region, and leaving it blank lets RunPod pick **any
+region on earth** — rarely what you want for data that may not leave the EU.
+A list is tried in order, so the first entry is the preferred region and the
+scaler only moves on when it cannot get a card there. Each (card, region) pair
+becomes its own candidate, so the capacity fallback that already walks GPU
+options walks regions too.
+
+Caveats worth knowing before you rely on it:
+
+* **It has to be created in the RunPod console** — Storage → **+ New volume** →
+  **Global volume**. The public API still refuses: `POST /v2/network-volumes`
+  allows only `STANDARD` and `HIGH_PERFORMANCE` and demands a `dataCenter`.
+* **Attaching is console-documented only.** No field appears in the Pod API
+  reference, and the v1 REST validator accepts unknown body keys silently — so
+  a wrong name cannot be caught by probing, it just yields a pod with no volume
+  that re-downloads its weights. coderai sends `globalNetworkVolumeId`,
+  overridable with `CODERAI_RUNPOD_GLOBAL_VOLUME_FIELD`. **Verify on the first
+  pod** that the weights are really at the mount.
+* **Read-heavy only.** No file locking, no atomic rename, eventual consistency,
+  last-write-wins on concurrent writes. Fine for weights, adapters, tokenizers
+  and configs; wrong for checkpoints — use a network volume to train.
+* RunPod mounts it at `/workspace` when it is the only volume, and moves it to
+  `/workspace-global` if a network volume is attached too. coderai therefore
+  points the pod env at the global volume only when no network volume is set.
+* GPU pods and GPU serverless only; CPU is not supported. And if the account
+  balance reaches $0 the volume is flagged and permanently deleted after 15
+  days.
+
+---
 
 ### Let a client ask for pods
 

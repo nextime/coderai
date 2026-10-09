@@ -759,6 +759,12 @@ class RunpodConfig:
     serverless_base: str = "https://api.runpod.ai/v2"  # serverless invoke base
     default_gpu_type: str = ""            # fallback RunPod gpuTypeId when a model gives none
     data_center: str = ""                 # optional data-center id filter (blank = any)
+    # Account-wide region allow-list, tried in order on a capacity miss. The way
+    # to say "anywhere in the EU": `data_center` pins ONE region, and leaving it
+    # blank lets RunPod pick any region on earth — not what you want for data
+    # that may not leave the EU. A per-model `data_centers` overrides this, and a
+    # network volume overrides both (it exists in one region only).
+    data_centers: list = field(default_factory=list)
     # RunPod "Container Registry Credentials" id, for pods whose image lives in a
     # private registry (your own coderai image, typically). Per-model/capability
     # `registry_auth_id` overrides this. Blank = public images only.
@@ -771,6 +777,18 @@ class RunpodConfig:
     # volume's own data center.
     network_volume_id: str = ""
     volume_mount_path: str = "/workspace"    # where pods mount it
+    # A RunPod GLOBAL volume (beta, Sept 2026): region-INDEPENDENT storage, so
+    # unlike network_volume_id above it does NOT pin pods to one data centre —
+    # which is the whole reason to use it. Store the weights once and rent a GPU
+    # in whichever region has one. Backed by object storage: fine for weights,
+    # adapters and tokenizers, wrong for checkpoints (no file locking, no atomic
+    # rename, eventual consistency, last-write-wins). RunPod mounts it at
+    # /workspace on its own, or /workspace-global when a network volume is
+    # attached too — so do not set both unless you mean that.
+    # Must be created in the RunPod console: the public API still refuses the
+    # type (POST /v2/network-volumes allows only STANDARD|HIGH_PERFORMANCE and
+    # demands a dataCenter).
+    global_volume_id: str = ""
     # Stable tag baked into every pod name (coderai-<deployment_id>-<model>-<rand>) so the
     # reaper can identify OUR pods across restarts and never touch another deployment's.
     deployment_id: str = "default"

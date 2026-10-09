@@ -67,7 +67,10 @@ def test_each_pod_reports_where_it_is_and_what_it_serves():
     # The handle gets its region from the pool's own resolver. It used to read
     # a local `dc` that did not exist in this function, so the pod was created
     # and then the handle raised NameError — the A40 billed untracked.
-    assert "data_center=self._data_center()" in src
+    # The handle records the region the pod ACTUALLY got, which with a region
+    # allow-list is the candidate's own region rather than the pool's first
+    # choice — otherwise the fleet page would report every pod in region #1.
+    assert 'data_center=(sel.get("_dc") or self._data_center())' in src
 
 
 def test_status_and_spend_are_the_same_document_behind_the_same_gate():
