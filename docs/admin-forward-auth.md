@@ -535,3 +535,120 @@ mint was unproven, and stops being necessary once it works.
   container by design, so the internal nginx is the only reachable entry point.
   That part of the write-up is correct and the conclusion stands — the fix had to
   be in the image. It is, just not in nginx.
+
+---
+
+## CORREZIONE 2026-10-09 — non era un bug dell'immagine, era configurazione nostra
+
+Le conclusioni precedenti ("host→8777 /admin non autentica", "voce per il manutentore")
+erano un **falso negativo**. Due errori nostri:
+
+1. **Il segreto va nell'header `X-Coderai-Proxy-Secret`** (config.py
+   `AdminForwardAuthConfig.shared_secret_header`), non `X-Admin-Forward-Auth-Secret`
+   che le prove usavano. Con il nome giusto il front **apre la sessione** (200 +
+   `Set-Cookie: session=…`); senza segreto fa 302 → /login (corretto).
+2. **La forward-auth si configura SOLO in `config.json` → `admin.forward_auth`**,
+   non dalle env `CODERAI_ADMIN_FORWARD_AUTH*` (config.py non le legge). Le env nel
+   quadlet erano morte; `admin` in config.json era assente → `enabled` default False
+   → forward-auth spenta. L'upgrade a 0.2.90 ha lasciato config.json senza `admin`.
+
+**Fatto il 09/10**: scritto `admin.forward_auth` in
+`~/coderai-orchestrator/config/coderai/config.json` (enabled, shared_secret =
+quello del quadlet, shared_secret_header di default, trusted_proxies
+127.0.0.1/::1/10.89.0.0/24, keep_local_login+auto_create_users+admin_without_groups).
+Riavviato il service. **Verificato**: host→8777 `/admin` con
+`X-Coderai-Proxy-Secret` + `X-Forwarded-User` → **minta** la sessione admin.
+
+### Il vero blocco: l'edge non ha `auth_request`
+Il nginx di Plesk **non ha il modulo `ngx_http_auth_request_module`**
+(`nginx -V` non lo elenca; `nginx -t` dà `unknown directive "auth_request"`).
+Quindi l'edge **non puo'** interrogare Digesta e iniettare identita' + segreto.
+Tentata la location con auth_request → revertita subito (sito di nuovo su
+basic-auth, sano).
+
+### Strada percorribile (SSO vero senza auth_request)
+`digesta-main` raggiunge `coderai:8776` sulla digesta-net (healthz 200). Il fix e'
+un **reverse-proxy dentro l'app Digesta** su `/coderai/*`: valida la sessione
+(admin), poi inoltra a `coderai:8776` iniettando `X-Forwarded-User/Groups` +
+`X-Coderai-Proxy-Secret`. L'edge `/coderai/` passerebbe a 8611 (Digesta) invece di
+8777, togliendo il basic-auth. Richiede un proxy in streaming (SSE/WebSocket/upload)
+nella GUI admin: lavoro non banale, da decidere.
+
+---
+
+## FATTO 2026-10-09 — SSO vero, via proxy lato Digesta (niente auth_request)
+
+Costruito il gateway dentro Digesta (commit `f6a2600`, live su prod):
+
+- `app/routes/coderai_proxy.py`: route `/coderai/*` che valida la **sessione admin
+  di Digesta** (cookie `digesta_session`) e inoltra in **streaming** a
+  `CODERAI_URL` (`http://coderai:8776`, sulla digesta-net) iniettando
+  `X-Forwarded-User/Groups`, `X-Coderai-Proxy-Secret` e `X-Forwarded-Prefix
+  /coderai`. Chi non e' admin: redirect al login di Digesta (navigazione) o 401
+  (fetch/XHR). Il cookie di Digesta non viene inoltrato a coderai.
+- `app/config.py`: `CODERAI_URL`, `CODERAI_PREFIX`, e `CODERAI_PROXY_SECRET` letto
+  da env o da `DATA_DIR/coderai_proxy.secret` (scritto su prod; cosi' si attiva
+  senza ricreare il container). Deve combaciare con
+  `admin.forward_auth.shared_secret` nel config.json di coderai.
+- edge nginx: `^~ /coderai/` ora fa `proxy_pass http://127.0.0.1:8611` (Digesta),
+  **senza** `X-Forwarded-Prefix` e **senza** `auth_basic`. L'htpasswd non serve piu'.
+
+Verificato end-to-end: `https://digesta.tech/coderai/admin` senza cookie → 302 al
+login di Digesta (niente prompt basic-auth); con sessione admin → 200, pagina
+`Overview — CoderAI`, coderai apre la sua sessione (`Set-Cookie: session=…`).
+`/v1` resta sui suoi token (401).
+
+**Limite noto**: i WebSocket non sono ancora proxati — un eventuale pannello di
+log dal vivo nella GUI puo' restare muto; il resto della GUI (HTTP/SSE) funziona.
+
+### WebSocket passthrough (commit digesta 47f9b5c)
+Aggiunta la route `@router.websocket("/coderai/{path:path}")`: stessa auth (solo
+admin di Digesta) e stessi header iniettati del lato HTTP (estratti in
+`_intestazioni_sso`), apre il WS verso `ws://coderai:8776/<path>` coi
+subprotocolli richiesti e pompa i due versi finche' uno chiude. L'edge nginx
+passa `Upgrade $http_upgrade` / `Connection $http_connection` (niente map a
+livello http: non e' definita e il user-include e' in contesto server).
+
+Verificato: con cookie admin il front di coderai riceve il dial upstream
+(`GET /<probe> ... from 10.89.0.65`), quindi la route gira, autentica e inoltra.
+**Ma** la GUI di coderai usa **SSE, non WebSocket**: il suo nginx interno
+(`location /`) ha solo `proxy_buffering off` «SSE: chat stream + task progress»,
+nessuna route WS nel front, nessun upgrade. Quindi oggi non c'e' nulla da
+relayare; il passthrough resta pronto per un'eventuale GUI WS futura (servirebbe
+anche l'upgrade nel nginx interno dell'immagine).
+
+---
+
+## Due file di configurazione, due lettori (09/10/2026)
+
+Configurando il catalogo modelli sul server di produzione e' venuto fuori il
+seguito del problema `CODERAI_CONFIG_DIR` descritto sopra. Nel container ci sono
+**due** `config.json` e li leggono **processi diversi**:
+
+| file | chi lo legge | cosa ci deve stare |
+|---|---|---|
+| `/root/.coderai/config.json` | il **launcher** | `server.engine_specs`, la porta pubblicata |
+| `/root/.coderai/coderai/config.json` | il **front** e l'**engine** | tutto il resto: `runpod`, `models`, `ocr`, `admin.forward_auth` |
+
+Il secondo e' quello che conta per l'inferenza, ed era di 599 byte: `server`,
+`backend`, `admin` e **nessun blocco `runpod`**. Risultato: la chiave API RunPod,
+i default A40/EU-SE-1 e i tetti di spesa (`global_max_hourly_usd` 12,
+`global_cost_limit_usd` 60/settimana) stavano nel file che **nessuno legge**, e
+l'engine rispondeva `RunPod is not enabled — cannot provision a pod`. La pagina
+admin → RunPod mostrava `enabled: false` e tetti a 0 (cioe' *illimitati*).
+
+Sistemato copiando `runpod`, `models`, `ocr`, `jobs`, `thermal` dal primo file
+nel secondo (backup `config.json.bak-pre-runpod-*`, permessi portati a 600
+perche' ora contiene la chiave API). `server`/`backend`/`admin` **non** sono
+stati toccati: la porta del front (18776) non e' quella del launcher (8000).
+
+Stessa cosa per il catalogo: il front leggeva `coderai/models.json`, uno stub
+vuoto di 199 byte, mentre l'engine aveva quello vero. Ora
+`coderai/models.json` e' un **symlink** a `../models.json`, cosi' i due leggono
+un unico file e la GUI che lo riscrive riscrive quello giusto.
+
+**Resta aperto**: finche' `CODERAI_CONFIG_DIR=/root/.coderai` e'
+auto-referenziale questa duplicazione va mantenuta a mano. La correzione
+definitiva e' montare il volume su `/config` e mettere
+`CODERAI_CONFIG_DIR=/config`, cosi' front ed engine convergono su una sola
+directory e non serve ne' il symlink ne' la copia del blocco `runpod`.
