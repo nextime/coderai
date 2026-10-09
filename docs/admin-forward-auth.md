@@ -214,6 +214,46 @@ host→8777 mints would lock everyone out (no coderai passwords; SSO would be th
 The Digesta side is ready — `GET /api/authz/coderai` returns `204` + `X-User` for a Digesta
 admin, `401` otherwise, for nginx `auth_request`.
 
+### Update — 0.2.87, sharper repro (the bug is BEFORE the front, on the published-port path)
+Two things ruled out, one thing pinned down:
+
+- **Not a `trusted_proxies` string mismatch.** Broadened it to
+  `["127.0.0.1","::1","::ffff:127.0.0.1","10.89.0.178","::ffff:10.89.0.178","10.89.0.1","::ffff:10.89.0.1"]`
+  (covering IPv4-mapped-IPv6 and gateway forms) and restarted — host→8777 `/admin` **still** `302`s.
+
+- **The `/admin` request never reaches the front on the published-port path.** For host→`127.0.0.1:8777/admin`
+  the response is `302 → /coderai/login` with **`Server: nginx`**, and the **front's uvicorn access log shows
+  no `/admin` line at all** (while it logs `/healthz` 200 from the same host→8777 path). So the **internal
+  nginx returns the 302 itself**, without proxying `/admin` to the front.
+
+- **Yet the same `/admin` DOES reach the front and mint from inside the container.** `curl …
+  http://127.0.0.1:8776/admin` (internal nginx, source `127.0.0.1`) with the same secret + `X-Forwarded-*`
+  headers → `200 + Set-Cookie`. And `http://127.0.0.1:18776/admin` (front direct) likewise mints.
+
+So the internal nginx treats `/admin` differently **by source**: proxied to the front from loopback
+(`127.0.0.1`), but short-circuited to a `/coderai/login` 302 from the rootless published-port source
+(`10.89.0.178`). `/healthz` is proxied to the front from both sources. The nginx.conf we can read
+(`/etc/nginx/nginx.conf`: `map` blocks for `X-Forwarded-*`, sub-app `location`s, `location / { proxy_pass
+http://coderai; }`) has **no `/admin` block and no source/`allow`/`deny`/`auth_request`/`geo` rule** — so the
+gate is somewhere we can't see (an included conf, a baked front/nginx behaviour, or the front proxy upstream
+failing for `/admin` from non-loopback and mapping to a login redirect). **This is the thing to fix**: `/admin`
+must reach the front over the published-port path exactly as `/healthz` does. A quick repro on any rootless
+podman host: publish the full image's `8776` on a loopback port and `curl host:PORT/admin` with the secret +
+`X-Forwarded-User`/`-Groups` headers — it 302s to `/coderai/login` and never hits the front, whereas the same
+from inside the container mints.
+
+We also tried to **bypass the internal nginx** by publishing the front (`18776`) on its own loopback host
+port and pointing at it directly — but the **front binds `127.0.0.1:18776` *inside the container*** (loopback
+only), so a published port to `18776` reaches the container's eth0 where nothing listens (connection refused).
+The internal nginx on `8776` is the **only** thing reachable from the host, so the `/admin` short-circuit
+cannot be worked around at the proxy/ops layer — **the fix has to be in the image** (internal nginx and/or the
+front), making `/admin` reach the front over the published-port path the same way `/healthz` already does.
+
+Until this is fixed, the host nginx on prod stays on **basic-auth** (not swapped to `auth_request`), to avoid
+locking everyone out of the GUI via the one path nginx uses. Everything else (Digesta `/api/authz/coderai`
+endpoint, the quadlet env + config, the pinned container IP) is ready for the swap the moment host→8777 `/admin`
+mints.
+
 ---
 
 ## As shipped (0.2.85)
@@ -366,3 +406,132 @@ test with.
   mints**, and you no longer have to choose: with `keep_local_login: true` the
   password form stays as a loopback fallback, so a broken SSO cannot lock you out.
   Verify the mint through the real path first, then swap.
+
+---
+
+## Answer to the 0.2.87 follow-up: the 302 IS the front refusing
+
+The sharper repro is good work, but both pillars of "the bug is before the front"
+have innocent explanations, and the test that was meant to rule out
+`trusted_proxies` could not have.
+
+### `Server: nginx` does not mean nginx wrote the response
+
+nginx sets its own `Server` header on **proxied** responses too, unless you add
+`proxy_pass_header Server`. So that header is present whether the 302 came from
+nginx or was passed through from the front. It carries no information here.
+
+### The missing `/admin` access-log line is a log filter, not a missing request
+
+`codai/frontproxy/app.py` has `_PollNoiseFilter`, installed on the front's
+uvicorn **access** handler unless `--debug-web`:
+
+```python
+_READ = ("GET", "HEAD", "OPTIONS")
+_WEB_PREFIXES = ("/admin", "/static", "/login", "/logout")
+```
+
+A `GET /admin` is **dropped from the access log, from every source**. `/healthz`
+is not in that list, which is exactly the asymmetry that was observed:
+
+| request | access log |
+|---|---|
+| `GET /admin` | **dropped** |
+| `GET /healthz` | logged |
+| `GET /coderai/admin` | logged (the prefix is not stripped yet) |
+
+So "no `/admin` line" is the expected output for a request the front *did*
+handle — the in-container test that minted was not logged either. Re-run any of
+this with `--debug-web` and the lines appear. There is no nginx rule to find,
+which is also why none was found: `location /` proxies `/admin` to the front
+from both sources, as `/healthz` demonstrates.
+
+A `302 → /coderai/login` with no `Set-Cookie` is precisely what the front
+returns when forward-auth declines: the middleware calls `_fa_login`, gets
+nothing, and falls through to the normal "no session" redirect.
+
+### Why broadening `trusted_proxies` changed nothing
+
+It was broadened in `config.json` — the file we established the app is **not
+reading**, which is why `enabled: true` there did nothing and
+`CODERAI_ADMIN_FORWARD_AUTH=1` was needed. Editing an unread file cannot change
+behaviour, so that test does not exonerate the peer check. The list actually in
+force was still the default `["127.0.0.1", "::1"]`: loopback in, container
+address out. One cause, all three symptoms.
+
+### And a second, independent bug the `::ffff:` instinct was right about
+
+Adding `::ffff:10.89.0.178` was the correct hunch. The internal nginx listens on
+**both** `8776` and `[::]:8776`, so a connection landing on the v6 socket makes
+`$remote_addr` — and therefore `X-Forwarded-For`, and therefore the peer — the
+IPv4-mapped form. The check compared **strings**, so `::ffff:10.89.0.178` was
+refused even with `10.89.0.178` listed, and nothing in the configuration
+explained the refusal.
+
+Fixed in **0.2.90**: peers are compared as addresses. A mapped v6 peer matches
+the plain v4 entry and vice versa, and **CIDR entries work**, so a container
+network is trusted as `10.89.0.0/24` instead of pinning one address with
+`Network=digesta-net:ip=…`. A non-address entry is still compared literally.
+
+## Do this, in this order
+
+**1. Upgrade.** `production` carries 0.2.90.
+
+```bash
+CODERAI_UPGRADE_REF=production coderai-docker --podman --upgrade \
+    ghcr.io/nextime/coderai:latest
+systemctl --user restart coderai.service
+podman exec coderai grep -m1 __version__ /opt/coderai/app/codai/__init__.py
+```
+
+Or pull the signed image — `ghcr.io/nextime/coderai:0.2.88` is published and
+`cosign verify`s; 0.2.89/0.2.90 are reachable by `--upgrade`.
+
+**2. Put the peer list where it is read, by env, so the config path stops
+mattering** — in the quadlet, beside the two variables already there:
+
+```ini
+Environment=CODERAI_ADMIN_FORWARD_AUTH=1
+Environment=CODERAI_ADMIN_FORWARD_AUTH_SECRET=…
+Environment=CODERAI_ADMIN_FORWARD_AUTH_TRUSTED_PROXIES=127.0.0.1,::1,10.89.0.0/24
+```
+
+New in 0.2.88. Previously the switch and the secret could come from a unit file
+but the peers could only come from `config.json` — so the feature could be
+enabled by env and then reject every request from its own proxy.
+
+**3. Then one request settles it.** 0.2.88+ says why it refused, once per peer
+and reason per 60s:
+
+```
+[front] admin forward-auth refused: peer is not in trusted_proxies
+        ['127.0.0.1', '::1'] (peer '10.89.0.178')
+```
+
+If the list in that line is the default pair, `config.json` is still unread and
+step 2 is what makes it work. If it names the peer and the line is about the
+secret instead, the peer check passed and the secret is the remaining problem.
+Either way the next move is in the message rather than in a repro.
+
+**4. Fix the config path anyway**, so Settings and everything else apply:
+
+```bash
+podman exec coderai sh -lc 'ls -l ~/.coderai/config.json; \
+  python3 -c "import json;print(json.load(open(\"$HOME/.coderai/config.json\")).get(\"admin\"))"'
+```
+
+The app resolves config from the HOME-style `$CODERAI_CONFIG_DIR/coderai`; a
+file at `$CODERAI_CONFIG_DIR/config.json` is silently ignored.
+
+**5. Swap nginx to `auth_request`** once host→8777 mints. With
+`keep_local_login: true` the password form stays as a loopback fallback, so a
+broken SSO cannot lock anyone out — the basic-auth caution was right while the
+mint was unproven, and stops being necessary once it works.
+
+### Not worth pursuing
+
+- There is no `/admin` short-circuit in nginx to find.
+- Publishing the front's `18776` cannot work: it binds `127.0.0.1` inside the
+  container by design, so the internal nginx is the only reachable entry point.
+  That part of the write-up is correct and the conclusion stands — the fix had to
+  be in the image. It is, just not in nginx.

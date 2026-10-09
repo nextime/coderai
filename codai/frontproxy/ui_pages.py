@@ -118,6 +118,50 @@ def register_ui_pages(app: FastAPI, config_dir) -> bool:
             return [t for t in (x.strip() for x in raw.replace(",", " ").split()) if t]
         return [str(t).strip() for t in (cfg.trusted_proxies or []) if str(t).strip()]
 
+    def _fa_peer_allowed(peer: str, trusted: list) -> bool:
+        """Is this peer one of the trusted proxies?
+
+        Compared as ADDRESSES, not strings. The internal nginx listens on both
+        `8776` and `[::]:8776`, so a connection that lands on the v6 socket makes
+        $remote_addr -- and therefore X-Forwarded-For, and therefore the peer --
+        the IPv4-mapped form `::ffff:10.89.0.178`. A string membership test
+        rejects that even when the operator has listed `10.89.0.178`, which is a
+        refusal nothing in the configuration explains. CIDR entries work too, so
+        a container network can be trusted as `10.89.0.0/24` rather than by
+        pinning one address.
+
+        Anything that is not an address or a network (a unix socket path, say) is
+        still compared literally, so an exotic entry keeps working.
+        """
+        import ipaddress
+        if not peer:
+            return False
+        if peer in trusted:          # the common case, and the cheapest
+            return True
+        try:
+            ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return False
+        mapped = getattr(ip, "ipv4_mapped", None)
+        candidates = [ip] + ([mapped] if mapped else [])
+        for entry in trusted:
+            if "/" in entry:
+                try:
+                    net = ipaddress.ip_network(entry, strict=False)
+                except ValueError:
+                    continue
+                if any(c in net for c in candidates if c.version == net.version):
+                    return True
+                continue
+            try:
+                want = ipaddress.ip_address(entry)
+            except ValueError:
+                continue
+            wmapped = getattr(want, "ipv4_mapped", None)
+            if any(c == w for c in candidates for w in ([want] + ([wmapped] if wmapped else []))):
+                return True
+        return False
+
     def _fa_reject(peer: str, reason: str) -> bool:
         """Say once, per peer and reason, why a forward-auth attempt was refused."""
         import time
@@ -147,7 +191,7 @@ def register_ui_pages(app: FastAPI, config_dir) -> bool:
         import hmac
         peer = (request.client.host if request.client else "") or ""
         trusted = _fa_peer_allowlist(cfg)
-        if peer not in trusted:
+        if not _fa_peer_allowed(peer, trusted):
             return _fa_reject(peer, f"peer is not in trusted_proxies {trusted}")
         sent = request.headers.get(cfg.shared_secret_header.lower(), "") or ""
         if not sent:

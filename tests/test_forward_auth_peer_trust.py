@@ -162,3 +162,98 @@ def test_the_docstring_no_longer_claims_the_immediate_peer():
     blk = UI.split("def _fa_trusted(")[1].split("def _fa_identity")[0]
     assert "immediate peer" not in blk
     assert "ProxyHeadersMiddleware" in blk, "say where the value comes from"
+
+
+# ------------------------------------------------- the peer is an ADDRESS, not a string
+# Second report from the Digesta host (0.2.87): the operator broadened
+# trusted_proxies to include both `10.89.0.178` and `::ffff:10.89.0.178` and
+# host->8777 still refused. The `::ffff:` instinct was right -- the internal
+# nginx listens on `8776` AND `[::]:8776`, so a connection landing on the v6
+# socket makes $remote_addr, X-Forwarded-For and therefore the peer the
+# IPv4-mapped form -- but a plain string membership test rejects that even with
+# the plain address listed, and the broadened list went into the config file the
+# app was not reading anyway.
+
+def _allowed(peer, trusted):
+    """Mirror of _fa_peer_allowed, which is a closure inside register_ui_pages."""
+    import ipaddress
+    if not peer:
+        return False
+    if peer in trusted:
+        return True
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    candidates = [ip] + ([mapped] if mapped else [])
+    for entry in trusted:
+        if "/" in entry:
+            try:
+                net = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue
+            if any(c in net for c in candidates if c.version == net.version):
+                return True
+            continue
+        try:
+            want = ipaddress.ip_address(entry)
+        except ValueError:
+            continue
+        wmapped = getattr(want, "ipv4_mapped", None)
+        if any(c == w for c in candidates for w in ([want] + ([wmapped] if wmapped else []))):
+            return True
+    return False
+
+
+def test_the_helper_in_the_source_matches_this_mirror():
+    """If the implementation drifts from the mirror above, these tests lie."""
+    blk = UI.split("def _fa_peer_allowed")[1].split("def _fa_reject")[0]
+    for marker in ("ipv4_mapped", 'if "/" in entry:', "ip_network(entry, strict=False)",
+                   "if peer in trusted:"):
+        assert marker in blk, marker
+
+
+def test_a_mapped_peer_matches_the_plain_address():
+    """The reported failure, in one line."""
+    assert _allowed("::ffff:10.89.0.178", ["127.0.0.1", "::1", "10.89.0.178"])
+
+
+def test_a_plain_peer_matches_a_mapped_entry():
+    """The reverse, so an operator who listed the ::ffff: form is not punished."""
+    assert _allowed("10.89.0.178", ["::ffff:10.89.0.178"])
+
+
+def test_mapped_loopback_is_still_loopback():
+    assert _allowed("::ffff:127.0.0.1", ["127.0.0.1", "::1"])
+
+
+def test_a_container_network_can_be_trusted_as_cidr():
+    """Better than pinning one address with Network=digesta-net:ip=…"""
+    assert _allowed("10.89.0.178", ["10.89.0.0/24"])
+    assert _allowed("::ffff:10.89.0.178", ["10.89.0.0/24"])
+
+
+def test_an_address_outside_the_network_is_still_refused():
+    assert not _allowed("10.90.0.5", ["10.89.0.0/24"])
+    assert not _allowed("10.89.0.5", ["10.89.0.178"])
+
+
+def test_an_empty_peer_is_refused():
+    """request.client is None on some transports; that is not 'trusted'."""
+    assert not _allowed("", ["127.0.0.1"])
+
+
+def test_a_non_address_entry_is_still_compared_literally():
+    """A unix socket path or hostname entry must keep working."""
+    assert _allowed("/run/nginx.sock", ["/run/nginx.sock"])
+    assert not _allowed("10.0.0.1", ["/run/nginx.sock"])
+
+
+def test_a_malformed_entry_does_not_crash_or_open_the_door():
+    assert not _allowed("10.89.0.178", ["not-an-address", "10.89.0.0/999"])
+
+
+def test_widening_is_never_implicit():
+    """A v6 peer must not match a v4 network just because the bits line up."""
+    assert not _allowed("2001:db8::1", ["10.89.0.0/24"])

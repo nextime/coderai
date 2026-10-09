@@ -68,7 +68,9 @@ def test_the_config_round_trips(tmp_path):
 # --------------------------------------------------------- the trust contract
 def test_both_checks_are_required_not_either():
     blk = UI.split("def _fa_trusted")[1].split("def _fa_identity")[0]
-    assert "peer not in trusted" in blk
+    # The peer is checked as an ADDRESS (mapped IPv6 and CIDR forms included),
+    # not by string membership -- see tests/test_forward_auth_peer_trust.py.
+    assert "_fa_peer_allowed(peer, trusted)" in blk
     assert "compare_digest" in blk, "the secret must not be compared with =="
     # The peer check and the secret check are separate early returns, so neither
     # alone can authenticate. Each refusal goes through _fa_reject, which returns
