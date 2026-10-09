@@ -167,7 +167,9 @@ inflight(){
     echo "$best $detail"
 }
 
-# Serving anything, or we cannot tell? Then this run does nothing.
+# Any work in progress -- a request OR a detached job like training -- or we
+# cannot tell? Then this run does nothing. Calling it "serving" was wrong:
+# the case this exists for has no request in flight at all.
 guard_idle(){
     local out count detail
     out="$(inflight)"; count="${out%% *}"; detail="${out#* }"
@@ -182,7 +184,7 @@ guard_idle(){
         return 0
     fi
     if [ "$count" -gt 0 ]; then
-        say "SKIP: serving $count request(s) [$detail] — leaving the image alone"
+        say "SKIP: $count piece(s) of work in progress [$detail] — leaving the image alone"
         return 1
     fi
     say "idle ($detail)"
@@ -255,16 +257,16 @@ OUT="$(inflight)"; BUSY="${OUT%% *}"; WHAT="${OUT#* }"
 if [ "$BUSY" = unknown ] || { [ "$BUSY" -gt 0 ] 2>/dev/null; }; then
     if [ "$N" -lt "$MAX_DEFERRALS" ]; then
         echo $((N + 1)) > "$DEFERRALS"
-        say "serving [$WHAT] — deferring the restart ($((N + 1))/$MAX_DEFERRALS)"
+        say "work in progress [$WHAT] — deferring the restart ($((N + 1))/$MAX_DEFERRALS)"
         exit 0
     fi
     if [ "$MAX_DEFERRALS" -le 0 ]; then
         echo $((N + 1)) > "$DEFERRALS"
-        say "serving [$WHAT] — the new code is in the image and waits for an idle"
+        say "work in progress [$WHAT] — the new code is in the image and waits for an idle"
         say "      moment ($((N + 1)) run(s) so far). Set MAX_DEFERRALS>0 to restart anyway."
         exit 0
     fi
-    say "serving [$WHAT] but $N deferrals already — restarting anyway"
+    say "work in progress [$WHAT] but $N deferrals already — restarting anyway"
 fi
 
 if restart_and_verify; then
