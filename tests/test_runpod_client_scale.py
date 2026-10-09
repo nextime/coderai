@@ -280,3 +280,43 @@ def test_the_endpoint_rejects_a_negative_body_before_it_reaches_the_pool():
     with pytest.raises(ValidationError):
         RunpodScaleRequest(model="qwen38-awq", pods=-1)
     assert RunpodScaleRequest(model="qwen38-awq", pods=0).pods == 0
+
+
+# ------------------------------------- warming at boot, which pays real money
+
+def test_a_disabled_model_is_never_warmed():
+    """A catalogue entry parked for later with keep_warm still set would have
+    rented a GPU at every boot. Nothing else here consults `enabled`."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def warm_configured_pools")[1].split("def _all_pools_hourly_rate")[0]
+    assert 'entry.get("enabled") is False' in blk
+
+
+def test_a_runpod_only_entry_is_found_by_its_id():
+    """Such an entry has no local `path` — there are no weights on this machine
+    — and an `alias` only when a second name is wanted. Keyed on alias-or-path
+    alone it warmed under "" and the pool was never the one serving requests."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def warm_configured_pools")[1].split("def _all_pools_hourly_rate")[0]
+    assert 'entry.get("id")' in blk
+    assert 'print("[runpod] a keep_warm entry has no id/alias/path' in blk
+
+
+def test_boot_warming_respects_the_schedule():
+    """ensure_ready() is the "a request is waiting" path and provisions
+    unconditionally. At boot nothing is waiting, so a restart at 02:00 must not
+    rent the pod the schedule exists to avoid."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def warm_configured_pools")[1].split("def _all_pools_hourly_rate")[0]
+    i_guard = blk.find("effective_min_pods() < 1")
+    i_ready = blk.find("pool.ensure_ready()")
+    assert i_guard != -1 and i_ready != -1 and i_guard < i_ready
+
+
+def test_a_client_lease_can_warm_at_boot_even_out_of_hours():
+    """The guard reads effective_min_pods, which already maxes the lease in, so
+    a lease that outlives a restart is honoured rather than dropped."""
+    p = _pool(min_pods=1, max_pods=3, schedule_enabled=True,
+              schedule_start="08:00", schedule_end="20:00")
+    p.set_client_floor(2)
+    assert p.effective_min_pods() >= 2

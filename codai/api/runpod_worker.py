@@ -2796,9 +2796,32 @@ def warm_configured_pools() -> int:
             block = entry.get("runpod")
             if not isinstance(block, dict) or not _as_bool(block.get("keep_warm"), False):
                 continue
-            name = entry.get("alias") or entry.get("path") or ""
+            # A disabled model must not rent a GPU. Nothing else consults
+            # `enabled` here, so a catalogue entry parked for later with
+            # keep_warm still set would have started billing at every boot.
+            if entry.get("enabled") is False:
+                continue
+            # `id` is how a RunPod-only entry names itself: it has no local
+            # `path` (there are no weights on this machine) and an `alias` only
+            # when a second name is wanted. Without it such an entry warmed
+            # under the key "" and the pool was never the one serving requests.
+            name = entry.get("alias") or entry.get("path") or entry.get("id") or ""
+            if not name:
+                print("[runpod] a keep_warm entry has no id/alias/path — skipped",
+                      flush=True)
+                continue
             try:
                 pool = get_model_pod_pool(name, entry, block)
+                # ensure_ready() provisions unconditionally — it is the "a
+                # request is waiting" path. At boot there is no request, so a
+                # scheduled model must respect its window or a restart at 02:00
+                # would rent the pod the schedule exists to avoid.
+                if pool.effective_min_pods() < 1:
+                    st = schedule_state(pool.mcfg)
+                    print(f"[runpod] not warming {name!r} yet: outside its window "
+                          f"({st.get('window')}) — a request still starts a pod",
+                          flush=True)
+                    continue
                 pool.ensure_ready()
                 warmed += 1
                 print(f"[runpod] keeping a pod warm for {name!r}", flush=True)
