@@ -27,6 +27,7 @@ from typing import List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from codai.broker.client import BrokerClient
 from codai.broker.service import BrokerService
@@ -849,6 +850,41 @@ async def runpod_status(request: Request):
     question is "what is the fleet doing" rather than "what is it costing".
     """
     return await runpod_spend(request)
+
+
+class RunpodScaleRequest(BaseModel):
+    model: str = Field(..., description="Model id whose pod pool to scale.")
+    pods: int = Field(..., ge=0,
+                      description="Warm pods to hold, clamped to the model's max_pods. "
+                                  "0 releases the lease.")
+    model_config = ConfigDict(extra="allow")
+
+
+@app.post("/v1/runpod/scale", summary="Ask for warm pods on a model", tags=["Core"])
+async def runpod_scale(body: RunpodScaleRequest, request: Request):
+    """Let a client hold N pods warm for a model, up to its configured max_pods.
+
+    For a client that KNOWS what is coming — a batch of a thousand documents —
+    and would otherwise discover the pool one cold start at a time. The
+    orchestrator already grows a pool under load
+    (``scale_up_inflight_per_pod``), so this is not needed for ordinary traffic;
+    it removes the ramp, it does not replace the autoscaler.
+
+    Deliberately NOT admin-scoped: the gate is per model
+    (``allow_client_scale``), the number is clamped to ``max_pods``, and the
+    lease expires (``client_scale_ttl_s``, default 30 min) so a client that dies
+    holding four A40s stops paying for them by itself. The account's $/hr and
+    spend caps still refuse to provision regardless of what is asked here.
+    """
+    from codai.api import runpod_worker
+    try:
+        return runpod_worker.set_client_pods(body.model, body.pods)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"scale failed: {exc}")
 
 
 @app.get("/coderai/capabilities", summary="Server capability document", tags=["Core"])

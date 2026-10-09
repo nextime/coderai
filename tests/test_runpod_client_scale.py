@@ -1,0 +1,282 @@
+"""A client may ask for warm pods, up to the model's configured ceiling.
+
+Digesta knows things the orchestrator cannot: that a batch of a thousand
+documents is about to start. The autoscaler would discover that one cold start
+at a time, so a client that knows is allowed to say so — bounded three ways,
+because a client that can raise the floor can raise the bill:
+
+* per model (``allow_client_scale``, off by default),
+* clamped to ``max_pods``,
+* and as a LEASE that expires, so a client that dies holding four A40s stops
+  paying for them without anyone noticing.
+
+The lease is the part worth testing hardest: the other two fail visibly, that
+one fails as a bill.
+"""
+import time
+
+from codai.api import runpod_worker as rw
+
+
+class _Cfg:
+    """Just enough of RunpodModelConfig for the floor arithmetic."""
+
+    def __init__(self, **kw):
+        self.min_pods = kw.get("min_pods", 0)
+        self.max_pods = kw.get("max_pods", 1)
+        self.schedule_enabled = kw.get("schedule_enabled", False)
+        self.schedule_days = kw.get("schedule_days", [])
+        self.schedule_start = kw.get("schedule_start", "")
+        self.schedule_end = kw.get("schedule_end", "")
+        self.schedule_tz = kw.get("schedule_tz", "")
+        self.allow_client_scale = kw.get("allow_client_scale", True)
+        self.client_scale_ttl_s = kw.get("client_scale_ttl_s", 1800)
+        self.idle_timeout_s = kw.get("idle_timeout_s", 300)
+        self.data_center = kw.get("data_center", "EU-SE-1")
+        self.api_key = "cra-test"
+        self.allow_open_pod = False
+        self.health_path = ""
+
+
+def _pool(**kw):
+    """A pool object without touching RunPod or the model list."""
+    p = rw.RunpodPodPool.__new__(rw.RunpodPodPool)
+    import threading
+    p.model_key = kw.pop("model_key", "qwen38-awq")
+    p.mcfg = _Cfg(**kw)
+    p.pods = []
+    p._cv = threading.Condition(threading.RLock())
+    p._client_floor = 0
+    p._client_floor_until = 0.0
+    p._client_floor_logged = -1
+    p._sched_closed_logged = False
+    p._closed = False
+    return p
+
+
+# ------------------------------------------------------------------ the clamp
+
+def test_a_client_gets_what_it_asks_for_within_the_ceiling():
+    p = _pool(max_pods=4)
+    out = p.set_client_floor(3)
+    assert out["granted"] == 3 and out["clamped"] is False
+    assert p.effective_min_pods() == 3
+
+
+def test_asking_for_more_than_max_pods_gets_the_ceiling_not_an_error():
+    """It asked for "as many as you can"; refusing would leave it with none."""
+    p = _pool(max_pods=2)
+    out = p.set_client_floor(99)
+    assert out["granted"] == 2 and out["clamped"] is True
+    assert out["max_pods"] == 2
+    assert p.effective_min_pods() == 2
+
+
+def test_zero_releases_the_lease():
+    p = _pool(max_pods=4)
+    p.set_client_floor(3)
+    out = p.set_client_floor(0)
+    assert out["granted"] == 0 and out["expires_in_s"] == 0
+    assert p.client_floor() == 0
+    assert p.effective_min_pods() == 0
+
+
+def test_a_negative_number_is_a_release_not_a_negative_floor():
+    p = _pool(max_pods=4)
+    p.set_client_floor(2)
+    assert p.set_client_floor(-5)["granted"] == 0
+    assert p.effective_min_pods() == 0
+
+
+# ------------------------------------------------------------------ the lease
+
+def test_the_lease_expires_on_its_own():
+    """The failure that costs money: a client asks and never comes back."""
+    p = _pool(max_pods=4, client_scale_ttl_s=60)
+    p.set_client_floor(3)
+    assert p.client_floor() == 3
+    p._client_floor_until = time.time() - 1          # as if 60s had passed
+    assert p.client_floor() == 0
+    assert p.effective_min_pods() == 0
+
+
+def test_renewing_extends_the_lease():
+    p = _pool(max_pods=4, client_scale_ttl_s=120)
+    p.set_client_floor(2)
+    p._client_floor_until = time.time() + 5
+    p.set_client_floor(2)
+    assert p._client_floor_until - time.time() > 100
+
+
+def test_the_configured_ttl_is_honoured():
+    p = _pool(max_pods=2, client_scale_ttl_s=300)
+    assert p.set_client_floor(1)["expires_in_s"] == 300
+
+
+def test_a_ttl_of_zero_does_not_mean_forever():
+    """An unexpiring lease is the one thing a lease must not be, so a 0 in the
+    config falls back to the default instead of being honoured."""
+    cfg = rw.parse_model_runpod({"client_scale_ttl_s": 0, "allow_client_scale": True})
+    assert cfg.client_scale_ttl_s == 1800
+    cfg = rw.parse_model_runpod({"client_scale_ttl_s": 5})
+    assert cfg.client_scale_ttl_s == 60      # floored, never seconds-short
+
+
+# ------------------------------------------------- how it meets the schedule
+
+def test_the_lease_and_the_schedule_are_maxed_not_summed():
+    """Both mean "hold this many ready". Summing would rent twice the pods."""
+    p = _pool(min_pods=1, max_pods=4)
+    p.set_client_floor(2)
+    assert p.effective_min_pods() == 2
+
+
+def test_a_client_cannot_lower_the_configured_floor():
+    """qwen38 is warm during office hours by configuration; a client asking for
+    1 must not be able to switch that off, nor asking for 0 to tear it down."""
+    p = _pool(min_pods=2, max_pods=4)
+    p.set_client_floor(1)
+    assert p.effective_min_pods() == 2
+    p.set_client_floor(0)
+    assert p.effective_min_pods() == 2
+
+
+def test_a_lease_works_outside_the_warm_window():
+    """Out of hours the configured floor is 0 — that is where a client asking
+    for pods is most useful, so the lease must survive the closed window."""
+    p = _pool(min_pods=1, max_pods=3, schedule_enabled=True,
+              schedule_start="08:00", schedule_end="20:00",
+              schedule_days=[0, 1, 2, 3, 4], schedule_tz="Europe/Rome")
+    # Pretend we are outside: assert on both branches rather than on the clock.
+    out_of_window = 0 if not rw.schedule_state(p.mcfg)["in_window"] else None
+    p.set_client_floor(3)
+    assert p.effective_min_pods() == 3
+    if out_of_window is not None:
+        p.set_client_floor(0)
+        assert p.effective_min_pods() == 0
+
+
+def test_the_ceiling_still_holds_when_a_schedule_is_configured():
+    p = _pool(min_pods=1, max_pods=2, schedule_enabled=True,
+              schedule_start="08:00", schedule_end="20:00")
+    p.set_client_floor(10)
+    assert p.effective_min_pods() == 2
+
+
+# ----------------------------------------------------------- the opt-in gate
+
+def test_client_scaling_is_off_by_default():
+    """It spends money, so it cannot be something a model has by accident."""
+    assert rw.parse_model_runpod({}).allow_client_scale is False
+
+
+def test_the_flag_is_read_from_the_block():
+    assert rw.parse_model_runpod({"allow_client_scale": True}).allow_client_scale is True
+
+
+def test_a_model_that_did_not_opt_in_is_refused_as_forbidden():
+    """403, not 404: the model exists, the permission does not — a different
+    problem for whoever is integrating."""
+    import pytest
+    saved = rw.model_runpod_block
+    rw.model_runpod_block = lambda name: {"mode": "pods", "max_pods": 2}
+    try:
+        with pytest.raises(PermissionError):
+            rw.set_client_pods("qwen38-awq", 2)
+    finally:
+        rw.model_runpod_block = saved
+
+
+def test_a_model_with_no_runpod_block_is_not_found():
+    import pytest
+    saved = rw.model_runpod_block
+    rw.model_runpod_block = lambda name: {}
+    try:
+        with pytest.raises(LookupError):
+            rw.set_client_pods("not-a-runpod-model", 1)
+    finally:
+        rw.model_runpod_block = saved
+
+
+def test_an_empty_model_name_is_not_found():
+    import pytest
+    with pytest.raises(LookupError):
+        rw.set_client_pods("", 1)
+
+
+def test_serverless_is_refused_because_runpod_owns_its_scaling():
+    import pytest
+    saved = rw.model_runpod_block
+    rw.model_runpod_block = lambda name: {"mode": "serverless", "endpoint_id": "e1",
+                                          "allow_client_scale": True}
+    try:
+        with pytest.raises(PermissionError):
+            rw.set_client_pods("llama-3.3-70b", 2)
+    finally:
+        rw.model_runpod_block = saved
+
+
+# -------------------------------------------------------------- the reporting
+
+def test_the_lease_is_visible_in_the_schedule_status():
+    """A bill nobody expected has to have a visible cause."""
+    p = _pool(max_pods=3, model_key="qwen38-awq")
+    p.set_client_floor(2)
+    saved = dict(rw._pools)
+    rw._pools.clear()
+    rw._pools["qwen38-awq"] = p
+    try:
+        row = rw.pools_schedule_status()[0]
+    finally:
+        rw._pools.clear()
+        rw._pools.update(saved)
+    assert row["client_pods"] == 2
+    assert row["client_scale_allowed"] is True
+    assert row["max_pods"] == 3
+    assert row["client_lease_expires_in_s"] > 0
+    assert row["effective_min_pods"] == 2
+
+
+def test_an_expired_lease_reports_zero_not_a_stale_number():
+    p = _pool(max_pods=3)
+    p.set_client_floor(2)
+    p._client_floor_until = time.time() - 1
+    saved = dict(rw._pools)
+    rw._pools.clear()
+    rw._pools["qwen38-awq"] = p
+    try:
+        row = rw.pools_schedule_status()[0]
+    finally:
+        rw._pools.clear()
+        rw._pools.update(saved)
+    assert row["client_pods"] == 0
+    assert row["client_lease_expires_in_s"] == 0
+
+
+# ------------------------------------------------------------ the HTTP surface
+
+def test_the_endpoint_exists_and_is_a_post():
+    from codai.api.app import app
+    routes = {getattr(r, "path", ""): getattr(r, "methods", set()) for r in app.routes}
+    assert "/v1/runpod/scale" in routes
+    assert "POST" in routes["/v1/runpod/scale"]
+
+
+def test_the_endpoint_maps_the_two_errors_to_different_statuses():
+    """404 for "no such model", 403 for "not allowed" — so a client can tell a
+    typo from a permission it has to be granted."""
+    src = (__import__("pathlib").Path(rw.__file__).parents[1]
+           / "api" / "app.py").read_text()
+    blk = src.split("async def runpod_scale")[1].split("@app.")[0]
+    assert "LookupError" in blk and "status_code=404" in blk
+    assert "PermissionError" in blk and "status_code=403" in blk
+
+
+def test_the_endpoint_rejects_a_negative_body_before_it_reaches_the_pool():
+    """ge=0 on the field, so pydantic answers 422 rather than the pool guessing."""
+    from codai.api.app import RunpodScaleRequest
+    import pytest
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        RunpodScaleRequest(model="qwen38-awq", pods=-1)
+    assert RunpodScaleRequest(model="qwen38-awq", pods=0).pods == 0

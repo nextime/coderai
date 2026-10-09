@@ -604,6 +604,8 @@ Four numbers decide the shape of a pool:
 | `max_pods` | hard ceiling on concurrent pods for this model. |
 | `scale_up_inflight_per_pod` | add a pod once the least-loaded one already has this many requests in flight. **Without this the pool only grows when it has no healthy pod at all**, so fifty concurrent requests would pile onto pod #1. |
 | `idle_timeout_s` | destroy a pod this long after its last request. |
+| `allow_client_scale` | let a client lease a warm floor up to `max_pods` through `POST /v1/runpod/scale`. Off by default. |
+| `client_scale_ttl_s` | how long such a lease lasts unless renewed (default 1800). A lease that never expired would be a bill that never stopped. |
 
 **Then the two that are easy to miss**, and the reason a pod can look slow while
 its GPU is idle:
@@ -645,6 +647,52 @@ cold-starts a pod, exactly as `min_pods: 0` always has. An end earlier than the
 start runs overnight and belongs to the day it started on, so `22:00`–`06:00` on
 `fri` covers Friday night into Saturday morning. Leave `schedule_days` empty for
 every day.
+
+### Let a client ask for pods
+
+The autoscaler reacts to load: it adds a pod once the least-loaded one already
+has `scale_up_inflight_per_pod` requests in flight. That is the right behaviour
+for traffic nobody predicted, and the wrong one for a client that KNOWS what is
+coming — a batch of a thousand documents discovers the pool one cold start at a
+time.
+
+So a client can say so, on a model that opted in:
+
+```json
+"allow_client_scale": true,
+"client_scale_ttl_s": 1800
+```
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8776/v1/runpod/scale \
+     -H "Authorization: Bearer sk-coderai-…" -H "Content-Type: application/json" \
+     -d '{"model": "qwen38-awq", "pods": 3}'
+```
+
+```json
+{"model": "qwen38-awq", "requested": 3, "granted": 3,
+ "max_pods": 3, "expires_in_s": 1800, "clamped": false}
+```
+
+It is a **lease**, bounded three ways, because a client that can raise the floor
+can raise the bill:
+
+| bound | what it does |
+|---|---|
+| `allow_client_scale` | off by default — no model is scalable by a client unless you said so |
+| `max_pods` | asking for more returns the ceiling with `"clamped": true`, not an error: the client asked for "as many as you can" |
+| `client_scale_ttl_s` | the lease expires (default 30 min) unless renewed, so a client that dies holding four A40s stops paying for them by itself |
+
+`"pods": 0` releases it early. The lease and a warm-pod schedule are **maxed,
+never summed** — both mean "hold this many ready" — so a client cannot lower a
+floor you configured, and a closed window cannot cancel a lease the client is
+relying on. The account's $/hr and spend caps still refuse to provision whatever
+is asked here, and `GET /v1/runpod/status` reports the live lease per model
+(`client_pods`, `client_lease_expires_in_s`) so an unexpected bill has a visible
+cause.
+
+Deliberately not admin-scoped: the gate is the per-model flag, not the key. An
+ordinary API key may scale a model you marked scalable, and nothing else.
 
 ---
 

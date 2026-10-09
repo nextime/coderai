@@ -128,6 +128,12 @@ def test_effective_min_pods_drops_to_zero_outside_the_window(monkeypatch):
                                       "schedule_start": "08:00",
                                       "schedule_end": "20:00"})
         effective_min_pods = rw.RunpodPodPool.effective_min_pods
+        # The floor is also the max of any client lease (/v1/runpod/scale), so
+        # the real method needs the lease state. None here: this is the schedule.
+        client_floor = rw.RunpodPodPool.client_floor
+        _client_floor = 0
+        _client_floor_until = 0.0
+        _client_floor_logged = -1
 
     pool = _Pool()
     monkeypatch.setattr(rw, "schedule_state", lambda cfg, now=None: {"in_window": True})

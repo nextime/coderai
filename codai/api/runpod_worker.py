@@ -174,6 +174,14 @@ class RunpodModelConfig:
     # block requests: one arriving outside the window still cold-starts a pod,
     # exactly as min_pods=0 always has.
     schedule_enabled: bool = False
+    # Let a CLIENT ask for a warm floor of its own, up to max_pods, through
+    # POST /v1/runpod/scale. Off by default: a client that can raise the floor
+    # can raise the bill, so it is opt-in per model. The client's floor is a
+    # LEASE — it expires after client_scale_ttl_s unless renewed — because the
+    # failure that matters is not a wrong number, it is a client that asks for
+    # four pods and then dies, leaving them billing until someone notices.
+    allow_client_scale: bool = False
+    client_scale_ttl_s: int = 1800
     schedule_days: list = field(default_factory=list)   # 0=Mon … 6=Sun; empty = every day
     schedule_start: str = ""                 # "HH:MM" local to schedule_tz
     schedule_end: str = ""                   # "HH:MM"; end <= start means overnight
@@ -1514,6 +1522,11 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
         # two that can disagree.
         cfg.min_pods = max(1, cfg.min_pods)
     cfg.max_pods = max(1, _as_int(b.get("max_pods"), cfg.max_pods))
+    cfg.allow_client_scale = _as_bool(b.get("allow_client_scale"), cfg.allow_client_scale)
+    # A zero/absent TTL would mean "never expires", which is the one thing a
+    # lease must not mean. Keep the default rather than honour it.
+    cfg.client_scale_ttl_s = max(60, _as_int(b.get("client_scale_ttl_s"),
+                                             cfg.client_scale_ttl_s) or 1800)
     cfg.scale_up_inflight_per_pod = max(1, _as_int(b.get("scale_up_inflight_per_pod"),
                                                    cfg.scale_up_inflight_per_pod))
     cfg.max_inflight_per_pod = max(0, _as_int(b.get("max_inflight_per_pod"),
@@ -1946,6 +1959,11 @@ class RunpodPodPool:
         #: Set from the pod plan at provision time; the default suits an LLM pod.
         self.health_path = mcfg.health_path or "/v1/models"
         self._cv = threading.Condition(threading.RLock())
+        #: A warm floor a client leased through /v1/runpod/scale, and when the
+        #: lease runs out. 0/0 = nobody asked.
+        self._client_floor = 0
+        self._client_floor_until = 0.0
+        self._client_floor_logged = -1
         self._provisioning = False
         self._closed = False
         # One log line per window transition, not one every scaler tick.
@@ -2490,6 +2508,39 @@ class RunpodPodPool:
         print(f"[runpod] pod {pod.pod_id} for {self.model_key!r} terminated ({reason}); "
               f"billed ~${cost:.3f}", flush=True)
 
+    def client_floor(self) -> int:
+        """The warm floor a client leased, 0 once the lease has run out.
+
+        Read-only and cheap: the lease is not removed here, so the scaler, the
+        status page and the endpoint all see the same number within a pass.
+        """
+        if self._client_floor <= 0:
+            return 0
+        if time.time() >= self._client_floor_until:
+            return 0
+        return min(self._client_floor, max(1, self.mcfg.max_pods))
+
+    def set_client_floor(self, pods: int) -> dict:
+        """Lease (or release, with 0) a client-requested warm floor.
+
+        Clamped to max_pods: the configured ceiling is the budget, and a client
+        asking for more gets the ceiling rather than an error — it asked for
+        "as many as you can", and failing the call would leave it with none.
+        """
+        cap = max(1, int(self.mcfg.max_pods))
+        want = max(0, int(pods))
+        granted = min(want, cap)
+        ttl = max(60, int(getattr(self.mcfg, "client_scale_ttl_s", 1800) or 1800))
+        with self._cv:
+            self._client_floor = granted
+            self._client_floor_until = (time.time() + ttl) if granted else 0.0
+            self._client_floor_logged = -1
+        print(f"[runpod] {self.model_key!r}: client asked for {want} warm pod(s), "
+              f"granted {granted} (max_pods {cap}) for {ttl}s", flush=True)
+        return {"model": self.model_key, "requested": want, "granted": granted,
+                "max_pods": cap, "expires_in_s": ttl if granted else 0,
+                "clamped": want > cap}
+
     def effective_min_pods(self) -> int:
         """The warm floor that applies right now.
 
@@ -2497,10 +2548,23 @@ class RunpodPodPool:
         serving (a request still cold-starts a pod) but stops paying to hold one
         ready. Inside the window, or with no schedule, it is the configured
         min_pods.
+
+        A client lease (``/v1/runpod/scale``) is the HIGHER of the two, never the
+        sum: it says "hold this many ready", which is already satisfied by a
+        schedule holding that many. So a client cannot lower the configured
+        floor, and the schedule cannot cancel a lease the client is relying on.
         """
         if not getattr(self.mcfg, "schedule_enabled", False):
-            return self.mcfg.min_pods
-        return self.mcfg.min_pods if schedule_state(self.mcfg)["in_window"] else 0
+            scheduled = self.mcfg.min_pods
+        else:
+            scheduled = (self.mcfg.min_pods
+                         if schedule_state(self.mcfg)["in_window"] else 0)
+        leased = self.client_floor()
+        if leased > scheduled and leased != self._client_floor_logged:
+            print(f"[runpod] {self.model_key!r}: warm floor {leased} from a client "
+                  f"lease (configured {scheduled})", flush=True)
+            self._client_floor_logged = leased
+        return max(scheduled, min(leased, max(1, self.mcfg.max_pods)))
 
     def maintain(self):
         """One scaler pass: reap idle/dead pods to min_pods, keep min warm."""
@@ -2825,10 +2889,44 @@ def pools_schedule_status() -> list:
             "next_change": st["next_change"],
             "min_pods": cfg.min_pods,
             "effective_min_pods": pool.effective_min_pods(),
+            "max_pods": cfg.max_pods,
             "healthy_pods": healthy,
             "data_center": cfg.data_center or "",
+            # The client lease, so a bill nobody expected has a visible cause.
+            "client_scale_allowed": bool(getattr(cfg, "allow_client_scale", False)),
+            "client_pods": pool.client_floor(),
+            "client_lease_expires_in_s": max(
+                0, int(pool._client_floor_until - time.time())) if pool.client_floor() else 0,
         })
     return out
+
+
+def set_client_pods(model: str, pods: int) -> dict:
+    """Lease a warm floor for one model on a client's behalf.
+
+    Raises LookupError when the model has no RunPod block, and PermissionError
+    when it has one that did not opt in — told apart so the caller can answer
+    404 and 403, which are different problems for whoever is integrating.
+    """
+    key = str(model or "").strip()
+    if not key:
+        raise LookupError("no model named")
+    block = model_runpod_block(key)
+    if not block:
+        raise LookupError(f"{key!r} has no runpod block")
+    mcfg = parse_model_runpod(block)
+    if not mcfg.allow_client_scale:
+        raise PermissionError(
+            f"{key!r} does not allow client scaling — set "
+            '"allow_client_scale": true on its runpod block')
+    if mcfg.is_serverless:
+        raise PermissionError(
+            f"{key!r} runs serverless — RunPod owns its scaling; set "
+            "min_workers/max_workers on the endpoint instead")
+    # Creating the pool is the point: asking for a warm floor on a model nobody
+    # has called yet is exactly when it is worth pre-warming.
+    pool = get_model_pod_pool(key, _model_entry(key), block)
+    return pool.set_client_floor(pods)
 
 
 def pods_status() -> list:
