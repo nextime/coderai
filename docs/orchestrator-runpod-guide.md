@@ -996,6 +996,92 @@ For an orchestrator fleet, pulling the signed image is the auditable path and
 Restart after an upgrade (`systemctl restart coderai`) — the code is swapped in
 the image, not in the running process.
 
+### Upgrading unattended, hourly
+
+Two installs follow this repo: **zeiss** (nexlab) and the **Digesta production
+host in Aruba**. The Aruba one upgrades itself, hourly, from `production`, with
+nobody logged in. That is `packaging/linux/launcher/coderai-autoupgrade` plus the
+two units in `packaging/linux/systemd/`.
+
+```bash
+install -D -m755 packaging/linux/launcher/coderai-autoupgrade ~/.local/bin/
+install -D -m644 packaging/linux/systemd/coderai-autoupgrade.service \
+                 packaging/linux/systemd/coderai-autoupgrade.timer \
+                 ~/.config/systemd/user/
+install -D -m600 packaging/linux/systemd/autoupgrade.conf.example \
+                 ~/.config/coderai/autoupgrade.conf
+$EDITOR ~/.config/coderai/autoupgrade.conf      # see the two traps below
+systemctl --user daemon-reload
+systemctl --user enable --now coderai-autoupgrade.timer
+sudo loginctl enable-linger "$USER"             # NOT optional on a server
+```
+
+**Run it once by hand first** and read the output — `~/.local/bin/coderai-autoupgrade`.
+It prints the configuration it actually resolved, and whether the idle check is
+on. An unattended job that was never watched once is a guess.
+
+**It skips the upgrade entirely while CoderAI is serving.** Checked before the
+image is touched, not merely before the restart, so a busy host never reaches the
+state where new code waits in the image. Two probes, the higher count wins:
+
+| probe | what it sees |
+|---|---|
+| `<base>/metrics` → `coderai_engine_inflight` | every request the front has in flight, pod-served included |
+| `<base>/v1/runpod/status` → `summary.inflight` | what the rented pods themselves report |
+
+The RunPod one matters most on an orchestrator where **every** model is remote:
+the local engines are idle by definition, so the pods' own count is the only
+signal that work is happening. Interrupting a pod-served request loses the work
+*and* keeps paying for the pod that was doing it.
+
+The check **fails closed**. No token, wrong URL, unreachable endpoint → it skips
+and says so, because an unreadable probe almost always means a misconfiguration
+rather than an idle server. `REQUIRE_IDLE_CHECK="0"` opts out, and then it will
+interrupt live requests.
+
+By default a live request is **never** interrupted (`MAX_DEFERRALS="0"`): if the
+image was upgraded and a request arrives before the restart, the new code waits
+and every run says so. Set it above zero to allow a restart after that many
+hourly ticks.
+
+**It decides by reading the image, not by an exit code.** `coderai-docker
+--upgrade` exits `0` both when it upgraded and when the image was already
+current, so an exit-code-driven loop would restart the service every hour
+forever. The script reads `__version__` out of the image before and after; a
+change is the only thing that triggers a restart.
+
+**It rolls back.** The pre-upgrade image is tagged first (a tag, so it costs
+nothing). If the service is not healthy within `HEALTH_TIMEOUT` after the
+restart, the tag is put back, the service is restarted again, and the run exits
+non-zero with one line saying whether it recovered. A service left down says
+"Needs a human".
+
+Two traps worth knowing before they cost you an evening:
+
+- **The config file is sourced as shell, so quote anything with a space.**
+  `RESTART_CMD=systemctl --user restart coderai.service` assigns only
+  `systemctl` and then *runs* `--user restart coderai.service`. The restart then
+  restarts nothing, the health check fails, and a perfectly good upgrade gets
+  rolled back. Hence the quoting in the example, and hence the resolved
+  `restart=[…]` line in every run's log.
+- **`loginctl enable-linger`.** A systemd *user* timer only fires while the user
+  has a session. Without lingering it is silently inert after a reboot — the one
+  failure mode here that leaves no trace anywhere.
+
+`HEALTH_URL` is the only address to get right; `/metrics` and
+`/v1/runpod/status` are derived from it. On the Digesta host the container's
+8776 is published on 8777, so it is `http://127.0.0.1:8777/healthz`.
+
+State and history live in `${XDG_STATE_HOME:-~/.local/state}/coderai`:
+`autoupgrade.log` (trimmed, since this runs 24 times a day), `restart-pending`
+and `deferrals`. The journal has the per-run copy: `journalctl --user -u
+coderai-autoupgrade`.
+
+One thing to keep in mind: each real upgrade commits another layer onto the tag,
+so after many of them the image has drifted from anything in the registry. Pull
+the signed image occasionally to re-base it — `--upgrade` is for carrying fixes
+between releases, not a substitute for them.
+
 ## 10. Reference
 
 | | |
@@ -1007,4 +1093,5 @@ the image, not in the running process.
 | Remote execution / engines | `docs/remote-execution.md` |
 | Other capability images | `docs/install-from-packages.md` |
 | In-image upgrader | `packaging/linux/launcher/coderai-upgrade`, driven by `coderai-docker --upgrade` |
+| Unattended upgrade | `packaging/linux/launcher/coderai-autoupgrade` + `packaging/linux/systemd/` (hourly, skips while serving, rolls back) |
 | Host runner | `packaging/linux/run_oci.sh` (installed as `coderai-docker`) |

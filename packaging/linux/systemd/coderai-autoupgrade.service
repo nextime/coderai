@@ -1,0 +1,28 @@
+# Unattended in-place upgrade for a CoderAI orchestrator.
+#
+# A rootless-podman host runs this as a USER unit, next to the quadlet that runs
+# the orchestrator itself:
+#
+#   install -D -m755 packaging/linux/launcher/coderai-autoupgrade ~/.local/bin/
+#   install -D -m644 packaging/linux/systemd/coderai-autoupgrade.* \
+#       ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coderai-autoupgrade.timer
+#
+# A user timer only fires while the user has a session, so on a server:
+#   sudo loginctl enable-linger $USER
+# Without it the timer is silently inert after a reboot, which is the one
+# failure mode of this setup that leaves no trace anywhere.
+[Unit]
+Description=CoderAI unattended in-place upgrade (production branch)
+Documentation=file:/opt/coderai/app/docs/orchestrator-runpod-guide.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/coderai-autoupgrade
+# A shallow clone plus a pip sync inside the container, then a restart and a
+# health wait. Generous: being killed half way through is worse than being slow.
+TimeoutStartSec=2700
+# The script already writes its own timestamped log; this keeps the journal copy.
+StandardOutput=journal
+StandardError=journal

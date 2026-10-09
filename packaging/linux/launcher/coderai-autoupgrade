@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# Unattended in-place upgrade for a CoderAI orchestrator, for a host that should
+# follow the `production` branch without someone logging in.
+#
+# Driven by a systemd timer (see packaging/linux/systemd/) or cron. One run:
+#
+#   1. take a lock, so two timers can never upgrade the same image at once;
+#   2. remember the version baked into the image, and tag that image as the
+#      rollback point;
+#   3. run the host runner's `--upgrade`;
+#   4. read the baked version again. CHANGED is the signal to restart -- not the
+#      runner's exit code, which reports 0 both when it upgraded and when the
+#      image was already current, so an exit-code-driven loop would restart the
+#      service on every tick;
+#   5. restart only if the service is idle, else defer to the next tick (the new
+#      code sits in the image until then, which is safe);
+#   6. verify health after the restart, and ROLL BACK to the remembered image if
+#      it does not come up.
+#
+# Exit 0: nothing to do, upgraded and healthy, or deliberately deferred.
+# Exit 1: the upgrade or the restart failed -- and then the message says whether
+#         a rollback happened, because that is the only thing an operator who
+#         reads one line needs to know.
+set -uo pipefail
+
+CONF="${CODERAI_AUTOUPGRADE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/coderai/autoupgrade.conf}"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+# Which container engine. A rootless podman host is the common case for this
+# script, so prefer podman when both are installed.
+if [ -z "${ENGINE:-}" ]; then
+    if command -v podman >/dev/null 2>&1; then ENGINE=podman
+    elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+    else echo "autoupgrade: neither podman nor docker on PATH" >&2; exit 1; fi
+fi
+IMAGE_TAG="${IMAGE_TAG:-ghcr.io/nextime/coderai:latest}"
+UPGRADE_REF="${UPGRADE_REF:-production}"
+RUNNER="${RUNNER:-$(command -v coderai-docker || true)}"
+RESTART_CMD="${RESTART_CMD:-systemctl --user restart coderai.service}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8777/healthz}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-300}"
+# The idle check. An upgrade is SKIPPED outright while CoderAI is serving
+# anything -- a request on a local engine or, the case that matters most here,
+# one being served by a rented RunPod pod, because interrupting that both loses
+# the work and keeps paying for the pod that was doing it.
+#
+# Both probes are derived from HEALTH_URL so there is one address to get right:
+#   <base>/metrics            -> coderai_engine_inflight, every request the front
+#                                has in flight, pod-served ones included
+#   <base>/v1/runpod/status   -> summary.inflight, the pods' own count
+# The higher of the two wins. They overlap; neither is trusted to be complete.
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+_base="${HEALTH_URL%/healthz}"; _base="${_base%/}"
+METRICS_URL="${METRICS_URL:-$_base/metrics}"
+STATUS_URL="${STATUS_URL:-$_base/v1/runpod/status}"
+# Fail CLOSED: if neither probe can be read, assume it is serving and do nothing.
+# A silent upgrade that interrupts production is worse than a skipped one, and an
+# unreadable probe usually means a wrong token or URL, not an idle server.
+REQUIRE_IDLE_CHECK="${REQUIRE_IDLE_CHECK:-1}"
+# Once the image HAS been upgraded, the restart can be deferred this many ticks
+# before going ahead anyway. 0 (the default) means never interrupt a request:
+# the new code waits in the image and every run says so.
+MAX_DEFERRALS="${MAX_DEFERRALS:-0}"
+STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/coderai}"
+LOG="${LOG:-$STATE_DIR/autoupgrade.log}"
+ROLLBACK_TAG="${ROLLBACK_TAG:-coderai-autoupgrade:rollback}"
+
+mkdir -p "$STATE_DIR" || { echo "autoupgrade: cannot create $STATE_DIR" >&2; exit 1; }
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+PENDING="$STATE_DIR/restart-pending"
+DEFERRALS="$STATE_DIR/deferrals"
+
+say(){ printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG"; }
+
+# Running hourly for years, this is the one file that grows without bound. Keep
+# the tail and nothing else: the journal has the per-run copy, this log exists so
+# the HISTORY of upgrades survives a journal rotation.
+LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX_LINES" ]; then
+    tail -n "$((LOG_MAX_LINES / 2))" "$LOG" > "$LOG.trim" 2>/dev/null \
+        && mv "$LOG.trim" "$LOG"
+fi
+
+[ -n "$RUNNER" ] || { say "FAIL: no coderai-docker on PATH (set RUNNER= in $CONF)"; exit 1; }
+[ -x "$RUNNER" ] || { say "FAIL: RUNNER '$RUNNER' is not executable"; exit 1; }
+
+# Echo the settings that were actually resolved, every run. The config file is
+# SOURCED, so an unquoted multi-word value silently keeps only its first word --
+# `RESTART_CMD=systemctl --user restart coderai.service` assigns "systemctl" and
+# runs the rest. That mangling is invisible until it restarts nothing, the health
+# check fails and a perfectly good upgrade gets rolled back. One line makes it
+# obvious instead.
+IDLE_CHECK=off; [ -n "$ADMIN_TOKEN" ] && IDLE_CHECK=on
+say "config: engine=$ENGINE image=$IMAGE_TAG ref=$UPGRADE_REF"
+say "config: restart=[$RESTART_CMD] health=$HEALTH_URL idle-check=$IDLE_CHECK"
+
+# ---------------------------------------------------------------------- the lock
+# flock on a dedicated fd, non-blocking: a run that overlaps the previous one is
+# a no-op, not a queue. The timer fires again soon enough.
+exec 9>"$STATE_DIR/autoupgrade.lock"
+if ! flock -n 9; then
+    say "another autoupgrade run holds the lock; nothing done"
+    exit 0
+fi
+
+baked_version(){
+    "$ENGINE" run --rm --entrypoint grep "$IMAGE_TAG" -h "__version__" \
+        /opt/coderai/app/codai/__init__.py 2>/dev/null \
+        | tr -d ' "' | cut -d= -f2 | head -1
+}
+
+_probe_metrics(){
+    # Sum of coderai_engine_inflight across engines. A request routed to a RunPod
+    # pod is still in flight here, so this covers remote serving as well as local.
+    curl -fsS --max-time 10 -H "Authorization: Bearer $ADMIN_TOKEN" "$METRICS_URL" 2>/dev/null \
+        | awk '/^coderai_engine_inflight[ {]/ { n += $NF; seen = 1 }
+               END { if (seen) printf "%d\n", n; else print "unknown" }'
+}
+
+_probe_runpod(){
+    # What the pods themselves report. Present even if the front's counter is not.
+    curl -fsS --max-time 10 -H "Authorization: Bearer $ADMIN_TOKEN" "$STATUS_URL" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: print(int((json.load(sys.stdin).get("summary") or {}).get("inflight") or 0))
+except Exception: print("unknown")' 2>/dev/null
+}
+
+# Echoes "<count> <detail>", or "unknown <why>" when nothing could be read.
+inflight(){
+    local m r best detail
+    [ -n "$ADMIN_TOKEN" ] || { echo "unknown no ADMIN_TOKEN configured"; return; }
+    m="$(_probe_metrics)"; r="$(_probe_runpod)"
+    case "$m" in ''|unknown) m=unknown ;; *[!0-9]*) m=unknown ;; esac
+    case "$r" in ''|unknown) r=unknown ;; *[!0-9]*) r=unknown ;; esac
+    if [ "$m" = unknown ] && [ "$r" = unknown ]; then
+        echo "unknown neither $METRICS_URL nor $STATUS_URL could be read"
+        return
+    fi
+    best=0; detail=""
+    [ "$m" != unknown ] && { best="$m"; detail="engines=$m"; }
+    if [ "$r" != unknown ]; then
+        detail="${detail:+$detail }runpod=$r"
+        [ "$r" -gt "$best" ] && best="$r"
+    fi
+    echo "$best $detail"
+}
+
+# Serving anything, or we cannot tell? Then this run does nothing.
+guard_idle(){
+    local out count detail
+    out="$(inflight)"; count="${out%% *}"; detail="${out#* }"
+    if [ "$count" = unknown ]; then
+        if [ "$REQUIRE_IDLE_CHECK" = "1" ]; then
+            say "SKIP: cannot tell whether CoderAI is serving ($detail) — refusing to"
+            say "      upgrade blind. Fix the probe, or set REQUIRE_IDLE_CHECK=\"0\" to"
+            say "      upgrade without the check (it will interrupt live requests)."
+            return 1
+        fi
+        say "WARN: idle check unavailable ($detail) and REQUIRE_IDLE_CHECK=0 — continuing"
+        return 0
+    fi
+    if [ "$count" -gt 0 ]; then
+        say "SKIP: serving $count request(s) [$detail] — leaving the image alone"
+        return 1
+    fi
+    say "idle ($detail)"
+    return 0
+}
+
+healthy(){
+    local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if curl -fsS --max-time 10 "$HEALTH_URL" 2>/dev/null | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+            return 0
+        fi
+        sleep 10
+    done
+    return 1
+}
+
+restart_and_verify(){
+    say "restarting: $RESTART_CMD"
+    if ! sh -c "$RESTART_CMD" >>"$LOG" 2>&1; then
+        say "WARN: the restart command returned non-zero"
+    fi
+    if healthy; then return 0; fi
+    return 1
+}
+
+# ------------------------------------------------------------------- the upgrade
+BEFORE="$(baked_version)"
+[ -n "$BEFORE" ] || { say "FAIL: cannot read the version from $IMAGE_TAG (wrong tag? engine '$ENGINE'?)"; exit 1; }
+
+if [ -f "$PENDING" ]; then
+    # A previous run upgraded the image but could not restart. Do not upgrade
+    # again on top of that; land what is already there first.
+    say "a restart is still pending for $(cat "$PENDING" 2>/dev/null) — not upgrading further"
+else
+    # Nothing is touched while CoderAI is serving. Checked BEFORE the upgrade and
+    # not only before the restart, so a busy host never even reaches the state
+    # where new code sits in the image waiting for a window.
+    guard_idle || exit 0
+    say "image $IMAGE_TAG carries $BEFORE; checking '$UPGRADE_REF'"
+    # The rollback point is a TAG on the current image, so it costs nothing and
+    # survives the commit the upgrade makes onto $IMAGE_TAG.
+    "$ENGINE" tag "$IMAGE_TAG" "$ROLLBACK_TAG" >/dev/null 2>&1 \
+        || say "WARN: could not tag the rollback point; continuing without one"
+
+    CODERAI_UPGRADE_REF="$UPGRADE_REF" "$RUNNER" --upgrade --upgrade-ref "$UPGRADE_REF" \
+        "$IMAGE_TAG" >>"$LOG" 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] || { say "FAIL: the upgrade run exited $rc; image left as it was"; exit 1; }
+
+    AFTER="$(baked_version)"
+    if [ "$AFTER" = "$BEFORE" ]; then
+        say "already current at $BEFORE; nothing to restart"
+        rm -f "$DEFERRALS"
+        exit 0
+    fi
+    say "image upgraded $BEFORE -> $AFTER"
+    printf '%s -> %s\n' "$BEFORE" "$AFTER" > "$PENDING"
+fi
+
+# ------------------------------------------------------------- restart, or defer
+# The upgrade itself takes a minute, so ask again: a request may have arrived
+# while it ran, and the restart is the part that would kill it.
+N=$(cat "$DEFERRALS" 2>/dev/null || echo 0)
+OUT="$(inflight)"; BUSY="${OUT%% *}"; WHAT="${OUT#* }"
+if [ "$BUSY" = unknown ] || { [ "$BUSY" -gt 0 ] 2>/dev/null; }; then
+    if [ "$N" -lt "$MAX_DEFERRALS" ]; then
+        echo $((N + 1)) > "$DEFERRALS"
+        say "serving [$WHAT] — deferring the restart ($((N + 1))/$MAX_DEFERRALS)"
+        exit 0
+    fi
+    if [ "$MAX_DEFERRALS" -le 0 ]; then
+        echo $((N + 1)) > "$DEFERRALS"
+        say "serving [$WHAT] — the new code is in the image and waits for an idle"
+        say "      moment ($((N + 1)) run(s) so far). Set MAX_DEFERRALS>0 to restart anyway."
+        exit 0
+    fi
+    say "serving [$WHAT] but $N deferrals already — restarting anyway"
+fi
+
+if restart_and_verify; then
+    say "OK: running $(cat "$PENDING" 2>/dev/null | sed 's/.*-> //') and healthy"
+    rm -f "$PENDING" "$DEFERRALS"
+    exit 0
+fi
+
+# ------------------------------------------------------------------- the rollback
+say "FAIL: the service did not become healthy within ${HEALTH_TIMEOUT}s after the upgrade"
+if "$ENGINE" image inspect "$ROLLBACK_TAG" >/dev/null 2>&1; then
+    say "rolling back $IMAGE_TAG to the pre-upgrade image"
+    "$ENGINE" tag "$ROLLBACK_TAG" "$IMAGE_TAG" >/dev/null 2>&1
+    if restart_and_verify; then
+        say "FAIL: upgrade reverted — back on $BEFORE and healthy. The upgrade is NOT applied."
+        rm -f "$PENDING" "$DEFERRALS"
+        exit 1
+    fi
+    say "FAIL: the service is down and the rollback did not bring it back. Needs a human."
+    exit 1
+fi
+say "FAIL: no rollback image available; the service is down. Needs a human."
+exit 1

@@ -1,0 +1,28 @@
+# How often to look for a new production build. HOURLY: the Digesta production
+# host follows `production` closely, so a fix should land within the hour rather
+# than waiting for the night.
+#
+# An hourly tick is cheap when there is nothing to do -- the check is a shallow
+# clone of one branch and a version compare, and the script exits without
+# touching the service unless the baked version actually changed. A restart only
+# happens on a real upgrade, and only when the fleet is idle (or after
+# MAX_DEFERRALS hours of never being idle).
+#
+# RandomizedDelaySec spreads a fleet of orchestrators so they do not all clone
+# and restart on the same minute. Persistent=true runs a missed check once after
+# a reboot, so a host that was off does not wait for the next full hour.
+#
+# For a host that should only move in a maintenance window, replace OnCalendar
+# with e.g. `*-*-* 04:30:00` and keep everything else.
+[Unit]
+Description=Hourly check for a new CoderAI production build
+
+[Timer]
+# `hourly` is systemd's shorthand for `*-*-* *:00:00`.
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

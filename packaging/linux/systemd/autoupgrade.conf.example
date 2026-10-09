@@ -1,0 +1,40 @@
+# CoderAI unattended upgrade — copy to ~/.config/coderai/autoupgrade.conf
+# Sourced by coderai-autoupgrade as shell, so it is `KEY=value`, no export needed.
+# QUOTE any value containing spaces: unquoted, `RESTART_CMD=systemctl --user
+# restart coderai.service` assigns only "systemctl" and then RUNS the rest as a
+# command. Every value below is a default made explicit; delete what you do not
+# change.
+
+# podman (preferred when installed) or docker.
+ENGINE="podman"
+
+# The tag the service actually runs. --upgrade COMMITS onto this tag, so it must
+# be the same one the quadlet/unit names, or the restart picks up the old code.
+IMAGE_TAG="ghcr.io/nextime/coderai:latest"
+
+# The branch to follow. `production` is the released line; `master` is ahead of it.
+UPGRADE_REF="production"
+
+# The host runner. Found on PATH when unset.
+#RUNNER="/usr/local/bin/coderai-docker"
+
+# How the service is restarted once the image carries new code. For a rootless
+# quadlet this is the generated unit; for a system install, `sudo systemctl
+# restart coderai`; on a host without systemd, `/etc/init.d/coderai restart`.
+RESTART_CMD="systemctl --user restart coderai.service"
+
+# Where to confirm the service came back. On the Digesta host the container's
+# 8776 is published on 8777. If this is wrong the script will roll back a
+# perfectly good upgrade, so check it once by hand.
+HEALTH_URL="http://127.0.0.1:8777/healthz"
+HEALTH_TIMEOUT="300"
+
+# Optional idle check: an admin-scoped API token lets the script ask how many
+# requests are in flight and defer the restart instead of interrupting them.
+# Without it the restart happens whenever the timer says so.
+#STATUS_URL="http://127.0.0.1:8777/v1/runpod/status"
+#ADMIN_TOKEN="cra-..."
+
+# After this many deferrals the restart happens anyway, so a fleet that is never
+# idle cannot pin an old version indefinitely.
+MAX_DEFERRALS="8"
