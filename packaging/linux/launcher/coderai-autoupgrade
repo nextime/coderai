@@ -111,11 +111,18 @@ baked_version(){
 }
 
 _probe_metrics(){
-    # Sum of coderai_engine_inflight across engines. A request routed to a RunPod
-    # pod is still in flight here, so this covers remote serving as well as local.
+    # Two numbers from one scrape, as "<inflight> <jobs>":
+    #   coderai_engine_inflight  -- requests in flight, pod-served ones included
+    #   coderai_jobs_active      -- running/queued TASKS across the engines
+    # The second is what catches training: a LoRA run is started by a request
+    # that returns immediately and then works for hours, so inflight is 0 the
+    # whole time. An older front serves no jobs gauge; "-" then says so rather
+    # than claiming zero.
     curl -fsS --max-time 10 -H "Authorization: Bearer $ADMIN_TOKEN" "$METRICS_URL" 2>/dev/null \
         | awk '/^coderai_engine_inflight[ {]/ { n += $NF; seen = 1 }
-               END { if (seen) printf "%d\n", n; else print "unknown" }'
+               /^coderai_jobs_active[ {]/     { j = $NF; jseen = 1 }
+               END { if (!seen) { print "unknown unknown"; exit }
+                     printf "%d %s\n", n, (jseen ? sprintf("%d", j) : "-") }'
 }
 
 _probe_runpod(){
@@ -127,11 +134,17 @@ except Exception: print("unknown")' 2>/dev/null
 }
 
 # Echoes "<count> <detail>", or "unknown <why>" when nothing could be read.
+#
+# The MAXIMUM of the sources, never the sum: a generation appears as both an
+# in-flight request and a running task, so adding them would double-count and
+# the numbers in the log would not match anything an operator can see.
 inflight(){
-    local m r best detail
+    local out m j r best detail
     [ -n "$ADMIN_TOKEN" ] || { echo "unknown no ADMIN_TOKEN configured"; return; }
-    m="$(_probe_metrics)"; r="$(_probe_runpod)"
+    out="$(_probe_metrics)"; m="${out%% *}"; j="${out##* }"
+    r="$(_probe_runpod)"
     case "$m" in ''|unknown) m=unknown ;; *[!0-9]*) m=unknown ;; esac
+    case "$j" in ''|-|unknown) j=unknown ;; *[!0-9]*) j=unknown ;; esac
     case "$r" in ''|unknown) r=unknown ;; *[!0-9]*) r=unknown ;; esac
     if [ "$m" = unknown ] && [ "$r" = unknown ]; then
         echo "unknown neither $METRICS_URL nor $STATUS_URL could be read"
@@ -139,6 +152,14 @@ inflight(){
     fi
     best=0; detail=""
     [ "$m" != unknown ] && { best="$m"; detail="engines=$m"; }
+    if [ "$j" != unknown ]; then
+        detail="${detail:+$detail }jobs=$j"
+        [ "$j" -gt "$best" ] && best="$j"
+    else
+        # Only worth saying once the rest is known to work: it means the front
+        # predates coderai_jobs_active, so training is invisible to this check.
+        detail="${detail:+$detail }jobs=? (front too old)"
+    fi
     if [ "$r" != unknown ]; then
         detail="${detail:+$detail }runpod=$r"
         [ "$r" -gt "$best" ] && best="$r"

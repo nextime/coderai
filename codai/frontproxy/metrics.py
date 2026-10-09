@@ -22,7 +22,12 @@ What is exported, all prefixed ``coderai_``:
   front completed, attributed to the API key that made it (its name on the
   Tokens page; ``session`` for a browser; ``anonymous`` when open);
 * ``engine_up{engine,backend,remote}``, ``engine_inflight``,
-  ``engine_vram_free_bytes`` / ``_total_bytes``, ``engine_loaded_models``;
+  ``engine_jobs_active``, ``engine_vram_free_bytes`` / ``_total_bytes``,
+  ``engine_loaded_models``;
+* ``jobs_active`` — every running/queued task across the engines, training
+  included. Training is the case ``requests_active`` cannot see: the request
+  that starts it returns at once and the work runs for hours, so anything
+  deciding whether it is safe to restart has to read this one;
 * ``node_up{node}``, ``node_recoveries_total``;
 * ``rpc_server_up{endpoint}``; ``discovery_peers`` / ``discovery_members``;
 * ``runpod_spend_usd{model,period}`` (trailing hour/day/week/month), ``runpod_pods``;
@@ -32,6 +37,28 @@ What is exported, all prefixed ``coderai_``:
 import threading
 import time
 from collections import defaultdict
+
+
+# A task still holding the card. "paused" is in here on purpose: a thermally
+# paused generation has not finished, and anything that reads this to decide
+# whether it is safe to restart must treat it as busy.
+_ACTIVE_TASK_STATES = ("running", "queued", "paused")
+
+
+def _active_jobs(engine) -> int:
+    """Running/queued tasks the engine reported on its last state poll.
+
+    This is the only view of work that has NO request in flight: a LoRA
+    training run is started by a request that returns immediately and then
+    proceeds for hours, so ``engine_inflight`` is 0 throughout. Without this,
+    an unattended upgrade that waits for idleness would restart straight
+    through a training job.
+    """
+    out = 0
+    for t in (getattr(engine, "tasks", None) or []):
+        if isinstance(t, dict) and str(t.get("status") or "") in _ACTIVE_TASK_STATES:
+            out += 1
+    return out
 
 
 def _esc(v) -> str:
@@ -114,7 +141,7 @@ def render(front) -> str:
                   f"coderai_front_start_time_seconds {m.started:.0f}"]
 
     # Engines and nodes, from the registry.
-    up, infl, vfree, vtot, loaded, nup = [], [], [], [], [], []
+    up, infl, vfree, vtot, loaded, nup, jobs = [], [], [], [], [], [], []
     for e in front.registry.all():
         if getattr(e, "role", "engine") == "system":
             continue
@@ -122,6 +149,7 @@ def render(front) -> str:
         lab = {"engine": e.name, "backend": e.backend or "", "remote": "1" if remote else "0"}
         up.append("coderai_engine_up" + _labels(lab) + f" {1 if e.healthy else 0}")
         infl.append("coderai_engine_inflight" + _labels(lab) + f" {int(getattr(e, 'inflight', 0) or 0)}")
+        jobs.append("coderai_engine_jobs_active" + _labels(lab) + f" {_active_jobs(e)}")
         v = e.vram or {}
         if v:
             vfree.append("coderai_engine_vram_free_bytes" + _labels(lab)
@@ -134,6 +162,8 @@ def render(front) -> str:
     for help_, typ, rows in (
             ("Engine (or node) answering its health poll.", "gauge", up),
             ("Requests currently proxied to the engine.", "gauge", infl),
+            ("Running/queued tasks on the engine, including training with no "
+             "request in flight.", "gauge", jobs),
             ("Free VRAM the engine reports.", "gauge", vfree),
             ("Total VRAM the engine reports.", "gauge", vtot),
             ("Models resident on the engine.", "gauge", loaded),
@@ -213,6 +243,18 @@ def render(front) -> str:
         active = sum(int(getattr(e, "inflight", 0) or 0) for e in front.registry.all())
         lines += ["# HELP coderai_requests_active Requests in flight through the front.",
                   "# TYPE coderai_requests_active gauge", f"coderai_requests_active {active}"]
+    except Exception:
+        pass
+
+    # Every piece of work in progress, whether or not a request is open on it.
+    # One number so "is it safe to restart?" is a single scrape and cannot be
+    # got wrong by summing the per-engine series (a generation shows up BOTH as
+    # an in-flight request and as a task, so these overlap by design).
+    try:
+        njobs = sum(_active_jobs(e) for e in front.registry.all())
+        lines += ["# HELP coderai_jobs_active Running/queued tasks across all engines "
+                  "(training included; overlaps coderai_requests_active).",
+                  "# TYPE coderai_jobs_active gauge", f"coderai_jobs_active {njobs}"]
     except Exception:
         pass
     return "\n".join(lines) + "\n"
