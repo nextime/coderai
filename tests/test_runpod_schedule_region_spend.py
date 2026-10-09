@@ -12,6 +12,8 @@ import re
 
 import pytest
 
+from codai.api import runpod_worker as rw
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -160,10 +162,36 @@ def test_region_is_normalised_and_per_model():
 
 
 def test_volume_region_still_wins_over_the_model_setting():
-    """A pod in another region cannot attach the volume, so the volume decides."""
+    """A pod in another region cannot attach the volume, so the volume decides.
+
+    Exercised rather than grepped: this used to assert the source text
+    `dc or ""`, which was a NameError in one of the two places that read it —
+    the pod was rented and then never recorded. A string match could not see
+    that; calling the method can.
+    """
+    class _Acct:
+        data_center = "EU-RO-1"
+
+    pool = rw.RunpodPodPool.__new__(rw.RunpodPodPool)
+    pool.account = _Acct()
+    pool.mcfg = rw.parse_model_runpod({"data_center": "EU-SE-1"})
+
+    pool._volume_dc = None
+    assert pool._data_center() == "EU-SE-1"        # the model's setting
+    pool.mcfg.data_center = ""
+    assert pool._data_center() == "EU-RO-1"        # falls back to the account
+    pool._volume_dc = "EU-CZ-1"
+    assert pool._data_center() == "EU-CZ-1"        # the volume always wins
+    pool.mcfg.data_center = "EU-SE-1"
+    assert pool._data_center() == "EU-CZ-1"
+
+
+def test_both_provisioning_paths_ask_for_the_region_the_same_way():
+    """One computed it as a local, the other read that name from a scope it was
+    never in. Neither may go back to a local."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    assert 'dc = (self.mcfg.data_center' in src
-    assert 'data_center_id=(getattr(self, "_volume_dc", "") or dc)' in src
+    assert src.count("self._data_center()") >= 2
+    assert "dc = (self.mcfg.data_center" not in src
 
 
 # --------------------------------------------------- orchestration: admin API

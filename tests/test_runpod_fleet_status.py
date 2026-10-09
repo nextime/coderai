@@ -64,7 +64,10 @@ def test_each_pod_reports_where_it_is_and_what_it_serves():
         assert field in blk, field
     # and the placement has to be carried on the pod to be reportable
     assert "data_center: str = \"\"" in src.split("class PodHandle")[1][:600]
-    assert 'data_center=(getattr(self, "_volume_dc", "") or dc or "")' in src
+    # The handle gets its region from the pool's own resolver. It used to read
+    # a local `dc` that did not exist in this function, so the pod was created
+    # and then the handle raised NameError — the A40 billed untracked.
+    assert "data_center=self._data_center()" in src
 
 
 def test_status_and_spend_are_the_same_document_behind_the_same_gate():

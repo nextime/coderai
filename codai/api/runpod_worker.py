@@ -2099,10 +2099,6 @@ class RunpodPodPool:
                 print(f"[runpod] direct_tcp on a {plan.get('engine')} image: plain "
                       f"HTTP — that image cannot take a certificate; the bearer "
                       f"token travels unencrypted", flush=True)
-        # Region precedence: the volume's data centre (a pod elsewhere simply
-        # cannot attach it) > this model's setting > the account default.
-        dc = (self.mcfg.data_center
-              or getattr(self.account, "data_center", "") or "")
         last = None
         for i in range(start, len(ranked)):
             sel = ranked[i]
@@ -2126,7 +2122,7 @@ class RunpodPodPool:
                     cloud_type=sel["cloud_type"], container_disk_gb=_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],
-                    data_center_id=(getattr(self, "_volume_dc", "") or dc),
+                    data_center_id=self._data_center(),
                     network_volume_id=vol_id,
                     volume_mount_path=(vol_mount or "/workspace"),
                     registry_auth_id=(self.mcfg.registry_auth_id
@@ -2199,6 +2195,23 @@ class RunpodPodPool:
     # but never actually starts (stuck pending — seen in practice) is retried on the
     # NEXT candidate rather than failing the request.
     MAX_PROVISION_ATTEMPTS = 3
+
+    def _data_center(self) -> str:
+        """Which RunPod region this pool's pods go to.
+
+        The volume's own data centre wins: a network volume lives in one region
+        and a pod elsewhere simply cannot attach it. Then the model's setting,
+        then the account default.
+
+        A method rather than a local because it was a local: ``dc`` was computed
+        inside _create_with_fallback and then read again in _provision_one,
+        which has no such name. The pod was created, the PodHandle raised
+        NameError, and the pool never recorded the pod it had just rented — so
+        provisioning retried and the untracked A40 billed on.
+        """
+        return (getattr(self, "_volume_dc", "")
+                or self.mcfg.data_center
+                or getattr(self.account, "data_center", "") or "")
 
     def _provision_one(self):
         """Create + boot one pod; append it healthy. Blocking (minutes).
@@ -2286,7 +2299,7 @@ class RunpodPodPool:
                           started_at=time.time(), gpu=sel["display_name"],
                           is_spot=sel["is_spot"], healthy=True, last_used=time.time(),
                           console_url=console,
-                          data_center=(getattr(self, "_volume_dc", "") or dc or ""),
+                          data_center=self._data_center(),
                           cloud_type=str(sel.get("cloud_type") or ""),
                           gpu_count=int(sel.get("gpu_count") or 1))
             with self._cv:

@@ -358,3 +358,17 @@ def test_the_answer_names_the_model_the_client_asked_about():
     blk = src.split("def set_client_pods")[1]
     assert 'out["model"] = key' in blk
     assert 'out["pool"]' in blk
+
+
+def test_a_pod_is_recorded_even_when_the_region_is_unset():
+    """The leak, reproduced at the level it happened: build the handle fields
+    the way _provision_one does, with nothing configured anywhere. If the
+    region expression raises, the pool never records the pod it just rented."""
+    class _Acct:
+        data_center = ""
+
+    pool = rw.RunpodPodPool.__new__(rw.RunpodPodPool)
+    pool.account = _Acct()
+    pool.mcfg = rw.parse_model_runpod({})
+    pool._volume_dc = None
+    assert pool._data_center() == ""        # no exception, and a usable value
