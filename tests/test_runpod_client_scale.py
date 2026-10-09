@@ -372,3 +372,59 @@ def test_a_pod_is_recorded_even_when_the_region_is_unset():
     pool.mcfg = rw.parse_model_runpod({})
     pool._volume_dc = None
     assert pool._data_center() == ""        # no exception, and a usable value
+
+
+# ------------------------------- a restart must not rent beside its own pod
+
+def test_the_warm_path_adopts_before_it_rents():
+    """A warm floor is re-established at EVERY boot. Without adoption an hourly
+    unattended upgrade rents a fresh A40 each time and leaves the previous one
+    billing until the reaper's 20-minute grace expires — observed three times
+    on the production orchestrator in one afternoon."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    ready = src.split("def ensure_ready")[1].split("def _pick")[0]
+    assert "_adopt_shared_pod()" in ready
+    assert ready.index("_adopt_shared_pod()") < ready.index("self._provision_one()")
+    warm = src.split("def maintain")[1].split("def close")[0]
+    assert "if not self._adopt_shared_pod():" in warm
+
+
+def test_adoption_is_one_implementation_for_both_callers():
+    """It lived inside acquire() only, which is why the warm path never had it."""
+    src = __input = __import__("pathlib").Path(rw.__file__).read_text()
+    assert src.count("def _adopt_shared_pod") == 1
+    assert src.count("_adopt_shared_pod()") >= 3   # acquire + ensure_ready + maintain
+
+
+def test_an_adopted_pod_keeps_its_price():
+    """It used to be recorded at $0/hr as "billed by its owner". After OUR
+    restart there is no other owner: reporting it free hides a real A40 from
+    the $/hr cap and from the spend page."""
+    src = __import__("pathlib").Path(rw.__file__).read_text()
+    blk = src.split("def _adopt_shared_pod")[1].split("def _data_center")[0]
+    assert "hourly_usd=float(shared_rate or 0.0)" in blk
+    assert "hourly_usd=0.0" not in blk
+
+
+def test_the_registry_records_the_rate_so_adoption_can_read_it():
+    import json
+    import tempfile
+    d = tempfile.mkdtemp()
+    saved = rw._pod_registry_path
+    rw._pod_registry_path = lambda: d + "/pods.json"
+    try:
+        rw.register_pod("p1", "pool:x", "http://pod:8000", "tok", hourly_usd=0.59)
+        rec = json.load(open(d + "/pods.json"))["p1"]
+        assert rec["hourly_usd"] == 0.59
+        assert rec["url"] == "http://pod:8000" and rec["key"] == "tok"
+        # An older entry with no rate must not break adoption.
+        rec.pop("hourly_usd")
+        json.dump({"p1": rec}, open(d + "/pods.json", "w"))
+        saved_health = rw._pod_health_ok
+        rw._pod_health_ok = lambda *a, **k: True
+        try:
+            assert rw.find_shared_pod("pool:x")[3] == 0.0
+        finally:
+            rw._pod_health_ok = saved_health
+    finally:
+        rw._pod_registry_path = saved

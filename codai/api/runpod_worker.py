@@ -2196,6 +2196,45 @@ class RunpodPodPool:
     # NEXT candidate rather than failing the request.
     MAX_PROVISION_ATTEMPTS = 3
 
+    def _adopt_shared_pod(self) -> bool:
+        """Take over a pod already running for this pool, instead of renting.
+
+        Two cases, one mechanism: a sibling engine booted one for the same pool,
+        or WE booted one before the last restart. The second is the expensive
+        one — a warm floor is re-established at every boot, so an hourly
+        unattended upgrade rented a fresh A40 each time and left the previous
+        one billing until the reaper's 20-minute grace expired.
+        """
+        shared_id, shared_url, shared_key, shared_rate = find_shared_pod(
+            str(self.model_key), self.health_path, self.api_key)
+        if not shared_url:
+            return False
+        if shared_key and shared_key != self.api_key:
+            # That pod only answers to the token it was launched with. Adopt the
+            # token so this pool — and the pods it rents next — speak the same
+            # one. Only safe while we hold no pod of our own; otherwise we end
+            # up with a pool whose pods want two different tokens.
+            with self._cv:
+                if self.pods:
+                    return False
+            self.api_key = shared_key
+            print(f"[runpod] adopting pod {shared_id}'s bearer token", flush=True)
+        print(f"[runpod] reusing the pod already running for {self.model_key!r} "
+              f"({shared_id}) instead of renting another", flush=True)
+        handle = PodHandle(pod_id=shared_id, url=shared_url,
+                           # Its recorded price when we know it: a pod we are
+                           # inheriting after our own restart is ours to pay for,
+                           # and reporting it free hides it from the $/hr cap.
+                           hourly_usd=float(shared_rate or 0.0),
+                           started_at=time.time(), gpu="(adopted)",
+                           healthy=True, last_used=time.time())
+        with self._cv:
+            self.pods.append(handle)
+            self._cv.notify_all()
+        register_pod(shared_id, str(self.model_key), shared_url, self.api_key,
+                     hourly_usd=float(shared_rate or 0.0))
+        return True
+
     def _data_center(self) -> str:
         """Which RunPod region this pool's pods go to.
 
@@ -2310,7 +2349,8 @@ class RunpodPodPool:
                 _provisioning_info.pop(pod_id, None)
             # Publish the URL so a sibling engine needing the same pool reuses
             # this pod instead of renting a second GPU for the same work.
-            register_pod(pod_id, str(self.model_key), url, self.api_key)
+            register_pod(pod_id, str(self.model_key), url, self.api_key,
+                         hourly_usd=sel["price"])
             print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
             return h
         raise last_exc or RunpodError("RunPod: could not provision a pod.")
@@ -2330,6 +2370,11 @@ class RunpodPodPool:
                 return
             self._provisioning = True
         try:
+            # A pod for this pool may already be up — a sibling engine's, or our
+            # own from before the last restart. Renting beside it is how a warm
+            # floor of one became two A40s at every boot.
+            if self._adopt_shared_pod():
+                return
             for _ in range(want):
                 try:
                     self._provision_one()
@@ -2437,31 +2482,8 @@ class RunpodPodPool:
                         self._cv.notify_all()
                         self._cv.wait(15.0)
                     continue
-                shared_id, shared_url, shared_key = find_shared_pod(
-                    str(self.model_key), self.health_path, self.api_key)
-                if shared_url and shared_key and shared_key != self.api_key:
-                    # That pod only answers to the token it was launched with.
-                    # Adopt the token so this pool — and the pods it rents next —
-                    # speak the same one. Only safe while we hold no pod of our
-                    # own; otherwise leave it to be reaped rather than end up
-                    # with a pool whose pods want two different tokens.
+                if self._adopt_shared_pod():
                     with self._cv:
-                        adoptable = not self.pods
-                    if not adoptable:
-                        shared_id, shared_url = None, ""
-                    else:
-                        self.api_key = shared_key
-                        print(f"[runpod] adopting pod {shared_id}'s bearer token",
-                              flush=True)
-                if shared_url:
-                    print(f"[runpod] reusing pod {shared_id} from another engine "
-                          f"for {self.model_key!r}", flush=True)
-                    handle = PodHandle(pod_id=shared_id, url=shared_url,
-                                       hourly_usd=0.0,  # billed by its owner
-                                       started_at=time.time(), gpu="(shared)",
-                                       healthy=True, last_used=time.time())
-                    with self._cv:
-                        self.pods.append(handle)
                         self._provisioning = False
                         self._cv.notify_all()
                     continue
@@ -2636,7 +2658,8 @@ class RunpodPodPool:
                     return
                 self._provisioning = True
             try:
-                self._provision_one()
+                if not self._adopt_shared_pod():
+                    self._provision_one()
             except Exception as exc:
                 print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
             finally:
@@ -3079,7 +3102,7 @@ def _registry_update(fn):
 
 
 def register_pod(pod_id: str, pool_key: str = "", url: str = "",
-                 api_key: str = "") -> None:
+                 api_key: str = "", hourly_usd: float = 0.0) -> None:
     """Record a pod as owned by this deployment.
 
     Two reasons, both about processes that cannot see each other: no sibling's
@@ -3096,7 +3119,10 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
         return
     _registry_update(lambda d: d.__setitem__(
         str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time(),
-                      "url": str(url or ""), "key": str(api_key or "")})
+                      "url": str(url or ""), "key": str(api_key or ""),
+                      # So a pod adopted after a restart is still attributed its
+                      # real $/hr instead of looking free.
+                      "hourly_usd": float(hourly_usd or 0.0)})
         or True)
 
 
@@ -3126,7 +3152,7 @@ def sibling_is_provisioning(pool_key: str) -> bool:
 
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
                     api_key: str = "") -> tuple:
-    """A pod another process already has for this pool: (pod_id, url, key).
+    """A pod already running for this pool: (pod_id, url, key, hourly_usd).
 
     ``key`` is the token that pod was launched with, which is not necessarily
     ours — see register_pod. Empty when unknown (an entry from before tokens were
@@ -3136,6 +3162,12 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
     capability was rented a pod PER ENGINE, paying twice for one job while
     max_pods said 1. Checked against the shared registry and health-probed, so a
     dead entry is never handed out.
+
+    It also covers OUR OWN pod from before a restart: the pid no longer matches,
+    so the entry is adoptable. That matters most for a warm floor, which is
+    re-established at every boot — an hourly unattended upgrade would otherwise
+    rent a fresh A40 each time and leave the last one billing until the reaper's
+    grace ran out.
     """
     data = _registry_update(lambda d: False)
     if not isinstance(data, dict):
@@ -3151,8 +3183,8 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
             continue
         key = str(info.get("key") or "") or api_key
         if _pod_health_ok(url, path=health_path, api_key=key):
-            return pod_id, url, key
-    return None, "", ""
+            return pod_id, url, key, float(info.get("hourly_usd") or 0.0)
+    return None, "", "", 0.0
 
 
 def unregister_pod(pod_id: str) -> None:

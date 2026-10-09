@@ -348,18 +348,18 @@ def test_a_sibling_engines_pod_is_reused_not_duplicated(tmp_path, monkeypatch):
         "pod-from-nvidia", {"pool": "capability:embeddings", "pid": 999999,
                             "at": 0, "url": "http://pod-a:8000"}) or True)
 
-    pod_id, url, key = rw.find_shared_pod("capability:embeddings")
+    pod_id, url, key, rate = rw.find_shared_pod("capability:embeddings")
     assert (pod_id, url) == ("pod-from-nvidia", "http://pod-a:8000")
 
     # A different pool must not borrow it.
-    assert rw.find_shared_pod("capability:images") == (None, "", "")
+    assert rw.find_shared_pod("capability:images") == (None, "", "", 0.0)
 
     # Our own pods are left to the local pool, not "borrowed" from ourselves.
     import os
     rw._registry_update(lambda d: d.__setitem__(
         "pod-mine", {"pool": "capability:images", "pid": os.getpid(),
                      "at": 0, "url": "http://pod-b:8000"}) or True)
-    assert rw.find_shared_pod("capability:images") == (None, "", "")
+    assert rw.find_shared_pod("capability:images") == (None, "", "", 0.0)
 
 
 def test_a_borrowed_pod_is_released_not_terminated(monkeypatch):
@@ -538,7 +538,7 @@ def test_a_surviving_pods_token_is_remembered_across_a_restart(tmp_path, monkeyp
                     "http://pod-a:8000", "cra-original")
     monkeypatch.setattr(rw.os, "getpid", lambda: 424242)   # a NEW process
 
-    pod_id, url, key = rw.find_shared_pod("capability:embeddings",
+    pod_id, url, key, rate = rw.find_shared_pod("capability:embeddings",
                                           api_key="cra-freshly-generated")
     assert (pod_id, url, key) == ("pod-survivor", "http://pod-a:8000", "cra-original")
     assert seen["key"] == "cra-original", "probed with the pod's token, not ours"
