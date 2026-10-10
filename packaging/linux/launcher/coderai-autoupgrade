@@ -24,8 +24,26 @@
 set -uo pipefail
 
 CONF="${CODERAI_AUTOUPGRADE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/coderai/autoupgrade.conf}"
+
+# Every knob below is `VAR="${VAR:-default}"`, which reads as "the environment may
+# override it" -- but the conf is sourced FIRST and assigns unconditionally
+# (`MAX_DEFERRALS="0"`), so the conf silently won and `MAX_DEFERRALS=1
+# coderai-autoupgrade` did exactly nothing, with no line in the log to say why.
+# An operator passing a variable on the command line is overriding the unattended
+# policy deliberately and for one run, so the environment has to win. Snapshot what
+# it set, source the conf, put the snapshot back.
+AUTOUPGRADE_TUNABLES="ENGINE IMAGE_TAG UPGRADE_REF RUNNER RESTART_CMD HEALTH_URL
+    HEALTH_TIMEOUT ADMIN_TOKEN METRICS_URL STATUS_URL REQUIRE_IDLE_CHECK
+    MAX_DEFERRALS CONTAINER_NAME STATE_DIR LOG ROLLBACK_TAG LOG_MAX_LINES"
+for _t in $AUTOUPGRADE_TUNABLES; do
+    eval "[ -n \"\${$_t:-}\" ] && _ENV_$_t=\"\$$_t\""
+done
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
+for _t in $AUTOUPGRADE_TUNABLES; do
+    eval "[ -n \"\${_ENV_$_t:-}\" ] && $_t=\"\$_ENV_$_t\""
+done
+unset _t
 
 # Which container engine. A rootless podman host is the common case for this
 # script, so prefer podman when both are installed.
@@ -58,6 +76,9 @@ STATUS_URL="${STATUS_URL:-$_base/v1/runpod/status}"
 # A silent upgrade that interrupts production is worse than a skipped one, and an
 # unreadable probe usually means a wrong token or URL, not an idle server.
 REQUIRE_IDLE_CHECK="${REQUIRE_IDLE_CHECK:-1}"
+# Which container is the server, for the one question the HTTP probes cannot
+# answer: is there a server at all? See container_state().
+CONTAINER_NAME="${CONTAINER_NAME:-coderai}"
 # Once the image HAS been upgraded, the restart can be deferred this many ticks
 # before going ahead anyway. 0 (the default) means never interrupt a request:
 # the new code waits in the image and every run says so.
@@ -92,8 +113,13 @@ fi
 # check fails and a perfectly good upgrade gets rolled back. One line makes it
 # obvious instead.
 IDLE_CHECK=off; [ -n "$ADMIN_TOKEN" ] && IDLE_CHECK=on
-say "config: engine=$ENGINE image=$IMAGE_TAG ref=$UPGRADE_REF"
+say "config: engine=$ENGINE image=$IMAGE_TAG ref=$UPGRADE_REF container=$CONTAINER_NAME"
 say "config: restart=[$RESTART_CMD] health=$HEALTH_URL idle-check=$IDLE_CHECK"
+# The two knobs that decide whether a run acts or waits. Neither was in the log,
+# so "it skipped again" and "it was told to skip" looked identical -- and with the
+# conf overriding the environment, an operator could be looking at the opposite of
+# what they typed.
+say "config: require-idle=$REQUIRE_IDLE_CHECK max-deferrals=$MAX_DEFERRALS"
 
 # ---------------------------------------------------------------------- the lock
 # flock on a dedicated fd, non-blocking: a run that overlaps the previous one is
@@ -108,6 +134,31 @@ baked_version(){
     "$ENGINE" run --rm --entrypoint grep "$IMAGE_TAG" -h "__version__" \
         /opt/coderai/app/codai/__init__.py 2>/dev/null \
         | tr -d ' "' | cut -d= -f2 | head -1
+}
+
+# "running", "stopped", or "unknown" when the engine itself could not be asked.
+#
+# Both probes are HTTP, so a server that is DOWN looks exactly like a wrong token:
+# both are unreadable, inflight() says "unknown", and the fail-closed guard refuses
+# to touch the install that most needs touching. That is not hypothetical -- zeiss
+# came back from a hard reset with no container at all, and every hourly run from
+# then on skipped, so the host sat on old code and stayed DOWN until a human
+# noticed. A container that is not running cannot be serving anything, and the
+# restart that follows an upgrade is also what brings it back.
+#
+# Only a POSITIVE answer counts. If the engine cannot be asked (daemon down,
+# wrong socket) this says "unknown" and the fail-closed guard still applies: the
+# point is to recognise an absent server, not to assume one.
+container_state(){
+    local names rc
+    names="$("$ENGINE" ps --format '{{.Names}}' 2>/dev/null)"; rc=$?
+    [ "$rc" -eq 0 ] || { echo unknown; return; }
+    printf '%s\n' "$names" | grep -qx "$CONTAINER_NAME" && { echo running; return; }
+    # An install that names its container something else is still covered: any
+    # running container of the image being upgraded is the server.
+    [ -n "$("$ENGINE" ps --quiet --filter "ancestor=$IMAGE_TAG" 2>/dev/null)" ] \
+        && { echo running; return; }
+    echo stopped
 }
 
 _probe_metrics(){
@@ -140,6 +191,13 @@ except Exception: print("unknown")' 2>/dev/null
 # the numbers in the log would not match anything an operator can see.
 inflight(){
     local out m j r best detail
+    # Cheapest and most certain signal first, and the only one that works when the
+    # server is down: no container, no work. Checked before the token, because a
+    # host with no server configured for the probes is the same situation.
+    if [ "$(container_state)" = stopped ]; then
+        echo "0 no '$CONTAINER_NAME' container running — nothing can be in flight"
+        return
+    fi
     [ -n "$ADMIN_TOKEN" ] || { echo "unknown no ADMIN_TOKEN configured"; return; }
     out="$(_probe_metrics)"; m="${out%% *}"; j="${out##* }"
     r="$(_probe_runpod)"

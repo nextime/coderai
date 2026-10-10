@@ -4,6 +4,10 @@
 # restart coderai.service` assigns only "systemctl" and then RUNS the rest as a
 # command. Every value below is a default made explicit; delete what you do not
 # change.
+#
+# A value passed in the ENVIRONMENT wins over this file, for that run only — so
+# `MAX_DEFERRALS=1 coderai-autoupgrade` lands a deferred restart now without
+# editing anything. (It used to be the other way round, silently.)
 
 # podman (preferred when installed) or docker.
 ENGINE="podman"
@@ -29,11 +33,25 @@ RESTART_CMD="systemctl --user restart coderai.service"
 HEALTH_URL="http://127.0.0.1:8777/healthz"
 HEALTH_TIMEOUT="300"
 
-# Optional idle check: an admin-scoped API token lets the script ask how many
-# requests are in flight and defer the restart instead of interrupting them.
-# Without it the restart happens whenever the timer says so.
+# The container that IS the server. Only used to answer the one question the HTTP
+# probes cannot: whether a server is running at all. A host that came back from a
+# reboot with no container is idle by definition, and the upgrade's restart is also
+# what brings it back — without this the probes are unreadable, the check below
+# fails closed, and the host sits on old code and stays down.
+CONTAINER_NAME="coderai"
+
+# The idle check: an admin-scoped API token lets the script ask how many requests
+# are in flight and defer the restart instead of interrupting them. WITHOUT a token
+# the check cannot be made at all, and because it fails closed (REQUIRE_IDLE_CHECK
+# below) a running server is then never upgraded — every tick skips and says so.
+# Either set a token, or set REQUIRE_IDLE_CHECK="0" and accept that a restart can
+# interrupt a live request.
 #STATUS_URL="http://127.0.0.1:8777/v1/runpod/status"
 #ADMIN_TOKEN="cra-..."
+
+# Fail closed when the check cannot be made. 1 (the default) is right for a host
+# that serves; 0 suits one where nothing is lost by restarting at a bad moment.
+REQUIRE_IDLE_CHECK="1"
 
 # After this many deferrals the restart happens anyway, so a fleet that is never
 # idle cannot pin an old version indefinitely.
