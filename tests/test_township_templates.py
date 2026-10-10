@@ -259,24 +259,35 @@ def test_seeding_runs_before_the_management_commands():
 
 
 def test_the_longcat_starter_asks_for_fewer_longer_scenes():
+    """The scene lengths now come from the MODEL (0 = auto in both starters), so this
+    asks the same question of the geometry the planner will use."""
     wan = TW.BUILTIN_TEMPLATES["Wan - many short scenes"]
     lc = TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]
-    # Longer scenes…
-    assert lc["clip_min_frames"] > wan["clip_max_frames"]
     # …at LongCat's own frame rate, not the Wan-era compromise.
     assert lc["fps"] == 15 and wan["fps"] == 8
+    w_lo, w_hi = TW._clip_frame_range(wan["clip_min_frames"], wan["clip_max_frames"],
+                                      TW.video_geometry("wan2.2"), "clip", wan["fps"])
+    l_lo, l_hi = TW._clip_frame_range(lc["clip_min_frames"], lc["clip_max_frames"],
+                                      TW.video_geometry("longcat"), "clip", lc["fps"])
+    # Longer scenes…
+    assert l_lo > w_hi
     # …so the same 45s short needs far fewer of them.
-    scenes_wan = 45 / (wan["clip_max_frames"] / wan["fps"])
-    scenes_lc = 45 / (lc["clip_max_frames"] / lc["fps"])
-    assert scenes_lc < scenes_wan / 2
+    assert 45 / (l_hi / lc["fps"]) < 45 / (w_hi / wan["fps"]) / 2
 
 
 def test_the_longcat_frame_counts_obey_the_vae_rule():
     """(frames - 1) divisible by 4 — the same rule the server checks before a long run,
-    and the one LongCat's own 93-frame segment satisfies."""
+    and the one LongCat's own 93-frame segment satisfies. The starter no longer carries
+    the numbers, so the rule is asked of what auto derives."""
     lc = TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]
-    for key in ("clip_min_frames", "clip_max_frames", "single_clip_max_frames"):
-        assert (lc[key] - 1) % 4 == 0, key
+    geom = TW.video_geometry("longcat")
+    for kind in ("clip", "intro", "outcome"):
+        for n in TW._clip_frame_range(0, 0, geom, kind, lc["fps"]):
+            assert (n - 1) % 4 == 0, (kind, n)
+            # And on the segment grid, which is stricter and is what keeps
+            # block-sparse attention usable.
+            assert (n - 93) % 80 == 0, (kind, n)
+    assert (TW._single_render_cap(lc["single_clip_max_frames"], geom) - 1) % 4 == 0
 
 
 def test_the_longcat_starter_selects_the_model():
@@ -309,10 +320,13 @@ def test_the_starters_cover_the_outcome_clips_too():
 
 def test_the_longcat_outcomes_obey_the_vae_rule_as_well():
     lc = TW.BUILTIN_TEMPLATES["LongCat - few long scenes"]
-    for key in ("outcome_min_frames", "outcome_max_frames"):
-        assert (lc[key] - 1) % 4 == 0, key
-    # 93 is one whole LongCat segment: the shortest honest ask.
-    assert lc["outcome_min_frames"] == 93
+    lo, hi = TW._clip_frame_range(lc["outcome_min_frames"], lc["outcome_max_frames"],
+                                  TW.video_geometry("longcat"), "outcome", lc["fps"])
+    for n in (lo, hi):
+        assert (n - 1) % 4 == 0, n
+    # An outcome is split across two shots, so its total is at least two segments —
+    # 93 is one whole LongCat segment and the shortest honest ask for either half.
+    assert lo >= 93 * 2 - 13
 
 
 def test_the_starters_leave_the_image_side_stages_alone():

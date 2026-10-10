@@ -1786,21 +1786,301 @@ CLIP_MIN_FRAMES = 50
 CLIP_MAX_FRAMES = 70
 
 
-def _clip_frame_range(lo, hi):
-    """Normalize a (min, max) fight-clip frame budget from config: clamp to
+# ─────────────────────────────────────────────────────────────────────────────
+# Model-based clip geometry
+#
+# How long a scene should be is not a matter of taste, it is a property of the
+# model: Wan2.2 cannot hold coherence past ~81 frames in ONE call, so a minute of
+# video is a dozen short cuts chained from a frame tail, while LongCat was
+# pretrained on continuation and the server renders a long shot in segments — so
+# the same minute is a handful of long takes. Carrying one frame number for both
+# means the operator retunes four fields by hand every time the model changes, and
+# forgetting to is invisible until the output looks wrong.
+#
+# Two halves, deliberately split:
+#
+#   GEOMETRY  — what the model can emit: native frame rate, the frame counts its
+#               VAE can decode, how much one render holds. The SERVER owns this and
+#               publishes it per model on /v1/models (ModelInfo.video, built by
+#               codai/models/video_geometry.py). _LOCAL_GEOMETRY below is only a
+#               fallback for an older front that does not send it yet.
+#   BANDS     — how long a township scene should be, in SECONDS. That is this
+#               tool's editorial judgement, not the model's, so it stays here.
+#
+# Seconds, not frames, because the clip COUNT falls out of
+# long_target / (frames / fps): pin frames and every scene silently changes
+# duration the moment the output rate does.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fallback geometry, mirroring codai/models/video_geometry.py. Legal total frame
+# counts are frame_base + frame_step * k.
+_LOCAL_GEOMETRY = {
+    "longcat": {"family": "longcat", "native_fps": 15, "frame_base": 93,
+                "frame_step": 80, "min_frames": 93, "max_frames": None,
+                "max_frames_per_render": 93, "cond_frames": 13,
+                "side_multiple": 64, "continuation": "native"},
+    "h3":      {"family": "h3", "native_fps": 24, "frame_base": 5,
+                "frame_step": 17, "min_frames": 124, "max_frames": 345,
+                "max_frames_per_render": 345, "cond_frames": 0,
+                "side_multiple": 32, "continuation": "none"},
+    "wan":     {"family": "wan", "native_fps": 16, "frame_base": 1,
+                "frame_step": 4, "min_frames": 5, "max_frames": None,
+                "max_frames_per_render": MODEL_MAX_FRAMES, "cond_frames": 0,
+                "side_multiple": 16, "continuation": "chained"},
+}
+
+# Scene length per family, in seconds of playback.
+#
+#   scene    — a fight clip. Wan's 6.2-8.75 s is the historical 50-70 frames at
+#              8 fps, kept so nothing changes shape for existing runs. LongCat's
+#              11.5-22 s is one to four segments: a 70 s match becomes 4-6 takes
+#              instead of 9-11 cuts.
+#   intro    — the two entrances and the face-off. These are NOT fight clips and
+#              were sharing the fight budget, which on LongCat made every entrance
+#              an 11-22 s take. A single segment is plenty.
+#   outcome  — the TOTAL for an outcome video, split across its finish + victory
+#              shots, so each shot gets about half.
+_SCENE_BANDS = {
+    "longcat": {"scene": (11.5, 22.0), "intro": (6.0, 7.0), "outcome": (12.0, 19.0)},
+    "h3":      {"scene": (5.0, 10.0),  "intro": (5.0, 5.5), "outcome": (10.0, 15.0)},
+    "wan":     {"scene": (6.2, 8.75),  "intro": (3.0, 5.0), "outcome": (12.0, 18.75)},
+}
+
+# Where this tool chains more conservatively than the model strictly requires.
+# Wan's 81-frame ceiling is where coherence breaks; 50 is where it still looks good,
+# and that has been the shipped behaviour since the beginning.
+_RENDER_CHUNK = {"wan": SINGLE_CLIP_MAX_FRAMES}
+
+# Geometry already fetched, keyed by model id. /v1/models is one HTTP call but the
+# planner asks per match, and a plan must not depend on the server staying up.
+_GEOM_CACHE = {}
+# The auto-selected video model, resolved once per process for the same reason.
+_AUTO_VIDEO_MODEL = {}
+
+
+def _local_geometry_for(model_id) -> dict:
+    """Fallback family match by NAME, for a front that does not publish geometry."""
+    mid = (model_id or "").lower().replace("_", "-")
+    if "longcat" in mid:
+        return dict(_LOCAL_GEOMETRY["longcat"])
+    if "minimax-h3" in mid:
+        return dict(_LOCAL_GEOMETRY["h3"])
+    return dict(_LOCAL_GEOMETRY["wan"])
+
+
+def video_geometry(model_id, client=None) -> dict:
+    """What `model_id` can emit: the server's published geometry, else the local table.
+
+    The server is asked first because it knows what it actually loaded — a checkpoint
+    aliased to something this table has never heard of, or a per-model override in
+    models.json, is right there and guessing from the name would be wrong. Any failure
+    (old front, no network, model not listed) falls back silently: a plan must never
+    depend on the server being reachable.
+    """
+    key = str(model_id or "")
+    if key in _GEOM_CACHE:
+        return dict(_GEOM_CACHE[key])
+    geom = None
+    if client is not None:
+        try:
+            for m in client.list_models():
+                if m.get("id") != key:
+                    continue
+                pub = m.get("video")
+                if isinstance(pub, dict) and pub.get("frame_step"):
+                    geom = dict(pub)
+                break
+        except Exception:
+            geom = None
+    if geom is None:
+        geom = _local_geometry_for(key)
+    else:
+        # The server publishes geometry only; the bands stay this tool's business.
+        geom.setdefault("family", _local_geometry_for(key).get("family", "wan"))
+    _GEOM_CACHE[key] = dict(geom)
+    return dict(geom)
+
+
+def resolved_video_model(default_args, client=None):
+    """The video model a web job will actually render with.
+
+    The Run page leaves `video_model` blank to mean "auto-select", and a blank model
+    plans with the wrong geometry — which is the whole bug this is here to avoid. So
+    ask the server the same question the render will: whichever video model it would
+    pick. Cached, because the planner asks per match.
+    """
+    configured = (getattr(default_args, "video_model", None) or "").strip()
+    if configured:
+        return configured
+    if client is None:
+        return ""
+    if "id" in _AUTO_VIDEO_MODEL:
+        return _AUTO_VIDEO_MODEL["id"]
+    picked = ""
+    try:
+        models = client.list_video_models()
+        picked = (models[0].get("id") or "") if models else ""
+    except Exception:
+        picked = ""
+    _AUTO_VIDEO_MODEL["id"] = picked
+    return picked
+
+
+def web_video_geometry(default_args, client=None) -> dict:
+    """Geometry for whatever video model a web job will use (blank = auto-selected).
+
+    Builds its own client when the caller has none: several web jobs plan their frame
+    budgets before they reach the point of talking to the server, and both the model
+    id and the geometry are cached, so this costs one request per process at most.
+    """
+    if client is None:
+        try:
+            client = CoderAIClient(default_args.base_url,
+                                   resolve_api_key(default_args))
+        except Exception:
+            client = None
+    return video_geometry(resolved_video_model(default_args, client), client)
+
+
+def _scene_band(geom: dict, kind: str):
+    """The (min, max) seconds band for a clip of `kind` on this model's family."""
+    fam = (geom or {}).get("family") or "wan"
+    bands = _SCENE_BANDS.get(fam) or _SCENE_BANDS["wan"]
+    return bands.get(kind) or bands["scene"]
+
+
+def _snap_frames(n, geom: dict = None) -> int:
+    """`n` moved onto the nearest frame count this model can actually emit.
+
+    Without this the planner hands the server counts like 250: not 4n+1 for any VAE,
+    and for LongCat not on the 93+80k segment grid either, so the server rounds and
+    the plan's own numbers become fiction. Worse on LongCat specifically — every
+    point of 93+80k is also a 16n+13 count that block-sparse attention can tile
+    (80 divides by 16), so landing OFF the grid is what silently drops the clip onto
+    dense attention.
+    """
+    geom = geom or _LOCAL_GEOMETRY["wan"]
+    base = int(geom.get("frame_base") or 1)
+    step = max(1, int(geom.get("frame_step") or 1))
+    lo = int(geom.get("min_frames") or base)
+    hi = geom.get("max_frames")
+    try:
+        want = int(n)
+    except (TypeError, ValueError):
+        want = lo
+    out = base + step * max(0, int(round((want - base) / float(step))))
+    while out < lo:
+        out += step
+    if hi:
+        while out > int(hi):
+            out -= step
+    return max(base, min(out, MAX_PLANNED_FRAMES))
+
+
+def _auto_frame_range(geom: dict, kind: str, fps: int):
+    """The (min, max) frame budget for `kind` on this model at `fps`.
+
+    Derived from the family's seconds band, then snapped onto the model's own grid —
+    so both ends of the range are counts it can emit, and the planner cannot pick a
+    length between two legal ones.
+    """
+    lo_s, hi_s = _scene_band(geom, kind)
+    rate = max(1, int(fps or (geom or {}).get("native_fps") or 16))
+    lo = _snap_frames(lo_s * rate, geom)
+    hi = _snap_frames(hi_s * rate, geom)
+    return (hi, lo) if lo > hi else (lo, hi)
+
+
+def _clip_frame_range(lo, hi, geom: dict = None, kind: str = "clip", fps: int = None):
+    """Normalize a (min, max) clip frame budget from config: clamp to
     [8, MAX_PLANNED_FRAMES] and ensure lo <= hi, so bad UI input can't break the
     planner (random.randint requires lo <= hi). A clip longer than one model call
     is split + chained at render time, so the ceiling is MAX_PLANNED_FRAMES, not
-    the per-render MODEL_MAX_FRAMES."""
+    the per-render MODEL_MAX_FRAMES.
+
+    0 (or blank) means AUTO: derive the budget from the model's own geometry and this
+    tool's seconds band for `kind` instead. That is the default, because the frame
+    numbers that suit Wan are wrong for LongCat by a factor of four and nobody should
+    have to retune four fields to switch model. An explicit number always wins — a
+    saved config from before this existed keeps the exact budget it had.
+    """
     try:
-        lo = int(lo); hi = int(hi)
+        lo = int(lo or 0); hi = int(hi or 0)
     except (TypeError, ValueError):
-        lo, hi = CLIP_MIN_FRAMES, CLIP_MAX_FRAMES
-    lo = max(8, min(lo, MAX_PLANNED_FRAMES))
-    hi = max(8, min(hi, MAX_PLANNED_FRAMES))
+        lo = hi = 0
+    if lo <= 0 or hi <= 0:
+        a_lo, a_hi = _auto_frame_range(geom or _LOCAL_GEOMETRY["wan"], kind, fps)
+        lo = lo if lo > 0 else a_lo
+        hi = hi if hi > 0 else a_hi
+    lo = max(8, min(int(lo), MAX_PLANNED_FRAMES))
+    hi = max(8, min(int(hi), MAX_PLANNED_FRAMES))
     if lo > hi:
         lo, hi = hi, lo
     return lo, hi
+
+
+def _intro_frame_range(default_args, geom: dict, fps: int, clip_range):
+    """The entrance / face-off budget for a web job.
+
+    An explicitly configured clip range still governs the intro, the way it always
+    did; only when the clip budget is AUTO does the intro get its own shorter band.
+    Changing that for an operator who typed numbers in would be a surprise.
+    """
+    if (getattr(default_args, "clip_min_frames", 0) or 0) > 0 and \
+            (getattr(default_args, "clip_max_frames", 0) or 0) > 0:
+        return tuple(clip_range)
+    return _clip_frame_range(0, 0, geom, "intro", fps)
+
+
+def _single_render_cap(configured, geom: dict = None) -> int:
+    """Max frames in ONE model generation. 0/blank = ask the model.
+
+    LongCat reports 93 but owns its continuation loop server-side, so the planner
+    must NOT chain it — that is handled at render time by lifting the cap; this is
+    the number for models whose long clips are chained here.
+    """
+    try:
+        n = int(configured or 0)
+    except (TypeError, ValueError):
+        n = 0
+    cap = int((geom or {}).get("max_frames_per_render") or MODEL_MAX_FRAMES)
+    if n > 0:
+        # An explicit chunk is still bounded by what one render can hold: asking Wan
+        # for 120 frames in a single call does not make it coherent for 120 frames.
+        return max(8, min(n, cap, MAX_PLANNED_FRAMES))
+    # The model's own ceiling is the TRUTH; this tool's chunk can be smaller. Wan
+    # holds coherence to ~81 frames but has always been chained at 50 here, and that
+    # conservatism is a rendering choice, not something to drop by switching to auto.
+    chunk = _RENDER_CHUNK.get((geom or {}).get("family") or "")
+    if chunk:
+        cap = min(cap, int(chunk))
+    # MODEL_MAX_FRAMES is Wan's coherence ceiling, not a universal one: clamping an
+    # H3 render (345 frames in one call) to 81 would chain a model that never needs
+    # chaining. The geometry decides; this only bounds a whole plan.
+    return max(8, min(cap, MAX_PLANNED_FRAMES))
+
+
+def _size_warning(video_size, geom: dict) -> str:
+    """A warning when the configured frame size is not what the model wants, else "".
+
+    Not corrected automatically: the resolution is an explicit choice with cost and
+    aspect consequences. But LongCat at 832x480 turns block-sparse attention into a
+    silent fallback to dense attention, which is slower and ran a 24GB card out of
+    memory — worth saying out loud once per run.
+    """
+    mult = int((geom or {}).get("side_multiple") or 0)
+    if not mult:
+        return ""
+    try:
+        w, h = (int(x) for x in str(video_size or "").lower().split("x", 1))
+    except (TypeError, ValueError):
+        return ""
+    if w % mult == 0 and h % mult == 0:
+        return ""
+    near = lambda v: max(mult, int(round(v / float(mult))) * mult)
+    return (f"video size {w}x{h} is not a multiple of {mult}, which "
+            f"{(geom or {}).get('family', 'this model')} needs for its fast attention "
+            f"path — nearest: {near(w)}x{near(h)}")
 
 
 def frames_for_seconds(seconds: float, fps: int = 8) -> int:
@@ -2533,13 +2813,15 @@ BUILTIN_TEMPLATES = {
         "fps_multiplier": 0,
         "upscale_factor": 0,
         "matches": 6,
-        "clip_min_frames": 50,
-        "clip_max_frames": 70,
-        "single_clip_max_frames": 50,
-        # Outcome stings are their own clips and go through the same video model:
-        # at 8fps, 96-150 frames is 12-19s.
-        "outcome_min_frames": 96,
-        "outcome_max_frames": 150,
+        # 0 = sized from the model. At 8fps Wan's band lands on the historical
+        # 49-69 frames (6-9s) per fight clip, a shorter 25-41 for the entrances and
+        # face-off, and 97-149 total for an outcome sting — each snapped to the 4n+1
+        # the VAE can decode. Type a number here to pin it instead.
+        "clip_min_frames": 0,
+        "clip_max_frames": 0,
+        "single_clip_max_frames": 0,
+        "outcome_min_frames": 0,
+        "outcome_max_frames": 0,
         "video_size": "832x480",
         "keyframe_size": "832x480",
         "short_min": 40.0, "short_max": 50.0,
@@ -2559,18 +2841,17 @@ BUILTIN_TEMPLATES = {
         # Each match is 2-4 long scenes instead of 6-8 short ones, but a scene is
         # ~4x the frames, so a batch is tuned down to keep one sitting finite.
         "matches": 3,
-        # 173 = 93 + 80 (two segments) ~ 11.5s; 333 = 93 + 80x3 (four) ~ 22s. Both 4n+1.
-        # At these lengths a 40-50s short is 2-4 scenes rather than 6-8.
-        "clip_min_frames": 173,
-        "clip_max_frames": 333,
-        # The client-side split is lifted for LongCat anyway (the server owns the segment
-        # loop), but this keeps the number honest if the model is switched back.
-        "single_clip_max_frames": 333,
-        # Outcomes follow the same rule as the clips: 93 is one whole segment and the
-        # shortest honest LongCat ask, 173 is two. The Wan-era 96/150 were neither
-        # 4n+1 nor segment-aligned, so the server had to round them.
-        "outcome_min_frames": 93,
-        "outcome_max_frames": 173,
+        # 0 = sized from the model, which for LongCat means the segment grid: 93 is
+        # one segment (~6.2s), and each continuation adds 80, so a fight clip lands
+        # on 173 (~11.5s) to 333 (~22s) and an entrance on a single 93. Every point
+        # of 93+80k is also a 16n+13 count block-sparse attention can tile, which is
+        # why staying on the grid is what keeps BSA on rather than silently falling
+        # back to dense attention. The Wan-era 96/150 were neither.
+        "clip_min_frames": 0,
+        "clip_max_frames": 0,
+        "single_clip_max_frames": 0,
+        "outcome_min_frames": 0,
+        "outcome_max_frames": 0,
         # 512, not LongCat's nominal 480p landscape: block-sparse attention tiles the
         # latent into (4, 4, 4) chunks and asserts every axis divides evenly, so a side
         # has to be a multiple of 64 (the VAE's 16px cell x 4). At 480 the flag is on
@@ -3317,14 +3598,23 @@ def _fighter_desc_hint(name: str, char_descriptions: dict) -> str:
 
 
 def _build_match_clip_specs(fps: int, cf_lo: int, cf_hi: int,
-                            long_target: float, f1: str, f2: str) -> list:
+                            long_target: float, f1: str, f2: str,
+                            geom: dict = None, intro_range=None) -> list:
     """Build a match's ordered clip specs: the pre-fight INTRO (a solo entrance for
     each fighter, then a referee-officiated face-off), followed by fight clips until
     `long_target` playback seconds is reached. The intro clips are extra and do NOT
-    count toward `long_target`. Prompts are filled later by `_fill_clip_prompt`."""
+    count toward `long_target`. Prompts are filled later by `_fill_clip_prompt`.
+
+    `geom` is the video model's geometry: every picked frame count is snapped onto
+    the grid that model can actually emit, so the plan's numbers are the ones the
+    render will use. `intro_range` budgets the entrances and face-off separately —
+    they are not fight clips, and on a model whose scenes run 11-22 s an entrance
+    that borrows the fight budget is four times longer than it should be.
+    """
     specs, ci = [], 0
+    in_lo, in_hi = intro_range or (cf_lo, cf_hi)
     for _role, _who in (("entrance", [f1]), ("entrance", [f2]), ("faceoff", [f1, f2])):
-        nf = random.randint(cf_lo, cf_hi)
+        nf = _snap_frames(random.randint(in_lo, in_hi), geom)
         specs.append({"idx": ci, "clip_seconds": round(nf / max(1, fps), 2),
                       "nf": nf, "intensity": "introduction", "role": _role,
                       "fighters": list(_who), "shot": None, "prompt": None})
@@ -3336,7 +3626,7 @@ def _build_match_clip_specs(fps: int, cf_lo: int, cf_hi: int,
         intensity = ("early exchanges" if round_num == 1
                      else "midpoint battle" if round_num == 2
                      else "climactic final exchange")
-        nf = random.randint(cf_lo, cf_hi)
+        nf = _snap_frames(random.randint(cf_lo, cf_hi), geom)
         # Every other fight clip is a CAMERA-MOTION clip (a bold moving-camera shot
         # through the environment) so a match isn't all locked-off frames.
         specs.append({"idx": ci, "clip_seconds": round(nf / max(1, fps), 2),
@@ -3720,13 +4010,18 @@ def _outcome_segments_spec(outcome: str):
 
 
 def _plan_outcome_shots(prompter, o: dict, char_descriptions: dict,
-                        opponent: str = None) -> None:
+                        opponent: str = None, geom: dict = None) -> None:
     """(Re)generate the multi-clip `shots` for one outcome entry in place.
 
     Each outcome video is assembled from a decisive FINISH clip (how the match
     ends — KO, retirement, the last action) followed by a VICTORY clip (the
     winner + referee raising their arm; both arms for a draw). The total frame
     budget (`o['nf']`) is split across the clips per _outcome_segments_spec.
+
+    Each shot is its own render, so with `geom` its share is snapped onto the frame
+    grid the model can emit and `o['nf']` is rewritten to the real total — a 60/40
+    split of a legal total is two counts that usually are not, which is how an
+    outcome ends up a different length than it was planned.
 
     For back-compat, o['shot'] / o['prompt'] mirror the FIRST (finish) clip —
     they still feed the outcome keyframe and the editable prompt shown in the UI.
@@ -3739,6 +4034,8 @@ def _plan_outcome_shots(prompter, o: dict, char_descriptions: dict,
     shots, allocated = [], 0
     for i, (role, frac) in enumerate(spec):
         nf = (total - allocated) if i == len(spec) - 1 else max(8, int(round(total * frac)))
+        if geom:
+            nf = _snap_frames(nf, geom)
         allocated += nf
         shot = prompter.outcome_shot(o["fighter"], o["outcome"],
                                      o.get("env_desc") or "", role=role,
@@ -3747,6 +4044,15 @@ def _plan_outcome_shots(prompter, o: dict, char_descriptions: dict,
                   "— African township fight, cinematic, dynamic camera, brutal")
         shots.append({"role": role, "shot": shot, "prompt": prompt, "nf": int(nf)})
     o["shots"] = shots
+    if geom:
+        # The snapped shares are what gets rendered; say so, so the plan and the
+        # output agree on how long this outcome is. target_s is the same number in
+        # seconds, so it moves with it (scaled rather than recomputed, since fps is
+        # the caller's business and is not passed here).
+        snapped = sum(int(sh["nf"]) for sh in shots)
+        if snapped != total and total > 0 and o.get("target_s"):
+            o["target_s"] = round(float(o["target_s"]) * snapped / total, 2)
+        o["nf"] = snapped
     if opponent:
         o["opponent"] = opponent
     o["shot"] = shots[0]["shot"]
@@ -4462,13 +4768,13 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  env_lora_map: dict = None, env_lora_weight: float = 0.8,
                  upscale_factor: int = 0, fps_multiplier: int = 0,
                  video_lora_scale: float = 1.0,
-                 clip_min_frames: int = CLIP_MIN_FRAMES,
-                 clip_max_frames: int = CLIP_MAX_FRAMES,
+                 clip_min_frames: int = 0,
+                 clip_max_frames: int = 0,
                  video_size: str = "832x480",
                  short_min: float = 40.0, short_max: float = 50.0,
                  long_min: float = 65.0, long_max: float = 75.0,
-                 single_clip_max_frames: int = SINGLE_CLIP_MAX_FRAMES,
-                 outcome_min_frames: int = 96, outcome_max_frames: int = 150,
+                 single_clip_max_frames: int = 0,
+                 outcome_min_frames: int = 0, outcome_max_frames: int = 0,
                  playback_fps: int = 0, upscale_model: str = None,
                  interpolation_model: str = None):
     # PLAYBACK fps decouples the encode/play rate from the model's frame budget:
@@ -4481,6 +4787,13 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
     _log("\n" + "═" * 60)
     _log("  STAGE 3 — Videos")
     _log("═" * 60)
+    # What this model can emit, asked of the server (ModelInfo.video) and used for
+    # every frame budget below: a scene length that suits Wan is wrong for LongCat
+    # by a factor of four, and the counts off its grid are rounded behind our back.
+    _geom = video_geometry(video_model, client)
+    _warn = _size_warning(video_size, _geom)
+    if _warn:
+        _log(f"  ⚠ {_warn}")
     video_dir = out_dir / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
     prompts_file = video_dir / "prompts.json"
@@ -4610,7 +4923,15 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
 
     # Fight-match plan: each match holds a list of clip specs.
     fight_plan = []
-    _cf_lo, _cf_hi = _clip_frame_range(clip_min_frames, clip_max_frames)
+    _cf_lo, _cf_hi = _clip_frame_range(clip_min_frames, clip_max_frames,
+                                       _geom, "clip", fps)
+    # The entrances and the face-off are not fight clips and get their own, shorter
+    # budget; only an explicit clip range overrides it.
+    _in_lo, _in_hi = ((_cf_lo, _cf_hi) if (clip_min_frames and clip_max_frames)
+                      else _clip_frame_range(0, 0, _geom, "intro", fps))
+    _log(f"  clip budget: {_cf_lo}-{_cf_hi}f fight, {_in_lo}-{_in_hi}f intro "
+         f"@ {fps}fps ({_geom.get('family', '?')} grid "
+         f"{_geom.get('frame_base')}+{_geom.get('frame_step')}k)")
     # Final-assembly duration targets (seconds). The LONG target drives how many
     # clips the planner produces: it keeps adding clips (each nf/fps seconds of
     # playback) until their summed duration reaches the long target, so the long
@@ -4632,7 +4953,7 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         for _intro_role, _intro_who in (("entrance", [f1]),
                                         ("entrance", [f2]),
                                         ("faceoff",  [f1, f2])):
-            _nf = random.randint(_cf_lo, _cf_hi)
+            _nf = _snap_frames(random.randint(_in_lo, _in_hi), _geom)
             clips_spec.append({
                 "idx": ci, "clip_seconds": round(_nf / max(1, fps), 2),
                 "nf": _nf, "intensity": "introduction",
@@ -4647,7 +4968,7 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                          else "climactic final exchange")
             # Budget frames directly (the model's motion budget, fps-independent),
             # within the configured range. Duration = frames / playback fps.
-            _nf = random.randint(_cf_lo, _cf_hi)
+            _nf = _snap_frames(random.randint(_cf_lo, _cf_hi), _geom)
             clip_seconds = round(_nf / max(1, fps), 2)
             clips_spec.append({
                 "idx": ci, "clip_seconds": clip_seconds,
@@ -4673,10 +4994,11 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
     # Outcome clips budget frames directly (like fight clips) within their own
     # configurable range; the total is split across the finish + victory clips and
     # each is chained the same way at render time. Duration = frames / playback fps.
-    _of_lo, _of_hi = _clip_frame_range(outcome_min_frames, outcome_max_frames)
+    _of_lo, _of_hi = _clip_frame_range(outcome_min_frames, outcome_max_frames,
+                                       _geom, "outcome", fps)
 
     def _new_outcome(m, fighter, outcome, opponent):
-        _onf = random.randint(_of_lo, _of_hi)
+        _onf = _snap_frames(random.randint(_of_lo, _of_hi), _geom)
         return {
             "match_name": m["match_name"],
             "fighter": fighter, "outcome": outcome, "opponent": opponent,
@@ -4732,7 +5054,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             _log(f"  │  [{_pidx}/{_ptot}] {_who} clip{c['idx']:02d}: {shot}")
     for o in outcome_plan:
         _pidx += 1
-        _plan_outcome_shots(prompter, o, char_descriptions, o.get("opponent"))
+        _plan_outcome_shots(prompter, o, char_descriptions, o.get("opponent"),
+                            geom=_geom)
         _roles = " → ".join(s["role"] for s in o.get("shots", []))
         _log(f"  │  [{_pidx}/{_ptot}] {o['fighter']} {o['outcome']} ({_roles}): {o['shot']}")
     _log("  ── Phase A complete — all prompts written ──")
@@ -4791,7 +5114,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                          video_lora_map=None, env_video_lora_map=None,
                          assemble_finals=True, video_lora_scale=1.0,
                          video_size="832x480",
-                         single_clip_max_frames=SINGLE_CLIP_MAX_FRAMES,
+                         single_clip_max_frames=0,
                          playback_fps=0, cancel_check=None):
     """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded).
 
@@ -4817,6 +5140,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     video_lora_map = video_lora_map or {}
     env_video_lora_map = env_video_lora_map or {}
     video_slug = _model_slug(video_model)
+    # What this model can emit — the same geometry the planner budgeted with. Needed
+    # here for the chaining decision: a model that continues natively must be asked
+    # for the whole shot in ONE request, and the tail length it expects is its own.
+    _geom = video_geometry(video_model, client)
     use_lora = "lora" in consistency
     # Wan2.2 is trained on 16:9 (canonical 832×480 / 1280×720); square 512 is
     # off-distribution and worsens motion + colour drift. Render at the native
@@ -4894,12 +5221,15 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     # itself — one request, native continuation, no re-encoded joins. Chaining it from
     # here would reintroduce exactly the drift the cap works around, so the cap is
     # lifted and the whole budget goes in one request.
-    _longcat = "longcat" in (video_model or "").lower()
+    # Decided by the model's published geometry rather than its name: a checkpoint
+    # aliased to something this tool has never heard of still says whether its
+    # continuation is native.
+    _longcat = (_geom.get("continuation") == "native"
+                or "longcat" in (video_model or "").lower())
     if _longcat:
         _chunk_max = 1 << 30
     else:
-        _chunk_max = max(8, min(int(single_clip_max_frames or SINGLE_CLIP_MAX_FRAMES),
-                                MODEL_MAX_FRAMES))
+        _chunk_max = _single_render_cap(single_clip_max_frames, _geom)
 
     def _render_once(label, prompt, profiles, env, nf, out_path,
                      fighters=None, init_override=None, step_cb=None,
@@ -5030,7 +5360,8 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         # How much tail to hand over. VACE's 5 frames were tuned for its conditioning;
         # LongCat's own default is 13 of 93, which is what its continuation was trained
         # with — handing it fewer would condition it on less than it expects.
-        _tail_frames = LONGCAT_COND_FRAMES if _longcat else VACE_TAIL_FRAMES
+        _tail_frames = (int(_geom.get("cond_frames") or 0) or LONGCAT_COND_FRAMES
+                        ) if _longcat else VACE_TAIL_FRAMES
         _nparts = len(parts_plan)
         _budget = [p[1] for p in parts_plan]
         _log(f"    ↪ chaining {_nparts} parts {_budget} into one shot"
@@ -5905,12 +6236,14 @@ def launch_web_ui(default_args):
                  "clips": []}
             fight_plan.append(m)
 
+            _geom = web_video_geometry(default_args)
             _of_lo, _of_hi = _clip_frame_range(
-                int(getattr(default_args, "outcome_min_frames", 96) or 96),
-                int(getattr(default_args, "outcome_max_frames", 150) or 150))
+                getattr(default_args, "outcome_min_frames", 0),
+                getattr(default_args, "outcome_max_frames", 0),
+                _geom, "outcome", fps)
 
             def _new_outcome(fighter, outcome, opp):
-                _onf = random.randint(_of_lo, _of_hi)
+                _onf = _snap_frames(random.randint(_of_lo, _of_hi), _geom)
                 return {"match_name": name, "fighter": fighter, "outcome": outcome,
                         "opponent": opp, "env": m["env"], "env_desc": env_desc,
                         "target_s": round(_onf / max(1, fps), 2), "nf": _onf,
@@ -5957,10 +6290,15 @@ def launch_web_ui(default_args):
             prompter = PromptGenerator(client, text_model,
                                        char_descriptions=char_descriptions)
             _cf_lo, _cf_hi = _clip_frame_range(
-                getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
-                getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
+                getattr(default_args, "clip_min_frames", 0),
+                getattr(default_args, "clip_max_frames", 0),
+                _geom, "clip", fps)
+            _in_lo, _in_hi = _intro_frame_range(default_args, _geom, fps,
+                                                (_cf_lo, _cf_hi))
             long_target = float(m["long_target"])
-            new_clips = _build_match_clip_specs(fps, _cf_lo, _cf_hi, long_target, f1, f2)
+            new_clips = _build_match_clip_specs(fps, _cf_lo, _cf_hi, long_target,
+                                                f1, f2, geom=_geom,
+                                                intro_range=(_in_lo, _in_hi))
             _ref = m.get("referee") or _referee_for(out_dir, name)
             match_avoid = []
             _focus_cycle = list(FIGHT_ACTION_FOCUS)
@@ -5988,7 +6326,8 @@ def launch_web_ui(default_args):
                     return
                 _opp = f2 if o.get("fighter") == f1 else f1
                 try:
-                    _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                    _plan_outcome_shots(prompter, o, char_descriptions, _opp,
+                                        geom=web_video_geometry(default_args, client))
                 except Exception:
                     pass
                 _prog(68 + int(28 * (j + 1) / max(1, len(match_outcomes))),
@@ -6444,17 +6783,23 @@ def launch_web_ui(default_args):
                 prompter = PromptGenerator(client, text_model,
                                            char_descriptions=char_descriptions)
                 long_target = float(m.get("long_target", 70))
+                _geom = web_video_geometry(default_args, client)
                 _cf_lo, _cf_hi = _clip_frame_range(
-                    getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
-                    getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
+                    getattr(default_args, "clip_min_frames", 0),
+                    getattr(default_args, "clip_max_frames", 0),
+                    _geom, "clip", fps)
+                _in_range = _intro_frame_range(default_args, _geom, fps,
+                                               (_cf_lo, _cf_hi))
                 _prog(12, f"re-planning clips for {match_name} @ {fps}fps "
-                          f"({_cf_lo}-{_cf_hi}f/clip)…")
+                          f"({_cf_lo}-{_cf_hi}f/clip, {_in_range[0]}-{_in_range[1]}f "
+                          f"intro, {_geom.get('family', '?')} grid)…")
                 # Rebuild the clip list with the same planner the full run uses:
                 # intro clips (entrances + face-off) then fight clips, frame budget
                 # within the configured range, match length counted in PLAYBACK
                 # seconds (nf/fps).
                 new_clips = _build_match_clip_specs(
-                    fps, _cf_lo, _cf_hi, long_target, m["f1"], m["f2"])
+                    fps, _cf_lo, _cf_hi, long_target, m["f1"], m["f2"],
+                    geom=_geom, intro_range=_in_range)
                 _ref = m.get("referee") or _referee_for(out_dir, match_name)
                 # Write a fresh, varied prompt for each new clip.
                 match_avoid = []
@@ -6593,7 +6938,8 @@ def launch_web_ui(default_args):
                         o["env_desc"] = m.get("env_desc", o.get("env_desc"))
                     _opp = m.get("f2") if o.get("fighter") == m.get("f1") else m.get("f1")
                     try:
-                        _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                        _plan_outcome_shots(prompter, o, char_descriptions, _opp,
+                                            geom=web_video_geometry(default_args, client))
                     except Exception as e:
                         _log(f"  [replan-outcomes] {o.get('fighter')} {o.get('outcome')}: {e}")
                     _prog(8 + int(88 * (j + 1) / max(1, len(match_outcomes))),
@@ -6656,7 +7002,8 @@ def launch_web_ui(default_args):
                            else f"{fr} {oc}")
                 _prog(40, f"rewriting {_olabel} prompts…")
                 try:
-                    _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                    _plan_outcome_shots(prompter, o, char_descriptions, _opp,
+                                        geom=web_video_geometry(default_args, client))
                 except Exception as e:
                     _fail(f"could not rewrite outcome prompts: {e}")
                     return
@@ -6693,8 +7040,10 @@ def launch_web_ui(default_args):
             elw = float(getattr(default_args, "env_lora_weight", 0.8))
             vls = float(getattr(default_args, "video_lora_scale", 1.0))
             vsz = str(getattr(default_args, "video_size", "832x480") or "832x480")
-            scm = int(getattr(default_args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES)
-                      or SINGLE_CLIP_MAX_FRAMES)
+            # 0 = auto: the render phase asks the model's own geometry for its
+            # per-render ceiling. Forcing the Wan-era 50 here would chain a model
+            # that never needs chaining.
+            scm = int(getattr(default_args, "single_clip_max_frames", 0) or 0)
 
             # ── Full match regeneration (text → image → video, end to end) ─────
             # One click rebuilds EVERYTHING for this match in order: re-plan the
@@ -6769,11 +7118,16 @@ def launch_web_ui(default_args):
                 prompter = PromptGenerator(client, text_model,
                                            char_descriptions=char_descriptions)
                 long_target = float(m.get("long_target", 70))
+                _geom = web_video_geometry(default_args, client)
                 _cf_lo, _cf_hi = _clip_frame_range(
-                    getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
-                    getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
+                    getattr(default_args, "clip_min_frames", 0),
+                    getattr(default_args, "clip_max_frames", 0),
+                    _geom, "clip", fps)
                 new_clips = _build_match_clip_specs(
-                    fps, _cf_lo, _cf_hi, long_target, m["f1"], m["f2"])
+                    fps, _cf_lo, _cf_hi, long_target, m["f1"], m["f2"],
+                    geom=_geom,
+                    intro_range=_intro_frame_range(default_args, _geom, fps,
+                                                   (_cf_lo, _cf_hi)))
                 _ref = m.get("referee") or _referee_for(out_dir, match_name)
                 match_avoid = []
                 _focus_cycle = list(FIGHT_ACTION_FOCUS)
@@ -6801,7 +7155,8 @@ def launch_web_ui(default_args):
                         o["env_desc"] = m.get("env_desc", o.get("env_desc"))
                     _opp = m.get("f2") if o.get("fighter") == m.get("f1") else m.get("f1")
                     try:
-                        _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                        _plan_outcome_shots(prompter, o, char_descriptions, _opp,
+                                            geom=web_video_geometry(default_args, client))
                     except Exception:
                         pass
                 try:
@@ -8175,19 +8530,27 @@ try{ if(localStorage.getItem('tf-dock')==='1') toggleDock(true); }catch(e){}
            <input name=dataset_min_clips type=number min=1 max=500 value="{_v('dataset_min_clips', DATASET_MIN_CLIPS)}"></div>
     </div>
     <div class=row3 style="margin-top:.4rem">
-      <div><label>Clip min frames <span class=hint>(per fight clip)</span></label>
-           <input name=clip_min_frames type=number min=8 max=480 value="{_v('clip_min_frames', 50)}"></div>
+      <div><label>Clip min frames <span class=hint>(per fight clip; 0 = from the model)</span></label>
+           <input name=clip_min_frames type=number min=0 max=480 value="{_v('clip_min_frames', 0)}"></div>
       <div><label>Clip max frames <span class=hint>(dur = frames÷fps; >cap splits into one shot)</span></label>
-           <input name=clip_max_frames type=number min=8 max=480 value="{_v('clip_max_frames', 70)}"></div>
-      <div><label>Single-render cap <span class=hint>(≤81; longer = chained parts)</span></label>
-           <input name=single_clip_max_frames type=number min=8 max=81 value="{_v('single_clip_max_frames', 50)}"></div>
+           <input name=clip_max_frames type=number min=0 max=480 value="{_v('clip_max_frames', 0)}"></div>
+      <div><label>Single-render cap <span class=hint>(0 = the model's own, ≤81)</span></label>
+           <input name=single_clip_max_frames type=number min=0 max=81 value="{_v('single_clip_max_frames', 0)}"></div>
     </div>
     <div class=row3 style="margin-top:.4rem">
-      <div><label>Outcome min frames <span class=hint>(total: finish + victory)</span></label>
-           <input name=outcome_min_frames type=number min=8 max=480 value="{_v('outcome_min_frames', 96)}"></div>
+      <div><label>Outcome min frames <span class=hint>(total: finish + victory; 0 = from the model)</span></label>
+           <input name=outcome_min_frames type=number min=0 max=480 value="{_v('outcome_min_frames', 0)}"></div>
       <div><label>Outcome max frames <span class=hint>(split across the 2 outcome clips, then chained)</span></label>
-           <input name=outcome_max_frames type=number min=8 max=480 value="{_v('outcome_max_frames', 150)}"></div>
+           <input name=outcome_max_frames type=number min=0 max=480 value="{_v('outcome_max_frames', 0)}"></div>
       <div></div>
+    </div>
+    <div class=row style="margin-top:.2rem">
+      <div class=hint>Leave the five frame fields at <b>0</b> to size clips from the video
+        model itself: its native rate, the frame counts its VAE can decode and how much
+        one render holds. Wan gives ~6-9 s scenes chained from a frame tail; LongCat
+        gives 11-22 s takes in one request, so a match is a handful of long shots
+        instead of a dozen cuts. The entrances and face-off get their own shorter
+        budget. Typing a number pins it for every model.</div>
     </div>
     <div class=row style="margin-top:.4rem">
       <div><label>Short final assembly <span class=hint>(seconds, min–max)</span></label>
@@ -11763,11 +12126,11 @@ async function resetPrompts(ev){
                     "env_lora_weight": float(_fv("env_lora_weight", "0.8") or 0.8),
                     "video_lora_scale": float(_fv("video_lora_scale", "1.0") or 1.0),
                     "video_size": _fv("video_size", "832x480") or "832x480",
-                    "clip_min_frames": int(_fv("clip_min_frames", "50") or 50),
-                    "clip_max_frames": int(_fv("clip_max_frames", "70") or 70),
-                    "single_clip_max_frames": int(_fv("single_clip_max_frames", "50") or 50),
-                    "outcome_min_frames": int(_fv("outcome_min_frames", "96") or 96),
-                    "outcome_max_frames": int(_fv("outcome_max_frames", "150") or 150),
+                    "clip_min_frames": int(_fv("clip_min_frames", "0") or 0),
+                    "clip_max_frames": int(_fv("clip_max_frames", "0") or 0),
+                    "single_clip_max_frames": int(_fv("single_clip_max_frames", "0") or 0),
+                    "outcome_min_frames": int(_fv("outcome_min_frames", "0") or 0),
+                    "outcome_max_frames": int(_fv("outcome_max_frames", "0") or 0),
                     "short_min": float(_fv("short_min", "40") or 40),
                     "short_max": float(_fv("short_max", "50") or 50),
                     "long_min": float(_fv("long_min", "65") or 65),
@@ -12027,11 +12390,11 @@ async function resetPrompts(ev){
             ns.dataset_min_clips = int(_fv("dataset_min_clips", str(DATASET_MIN_CLIPS))
                                        or DATASET_MIN_CLIPS)
             ns.video_size        = _fv("video_size", "832x480") or "832x480"
-            ns.clip_min_frames   = int(_fv("clip_min_frames", "50"))
-            ns.clip_max_frames   = int(_fv("clip_max_frames", "70"))
-            ns.single_clip_max_frames = int(_fv("single_clip_max_frames", "50"))
-            ns.outcome_min_frames = int(_fv("outcome_min_frames", "96"))
-            ns.outcome_max_frames = int(_fv("outcome_max_frames", "150"))
+            ns.clip_min_frames   = int(_fv("clip_min_frames", "0") or 0)
+            ns.clip_max_frames   = int(_fv("clip_max_frames", "0") or 0)
+            ns.single_clip_max_frames = int(_fv("single_clip_max_frames", "0") or 0)
+            ns.outcome_min_frames = int(_fv("outcome_min_frames", "0") or 0)
+            ns.outcome_max_frames = int(_fv("outcome_max_frames", "0") or 0)
             ns.short_min         = float(_fv("short_min", "40"))
             ns.short_max         = float(_fv("short_max", "50"))
             ns.long_min          = float(_fv("long_min", "65"))
@@ -12442,8 +12805,8 @@ async function resetPrompts(ev){
                 env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
                 video_lora_scale=getattr(args, "video_lora_scale", 1.0),
                 video_size=getattr(args, "video_size", "832x480"),
-                clip_min_frames=getattr(args, "clip_min_frames", CLIP_MIN_FRAMES),
-                clip_max_frames=getattr(args, "clip_max_frames", CLIP_MAX_FRAMES),
+                clip_min_frames=getattr(args, "clip_min_frames", 0),
+                clip_max_frames=getattr(args, "clip_max_frames", 0),
                 keyframes_only=True,
             )
             _web_log("\n✓ Keyframe step complete.")
@@ -12466,8 +12829,8 @@ async function resetPrompts(ev){
                 keyframe_steps=getattr(args, "keyframe_steps", 28),
                 keyframe_size=getattr(args, "keyframe_size", "832x480"),
                 lora_weight=getattr(args, "lora_weight", 0.85),
-                clip_min_frames=getattr(args, "clip_min_frames", CLIP_MIN_FRAMES),
-                clip_max_frames=getattr(args, "clip_max_frames", CLIP_MAX_FRAMES),
+                clip_min_frames=getattr(args, "clip_min_frames", 0),
+                clip_max_frames=getattr(args, "clip_max_frames", 0),
                 env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
                 video_lora_scale=getattr(args, "video_lora_scale", 1.0),
                 video_size=getattr(args, "video_size", "832x480"),
@@ -12475,9 +12838,9 @@ async function resetPrompts(ev){
                 short_max=getattr(args, "short_max", 50.0),
                 long_min=getattr(args, "long_min", 65.0),
                 long_max=getattr(args, "long_max", 75.0),
-                single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
-                outcome_min_frames=getattr(args, "outcome_min_frames", 96),
-                outcome_max_frames=getattr(args, "outcome_max_frames", 150),
+                single_clip_max_frames=getattr(args, "single_clip_max_frames", 0),
+                outcome_min_frames=getattr(args, "outcome_min_frames", 0),
+                outcome_max_frames=getattr(args, "outcome_max_frames", 0),
                 playback_fps=getattr(args, "playback_fps", 0),
                 upscale_factor=getattr(args, "upscale_factor", 0),
                 fps_multiplier=getattr(args, "fps_multiplier", 0),
@@ -12825,28 +13188,30 @@ OUTPUT LAYOUT
                           help="Environment LoRA rank (default: 16).")
     cons_grp.add_argument("--env-lora-weight", type=float, default=0.8, metavar="F",
                           help="Weight applied to each environment LoRA at generation (default: 0.8).")
-    cons_grp.add_argument("--clip-min-frames", type=int, default=CLIP_MIN_FRAMES, metavar="N",
-                          help=f"Minimum frames per fight clip (default: {CLIP_MIN_FRAMES}). Clip "
-                               "duration = frames / fps; kept within the model's safe length "
-                               f"(≤{MODEL_MAX_FRAMES}).")
-    cons_grp.add_argument("--clip-max-frames", type=int, default=CLIP_MAX_FRAMES, metavar="N",
-                          help=f"Maximum frames per fight clip (default: {CLIP_MAX_FRAMES}). A clip "
-                               f"longer than --single-clip-max-frames is split into chained, "
-                               f"concatenated sub-renders (one continuous shot).")
-    cons_grp.add_argument("--single-clip-max-frames", type=int, default=SINGLE_CLIP_MAX_FRAMES,
+    cons_grp.add_argument("--clip-min-frames", type=int, default=0, metavar="N",
+                          help="Minimum frames per fight clip. 0 (the default) = AUTO: derive it "
+                               "from the video model's own geometry — Wan's ~6-9 s scenes, "
+                               "LongCat's 11-22 s takes — and snap it to a frame count that "
+                               "model can actually emit. Clip duration = frames / fps.")
+    cons_grp.add_argument("--clip-max-frames", type=int, default=0, metavar="N",
+                          help="Maximum frames per fight clip. 0 = AUTO (see --clip-min-frames). A "
+                               "clip longer than --single-clip-max-frames is split into chained, "
+                               "concatenated sub-renders (one continuous shot) — unless the model "
+                               "continues natively, in which case the server does it in one request.")
+    cons_grp.add_argument("--single-clip-max-frames", type=int, default=0,
                           metavar="N",
-                          help=f"Max frames in ONE model generation (default: {SINGLE_CLIP_MAX_FRAMES}, "
-                               f"≤{MODEL_MAX_FRAMES}). Clips/outcomes longer than this are rendered as "
-                               f"multiple parts chained via each part's last frame and concatenated "
-                               f"into a single shot; the parts are discarded.")
-    cons_grp.add_argument("--outcome-min-frames", type=int, default=96, metavar="N",
-                          help="Minimum TOTAL frames per outcome video (default: 96). An outcome is "
-                               "a two-clip sequence (finish → victory); this budget is split across "
-                               "them.")
-    cons_grp.add_argument("--outcome-max-frames", type=int, default=150, metavar="N",
-                          help="Maximum TOTAL frames per outcome video (default: 150). Split across the "
-                               "finish + victory clips, each chained when longer than "
-                               "--single-clip-max-frames.")
+                          help=f"Max frames in ONE model generation (0 = AUTO: the model's own "
+                               f"per-render ceiling, ≤{MODEL_MAX_FRAMES}). Clips/outcomes longer than "
+                               f"this are rendered as multiple parts chained via each part's last "
+                               f"frame and concatenated into a single shot; the parts are discarded.")
+    cons_grp.add_argument("--outcome-min-frames", type=int, default=0, metavar="N",
+                          help="Minimum TOTAL frames per outcome video (0 = AUTO from the model). An "
+                               "outcome is a two-clip sequence (finish → victory); this budget is "
+                               "split across them and each share is snapped to the model's grid.")
+    cons_grp.add_argument("--outcome-max-frames", type=int, default=0, metavar="N",
+                          help="Maximum TOTAL frames per outcome video (0 = AUTO from the model). "
+                               "Split across the finish + victory clips, each chained when longer "
+                               "than --single-clip-max-frames.")
     cons_grp.add_argument("--short-min", type=float, default=40.0, metavar="SEC",
                           help="Minimum duration (s) of the SHORT final assembly (default: 40).")
     cons_grp.add_argument("--short-max", type=float, default=50.0, metavar="SEC",
@@ -13164,8 +13529,8 @@ OUTPUT LAYOUT
             char_strength=getattr(args, "character_strength", 0.7),
             keyframe_steps=getattr(args, "keyframe_steps", 28),
             keyframe_size=getattr(args, "keyframe_size", "832x480"),
-            clip_min_frames=getattr(args, "clip_min_frames", CLIP_MIN_FRAMES),
-            clip_max_frames=getattr(args, "clip_max_frames", CLIP_MAX_FRAMES),
+            clip_min_frames=getattr(args, "clip_min_frames", 0),
+            clip_max_frames=getattr(args, "clip_max_frames", 0),
             lora_weight=getattr(args, "lora_weight", 0.85),
             env_lora_map=env_lora_map,
             env_lora_weight=getattr(args, "env_lora_weight", 0.8),
@@ -13175,9 +13540,9 @@ OUTPUT LAYOUT
             short_max=getattr(args, "short_max", 50.0),
             long_min=getattr(args, "long_min", 65.0),
             long_max=getattr(args, "long_max", 75.0),
-            single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
-            outcome_min_frames=getattr(args, "outcome_min_frames", 96),
-            outcome_max_frames=getattr(args, "outcome_max_frames", 150),
+            single_clip_max_frames=getattr(args, "single_clip_max_frames", 0),
+            outcome_min_frames=getattr(args, "outcome_min_frames", 0),
+            outcome_max_frames=getattr(args, "outcome_max_frames", 0),
             playback_fps=getattr(args, "playback_fps", 0),
             upscale_factor=getattr(args, "upscale_factor", 0),
             fps_multiplier=getattr(args, "fps_multiplier", 0),

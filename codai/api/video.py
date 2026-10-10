@@ -2158,10 +2158,19 @@ def _sync_video_loras(pipe, loras) -> None:
 def _snap_wan_frames(n: int) -> int:
     """Snap a frame count to the Wan VAE's temporal grid (4k+1). The VACE
     video/mask lists must be exactly num_frames long, and the pipeline expects a
-    4k+1 count, so we round to the nearest valid value (min 5)."""
-    n = max(5, int(n))
-    k = round((n - 1) / 4)
-    return max(5, k * 4 + 1)
+    4k+1 count, so we round to the nearest valid value (min 5).
+
+    Delegates to codai/models/video_geometry.py, which is the same grid /v1/models
+    publishes to clients — so what the server snaps to and what it advertises cannot
+    drift apart. The arithmetic is kept inline as a fallback because this is on the
+    render path and must never fail over an import."""
+    try:
+        from codai.models import video_geometry
+        return video_geometry.snap_frames(n, video_geometry.FAMILIES["wan"])
+    except Exception:
+        n = max(5, int(n))
+        k = round((n - 1) / 4)
+        return max(5, k * 4 + 1)
 
 
 def _build_vace_conditioning(cond_frames, num_frames: int, width: int, height: int):

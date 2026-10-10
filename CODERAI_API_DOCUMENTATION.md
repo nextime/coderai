@@ -141,6 +141,48 @@ Response shape:
 }
 ```
 
+A **video** model carries one extra object, `video`, describing what it can actually
+emit — so a client can plan around the model instead of guessing from its name:
+
+```json
+{
+  "id": "longcat",
+  "type": "video",
+  "capabilities": ["video_generation"],
+  "video": {
+    "family": "longcat",
+    "native_fps": 15,
+    "frame_base": 93,
+    "frame_step": 80,
+    "min_frames": 93,
+    "max_frames": null,
+    "max_frames_per_render": 93,
+    "segment_frames": 93,
+    "cond_frames": 13,
+    "side_multiple": 64,
+    "continuation": "native"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `native_fps` | The rate the model was trained to produce |
+| `frame_base`, `frame_step` | Legal TOTAL frame counts are `frame_base + frame_step * k`. Wan is `1 + 4k` (its VAE's 4n+1), LongCat `93 + 80k` (one 93-frame segment, each continuation re-rendering 13 of them and so adding 80), MiniMax-H3 `5 + 17k` |
+| `min_frames`, `max_frames` | Limits on the total; `null` = none (LongCat's segment loop runs as long as asked) |
+| `max_frames_per_render` | How much ONE model call holds. Wan is ~81; past that the frames visibly jump, so longer clips must be chained |
+| `segment_frames`, `cond_frames` | For a natively-continuing model: the segment length and how much of it re-renders the previous tail |
+| `side_multiple` | Width and height should be multiples of this, or the model falls back to a slower attention path (LongCat at 480 silently loses block-sparse attention) |
+| `continuation` | `native` (the server generates a long shot in segments — ask for the whole length in one request), `chained` (the client extends from a frame tail), `none` |
+
+A count off the grid is **rounded by the server**, so a request for 250 LongCat frames
+comes back a different length than it asked for. Snap client-side and the plan and the
+output agree. Per-model overrides in `models.json`
+(`video_native_fps`, `video_frame_base`, `video_frame_step`, `video_min_frames`,
+`video_max_frames`, `video_max_frames_per_render`, `video_side_multiple`,
+`video_segment_frames`, `video_cond_frames`) win over the built-in family defaults, so a
+checkpoint the server has never seen before is configurable rather than mis-described.
+
 Example:
 
 ```bash

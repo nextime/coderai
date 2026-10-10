@@ -113,6 +113,22 @@ three latent frames that are still noise. The attention is well-defined but it i
 the model was trained on. Measure a known-good clip against the dense path before trusting
 it on anything you care about.
 
+### Why 93 + 80k is also the BSA-safe grid
+
+A long request is rendered by the segment loop: the first call emits 93 frames and each
+continuation re-renders 13 of the previous segment's frames, so it only *adds* 80. The
+totals the server actually emits are therefore **93, 173, 253, 333 …** — and because 80
+divides by 16, every one of them is also a `16n+13` count. Staying on the segment grid and
+keeping block-sparse attention usable are the same act; a request for 250 frames is
+neither, gets rounded to 253, and the plan's own numbers become fiction.
+
+`/v1/models` publishes that grid per model (`video.frame_base`, `video.frame_step`,
+`video.max_frames_per_render`, `video.side_multiple`, `video.continuation`) so a client can
+snap before it asks. `codai/models/video_geometry.py` is the one table, and the render path
+snaps with it too. `tools/gen_township_fighters.py` is the worked example: its clip-length
+fields default to `0` = derive from the model, which turns a 70-second match from a dozen
+Wan-shaped cuts into four to six LongCat takes without retuning anything by hand.
+
 ## Generating
 
 ```jsonc

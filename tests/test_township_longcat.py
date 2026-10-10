@@ -40,7 +40,10 @@ LC = _contract()
 
 # ------------------------------------------------------------ the tool
 def test_the_tool_recognises_a_longcat_model():
-    assert '_longcat = "longcat" in (video_model or "").lower()' in TOOL
+    """By the geometry the server publishes first, and by the name as a fallback: an
+    entry aliased over an HF repo id is a LongCat model the name cannot identify."""
+    assert '_geom.get("continuation") == "native"' in TOOL
+    assert 'or "longcat" in (video_model or "").lower()' in TOOL
 
 
 def test_the_client_side_split_is_lifted_for_longcat():
@@ -48,15 +51,17 @@ def test_the_client_side_split_is_lifted_for_longcat():
     and better, so the cap must not force parts."""
     seg = TOOL[TOOL.index("_longcat = "):TOOL.index("def _render_once")]
     assert "_chunk_max = 1 << 30" in seg
-    # …and the non-LongCat path keeps the cap it always had.
-    assert "SINGLE_CLIP_MAX_FRAMES" in seg and "MODEL_MAX_FRAMES" in seg
+    # …and the non-LongCat path keeps a cap, now the model's own.
+    assert "_single_render_cap(single_clip_max_frames, _geom)" in seg
 
 
 def test_other_models_are_unaffected():
-    """A Wan/VACE run must behave exactly as before."""
+    """A Wan/VACE run must behave exactly as before: still chained, still at 50 frames
+    per render, which is what _single_render_cap returns for the wan family."""
     seg = TOOL[TOOL.index("_longcat = "):TOOL.index("def _render_once")]
     assert "else:" in seg
-    assert "max(8, min(int(single_clip_max_frames" in seg
+    assert "_single_render_cap(single_clip_max_frames, _geom)" in seg
+    assert '_RENDER_CHUNK = {"wan": SINGLE_CLIP_MAX_FRAMES}' in TOOL
 
 
 def test_longcat_continues_from_a_tail_like_vace_does():
@@ -72,7 +77,10 @@ def test_the_tail_length_matches_what_longcat_was_trained_with():
     expects."""
     got = int(re.search(r"LONGCAT_COND_FRAMES = (\d+)", TOOL).group(1))
     assert got == LC.DEFAULT_COND_FRAMES
-    assert "_tail_frames = LONGCAT_COND_FRAMES if _longcat else VACE_TAIL_FRAMES" in TOOL
+    # The model's published cond_frames wins, with the constant as the fallback for a
+    # front that does not publish geometry yet.
+    assert 'int(_geom.get("cond_frames") or 0) or LONGCAT_COND_FRAMES' in TOOL
+    assert "else VACE_TAIL_FRAMES" in TOOL
 
 
 def test_the_vace_tail_length_is_untouched():

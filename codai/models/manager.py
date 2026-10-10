@@ -5666,6 +5666,20 @@ class MultiModelManager:
             if model_type and model_type in TYPE_MIN_CAP and not caps.to_list():
                 setattr(caps, TYPE_MIN_CAP[model_type], True)
             resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
+            # A video model carries its geometry: the frame rate it was trained at,
+            # the frame counts its VAE can decode, how much one render holds and
+            # whether it continues natively. Without it every client plans video by
+            # guessing from the model NAME, which is how township ended up with a
+            # hand-maintained table per family. Never fatal: an unknown family
+            # degrades to the Wan-shaped default, and a failure here must not cost
+            # the whole listing.
+            video_geom = None
+            if resolved_type == "video" or "video_generation" in caps.to_list():
+                try:
+                    from codai.models import video_geometry
+                    video_geom = video_geometry.geometry_for(model_id, meta)
+                except Exception:
+                    video_geom = None
             models.append(ModelInfo(
                 id=model_id,
                 type=resolved_type,
@@ -5679,6 +5693,7 @@ class MultiModelManager:
                 load_mode=meta.get("load_mode"),
                 languages=meta.get("languages") or None,
                 supports_translation=meta.get("supports_translation"),
+                video=video_geom,
             ))
 
         # --- Models from config (the authoritative source) ---

@@ -155,6 +155,12 @@ class ModelInfo(BaseModel):
     languages: Optional[List[str]] = None
     supports_translation: Optional[bool] = None
     speaker_diarization: Optional[bool] = None
+    # Video generation: what this model can actually emit — native frame rate, the
+    # legal frame-count grid, how long ONE render may be and whether continuation is
+    # native. Published so a client can PLAN around the model (how long a scene can
+    # be, how many scenes fill a minute) instead of hardcoding a table per family.
+    # See codai/models/video_geometry.py.
+    video: Optional[Dict] = None
 
 
 class ModelList(BaseModel):
