@@ -1846,6 +1846,17 @@ def _train_via_overlay(arch, req, base_path, images, instance_prompt,
     proc = subprocess.Popen([py, script, "--job", job_path],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
+    # The most expendable thing on the box, and one of the fattest: a training run
+    # holds tens of GB for hours, and losing it costs a restart of one job rather
+    # than every request in flight. Tell the OOM killer to come here first. Set
+    # from the parent (raising another process's score needs no privilege) rather
+    # than in a preexec_fn, which runs Python between fork and exec in a threaded
+    # server. Best-effort: a training job that cannot be marked still trains.
+    try:
+        from codai.util import oom
+        oom.mark("training", proc.pid)
+    except Exception:
+        pass
 
     def _pump():
         for line in proc.stdout:

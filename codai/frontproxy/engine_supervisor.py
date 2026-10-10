@@ -54,6 +54,17 @@ def _engine_preexec():
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 9, 0, 0, 0)
     except Exception:
         pass
+    # Step this engine, and everything it goes on to spawn, one tier ABOVE the
+    # front in the OOM killer's order. An engine holding a model is always near the
+    # top of the kernel's badness list — that is how coderai-nvidia came to be the
+    # victim of a leak in an unrelated process — and the front is the one process
+    # whose death loses everything, including the ability to respawn an engine.
+    # Raising is unprivileged; see codai/util/oom.py for why it can only go this way.
+    try:
+        from codai.util import oom
+        oom.mark("engine")
+    except Exception:
+        pass
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:

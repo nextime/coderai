@@ -224,6 +224,16 @@ Bring your bare-metal config + data into the container with --map (dir OR file):
   # Video editor (config file + the media_dir/output_dir it points at):
   ...  --map /host/video_editor.config.json:/cache/video_editor/video_editor.config.json \
        --map /host/coderai_media --map /host/video_editor_output
+
+Environment:
+  CODERAI_OOM_SCORE_ADJ  How hard the kernel should avoid killing this container
+                         when the HOST runs out of memory (-1000..1000, default
+                         -500; 0 leaves the kernel's own ordering alone). A server
+                         holding a model is one of the fattest tasks on the box, so
+                         the OOM killer reaches for it first even when the leak is
+                         somewhere else. Rootless podman clamps a negative value
+                         to 0. Inside the container, engines and training runs step
+                         back UP from this base so they are shed first.
 EOF
 }
 
@@ -473,6 +483,25 @@ if [[ "$HOST_NETWORK" == "1" ]]; then
   args=(run --rm --name "$NAME" --ipc=host --network host -e CODERAI_HOST="${HOST_BIND:-0.0.0.0}" -e CODERAI_PORT="$PORT")
 else
   args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
+fi
+
+# Who the kernel kills when the HOST runs out of memory. oom_score is essentially
+# "how much memory does this task hold", so an orchestrator with a model loaded is
+# always near the top of that list and gets reached for first — even when the leak
+# is somewhere else entirely. That is what happened on 2026-10-10: a runaway test
+# process on the host filled swap, and the kernel killed coderai-nvidia, which was
+# serving at the time, while the process at fault carried on.
+#
+# -500 of the -1000..1000 range is a strong preference, not immunity. It has to be
+# set HERE because the container engine runs as root and has CAP_SYS_RESOURCE,
+# while nothing inside the container does: in-container processes can only step UP
+# from this base, which is exactly what the engine and worker tiers do
+# (codai/util/oom.py). Rootless podman clamps a negative value to 0 — still an
+# improvement on the +200 a user service inherits from systemd's user manager.
+# Set CODERAI_OOM_SCORE_ADJ=0 to leave the kernel's own ordering alone.
+OOM_SCORE_ADJ="${CODERAI_OOM_SCORE_ADJ:--500}"
+if [[ "$OOM_SCORE_ADJ" != "0" ]]; then
+  args+=(--oom-score-adj "$OOM_SCORE_ADJ")
 fi
 # Forward a HuggingFace token from the host env so the engines authenticate to the
 # HF Hub (higher rate limits + gated models) instead of sending unauthenticated
