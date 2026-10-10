@@ -74,6 +74,45 @@ checkout and venv, and the avatar fields. Global runtime settings (venv, the 3.1
 interpreter, `auto_build`, attention backend, timeouts, the eviction drain) live in
 **Settings → LongCat**.
 
+## Block-sparse attention
+
+Attention dominates at video token counts — ~37k tokens for 93 frames at 480x832, and it
+is O(N^2) in that — so the checkpoint carries `bsa_params` with sparsity 0.9375, roughly a
+16x cut, implemented in pure Triton. **Block-sparse attention** on the model page turns it
+on. It ships off: it is an approximation, and on a video model the artifacts show up as
+temporal flicker rather than one soft frame.
+
+It also cannot run every geometry. `flash_attn_bsa_3d` tiles the latent into 3D chunks and
+asserts the latent divides evenly by the chunk on every axis, which with the shipped
+`(4, 4, 4)` means:
+
+- **sides divisible by 64** — the VAE's 16-pixel latent cell times 4. Upstream's own
+  default 480x832 is *not* one (480/16 = 30).
+- **frame counts of 16n+13** — 13, 29, 45, 61, 77, 93, … not the 4n+1 the generation rule
+  suggests, because the latent depth is `(F-1)/4 + 1` and *that* is what must divide by 4.
+
+And there is a third condition that is easy to miss. A **conditioning** pass — i2v, or any
+continuation — does not tile the latent once: `Attention.forward` splits the sequence into
+a conditioning block and a noise block and tiles each separately, so both depths must
+divide by the chunk too. `generate_i2v` hardcodes a single conditioning latent, and
+`1 % 4 != 0`, so block-sparse attention can never run an i2v pass at any frame count or
+resolution. coderai detects all three before the first denoising step and runs that pass
+**dense**, with a log line saying which condition failed — rather than letting a bare
+`AssertionError` surface from inside the DiT.
+
+### Padding the conditioning (experimental, off)
+
+**Pad conditioning for BSA** rounds the conditioning latent count up to the chunk
+granularity on the way into the DiT, which is exactly what upstream's own `generate_refine`
+does for itself. With it on, an i2v or continuation pass keeps block-sparse attention
+instead of falling back.
+
+It is off by default, and it is not free: the pipeline marks only the real conditioning
+frames clean (`timestep[:, :1] = 0`), so rounding 1 up to 4 hands the conditioning block
+three latent frames that are still noise. The attention is well-defined but it is not what
+the model was trained on. Measure a known-good clip against the dense path before trusting
+it on anything you care about.
+
 ## Generating
 
 ```jsonc

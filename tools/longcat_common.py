@@ -286,7 +286,35 @@ VAE_TEMPORAL_STRIDE = 4
 DEFAULT_BSA_CHUNK = (4, 4, 4)
 
 
-def bsa_problems(num_frames: int, height: int, width: int, chunk=None) -> list:
+# What generate_i2v passes, hardcoded, whatever num_frames is
+# (pipeline_longcat_video.py:796; the avatar pipeline does the same at 1076-1113).
+I2V_COND_LATENTS = 1
+
+
+def cond_latents_for(num_cond_frames) -> int:
+    """How many latent frames a continuation pass treats as conditioning.
+
+    Mirrors pipeline_longcat_video.py:1016 — and, like it, does NOT round up to the
+    BSA granularity the way generate_refine does at 1245.
+    """
+    try:
+        frames = int(num_cond_frames)
+    except (TypeError, ValueError):
+        return 0
+    if frames <= 0:
+        return 0
+    return 1 + (frames - 1) // VAE_TEMPORAL_STRIDE
+
+
+def round_to_granularity(count, chunk=None) -> int:
+    """``count`` rounded UP to the BSA temporal granularity, as generate_refine does."""
+    tq = int((tuple(chunk or DEFAULT_BSA_CHUNK))[0]) or 1
+    n = max(0, int(count))
+    return -(-n // tq) * tq
+
+
+def bsa_problems(num_frames: int, height: int, width: int, chunk=None,
+                 num_cond_latents=None) -> list:
     """Why block-sparse attention cannot run THIS geometry, or [].
 
     flash_attn_bsa_3d tiles the latent into 3D chunks and asserts the latent divides
@@ -299,6 +327,15 @@ def bsa_problems(num_frames: int, height: int, width: int, chunk=None) -> list:
     num_frames at 13, 29, 45, 61, 77, 93 … Upstream's own default 480x832 is NOT one of
     them (480/16 = 30), which is presumably why the flag ships off: an AssertionError
     out of the first denoising step says nothing about geometry.
+
+    ``num_cond_latents`` is the OTHER half of the same assert, and the half that cost a
+    production run. A conditioning pass does not tile the latent once: Attention.forward
+    slices the sequence into a conditioning block and a noise block and calls
+    flash_attn_bsa_3d on EACH (modules/attention.py:123-134), so the cond depth and the
+    remaining noise depth must both divide by ``tq`` as well. generate_i2v hardcodes one
+    cond latent and 1 % 4 != 0, which means block-sparse attention has never once been
+    able to run an i2v pass at any frame count or resolution. Pass 0 or None for a pass
+    with no conditioning branch.
     """
     tq, hq, wq = tuple(chunk or DEFAULT_BSA_CHUNK)
     problems = []
@@ -329,6 +366,18 @@ def bsa_problems(num_frames: int, height: int, width: int, chunk=None) -> list:
             f"num_frames must leave a latent depth divisible by {tq} for block-sparse "
             f"attention ({step}n+1: 13, 29, 45, 61, 77, 93 …); got {frames}"
             + (f", try {' or '.join(str(n) for n in options)}" if options else ""))
+
+    if num_cond_latents:
+        cond = int(num_cond_latents)
+        noise = latent_t - cond
+        if cond % tq or noise <= 0 or noise % tq:
+            problems.append(
+                f"a conditioning pass tiles {cond} cond + {noise} noise latent frames "
+                f"separately, so BOTH must divide by {tq} for block-sparse attention; "
+                f"generate_i2v hardcodes {I2V_COND_LATENTS}, which never can. Turn "
+                f"bsa_pad_cond on to round the conditioning up to "
+                f"{round_to_granularity(cond, chunk)}, or leave block-sparse attention "
+                f"off for conditioning passes")
     return problems
 
 

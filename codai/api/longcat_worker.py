@@ -45,6 +45,10 @@ Per-model config keys (models.json entry, all optional)::
     "quality": "fast",             # draft | fast | best
     "offload_strategy": "",        # '' | model | sequential
     "bsa": "off",                  # block-sparse attention: on | off | auto
+    "bsa_pad_cond": "off",         # on | off — let i2v/continuation passes use BSA by
+                                   #   rounding the conditioning latents up to the
+                                   #   granularity; off, because it widens the
+                                   #   conditioning block past what is actually clean
     "base_model": "",              # avatar families borrow tokenizer/text_encoder/vae
     "text_encoder_quant": "none",   # none | int8 | nf4 | fp4 (keeps it resident)
     "prompt_cache": "off",         # off | disk — cache prompt embeddings between
@@ -498,6 +502,12 @@ def ensure_service(model_path: str, config: dict = None,
                   (getattr(sec, "bsa", "") if sec is not None else "") or "").strip()
         if bsa:
             cmd += ["--bsa", bsa]
+        # Only meaningful with bsa on, and the service validates it either way.
+        pad = str(config.get("bsa_pad_cond") or
+                  (getattr(sec, "bsa_pad_cond", "") if sec is not None else "")
+                  or "").strip()
+        if pad:
+            cmd += ["--bsa-pad-cond", pad]
         split = str(config.get("cp_split_hw") or "").strip()
         if split:
             cmd += ["--cp-split-hw", split]

@@ -718,6 +718,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <option value="on">on — needs sides /64 and 16n+13 frames</option>
               <option value="auto">auto — on when triton is available</option>
             </select></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Pad conditioning for BSA</label>
+            <select id="cfg-longcat-bsa-pad-cond" class="form-input">
+              <option value="">off — i2v/continuation run dense (safe)</option>
+              <option value="on">on — round cond latents up so BSA applies (experimental)</option>
+            </select></div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-top:.5rem">
           <div class="form-row" style="margin:0"><label class="form-label">Prompt cache</label>
@@ -4642,6 +4647,7 @@ function _populateCluster(m, s){
   set('cfg-longcat-offload', s.offload_strategy || '');
   set('cfg-longcat-te-quant', s.text_encoder_quant || '');
   set('cfg-longcat-bsa', s.bsa || '');
+  set('cfg-longcat-bsa-pad-cond', s.bsa_pad_cond || '');
   set('cfg-longcat-prompt-cache', s.prompt_cache || '');
   set('cfg-longcat-prompt-cache-dir', s.prompt_cache_dir || '');
   set('cfg-longcat-prompt-cache-max', s.prompt_cache_max_gb || '');
@@ -4692,6 +4698,7 @@ function _collectCluster(){
     out.offload_strategy = val('cfg-longcat-offload') || '';
     out.text_encoder_quant = val('cfg-longcat-te-quant') || '';
     out.bsa = val('cfg-longcat-bsa') || '';
+    out.bsa_pad_cond = val('cfg-longcat-bsa-pad-cond') || '';
     out.prompt_cache = val('cfg-longcat-prompt-cache') || '';
     out.prompt_cache_dir = val('cfg-longcat-prompt-cache-dir') || '';
     out.prompt_cache_max_gb = num('cfg-longcat-prompt-cache-max');

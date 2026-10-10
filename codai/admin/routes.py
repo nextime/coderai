@@ -2959,7 +2959,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 
                     # LongCat component quantisation, block-sparse attention, the base
                     # checkpoint an avatar family borrows from, and the CP tile.
-                    "text_encoder_quant", "bsa", "base_model", "cp_split_hw",
+                    "text_encoder_quant", "bsa", "bsa_pad_cond", "base_model",
+                    "cp_split_hw",
                     # The prompt-embedding cache: an encode outlives the request that
                     # paid for it, and the text encoder is then built only on a miss.
                     "prompt_cache", "prompt_cache_dir", "prompt_cache_max_gb",):

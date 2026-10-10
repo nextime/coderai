@@ -288,6 +288,11 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         # Both pipeline modules are imported by now (the avatar one only for an
         # avatar family), so this is the first point where the bars can be rebound.
         _install_progress_bars()
+        if _bsa_enabled() and _bsa_pad_cond() and _install_cond_padding(pipe):
+            log(f"block-sparse attention: conditioning latents padded up to "
+                f"{int(_bsa_chunk(pipe)[0])} (bsa_pad_cond on) — i2v and continuation "
+                f"passes keep BSA, at the cost of attending over latent frames the "
+                f"pipeline still marks as noise")
         _place_pipeline(pipe, offload)
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
@@ -350,6 +355,81 @@ def _bsa_enabled(setting=None):
             "block-sparse attention needs triton, which is not installed in the "
             "LongCat venv")
     log("block-sparse attention: on")
+    return True
+
+
+def _bsa_pad_cond(setting=None) -> bool:
+    """Whether to round a conditioning pass up to the block-sparse granularity. OFF.
+
+    This is the only way to get block-sparse attention on an i2v or continuation pass:
+    generate_i2v hardcodes one conditioning latent, the cond and noise blocks are tiled
+    separately, and 1 % 4 != 0, so the pass asserts out of the first denoising step.
+    generate_refine already solves it for itself (pipeline_longcat_video.py:1245) by
+    rounding both counts up to the granularity; this does the same thing for the paths
+    upstream left out.
+
+    It is off by default because it is NOT free. The pipeline marks only the real
+    conditioning frames clean (``timestep[:, :1] = 0``), so rounding 1 up to 4 hands the
+    conditioning block three latent frames that are still noise. Attention over them is
+    well-defined but it is not what the model was trained on, and the failure mode for a
+    video model is temporal drift — the same class of defect as the dual-expert grey
+    video. Measure a known-good clip against the dense path before trusting it.
+    """
+    want = str(setting if setting is not None
+               else os.environ.get("LONGCAT_BSA_PAD_COND") or "off").strip().lower()
+    if want in ("", "0", "off", "false", "no", "none"):
+        return False
+    if want not in ("1", "on", "true", "yes"):
+        raise ValueError(f"bsa_pad_cond must be on or off; got {want!r}")
+    return True
+
+
+def _bsa_chunk(pipe):
+    """The checkpoint's own 3D chunk, or the shipped default."""
+    blocks = [m for m in pipe.dit.modules() if getattr(m, "enable_bsa", False)] \
+        if getattr(pipe, "dit", None) is not None else []
+    if blocks:
+        chunk = (getattr(blocks[0], "bsa_params", None) or {}).get("chunk_3d_shape_q")
+        if chunk:
+            return tuple(chunk)
+    return LC.DEFAULT_BSA_CHUNK
+
+
+def _install_cond_padding(pipe):
+    """Round ``num_cond_latents`` up to the granularity on the way into the DiT.
+
+    Patched onto the DiT instance rather than the vendored source, the same way the
+    denoising bars are rebound: the count is born inside generate_i2v's loop, so there
+    is no outer argument to correct, but every path funnels through one ``self.dit(...)``
+    call. nn.Module._call_impl reads ``self.forward``, so an instance attribute is the
+    hook.
+
+    Returns False when there is nothing to do, so the caller can say so.
+    """
+    dit = getattr(pipe, "dit", None)
+    if dit is None or getattr(dit, "_lc_cond_padded", False):
+        return False
+    inner = dit.forward
+    tq = int(_bsa_chunk(pipe)[0]) or 1
+
+    def forward(*args, **kwargs):
+        n = kwargs.get("num_cond_latents")
+        if n:
+            hidden = kwargs.get("hidden_states")
+            if hidden is None and args:
+                hidden = args[0]
+            # [B, C, T, H, W]: the latent depth this pass is splitting.
+            depth = int(hidden.shape[2]) if getattr(hidden, "ndim", 0) == 5 else 0
+            padded = -(-int(n) // tq) * tq
+            # Leave it alone if padding would swallow the noise block — _bsa_for has
+            # already turned BSA off for that case, so dense attention wants the real
+            # count, not a widened one.
+            if padded != n and (not depth or padded < depth):
+                kwargs["num_cond_latents"] = padded
+        return inner(*args, **kwargs)
+
+    dit.forward = forward
+    dit._lc_cond_padded = True
     return True
 
 
@@ -798,8 +878,39 @@ def _wrap_encode_prompt(pipe, swap: bool, cache=None, lazy=None):
     # Set on the INSTANCE: all four generate_* methods call self.encode_prompt.
     pipe.encode_prompt = encode_prompt
     return pipe
+def _cond_latent_passes(task: str, ctx: dict) -> list:
+    """How many conditioning latents each pass of THIS request will attend over.
+
+    One request is not one pass. _run_segments renders segment 0 with the task's own
+    entry point and every later segment with generate_vc, so even a t2v request runs a
+    conditioning pass once num_segments > 1 — and block-sparse attention is a property
+    of the DiT, set for the whole request. So collect every count the request can
+    produce and let the caller refuse if ANY of them cannot tile.
+
+    0 is a pass with no conditioning branch.
+    """
+    counts = []
+    cond_frames = ctx.get("num_cond_frames")
+    continuing = ctx.get("cond_video") is not None
+    if continuing or task in ("vc", "avc"):
+        counts.append(LC.cond_latents_for(cond_frames))
+    elif task in ("i2v", "ai2v"):
+        counts.append(LC.I2V_COND_LATENTS)
+    else:
+        counts.append(0)
+    if max(1, int(ctx.get("num_segments") or 1)) > 1:
+        counts.append(LC.cond_latents_for(cond_frames))
+    if task in LC.AVATAR_TASKS or task == "avc":
+        # The avatar continuation adds one more for a reference image
+        # (pipeline_longcat_video_avatar.py:1375).
+        base = LC.cond_latents_for(cond_frames)
+        if base:
+            counts.append(base + 1)
+    return counts
+
+
 @contextlib.contextmanager
-def _bsa_for(pipe, ctx):
+def _bsa_for(pipe, ctx, task: str = ""):
     """Run this pass with block-sparse attention only if the geometry allows it.
 
     flash_attn_bsa_3d asserts the latent divides evenly by its 3D chunk, so a shape it
@@ -807,16 +918,30 @@ def _bsa_for(pipe, ctx):
     AssertionError out of the first denoising step. Turning the flag on in a config
     must not break requests that work; falling back silently must not leave someone
     wondering why nothing got faster. So: fall back, and say why.
+
+    The geometry is not only num_frames x height x width. A conditioning pass tiles the
+    cond and noise blocks separately, and generate_i2v's hardcoded single cond latent
+    tiles under no chunk at all — which is how an i2v request with a perfectly valid
+    93-frame, 64-divisible geometry still died in the first step. With bsa_pad_cond on,
+    the DiT wrapper rounds that count up before the split, so the counts checked here
+    are the padded ones.
     """
     blocks = [m for m in pipe.dit.modules() if getattr(m, "enable_bsa", False)] \
         if getattr(pipe, "dit", None) is not None else []
     problems = []
     if blocks:
         chunk = (blocks[0].bsa_params or {}).get("chunk_3d_shape_q")
-        problems = LC.bsa_problems(ctx.get("num_frames") or LC.DEFAULT_NUM_FRAMES,
-                                   ctx.get("height") or LC.DEFAULT_BASE_SIZE[0],
-                                   ctx.get("width") or LC.DEFAULT_BASE_SIZE[1],
-                                   chunk)
+        conds = _cond_latent_passes(task, ctx)
+        if _bsa_pad_cond():
+            conds = [LC.round_to_granularity(c, chunk) if c else c for c in conds]
+        for cond in dict.fromkeys(conds):
+            for problem in LC.bsa_problems(
+                    ctx.get("num_frames") or LC.DEFAULT_NUM_FRAMES,
+                    ctx.get("height") or LC.DEFAULT_BASE_SIZE[0],
+                    ctx.get("width") or LC.DEFAULT_BASE_SIZE[1],
+                    chunk, num_cond_latents=cond):
+                if problem not in problems:
+                    problems.append(problem)
     if not blocks or not problems:
         yield bool(blocks)
         return
@@ -1455,7 +1580,7 @@ def generate(body: dict) -> dict:
                 log(f"stage 'refinement': refining {len(frames)} frames")
                 frames = _frames_from_output(pipe.generate_refine(**kw)[0])
             else:
-                with _bsa_for(pipe, ctx):
+                with _bsa_for(pipe, ctx, task):
                     frames, yielded = _run_segments(pipe, task, stage, ctx, log=log)
             log(f"stage '{stage}': {len(frames)} frames")
     finally:
@@ -1648,6 +1773,11 @@ def main(argv=None):
     ap.add_argument("--bsa", default="off",
                     help="block-sparse attention: on | off | auto (auto stays off "
                          "when triton is missing instead of failing)")
+    ap.add_argument("--bsa-pad-cond", default="off",
+                    help="round a conditioning pass up to the block-sparse granularity "
+                         "so i2v/continuation can use BSA at all: on | off (default "
+                         "off; it widens the conditioning block past what the pipeline "
+                         "marks clean)")
     ap.add_argument("--cp-split-hw", default="",
                     help="context-parallel tile as HxW, e.g. 1x2; "
                          "defaults to 1x<cp_size>")
@@ -1666,6 +1796,7 @@ def main(argv=None):
     # by default (requirements-longcat.txt installs xformers instead).
     os.environ.setdefault("LONGCAT_ATTENTION", args.attention)
     os.environ.setdefault("LONGCAT_BSA", args.bsa)
+    os.environ.setdefault("LONGCAT_BSA_PAD_COND", args.bsa_pad_cond)
     _state["base_model"] = args.base_model or ""
     _problems = LC.component_quant_problems("text_encoder_quant",
                                             args.text_encoder_quant)
@@ -1691,6 +1822,7 @@ def main(argv=None):
     # Validate both before anything slow happens: a bad value should not surface after
     # a multi-minute load.
     _bsa_enabled()
+    _bsa_pad_cond()
     _state["cp_split_hw"] = _cp_split_hw(1, args.cp_split_hw)
 
     rank, _local = (0, 0)
