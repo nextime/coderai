@@ -26,6 +26,32 @@ Dispatcher = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 logger = logging.getLogger(__name__)
 
 
+def being_cancelled() -> bool:
+    """True when the CURRENT coroutine has itself been cancelled.
+
+    asyncio delivers a cancellation as a CancelledError at the next await point —
+    including an await whose whole purpose is to collect a CHILD task we just
+    cancelled. ``except asyncio.CancelledError: pass`` around that await therefore
+    catches two completely different things: the child reporting that it stopped
+    (fine to swallow) and the caller asking US to stop (never fine). Swallowing the
+    second one means a shutdown is silently ignored and the loop carries on.
+
+    ``Task.cancelling()`` (3.11+) counts cancel() calls made against the current
+    task, which is what tells them apart. Guarded with getattr so an older runtime
+    degrades to the previous behaviour rather than raising.
+    """
+    current = asyncio.current_task()
+    counter = getattr(current, "cancelling", None)
+    try:
+        return bool(counter and counter() > 0)
+    except Exception:
+        return False
+
+
+# The name the first fix used; kept so nothing that imported it breaks.
+_being_cancelled = being_cancelled
+
+
 class BrokerClient:
     def __init__(self, runtime, dispatcher: Dispatcher | None = None):
         self.runtime = runtime
@@ -218,9 +244,21 @@ class BrokerClient:
                     self._inflight_tasks.add(task)
                     task.add_done_callback(self._inflight_tasks.discard)
             except asyncio.CancelledError:
-                await self._stop_heartbeat_task()
-                await self._cancel_inflight_tasks()
-                await self._close_websocket()
+                # Cleanup here awaits child tasks, and those awaits are themselves
+                # cancellation points: with the cancel still pending they would
+                # re-raise immediately (see _being_cancelled) and leave the
+                # websocket open. Clear it for the duration of the cleanup and
+                # re-raise at the end, so the caller still sees a cancelled task.
+                current = asyncio.current_task()
+                uncancel = getattr(current, "uncancel", None)
+                if uncancel is not None:
+                    uncancel()
+                try:
+                    await self._stop_heartbeat_task()
+                    await self._cancel_inflight_tasks()
+                    await self._close_websocket()
+                except Exception:
+                    logger.debug("broker shutdown cleanup failed", exc_info=True)
                 raise
             except Exception as error:
                 logger.warning(
@@ -258,7 +296,11 @@ class BrokerClient:
         try:
             await task
         except asyncio.CancelledError:
-            pass
+            # The heartbeat reporting that it stopped is expected. OUR own
+            # cancellation arriving here is not, and must not be absorbed: it is
+            # how run_forever is shut down.
+            if being_cancelled():
+                raise
 
     async def _cancel_inflight_tasks(self):
         if not self._inflight_tasks:
@@ -271,7 +313,8 @@ class BrokerClient:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                if being_cancelled():
+                    raise
             except Exception:
                 pass
 
@@ -297,7 +340,10 @@ class BrokerClient:
                 except Exception:
                     break
         except asyncio.CancelledError:
-            pass
+            # Re-raise: the caller cancels this deliberately when the request
+            # finishes, and a task that swallows its cancellation reports itself as
+            # having completed normally, which hides a stuck keepalive.
+            raise
 
     async def _heartbeat_loop(self):
         started_at = time.monotonic()
@@ -476,7 +522,12 @@ class BrokerClient:
                         try:
                             await keepalive_task
                         except asyncio.CancelledError:
-                            pass
+                            # Not ours to swallow: this runs inside an inflight
+                            # request task, and absorbing the cancel here means a
+                            # shutdown waits out a whole generation instead of
+                            # stopping it.
+                            if being_cancelled():
+                                raise
                 return None
 
             try:
@@ -493,7 +544,8 @@ class BrokerClient:
                     try:
                         await keepalive_task
                     except asyncio.CancelledError:
-                        pass
+                        if being_cancelled():
+                            raise
             reply_bytes = json.dumps(response)
             logger.info(
                 "CoderAI broker replied request_id=%s status=%s event=%s reply_bytes=%d",

@@ -24,6 +24,42 @@ class Recorder:
         self.events.append(event)
 
 
+class RunawayLoop(BaseException):
+    """Raised to break a test's reconnect loop out of run_forever.
+
+    BaseException on purpose: an ordinary exception raised from the sleep stand-in
+    would be caught by run_forever's `except Exception` reconnect handler and bring
+    us straight back round to the same stand-in.
+    """
+
+
+def bounded_zero_sleep(calls, limit=50, what="run_forever"):
+    """A zero-delay stand-in for asyncio.sleep that refuses to spin forever.
+
+    Mocking the reconnect delay to zero is what makes these tests fast, and it is
+    also what makes them dangerous: with the delay gone, the reconnect loop is a
+    busy loop, and it only stops because the test cancels the task. When a
+    cancellation was swallowed (see _being_cancelled in codai/broker/client.py) the
+    spin never ended — it allocated ~78 MB/s, because AsyncMock records every call
+    it receives, reached 46 GB RSS, and the OOM killer took the server down with it.
+
+    So the stand-in counts. These tests need a couple of reconnects; well past that
+    means the loop is no longer stopping, and failing in milliseconds with a clear
+    message beats taking the host down.
+    """
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        calls.append(delay)
+        if len(calls) > limit:
+            raise RunawayLoop(
+                f"{what} slept {len(calls)} times without stopping — a "
+                "cancellation is being swallowed")
+        await real_sleep(0)
+
+    return fake_sleep
+
+
 class FakeWebSocket:
     def __init__(self, messages):
         self._messages = list(messages)
@@ -248,10 +284,8 @@ async def test_broker_client_run_forever_closes_registered_socket_before_reconne
         if len(attempts) >= 2:
             reconnected.set()
 
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(delay):
-        await real_sleep(0)
+    sleep_calls = []
+    fake_sleep = bounded_zero_sleep(sleep_calls, what="the reconnect loop")
 
     client.connect_and_register = AsyncMock(side_effect=fake_connect_and_register)
 
@@ -498,11 +532,7 @@ async def test_broker_client_run_forever_reconnects_after_disconnect():
         if len(attempts) >= 2:
             reconnected.set()
 
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(delay):
-        sleep_calls.append(delay)
-        await real_sleep(0)
+    fake_sleep = bounded_zero_sleep(sleep_calls, what="the reconnect loop")
 
     client.connect_and_register = AsyncMock(side_effect=fake_connect_and_register)
 
@@ -615,11 +645,7 @@ async def test_broker_client_run_forever_handles_heartbeat_before_reconnect():
         if len(attempts) >= 2:
             reconnected.set()
 
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(delay):
-        sleep_calls.append(delay)
-        await real_sleep(0)
+    fake_sleep = bounded_zero_sleep(sleep_calls, what="the reconnect loop")
 
     client.connect_and_register = AsyncMock(side_effect=fake_connect_and_register)
 

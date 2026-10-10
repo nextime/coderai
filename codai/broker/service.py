@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from codai.broker.client import BrokerClient
+from codai.broker.client import BrokerClient, being_cancelled
 from codai.broker.dispatcher import execute_broker_request
 
 
@@ -36,6 +36,11 @@ class BrokerService:
         try:
             await task
         except asyncio.CancelledError:
-            pass
+            # The client reporting that it stopped is the expected outcome. A
+            # cancellation of THIS coroutine — stop() awaited from a task that is
+            # itself being torn down — is not, and swallowing it tells the caller
+            # the shutdown completed normally.
+            if being_cancelled():
+                raise
         finally:
             self._started = False
