@@ -337,8 +337,35 @@ class OlmOcrEngine(OcrEngine):
         temperature = float(getattr(self.cfg, "olmocr_temperature", 0.1) or 0.0)
 
         if self._mode() == "model":
-            return self._ask_local(messages, max_tokens, temperature)
+            return self._ask_model(messages, max_tokens, temperature)
         return self._ask_http(messages, max_tokens, temperature)
+
+    def _ask_model(self, messages, max_tokens, temperature) -> str:
+        """Model mode: ask the dispatcher which server should take this page.
+
+        The in-process path below is the right one for a model this machine
+        serves — it goes through the model manager, so loading, VRAM eviction and
+        queueing all apply. It is the WRONG one for a model served elsewhere: it
+        cannot see which cluster node is least busy (nodes live in the front's
+        registry, not here), and it bypasses the front, where burst-to-RunPod
+        lives. So the choice is made per page, and only a local answer takes the
+        in-process route.
+        """
+        model_id = (getattr(self.cfg, "olmocr_model_id", "") or "").strip()
+        try:
+            from codai.ocr import dispatch
+            spill = int(getattr(self.cfg, "serve_spill_inflight", 0) or 0)
+            lease = dispatch.choose(model_id, spill_after=spill)
+        except Exception:
+            return self._ask_local(messages, max_tokens, temperature)
+        try:
+            if lease.kind == "local":
+                return self._ask_local(messages, max_tokens, temperature)
+            return self._ask_http(messages, max_tokens, temperature,
+                                  base=lease.base, api_key=lease.api_key,
+                                  model_name=model_id)
+        finally:
+            lease.release()
 
     def _ask_local(self, messages, max_tokens, temperature) -> str:
         """Through coderai's own in-process chat handler (model mode)."""
@@ -365,22 +392,27 @@ class OlmOcrEngine(OcrEngine):
             raise OcrError(f"olmOCR model '{model_id}' returned no text", status=500)
         return content
 
-    def _ask_http(self, messages, max_tokens, temperature) -> str:
-        """Against an OpenAI-compatible server (vllm/server modes)."""
+    def _ask_http(self, messages, max_tokens, temperature, base: str = "",
+                  api_key: str = "", model_name: str = "") -> str:
+        """Against an OpenAI-compatible server (vllm/server modes).
+
+        ``base``/``api_key``/``model_name`` override the configured server for one
+        page, which is how model mode reaches the upstream the dispatcher chose.
+        """
         import requests
 
         payload = {
-            "model": self._model_name(),
+            "model": model_name or self._model_name(),
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
         }
         headers = {"Content-Type": "application/json"}
-        key = (getattr(self.cfg, "olmocr_api_key", "") or "").strip()
+        key = api_key or (getattr(self.cfg, "olmocr_api_key", "") or "").strip()
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        url = self._base.rstrip("/") + "/chat/completions"
+        url = (base or self._base).rstrip("/") + "/chat/completions"
         try:
             r = requests.post(url, json=payload, headers=headers,
                               timeout=float(getattr(self.cfg, "olmocr_timeout", 300.0) or 300.0))

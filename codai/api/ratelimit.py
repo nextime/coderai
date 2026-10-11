@@ -107,6 +107,24 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if _env_token and auth_header.lower().startswith("bearer "):
             if hmac.compare_digest(auth_header[7:].strip(), _env_token):
                 return await call_next(request)
+        # An OCR engine attached to the fan-out gateway. It is a subprocess of
+        # this install with no account and no API token; the credential it was
+        # given is a lease, minted per attachment and held only in memory, and it
+        # authorises nothing but its own gateway path.
+        #
+        # The lease is taken from the PATH, not the header, because the engine's
+        # probes carry no header: surya checks /health and /v1/models with a bare
+        # httpx GET (see surya/inference/backends/spawn.py) and refuses to attach
+        # at all if /health is not 200. A bearer is still accepted and still has
+        # to be a valid lease — it is what its chat requests send.
+        if path.startswith("/v1/ocr/engine/"):
+            try:
+                from codai.ocr.gateway import token_is_valid
+                lease_tok = path[len("/v1/ocr/engine/"):].split("/", 1)[0]
+                if token_is_valid(lease_tok):
+                    return await call_next(request)
+            except Exception:
+                pass
         # The shared cluster token (Settings → Cluster, or CODERAI_CLUSTER_TOKEN
         # on a capability image): what a head that discovered this install
         # presents on every request it forwards here.

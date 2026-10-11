@@ -26,6 +26,15 @@ scaling, the budget ledger and the idle reaper stay where they belong.
 
 The endpoint is a lease, not an address: a scale-to-zero pod is reaped when OCR goes
 quiet, and the caller is expected to re-resolve rather than to trust it forever.
+
+One address, however, cannot spread load: an engine handed a pod's URL keeps using
+that pod however busy it gets, and the pool — which grows on in-flight requests it
+counts itself — never learns there is load at all. So unless the install turns it
+off (``ocr.serve_fanout``), what the engine is handed is a lease on OUR OpenAI
+address (:mod:`codai.ocr.gateway`), which forwards each request verbatim to
+whichever server is least busy (:mod:`codai.ocr.dispatch`). The direct address
+remains the behaviour with fan-out disabled, and is still what the gateway resolves
+to when there is exactly one place to go.
 """
 
 import threading
@@ -162,6 +171,30 @@ def _served_name_of(backend, model_id: str) -> str:
     return model_id
 
 
+def _fanout_enabled() -> bool:
+    try:
+        from codai.admin.routes import config_manager
+        ocfg = getattr(getattr(config_manager, "config", None), "ocr", None)
+        return bool(getattr(ocfg, "serve_fanout", True))
+    except Exception:
+        return True
+
+
+def _fanout_endpoint(model_id: str):
+    """``(gateway base, lease token, served name)``, or None if fan-out cannot be used.
+
+    The served name is resolved the same way as for a direct attachment, because the
+    engine checks it against its own checkpoint before sending a single page.
+    """
+    from codai.ocr import dispatch, gateway
+    cands = dispatch.candidates(model_id)
+    if not cands:
+        return None
+    served = model_id
+    token = gateway.issue(model_id, served)
+    return gateway.engine_url(token), token, served
+
+
 def endpoint_for(model_id: str):
     """``(base_url ending /v1, api_key, served_name)`` for ``model_id``.
 
@@ -172,6 +205,14 @@ def endpoint_for(model_id: str):
     model_id = (model_id or "").strip()
     if not model_id:
         raise OcrError("no model id configured for the served OCR engine", status=400)
+
+    # One address of ours, many servers behind it. Discovery happens now (so a
+    # misconfiguration is still a clear error at load time) but nothing is rented:
+    # a pod is picked, and paid for, per request.
+    if _fanout_enabled():
+        fan = _fanout_endpoint(model_id)
+        if fan is not None:
+            return fan
 
     with _lock:
         backend = _backends.get(model_id)

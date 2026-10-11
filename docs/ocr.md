@@ -293,6 +293,42 @@ orchestrator: surya attaches straight to the endpoint the pool hands it. A pod r
 only the code baked into its image, so an install whose pods predate this needs its
 capability image rebuilt before the numbers appear.
 
+### Scaling in `model` mode
+
+An OCR pipeline drives one server address itself — that is what keeps the page
+images, the strict schema and the confidence scores intact. One address cannot
+spread load, though, and three things used to follow from that:
+
+* a RunPod pool grows when its least-loaded pod reaches
+  `scale_up_inflight_per_pod` **in-flight** requests, and in-flight is counted
+  when a request passes through the pool. An attached engine never did, so the
+  pool saw no load however hard OCR ran — and the engine had one pod's URL anyway;
+* several cluster nodes serving the model resolved to whichever answered first,
+  for ever, however busy it became;
+* a local model set to burst to RunPod never did: that trigger lives on the proxy
+  path an attached engine bypasses.
+
+With **`ocr.serve_fanout`** on (the default) the engine is instead handed one
+address of coderai's own, and each request is forwarded — **verbatim**, body bytes
+in and body bytes out, so nothing is decided about it — to whichever server is
+least busy:
+
+| the model is… | a page goes to |
+|---|---|
+| `backend: runpod` | the pool, every request: it picks the least-loaded pod and rents another when they are all at the threshold |
+| served on this machine | the local server, until it is busier than `ocr.serve_spill_inflight`, then a pod (the burst `runpod_spillover` describes) |
+| held by cluster nodes | the least busy of them, counting what each node reports for its **whole** install, so a node loaded with other work is left alone |
+| several of these at once | its configured home first — an explicit `backend` is a decision, not a hint — then the rest as overflow |
+
+`ocr.serve_spill_inflight: 0` means "never rent because of load": a pool is then
+used only when there is nothing else. Turning `serve_fanout` off restores the
+single direct address (one pod, no growth), which is one hop fewer and loses
+nothing on an install with exactly one server.
+
+The address is a lease: a secret minted per attachment, carried in the URL (the
+engine's `/health` and `/v1/models` probes send no headers, so it cannot be a
+bearer alone) and valid for nothing but that one gateway path.
+
 ```bash
 curl -F file=@sentenza.pdf -F structured=true -F detect=both -F schema=italian_sentenza \
      http://localhost:8776/v1/ocr

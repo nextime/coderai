@@ -256,6 +256,17 @@ class _InternalAuthMiddleware:
 
     async def __call__(self, scope, receive, send):
         if self._token and scope.get("type") == "http":
+            # The OCR fan-out gateway is the one exception, and it has to be: the
+            # client is an OCR engine running as a subprocess of THIS process, and
+            # it speaks plain OpenAI — surya's client sends a bearer token and
+            # nothing else, and its /health and /v1/models probes send no headers
+            # at all, so it cannot present the internal token however much we
+            # would like it to. The path is not open: every route under it demands
+            # a live lease (codai.ocr.gateway), a secret minted per attachment and
+            # held only in memory, and BearerAuthMiddleware checks it too.
+            if str(scope.get("path", "")).startswith("/v1/ocr/engine/"):
+                await self._app(scope, receive, send)
+                return
             headers = dict(scope.get("headers", []))
             got = headers.get(b"x-coderai-internal", b"").decode("latin-1")
             if got != self._token:
@@ -725,6 +736,11 @@ app.include_router(loras_router, tags=["LoRAs"])
 app.include_router(environments_router, tags=["Environments"])
 app.include_router(spatial_router, tags=["Spatial / 3D"])
 app.include_router(ocr_router, tags=["OCR"])
+# The address an attached OCR engine drives: one stable URL of ours, forwarded
+# per request to the least-busy server that holds the model. Not in the schema —
+# it is machine-to-machine, authenticated by a lease rather than an API token.
+from codai.ocr.gateway import router as ocr_gateway_router      # noqa: E402
+app.include_router(ocr_gateway_router, include_in_schema=False)
 app.include_router(rerank_router, tags=["Rerank"])
 from codai.api.models_transfer import router as models_transfer_router
 app.include_router(models_transfer_router, tags=["Models"])

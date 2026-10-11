@@ -981,6 +981,22 @@ class OcrConfig:
     surya_model_id: str = ""           # ("model" mode) the models.json id serving Surya2
     surya_server_url: str = ""         # external OpenAI server URL (llamacpp/manual); blank = auto
 
+    # --- how a served engine reaches its model ("model" mode, both engines) --- #
+    # An OCR pipeline drives ONE server address itself, which is what keeps its
+    # images, json_schema and logprobs intact. One address cannot spread load,
+    # though: an attached engine pins to the pod it was given, and a pool that
+    # counts its own in-flight requests never sees OCR traffic at all, so it never
+    # scales. With fan-out on, the engine is handed an address of OURS that
+    # forwards each request — byte for byte, deciding nothing — to the least busy
+    # of the local server, the cluster nodes holding the model, and the pod pool.
+    # Turn it off to go back to one direct address (one pod, no growth).
+    serve_fanout: bool = True
+    # In-flight requests at which a FIXED server (local, or a cluster node) is
+    # considered busy enough to rent instead: the local-plus-spillover policy, in
+    # the one place an attached OCR engine can act on it. 0 = never rent on load
+    # alone (a pool is then used only when there is nothing else).
+    serve_spill_inflight: int = 4
+
     # --- olmOCR-2 (AllenAI, Apache-2.0) --- a document VLM: whole-page transcription in
     # reading order, equations as LaTeX, tables as HTML, no bounding boxes. Driven over an
     # OpenAI chat endpoint with olmOCR's own prompt; see codai/ocr/olmocr.py.
@@ -1615,6 +1631,8 @@ class ConfigManager:
                 "surya_model": self.config.ocr.surya_model,
                 "surya_model_id": self.config.ocr.surya_model_id,
                 "surya_server_url": self.config.ocr.surya_server_url,
+                "serve_fanout": self.config.ocr.serve_fanout,
+                "serve_spill_inflight": self.config.ocr.serve_spill_inflight,
                 "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
                 "evict_drain_timeout_s": self.config.ocr.evict_drain_timeout_s,
                 "vlm_gpu_memory_utilization": self.config.ocr.vlm_gpu_memory_utilization,

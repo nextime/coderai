@@ -1529,6 +1529,13 @@ def main():
         print(f"API docs: http://{bind_host}:{bind_port}/docs")
         print(f"Admin UI: http://{bind_host}:{bind_port}/admin")
 
+    # Where this process can be reached on loopback. An OCR engine runs as a
+    # subprocess of THIS process and is handed a URL back into it (the fan-out
+    # gateway), so it has to know the port it actually bound — which for an engine
+    # is an internal port, not the configured public one.
+    os.environ["CODERAI_SELF_BASE"] = (
+        f"http{'s' if bind_https else ''}://127.0.0.1:{bind_port}")
+
     if model_manager.backend is not None:
         actual_backend = model_manager.backend_type
         if hasattr(model_manager.backend, 'force_cuda') and model_manager.backend.force_cuda:

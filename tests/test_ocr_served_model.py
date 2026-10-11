@@ -393,45 +393,76 @@ class _Node:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
 
-def test_a_model_held_by_a_cluster_node_resolves_to_that_node(monkeypatch):
+def test_a_model_held_by_a_cluster_node_is_found(monkeypatch):
     """A node is a whole coderai registered as a remote ENGINE, so no backend in the
     model layer knows it exists. Without asking the nodes, a node-hosted VLM answered
-    "not served over HTTP" — on an install that was serving it perfectly well."""
+    "not served over HTTP" — on an install that was serving it perfectly well.
+
+    Which node serves a given page is now decided per request by load
+    (codai.ocr.dispatch), so this asserts the discovery: the node that holds the
+    model is a candidate, carrying the shared cluster token."""
+    from codai.ocr import dispatch
+    dispatch.forget()
     _models_layer(monkeypatch)
     nodes = [_Node("alpha", "https://a.lan:8443"), _Node("beta", "https://b.lan:8443")]
     _cluster(monkeypatch, nodes, {"alpha": ["qwen"], "beta": ["datalab-to/surya-ocr-2"]})
-    base, key, served = served_model.endpoint_for("datalab-to/surya-ocr-2")
-    assert base == "https://b.lan:8443/v1"
-    assert key == "clustertok"          # the shared token fills a blank per-node key
-    assert served == "datalab-to/surya-ocr-2"
+    cands = dispatch._node_candidates("datalab-to/surya-ocr-2")
+    assert [c.base for c in cands] == ["https://b.lan:8443/v1"]
+    assert cands[0].api_key == "clustertok"   # shared token fills a blank node key
+
+
+def test_every_node_that_holds_it_is_a_candidate_not_just_the_first(monkeypatch):
+    """The first node that answered used to win for ever, however busy it got."""
+    from codai.ocr import dispatch
+    dispatch.forget()
+    _models_layer(monkeypatch)
+    nodes = [_Node("alpha", "https://a.lan:8443"), _Node("beta", "https://b.lan:8443")]
+    _cluster(monkeypatch, nodes, {"alpha": ["m"], "beta": ["m"]})
+    assert len(dispatch._node_candidates("m")) == 2
 
 
 def test_a_node_that_does_not_answer_is_skipped_not_fatal(monkeypatch):
+    from codai.ocr import dispatch
+    dispatch.forget()
     _models_layer(monkeypatch)
     nodes = [_Node("down", "https://d.lan:8443"), _Node("up", "https://u.lan:8443")]
     _cluster(monkeypatch, nodes, {"down": None, "up": ["m"]})
-    base, _, _ = served_model.endpoint_for("m")
-    assert base == "https://u.lan:8443/v1"
+    assert [c.base for c in dispatch._node_candidates("m")] == ["https://u.lan:8443/v1"]
 
 
 def test_the_nodes_are_not_asked_when_clustering_is_off(monkeypatch):
     """Probing every configured node on an install that does not cluster would add a
     timeout to the first page of every document."""
+    from codai.ocr import dispatch
+    dispatch.forget()
     _models_layer(monkeypatch)
     _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")],
              {"alpha": ["m"]}, enabled=False)
-    with pytest.raises(OcrError):
-        served_model.endpoint_for("m")
+    assert dispatch._node_candidates("m") == []
 
 
 def test_runpod_wins_over_a_node_that_also_lists_it(monkeypatch):
     """An explicit backend pin on the entry is the operator's decision and is
-    authoritative; node discovery is the fallback, not an override."""
-    backend = FakeBackend(url="https://pod/v1", key="podtok")
-    _models_layer(monkeypatch, runpod=True, engine="runpod")
-    import codai.backends.runpod as rp
-    backend.load_model = lambda mid: None
-    monkeypatch.setattr(rp, "RunpodBackend", lambda cfg: backend)
-    _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")], {"alpha": ["m"]})
-    base, key, _ = served_model.endpoint_for("m")
-    assert (base, key) == ("https://pod/v1", "podtok")
+    authoritative; node discovery is the fallback, not an override.
+
+    Load-aware picking must not quietly repeal that: a pool that is the model's
+    configured home is marked primary and is taken first, even though a node is
+    the cheaper hop and would otherwise win on load."""
+    from codai.ocr import dispatch
+    dispatch.forget()
+    pool_taken = []
+
+    node = dispatch.Candidate(key="node:alpha", kind="node",
+                              base="https://a.lan:8443/v1", priority=1)
+
+    def _acquire():
+        pool_taken.append(1)
+        return "https://pod/v1", "podtok", lambda: None
+    pod = dispatch.Candidate(key="pod:m", kind="pod", base="", priority=2,
+                             acquire=_acquire, primary=True)
+    monkeypatch.setattr(dispatch, "candidates", lambda m: [node, pod])
+    monkeypatch.setattr(dispatch, "_node_reported_load", lambda c: 0)
+    lease = dispatch.choose("m")
+    assert (lease.base, lease.api_key) == ("https://pod/v1", "podtok")
+    assert pool_taken == [1]
+    lease.release()
