@@ -103,3 +103,81 @@ def test_the_resolved_path_is_logged_so_a_split_is_visible(capsys, monkeypatch,
     rw._REGISTRY_PATH_LOGGED = False
     rw._pod_registry_path()
     assert "pod registry:" in capsys.readouterr().out
+
+
+# ------------------------------- a pod we cannot talk to is not an asset #
+# After a restart the pool adopts the pod it left running rather than renting
+# another. The pod only answers the bearer token it was LAUNCHED with, and the
+# registry carries that token across for exactly this reason — but when no key
+# was recorded the code fell back to our own and never checked the result. Seen
+# today, right after a restart: "reusing the pod already running" followed by
+# "Inference error: 401 — Invalid API key" on every page, for the rest of its
+# paid life. The probe that found the pod proves nothing about this: a coderai
+# pod answers /healthz to anybody.
+
+
+class _Reply:
+    def __init__(self, status):
+        self.status_code = status
+
+
+def _pool_for_probe(monkeypatch, status):
+    import threading
+    pool = rw.RunpodPodPool.__new__(rw.RunpodPodPool)
+    pool._cv = threading.Condition()
+    pool.model_key = "m"
+    pool.api_key = "ours"
+    pool.pods = []
+    from codai.api import pod_http
+    seen = {}
+
+    def _get(url, headers=None, timeout=None, **kw):
+        seen["url"] = url
+        seen["headers"] = headers or {}
+        return _Reply(status)
+    monkeypatch.setattr(pod_http, "get", _get)
+    return pool, seen
+
+
+def test_an_authenticated_path_is_what_gets_probed(monkeypatch):
+    """/healthz needs no token on a coderai pod, so probing it answers the wrong
+    question."""
+    pool, seen = _pool_for_probe(monkeypatch, 200)
+    assert pool._pod_answers_us("https://10.0.0.5:8000") is True
+    assert seen["url"].endswith("/v1/models")
+    assert seen["headers"]["Authorization"] == "Bearer ours"
+
+
+def test_a_401_means_the_pod_is_not_ours_to_use(monkeypatch):
+    pool, _ = _pool_for_probe(monkeypatch, 401)
+    assert pool._pod_answers_us("https://10.0.0.5:8000") is False
+
+
+def test_a_403_counts_too(monkeypatch):
+    pool, _ = _pool_for_probe(monkeypatch, 403)
+    assert pool._pod_answers_us("https://10.0.0.5:8000") is False
+
+
+def test_unreachable_is_not_unauthorised(monkeypatch):
+    """One failed probe must not destroy a pod that is merely still booting —
+    that is the health machinery's job, with its own budget."""
+    import threading
+    from codai.api import pod_http
+    pool = rw.RunpodPodPool.__new__(rw.RunpodPodPool)
+    pool._cv = threading.Condition()
+    pool.api_key = "ours"
+
+    def _boom(*a, **kw):
+        raise OSError("connection refused")
+    monkeypatch.setattr(pod_http, "get", _boom)
+    assert pool._pod_answers_us("https://10.0.0.5:8000") is True
+
+
+def test_adoption_refuses_and_terminates_a_pod_that_rejects_us():
+    """Paying for a pod nobody can use is the only outcome worse than killing
+    it, and with one registry per deployment an unrecorded key is a lost key."""
+    import inspect
+    src = inspect.getsource(rw.RunpodPodPool._adopt_shared_pod)
+    assert "_pod_answers_us" in src
+    assert "terminate_pod" in src
+    assert "return False" in src

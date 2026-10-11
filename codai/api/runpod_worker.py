@@ -2128,6 +2128,11 @@ class RunpodPodPool:
         #: waits out scale_down_after_s from here, so a momentary dip in a burst
         #: does not cost a pod that is wanted again seconds later.
         self._surplus_since = 0.0
+        #: A client said "give them back" and something was still working, so the
+        #: pods could not go yet. Without remembering it the intent was simply
+        #: lost: the pool fell back to idle_timeout_s (15 minutes on the Digesta
+        #: orchestrator) and billed for a fleet nobody had asked to keep.
+        self._release_pending = False
         # One log line per window transition, not one every scaler tick.
         self._sched_closed_logged = False
 
@@ -2373,6 +2378,28 @@ class RunpodPodPool:
     # NEXT candidate rather than failing the request.
     MAX_PROVISION_ATTEMPTS = 3
 
+    def _pod_answers_us(self, url: str) -> bool:
+        """Whether the pod accepts the token we would use for it.
+
+        Probes an AUTHENTICATED path, because the unauthenticated one proves
+        nothing: a coderai pod answers /healthz to anybody, which is how a pod
+        that 401s every real request passed the probe that adopted it.
+        """
+        base = (url or "").rstrip("/")
+        if not base:
+            return False
+        try:
+            from codai.api import pod_http
+            headers = ({"Authorization": f"Bearer {self.api_key}"}
+                       if self.api_key else {})
+            reply = pod_http.get(base + "/v1/models", headers=headers, timeout=20)
+        except Exception as exc:
+            # Unreachable is not "unauthorised": leave that to the health
+            # machinery rather than destroying a pod over one failed probe.
+            print(f"[runpod] token probe against {base} failed: {exc}", flush=True)
+            return True
+        return reply.status_code not in (401, 403)
+
     def _adopt_shared_pod(self) -> bool:
         """Take over a pod already running for this pool, instead of renting.
 
@@ -2396,6 +2423,27 @@ class RunpodPodPool:
                     return False
             self.api_key = shared_key
             print(f"[runpod] adopting pod {shared_id}'s bearer token", flush=True)
+        if not self._pod_answers_us(shared_url):
+            # A coderai pod's /healthz needs no token, so the probe that found
+            # this pod says nothing about whether we can USE it. With no key
+            # recorded we fall back to our own — and if that is not the token the
+            # pod was launched with, it answers 401 to every request for the rest
+            # of its paid life. Seen today: a pod adopted after a restart 401'd
+            # every OCR page.
+            #
+            # One registry per deployment means no recorded key is no key at all:
+            # the token is lost and the pod can never serve anyone. Paying for it
+            # is the only outcome worse than terminating it.
+            print(f"[runpod] pod {shared_id} refuses our bearer token (its own "
+                  f"was never recorded) — terminating rather than paying for a "
+                  f"pod nobody can use", flush=True)
+            try:
+                from codai.api.runpod_client import RunpodClient as _RC
+                unregister_pod(shared_id)
+                _RC(self.account).terminate_pod(shared_id)
+            except Exception as exc:
+                print(f"[runpod] could not terminate {shared_id}: {exc}", flush=True)
+            return False
         print(f"[runpod] reusing the pod already running for {self.model_key!r} "
               f"({shared_id}) instead of renting another", flush=True)
         handle = PodHandle(pod_id=shared_id, url=shared_url,
@@ -2796,6 +2844,10 @@ class RunpodPodPool:
         cap = max(1, int(self.mcfg.max_pods))
         want = max(0, int(pods))
         granted = min(want, cap)
+        if granted:
+            # Asking for warm pods cancels a pending release: the client changed
+            # its mind, and retiring what it just asked for would be absurd.
+            self._release_pending = False
         ttl = max(60, int(getattr(self.mcfg, "client_scale_ttl_s", 1800) or 1800))
         with self._cv:
             self._client_floor = granted
@@ -2902,11 +2954,24 @@ class RunpodPodPool:
                     draining.append(victim.pod_id)
             self._surplus_since = 0.0
             kept = len([p for p in self.pods if p.healthy and not p.draining])
+            # Anything still here above the operator's own floor is here because
+            # it is WORKING, not because anyone wants it warm. Remember that, so
+            # it goes the moment it falls idle instead of waiting out
+            # idle_timeout_s.
+            floor = self.effective_min_pods()
+            self._release_pending = bool(kept > floor or draining)
         print(f"[runpod] {self.model_key!r}: client released the fleet — "
               f"{len(terminated)} terminated, {len(draining)} draining, "
-              f"{kept} kept (floor {need})", flush=True)
+              f"{kept} kept ({need} still needed by work in flight, warm floor "
+              f"{floor})"
+              + (" — will retire as soon as they fall idle"
+                 if self._release_pending else ""), flush=True)
         return {"terminated": terminated, "draining": draining, "kept": kept,
-                "floor": need}
+                # `needed` is demand; `floor` is configuration. Reporting demand
+                # AS "floor" read as though the operator had asked for the pod,
+                # which is the opposite of what it meant.
+                "needed": need, "floor": floor,
+                "retire_when_idle": self._release_pending}
 
     def _scale_down(self, now: float) -> None:
         """Retire one surplus pod per pass, once the surplus has persisted.
@@ -2992,6 +3057,11 @@ class RunpodPodPool:
                       f"({schedule_state(self.mcfg).get('window')}) — warm floor 0",
                       flush=True)
                 self._sched_closed_logged = True
+        elif self._release_pending:
+            # A client asked for the fleet back while it was busy. Hold nothing
+            # once the work drains — the same "do not wait out the timeout"
+            # treatment a closed schedule window gets, for the same reason.
+            idle_to = min(idle_to, 1) if idle_to else 1
         else:
             self._sched_closed_logged = False
         with self._cv:
@@ -3009,6 +3079,8 @@ class RunpodPodPool:
         # Keep min_pods warm.
         with self._cv:
             healthy_n = len([p for p in self.pods if p.healthy])
+            if self._release_pending and healthy_n <= keep_min:
+                self._release_pending = False          # satisfied
         if healthy_n < keep_min and not self._closed and not self._provisioning:
             # One already on the way (from here, from ensure_ready, or from a
             # sibling engine sharing this pool) is one pod, not none: topping up

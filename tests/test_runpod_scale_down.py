@@ -362,3 +362,62 @@ def test_the_surplus_timer_is_reset_so_the_next_pass_starts_clean():
     pool._surplus_since = 123.0
     pool.shed_now()
     assert pool._surplus_since == 0.0
+
+
+# ------------------------------- a release that could not be honoured is kept #
+# A client asked for the fleet back while a page was still being read. The pods
+# could not go yet — correctly, work is never dropped to save money — but the
+# intent was then LOST: the pool fell back to idle_timeout_s (900s on the Digesta
+# orchestrator) and billed for a fleet nobody had asked to keep. Seen live:
+# "0 terminated, 0 draining, 1 kept", and the pod was still there four minutes
+# later with nothing running on it.
+
+
+def test_a_release_blocked_by_work_is_remembered():
+    pool = _pool(threshold=10, pods=[_pod("busy", 2)])
+    out = pool.shed_now()
+    assert out["kept"] == 1
+    assert out["retire_when_idle"] is True
+    assert pool._release_pending is True
+
+
+def test_demand_is_reported_as_demand_not_as_a_floor():
+    """The log and the reply said "floor 1" when the 1 came from work in flight,
+    which reads as though the operator had asked for the pod."""
+    pool = _pool(threshold=10, min_pods=0, pods=[_pod("busy", 2)])
+    out = pool.shed_now()
+    assert out["needed"] == 1          # demand
+    assert out["floor"] == 0           # configuration
+
+
+def test_nothing_is_remembered_when_the_release_fully_succeeded():
+    pool = _pool(pods=[_pod("idle", 0)])
+    out = pool.shed_now()
+    assert out["retire_when_idle"] is False
+    assert pool._release_pending is False
+
+
+def test_asking_for_pods_again_cancels_the_pending_release():
+    """The client changed its mind; retiring what it just asked for is absurd."""
+    pool = _pool(threshold=10, pods=[_pod("busy", 2)])
+    pool.shed_now()
+    assert pool._release_pending is True
+    pool.set_client_floor(2)
+    assert pool._release_pending is False
+
+
+def test_releasing_to_zero_leaves_the_intent_standing():
+    pool = _pool(threshold=10, pods=[_pod("busy", 2)])
+    pool.shed_now()
+    pool.set_client_floor(0)
+    assert pool._release_pending is True
+
+
+def test_a_pending_release_collapses_the_idle_timeout():
+    """The mechanism: the pod is retired as soon as it falls idle instead of
+    waiting out idle_timeout_s — the same treatment a closed schedule window
+    already gets, for the same reason."""
+    import inspect
+    src = inspect.getsource(rw.RunpodPodPool.maintain)
+    assert "elif self._release_pending:" in src
+    assert "idle_to = min(idle_to, 1)" in src

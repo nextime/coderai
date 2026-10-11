@@ -785,8 +785,16 @@ is inferring from a momentary reading and a cold pod costs minutes to replace. A
 client that has just finished a batch is not inferring — it knows no more work is
 coming — so for that call the window and the one-per-pass limit are both skipped,
 and the reply says what happened: `{"terminated": [...], "draining": [...],
-"kept": N, "floor": N}`. It still cannot scale through the operator's `min_pods`,
-and a pod with requests on it drains rather than dying under them.
+"kept": N, "needed": N, "floor": N, "retire_when_idle": bool}`. `needed` is what
+the work in flight still requires; `floor` is what the configuration keeps warm —
+two different reasons a pod survived, and worth telling apart when you are asking
+why one did.
+
+It still cannot scale through the operator's `min_pods`, and a pod with requests
+on it drains rather than dying under them. **The intent is remembered**: if the
+release could not be honoured because pods were working, `retire_when_idle` comes
+back true and those pods are retired the moment they fall idle, rather than
+waiting out `idle_timeout_s`. Asking for warm pods again cancels it.
 
 **Which surplus pod goes.** By default the least loaded, and among equals the one
 used least recently — its prefix cache is the coldest, so retiring it throws away
