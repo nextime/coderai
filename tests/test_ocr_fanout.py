@@ -258,9 +258,9 @@ def test_the_engine_url_is_what_surya_can_attach_to(monkeypatch):
     monkeypatch.setenv("CODERAI_SELF_BASE", "http://127.0.0.1:8777")
     token = gateway.issue("m", "m")
     url = gateway.engine_url(token)
-    assert url == f"http://127.0.0.1:8777/v1/ocr/engine/{token}/v1"
+    assert url == f"http://127.0.0.1:8777/v1/ocr/attach/{token}/v1"
     assert url.endswith("/v1")
-    assert url[: -len("/v1")] == f"http://127.0.0.1:8777/v1/ocr/engine/{token}"
+    assert url[: -len("/v1")] == f"http://127.0.0.1:8777/v1/ocr/attach/{token}"
 
 
 def test_a_lease_is_a_credential_and_nothing_else():
@@ -299,7 +299,7 @@ def test_model_mode_hands_the_engine_the_gateway(monkeypatch):
     monkeypatch.setattr(served_model, "_fanout_enabled", lambda: True)
     _fixed_candidates(monkeypatch, [_cand("node:a")])
     base, key, served = served_model.endpoint_for("datalab-to/surya-ocr-2")
-    assert "/v1/ocr/engine/" in base and base.endswith("/v1")
+    assert "/v1/ocr/attach/" in base and base.endswith("/v1")
     assert gateway.token_is_valid(key)
     assert served == "datalab-to/surya-ocr-2"
 
@@ -565,9 +565,9 @@ def test_a_probe_with_no_headers_at_all_gets_through(monkeypatch):
     _reset()
     monkeypatch.setenv("CODERAI_API_TOKEN", "some-api-token")
     token = gateway.issue("m", "m")
-    assert _through_bearer_gate(f"/v1/ocr/engine/{token}/health")
-    assert _through_bearer_gate(f"/v1/ocr/engine/{token}/v1/models")
-    assert _through_bearer_gate(f"/v1/ocr/engine/{token}/v1/chat/completions",
+    assert _through_bearer_gate(f"/v1/ocr/attach/{token}/health")
+    assert _through_bearer_gate(f"/v1/ocr/attach/{token}/v1/models")
+    assert _through_bearer_gate(f"/v1/ocr/attach/{token}/v1/chat/completions",
                                 {"authorization": f"Bearer {token}"})
 
 
@@ -577,16 +577,16 @@ def test_a_forged_lease_is_not_a_way_in(monkeypatch):
     _reset()
     monkeypatch.setenv("CODERAI_API_TOKEN", "some-api-token")
     gateway.issue("m", "m")
-    assert not _through_bearer_gate("/v1/ocr/engine/forged/health")
+    assert not _through_bearer_gate("/v1/ocr/attach/forged/health")
 
 
 def test_a_revoked_lease_stops_working(monkeypatch):
     _reset()
     monkeypatch.setenv("CODERAI_API_TOKEN", "some-api-token")
     token = gateway.issue("m", "m")
-    assert _through_bearer_gate(f"/v1/ocr/engine/{token}/health")
+    assert _through_bearer_gate(f"/v1/ocr/attach/{token}/health")
     gateway.revoke("m")
-    assert not _through_bearer_gate(f"/v1/ocr/engine/{token}/health")
+    assert not _through_bearer_gate(f"/v1/ocr/attach/{token}/health")
 
 
 def test_the_lease_does_not_unlock_the_rest_of_the_api(monkeypatch):
@@ -622,9 +622,9 @@ def test_the_engine_reaches_an_engine_only_process(monkeypatch):
         sent.append(msg)
 
     # No internal header, as the OCR worker sends it.
-    asyncio.run(mw({"type": "http", "path": f"/v1/ocr/engine/{token}/health",
+    asyncio.run(mw({"type": "http", "path": f"/v1/ocr/attach/{token}/health",
                     "headers": []}, None, _send))
-    assert reached == [f"/v1/ocr/engine/{token}/health"]
+    assert reached == [f"/v1/ocr/attach/{token}/health"]
 
     # Everything else is still refused without the header.
     reached.clear()
@@ -895,3 +895,34 @@ def test_the_catalogue_does_not_leak_where_the_model_runs():
     blob = repr(mgr.engine_catalogue())
     for leak in ("runpod", "pod", "node", "127.0.0.1", "http"):
         assert leak not in blob.lower()
+
+
+def test_the_public_engines_endpoint_is_not_covered_by_the_lease_exemption(monkeypatch):
+    """`/v1/ocr/engines` is a normal, authenticated API route. The lease exemption
+    covers `/v1/ocr/attach/` only — which is why the gateway does NOT live under
+    `/v1/ocr/engine*`, one keystroke from it."""
+    _reset()
+    monkeypatch.setenv("CODERAI_API_TOKEN", "some-api-token")
+    gateway.issue("m", "m")
+    assert not _through_bearer_gate("/v1/ocr/engines")
+    assert gateway.PREFIX == "/v1/ocr/attach"
+
+
+def test_the_internal_gate_exempts_only_the_attach_prefix(monkeypatch):
+    import asyncio
+    from codai.api.app import _InternalAuthMiddleware
+    monkeypatch.setenv("CODERAI_INTERNAL_TOKEN", "internal-secret")
+    reached = []
+
+    async def _inner(scope, receive, send):
+        reached.append(scope["path"])
+
+    mw = _InternalAuthMiddleware(_inner)
+
+    async def _send(msg):
+        pass
+
+    for path in ("/v1/ocr/engines", "/v1/ocr", "/v1/ocr/engine-stats"):
+        reached.clear()
+        asyncio.run(mw({"type": "http", "path": path, "headers": []}, None, _send))
+        assert reached == [], f"{path} must still require the internal token"

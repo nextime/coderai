@@ -117,10 +117,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # httpx GET (see surya/inference/backends/spawn.py) and refuses to attach
         # at all if /health is not 200. A bearer is still accepted and still has
         # to be a valid lease — it is what its chat requests send.
-        if path.startswith("/v1/ocr/engine/"):
+        if path.startswith("/v1/ocr/attach/"):
             try:
                 from codai.ocr.gateway import token_is_valid
-                lease_tok = path[len("/v1/ocr/engine/"):].split("/", 1)[0]
+                lease_tok = path[len("/v1/ocr/attach/"):].split("/", 1)[0]
                 if token_is_valid(lease_tok):
                     return await call_next(request)
             except Exception:

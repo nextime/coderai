@@ -264,7 +264,7 @@ class _InternalAuthMiddleware:
             # would like it to. The path is not open: every route under it demands
             # a live lease (codai.ocr.gateway), a secret minted per attachment and
             # held only in memory, and BearerAuthMiddleware checks it too.
-            if str(scope.get("path", "")).startswith("/v1/ocr/engine/"):
+            if str(scope.get("path", "")).startswith("/v1/ocr/attach/"):
                 await self._app(scope, receive, send)
                 return
             headers = dict(scope.get("headers", []))

@@ -41,9 +41,11 @@ from fastapi.responses import JSONResponse, Response
 router = APIRouter()
 
 #: Path the engine attaches under. The OpenAI base it is given is
-#: ``<self>/v1/ocr/engine/<lease>/v1`` so that stripping ``/v1`` — which is how
-#: surya derives the health URL — lands on ``<self>/v1/ocr/engine/<lease>``.
-PREFIX = "/v1/ocr/engine"
+#: ``<self>/v1/ocr/attach/<lease>/v1`` so that stripping ``/v1`` — which is how
+#: surya derives the health URL — lands on ``<self>/v1/ocr/attach/<lease>``.
+#: Deliberately not under ``/v1/ocr/engine*``: the auth gates exempt this prefix,
+#: and it must not be one keystroke from the public ``/v1/ocr/engines``.
+PREFIX = "/v1/ocr/attach"
 
 #: How long one page may take upstream. A dense scan on a cold pod legitimately
 #: takes minutes; a timeout here would look to the engine like a failed page.
