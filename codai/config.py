@@ -990,12 +990,10 @@ class OcrConfig:
     # forwards each request — byte for byte, deciding nothing — to the least busy
     # of the local server, the cluster nodes holding the model, and the pod pool.
     # Turn it off to go back to one direct address (one pod, no growth).
+    # How busy is too busy comes from the MODEL (its own
+    # `scale_up_inflight_per_pod`), not from here — one knob per model, already on
+    # the model page, instead of a second OCR-shaped copy of it.
     serve_fanout: bool = True
-    # In-flight requests at which a FIXED server (local, or a cluster node) is
-    # considered busy enough to rent instead: the local-plus-spillover policy, in
-    # the one place an attached OCR engine can act on it. 0 = never rent on load
-    # alone (a pool is then used only when there is nothing else).
-    serve_spill_inflight: int = 4
 
     # --- olmOCR-2 (AllenAI, Apache-2.0) --- a document VLM: whole-page transcription in
     # reading order, equations as LaTeX, tables as HTML, no bounding boxes. Driven over an
@@ -1632,7 +1630,6 @@ class ConfigManager:
                 "surya_model_id": self.config.ocr.surya_model_id,
                 "surya_server_url": self.config.ocr.surya_server_url,
                 "serve_fanout": self.config.ocr.serve_fanout,
-                "serve_spill_inflight": self.config.ocr.serve_spill_inflight,
                 "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
                 "evict_drain_timeout_s": self.config.ocr.evict_drain_timeout_s,
                 "vlm_gpu_memory_utilization": self.config.ocr.vlm_gpu_memory_utilization,

@@ -353,9 +353,9 @@ class OlmOcrEngine(OcrEngine):
         """
         model_id = (getattr(self.cfg, "olmocr_model_id", "") or "").strip()
         try:
-            from codai.ocr import dispatch
-            spill = int(getattr(self.cfg, "serve_spill_inflight", 0) or 0)
-            lease = dispatch.choose(model_id, spill_after=spill)
+            from codai.models import placement
+            lease = placement.choose(
+                model_id, spill_after=placement.spill_threshold(model_id))
         except Exception:
             return self._ask_local(messages, max_tokens, temperature)
         try:

@@ -347,13 +347,19 @@ def test_a_proxy_forwards_the_schema_it_was_given():
 
 
 # ------------------------------------------------------------- the three places
-def _cluster(monkeypatch, nodes, listing, enabled=True, token="clustertok"):
-    """Stand in for the cluster config and the nodes' own catalogues."""
+def _cluster(monkeypatch, nodes, listing, enabled=True, token="clustertok",
+             pin=None, model="m"):
+    """Stand in for the cluster config, the model entry and the nodes' catalogues.
+
+    ``pin`` is the model entry's ``engine`` — what makes a node eligible at all.
+    """
     import types as _t
 
     cfg = _t.SimpleNamespace(cluster=_t.SimpleNamespace(enabled=enabled, token=token))
+    entries = [{"id": model, **({"engine": pin} if pin else {})}]
     monkeypatch.setitem(sys.modules, "codai.admin.routes",
-                        _t.SimpleNamespace(config_manager=_t.SimpleNamespace(config=cfg)))
+                        _t.SimpleNamespace(config_manager=_t.SimpleNamespace(
+                            config=cfg, models_data={"text_models": entries})))
 
     class _Reply:
         def __init__(self, ids):
@@ -401,11 +407,14 @@ def test_a_model_held_by_a_cluster_node_is_found(monkeypatch):
     Which node serves a given page is now decided per request by load
     (codai.ocr.dispatch), so this asserts the discovery: the node that holds the
     model is a candidate, carrying the shared cluster token."""
-    from codai.ocr import dispatch
+    from codai.models import placement as dispatch
+    from codai.models import placement as dispatch
     dispatch.forget()
     _models_layer(monkeypatch)
     nodes = [_Node("alpha", "https://a.lan:8443"), _Node("beta", "https://b.lan:8443")]
     _cluster(monkeypatch, nodes, {"alpha": ["qwen"], "beta": ["datalab-to/surya-ocr-2"]})
+    _cluster(monkeypatch, nodes, {"alpha": ["qwen"], "beta": ["datalab-to/surya-ocr-2"]},
+             pin="beta", model="datalab-to/surya-ocr-2")
     cands = dispatch._node_candidates("datalab-to/surya-ocr-2")
     assert [c.base for c in cands] == ["https://b.lan:8443/v1"]
     assert cands[0].api_key == "clustertok"   # shared token fills a blank node key
@@ -413,31 +422,67 @@ def test_a_model_held_by_a_cluster_node_is_found(monkeypatch):
 
 def test_every_node_that_holds_it_is_a_candidate_not_just_the_first(monkeypatch):
     """The first node that answered used to win for ever, however busy it got."""
-    from codai.ocr import dispatch
+    from codai.models import placement as dispatch
+    from codai.models import placement as dispatch
     dispatch.forget()
     _models_layer(monkeypatch)
     nodes = [_Node("alpha", "https://a.lan:8443"), _Node("beta", "https://b.lan:8443")]
-    _cluster(monkeypatch, nodes, {"alpha": ["m"], "beta": ["m"]})
+    _cluster(monkeypatch, nodes, {"alpha": ["m"], "beta": ["m"]}, pin="alpha, beta")
     assert len(dispatch._node_candidates("m")) == 2
 
 
 def test_a_node_that_does_not_answer_is_skipped_not_fatal(monkeypatch):
-    from codai.ocr import dispatch
+    from codai.models import placement as dispatch
+    from codai.models import placement as dispatch
     dispatch.forget()
     _models_layer(monkeypatch)
     nodes = [_Node("down", "https://d.lan:8443"), _Node("up", "https://u.lan:8443")]
-    _cluster(monkeypatch, nodes, {"down": None, "up": ["m"]})
+    _cluster(monkeypatch, nodes, {"down": None, "up": ["m"]}, pin="down, up")
     assert [c.base for c in dispatch._node_candidates("m")] == ["https://u.lan:8443/v1"]
 
 
 def test_the_nodes_are_not_asked_when_clustering_is_off(monkeypatch):
     """Probing every configured node on an install that does not cluster would add a
     timeout to the first page of every document."""
-    from codai.ocr import dispatch
+    from codai.models import placement as dispatch
+    from codai.models import placement as dispatch
     dispatch.forget()
     _models_layer(monkeypatch)
     _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")],
-             {"alpha": ["m"]}, enabled=False)
+             {"alpha": ["m"]}, enabled=False, pin="alpha")
+    assert dispatch._node_candidates("m") == []
+
+
+def test_a_node_is_never_used_unless_the_model_is_pinned_to_it(monkeypatch):
+    """Asking every node what it holds, and using whoever answers, is
+    configuration by probe: it puts work on a machine nobody chose and moves it
+    the moment a different node replies first. A node serves a model because the
+    operator pinned the model to it — the same `engine` pin the front router
+    already treats as a hard constraint."""
+    from codai.models import placement as dispatch
+    dispatch.forget()
+    _models_layer(monkeypatch)
+    _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")], {"alpha": ["m"]})
+    assert dispatch._node_candidates("m") == []
+
+
+def test_a_pin_to_one_node_does_not_enlist_the_others(monkeypatch):
+    from codai.models import placement as dispatch
+    dispatch.forget()
+    _models_layer(monkeypatch)
+    nodes = [_Node("alpha", "https://a.lan:8443"), _Node("beta", "https://b.lan:8443")]
+    _cluster(monkeypatch, nodes, {"alpha": ["m"], "beta": ["m"]}, pin="beta")
+    assert [c.base for c in dispatch._node_candidates("m")] == ["https://b.lan:8443/v1"]
+
+
+def test_a_pinned_node_that_does_not_hold_the_model_is_not_invented(monkeypatch):
+    """Better an honest "nothing serves this" than pages sent to a node that
+    cannot read them."""
+    from codai.models import placement as dispatch
+    dispatch.forget()
+    _models_layer(monkeypatch)
+    _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")], {"alpha": ["other"]},
+             pin="alpha")
     assert dispatch._node_candidates("m") == []
 
 
@@ -448,7 +493,7 @@ def test_runpod_wins_over_a_node_that_also_lists_it(monkeypatch):
     Load-aware picking must not quietly repeal that: a pool that is the model's
     configured home is marked primary and is taken first, even though a node is
     the cheaper hop and would otherwise win on load."""
-    from codai.ocr import dispatch
+    from codai.models import placement as dispatch
     dispatch.forget()
     pool_taken = []
 

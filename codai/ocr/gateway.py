@@ -122,8 +122,8 @@ async def health(token: str):
     got = lease(token)
     if got is None:
         return _unknown_lease()
-    from codai.ocr import dispatch
-    if not dispatch.any_candidate(got["model_id"]):
+    from codai.models import placement
+    if not placement.any_candidate(got["model_id"]):
         return JSONResponse(status_code=503,
                             content={"error": {"message": "no server for "
                                                           + got["model_id"]}})
@@ -165,14 +165,15 @@ async def chat_completions(token: str, request: Request):
 
     import httpx
 
-    from codai.admin.routes import config_manager
-    from codai.ocr import dispatch
+    from codai.models import placement
     body = await request.body()
-    ocfg = getattr(getattr(config_manager, "config", None), "ocr", None)
-    spill_after = int(getattr(ocfg, "serve_spill_inflight", 0) or 0)
 
     try:
-        chosen = dispatch.choose(got["model_id"], spill_after=spill_after)
+        # How busy is too busy is the MODEL's own setting, the same one the pool
+        # scales on — not a second, OCR-shaped copy of it.
+        chosen = placement.choose(
+            got["model_id"],
+            spill_after=placement.spill_threshold(got["model_id"]))
     except Exception as exc:
         status = int(getattr(exc, "status", 503) or 503)
         return JSONResponse(status_code=status,

@@ -2,32 +2,40 @@
 # Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
 # GPLv3 - see the project LICENSE.
 
-"""Which server should serve THIS OCR page — asked once per request.
+"""Where should a request for this model run — asked per request, for any model.
 
-:mod:`codai.ocr.served_model` answers "where is this model served" once and hands
-the answer to the OCR engine, which then speaks to that one address for as long as
-it lives. That is the right shape for fidelity (the engine drives the server
-directly, so nothing rewrites its images, its json_schema or its logprobs) and the
-wrong shape for load:
+A caller names a model. Where it runs is coderai's business, and the answer comes
+from how the model is configured: on this machine, on a cluster node it is pinned
+to, on a rented pod, or on this machine until it is busy and then a rented pod.
+Nothing about that is specific to one kind of model or one endpoint.
+
+For requests that pass THROUGH coderai this has always been true — the front
+router honours the model's ``engine`` pin, treats a cluster node as an engine by
+name, reaches RunPod through the model's backend, and bursts to a pod when the
+model says to. This module is the same decision for a caller that cannot go
+through that path: a component that must hold an OpenAI **address** and speak to
+the model itself.
+
+OCR is why it exists. Surya-2 and olmOCR are pipelines, not models: they drive a
+model server directly, sending multipart images, a strict ``json_schema`` and
+``logprobs: true`` — all three of which were silently dropped the last time OCR
+went through the backend abstraction, which parses a request and re-emits it. So
+the pipeline keeps its direct address, and :mod:`codai.ocr.gateway` makes that
+address ours and forwards the bytes unchanged. What it cannot do is choose, and
+choosing is what this module does:
 
 * a RunPod pool grows when its least-loaded pod reaches
-  ``scale_up_inflight_per_pod`` in-flight requests, and in-flight is counted in
-  :meth:`RunpodBackend._acquire_endpoint`. An attached engine never goes through
-  it, so the pool saw zero load however hard OCR was running, never grew, and the
-  engine would not have used a second pod anyway — it had one URL;
-* a model served on several cluster nodes resolved to whichever node answered
-  first, for ever, however busy that node became;
-* a local model that was configured to burst to RunPod under load never did: the
-  spillover trigger lives on the proxy path the engine bypasses.
+  ``scale_up_inflight_per_pod`` in-flight requests, counted as a request passes
+  through the pool. A caller holding one pod's URL never passed through, so the
+  pool saw no load however hard it was driven — and had the caller wanted a
+  second pod, it had no address for one;
+* a model pinned to several cluster nodes went to whichever answered first, for
+  ever, however busy that node became;
+* a local model configured to burst to RunPod under load never did: that trigger
+  lives on the proxy path such a caller bypasses.
 
-So the engine is given a stable address that belongs to US, and this module picks
-the upstream per request: the least loaded of the local server, the cluster nodes
-that hold the model, and the pod pool — borrowing a pod through
-:meth:`PodPool.acquire` so the pool sees the real concurrency and grows on it.
-
-The fidelity argument survives because :mod:`codai.ocr.gateway` forwards bytes.
-The earlier losses came from coderai *parsing* a request and re-emitting it through
-the backend abstraction; a hop that copies the body verbatim decides nothing.
+Any future component that needs "an endpoint for model X, placed as configured"
+should ask here rather than grow its own answer.
 """
 
 import threading
@@ -162,13 +170,53 @@ def _local_candidate(model_id: str) -> Optional[Candidate]:
                      base=base.rstrip("/") + "/v1", priority=0, primary=True)
 
 
-def _node_candidates(model_id: str) -> List[Candidate]:
-    """Every enabled cluster node whose own catalogue lists the model.
+def model_entry(model_id: str) -> dict:
+    """The model's own entry in models.json, or {}."""
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", {}) or {}
+        for lst in md.values():
+            if not isinstance(lst, list):
+                continue
+            for m in lst:
+                if isinstance(m, dict) and str(m.get("id") or "") == model_id:
+                    return m
+    except Exception:
+        return {}
+    return {}
 
-    All of them, not the first one that answers: which node serves a given page
-    is decided per request, by load.
+
+def _pinned_engines(model_id: str) -> set:
+    """The engines this model is PINNED to, lower-cased, or an empty set.
+
+    ``engine`` on a model entry is what the front router already treats as a hard
+    constraint — the model runs there or not at all. A cluster node is an engine
+    by that name, so this is also how an operator says "serve it on box2".
+    """
+    pin = str((model_entry(model_id) or {}).get("engine") or "").strip().lower()
+    if not pin:
+        return set()
+    # A comma-separated pin names several (so OCR can spread over them); the
+    # front treats the whole string as one engine name, so a single pin — the
+    # common case — behaves identically in both places.
+    return {part.strip() for part in pin.split(",") if part.strip()}
+
+
+def _node_candidates(model_id: str) -> List[Candidate]:
+    """The cluster nodes this model is PINNED to, that do hold it.
+
+    Nodes are never discovered. Asking every node what it has, and using whoever
+    answered, is configuration by probe: it would send pages to a machine nobody
+    chose, and silently move them when a different node happened to reply first.
+    A node serves OCR because the operator pinned the model to it.
+
+    All the pinned ones are returned, not the first that answers: which of them
+    takes a given page is decided per request, by load.
     """
     out: List[Candidate] = []
+    pinned = _pinned_engines(model_id)
+    if not pinned:
+        return out
     try:
         from codai.admin.routes import config_manager
         from codai.cluster.nodes import enabled_nodes, sync_client
@@ -177,6 +225,8 @@ def _node_candidates(model_id: str) -> List[Candidate]:
             return out
         token = (getattr(ccfg, "token", "") or "").strip()
         for spec in enabled_nodes(ccfg):
+            if str(getattr(spec, "name", "") or "").strip().lower() not in pinned:
+                continue
             if token and not spec.api_key:
                 spec.api_key = token
             root = spec.url.rstrip("/")
@@ -195,7 +245,13 @@ def _node_candidates(model_id: str) -> List[Candidate]:
             if model_id in ids:
                 out.append(Candidate(key=f"node:{spec.name or root}", kind="node",
                                      base=base, api_key=spec.api_key, priority=1,
-                                     node_url=root))
+                                     node_url=root, primary=True))
+            else:
+                # Pinned to a node that does not hold it: say so, rather than
+                # quietly serving the page from somewhere the operator did not
+                # choose (or renting a card for it).
+                print(f"[ocr] {model_id!r} is pinned to node {spec.name!r}, which "
+                      f"does not list it — skipping that node", flush=True)
     except Exception:
         return out
     return out
@@ -239,16 +295,8 @@ def _spill_pod_candidate(model_id: str) -> Optional[Candidate]:
     try:
         from codai.admin.routes import config_manager
         from codai.api.runpod_worker import (get_model_pod_pool, parse_model_runpod)
-        md = getattr(config_manager, "models_data", {}) or {}
-        entry = None
-        for lst in md.values():
-            if not isinstance(lst, list):
-                continue
-            for m in lst:
-                if isinstance(m, dict) and str(m.get("id") or "") == model_id:
-                    entry = m
-                    break
-        if entry is None:
+        entry = model_entry(model_id)
+        if not entry:
             return None
         sp = entry.get("runpod_spillover")
         if not isinstance(sp, dict) or not sp.get("enabled"):
@@ -415,6 +463,32 @@ def _take(cand: Candidate) -> Optional[Lease]:
         return None
     _inc(cand.key)
     return Lease(base, key, cand.key, cand.kind, release)
+
+
+def spill_threshold(model_id: str) -> int:
+    """In-flight requests at which a server we own is busy enough to rent instead.
+
+    This is the model's own ``scale_up_inflight_per_pod`` — the number already
+    configured, per model, to mean "one server should not hold more than this
+    before another is needed". Reusing it keeps one knob per model instead of a
+    parallel OCR-shaped one, and it is already in the model page.
+
+    0 when the model has no RunPod block to burst to: nothing to rent, so load
+    alone never changes where a page goes.
+    """
+    entry = model_entry(model_id)
+    for block in (entry.get("runpod"),
+                  (entry.get("runpod_spillover") or {}).get("target")):
+        if isinstance(block, dict):
+            try:
+                n = int(block.get("scale_up_inflight_per_pod") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                return n
+            if block is entry.get("runpod") or block:
+                return 4          # the documented default for a pool that exists
+    return 0
 
 
 def any_candidate(model_id: str) -> bool:

@@ -1205,10 +1205,9 @@
     </div>
 
     <div class="card-title" style="font-size:13px;margin-top:.4rem">Scaling in <b>Model</b> mode <span class="muted" style="font-weight:400">(both VLM engines)</span></div>
-    <p class="form-hint" style="margin:0 0 .4rem">In <b>Model</b> mode the OCR engine drives the model server itself, which is what keeps its page images, strict JSON schema and <b>confidence scores</b> intact. <b>Spread the load</b> gives it one address here instead, forwarded per request — unchanged, byte for byte — to the least busy of: this machine's server, the cluster nodes that hold the model, and the RunPod pool. Without it the engine pins to a single pod, and the pool never sees the load so it never grows.</p>
+    <p class="form-hint" style="margin:0 0 .4rem">In <b>Model</b> mode the OCR engine drives the model server itself, which is what keeps its page images, strict JSON schema and <b>confidence scores</b> intact. <b>Spread the load</b> gives it one address here instead, forwarded per request — unchanged, byte for byte — to wherever that model is configured to run: this machine, the cluster node it is pinned to, or its RunPod pool, whichever is least busy. Without it the engine pins to a single pod, and the pool never sees the load so it never grows. <b>Where</b> a model runs, and how busy is too busy (<code>scale_up_inflight_per_pod</code>), are set per model on the <a href="/admin/models">Models</a> page — the same settings every other request already follows.</p>
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-serve-fanout"><span>Spread the load across servers</span></label>
-      <div class="form-group" style="flex:1;min-width:200px"><label class="form-label">Rent when busier than <span class="muted">(requests in flight; 0 = never on load)</span></label><input type="number" id="s-ocr-serve-spill" class="form-input" min="0" placeholder="4"></div>
     </div>
 
     <div class="card-title" style="font-size:13px;margin-top:.4rem">olmOCR-2 <span class="muted" style="font-weight:400">(document VLM)</span></div>
@@ -2145,7 +2144,6 @@ async function loadSettings(){
     document.getElementById('s-ocr-surya-model-id').value = ocr.surya_model_id ?? '';
     document.getElementById('s-ocr-surya-server-url').value = ocr.surya_server_url ?? '';
     document.getElementById('s-ocr-serve-fanout').checked = ocr.serve_fanout !== false;
-    document.getElementById('s-ocr-serve-spill').value = ocr.serve_spill_inflight ?? 4;
     document.getElementById('s-ocr-olmocr-enabled').checked = !!ocr.olmocr_enabled;
     document.getElementById('s-ocr-olmocr-serve').value = ocr.olmocr_serve ?? 'model';
     document.getElementById('s-ocr-olmocr-instances').value = ocr.olmocr_instances ?? 1;
@@ -2398,7 +2396,6 @@ async function saveSettings(silent){
       surya_model: document.getElementById('s-ocr-surya-model').value.trim(),
       surya_model_id: document.getElementById('s-ocr-surya-model-id').value.trim(),
       serve_fanout: document.getElementById('s-ocr-serve-fanout').checked,
-      serve_spill_inflight: parseInt(document.getElementById('s-ocr-serve-spill').value || '4', 10),
       surya_server_url: document.getElementById('s-ocr-surya-server-url').value.trim(),
       olmocr_enabled: document.getElementById('s-ocr-olmocr-enabled').checked,
       olmocr_serve: document.getElementById('s-ocr-olmocr-serve').value || 'model',

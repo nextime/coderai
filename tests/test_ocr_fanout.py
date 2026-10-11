@@ -27,7 +27,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from codai.ocr import dispatch, gateway                            # noqa: E402
+from codai.models import placement as dispatch
+from codai.ocr import gateway                            # noqa: E402
 from codai.ocr.base import OcrError                                # noqa: E402
 
 
@@ -632,3 +633,79 @@ def test_the_engine_reaches_an_engine_only_process(monkeypatch):
     assert reached == []
     assert any(m.get("status") == 403 for m in sent if m.get("type")
                == "http.response.start")
+
+
+# ------------------------------------------------- seamless from the client in #
+# A client asks for OCR with a model it has heard of — the id it sees in
+# /v1/models — and should not have to know that we read pages with it by driving
+# a pipeline called "surya", nor where that model is currently running.
+
+
+def _mgr(**ocr):
+    import types
+    from codai.ocr.manager import OcrManager
+    mgr = OcrManager.__new__(OcrManager)
+    fields = dict(default_engine="paddle", surya_model_id="", surya_model="",
+                  olmocr_model_id="", olmocr_model="", surya_enabled=True,
+                  surya_accept_license=True, olmocr_enabled=True,
+                  olmocr_accept_license=True, enabled=True)
+    fields.update(ocr)
+    cfg = types.SimpleNamespace(**fields)
+    mgr._require_cfg = lambda: cfg
+    return mgr
+
+
+def test_a_client_can_name_the_model_instead_of_the_engine():
+    mgr = _mgr(surya_model_id="datalab-to/surya-ocr-2")
+    assert mgr.resolve_engine("datalab-to/surya-ocr-2") == "surya"
+
+
+def test_the_olmocr_checkpoint_names_olmocr():
+    mgr = _mgr(olmocr_model_id="allenai/olmOCR-2-7B-1025-FP8")
+    assert mgr.resolve_engine("allenai/olmOCR-2-7B-1025-FP8") == "olmocr"
+
+
+def test_naming_the_engine_still_works():
+    """The existing clients say "surya", and must keep working unchanged."""
+    mgr = _mgr(surya_model_id="datalab-to/surya-ocr-2")
+    assert mgr.resolve_engine("surya") == "surya"
+
+
+def test_the_checkpoint_field_counts_too_not_only_the_model_id():
+    """An install serving surya locally sets surya_model, not surya_model_id."""
+    mgr = _mgr(surya_model="datalab-to/surya-ocr-2")
+    assert mgr.resolve_engine("datalab-to/surya-ocr-2") == "surya"
+
+
+def test_a_model_we_do_not_read_pages_with_is_still_a_clear_400():
+    from codai.ocr.base import OcrError
+    mgr = _mgr(surya_model_id="datalab-to/surya-ocr-2")
+    try:
+        mgr.resolve_engine("meta-llama/Llama-3.3-70B")
+    except OcrError as exc:
+        assert exc.status == 400
+        assert "engines:" in str(exc)
+    else:
+        raise AssertionError("expected an OcrError")
+
+
+# ------------------------------------- how busy is too busy is the MODEL's own #
+def test_the_spill_threshold_comes_from_the_model(monkeypatch):
+    """Not from a second OCR-shaped copy of a number the model already carries."""
+    from codai.models import placement
+    monkeypatch.setattr(placement, "model_entry",
+                        lambda m: {"id": m, "runpod": {"scale_up_inflight_per_pod": 9}})
+    assert placement.spill_threshold("m") == 9
+
+
+def test_a_pool_with_no_threshold_set_uses_the_documented_default(monkeypatch):
+    from codai.models import placement
+    monkeypatch.setattr(placement, "model_entry", lambda m: {"id": m, "runpod": {}})
+    assert placement.spill_threshold("m") == 4
+
+
+def test_a_model_with_nothing_to_rent_never_spills_on_load(monkeypatch):
+    """No RunPod block means no pod to burst to, so load alone cannot move a page."""
+    from codai.models import placement
+    monkeypatch.setattr(placement, "model_entry", lambda m: {"id": m})
+    assert placement.spill_threshold("m") == 0

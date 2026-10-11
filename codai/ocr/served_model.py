@@ -186,8 +186,9 @@ def _fanout_endpoint(model_id: str):
     The served name is resolved the same way as for a direct attachment, because the
     engine checks it against its own checkpoint before sending a single page.
     """
-    from codai.ocr import dispatch, gateway
-    cands = dispatch.candidates(model_id)
+    from codai.models import placement
+    from codai.ocr import gateway
+    cands = placement.candidates(model_id)
     if not cands:
         return None
     served = model_id

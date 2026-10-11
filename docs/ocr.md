@@ -313,17 +313,32 @@ address of coderai's own, and each request is forwarded — **verbatim**, body b
 in and body bytes out, so nothing is decided about it — to whichever server is
 least busy:
 
-| the model is… | a page goes to |
+| the model is configured… | a page goes to |
 |---|---|
 | `backend: runpod` | the pool, every request: it picks the least-loaded pod and rents another when they are all at the threshold |
-| served on this machine | the local server, until it is busier than `ocr.serve_spill_inflight`, then a pod (the burst `runpod_spillover` describes) |
-| held by cluster nodes | the least busy of them, counting what each node reports for its **whole** install, so a node loaded with other work is left alone |
-| several of these at once | its configured home first — an explicit `backend` is a decision, not a hint — then the rest as overflow |
+| to run on this machine | the local server, until it is busier than the model's own `scale_up_inflight_per_pod`, then a pod (the burst `runpod_spillover` describes) |
+| pinned to cluster nodes (`engine`) | the least busy of them, counting what each node reports for its **whole** install, so a node loaded with other work is left alone |
+| as several of these at once | its configured home first — an explicit `backend` or `engine` is a decision, not a hint — then the rest as overflow |
 
-`ocr.serve_spill_inflight: 0` means "never rent because of load": a pool is then
-used only when there is nothing else. Turning `serve_fanout` off restores the
-single direct address (one pod, no growth), which is one hop fewer and loses
-nothing on an install with exactly one server.
+Nothing here is discovered. A cluster node serves a model because the model is
+**pinned** to it, with the same `engine` pin the front router already treats as a
+hard constraint (a comma-separated pin names several nodes, so OCR can spread over
+them). Asking every node what it happens to hold, and using whoever answers first,
+would put work on a machine nobody chose and move it when a different node replied
+first.
+
+How busy is too busy is the model's own `scale_up_inflight_per_pod`, on the model
+page — the same number the pool scales on, not a second OCR-shaped copy of it. A
+model with no RunPod block has nothing to rent, so load alone never moves its
+pages. Turning `ocr.serve_fanout` off restores the single direct address (one pod,
+no growth), which is one hop fewer and loses nothing on an install with exactly
+one server.
+
+**None of this is visible to the caller.** A client asks for OCR with a model it
+has heard of — the id it sees in `/v1/models` — or with an engine name, and both
+work: `engine=surya` and `engine=datalab-to/surya-ocr-2` reach the same place.
+Where that model runs is read from its configuration, exactly as it is for every
+other request coderai serves.
 
 The address is a lease: a secret minted per attachment, carried in the URL (the
 engine's `/health` and `/v1/models` probes send no headers, so it cannot be a

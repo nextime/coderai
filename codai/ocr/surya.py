@@ -190,12 +190,13 @@ class SuryaEngine(SubprocessOcrEngine):
                 raise
             print(f"[ocr] surya endpoint {self._server_url} is gone "
                   f"({first}) — re-resolving", flush=True)
-            from codai.ocr import dispatch, served_model
+            from codai.models import placement
+            from codai.ocr import served_model
             served_model.forget()
             # The candidate set is discovered, so a vanished pod or node must be
             # re-discovered too; otherwise the re-resolve hands back the same
             # dead address it just rejected.
-            dispatch.forget()
+            placement.forget()
             self.cleanup()
             self.load()
             self._loaded = True

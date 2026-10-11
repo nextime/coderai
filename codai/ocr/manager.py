@@ -410,11 +410,36 @@ class OcrManager:
             getattr(cfg, "vlm_gpu_memory_utilization", 0.0),
         )
 
+    def _engine_serving_model(self, wanted: str) -> str:
+        """The engine configured to read pages with this MODEL, or "".
+
+        A client asks for OCR with a model it knows about — the id it sees in
+        /v1/models — not with the name of the pipeline we happen to drive it with.
+        Both are accepted: "surya" names the engine, and the Surya-2 checkpoint
+        names the same thing from the caller's side. Where that model then runs
+        (here, a pinned cluster node, a rented pod) is ours to decide and nothing
+        the caller should have to know.
+        """
+        cfg = self._require_cfg()
+        for engine, fields in (("surya", ("surya_model_id", "surya_model")),
+                               ("olmocr", ("olmocr_model_id", "olmocr_model"))):
+            for field in fields:
+                got = str(getattr(cfg, field, "") or "").strip().lower()
+                if got and got == wanted:
+                    return engine
+        return ""
+
     def resolve_engine(self, requested: Optional[str]) -> str:
         cfg = self._require_cfg()
         name = (requested or cfg.default_engine or "paddle").strip().lower()
         if name not in _ENGINE_FACTORIES:
-            raise OcrError(f"unknown OCR engine '{name}'", status=400)
+            by_model = self._engine_serving_model(name)
+            if by_model:
+                name = by_model
+        if name not in _ENGINE_FACTORIES:
+            raise OcrError(
+                f"unknown OCR engine or model '{name}' (engines: "
+                f"{', '.join(sorted(_ENGINE_FACTORIES))})", status=400)
         if not _engine_enabled(cfg, name):
             raise OcrError(
                 f"OCR engine '{name}' is not enabled (or license not accepted). "
