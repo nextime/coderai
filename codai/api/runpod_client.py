@@ -469,19 +469,34 @@ class RunpodClient:
 
     def list_pods(self) -> list:
         """List the account's pods: [{id, name, status, cost_per_hr, image}]."""
+        # runtime.uptimeInSeconds is what makes the reaper's grace period real:
+        # without an age every pod looked undatable, and the "never reap a pod
+        # younger than GRACE" backstop abstained on all of them.
         q = """
         query Pods {
           myself {
-            pods { id name desiredStatus costPerHr imageName }
+            pods { id name desiredStatus costPerHr imageName
+                   runtime { uptimeInSeconds } }
           }
         }"""
         data = self._gql(q)
         me = data.get("myself") or {}
-        return [{
-            "id": p.get("id"), "name": p.get("name"),
-            "status": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
-            "image": p.get("imageName"),
-        } for p in (me.get("pods") or [])]
+        out = []
+        for p in (me.get("pods") or []):
+            row = {
+                "id": p.get("id"), "name": p.get("name"),
+                "status": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
+                "image": p.get("imageName"),
+            }
+            # Absent while a pod is still being scheduled, which is exactly when
+            # it must not be mistaken for a leftover — the reaper now treats a
+            # missing age as "too young to judge".
+            rt = p.get("runtime") or {}
+            up = rt.get("uptimeInSeconds")
+            if isinstance(up, (int, float)) and up >= 0:
+                row["uptime_s"] = float(up)
+            out.append(row)
+        return out
 
     def get_pod_logs(self, pod_id: str, tail: int = 200) -> dict:
         """Best-effort container/vLLM logs for a pod via the REST API.

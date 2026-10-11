@@ -3618,7 +3618,25 @@ def reap_orphans() -> int:
         if status in ("TERMINATED", "EXITED"):
             continue
         age = _pod_age_seconds(p)
-        if age is not None and age < REAP_GRACE_SECONDS:
+        if age is None:
+            # Fail CLOSED. This guard is documented as holding "whatever the
+            # registry says", and it was written as `age is not None and
+            # age < GRACE` — so an unknown age skipped it entirely. list_pods()
+            # returned no timestamp at all until the query below was widened,
+            # which means the backstop never protected a single pod: a pod one
+            # second old, invisible to a sibling's registry, was terminated as a
+            # leftover. Observed live on the Digesta orchestrator — created
+            # 19:24:56, reaped 19:24:57, and OCR then waited out the boot
+            # timeout on a pod that no longer existed.
+            #
+            # Not reaping costs one more cycle. Reaping a live pod costs the work
+            # on it and, when the pool immediately rents a replacement, bills in
+            # a loop that never serves a request.
+            print(f"[runpod-reaper] pod {pid} ({name}) has no age from RunPod — "
+                  f"leaving it alone rather than guessing it is a leftover",
+                  flush=True)
+            continue
+        if age < REAP_GRACE_SECONDS:
             continue                      # too young to be a leftover
         try:
             client.terminate_pod(pid)
