@@ -70,7 +70,12 @@ _KEEPALIVE_EXPIRY_S = 60.0
 
 _lock = threading.Lock()
 _leases: dict = {}              # lease token -> {"model_id", "served_name"}
-_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()  # loop -> client
+#: loop -> {pinned?: client}. TWO clients per loop, because the upstreams need
+#: different trust: a direct-TCP pod serves OUR certificate on a bare IP, which
+#: only coderai's CA can verify and whose hostname can never match, while a
+#: cluster node has an ordinary certificate a public CA signed. One client cannot
+#: hold both policies, and using the pinned one everywhere would reject the node.
+_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
 def issue(model_id: str, served_name: str) -> str:
@@ -125,33 +130,62 @@ def engine_url(token: str) -> str:
 
 
 # --------------------------------------------------------------------- routes #
-def _upstream_client():
-    """The shared client for this event loop, created on first use."""
+def _pinned_ssl_context():
+    """The TLS policy a direct-TCP pod needs: our CA, no hostname match.
+
+    The same policy :mod:`codai.api.pod_http` applies for every other request to
+    a pod — it is only separate here because that module is built on requests and
+    this hop is async. Getting it wrong is not subtle: the pod answered
+    "CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate" to every
+    page the first time a real document went through.
+    """
+    import ssl
+
+    from codai.api.pod_tls import ensure_ca
+    ctx = ssl.create_default_context(cafile=ensure_ca())
+    # The pod is addressed by an IP its certificate cannot name.
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def _upstream_client(url: str = ""):
+    """The shared client for this event loop and this upstream's trust policy."""
     import asyncio
 
     import httpx
 
     try:
+        from codai.api.pod_http import is_pinned_url
+        pinned = bool(is_pinned_url(url))
+    except Exception:
+        pinned = False
+    try:
         key = asyncio.get_running_loop()
     except RuntimeError:
         key = _upstream_client            # a stable stand-in when there is no loop
     with _lock:
-        got = _clients.get(key)
+        bucket = _clients.get(key)
+        if bucket is None:
+            bucket = {}
+            _clients[key] = bucket
+        got = bucket.get(pinned)
         if got is not None and not got.is_closed:
             return got
+        verify = _pinned_ssl_context() if pinned else True
         got = httpx.AsyncClient(
-            timeout=UPSTREAM_TIMEOUT_S,
+            timeout=UPSTREAM_TIMEOUT_S, verify=verify,
             limits=httpx.Limits(max_connections=_MAX_CONNECTIONS,
                                 max_keepalive_connections=_MAX_KEEPALIVE,
                                 keepalive_expiry=_KEEPALIVE_EXPIRY_S))
-        _clients[key] = got
+        bucket[pinned] = got
         return got
 
 
 async def close_upstream_clients() -> None:
     """Close the pooled clients (process shutdown, or a test tidying up)."""
     with _lock:
-        clients = list(_clients.values())
+        clients = [c for bucket in _clients.values() for c in bucket.values()]
         _clients.clear()
     for c in clients:
         try:
@@ -239,7 +273,7 @@ async def chat_completions(token: str, request: Request):
         if chosen.api_key:
             headers["Authorization"] = f"Bearer {chosen.api_key}"
         url = chosen.base.rstrip("/") + "/chat/completions"
-        reply = await _upstream_client().post(url, content=body, headers=headers)
+        reply = await _upstream_client(url).post(url, content=body, headers=headers)
         # The reply goes back as it came: a re-serialised response is how
         # logprobs got lost in the first place.
         media = reply.headers.get("content-type", "application/json")

@@ -1121,3 +1121,102 @@ def test_local_is_no_longer_what_an_unconfigured_install_gets():
     from codai.config import OcrConfig
     assert OcrConfig().surya_serve == "model"
     assert _surya(serve="")._serve_mode() == "model"
+
+
+# ------------------------------------------- a pod serves OUR certificate, on an IP #
+# The first real document found this: the pod came up at https://194.68.245.79:22198
+# and every page came back "CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+# certificate". A direct-TCP pod serves the certificate coderai's own CA signed,
+# on a bare IP that certificate can never name — which is why pod_http pins to
+# that CA and switches hostname checking off. This hop is async, so it could not
+# reuse that module and had to be told the same thing.
+
+
+def test_a_pod_url_gets_the_pinned_trust_policy(monkeypatch):
+    _reset()
+    import asyncio
+    import httpx
+    built = []
+
+    class _Counting(_CapturingClient):
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            super().__init__(*a, **kw)
+
+        @property
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Counting)
+    monkeypatch.setattr(gateway, "_pinned_ssl_context", lambda: "PINNED-CTX")
+    _no_node_load(monkeypatch)
+    _fixed_candidates(monkeypatch, [_cand("pod:m", kind="pod",
+                                          base="https://194.68.245.79:22198/v1")])
+    token = gateway.issue("m", "m")
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert built and built[0]["verify"] == "PINNED-CTX"
+
+
+def test_an_ordinary_https_upstream_keeps_normal_verification(monkeypatch):
+    """A cluster node has a certificate a public CA signed; the pinned context
+    trusts ONLY our CA, so using it everywhere would reject the node."""
+    _reset()
+    import asyncio
+    import httpx
+    built = []
+
+    class _Counting(_CapturingClient):
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            super().__init__(*a, **kw)
+
+        @property
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Counting)
+    _no_node_load(monkeypatch)
+    _fixed_candidates(monkeypatch, [_cand("node:a", base="https://node.lan:8443/v1")])
+    token = gateway.issue("m", "m")
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert built and built[0]["verify"] is True
+
+
+def test_the_two_policies_do_not_share_a_client(monkeypatch):
+    """Otherwise whichever upstream came first would decide the trust for both."""
+    _reset()
+    import asyncio
+    import httpx
+    built = []
+
+    class _Counting(_CapturingClient):
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            super().__init__(*a, **kw)
+
+        @property
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Counting)
+    monkeypatch.setattr(gateway, "_pinned_ssl_context", lambda: "PINNED-CTX")
+
+    async def _both():
+        _fixed_candidates(monkeypatch, [_cand("node:a", base="https://node.lan/v1")])
+        await gateway.chat_completions(tok, _Req(SURYA_BODY))
+        _fixed_candidates(monkeypatch, [_cand("pod:m", kind="pod",
+                                              base="https://10.0.0.5:8000/v1")])
+        await gateway.chat_completions(tok, _Req(SURYA_BODY))
+
+    _no_node_load(monkeypatch)
+    tok = gateway.issue("m", "m")
+    asyncio.run(_both())
+    assert [b["verify"] for b in built] == [True, "PINNED-CTX"]
+
+
+def test_a_plain_http_upstream_is_not_pinned(monkeypatch):
+    """A local vLLM on loopback has no certificate at all."""
+    from codai.api.pod_http import is_pinned_url
+    assert is_pinned_url("http://127.0.0.1:8000/v1") is False
+    assert is_pinned_url("https://194.68.245.79:22198/v1") is True
+    assert is_pinned_url("https://node.lan:8443/v1") is False
