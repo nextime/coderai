@@ -168,6 +168,17 @@ class RunpodModelConfig:
     # this long (a burst that dips for a moment must not cost a pod that is
     # needed again seconds later, and a cold pod takes minutes to replace).
     scale_down_after_s: int = 180
+    # Which surplus pod to give back first. Off, the pool retires the least
+    # loaded one (and among equals the one used least recently, whose prefix
+    # cache is coldest). On, PRICE leads: the dearest pod goes first.
+    #
+    # Only a mixed fleet has anything to choose between — pods rented at
+    # different times take whatever the market offered, so the same pool can hold
+    # a $0.35 card and a $0.79 one for the same work, and shedding the cheap one
+    # saves less than half as much. Note what "dearest" tends to mean: an
+    # on-demand pod costs more than a spot pod, so this prefers to keep the
+    # interruptible ones.
+    scale_down_costliest_first: bool = False
     # Hard ceiling on concurrent requests per pod (0 = no ceiling, let the remote
     # server's own batching absorb them). Above it, a request waits for a slot
     # instead of being piled on — use it for engines that degrade badly under
@@ -1652,6 +1663,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     # 0 disables shedding entirely (pods then go only when idle_timeout_s says so).
     cfg.scale_down_after_s = max(0, _as_int(b.get("scale_down_after_s"),
                                             cfg.scale_down_after_s))
+    cfg.scale_down_costliest_first = _as_bool(b.get("scale_down_costliest_first"),
+                                              cfg.scale_down_costliest_first)
     cfg.max_inflight_per_pod = max(0, _as_int(b.get("max_inflight_per_pod"),
                                               cfg.max_inflight_per_pod))
     cfg.sticky_sessions = _as_bool(b.get("sticky_sessions"), cfg.sticky_sessions)
@@ -2832,6 +2845,27 @@ class RunpodPodPool:
         need = -(-total // threshold)          # ceil, in integers
         return max(self.effective_min_pods(), min(int(self.mcfg.max_pods), need))
 
+    def _scale_down_victim(self, serving: list):
+        """Which surplus pod to give back.
+
+        By default the least loaded, and among equals the one used least recently:
+        its prefix cache is the coldest, so retiring it throws away the least
+        work. (That tie-break was inverted when this was written — ``-last_used``
+        picked the pod used MOST recently, discarding the warmest cache in the
+        set.)
+
+        With ``scale_down_costliest_first`` price leads instead, which is the
+        whole point on a mixed fleet: pods are rented at whatever the market
+        offered, so one pool can hold a cheap card and an expensive one doing the
+        same work. Cost still only decides WHICH pod goes, never whether one
+        goes — and a dear pod with requests on it is drained, not dropped.
+        """
+        if getattr(self.mcfg, "scale_down_costliest_first", False):
+            # Dearest first; then the idlest, then the coldest cache.
+            return max(serving, key=lambda p: (float(p.hourly_usd or 0.0),
+                                               -p.inflight, -p.last_used))
+        return min(serving, key=lambda p: (p.inflight, p.last_used))
+
     def _scale_down(self, now: float) -> None:
         """Retire one surplus pod per pass, once the surplus has persisted.
 
@@ -2882,7 +2916,7 @@ class RunpodPodPool:
             # Hold the observation window again before the next one, so a pass
             # does not walk the fleet down in one sweep.
             self._surplus_since = now
-            victim = min(serving, key=lambda x: (x.inflight, -x.last_used))
+            victim = self._scale_down_victim(serving)
             if victim.inflight == 0:
                 victim.healthy = False
                 self.pods.remove(victim)

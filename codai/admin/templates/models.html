@@ -1115,6 +1115,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </div>
             <div class="form-row" style="margin:0;align-self:end">
               <label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-sticky" style="width:auto" checked> Sticky sessions</label>
+              <label style="display:flex;align-items:center;gap:.3rem;font-size:12px" title="When shedding a surplus pod, give back the dearest one first instead of the least loaded. Only a mixed fleet has anything to choose between — pods take whatever the market offered when they were rented. Note that an on-demand pod costs more than a spot one, so this prefers to keep the interruptible ones."><input type="checkbox" id="cfg-rp-costliest" style="width:auto"> Scale down the most expensive first</label>
               <span class="form-hint" style="font-size:11px">Send a conversation back to the pod whose cache still holds it.</span>
             </div>
           </div>
@@ -4934,6 +4935,7 @@ function _populateRunpod(s){
   set('cfg-rp-scale-down', rp.scale_down_after_s != null ? rp.scale_down_after_s : '');
   set('cfg-rp-max-inflight', rp.max_inflight_per_pod != null ? rp.max_inflight_per_pod : '');
   chk('cfg-rp-sticky', rp.sticky_sessions !== false);
+  chk('cfg-rp-costliest', !!rp.scale_down_costliest_first);
   _updateRunpodVisibility();
   _updateRunpodEngineHint();
   _populatePlacement(s);
@@ -5115,6 +5117,7 @@ function _collectRunpod(){
     scale_down_after_s:        intOrU('cfg-rp-scale-down'),
     max_inflight_per_pod:      intOrU('cfg-rp-max-inflight'),
     sticky_sessions:    document.getElementById('cfg-rp-sticky').checked,
+    scale_down_costliest_first: document.getElementById('cfg-rp-costliest').checked,
     schedule_enabled:   document.getElementById('cfg-rp-schedule-enabled').checked,
     schedule_start:     (val('cfg-rp-schedule-start') || '').trim(),
     schedule_end:       (val('cfg-rp-schedule-end') || '').trim(),

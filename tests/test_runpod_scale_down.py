@@ -27,7 +27,8 @@ sys.path.insert(0, str(ROOT))
 from codai.api import runpod_worker as rw                         # noqa: E402
 
 
-def _pool(max_pods=8, min_pods=0, threshold=4, after=180, pods=()):
+def _pool(max_pods=8, min_pods=0, threshold=4, after=180, pods=(),
+          costliest_first=False):
     """A PodPool with its scaling state and nothing else."""
     pool = rw.RunpodPodPool.__new__(rw.RunpodPodPool)
     import threading
@@ -42,6 +43,7 @@ def _pool(max_pods=8, min_pods=0, threshold=4, after=180, pods=()):
     cfg.min_pods = min_pods
     cfg.scale_up_inflight_per_pod = threshold
     cfg.scale_down_after_s = after
+    cfg.scale_down_costliest_first = costliest_first
     cfg.schedule_enabled = False
     pool.mcfg = cfg
     pool.effective_min_pods = lambda: min_pods
@@ -51,8 +53,8 @@ def _pool(max_pods=8, min_pods=0, threshold=4, after=180, pods=()):
     return pool
 
 
-def _pod(pid, inflight=0, last_used=0.0, draining=False):
-    return rw.PodHandle(pod_id=pid, url=f"http://{pid}", hourly_usd=0.6,
+def _pod(pid, inflight=0, last_used=0.0, draining=False, hourly_usd=0.6):
+    return rw.PodHandle(pod_id=pid, url=f"http://{pid}", hourly_usd=hourly_usd,
                         started_at=0.0, inflight=inflight, last_used=last_used,
                         draining=draining)
 
@@ -226,3 +228,70 @@ def test_one_request_is_enough_for_shedding_to_apply():
     pool = _pool(threshold=4, pods=[_pod("a", 1), _pod("b", 0)])
     _settle(pool)
     assert len(pool._killed) == 1
+
+
+# ------------------------------------------------- which of the surplus pods goes #
+# A pool rents at whatever the market offered, so one fleet can hold a $0.35 card
+# and a $0.79 one doing the same work. Shedding the cheap one saves less than half
+# as much, and the operator may want to say so.
+
+
+def test_by_default_the_least_loaded_pod_goes():
+    pool = _pool(threshold=10, pods=[_pod("busy", 3), _pod("quiet", 1)])
+    assert pool._scale_down_victim(pool.pods).pod_id == "quiet"
+
+
+def test_among_equals_the_coldest_cache_goes():
+    """Retiring the pod used least recently throws away the least work: its
+    prefix cache is the one with the least in it. This tie-break was inverted
+    when scale-down was written — it picked the pod used MOST recently."""
+    pool = _pool(pods=[_pod("warm", 0, last_used=900.0),
+                       _pod("cold", 0, last_used=100.0)])
+    assert pool._scale_down_victim(pool.pods).pod_id == "cold"
+
+
+def test_with_the_rule_on_the_dearest_pod_goes_first():
+    pool = _pool(costliest_first=True,
+                 pods=[_pod("cheap", 0, hourly_usd=0.35),
+                       _pod("dear", 0, hourly_usd=0.79)])
+    assert pool._scale_down_victim(pool.pods).pod_id == "dear"
+
+
+def test_price_leads_even_when_the_dear_pod_is_the_busier_one():
+    """It is drained, not dropped — so choosing it costs nothing but time, and
+    saves more than shedding the cheap one."""
+    pool = _pool(costliest_first=True, threshold=10,
+                 pods=[_pod("cheap", 0, hourly_usd=0.35),
+                       _pod("dear", 2, hourly_usd=0.79)])
+    assert pool._scale_down_victim(pool.pods).pod_id == "dear"
+
+
+def test_at_the_same_price_the_rule_falls_back_to_the_idlest():
+    pool = _pool(costliest_first=True, threshold=10,
+                 pods=[_pod("a", 2, hourly_usd=0.6), _pod("b", 0, hourly_usd=0.6)])
+    assert pool._scale_down_victim(pool.pods).pod_id == "b"
+
+
+def test_at_the_same_price_and_load_the_coldest_cache_goes():
+    pool = _pool(costliest_first=True,
+                 pods=[_pod("warm", 0, last_used=900.0, hourly_usd=0.6),
+                       _pod("cold", 0, last_used=100.0, hourly_usd=0.6)])
+    assert pool._scale_down_victim(pool.pods).pod_id == "cold"
+
+
+def test_the_rule_decides_which_pod_goes_never_whether_one_goes():
+    """A fleet the load still needs keeps every pod, dear ones included."""
+    pool = _pool(costliest_first=True, threshold=4,
+                 pods=[_pod("a", 4, hourly_usd=0.79), _pod("b", 4, hourly_usd=0.35)])
+    _settle(pool)
+    assert pool._killed == []
+    assert not any(p.draining for p in pool.pods)
+
+
+def test_a_dear_pod_with_work_is_still_drained_not_killed():
+    pool = _pool(costliest_first=True, threshold=10,
+                 pods=[_pod("cheap", 0, hourly_usd=0.35),
+                       _pod("dear", 2, hourly_usd=0.79)])
+    _settle(pool)
+    assert pool._killed == []
+    assert [p.pod_id for p in pool.pods if p.draining] == ["dear"]

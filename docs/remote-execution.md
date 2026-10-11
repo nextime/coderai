@@ -772,6 +772,23 @@ Three rules make it safe to leave on:
 The warm floor (`min_pods`, or a client's `/v1/runpod/scale` lease) is a floor
 here too and is never scaled through.
 
+**Which surplus pod goes.** By default the least loaded, and among equals the one
+used least recently — its prefix cache is the coldest, so retiring it throws away
+the least work. With `"scale_down_costliest_first": true` price leads instead:
+
+```json
+{"runpod": {"max_pods": 64, "scale_down_after_s": 180,
+            "scale_down_costliest_first": true}}
+```
+
+Only a mixed fleet has anything to choose between: pods are rented at whatever
+the market offered when each one was started, so the same pool can hold a $0.35
+card and a $0.79 card doing identical work, and shedding the cheap one saves less
+than half as much. The rule decides **which** pod goes, never whether one goes,
+and a dear pod with requests on it is drained rather than dropped. One thing to
+weigh before switching it on: an on-demand pod costs more than a spot pod, so
+"dearest first" prefers to keep the interruptible ones.
+
 **This needs a multi-model pod image.** A vLLM pod is launched `--model X` and a
 llama.cpp pod `-hf one.gguf`: they serve exactly one model, so sharing is refused
 with an explicit error rather than sending requests to a pod that would answer
