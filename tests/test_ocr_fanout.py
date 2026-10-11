@@ -1033,3 +1033,91 @@ def test_a_dead_loop_does_not_keep_its_client_alive(monkeypatch):
     asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
     gc.collect()
     assert len(gateway._clients) == 0
+
+
+# ---------------------------------------- local means a GPU here, or not at all #
+# Surya's `local` mode runs detection and recognition in its own venv, on this
+# machine. Its own settings pick the device and settle for the CPU whenever torch
+# sees no CUDA (surya/settings.py TORCH_DEVICE_MODEL: cuda -> mps -> cpu), where a
+# page takes minutes and the result looks perfectly normal. paddle and docTR
+# refuse in that situation; surya was the one engine that did not.
+
+
+def _surya(serve="local", use_gpu=True):
+    import types
+    from codai.ocr.surya import SuryaEngine
+    eng = SuryaEngine.__new__(SuryaEngine)
+    eng.cfg = types.SimpleNamespace(surya_serve=serve, surya_use_gpu=use_gpu,
+                                    surya_model_id="", surya_model="",
+                                    surya_server_url="", surya_accept_license=True,
+                                    surya_venv="", surya_auto_build=False)
+    eng._server_url = ""
+    eng._server_key = ""
+    eng._served_name = ""
+    return eng
+
+
+def test_local_mode_refuses_a_machine_with_no_gpu(monkeypatch):
+    from codai.ocr.base import OcrError
+    import codai.ocr.surya as mod
+    monkeypatch.setattr(mod, "_cuda_present", lambda: False)
+    monkeypatch.setattr(mod.SuryaEngine.__bases__[0], "load", lambda self: None,
+                        raising=False)
+    try:
+        _surya("local").load()
+    except OcrError as exc:
+        assert exc.status == 503
+        assert "surya_use_gpu" in str(exc)
+        assert "surya_serve" in str(exc)        # and it names the way out
+    else:
+        raise AssertionError("expected local mode to refuse")
+
+
+def test_local_mode_loads_where_there_is_a_gpu(monkeypatch):
+    import codai.ocr.surya as mod
+    monkeypatch.setattr(mod, "_cuda_present", lambda: True)
+    monkeypatch.setattr(mod.SuryaEngine.__bases__[0], "load", lambda self: None,
+                        raising=False)
+    _surya("local").load()                      # no raise
+
+
+def test_the_cpu_can_still_be_chosen_deliberately(monkeypatch):
+    """Refusing the silent fallback must not remove the deliberate option."""
+    import codai.ocr.surya as mod
+    monkeypatch.setattr(mod, "_cuda_present", lambda: False)
+    monkeypatch.setattr(mod.SuryaEngine.__bases__[0], "load", lambda self: None,
+                        raising=False)
+    _surya("local", use_gpu=False).load()       # no raise
+
+
+def test_the_worker_is_told_the_device_rather_than_guessing():
+    assert _surya("local").\
+        _local_env() == {"TORCH_DEVICE": "cuda"}
+    assert _surya("local", use_gpu=False)._local_env() == {"TORCH_DEVICE": "cpu"}
+
+
+def test_no_gpu_detected_means_no_gpu(monkeypatch):
+    """Fail closed. The mode exists to use a GPU, and guessing one is there ends
+    in a CPU run that looks healthy and never finishes."""
+    import builtins
+    import codai.ocr.surya as mod
+    real_import = builtins.__import__
+
+    def _no_torch(name, *a, **kw):
+        if name == "torch":
+            raise ImportError("no torch in this venv")
+        return real_import(name, *a, **kw)
+    monkeypatch.setattr(builtins, "__import__", _no_torch)
+    monkeypatch.setattr(mod.shutil if hasattr(mod, "shutil") else mod,
+                        "__name__", "x", raising=False)
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    assert mod._cuda_present() is False
+
+
+def test_local_is_no_longer_what_an_unconfigured_install_gets():
+    """It has to be asked for: the default used to be the one mode that needs a
+    GPU on the very box whose job is to rent one."""
+    from codai.config import OcrConfig
+    assert OcrConfig().surya_serve == "model"
+    assert _surya(serve="")._serve_mode() == "model"

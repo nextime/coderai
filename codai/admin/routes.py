@@ -4141,6 +4141,7 @@ def build_settings_dict(c, gpu_cards):
             "surya_auto_build": c.ocr.surya_auto_build,
             "surya_serve": c.ocr.surya_serve,
             "surya_model": c.ocr.surya_model,
+            "surya_use_gpu": c.ocr.surya_use_gpu,
             "surya_model_id": c.ocr.surya_model_id,
             "serve_fanout": c.ocr.serve_fanout,
             "surya_server_url": c.ocr.surya_server_url,
@@ -4940,6 +4941,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_auto_build" in d: o.surya_auto_build = bool(d["surya_auto_build"])
         if "surya_serve" in d: o.surya_serve = (d.get("surya_serve") or "local").strip()
         if "surya_model" in d: o.surya_model = (d.get("surya_model") or "").strip()
+        if "surya_use_gpu" in d: o.surya_use_gpu = bool(d.get("surya_use_gpu"))
         if "surya_model_id" in d: o.surya_model_id = (d.get("surya_model_id") or "").strip()
         if "serve_fanout" in d: o.serve_fanout = bool(d.get("serve_fanout"))
         if "surya_server_url" in d: o.surya_server_url = (d.get("surya_server_url") or "").strip()

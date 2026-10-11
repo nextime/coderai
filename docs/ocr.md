@@ -255,10 +255,17 @@ per-engine `*_enabled` /
 `extract_enabled` / `extract_model_id` / `extract_schema` / `extract_validate`.
 
 `*_use_gpu` is a **requirement, not a preference**: with it on and no CUDA device
-present, paddle and docTR refuse to load (503, naming the setting) rather than
-reading pages on the CPU many times slower with nothing in the response to say so.
-Set it to `false` to run on the CPU deliberately — that is fully supported, it just
-has to be asked for.
+present, paddle, docTR and Surya's `local` mode refuse to load (503, naming the
+setting) rather than reading pages on the CPU many times slower with nothing in
+the response to say so. Set it to `false` to run on the CPU deliberately — that is
+fully supported, it just has to be asked for.
+
+Surya's `local` mode in particular has to be **asked for**. `surya_serve` defaults
+to `model`, not `local`: an install that said nothing used to get the one mode that
+runs the model on this machine — which on a GPU-less orchestrator meant a silent
+CPU run of a VLM pipeline, i.e. minutes a page while looking healthy. `model`
+adapts to wherever the checkpoint is actually served and tells you to set
+`surya_model_id` when it has not been told.
 
 **Concurrency on one GPU** comes from loading multiple instances of an engine
 (`paddle_instances` etc.) and fanning pages across them (bounded by `max_concurrency`).

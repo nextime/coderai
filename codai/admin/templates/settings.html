@@ -1181,6 +1181,7 @@
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-surya-enabled"><span>Enable</span></label>
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-surya-license"><span>Accept license</span></label>
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Instances</label><input type="number" id="s-ocr-surya-instances" class="form-input" min="1" placeholder="1"></div>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer" title="Local mode only. On, Surya runs on this machine's GPU or refuses to load — it will not quietly fall back to the CPU, where a page takes minutes. Off, the CPU is used deliberately."><input type="checkbox" id="s-ocr-surya-use-gpu" checked><span>Require GPU (Local)</span></label>
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Langs</label><input type="text" id="s-ocr-surya-langs" class="form-input" placeholder="it"></div>
     </div>
     <p class="form-hint" style="margin:0 0 .3rem">Runs in an <b>isolated venv</b> (Surya caps pillow&lt;11, incompatible with the main venv).</p>
@@ -2136,10 +2137,11 @@ async function loadSettings(){
     document.getElementById('s-ocr-surya-enabled').checked = !!ocr.surya_enabled;
     document.getElementById('s-ocr-surya-license').checked = !!ocr.surya_accept_license;
     document.getElementById('s-ocr-surya-instances').value = ocr.surya_instances ?? 1;
+    document.getElementById('s-ocr-surya-use-gpu').checked = ocr.surya_use_gpu !== false;
     document.getElementById('s-ocr-surya-langs').value = ocr.surya_langs ?? 'it';
     document.getElementById('s-ocr-surya-venv').value = ocr.surya_venv ?? '';
     document.getElementById('s-ocr-surya-auto-build').checked = !!ocr.surya_auto_build;
-    document.getElementById('s-ocr-surya-serve').value = ocr.surya_serve || 'local';
+    document.getElementById('s-ocr-surya-serve').value = ocr.surya_serve || 'model';
     document.getElementById('s-ocr-surya-model').value = ocr.surya_model ?? '';
     document.getElementById('s-ocr-surya-model-id').value = ocr.surya_model_id ?? '';
     document.getElementById('s-ocr-surya-server-url').value = ocr.surya_server_url ?? '';
@@ -2394,6 +2396,7 @@ async function saveSettings(silent){
       surya_auto_build: document.getElementById('s-ocr-surya-auto-build').checked,
       surya_serve: document.getElementById('s-ocr-surya-serve').value,
       surya_model: document.getElementById('s-ocr-surya-model').value.trim(),
+      surya_use_gpu: document.getElementById('s-ocr-surya-use-gpu').checked,
       surya_model_id: document.getElementById('s-ocr-surya-model-id').value.trim(),
       serve_fanout: document.getElementById('s-ocr-serve-fanout').checked,
       surya_server_url: document.getElementById('s-ocr-surya-server-url').value.trim(),

@@ -20,6 +20,32 @@ from codai.ocr.base import OcrError, vlm_serve_limits
 _REQ = os.path.join(os.path.dirname(__file__), "..", "..", "requirements-surya.txt")
 
 
+def _cuda_present() -> bool:
+    """Whether this machine has a usable CUDA device.
+
+    Asked of torch first, because that is what Surya itself will ask. torch may
+    not be importable in the main venv at all (Surya lives in its own), so
+    nvidia-smi is the fallback — and if neither can answer, the answer is NO.
+    Failing closed is the point: the mode exists to use a GPU, and guessing that
+    one is present ends in a CPU run that looks healthy and never finishes.
+    """
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        pass
+    try:
+        import shutil
+        import subprocess
+        smi = shutil.which("nvidia-smi")
+        if not smi:
+            return False
+        out = subprocess.run([smi, "-L"], capture_output=True, text=True, timeout=10)
+        return out.returncode == 0 and "GPU 0" in (out.stdout or "")
+    except Exception:
+        return False
+
+
 class SuryaEngine(SubprocessOcrEngine):
     name = "surya"
     _worker_engine = "surya"
@@ -46,8 +72,20 @@ class SuryaEngine(SubprocessOcrEngine):
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")
 
     def _serve_mode(self) -> str:
-        mode = (getattr(self.cfg, "surya_serve", "local") or "local").strip().lower()
+        mode = (getattr(self.cfg, "surya_serve", "model") or "model").strip().lower()
         return "llamacpp" if mode == "server" else mode
+
+    def _local_env(self) -> dict:
+        """Device for the LOCAL mode worker.
+
+        Said out loud rather than left to Surya's own fallback: with the GPU
+        required we have already refused if there is none, and when the operator
+        has chosen the CPU the worker is told so explicitly instead of arriving
+        there by accident.
+        """
+        if getattr(self.cfg, "surya_use_gpu", True):
+            return {"TORCH_DEVICE": "cuda"}
+        return {"TORCH_DEVICE": "cpu"}
 
     def _worker_env(self) -> dict:
         """For the served ("Surya2") modes, tell the worker to attach to an external
@@ -62,7 +100,7 @@ class SuryaEngine(SubprocessOcrEngine):
         "EMPTY", which is why a locked endpoint is always attached to as "vllm")."""
         mode = self._serve_mode()
         if mode not in self.SERVED_MODES:
-            return {}
+            return self._local_env()
         url = self._server_url
         if not url:
             return {}
@@ -153,6 +191,21 @@ class SuryaEngine(SubprocessOcrEngine):
                                               **vlm_serve_limits(self.cfg))
             self._server_url = base.rstrip("/") + "/v1"
             self._served_name = model
+        elif mode == "local":
+            # Local means on this machine's GPU, or not at all. Surya would
+            # otherwise pick its own device and quietly settle for the CPU, where
+            # a page takes minutes instead of seconds and nothing in the result
+            # says why. paddle and docTR refuse in the same situation; this used
+            # to be the one engine that did not.
+            if getattr(self.cfg, "surya_use_gpu", True) and not _cuda_present():
+                raise OcrError(
+                    "Surya 'local' mode runs the model on this machine and found "
+                    "no CUDA device. It will NOT quietly run on the CPU, where a "
+                    "page takes minutes. Use ocr.surya_serve = \"model\" to run it "
+                    "on whatever serves the Surya-2 checkpoint (a RunPod pod, a "
+                    "cluster node, a local vLLM), or set ocr.surya_use_gpu = false "
+                    "to accept the CPU deliberately.",
+                    status=503)
         elif mode == "llamacpp":
             url = (getattr(self.cfg, "surya_server_url", "") or "").strip()
             if not url:

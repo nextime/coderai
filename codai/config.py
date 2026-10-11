@@ -976,7 +976,18 @@ class OcrConfig:
     #   "vllm"     — coderai's OWN isolated vLLM venv serves `surya_model` here (CUDA).
     #   "llamacpp" — attach to a llama.cpp/OpenAI server already running, at
     #                `surya_server_url`. ("server" is accepted as a synonym.)
-    surya_serve: str = "local"         # local | model | vllm | llamacpp
+    # `local` runs detection and recognition in Surya's own venv, on this
+    # machine's GPU. Like paddle and docTR, that is a REQUIREMENT and not a
+    # preference: Surya's own settings fall back to CPU whenever torch sees no
+    # CUDA device (surya/settings.py TORCH_DEVICE_MODEL: cuda -> mps -> cpu), and
+    # a VLM pipeline on a CPU is not slow, it is unusable — while looking
+    # perfectly healthy. Set it to false to run on the CPU deliberately.
+    surya_use_gpu: bool = True
+    # NOT "local": an install that says nothing would get the mode that runs the
+    # model here, which on a box with no GPU is a refusal (and used to be a
+    # silent CPU run). "model" adapts to wherever the Surya-2 checkpoint is
+    # actually served, and asks for ocr.surya_model_id when it is not told.
+    surya_serve: str = "model"         # model | local | vllm | llamacpp
     surya_model: str = "datalab-to/surya-ocr-2"   # HF checkpoint for the served (vllm) backend
     surya_model_id: str = ""           # ("model" mode) the models.json id serving Surya2
     surya_server_url: str = ""         # external OpenAI server URL (llamacpp/manual); blank = auto
@@ -1625,6 +1636,7 @@ class ConfigManager:
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_venv": self.config.ocr.surya_venv,
                 "surya_auto_build": self.config.ocr.surya_auto_build,
+                "surya_use_gpu": self.config.ocr.surya_use_gpu,
                 "surya_serve": self.config.ocr.surya_serve,
                 "surya_model": self.config.ocr.surya_model,
                 "surya_model_id": self.config.ocr.surya_model_id,
