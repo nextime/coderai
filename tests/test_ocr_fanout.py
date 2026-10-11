@@ -35,6 +35,9 @@ from codai.ocr.base import OcrError                                # noqa: E402
 def _reset():
     dispatch.forget()
     gateway.revoke()
+    # The upstream client is pooled and cached per event loop; a cached one would
+    # carry a previous test's stub into the next test.
+    gateway._clients.clear()
 
 
 def _cand(key, kind="node", base="http://n/v1", priority=1, node_url="",
@@ -926,3 +929,107 @@ def test_the_internal_gate_exempts_only_the_attach_prefix(monkeypatch):
         reached.clear()
         asyncio.run(mw({"type": "http", "path": path, "headers": []}, None, _send))
         assert reached == [], f"{path} must still require the internal token"
+
+
+# --------------------------------------------- one handshake per pod, not per page #
+# The gateway built a new httpx.AsyncClient for every request, so each page paid a
+# fresh TCP and TLS handshake to the pod. With surya_instances: 24 that is 24
+# streams reconnecting per page against a round trip that already dominates.
+
+
+def test_the_upstream_client_is_reused_within_one_event_loop(monkeypatch):
+    """The point of the fix: a second page on the same loop reuses the connection
+    pool instead of building another one."""
+    _reset()
+    import asyncio
+    import httpx
+    built = []
+
+    class _Counting(_CapturingClient):
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            super().__init__(*a, **kw)
+
+        @property
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Counting)
+    _no_node_load(monkeypatch)
+    _fixed_candidates(monkeypatch, [_cand("node:a", base="http://a/v1")])
+    token = gateway.issue("m", "m")
+
+    async def _two_pages():
+        await gateway.chat_completions(token, _Req(SURYA_BODY))
+        await gateway.chat_completions(token, _Req(SURYA_BODY))
+
+    asyncio.run(_two_pages())
+    assert len(built) == 1, "a second page must not build a second client"
+
+
+def test_the_client_is_created_with_keep_alive_limits(monkeypatch):
+    """A pool with no keep-alive would reconnect anyway."""
+    _reset()
+    import asyncio
+    import httpx
+    built = []
+
+    class _Counting(_CapturingClient):
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            super().__init__(*a, **kw)
+
+        @property
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Counting)
+    _no_node_load(monkeypatch)
+    _fixed_candidates(monkeypatch, [_cand("node:a", base="http://a/v1")])
+    token = gateway.issue("m", "m")
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert built and built[0].get("limits") is not None
+    assert built[0].get("timeout") == gateway.UPSTREAM_TIMEOUT_S
+
+
+def test_a_client_is_not_shared_between_different_loops(monkeypatch):
+    """An AsyncClient binds to the loop that made it; using one from another loop
+    is an error waiting for load to find it."""
+    _reset()
+    import asyncio
+    import httpx
+    built = []
+
+    class _Counting(_CapturingClient):
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            super().__init__(*a, **kw)
+
+        @property
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Counting)
+    _no_node_load(monkeypatch)
+    _fixed_candidates(monkeypatch, [_cand("node:a", base="http://a/v1")])
+    token = gateway.issue("m", "m")
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert len(built) == 2, "each loop needs its own client"
+
+
+def test_a_dead_loop_does_not_keep_its_client_alive(monkeypatch):
+    """Keyed weakly by the loop object, so a finished loop's entry disappears
+    rather than accumulating — and cannot be handed to a new loop that happens to
+    reuse the address."""
+    _reset()
+    import asyncio
+    import gc
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _CapturingClient)
+    _no_node_load(monkeypatch)
+    _fixed_candidates(monkeypatch, [_cand("node:a", base="http://a/v1")])
+    token = gateway.issue("m", "m")
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    gc.collect()
+    assert len(gateway._clients) == 0

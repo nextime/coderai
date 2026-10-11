@@ -33,6 +33,7 @@ that was not handed both.
 import os
 import secrets
 import threading
+import weakref
 from typing import Optional
 
 from fastapi import APIRouter, Request
@@ -51,8 +52,25 @@ PREFIX = "/v1/ocr/attach"
 #: takes minutes; a timeout here would look to the engine like a failed page.
 UPSTREAM_TIMEOUT_S = 3600.0
 
+#: Upstream connection pooling. A client per REQUEST meant a fresh TCP and TLS
+#: handshake for every page: with `surya_instances: 24` that is 24 streams each
+#: reconnecting per page, against a pod whose round trip is already the dominant
+#: cost. One client holds keep-alive connections open instead, which is the
+#: difference between a handshake per page and a handshake per pod.
+#:
+#: Keyed by event loop: an httpx.AsyncClient binds to the loop that created it,
+#: and coderai runs more than one (the OCR pool has a loop of its own), so a
+#: single global client would be used from a loop it does not belong to. The key
+#: is the loop OBJECT, held weakly — keying by id() would both leak an entry per
+#: dead loop and, because CPython reuses addresses, risk handing a new loop a
+#: client bound to the closed one that used to live there.
+_MAX_CONNECTIONS = 256
+_MAX_KEEPALIVE = 64
+_KEEPALIVE_EXPIRY_S = 60.0
+
 _lock = threading.Lock()
 _leases: dict = {}              # lease token -> {"model_id", "served_name"}
+_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()  # loop -> client
 
 
 def issue(model_id: str, served_name: str) -> str:
@@ -107,6 +125,41 @@ def engine_url(token: str) -> str:
 
 
 # --------------------------------------------------------------------- routes #
+def _upstream_client():
+    """The shared client for this event loop, created on first use."""
+    import asyncio
+
+    import httpx
+
+    try:
+        key = asyncio.get_running_loop()
+    except RuntimeError:
+        key = _upstream_client            # a stable stand-in when there is no loop
+    with _lock:
+        got = _clients.get(key)
+        if got is not None and not got.is_closed:
+            return got
+        got = httpx.AsyncClient(
+            timeout=UPSTREAM_TIMEOUT_S,
+            limits=httpx.Limits(max_connections=_MAX_CONNECTIONS,
+                                max_keepalive_connections=_MAX_KEEPALIVE,
+                                keepalive_expiry=_KEEPALIVE_EXPIRY_S))
+        _clients[key] = got
+        return got
+
+
+async def close_upstream_clients() -> None:
+    """Close the pooled clients (process shutdown, or a test tidying up)."""
+    with _lock:
+        clients = list(_clients.values())
+        _clients.clear()
+    for c in clients:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
+
+
 def _unknown_lease() -> JSONResponse:
     return JSONResponse(status_code=404,
                         content={"error": {"message": "unknown OCR engine lease",
@@ -165,8 +218,6 @@ async def chat_completions(token: str, request: Request):
     if got is None:
         return _unknown_lease()
 
-    import httpx
-
     from codai.models import placement
     body = await request.body()
 
@@ -188,8 +239,7 @@ async def chat_completions(token: str, request: Request):
         if chosen.api_key:
             headers["Authorization"] = f"Bearer {chosen.api_key}"
         url = chosen.base.rstrip("/") + "/chat/completions"
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S) as client:
-            reply = await client.post(url, content=body, headers=headers)
+        reply = await _upstream_client().post(url, content=body, headers=headers)
         # The reply goes back as it came: a re-serialised response is how
         # logprobs got lost in the first place.
         media = reply.headers.get("content-type", "application/json")
