@@ -153,6 +153,30 @@ class SchemaPayload(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
 
+@router.get("/v1/ocr/engines", summary="List the OCR engines this install offers")
+async def list_ocr_engines():
+    """Which engine names `/v1/ocr` accepts here, and what each one returns.
+
+    A client used to have to know: naming an engine this install had not enabled
+    was a 400 with nothing to ask beforehand. Every field is read from this
+    install's config, including the ids that also resolve to an engine (so a
+    caller can name the model it knows rather than the pipeline driving it) and
+    which engines can return boxes or layout regions at all.
+
+    Where an engine's model runs — here, a pinned cluster node, a rented pod — is
+    deliberately NOT in the answer: that is configuration, it can change between
+    two requests, and a client never has to care.
+    """
+    cfg = _ocr_config()
+    if cfg is None:
+        raise HTTPException(status_code=503, detail="OCR subsystem is not available")
+    ocr_manager.configure(cfg)
+    try:
+        return ocr_manager.engine_catalogue()
+    except OcrError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+
 @router.get("/v1/ocr/schemas", summary="List available extraction schemas")
 async def list_schemas():
     return {"schemas": schema_store.list()}

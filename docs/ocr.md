@@ -271,8 +271,23 @@ aggregate throughput without vLLM (a continuous-batching path is a future option
 ```
 POST /v1/ocr            multipart: file=@doc.pdf [engine=] [dpi=] [detect=] [structured=] [schema=]
 POST /v1/ocr/batch      multipart: files=@a.pdf files=@b.png [...same fields...]
+GET  /v1/ocr/engines    what this install offers, and what each engine returns
 GET/POST/DELETE /v1/ocr/schemas[/{name}]   manage extraction schemas
 ```
+
+`engine=` takes an engine name (`paddle`, `doctr`, `surya`, `olmocr`) **or** the id
+of the model a pipeline drives, so `engine=surya` and
+`engine=datalab-to/surya-ocr-2` reach the same place. Omit it and
+`ocr.default_engine` decides — which may itself be written either way.
+
+`GET /v1/ocr/engines` is how a client finds that out instead of guessing: each row
+carries `enabled` (with a `reason` when it is not), `kind` (`engine` owns its
+weights, `pipeline` drives a model), `aliases` (the model ids that also resolve to
+it), `instances`, and `returns` — `{boxes, regions, tables, meta}`, so a caller
+needing coordinates can see that olmOCR has none. The top level reports `default`
+(what the operator wrote) and `default_engine` (what it resolves to). Where an
+engine's model runs is deliberately absent: it is configuration, it can change
+between two requests, and a client that learned it would come to depend on it.
 
 Response: `{engine, num_pages, text, pages[], stamps[], signatures[], structured}`. Each
 page carries `lines[]` (text + bbox + conf), `regions[]` (layout), `tables[]`, and

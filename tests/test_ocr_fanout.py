@@ -809,3 +809,89 @@ def test_the_default_may_itself_be_a_model_id():
 def test_an_explicit_engine_still_overrides_the_default():
     mgr = _mgr(default_engine="surya", surya_model_id="datalab-to/surya-ocr-2")
     assert mgr.resolve_engine("doctr") == "doctr"
+
+
+# ------------------------------------------------ what can I ask this install #
+# Naming an engine the install had not enabled was a 400, and there was nothing
+# to ask beforehand — the client had to know, or guess.
+
+
+def test_the_catalogue_lists_every_engine_with_whether_it_is_enabled():
+    mgr = _mgr(default_engine="surya", surya_model_id="datalab-to/surya-ocr-2",
+               paddle_enabled=False, doctr_enabled=False)
+    cat = mgr.engine_catalogue()
+    rows = {r["id"]: r for r in cat["data"]}
+    assert set(rows) == {"paddle", "doctr", "surya", "olmocr"}
+    assert rows["surya"]["enabled"] is True
+    assert rows["paddle"]["enabled"] is False
+
+
+def test_a_disabled_engine_says_why():
+    """So the answer is actionable rather than just negative."""
+    mgr = _mgr(paddle_enabled=False)
+    rows = {r["id"]: r for r in mgr.engine_catalogue()["data"]}
+    assert "ocr.paddle_enabled" in rows["paddle"]["reason"]
+
+
+def test_an_unaccepted_licence_is_not_reported_as_merely_disabled():
+    """It is one checkbox away, and saying "not enabled" would send the operator
+    to the wrong setting."""
+    mgr = _mgr(surya_enabled=True, surya_accept_license=False)
+    rows = {r["id"]: r for r in mgr.engine_catalogue()["data"]}
+    assert "licence" in rows["surya"]["reason"]
+
+
+def test_the_catalogue_publishes_the_model_names_that_also_work():
+    """The aliases are the whole point of accepting a model id in the request."""
+    mgr = _mgr(surya_model_id="datalab-to/surya-ocr-2",
+               olmocr_model_id="allenai/olmOCR-2-7B-1025-FP8")
+    rows = {r["id"]: r for r in mgr.engine_catalogue()["data"]}
+    assert "datalab-to/surya-ocr-2" in rows["surya"]["aliases"]
+    assert rows["olmocr"]["model"] == "allenai/olmOCR-2-7B-1025-FP8"
+    # And every advertised alias really does resolve.
+    for row in rows.values():
+        for alias in row.get("aliases", []):
+            assert mgr.resolve_engine(alias) == row["id"]
+
+
+def test_the_catalogue_says_which_engines_can_return_boxes():
+    """olmOCR is a document VLM: it transcribes a page and has no notion of where
+    a word was, so a client needing coordinates must be able to see that."""
+    mgr = _mgr()
+    rows = {r["id"]: r for r in mgr.engine_catalogue()["data"]}
+    assert rows["olmocr"]["returns"]["boxes"] is False
+    assert rows["surya"]["returns"]["boxes"] is True
+    assert rows["paddle"]["returns"]["regions"] is True
+
+
+def test_the_catalogue_distinguishes_a_pipeline_from_an_engine():
+    """Whether "where does it run" is even a question depends on this."""
+    mgr = _mgr()
+    rows = {r["id"]: r for r in mgr.engine_catalogue()["data"]}
+    assert rows["surya"]["kind"] == "pipeline"
+    assert rows["paddle"]["kind"] == "engine"
+
+
+def test_the_catalogue_reports_what_a_request_with_no_engine_will_use():
+    mgr = _mgr(default_engine="surya", surya_model_id="datalab-to/surya-ocr-2")
+    cat = mgr.engine_catalogue()
+    assert cat["default"] == "surya"
+    assert cat["default_engine"] == mgr.resolve_engine(None)
+
+
+def test_a_default_written_as_a_model_id_is_reported_resolved():
+    """`default` is what the operator wrote; `default_engine` is what it means."""
+    mgr = _mgr(default_engine="allenai/olmOCR-2-7B-1025-FP8",
+               olmocr_model_id="allenai/olmOCR-2-7B-1025-FP8")
+    cat = mgr.engine_catalogue()
+    assert cat["default"] == "allenai/olmOCR-2-7B-1025-FP8"
+    assert cat["default_engine"] == "olmocr"
+
+
+def test_the_catalogue_does_not_leak_where_the_model_runs():
+    """Placement is configuration and can change between two requests; a client
+    that learned it would start depending on it."""
+    mgr = _mgr(surya_model_id="datalab-to/surya-ocr-2")
+    blob = repr(mgr.engine_catalogue())
+    for leak in ("runpod", "pod", "node", "127.0.0.1", "http"):
+        assert leak not in blob.lower()

@@ -410,6 +410,70 @@ class OcrManager:
             getattr(cfg, "vlm_gpu_memory_utilization", 0.0),
         )
 
+    def engine_catalogue(self) -> dict:
+        """What a client may ask for, and what it would get.
+
+        Until now a caller had to KNOW which engines an install had enabled; a
+        wrong guess was a 400 and there was nothing to ask. Everything here is
+        read from this install's own config, so it answers the two questions a
+        client actually has: which names work, and which of them returns the
+        boxes or the layout I need.
+        """
+        cfg = self._require_cfg()
+        # What each engine can put in a page, so a client can choose on capability
+        # rather than on folklore. olmOCR is a document VLM: it transcribes a whole
+        # page in reading order and has no notion of where a word was.
+        shapes = {
+            "paddle":  {"boxes": True,  "regions": True,  "tables": True,  "meta": False},
+            "doctr":   {"boxes": True,  "regions": True,  "tables": False, "meta": False},
+            "surya":   {"boxes": True,  "regions": True,  "tables": True,  "meta": False},
+            "olmocr":  {"boxes": False, "regions": False, "tables": True,  "meta": True},
+        }
+        # A pipeline drives a model somebody else serves; an engine owns its own
+        # weights and runs in process. The distinction decides whether "where does
+        # it run" is even a question, so it is worth saying out loud.
+        kinds = {"paddle": "engine", "doctr": "engine",
+                 "surya": "pipeline", "olmocr": "pipeline"}
+        models = {"surya": ("surya_model_id", "surya_model"),
+                  "olmocr": ("olmocr_model_id", "olmocr_model")}
+
+        data = []
+        for name in sorted(_ENGINE_FACTORIES):
+            enabled = _engine_enabled(cfg, name)
+            row = {
+                "id": name,
+                "kind": kinds.get(name, "engine"),
+                "enabled": bool(enabled),
+                "instances": _engine_instances(cfg, name),
+                "returns": shapes.get(name, {}),
+            }
+            if not enabled:
+                if name == "surya" and cfg.surya_enabled and not cfg.surya_accept_license:
+                    row["reason"] = ("Surya's licence has not been accepted "
+                                     "(ocr.surya_accept_license)")
+                else:
+                    row["reason"] = f"not enabled (ocr.{name}_enabled)"
+            # The ids that ALSO resolve to this engine, so a client can name the
+            # model it knows about instead of the pipeline that drives it.
+            aliases = []
+            for field in models.get(name, ()):
+                got = str(getattr(cfg, field, "") or "").strip()
+                if got and got not in aliases:
+                    aliases.append(got)
+            if aliases:
+                row["aliases"] = aliases
+                row["model"] = aliases[0]
+                row["serve"] = str(getattr(cfg, f"{name}_serve", "") or "").strip()
+            data.append(row)
+
+        default = str(getattr(cfg, "default_engine", "") or "").strip()
+        try:
+            resolved = self.resolve_engine(None)
+        except OcrError:
+            resolved = ""
+        return {"object": "list", "default": default, "default_engine": resolved,
+                "data": data}
+
     def _engine_serving_model(self, wanted: str) -> str:
         """The engine configured to read pages with this MODEL, or "".
 
