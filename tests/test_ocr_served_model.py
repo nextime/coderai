@@ -70,6 +70,18 @@ class FakeBackend:
         return self.url, self.key
 
 
+def _models_layer(monkeypatch, runpod=False, engine=None):
+    """Steer the model layer. Patched as ATTRIBUTES of the real module: the resolver
+    does `from codai.models import manager`, which reads the package attribute and
+    never looks at sys.modules — a fake installed there is simply not seen (and a test
+    that thinks it is passes for the wrong reason)."""
+    from codai.models import manager as real
+    monkeypatch.setattr(real, "runpod_should_handle", lambda m: runpod)
+    monkeypatch.setattr(real, "resolve_engine_backend", lambda m: engine)
+    monkeypatch.setattr(real, "get_active_runpod_config", lambda: None, raising=False)
+    return real
+
+
 @pytest.fixture(autouse=True)
 def _clean_cache():
     served_model.forget()
@@ -106,12 +118,7 @@ def test_the_backend_is_resolved_once_not_per_page(monkeypatch):
 def test_a_model_nobody_serves_over_http_says_so(monkeypatch):
     """The alternative is a loopback to our own /v1, which would hide the
     misconfiguration behind an extra hop and drop Surya's guided decoding."""
-    mod = types.SimpleNamespace(
-        runpod_should_handle=lambda m: False,
-        resolve_engine_backend=lambda m: None,
-        get_active_runpod_config=lambda: None,
-    )
-    monkeypatch.setitem(sys.modules, "codai.models.manager", mod)
+    _models_layer(monkeypatch)
     with pytest.raises(OcrError) as caught:
         served_model.endpoint_for("local-only-model")
     assert caught.value.status == 503
@@ -337,3 +344,94 @@ def test_a_proxy_forwards_the_schema_it_was_given():
         src = (ROOT / mod).read_text()
         assert 'response_format.get("type") == "json_object"' not in src, mod
         assert src.count('payload["response_format"] = response_format') == 2, mod
+
+
+# ------------------------------------------------------------- the three places
+def _cluster(monkeypatch, nodes, listing, enabled=True, token="clustertok"):
+    """Stand in for the cluster config and the nodes' own catalogues."""
+    import types as _t
+
+    cfg = _t.SimpleNamespace(cluster=_t.SimpleNamespace(enabled=enabled, token=token))
+    monkeypatch.setitem(sys.modules, "codai.admin.routes",
+                        _t.SimpleNamespace(config_manager=_t.SimpleNamespace(config=cfg)))
+
+    class _Reply:
+        def __init__(self, ids):
+            self.status_code = 200 if ids is not None else 500
+            self._ids = ids or []
+
+        def json(self):
+            return {"data": [{"id": i} for i in self._ids]}
+
+    class _Client:
+        def __init__(self, spec):
+            self.spec = spec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url):
+            for node in nodes:
+                if node.url.rstrip("/") in url:
+                    return _Reply(listing.get(node.name))
+            return _Reply(None)
+
+    monkeypatch.setitem(sys.modules, "codai.cluster.nodes",
+                        _t.SimpleNamespace(enabled_nodes=lambda c: nodes,
+                                           sync_client=_Client))
+    return cfg
+
+
+class _Node:
+    def __init__(self, name, url, api_key=""):
+        self.name, self.url, self.api_key = name, url, api_key
+
+    def headers(self):
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+
+def test_a_model_held_by_a_cluster_node_resolves_to_that_node(monkeypatch):
+    """A node is a whole coderai registered as a remote ENGINE, so no backend in the
+    model layer knows it exists. Without asking the nodes, a node-hosted VLM answered
+    "not served over HTTP" — on an install that was serving it perfectly well."""
+    _models_layer(monkeypatch)
+    nodes = [_Node("alpha", "https://a.lan:8443"), _Node("beta", "https://b.lan:8443")]
+    _cluster(monkeypatch, nodes, {"alpha": ["qwen"], "beta": ["datalab-to/surya-ocr-2"]})
+    base, key, served = served_model.endpoint_for("datalab-to/surya-ocr-2")
+    assert base == "https://b.lan:8443/v1"
+    assert key == "clustertok"          # the shared token fills a blank per-node key
+    assert served == "datalab-to/surya-ocr-2"
+
+
+def test_a_node_that_does_not_answer_is_skipped_not_fatal(monkeypatch):
+    _models_layer(monkeypatch)
+    nodes = [_Node("down", "https://d.lan:8443"), _Node("up", "https://u.lan:8443")]
+    _cluster(monkeypatch, nodes, {"down": None, "up": ["m"]})
+    base, _, _ = served_model.endpoint_for("m")
+    assert base == "https://u.lan:8443/v1"
+
+
+def test_the_nodes_are_not_asked_when_clustering_is_off(monkeypatch):
+    """Probing every configured node on an install that does not cluster would add a
+    timeout to the first page of every document."""
+    _models_layer(monkeypatch)
+    _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")],
+             {"alpha": ["m"]}, enabled=False)
+    with pytest.raises(OcrError):
+        served_model.endpoint_for("m")
+
+
+def test_runpod_wins_over_a_node_that_also_lists_it(monkeypatch):
+    """An explicit backend pin on the entry is the operator's decision and is
+    authoritative; node discovery is the fallback, not an override."""
+    backend = FakeBackend(url="https://pod/v1", key="podtok")
+    _models_layer(monkeypatch, runpod=True, engine="runpod")
+    import codai.backends.runpod as rp
+    backend.load_model = lambda mid: None
+    monkeypatch.setattr(rp, "RunpodBackend", lambda cfg: backend)
+    _cluster(monkeypatch, [_Node("alpha", "https://a.lan:8443")], {"alpha": ["m"]})
+    base, key, _ = served_model.endpoint_for("m")
+    assert (base, key) == ("https://pod/v1", "podtok")

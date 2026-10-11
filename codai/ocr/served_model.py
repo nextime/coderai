@@ -78,6 +78,10 @@ def _entry_backend(model_id: str):
             raise OcrError(f"model {model_id!r}: RunPod endpoint unusable: {exc}",
                            status=503)
 
+    node = _cluster_node_endpoint(model_id)
+    if node is not None:
+        return node
+
     if mm.resolve_engine_backend(model_id) == "vllm":
         try:
             from codai.api import runpod_worker, vllm_worker
@@ -96,6 +100,44 @@ def _entry_backend(model_id: str):
         f"or pick a serve mode that fits this box.",
         status=503,
     )
+
+
+def _cluster_node_endpoint(model_id: str):
+    """A cluster node that holds ``model_id``, as a fixed endpoint, or None.
+
+    A node is a whole coderai, registered with the head as a remote ENGINE rather than
+    as a model-manager backend — so nothing in the backend layer knows about it, and a
+    pipeline asking "where is this model served" would have been told nowhere. The
+    node's own catalogue is the authority, so it is asked: whichever enabled node lists
+    the id serves it, with the cluster token as the key.
+    """
+    try:
+        from codai.admin.routes import config_manager
+        from codai.cluster.nodes import enabled_nodes, sync_client
+        ccfg = getattr(getattr(config_manager, "config", None), "cluster", None)
+        if ccfg is None or not getattr(ccfg, "enabled", False):
+            return None
+        token = (getattr(ccfg, "token", "") or "").strip()
+        for spec in enabled_nodes(ccfg):
+            if token and not spec.api_key:
+                spec.api_key = token
+            base = spec.url.rstrip("/")
+            base = base if base.endswith("/v1") else base + "/v1"
+            try:
+                # sync_client carries the node's token and trust settings but no
+                # base_url, so the address is spelled out.
+                with sync_client(spec) as client:
+                    reply = client.get(base + "/models")
+                    if reply.status_code != 200:
+                        continue
+                    ids = {str(m.get("id") or "") for m in (reply.json().get("data") or [])}
+            except Exception:
+                continue
+            if model_id in ids:
+                return _Fixed(base, spec.api_key, model_id)
+    except Exception:
+        return None
+    return None
 
 
 class _Fixed:

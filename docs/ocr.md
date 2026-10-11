@@ -89,6 +89,21 @@ one in the vocabulary the rest of the server already speaks:
 "ocr": { "surya_serve": "model", "surya_model_id": "datalab-to/surya-ocr-2" }
 ```
 
+A word on vocabulary, because this subsystem borrows one. Everywhere else in coderai an
+**engine** is the thing that *runs* a model — vLLM, llama.cpp, ds4. In `ocr.default_engine`
+the same word covers two different kinds of thing: paddle and docTR really are runners
+(own weights, no server), while **surya-2 and olmOCR are pipelines over a model something
+else runs**. Their engine is vLLM. That is why they alone need to be told where a server
+is, and why the answer is the same question the rest of coderai already answers for every
+model: local, a cluster node, or a rented pod.
+
+| where the model is served | how `model` mode finds it |
+|---|---|
+| this box, coderai's own vLLM | the vLLM backend's instance for that entry |
+| a cluster node | the node that lists the id in its own `/v1/models`, with the cluster token |
+| RunPod | the pod pool for that entry, provisioning if it is cold |
+| any other server | the entry's `service_url` |
+
 coderai resolves that id through the backend that owns it — provisioning a pod if the
 pool is cold — and hands the worker `SURYA_INFERENCE_URL`, `SURYA_MODEL_CHECKPOINT` (the
 served name; Surya refuses a server whose `/v1/models` disagrees) and `VLLM_API_KEY` (pods
