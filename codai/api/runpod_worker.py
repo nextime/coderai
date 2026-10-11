@@ -1868,6 +1868,8 @@ class PodHandle:
     #: save money would be paying for the work twice.
     draining: bool = False
     console_url: str = ""
+    #: How far its /logs have been drained into our own file.
+    log_cursor: int = 0
     #: Where this pod actually is and what it is. Reported to monitoring: the
     #: region matters for latency and for where the data is allowed to live, and
     #: "which model" is the first question anyone asks of a running fleet.
@@ -2335,6 +2337,63 @@ class RunpodPodPool:
     PORT_TIMEOUT_S = 900.0
     HEALTH_TIMEOUT_S = 600.0
 
+    def _pod_log_path(self, pod_id: str) -> str:
+        """Where this pod's drained log lives, beside the pod registry.
+
+        Kept after the pod is gone, which is the entire point: two of the three
+        pods investigated tonight had already been destroyed by the time there
+        was a question to ask.
+        """
+        base = os.path.dirname(_pod_registry_path())
+        d = os.path.join(base, "pod-logs")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{pod_id}.log")
+
+    def _drain_pod_log(self, pod: "PodHandle") -> None:
+        """Copy whatever the pod has said since last time into our own file.
+
+        Pull rather than push: the orchestrator can already reach a pod (that is
+        how it serves requests), the auth and pinned TLS are already in place,
+        and a pod that cannot reach back out still gets its log kept. Bounded at
+        both ends — the pod keeps a ring, we keep a tail — because neither disk
+        is free.
+        """
+        url = (pod.url or "").rstrip("/")
+        if not url:
+            return
+        since = getattr(pod, "log_cursor", 0) or 0
+        try:
+            headers = ({"Authorization": f"Bearer {self.api_key}"}
+                       if self.api_key else {})
+            reply = pod_http.get(f"{url}/logs?since={since}&limit=2000",
+                                 headers=headers, timeout=15)
+            if reply.status_code != 200:
+                return            # an older image has no /logs; nothing to do
+            data = reply.json()
+        except Exception:
+            return                # unreachable is the health machinery's problem
+        lines = data.get("lines") or []
+        dropped = int(data.get("dropped") or 0)
+        pod.log_cursor = int(data.get("cursor") or since)
+        if not lines and not dropped:
+            return
+        path = self._pod_log_path(pod.pod_id)
+        try:
+            with open(path, "a") as fh:
+                if dropped:
+                    # Silence and "nothing happened" must not read the same.
+                    fh.write(f"[drain] {dropped} line(s) rolled out of the pod's "
+                             f"ring before they were read\n")
+                for line in lines:
+                    fh.write(line + "\n")
+            if os.path.getsize(path) > _POD_LOG_MAX_BYTES:
+                with open(path) as fh:
+                    keep = fh.readlines()[-(_POD_LOG_KEEP_LINES):]
+                with open(path, "w") as fh:
+                    fh.writelines(keep)
+        except OSError:
+            pass
+
     def _dump_pod_logs(self, client, pod_id, why, url: str = ""):
         """Say what the pod was doing, from whichever source can still answer.
 
@@ -2345,6 +2404,17 @@ class RunpodPodPool:
         log, and it covers the container phases too (boot.sh writes them to the
         same file). Tried first, because it is the only one that ever works.
         """
+        # Drain whatever it has said first, so the file we keep covers the
+        # failure itself and not merely everything up to the last tick.
+        try:
+            for p in list(self.pods):
+                if p.pod_id == pod_id:
+                    self._drain_pod_log(p)
+                    print(f"[runpod] pod {pod_id} log kept at "
+                          f"{self._pod_log_path(pod_id)}", flush=True)
+                    break
+        except Exception:
+            pass
         if url:
             try:
                 import requests
@@ -3041,6 +3111,15 @@ class RunpodPodPool:
         """One scaler pass: shed pods the load no longer needs, reap idle/dead
         ones to min_pods, keep min warm."""
         now = time.time()
+        # Before anything is torn down: a pod's log is only readable while the
+        # pod exists, and the interesting lines are usually the last ones.
+        with self._cv:
+            alive_now = [p for p in self.pods if p.healthy]
+        for p in alive_now:
+            try:
+                self._drain_pod_log(p)
+            except Exception:
+                pass
         self._scale_down(now)
         with self._cv:
             pods = list(self.pods)
@@ -3716,6 +3795,11 @@ GLOBAL_VOLUME_MOUNT = "/workspace"
 #: leftover — the backstop for the race a registry cannot close (a process that
 #: died between creating a pod and recording it).
 REAP_GRACE_SECONDS = float(os.environ.get("CODERAI_RUNPOD_REAP_GRACE", "1200"))
+
+#: Bounds on the kept-after-death pod log. Generous enough for a boot plus a
+#: failure, small enough that a forgotten file cannot fill the config volume.
+_POD_LOG_MAX_BYTES = int(os.environ.get("CODERAI_POD_LOG_MAX_BYTES", 8 * 1024 * 1024))
+_POD_LOG_KEEP_LINES = int(os.environ.get("CODERAI_POD_LOG_KEEP_LINES", 20000))
 
 
 def _pod_age_seconds(pod: dict):

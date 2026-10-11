@@ -75,6 +75,13 @@ _BOOT_PHASES: list = []
 _BOOT_T0 = time.time()
 
 
+try:                              # before the first boot_phase() call
+    from codai.api.podlog import install as _install_podlog
+    _install_podlog()
+except Exception:
+    pass                          # a logging aid must never stop a boot
+
+
 def boot_phase(what: str) -> None:
     """Record and print one boot step, with seconds since process start.
 
@@ -313,6 +320,23 @@ if admin_static_dir.exists():
 # Serve a favicon at the conventional /favicon.ico path so browsers stop 404-ing on it.
 from fastapi.responses import FileResponse, Response as _FaviconResponse
 _favicon_path = admin_static_dir / "favicon.ico"
+
+
+@app.get("/logs", include_in_schema=False)
+async def pod_logs(since: int = 0, limit: int = 2000):
+    """This process's own output, from ``since`` onwards, with a cursor.
+
+    The missing half of ``/boot``: that covers the way up, this covers the life
+    after it. A rented pod is the one machine whose logs cannot be read from
+    outside — RunPod serves none — so it has to be able to say it itself, and
+    the renting install drains this into a file it keeps after the pod is gone.
+
+    Same guard as every other pod route: on a pod the bearer token is required
+    (CODERAI_API_TOKEN), so this is not a way to read an install's log without
+    one.
+    """
+    from codai.api.podlog import tail
+    return {"ok": True, **tail(since=since, limit=limit)}
 
 
 @app.get("/boot", include_in_schema=False)

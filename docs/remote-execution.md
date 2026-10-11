@@ -742,6 +742,33 @@ and the pool rents a second pod only once the first is carrying
 `scale_up_inflight_per_pod` requests. The same `pool` field works on a burst
 target, so two models' overflow shares one card.
 
+### What a pod was doing
+
+A rented pod is the one machine whose logs cannot be read from outside: RunPod
+publishes no pod-log API (its REST spec lists 23 routes and none serve logs, so
+every attempt returns HTTP 400), and `boot.sh` writes its phases to a file and
+then execs uvicorn, whose output goes to the container's stdout and nowhere else.
+
+So a coderai pod keeps a bounded ring of its own output and serves it:
+
+```
+GET /boot                      the way up: container phases + startup, with timings
+GET /logs?since=<cursor>       everything after it, with a cursor and a `dropped` count
+```
+
+and the renting install **drains** `/logs` on every scaler tick into
+`<config_dir>/pod-logs/<pod_id>.log`, **which it keeps after the pod is gone**.
+That is the point: a pod reclaimed mid-request takes its evidence with it, and
+the file is what is left to read afterwards. Both ends are bounded
+(`CODERAI_POD_LOG_MAX_BYTES`, `CODERAI_POD_LOG_KEEP_LINES`) because neither disk
+is free, and a gap in the pod's ring is written into the file rather than passed
+over in silence.
+
+The drain is a pull, not a push: the orchestrator can already reach a pod — that
+is how it serves requests — so the pod needs no outbound path, the bearer token
+and pinned TLS already apply, and a pod with no route back out still gets its log
+kept.
+
 ### Giving the pods back
 
 Growth has a matching contraction. The pool asks how many pods the **current**
