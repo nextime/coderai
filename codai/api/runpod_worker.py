@@ -167,6 +167,22 @@ class RunpodModelConfig:
     # concurrency needs and retires the excess, after holding the observation
     # this long (a burst that dips for a moment must not cost a pod that is
     # needed again seconds later, and a cold pod takes minutes to replace).
+    # Load the weights BEFORE calling the pod ready, by sending it one tiny
+    # inference. /v1/models answers as soon as the server is up, which is
+    # minutes before it can actually serve: a vLLM pod still has to download
+    # the checkpoint and build its KV cache on first use. So "ready" meant
+    # "reachable", every client read it as "usable", and the whole load landed
+    # inside somebody's first request — 807s for one OCR page, against clients
+    # timing out at 180-300s, and the conclusion that serving was broken.
+    #
+    # The pod bills through the load either way. This only decides whether the
+    # wait is visible to the operator (a pod that is not ready yet) or hidden
+    # inside a request that looks hung.
+    warmup_on_boot: bool = True
+    #: Budget for it. Separate from load_timeout_s: answering /v1/models and
+    #: having the weights resident are different milestones, and a checkpoint
+    #: re-downloaded on every pod (no network volume) is the slow one.
+    warmup_timeout_s: int = 900
     scale_down_after_s: int = 180
     # Which surplus pod to give back first. Off, the pool retires the least
     # loaded one (and among equals the one used least recently, whose prefix
@@ -1663,6 +1679,9 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     # 0 disables shedding entirely (pods then go only when idle_timeout_s says so).
     cfg.scale_down_after_s = max(0, _as_int(b.get("scale_down_after_s"),
                                             cfg.scale_down_after_s))
+    cfg.warmup_on_boot = _as_bool(b.get("warmup_on_boot"), cfg.warmup_on_boot)
+    cfg.warmup_timeout_s = max(0, _as_int(b.get("warmup_timeout_s"),
+                                          cfg.warmup_timeout_s))
     cfg.scale_down_costliest_first = _as_bool(b.get("scale_down_costliest_first"),
                                               cfg.scale_down_costliest_first)
     cfg.max_inflight_per_pod = max(0, _as_int(b.get("max_inflight_per_pod"),
@@ -2530,6 +2549,49 @@ class RunpodPodPool:
                      hourly_usd=float(shared_rate or 0.0))
         return True
 
+    def _warmup(self, pod_id: str, url: str) -> bool:
+        """Make the pod load its weights before anyone calls it ready.
+
+        One token against the served model. Cheap, and it is the only request
+        that can tell the difference between "the server is up" and "the model
+        is resident" — /v1/models answers the moment the process starts.
+
+        Returns whether it worked. A failure is NOT fatal: the pod may still
+        serve (a model whose warm-up shape we guessed wrong, an engine that
+        does not take chat completions), and refusing to use a pod we have
+        already paid to boot over a diagnostic request would be worse than the
+        hidden latency this exists to remove.
+        """
+        if not getattr(self.mcfg, "warmup_on_boot", True):
+            return False
+        budget = int(getattr(self.mcfg, "warmup_timeout_s", 900) or 0)
+        if budget <= 0:
+            return False
+        t0 = time.time()
+        payload = {"model": self.served or str(self.model_key),
+                   "messages": [{"role": "user", "content": "ok"}],
+                   "max_tokens": 1, "temperature": 0.0}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            reply = pod_http.post(url.rstrip("/") + "/v1/chat/completions",
+                                  json=payload, headers=headers, timeout=budget)
+        except Exception as exc:
+            print(f"[runpod] pod {pod_id}: warm-up did not complete "
+                  f"({type(exc).__name__}: {exc}) — serving anyway, the first "
+                  f"real request will pay the model load", flush=True)
+            return False
+        took = time.time() - t0
+        if reply.status_code >= 400:
+            print(f"[runpod] pod {pod_id}: warm-up answered HTTP "
+                  f"{reply.status_code} after {took:.0f}s — serving anyway "
+                  f"({str(reply.text)[:200]})", flush=True)
+            return False
+        print(f"[runpod] pod {pod_id}: weights resident after {took:.0f}s "
+              f"(warm-up inference) — ready means ready", flush=True)
+        return True
+
     def _data_centers(self) -> list:
         """Regions to try, in order. Always at least one entry.
 
@@ -2632,6 +2694,10 @@ class RunpodPodPool:
                               f"{time.time() - t_port:.0f}s more "
                               f"({time.time() - t_created:.0f}s total)", flush=True)
                         self._log_pod_catalogue(url)
+                        # Pay the model load here, where it is visible as a pod
+                        # that is not ready yet, rather than inside the first
+                        # request where it looks like a hang.
+                        self._warmup(pod_id, url)
                         break
                     time.sleep(5)
                 else:

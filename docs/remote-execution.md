@@ -742,6 +742,29 @@ and the pool rents a second pod only once the first is carrying
 `scale_up_inflight_per_pod` requests. The same `pool` field works on a burst
 target, so two models' overflow shares one card.
 
+### "Ready" means the model is loaded
+
+A vLLM pod answers `/v1/models` the moment its process starts — minutes before it
+can serve anything, because the checkpoint still has to be downloaded (every pod
+re-downloads it without a network volume) and the KV cache built on first use. So
+a pod was called ready while it was merely reachable, and the whole model load
+landed inside somebody's first request, where it is indistinguishable from a hang.
+
+Measured: one OCR page took **807 s** end to end — ~400 s image pull, ~400 s
+weights — while the client timed out at 180–300 s and reported the serving as
+broken. It was not; nobody had waited long enough.
+
+So the pool sends **one token** against the served model before calling the pod
+ready (`warmup_on_boot`, on by default, budget `warmup_timeout_s`). The pod bills
+through the load either way; this only decides whether the wait is visible as a
+pod that is not ready yet, or hidden inside a request that looks stuck. A
+warm-up that fails is reported and the pod is used anyway — it may still serve,
+and refusing a pod already paid for over a diagnostic request would be worse than
+the latency this removes.
+
+For a client this means `pods_ready == 1` can be trusted: poll it, then send the
+document with an ordinary timeout.
+
 ### What a pod was doing
 
 A rented pod is the one machine whose logs cannot be read from outside: RunPod
