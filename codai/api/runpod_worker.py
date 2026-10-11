@@ -3533,8 +3533,12 @@ def _pod_registry_path() -> str:
         base = ""
     if not base:
         try:
-            from codai.platform_paths import user_config_dir
-            base = str(user_config_dir())
+            from codai.platform_paths import (deployment_config_dir,
+                                              user_config_dir)
+            # The deployment's own answer first: XDG_CONFIG_HOME is exported by
+            # the launcher and so exists only in the processes it started.
+            dep = deployment_config_dir()
+            base = str(dep) if dep else str(user_config_dir())
         except Exception:
             base = os.path.expanduser("~/.coderai")
     path = os.path.join(base, "runpod-pods.json")

@@ -48,6 +48,30 @@ router = APIRouter()
 #: and it must not be one keystroke from the public ``/v1/ocr/engines``.
 PREFIX = "/v1/ocr/attach"
 
+#: Failures that mean "there is nothing at this address", as opposed to a
+#: server that answered slowly or badly. Only these drop the upstream: a read
+#: timeout is a model taking its time over a dense page, and discarding a
+#: perfectly good pod for that would be its own outage.
+def _dead_upstream_errors():
+    import httpx
+    return (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError,
+            ConnectionRefusedError, ConnectionResetError)
+
+
+def _is_dead_upstream(exc: BaseException) -> bool:
+    """Whether this failure means "nothing is at that address".
+
+    Written as a check rather than an exception class on purpose: ``except``
+    matches on the class hierarchy at C level and never consults
+    ``__instancecheck__``, so a clever proxy class silently catches nothing. A
+    test caught exactly that here.
+    """
+    try:
+        return isinstance(exc, _dead_upstream_errors())
+    except Exception:
+        return False
+
+
 #: How long one page may take upstream. A dense scan on a cold pod legitimately
 #: takes minutes; a timeout here would look to the engine like a failed page.
 UPSTREAM_TIMEOUT_S = 3600.0
@@ -255,34 +279,58 @@ async def chat_completions(token: str, request: Request):
     from codai.models import placement
     body = await request.body()
 
-    try:
-        # How busy is too busy is the MODEL's own setting, the same one the pool
-        # scales on — not a second, OCR-shaped copy of it.
-        chosen = placement.choose(
-            got["model_id"],
-            spill_after=placement.spill_threshold(got["model_id"]))
-    except Exception as exc:
-        status = int(getattr(exc, "status", 503) or 503)
-        return JSONResponse(status_code=status,
-                            content={"error": {"message": str(exc),
-                                               "type": "server_error"}})
-
-    try:
-        headers = {"Content-Type": request.headers.get("content-type",
-                                                       "application/json")}
-        if chosen.api_key:
-            headers["Authorization"] = f"Bearer {chosen.api_key}"
-        url = chosen.base.rstrip("/") + "/chat/completions"
-        reply = await _upstream_client(url).post(url, content=body, headers=headers)
-        # The reply goes back as it came: a re-serialised response is how
-        # logprobs got lost in the first place.
-        media = reply.headers.get("content-type", "application/json")
-        return Response(status_code=reply.status_code, content=reply.content,
-                        media_type=media)
-    except Exception as exc:
-        return JSONResponse(status_code=502,
-                            content={"error": {
-                                "message": f"OCR upstream {chosen.kind} failed: {exc}",
-                                "type": "server_error"}})
-    finally:
-        chosen.release()
+    content_type = request.headers.get("content-type", "application/json")
+    # Twice at most: a rented pod can vanish between being chosen and being
+    # asked (RunPod reclaimed one mid-document today). The first attempt reports
+    # the corpse so the pool drops it; the second runs against whatever replaces
+    # it. A third would just be a retry loop against a real outage.
+    last_dead = ""
+    for attempt in (1, 2):
+        try:
+            # How busy is too busy is the MODEL's own setting, the same one the
+            # pool scales on — not a second, OCR-shaped copy of it.
+            chosen = placement.choose(
+                got["model_id"],
+                spill_after=placement.spill_threshold(got["model_id"]))
+        except Exception as exc:
+            status = int(getattr(exc, "status", 503) or 503)
+            return JSONResponse(status_code=status,
+                                content={"error": {"message": str(exc),
+                                                   "type": "server_error"}})
+        try:
+            headers = {"Content-Type": content_type}
+            if chosen.api_key:
+                headers["Authorization"] = f"Bearer {chosen.api_key}"
+            url = chosen.base.rstrip("/") + "/chat/completions"
+            reply = await _upstream_client(url).post(url, content=body,
+                                                     headers=headers)
+            # The reply goes back as it came: a re-serialised response is how
+            # logprobs got lost in the first place.
+            media = reply.headers.get("content-type", "application/json")
+            return Response(status_code=reply.status_code, content=reply.content,
+                            media_type=media)
+        except Exception as exc:
+            if not _is_dead_upstream(exc):
+                return JSONResponse(status_code=502,
+                                    content={"error": {
+                                        "message": f"OCR upstream {chosen.kind} "
+                                                   f"failed: {exc}",
+                                        "type": "server_error"}})
+            # Nothing answered at the address at all. Report it so the pool
+            # stops handing out a pod that no longer exists — left unsaid, every
+            # following page picks the same one and the in-flight count climbs
+            # with nothing draining.
+            last_dead = f"{type(exc).__name__}: {exc}"
+            print(f"[ocr] upstream {chosen.base} is not answering "
+                  f"({last_dead}) — dropping it", flush=True)
+            chosen.dead()
+            chosen = None
+            continue
+        finally:
+            if chosen is not None:
+                chosen.release()
+    return JSONResponse(status_code=503,
+                        content={"error": {
+                            "message": f"no OCR server answered for "
+                                       f"{got['model_id']!r} ({last_dead})",
+                            "type": "server_error"}})

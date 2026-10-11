@@ -1220,3 +1220,113 @@ def test_a_plain_http_upstream_is_not_pinned(monkeypatch):
     assert is_pinned_url("http://127.0.0.1:8000/v1") is False
     assert is_pinned_url("https://194.68.245.79:22198/v1") is True
     assert is_pinned_url("https://node.lan:8443/v1") is False
+
+
+# --------------------------------------- a pod can vanish under a document #
+# RunPod reclaimed an A40 mid-document today. The pool went on reporting it
+# healthy, so every page chose the same corpse: the in-flight count climbed and
+# nothing drained, which a client sees as "requests neither complete nor time
+# out". RunpodBackend has always reported this (_unreachable); a caller holding a
+# lease has to do the same.
+
+
+def _dead_then_alive(monkeypatch, failures=1):
+    """An upstream that refuses the first N connections, then answers."""
+    import httpx
+    state = {"n": 0}
+
+    class _Flaky(_CapturingClient):
+        @property
+        def is_closed(self):
+            return False
+
+        async def post(self, url, content=None, headers=None):
+            state["n"] += 1
+            if state["n"] <= failures:
+                raise httpx.ConnectError("connection refused")
+            return await super().post(url, content=content, headers=headers)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Flaky)
+    return state
+
+
+def _pod_cands(monkeypatch, discarded):
+    """Two successive pod leases, each able to report itself dead."""
+    def _acquire():
+        return ("https://10.0.0.9:8000/v1", "k", lambda: None,
+                lambda: discarded.append(1))
+    cand = dispatch.Candidate(key="pod:m", kind="pod", base="", priority=2,
+                              acquire=_acquire, primary=True)
+    monkeypatch.setattr(dispatch, "candidates", lambda m: [cand])
+    monkeypatch.setattr(dispatch, "_node_reported_load", lambda c: 0)
+
+
+def test_a_vanished_pod_is_reported_and_the_page_retried(monkeypatch):
+    _reset()
+    import asyncio
+    discarded = []
+    _dead_then_alive(monkeypatch, failures=1)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert discarded == [1]                  # the pool was told
+    assert reply.status_code == 200          # and the page still got read
+
+
+def test_it_gives_up_after_one_retry_rather_than_looping(monkeypatch):
+    """A real outage must not become a retry loop against every pod in turn."""
+    _reset()
+    import asyncio
+    discarded = []
+    _dead_then_alive(monkeypatch, failures=5)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 503
+    assert len(discarded) == 2               # both attempts reported, then stop
+
+
+def test_the_inflight_count_does_not_outlive_a_dropped_pod(monkeypatch):
+    """The symptom the client actually saw: a count that only grew."""
+    _reset()
+    import asyncio
+    discarded = []
+    _dead_then_alive(monkeypatch, failures=5)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert dispatch.inflight() == 0
+
+
+def test_a_slow_server_is_not_mistaken_for_a_dead_one(monkeypatch):
+    """A read timeout is a model taking its time over a dense page. Discarding a
+    healthy pod for that would be an outage of its own."""
+    _reset()
+    import asyncio
+    import httpx
+    discarded = []
+
+    class _Slow(_CapturingClient):
+        @property
+        def is_closed(self):
+            return False
+
+        async def post(self, url, content=None, headers=None):
+            raise httpx.ReadTimeout("too slow")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Slow)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 502          # reported, not retried
+    assert discarded == []                   # and the pod kept
+    assert dispatch.inflight() == 0
+
+
+def test_the_candidate_set_is_rebuilt_after_a_death():
+    """It named a pod that is gone; keeping it cached would hand it out again."""
+    _reset()
+    dispatch._candidates["m"] = (9e9, [_cand("node:a")])
+    lease = dispatch.Lease("http://a/v1", "", "node:a", "node")
+    lease.dead()
+    assert "m" not in dispatch._candidates

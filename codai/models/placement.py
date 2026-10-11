@@ -91,12 +91,14 @@ class Lease:
     """One chosen upstream for one request. Always released."""
 
     def __init__(self, base: str, api_key: str, key: str, kind: str,
-                 release: Optional[Callable] = None):
+                 release: Optional[Callable] = None,
+                 dead: Optional[Callable] = None):
         self.base = base
         self.api_key = api_key
         self.key = key
         self.kind = kind
         self._release = release
+        self._dead = dead
         self._done = False
 
     def release(self) -> None:
@@ -109,6 +111,25 @@ class Lease:
                 self._release()
             except Exception:
                 pass
+
+    def dead(self) -> None:
+        """Nothing answered at this address: tell the pool, then release.
+
+        A rented pod can vanish under us — RunPod reclaimed one mid-document
+        today, and the pool went on reporting it healthy. Every page then chose
+        the same corpse, the in-flight count climbed and nothing drained, which
+        is what a client sees as "requests neither complete nor time out". The
+        proxy backend has always reported this (RunpodBackend._unreachable);
+        a caller holding a lease has to do the same.
+        """
+        if self._dead is not None:
+            try:
+                self._dead()
+            except Exception:
+                pass
+            self._dead = None
+        forget()          # the candidate set named a pod that is gone
+        self.release()
 
     def __enter__(self):
         return self
@@ -277,7 +298,9 @@ def _pod_candidate(model_id: str) -> Optional[Candidate]:
         base, release = backend._acquire_endpoint()
         auth = (backend._headers or {}).get("Authorization", "")
         key = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        return base, key, release
+        # _unreachable() drops the pod the backend just handed out, which is
+        # what stops the next page choosing the same dead one.
+        return base, key, release, backend._unreachable
 
     # `backend: runpod` on the entry means the pool IS this model's home, so it
     # comes before a node that happens to list the same id.
@@ -321,7 +344,8 @@ def _spill_pod_candidate(model_id: str) -> Optional[Candidate]:
     def _acquire():
         pod, url = pool.acquire()
         key = getattr(pool, "api_key", "") or ""
-        return (url.rstrip("/") + "/v1", key, lambda: pool.release(pod))
+        return (url.rstrip("/") + "/v1", key, lambda: pool.release(pod),
+                lambda: pool.discard(pod, "connection refused"))
 
     return Candidate(key=f"spill:{model_id}", kind="pod", base="", priority=3,
                      acquire=_acquire)
@@ -457,12 +481,16 @@ def choose(model_id: str, spill_after: int = 0) -> Lease:
 def _take(cand: Candidate) -> Optional[Lease]:
     """Acquire a pool candidate, or None when it cannot provide a server."""
     try:
-        base, key, release = cand.acquire()
+        got = cand.acquire()
     except Exception as exc:
         print(f"[ocr] {cand.key} cannot serve this page: {exc}", flush=True)
         return None
+    # A pool may also hand back a way to say "this one is dead"; older
+    # three-value forms simply have none.
+    base, key, release = got[0], got[1], got[2]
+    dead = got[3] if len(got) > 3 else None
     _inc(cand.key)
-    return Lease(base, key, cand.key, cand.kind, release)
+    return Lease(base, key, cand.key, cand.kind, release, dead)
 
 
 def spill_threshold(model_id: str) -> int:

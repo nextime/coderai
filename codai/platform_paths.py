@@ -56,6 +56,26 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def deployment_config_dir():
+    """The config dir this DEPLOYMENT uses, whatever started the process.
+
+    The container launcher sets ``CODERAI_CONFIG_DIR`` and keeps its state in
+    ``$CODERAI_CONFIG_DIR/coderai``. It also exports ``XDG_CONFIG_HOME`` to
+    match — but only into the processes IT starts, so anything entering the
+    container another way (``podman exec``, a cron job, a diagnostic script)
+    resolves ``~/.config/coderai`` instead and quietly gets its own pod
+    registry and its own pod TLS CA. Proven by accident: a one-off script in
+    the container printed a third registry path and created a second CA.
+
+    Returns None when the variable is unset, so a host install keeps whatever
+    it was already using.
+    """
+    env = os.environ.get("CODERAI_CONFIG_DIR")
+    if not env:
+        return None
+    return Path(env).expanduser() / APP_NAME
+
+
 def default_config_dir() -> Path:
     return ensure_dir(user_config_dir())
 
