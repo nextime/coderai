@@ -302,3 +302,38 @@ def test_the_incident_is_recorded_where_the_mode_is_defined():
     """-GPU-less is the case that found this; the next reader deserves the why."""
     assert "no GPU" in SERVED_SRC
     assert "NO_VLLM_VENV" in SERVED_SRC
+
+
+# ------------------------------------------------------ images through a proxy
+def test_a_proxy_backend_forwards_images_instead_of_flattening_them():
+    """The front turns multipart content into the literal text "[image_url content]"
+    unless the backend claims vision, and only the llama.cpp backend ever did — so
+    every page sent to a VLM served by RunPod or by vLLM arrived as that placeholder
+    and the model answered, fluently, about nothing.
+
+    A proxy is not the right place to make that judgement: forwarded, a text-only
+    model's server answers 400 and a VLM's server reads the page. This is the path a
+    client takes when it drives olmOCR itself."""
+    from codai.backends.runpod import RunpodBackend
+    from codai.backends.remote_openai import RemoteOpenAIBackend
+    from codai.backends.vllm import VllmBackend
+    for cls in (RunpodBackend, RemoteOpenAIBackend, VllmBackend):
+        assert getattr(cls, "supports_vision", False) is True, cls.__name__
+
+
+def test_the_front_asks_the_backend_and_nothing_else():
+    """If this gate moves, the flag above stops having any effect."""
+    text = (ROOT / "codai/api/text.py").read_text()
+    assert "'supports_vision', False" in text
+
+
+# ------------------------------------------- structured output through a proxy
+def test_a_proxy_forwards_the_schema_it_was_given():
+    """It used to keep only {"type":"json_object"} and drop everything else, so a
+    json_schema — the strict form current clients send, Surya's guided decoding among
+    them — never reached the server, which then answered free text the caller could
+    not parse. The streamed path dropped it outright, json_object included."""
+    for mod in ("codai/backends/runpod.py", "codai/backends/vllm.py"):
+        src = (ROOT / mod).read_text()
+        assert 'response_format.get("type") == "json_object"' not in src, mod
+        assert src.count('payload["response_format"] = response_format') == 2, mod

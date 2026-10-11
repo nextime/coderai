@@ -1350,7 +1350,25 @@ def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str,
                 "direct download. A local .gguf path does not exist on a rented pod.")
     if mcfg.ctx and mcfg.ctx > 0:
         args += ["-c", str(mcfg.ctx)]
-    return " ".join(args)
+    return _with_extra_args(args, mcfg)
+
+
+def _with_extra_args(args: list, mcfg: "RunpodModelConfig") -> str:
+    """The generated flags, then whatever the operator added on the model entry.
+
+    ``extra_args`` has been accepted on a runpod block (and whitelisted per engine)
+    since pods shipped, and until now went nowhere: it was parsed, stored and never
+    put on a command line. Setting it looked like tuning and did nothing — which is
+    worse than refusing it, because the pod boots, serves, and quietly ignores the
+    decision. The two OCR VLMs are the case that noticed: a page-reading model wants
+    prefix caching (the prompt repeats on every page) and the Qwen-VL pixel bounds,
+    and neither could be expressed.
+
+    Appended verbatim and LAST, so an explicit flag overrides a generated one the way
+    it does on any command line. ``docker_args`` still replaces the whole line for
+    anyone who wants nothing of ours."""
+    extra = (getattr(mcfg, "extra_args", "") or "").strip()
+    return " ".join(args) + (" " + extra if extra else "")
 
 
 def _as_bool(v, default=False):
@@ -1885,7 +1903,7 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
     if mcfg.quantization:
         args += ["--quantization", mcfg.quantization]
     args += _pod_lora_args(entry or {})
-    return " ".join(args)
+    return _with_extra_args(args, mcfg)
 
 
 #: Where a staged download lands inside the pod. Container disk by default —

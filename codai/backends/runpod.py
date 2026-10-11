@@ -54,6 +54,17 @@ class RunpodBackend(ModelBackend):
     # RunPod models never occupy local VRAM.
     uses_local_vram = False
 
+    #: Multipart (image) content is forwarded to the remote server VERBATIM.
+    #
+    # This is not a claim that every model behind this backend reads images — it is a
+    # statement about who gets to decide. The front flattens multipart content to the
+    # literal text "[image_url content]" unless the backend says otherwise, which for a
+    # proxy is the one unacceptable answer: the page is dropped and the model answers
+    # confidently about nothing. Forwarded, a text-only model's server returns a plain
+    # 400 and a VLM's server reads the image. (Found by olmOCR in "model" mode against
+    # a RunPod pod: every page arrived as that placeholder string.)
+    supports_vision = True
+
     def __init__(self, cfg=None):
         if cfg is None:
             from codai.config import RunpodConfig
@@ -231,8 +242,14 @@ class RunpodBackend(ModelBackend):
                 base, release = self._acquire_endpoint()
                 try:
                     payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
-                    if response_format and response_format.get("type") == "json_object":
-                        payload["response_format"] = {"type": "json_object"}
+                    # Forward the structured-output request AS ASKED. This used to
+                    # keep only {"type":"json_object"}, so a json_schema — the strict
+                    # form every current client sends, Surya's guided decoding among
+                    # them — was dropped on the way out and the server answered free
+                    # text that the caller then failed to parse. The remote decides
+                    # what it supports; a proxy that edits the request decides for it.
+                    if response_format:
+                        payload["response_format"] = response_format
                     if tools:
                         payload["tools"] = tools
                     r = pod_http.post(base + "/chat/completions", json=payload,
@@ -265,6 +282,11 @@ class RunpodBackend(ModelBackend):
                 # Pod acquire may provision (blocking) — do it off the event loop.
                 base, release = await asyncio.to_thread(self._acquire_endpoint)
                 payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
+                # A streamed request asks for structure as often as a buffered one,
+                # and dropped it here even for json_object: the parameter was
+                # accepted and then never looked at again.
+                if response_format:
+                    payload["response_format"] = response_format
                 if tools:
                     payload["tools"] = tools
                 try:

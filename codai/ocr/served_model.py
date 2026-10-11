@@ -45,25 +45,38 @@ def _entry_backend(model_id: str):
     """
     from codai.models import manager as mm
 
+    # A model pinned to another host (service_url) already IS an endpoint. Asking
+    # first costs nothing, and a failure to even ask must not shadow the next
+    # candidate — hence the claim and the construction are separate steps.
+    claimed_remote = False
     try:
         from codai.backends import remote_openai
-        if remote_openai.remote_should_handle(model_id):
-            backend = remote_openai.RemoteOpenAIBackend()
+        claimed_remote = bool(remote_openai.remote_should_handle(model_id))
+    except Exception:
+        claimed_remote = False
+    if claimed_remote:
+        try:
+            from codai.backends.remote_openai import RemoteOpenAIBackend
+            backend = RemoteOpenAIBackend()
             backend.load_model(model_id)
             return backend
-    except OcrError:
-        raise
-    except Exception as exc:
-        raise OcrError(f"model {model_id!r}: remote endpoint unusable: {exc}", status=503)
+        except Exception as exc:
+            raise OcrError(f"model {model_id!r}: remote endpoint unusable: {exc}",
+                           status=503)
 
     try:
-        if mm.runpod_should_handle(model_id):
+        claimed_runpod = bool(mm.runpod_should_handle(model_id))
+    except Exception:
+        claimed_runpod = False
+    if claimed_runpod:
+        try:
             from codai.backends.runpod import RunpodBackend
             backend = RunpodBackend(mm.get_active_runpod_config())
             backend.load_model(model_id)
             return backend
-    except Exception as exc:
-        raise OcrError(f"model {model_id!r}: RunPod endpoint unusable: {exc}", status=503)
+        except Exception as exc:
+            raise OcrError(f"model {model_id!r}: RunPod endpoint unusable: {exc}",
+                           status=503)
 
     if mm.resolve_engine_backend(model_id) == "vllm":
         try:

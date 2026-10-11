@@ -24,6 +24,10 @@ from codai.backends.base import ModelBackend
 class VllmBackend(ModelBackend):
     """Thin OpenAI proxy to a managed vLLM server."""
 
+    #: Multipart (image) content goes to the server as it arrived — see the same flag
+    #: on RunpodBackend for why a proxy must not flatten it.
+    supports_vision = True
+
     _inflight = 0
     _inflight_lock = threading.Lock()
 
@@ -187,8 +191,14 @@ class VllmBackend(ModelBackend):
         self._enter_request()
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
-            if response_format and response_format.get("type") == "json_object":
-                payload["response_format"] = {"type": "json_object"}
+            # Forward the structured-output request AS ASKED. This used to
+            # keep only {"type":"json_object"}, so a json_schema — the strict
+            # form every current client sends, Surya's guided decoding among
+            # them — was dropped on the way out and the server answered free
+            # text that the caller then failed to parse. The remote decides
+            # what it supports; a proxy that edits the request decides for it.
+            if response_format:
+                payload["response_format"] = response_format
             if tools:
                 payload["tools"] = tools
             r = requests.post(self._base() + "/v1/chat/completions", json=payload, timeout=3600)
@@ -205,6 +215,9 @@ class VllmBackend(ModelBackend):
         self._enter_request()
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
+            # Same for the streamed path, which ignored it entirely.
+            if response_format:
+                payload["response_format"] = response_format
             if tools:
                 payload["tools"] = tools
             async for chunk in self._stream(self._base() + "/v1/chat/completions", payload,
