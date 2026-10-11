@@ -63,7 +63,8 @@ def test_each_pod_reports_where_it_is_and_what_it_serves():
                   '"gpu_count"', '"model"'):
         assert field in blk, field
     # and the placement has to be carried on the pod to be reportable
-    assert "data_center: str = \"\"" in src.split("class PodHandle")[1][:600]
+    _handle = src.split("class PodHandle")[1].split("\nclass ")[0].split("\n@")[0]
+    assert "data_center: str = \"\"" in _handle
     # The handle gets its region from the pool's own resolver. It used to read
     # a local `dc` that did not exist in this function, so the pod was created
     # and then the handle raised NameError — the A40 billed untracked.

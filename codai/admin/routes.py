@@ -3154,7 +3154,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                           if isinstance(sv, str) else bool(sv))
         # ints
         for k in ("container_disk_gb", "volume_gb", "port", "ctx", "min_pods",
-                  "max_pods", "scale_up_inflight_per_pod", "max_inflight_per_pod",
+                  "max_pods", "scale_up_inflight_per_pod", "scale_down_after_s",
+                  "max_inflight_per_pod",
                   "idle_timeout_s",
                   # how hard the POD's own server may be driven
                   "pod_max_parallel_requests", "pod_queue_max_size",

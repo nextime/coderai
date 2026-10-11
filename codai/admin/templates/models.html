@@ -1104,6 +1104,10 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <input type="number" id="cfg-rp-scale-up" class="form-input" min="1" placeholder="4">
               <span class="form-hint" style="font-size:11px">Add a pod once the least-loaded one carries this many requests.</span>
             </div>
+            <div class="form-row" style="margin:0"><label class="form-label">Scale down after (s)</label>
+              <input type="number" id="cfg-rp-scale-down" class="form-input" min="0" placeholder="180">
+              <span class="form-hint" style="font-size:11px">Give a pod back once the load no longer needs it and has not for this long. One per pass, least-loaded first, draining rather than dropping work. <b>0</b> = keep every pod until it goes fully idle (<code>idle_timeout_s</code>), which on a trickle of traffic means paying for the peak.</span>
+            </div>
             <div class="form-row" style="margin:0">
               <label class="form-label">Max in-flight per pod</label>
               <input type="number" id="cfg-rp-max-inflight" class="form-input" min="0" placeholder="0 = unlimited">
@@ -4927,6 +4931,7 @@ function _populateRunpod(s){
   set('cfg-rp-health-path', rp.health_path || '');
   set('cfg-rp-docker-args', rp.docker_args || '');
   set('cfg-rp-scale-up', rp.scale_up_inflight_per_pod != null ? rp.scale_up_inflight_per_pod : '');
+  set('cfg-rp-scale-down', rp.scale_down_after_s != null ? rp.scale_down_after_s : '');
   set('cfg-rp-max-inflight', rp.max_inflight_per_pod != null ? rp.max_inflight_per_pod : '');
   chk('cfg-rp-sticky', rp.sticky_sessions !== false);
   _updateRunpodVisibility();
@@ -5107,6 +5112,7 @@ function _collectRunpod(){
     health_path:        (val('cfg-rp-health-path') || '').trim(),
     docker_args:        (val('cfg-rp-docker-args') || '').trim(),
     scale_up_inflight_per_pod: intOrU('cfg-rp-scale-up'),
+    scale_down_after_s:        intOrU('cfg-rp-scale-down'),
     max_inflight_per_pod:      intOrU('cfg-rp-max-inflight'),
     sticky_sessions:    document.getElementById('cfg-rp-sticky').checked,
     schedule_enabled:   document.getElementById('cfg-rp-schedule-enabled').checked,

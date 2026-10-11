@@ -158,6 +158,16 @@ class RunpodModelConfig:
     # pool only ever grows when it has NO healthy pod, so fifty concurrent
     # requests would all pile onto pod #1 while max_pods sat unused.
     scale_up_inflight_per_pod: int = 4
+    # Scaling DOWN again when the pressure that justified the pods is gone.
+    # Idle teardown alone is not enough: it only fires on a pod with NO work and
+    # no request for idle_timeout_s, so a fleet that grew to absorb a burst and
+    # is now trickling keeps every pod alive — each one touched just often enough
+    # to look used, all of them a fraction busy, and the bill is the peak for as
+    # long as the trickle lasts. So the pool also asks how many pods the CURRENT
+    # concurrency needs and retires the excess, after holding the observation
+    # this long (a burst that dips for a moment must not cost a pod that is
+    # needed again seconds later, and a cold pod takes minutes to replace).
+    scale_down_after_s: int = 180
     # Hard ceiling on concurrent requests per pod (0 = no ceiling, let the remote
     # server's own batching absorb them). Above it, a request waits for a slot
     # instead of being piled on — use it for engines that degrade badly under
@@ -1639,6 +1649,9 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
                                              cfg.client_scale_ttl_s) or 1800)
     cfg.scale_up_inflight_per_pod = max(1, _as_int(b.get("scale_up_inflight_per_pod"),
                                                    cfg.scale_up_inflight_per_pod))
+    # 0 disables shedding entirely (pods then go only when idle_timeout_s says so).
+    cfg.scale_down_after_s = max(0, _as_int(b.get("scale_down_after_s"),
+                                            cfg.scale_down_after_s))
     cfg.max_inflight_per_pod = max(0, _as_int(b.get("max_inflight_per_pod"),
                                               cfg.max_inflight_per_pod))
     cfg.sticky_sessions = _as_bool(b.get("sticky_sessions"), cfg.sticky_sessions)
@@ -1837,6 +1850,10 @@ class PodHandle:
     healthy: bool = True
     inflight: int = 0
     last_used: float = 0.0
+    #: Chosen for retirement and no longer given new work. It stays healthy and
+    #: keeps serving what it already has: killing a pod with requests on it to
+    #: save money would be paying for the work twice.
+    draining: bool = False
     console_url: str = ""
     #: Where this pod actually is and what it is. Reported to monitoring: the
     #: region matters for latency and for where the data is allowed to live, and
@@ -2094,6 +2111,10 @@ class RunpodPodPool:
         self._client_floor_logged = -1
         self._provisioning = False
         self._closed = False
+        #: When the fleet first looked larger than the load needs. Scale-down
+        #: waits out scale_down_after_s from here, so a momentary dip in a burst
+        #: does not cost a pod that is wanted again seconds later.
+        self._surplus_since = 0.0
         # One log line per window transition, not one every scaler tick.
         self._sched_closed_logged = False
 
@@ -2569,7 +2590,8 @@ class RunpodPodPool:
         """Which pod serves this request: the one that already holds the
         conversation's cache, else the least loaded."""
         cap = int(getattr(self.mcfg, "max_inflight_per_pod", 0) or 0)
-        free = [p for p in healthy if cap <= 0 or p.inflight < cap]
+        free = [p for p in healthy
+                if not p.draining and (cap <= 0 or p.inflight < cap)]
         if not free:
             return None
         if affinity and getattr(self.mcfg, "sticky_sessions", True):
@@ -2595,10 +2617,15 @@ class RunpodPodPool:
         """
         if len(self.pods) >= self.mcfg.max_pods or self._provisioning:
             return False
-        if not healthy:
+        # A draining pod is on its way out and takes no new work, so counting it
+        # as capacity would answer "no need to grow" with the one pod that cannot
+        # help — and counting its emptying in-flight as the minimum would say the
+        # opposite. It is simply not part of the fleet any more.
+        serving = [p for p in healthy if not p.draining]
+        if not serving:
             return True
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-        return min(p.inflight for p in healthy) >= threshold
+        return min(p.inflight for p in serving) >= threshold
 
     def _grow_in_background(self):
         """Provision another pod without making the triggering request wait for it.
@@ -2792,9 +2819,88 @@ class RunpodPodPool:
             self._client_floor_logged = leased
         return max(scheduled, min(leased, max(1, self.mcfg.max_pods)))
 
+    def _pods_needed(self, serving: list) -> int:
+        """How many pods the CURRENT concurrency justifies.
+
+        The same arithmetic as scaling up, read backwards: one pod per
+        ``scale_up_inflight_per_pod`` requests in flight. Never below the warm
+        floor, never above the ceiling, and never zero while anything is in
+        flight.
+        """
+        threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
+        total = sum(p.inflight for p in serving)
+        need = -(-total // threshold)          # ceil, in integers
+        return max(self.effective_min_pods(), min(int(self.mcfg.max_pods), need))
+
+    def _scale_down(self, now: float) -> None:
+        """Retire one surplus pod per pass, once the surplus has persisted.
+
+        One per pass, not all of them at once: each retirement changes the
+        arithmetic, and a fleet that shed everything on a single quiet moment
+        would then cold-start for minutes when the next burst arrived. The
+        surplus has to hold for ``scale_down_after_s`` first, for the same
+        reason.
+
+        The pod picked is the least loaded; if it still has work it is marked
+        draining and left to finish, so no request is ever thrown away to save a
+        few cents.
+        """
+        if self._closed or int(getattr(self.mcfg, "scale_down_after_s", 0) or 0) <= 0:
+            return
+        with self._cv:
+            serving = [p for p in self.pods if p.healthy and not p.draining]
+            draining = [p for p in self.pods if p.healthy and p.draining]
+            need = self._pods_needed(serving)
+            surplus = len(serving) - need
+            total = sum(p.inflight for p in serving)
+
+            # A pod that was draining and has now emptied is done: terminate it
+            # here rather than waiting for the idle reaper's timeout, which is
+            # what it was taken out of service to avoid paying.
+            for p in draining:
+                if p.inflight == 0:
+                    p.healthy = False
+                    self.pods.remove(p)
+                    threading.Thread(target=self._terminate, args=(p, "scaled down"),
+                                     daemon=True).start()
+
+            if surplus <= 0 or total == 0:
+                # Nothing in flight at all is NOT this routine's business. The
+                # idle reaper already walks a quiet pool down to the warm floor,
+                # on idle_timeout_s — a number the operator chose, weighing the
+                # bill against a cold start. Shedding here too would quietly
+                # replace 900s with scale_down_after_s and make that setting a
+                # lie. This exists for the other case: pods still serving, but
+                # more of them than the load needs.
+                self._surplus_since = 0.0
+                return
+            if not self._surplus_since:
+                self._surplus_since = now
+                return
+            if (now - self._surplus_since) < float(self.mcfg.scale_down_after_s):
+                return
+            # Hold the observation window again before the next one, so a pass
+            # does not walk the fleet down in one sweep.
+            self._surplus_since = now
+            victim = min(serving, key=lambda x: (x.inflight, -x.last_used))
+            if victim.inflight == 0:
+                victim.healthy = False
+                self.pods.remove(victim)
+                threading.Thread(target=self._terminate, args=(victim, "scaled down"),
+                                 daemon=True).start()
+                why = "terminated"
+            else:
+                victim.draining = True
+                why = f"draining ({victim.inflight} in flight)"
+        print(f"[runpod] {self.model_key!r}: {len(serving)} pod(s) for {total} "
+              f"request(s) in flight, {need} needed — {why} {victim.pod_id}",
+              flush=True)
+
     def maintain(self):
-        """One scaler pass: reap idle/dead pods to min_pods, keep min warm."""
+        """One scaler pass: shed pods the load no longer needs, reap idle/dead
+        ones to min_pods, keep min warm."""
         now = time.time()
+        self._scale_down(now)
         with self._cv:
             pods = list(self.pods)
         # Idle teardown (down to min_pods), only pods with no in-flight work.

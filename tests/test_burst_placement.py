@@ -124,12 +124,15 @@ def test_model_is_renamed_for_the_remote():
 # pod pool: real concurrency scaling, sticky cache, and the bearer token
 # --------------------------------------------------------------------------- #
 class _Pod:
-    def __init__(self, pid, inflight=0):
+    def __init__(self, pid, inflight=0, draining=False):
         self.pod_id = pid
         self.url = f"http://{pid}"
         self.healthy = True
         self.inflight = inflight
         self.last_used = 0.0
+        # A pod chosen for retirement takes no new work and is not counted as
+        # capacity (see test_runpod_scale_down).
+        self.draining = draining
 
 
 def _pool(**block):

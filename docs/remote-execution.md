@@ -742,6 +742,36 @@ and the pool rents a second pod only once the first is carrying
 `scale_up_inflight_per_pod` requests. The same `pool` field works on a burst
 target, so two models' overflow shares one card.
 
+### Giving the pods back
+
+Growth has a matching contraction. The pool asks how many pods the **current**
+concurrency justifies — the same arithmetic as scaling up, read backwards, one
+pod per `scale_up_inflight_per_pod` requests in flight — and retires the excess
+once the surplus has held for `scale_down_after_s` (default 180; `0` switches
+shedding off).
+
+`idle_timeout_s` alone does not cover this. It fires on a pod with **no** work
+and no request for its whole timeout, so a fleet that grew for a burst and is now
+serving a trickle keeps every pod: each is touched often enough to look used,
+each is a fraction busy, and the bill stays at the peak until the trickle stops.
+With a high `max_pods` that is the difference between a few dollars an hour and a
+few hundred.
+
+Three rules make it safe to leave on:
+
+* **work is never dropped to save money** — the pod retired is the least loaded,
+  and if it still has requests it is marked draining, taking no new work and
+  terminating only once it has finished what it had;
+* **one pod per pass**, after the surplus has persisted, and the window restarts
+  after each retirement: a dip of a few seconds must not cost a pod that is
+  wanted again seconds later, because a cold one takes minutes to replace;
+* **a quiet pool is not this routine's business.** With nothing in flight,
+  teardown is left entirely to `idle_timeout_s` — a number you chose, weighing
+  the bill against a cold start — so shedding never silently shortens it.
+
+The warm floor (`min_pods`, or a client's `/v1/runpod/scale` lease) is a floor
+here too and is never scaled through.
+
 **This needs a multi-model pod image.** A vLLM pod is launched `--model X` and a
 llama.cpp pod `-hf one.gguf`: they serve exactly one model, so sharing is refused
 with an explicit error rather than sending requests to a pod that would answer
