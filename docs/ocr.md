@@ -254,6 +254,12 @@ per-engine `*_enabled` /
 `*_instances` / `*_use_gpu` / lang; `detect_mode` (+ `detect_model_path`, `detect_conf`);
 `extract_enabled` / `extract_model_id` / `extract_schema` / `extract_validate`.
 
+`*_use_gpu` is a **requirement, not a preference**: with it on and no CUDA device
+present, paddle and docTR refuse to load (503, naming the setting) rather than
+reading pages on the CPU many times slower with nothing in the response to say so.
+Set it to `false` to run on the CPU deliberately — that is fully supported, it just
+has to be asked for.
+
 **Concurrency on one GPU** comes from loading multiple instances of an engine
 (`paddle_instances` etc.) and fanning pages across them (bounded by `max_concurrency`).
 OCR models are small, so a 24 GB card (e.g. RTX 3090) fits several instances — good

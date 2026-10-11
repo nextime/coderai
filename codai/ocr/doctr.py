@@ -51,19 +51,37 @@ class DoctrEngine(OcrEngine):
         except Exception as e:
             raise OcrError(f"failed to initialise docTR predictor: {e}", status=500)
 
-        # Device placement: default is GPU when torch sees CUDA. Force CPU if requested.
+        # Device placement. `doctr_use_gpu` is a REQUIREMENT, not a preference:
+        # this used to fall back to CPU whenever torch saw no CUDA device, which
+        # ran at a fraction of the speed and said so nowhere — the page came back
+        # looking normal, minutes late. coderai does not quietly move GPU work to
+        # the CPU anywhere else, and paddle refuses outright in the same
+        # situation; docTR was the odd one out. Running on CPU is still perfectly
+        # supported — it just has to be asked for.
         if not self.cfg.doctr_use_gpu:
             try:
                 self._model = self._model.cpu()
             except Exception:
                 pass
-        else:
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    self._model = self._model.cuda()
-            except Exception:
-                pass
+            return
+        try:
+            import torch
+            available = bool(torch.cuda.is_available())
+        except Exception as e:
+            raise OcrError(f"docTR needs torch to place the model on a GPU, and "
+                           f"importing it failed: {e}", status=503)
+        if not available:
+            raise OcrError(
+                "docTR is configured to use a GPU (ocr.doctr_use_gpu) and torch "
+                "sees no CUDA device. It will NOT silently run on the CPU, which "
+                "would be many times slower with nothing to show why. Set "
+                "ocr.doctr_use_gpu = false to run it on the CPU deliberately, or "
+                "use an install that has a card.",
+                status=503)
+        try:
+            self._model = self._model.cuda()
+        except Exception as e:
+            raise OcrError(f"docTR could not move onto the GPU: {e}", status=503)
 
     def cleanup(self) -> None:
         self._model = None

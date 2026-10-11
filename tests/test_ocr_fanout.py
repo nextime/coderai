@@ -648,7 +648,8 @@ def _mgr(**ocr):
     fields = dict(default_engine="paddle", surya_model_id="", surya_model="",
                   olmocr_model_id="", olmocr_model="", surya_enabled=True,
                   surya_accept_license=True, olmocr_enabled=True,
-                  olmocr_accept_license=True, enabled=True)
+                  olmocr_accept_license=True, enabled=True,
+                  doctr_enabled=True, paddle_enabled=True)
     fields.update(ocr)
     cfg = types.SimpleNamespace(**fields)
     mgr._require_cfg = lambda: cfg
@@ -709,3 +710,102 @@ def test_a_model_with_nothing_to_rent_never_spills_on_load(monkeypatch):
     from codai.models import placement
     monkeypatch.setattr(placement, "model_entry", lambda m: {"id": m})
     assert placement.spill_threshold("m") == 0
+
+
+# ------------------------------------------- no engine quietly moves to the CPU #
+# docTR used to call .cuda() if torch happened to see a card and otherwise just
+# stay on the CPU, so a GPU-less install read pages many times slower with
+# nothing in the response to say why. Nothing else in coderai moves GPU work to
+# the CPU on its own, and paddle refuses outright in the same situation.
+
+
+def _doctr_load(use_gpu, cuda_available, monkeypatch):
+    """Run the REAL DoctrEngine.load(), with docTR and torch stubbed.
+
+    Driving the real method matters: a helper that re-implemented the placement
+    rules would keep passing after the rules changed in doctr.py.
+    """
+    import types
+    from codai.ocr.doctr import DoctrEngine
+
+    placed = []
+    model = types.SimpleNamespace(cpu=lambda: placed.append("cpu") or model,
+                                  cuda=lambda: placed.append("gpu") or model)
+    doctr_models = types.SimpleNamespace(ocr_predictor=lambda **kw: model)
+    monkeypatch.setitem(sys.modules, "doctr",
+                        types.SimpleNamespace(models=doctr_models))
+    monkeypatch.setitem(sys.modules, "doctr.models", doctr_models)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: cuda_available,
+                                   empty_cache=lambda: None)))
+
+    eng = DoctrEngine.__new__(DoctrEngine)
+    eng.cfg = types.SimpleNamespace(doctr_use_gpu=use_gpu, doctr_det_arch="",
+                                    doctr_reco_arch="")
+    eng._model = None
+    eng.load()
+    return placed
+
+
+def test_doctr_refuses_rather_than_running_on_the_cpu_unasked(monkeypatch):
+    """A 503 that names the setting beats a page that takes minutes for no
+    visible reason."""
+    from codai.ocr.base import OcrError
+    try:
+        _doctr_load(use_gpu=True, cuda_available=False, monkeypatch=monkeypatch)
+    except OcrError as exc:
+        assert exc.status == 503
+        assert "doctr_use_gpu" in str(exc)
+    else:
+        raise AssertionError("expected docTR to refuse")
+
+
+def test_doctr_on_cpu_is_still_fully_supported_when_asked_for(monkeypatch):
+    """Refusing the silent fallback must not remove the deliberate choice."""
+    assert _doctr_load(use_gpu=False, cuda_available=False,
+                       monkeypatch=monkeypatch) == ["cpu"]
+
+
+def test_doctr_uses_the_gpu_when_it_has_one(monkeypatch):
+    assert _doctr_load(use_gpu=True, cuda_available=True,
+                       monkeypatch=monkeypatch) == ["gpu"]
+
+
+def test_doctr_does_not_touch_the_cpu_path_when_it_refuses(monkeypatch):
+    """It must refuse BEFORE placing the model anywhere."""
+    from codai.ocr.base import OcrError
+    try:
+        _doctr_load(use_gpu=True, cuda_available=False, monkeypatch=monkeypatch)
+    except OcrError:
+        pass
+
+
+def test_the_refusal_message_names_the_way_out():
+    import inspect
+    from codai.ocr.doctr import DoctrEngine
+    src = inspect.getsource(DoctrEngine.load)
+    assert "ocr.doctr_use_gpu = false" in src
+    assert "NOT silently run on the CPU" in src
+
+
+# -------------------------------------------- a request that names no engine #
+def test_no_engine_in_the_request_uses_the_configured_default():
+    """`ocr.default_engine` is the whole answer: a client that just posts a file
+    gets whatever the install decided OCR means."""
+    mgr = _mgr(default_engine="surya", surya_model_id="datalab-to/surya-ocr-2")
+    assert mgr.resolve_engine(None) == "surya"
+    assert mgr.resolve_engine("") == "surya"
+
+
+def test_the_default_may_itself_be_a_model_id():
+    """The same two spellings work for the default as for a request, so an
+    operator can write down the checkpoint they think in rather than the name of
+    the pipeline that drives it."""
+    mgr = _mgr(default_engine="allenai/olmOCR-2-7B-1025-FP8",
+               olmocr_model_id="allenai/olmOCR-2-7B-1025-FP8")
+    assert mgr.resolve_engine(None) == "olmocr"
+
+
+def test_an_explicit_engine_still_overrides_the_default():
+    mgr = _mgr(default_engine="surya", surya_model_id="datalab-to/surya-ocr-2")
+    assert mgr.resolve_engine("doctr") == "doctr"
