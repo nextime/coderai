@@ -24,6 +24,12 @@ class SuryaEngine(SubprocessOcrEngine):
     name = "surya"
     _worker_engine = "surya"
 
+    # Where the recognition VLM is, what the server calls it, and the token that
+    # opens it. Empty in the local mode, and resolved by load() in the served ones.
+    _server_url = ""
+    _server_key = ""
+    _served_name = ""
+
     def _venv_dir(self) -> str:
         return _resolve_venv_dir(self.cfg.surya_venv, "surya_venv", ("surya",))
 
@@ -36,19 +42,39 @@ class SuryaEngine(SubprocessOcrEngine):
     def _worker_opts(self) -> dict:
         return {"langs": self.cfg.surya_langs or "it"}
 
+    #: Modes where the recognition VLM lives in a model server we only talk to.
+    SERVED_MODES = ("model", "vllm", "llamacpp", "server")
+
     def _serve_mode(self) -> str:
-        return (getattr(self.cfg, "surya_serve", "local") or "local").strip().lower()
+        mode = (getattr(self.cfg, "surya_serve", "local") or "local").strip().lower()
+        return "llamacpp" if mode == "server" else mode
 
     def _worker_env(self) -> dict:
         """For the served ("Surya2") modes, tell the worker to attach to an external
-        OpenAI server instead of running detection+recognition locally."""
+        OpenAI server instead of running detection+recognition locally.
+
+        Surya reads these from its own settings, so the handshake is three values and
+        no patching: which client to use, where it is, and what the server calls the
+        model — it refuses to attach to a server whose /v1/models disagrees with the
+        checkpoint it expects. The key matters as much: a pod URL is reachable by
+        anyone who learns it, so ours are launched bearer-locked, and Surya's vLLM
+        client takes that token from VLLM_API_KEY (its llama.cpp client hardcodes
+        "EMPTY", which is why a locked endpoint is always attached to as "vllm")."""
         mode = self._serve_mode()
-        if mode not in ("vllm", "llamacpp"):
+        if mode not in self.SERVED_MODES:
             return {}
         url = self._server_url
         if not url:
             return {}
-        return {"SURYA_INFERENCE_BACKEND": mode, "SURYA_INFERENCE_URL": url}
+        env = {
+            "SURYA_INFERENCE_BACKEND": "llamacpp" if mode == "llamacpp" else "vllm",
+            "SURYA_INFERENCE_URL": url,
+        }
+        if self._served_name:
+            env["SURYA_MODEL_CHECKPOINT"] = self._served_name
+        if self._server_key:
+            env["VLLM_API_KEY"] = self._server_key
+        return env
 
     def prelaunch_vram_gb(self) -> float:
         """In the served modes Surya rides a vLLM instance that grabs
@@ -83,7 +109,7 @@ class SuryaEngine(SubprocessOcrEngine):
         nil, and the instance's real cost is reported once through
         :meth:`prelaunch_vram_gb` / the vLLM stop estimate. Counting a whole GB per
         instance here asked to free 24 GB on a 24-instance pool."""
-        return 0.05 if self._serve_mode() in ("vllm", "llamacpp") else 1.0
+        return 0.05 if self._serve_mode() in self.SERVED_MODES else 1.0
 
     def load(self) -> None:
         if not self.cfg.surya_accept_license:
@@ -92,8 +118,28 @@ class SuryaEngine(SubprocessOcrEngine):
                 status=400,
             )
         self._server_url = ""
+        self._server_key = ""
+        self._served_name = ""
         mode = self._serve_mode()
-        if mode == "vllm":
+        if mode == "model":
+            # The recognition VLM is a MODEL this install already serves — on the
+            # Digesta orchestrator a RunPod A40 pod it rents on demand. Ask whichever
+            # backend owns it where it ended up, and attach there. This is the only
+            # served mode that works on a box with no GPU of its own, which is also
+            # the box whose entire job is to rent one.
+            from codai.ocr.served_model import endpoint_for
+            model_id = ((getattr(self.cfg, "surya_model_id", "") or "").strip()
+                        or (getattr(self.cfg, "surya_model", "") or "").strip())
+            if not model_id:
+                raise OcrError(
+                    "Surya 'model' mode needs ocr.surya_model_id — the id of the "
+                    "Surya-2 checkpoint in models.json (it must be served over HTTP: "
+                    "backend \"runpod\", a service_url, or the local vLLM backend).",
+                    status=400)
+            self._server_url, self._server_key, self._served_name = endpoint_for(model_id)
+            print(f"[ocr] surya attaches to {self._server_url} "
+                  f"(served as {self._served_name!r})", flush=True)
+        elif mode == "vllm":
             # Serve the Surya2 VLM checkpoint via coderai's vLLM backend (continuous
             # batching) and attach Surya to it. Requires vllm enabled/auto-buildable.
             from codai.api import vllm_worker
@@ -106,6 +152,7 @@ class SuryaEngine(SubprocessOcrEngine):
                                               gpu_memory_utilization=self._vlm_gmu(),
                                               **vlm_serve_limits(self.cfg))
             self._server_url = base.rstrip("/") + "/v1"
+            self._served_name = model
         elif mode == "llamacpp":
             url = (getattr(self.cfg, "surya_server_url", "") or "").strip()
             if not url:
@@ -114,3 +161,38 @@ class SuryaEngine(SubprocessOcrEngine):
                     "OpenAI endpoint).", status=400)
             self._server_url = url
         super().load()
+
+    # ------------------------------------------------------------------ leases
+
+    def _endpoint_alive(self) -> bool:
+        """Whether the server this worker was pinned to still answers /health."""
+        import requests
+        from codai.ocr.served_model import health_url
+        try:
+            r = requests.get(health_url(self._server_url) + "/health", timeout=5)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def recognize_image(self, image):
+        """One page, re-resolving the endpoint if the lease expired underneath us.
+
+        In 'model' mode the address is a rented pod, and a pod that has been idle for
+        its timeout is reaped — correctly, it costs money. The worker is then pinned to
+        a URL nothing answers, and would fail every page from then on. So a failure is
+        checked against the endpoint itself: if it is still healthy the error is real
+        and is reported, and if it is gone the worker is restarted against a freshly
+        provisioned one. Exactly once — a second failure is an outage, not a lease."""
+        try:
+            return super().recognize_image(image)
+        except OcrError as first:
+            if self._serve_mode() != "model" or self._endpoint_alive():
+                raise
+            print(f"[ocr] surya endpoint {self._server_url} is gone "
+                  f"({first}) — re-resolving", flush=True)
+            from codai.ocr import served_model
+            served_model.forget()
+            self.cleanup()
+            self.load()
+            self._loaded = True
+            return super().recognize_image(image)

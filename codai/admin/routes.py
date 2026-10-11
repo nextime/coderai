@@ -4139,6 +4139,7 @@ def build_settings_dict(c, gpu_cards):
             "surya_auto_build": c.ocr.surya_auto_build,
             "surya_serve": c.ocr.surya_serve,
             "surya_model": c.ocr.surya_model,
+            "surya_model_id": c.ocr.surya_model_id,
             "surya_server_url": c.ocr.surya_server_url,
             "build_retry_cooldown_s": c.ocr.build_retry_cooldown_s,
             "evict_drain_timeout_s": c.ocr.evict_drain_timeout_s,
@@ -4936,6 +4937,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_auto_build" in d: o.surya_auto_build = bool(d["surya_auto_build"])
         if "surya_serve" in d: o.surya_serve = (d.get("surya_serve") or "local").strip()
         if "surya_model" in d: o.surya_model = (d.get("surya_model") or "").strip()
+        if "surya_model_id" in d: o.surya_model_id = (d.get("surya_model_id") or "").strip()
         if "surya_server_url" in d: o.surya_server_url = (d.get("surya_server_url") or "").strip()
         if "build_retry_cooldown_s" in d: o.build_retry_cooldown_s = _f("build_retry_cooldown_s", o.build_retry_cooldown_s, 0.0)
         if "vlm_gpu_memory_utilization" in d: o.vlm_gpu_memory_utilization = _f("vlm_gpu_memory_utilization", o.vlm_gpu_memory_utilization, 0.0)

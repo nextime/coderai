@@ -63,15 +63,46 @@ matches the chosen serving mode:
 
 | `surya_serve` | What it is | surya‑ocr version | How it runs |
 |---|---|---|---|
-| `local` (default) | classic detection + recognition on torch | **≤ 0.17.1** (`requirements-surya.txt` pins 0.17.1) | in the isolated venv, GPU |
-| `vllm` | the latest **"Surya2"** VLM (Qwen3.5‑VL, `datalab-to/surya-ocr-2`) | **≥ 0.20** (e.g. 0.22.1) | served by coderai's **vLLM backend**; Surya attaches via `SURYA_INFERENCE_URL` |
-| `llamacpp` | same Surya2 VLM | ≥ 0.20 | attaches to a `llama-server` at `ocr.surya_server_url` |
+| `local` (default) | classic detection + recognition on torch | **≤ 0.17.1** | in the isolated venv, on a GPU of this box |
+| `model` | the **"Surya2"** VLM as a MODEL this install serves (`ocr.surya_model_id` → `models.json`) | **≥ 0.20** (pinned 0.22.1) | wherever that entry says: a **RunPod pod rented on demand**, another host via `service_url`, or the local vLLM backend. **The only served mode that needs no GPU here.** |
+| `vllm` | the same Surya2 VLM, served from coderai's own isolated vLLM venv | ≥ 0.20 | this box, CUDA required |
+| `llamacpp` (alias `server`) | the same Surya2 VLM | ≥ 0.20 | attaches to a server you already run, at `ocr.surya_server_url` |
 
-Surya2 (≥0.20) is a VLM that CANNOT run standalone in the venv — it requires an external
-OpenAI server (vLLM/llama‑server). `vllm` mode is recommended: coderai serves
-`ocr.surya_model` through the vLLM backend (continuous batching) and points Surya at it.
-So: install **surya‑ocr 0.17.1** for `local`, or **surya‑ocr>=0.20** for `vllm`/`llamacpp` —
-one per venv.
+Surya2 (≥0.20) is a VLM that CANNOT run standalone in the venv — it needs an OpenAI
+server to attach to. In the served modes the venv is therefore light: it renders the page
+and speaks HTTP, and every GPU second is spent on the other side.
+
+### `model` mode: Surya on whatever serves the model
+
+Surya is a *client* — layout, reading order, guided-JSON decoding and logprobs are its
+own, which is why it drives a model server directly instead of going back through
+coderai's `/v1` (one proxy hop would drop the guided decoding and the logprobs with it).
+What it needs from coderai is therefore an address, and `model` mode is where it asks for
+one in the vocabulary the rest of the server already speaks:
+
+```jsonc
+// models.json — the VLM is an ordinary model entry, served like any other
+"datalab-to/surya-ocr-2": { "backend": "runpod", "engine": "coderai-vllm", … }
+```
+```jsonc
+// config.json
+"ocr": { "surya_serve": "model", "surya_model_id": "datalab-to/surya-ocr-2" }
+```
+
+coderai resolves that id through the backend that owns it — provisioning a pod if the
+pool is cold — and hands the worker `SURYA_INFERENCE_URL`, `SURYA_MODEL_CHECKPOINT` (the
+served name; Surya refuses a server whose `/v1/models` disagrees) and `VLLM_API_KEY` (pods
+are bearer-locked). Renting, autoscaling, the spend ledger and the idle reaper stay with
+the model layer; the OCR side holds only a lease. When a scale-to-zero pod is reaped
+between documents, the next page finds the endpoint unhealthy, re-resolves once — which
+rents a fresh pod — and is read rather than lost.
+
+This is the mode for a **GPU-less orchestrator**: an install whose job is to rent cards
+has no card of its own, so `vllm` mode there can only ever fail (`NO_VLLM_VENV`), and a
+URL pasted into `llamacpp` mode stops existing fifteen minutes after the last page.
+
+So: install **surya‑ocr 0.17.1** for `local`, or **surya‑ocr>=0.20** for
+`model`/`vllm`/`llamacpp` — one per venv.
 Or set `paddle_auto_build` / `surya_auto_build` to have coderai create the venv and install
 on first use. In the OCI image these venvs are **baked in** at `/opt/coderai/paddle_venv` /
 `/opt/coderai/surya_venv` (same as the `lipsync_venv` / `parler-venv`), so the image is

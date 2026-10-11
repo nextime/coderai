@@ -157,6 +157,27 @@ class RunpodBackend(ModelBackend):
         self._last_pod = pod
         return url.rstrip("/") + "/v1", (lambda: self._pool.release(pod))
 
+    def openai_endpoint(self):
+        """``(base_url ending /v1, api_key)`` for a client that will speak to this
+        model over HTTP ITSELF, instead of going through us.
+
+        The OCR VLM engines work that way: Surya and olmOCR attach to an OpenAI server
+        and drive it with their own prompts, guided-decoding schemas and logprobs — all
+        things a proxy hop would quietly drop. So they get the address and the key.
+
+        Provisioning happens here (a cold pool rents and boots a pod before returning),
+        but the in-flight slot is released at once: a long-lived attachment must not
+        hold a scaling slot open, and the pod's own idle reaper decides when it goes.
+        The address is therefore a lease — the caller re-resolves when it stops
+        answering rather than treating it as permanent."""
+        base, release = self._acquire_endpoint()
+        try:
+            auth = (self._headers or {}).get("Authorization", "")
+            key = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+            return base, key
+        finally:
+            release()
+
     def _unreachable(self) -> None:
         """The pod refused the connection: drop it and let the caller retry.
 

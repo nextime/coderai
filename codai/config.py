@@ -966,12 +966,19 @@ class OcrConfig:
     surya_venv: str = ""               # isolated venv dir; blank = ~/.coderai/surya_venv
     surya_auto_build: bool = False     # create the venv + pip install requirements-surya.txt on first use
     # Surya serving mode: "local" = classic det+recognition on torch in the isolated venv
-    # (surya-ocr <=0.17); "vllm"/"llamacpp" = the latest "Surya2" VLM served by an external
-    # OpenAI server that Surya attaches to (SURYA_INFERENCE_URL). "vllm" reuses coderai's
-    # vLLM backend to serve `surya_model` (continuous batching); "llamacpp" attaches to a
-    # llama.cpp server at `surya_server_url`.
-    surya_serve: str = "local"         # local | vllm | llamacpp
+    # (surya-ocr <=0.17); the rest serve the latest "Surya2" VLM from an OpenAI server that
+    # Surya attaches to (SURYA_INFERENCE_URL), which is where the work then happens:
+    #   "model"    — the VLM is a MODEL in models.json (`surya_model_id`), served however
+    #                that entry says: a RunPod pod this install rents on demand, another
+    #                server via service_url, or the local vLLM backend. The only served
+    #                mode that works with no GPU on this box — which is precisely the box
+    #                whose job is to rent one.
+    #   "vllm"     — coderai's OWN isolated vLLM venv serves `surya_model` here (CUDA).
+    #   "llamacpp" — attach to a llama.cpp/OpenAI server already running, at
+    #                `surya_server_url`. ("server" is accepted as a synonym.)
+    surya_serve: str = "local"         # local | model | vllm | llamacpp
     surya_model: str = "datalab-to/surya-ocr-2"   # HF checkpoint for the served (vllm) backend
+    surya_model_id: str = ""           # ("model" mode) the models.json id serving Surya2
     surya_server_url: str = ""         # external OpenAI server URL (llamacpp/manual); blank = auto
 
     # --- olmOCR-2 (AllenAI, Apache-2.0) --- a document VLM: whole-page transcription in
@@ -1606,6 +1613,7 @@ class ConfigManager:
                 "surya_auto_build": self.config.ocr.surya_auto_build,
                 "surya_serve": self.config.ocr.surya_serve,
                 "surya_model": self.config.ocr.surya_model,
+                "surya_model_id": self.config.ocr.surya_model_id,
                 "surya_server_url": self.config.ocr.surya_server_url,
                 "build_retry_cooldown_s": self.config.ocr.build_retry_cooldown_s,
                 "evict_drain_timeout_s": self.config.ocr.evict_drain_timeout_s,
@@ -1726,6 +1734,8 @@ class ConfigManager:
                                 ("CODERAI_OCR_OLMOCR_MODEL_ID", "olmocr_model_id"),
                                 ("CODERAI_OCR_OLMOCR_SERVER_URL", "olmocr_server_url"),
                                 ("CODERAI_OCR_SURYA_SERVE", "surya_serve"),
+                                ("CODERAI_OCR_SURYA_MODEL", "surya_model"),
+                                ("CODERAI_OCR_SURYA_MODEL_ID", "surya_model_id"),
                                 ("CODERAI_OCR_SURYA_SERVER_URL", "surya_server_url"),
                                 ("CODERAI_OCR_FALLBACK_ENGINES", "fallback_engines")):
                 _val = (_os.environ.get(_env) or "").strip()

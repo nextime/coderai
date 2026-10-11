@@ -1180,8 +1180,8 @@ class FrontProxy:
             local.append(True)
         if getattr(o, "surya_enabled", False) and getattr(o, "surya_accept_license", False):
             mode = (getattr(o, "surya_serve", "local") or "local").strip().lower()
-            external = mode == "llamacpp" and bool(
-                (getattr(o, "surya_server_url", "") or "").strip())
+            external = mode == "model" or (mode in ("llamacpp", "server") and bool(
+                (getattr(o, "surya_server_url", "") or "").strip()))
             local.append(not external)
         if getattr(o, "olmocr_enabled", False):
             mode = (getattr(o, "olmocr_serve", "model") or "model").strip().lower()
