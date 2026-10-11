@@ -62,3 +62,44 @@ def test_an_unknown_age_does_not_fall_through_to_termination():
     blk = src.split("def reap_orphans")[1]
     assert "if age is None:" in blk
     assert "age is not None and age < REAP_GRACE_SECONDS" not in blk
+
+
+# ------------------------------------------- one registry, whoever is asking #
+# The registry is the cross-process shield: a pod one process created must not
+# look like an orphan to another's reaper. It is only a shield if every process
+# resolves the SAME file.
+
+
+def test_the_registry_falls_back_to_the_xdg_path_not_the_legacy_one(monkeypatch,
+                                                                    tmp_path):
+    """The container's launcher exports XDG_CONFIG_HOME and puts the real config
+    dir at $CODERAI_CONFIG_DIR/coderai. A process without the config manager used
+    to fall back to ~/.coderai — one directory up from where the config manager
+    writes — so the two read different registries."""
+    import sys as _sys
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # No config manager in this process, which is the case that diverged.
+    monkeypatch.setitem(_sys.modules, "codai.admin.routes",
+                        type(_sys)("codai.admin.routes"))
+    rw._REGISTRY_PATH_LOGGED = True
+    got = rw._pod_registry_path()
+    assert got == str(tmp_path / "coderai" / "runpod-pods.json")
+
+
+def test_the_config_manager_still_wins_when_it_is_there(monkeypatch, tmp_path):
+    import sys as _sys
+    import types
+    fake = types.ModuleType("codai.admin.routes")
+    fake.config_manager = types.SimpleNamespace(config_dir=str(tmp_path / "live"))
+    monkeypatch.setitem(_sys.modules, "codai.admin.routes", fake)
+    rw._REGISTRY_PATH_LOGGED = True
+    assert rw._pod_registry_path() == str(tmp_path / "live" / "runpod-pods.json")
+
+
+def test_the_resolved_path_is_logged_so_a_split_is_visible(capsys, monkeypatch,
+                                                           tmp_path):
+    """A registry that silently splits is invisible until it costs a GPU."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    rw._REGISTRY_PATH_LOGGED = False
+    rw._pod_registry_path()
+    assert "pod registry:" in capsys.readouterr().out

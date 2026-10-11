@@ -295,3 +295,70 @@ def test_a_dear_pod_with_work_is_still_drained_not_killed():
     _settle(pool)
     assert pool._killed == []
     assert [p.pod_id for p in pool.pods if p.draining] == ["dear"]
+
+
+# ------------------------------------------- a client finishing a batch KNOWS #
+# The automatic path waits out scale_down_after_s and retires one pod per pass,
+# because it is inferring from a momentary reading and a cold pod costs minutes.
+# A client that has just finished a batch is not inferring — and until now it had
+# no way to say so: releasing its lease only stopped the pool wanting pods, it
+# did not give them back.
+
+
+def test_a_client_can_shed_the_whole_surplus_at_once():
+    """Not one per pass: the window exists to protect against guessing, and this
+    caller is not guessing."""
+    pool = _pool(pods=[_pod("a", 0), _pod("b", 0), _pod("c", 0), _pod("d", 0)])
+    out = pool.shed_now()
+    assert len(out["terminated"]) == 4
+    assert pool.pods == []
+
+
+def test_the_operators_floor_still_holds():
+    """A client may give back what it asked for, never what the operator pays to
+    keep warm."""
+    pool = _pool(min_pods=2, pods=[_pod("a", 0), _pod("b", 0), _pod("c", 0)])
+    out = pool.shed_now()
+    assert len(out["terminated"]) == 1
+    assert out["kept"] == 2 and out["floor"] == 2
+
+
+def test_a_busy_pod_drains_instead_of_dying():
+    """Paying for a pod another minute is cheaper than failing someone's page."""
+    pool = _pool(threshold=10, pods=[_pod("busy", 3), _pod("idle", 0)])
+    out = pool.shed_now()
+    assert out["terminated"] == ["idle"]
+    assert out["draining"] == [] or "busy" not in out["terminated"]
+
+
+def test_everything_busy_is_all_drained_not_killed():
+    pool = _pool(threshold=10, pods=[_pod("a", 1), _pod("b", 2), _pod("c", 3)])
+    out = pool.shed_now()
+    assert out["terminated"] == []
+    assert len(out["draining"]) == 2          # one pod covers 6 requests at 10
+    assert all(p.healthy for p in pool.pods)  # none dropped work
+
+
+def test_what_the_load_still_needs_is_kept():
+    """`teardown` is not "kill everything": it sheds the SURPLUS."""
+    pool = _pool(threshold=4, pods=[_pod("a", 4), _pod("b", 4), _pod("c", 0)])
+    out = pool.shed_now()
+    assert out["kept"] == 2
+    assert len(out["terminated"]) == 1
+
+
+def test_the_cost_rule_applies_to_a_forced_teardown_too():
+    pool = _pool(costliest_first=True,
+                 pods=[_pod("cheap", 0, hourly_usd=0.35),
+                       _pod("dear", 0, hourly_usd=0.79)])
+    pool.mcfg.min_pods = 1
+    pool.effective_min_pods = lambda: 1
+    out = pool.shed_now()
+    assert out["terminated"] == ["dear"]
+
+
+def test_the_surplus_timer_is_reset_so_the_next_pass_starts_clean():
+    pool = _pool(pods=[_pod("a", 0), _pod("b", 0)])
+    pool._surplus_since = 123.0
+    pool.shed_now()
+    assert pool._surplus_since == 0.0

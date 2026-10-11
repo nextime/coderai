@@ -2866,6 +2866,48 @@ class RunpodPodPool:
                                                -p.inflight, -p.last_used))
         return min(serving, key=lambda p: (p.inflight, p.last_used))
 
+    def shed_now(self) -> dict:
+        """Give back every pod the load no longer needs, immediately.
+
+        The automatic path waits out ``scale_down_after_s`` and retires one pod
+        per pass, because it is GUESSING from a momentary reading and a cold pod
+        costs minutes to replace. A client calling this is not guessing: it has
+        finished its batch and knows no more work is coming, which is knowledge
+        the autoscaler does not have. So the window and the one-per-pass limit
+        are both skipped.
+
+        What is not skipped: the warm floor still holds, and a pod with requests
+        on it drains rather than dying — paying for a pod for another minute is
+        cheaper than making someone's page fail.
+        """
+        terminated, draining = [], []
+        with self._cv:
+            serving = [p for p in self.pods if p.healthy and not p.draining]
+            need = self._pods_needed(serving)
+            surplus = max(0, len(serving) - need)
+            order = sorted(serving, key=lambda p: (p.inflight, p.last_used))
+            if getattr(self.mcfg, "scale_down_costliest_first", False):
+                order = sorted(serving, key=lambda p: (-float(p.hourly_usd or 0.0),
+                                                       p.inflight, p.last_used))
+            for victim in order[:surplus]:
+                if victim.inflight == 0:
+                    victim.healthy = False
+                    self.pods.remove(victim)
+                    terminated.append(victim.pod_id)
+                    threading.Thread(target=self._terminate,
+                                     args=(victim, "released by client"),
+                                     daemon=True).start()
+                else:
+                    victim.draining = True
+                    draining.append(victim.pod_id)
+            self._surplus_since = 0.0
+            kept = len([p for p in self.pods if p.healthy and not p.draining])
+        print(f"[runpod] {self.model_key!r}: client released the fleet — "
+              f"{len(terminated)} terminated, {len(draining)} draining, "
+              f"{kept} kept (floor {need})", flush=True)
+        return {"terminated": terminated, "draining": draining, "kept": kept,
+                "floor": need}
+
     def _scale_down(self, now: float) -> None:
         """Retire one surplus pod per pass, once the surplus has persisted.
 
@@ -3303,12 +3345,17 @@ def pools_schedule_status() -> list:
     return out
 
 
-def set_client_pods(model: str, pods: int) -> dict:
+def set_client_pods(model: str, pods: int, teardown: bool = False) -> dict:
     """Lease a warm floor for one model on a client's behalf.
 
     Raises LookupError when the model has no RunPod block, and PermissionError
     when it has one that did not opt in — told apart so the caller can answer
     404 and 403, which are different problems for whoever is integrating.
+
+    ``teardown`` sheds the surplus straight away instead of leaving it to the
+    scale-down window: the client that just finished a batch knows the work has
+    stopped, which the autoscaler can only infer slowly. It cannot go below the
+    operator's warm floor, and it drains rather than dropping work.
     """
     key = str(model or "").strip()
     if not key:
@@ -3329,6 +3376,9 @@ def set_client_pods(model: str, pods: int) -> dict:
     # has called yet is exactly when it is worth pre-warming.
     pool = get_model_pod_pool(key, _model_entry(key), block)
     out = pool.set_client_floor(pods)
+    if teardown:
+        # After the floor is lowered, so the shed measures against the new one.
+        out["teardown"] = pool.shed_now()
     # Answer with the name the client asked about, not the internal pool key:
     # several models may share one pool, and "pool:digesta-qwen38" is not
     # something the caller sent or can look up.
@@ -3375,6 +3425,10 @@ def pods_status() -> list:
     return out
 
 
+#: Logged once per process, so two processes disagreeing about where the
+#: registry lives shows up in the log instead of as a terminated pod.
+_REGISTRY_PATH_LOGGED = False
+
 #: Pods this DEPLOYMENT owns, shared across processes.
 #:
 #: coderai runs a front plus one engine per GPU. Each engine has its own pool
@@ -3383,13 +3437,40 @@ def pods_status() -> list:
 #: created a pod and the radeon engine terminated it four seconds later, then the
 #: reverse — a mutual kill loop that rented and destroyed pods until stopped.
 def _pod_registry_path() -> str:
+    """The one file every process must agree on.
+
+    It used to fall back to ``~/.coderai`` when ``config_manager`` was not
+    initialised in the calling process — and the container's launcher puts the
+    real config dir at ``$CODERAI_CONFIG_DIR/coderai`` (it exports
+    XDG_CONFIG_HOME, so ``user_config_dir()`` lands there too). So a process
+    that had the config manager wrote one registry and a process that did not
+    read ANOTHER, one directory up: the pods one owned were orphans to the
+    other.
+
+    That is what made the documented kill loop recur on the Digesta
+    orchestrator: a pod created at 19:24:56 was terminated as untracked at
+    19:24:57. The fallback is now the same XDG-aware path the launcher computes,
+    so the two cannot diverge; the resolved path is logged once, because a
+    registry that silently splits is invisible until it costs a GPU.
+    """
+    base = ""
     try:
         from codai.admin.routes import config_manager
         base = str(getattr(config_manager, "config_dir", "") or "")
     except Exception:
         base = ""
-    base = base or os.path.expanduser("~/.coderai")
-    return os.path.join(base, "runpod-pods.json")
+    if not base:
+        try:
+            from codai.platform_paths import user_config_dir
+            base = str(user_config_dir())
+        except Exception:
+            base = os.path.expanduser("~/.coderai")
+    path = os.path.join(base, "runpod-pods.json")
+    global _REGISTRY_PATH_LOGGED
+    if not _REGISTRY_PATH_LOGGED:
+        _REGISTRY_PATH_LOGGED = True
+        print(f"[runpod] pod registry: {path}", flush=True)
+    return path
 
 
 def _registry_update(fn):

@@ -772,6 +772,22 @@ Three rules make it safe to leave on:
 The warm floor (`min_pods`, or a client's `/v1/runpod/scale` lease) is a floor
 here too and is never scaled through.
 
+**A client can give them back early.** The same endpoint releases and, with
+`teardown`, sheds immediately rather than waiting out the window:
+
+```bash
+curl -X POST .../v1/runpod/scale -H 'Authorization: Bearer <key>' \
+     -d '{"model": "datalab-to/surya-ocr-2", "pods": 0, "teardown": true}'
+```
+
+The automatic path deliberately waits and retires one pod per pass, because it
+is inferring from a momentary reading and a cold pod costs minutes to replace. A
+client that has just finished a batch is not inferring — it knows no more work is
+coming — so for that call the window and the one-per-pass limit are both skipped,
+and the reply says what happened: `{"terminated": [...], "draining": [...],
+"kept": N, "floor": N}`. It still cannot scale through the operator's `min_pods`,
+and a pod with requests on it drains rather than dying under them.
+
 **Which surplus pod goes.** By default the least loaded, and among equals the one
 used least recently — its prefix cache is the coldest, so retiring it throws away
 the least work. With `"scale_down_costliest_first": true` price leads instead:

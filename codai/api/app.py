@@ -873,6 +873,11 @@ class RunpodScaleRequest(BaseModel):
     pods: int = Field(..., ge=0,
                       description="Warm pods to hold, clamped to the model's max_pods. "
                                   "0 releases the lease.")
+    teardown: bool = Field(False,
+                           description="Give the surplus pods back NOW rather than "
+                                       "waiting out scale_down_after_s. Never goes "
+                                       "below the model's own min_pods, and a pod "
+                                       "with requests on it drains first.")
     model_config = ConfigDict(extra="allow")
 
 
@@ -886,6 +891,13 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     (``scale_up_inflight_per_pod``), so this is not needed for ordinary traffic;
     it removes the ramp, it does not replace the autoscaler.
 
+    The same call gives them back: ``pods: 0`` releases the lease, and
+    ``teardown: true`` sheds the surplus immediately instead of waiting out
+    ``scale_down_after_s``. A client that has just finished a batch knows the
+    work has stopped, which the autoscaler can only infer from a timer — but it
+    still cannot scale through the operator's own ``min_pods``, and a pod with
+    requests on it drains rather than dying under them.
+
     Deliberately NOT admin-scoped: the gate is per model
     (``allow_client_scale``), the number is clamped to ``max_pods``, and the
     lease expires (``client_scale_ttl_s``, default 30 min) so a client that dies
@@ -894,7 +906,8 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     """
     from codai.api import runpod_worker
     try:
-        return runpod_worker.set_client_pods(body.model, body.pods)
+        return runpod_worker.set_client_pods(body.model, body.pods,
+                                            teardown=bool(body.teardown))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except PermissionError as exc:
