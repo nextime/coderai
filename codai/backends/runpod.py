@@ -79,6 +79,7 @@ class RunpodBackend(ModelBackend):
         self._mode = "serverless"
         self._pool = None                         # pods: RunpodPodPool
         self._last_usage: Dict = {}
+        self._last_logprobs: Optional[Dict] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -141,6 +142,15 @@ class RunpodBackend(ModelBackend):
 
     def get_last_usage(self) -> dict:
         return dict(self._last_usage)
+
+    def get_last_logprobs(self):
+        """The pod's per-token log-probabilities for the last call, or None.
+
+        See the same method on VllmBackend: an OCR pipeline turns these into the
+        confidence it reports per line, and a proxy that swallows them makes the
+        pipeline fall back to a flat 1.0 — a confidence that was never measured.
+        """
+        return self._last_logprobs
 
     def cleanup(self) -> None:
         # Serverless: nothing to tear down (RunPod owns it). Pods: the pool
@@ -208,6 +218,17 @@ class RunpodBackend(ModelBackend):
                 "total_tokens": usage.get("total_tokens", 0),
             }
 
+    def _collect_logprobs(self, piece) -> None:
+        """Accumulate a streamed chunk's logprobs into one response-shaped object."""
+        if not isinstance(piece, dict):
+            return
+        content = piece.get("content")
+        if not content:
+            return
+        if not isinstance(self._last_logprobs, dict):
+            self._last_logprobs = {"content": []}
+        self._last_logprobs.setdefault("content", []).extend(content)
+
     def format_messages(self, messages) -> str:
         parts = []
         for m in messages:
@@ -216,7 +237,8 @@ class RunpodBackend(ModelBackend):
             parts.append(f"{role}: {content}")
         return "\n".join(parts)
 
-    def _chat_payload(self, messages, max_tokens, temperature, top_p, stop, stream):
+    def _chat_payload(self, messages, max_tokens, temperature, top_p, stop, stream,
+                      logprobs=None, top_logprobs=None):
         payload = {
             "model": self._served_name,
             "messages": messages,
@@ -228,20 +250,28 @@ class RunpodBackend(ModelBackend):
             payload["max_tokens"] = max_tokens
         if stop:
             payload["stop"] = stop
+        if logprobs:
+            payload["logprobs"] = True
+            if top_logprobs is not None:
+                payload["top_logprobs"] = int(top_logprobs)
         return payload
 
     # ------------------------------------------------------------------ #
     # chat-level generation
     # ------------------------------------------------------------------ #
     def generate_chat(self, messages: List[Dict], max_tokens=None, temperature=0.7,
-                      top_p=1.0, stop=None, tools=None, response_format=None):
+                      top_p=1.0, stop=None, tools=None, response_format=None,
+                      logprobs=None, top_logprobs=None):
         import requests
         self._enter_request()
+        self._last_logprobs = None
         try:
             for attempt in (1, 2):
                 base, release = self._acquire_endpoint()
                 try:
-                    payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
+                    payload = self._chat_payload(messages, max_tokens, temperature, top_p,
+                                                 stop, False, logprobs=logprobs,
+                                                 top_logprobs=top_logprobs)
                     # Forward the structured-output request AS ASKED. This used to
                     # keep only {"type":"json_object"}, so a json_schema — the strict
                     # form every current client sends, Surya's guided decoding among
@@ -266,7 +296,9 @@ class RunpodBackend(ModelBackend):
                     r.raise_for_status()
                     data = r.json()
                     self._store_usage(data.get("usage", {}))
-                    return data["choices"][0]["message"].get("content") or ""
+                    choice = (data.get("choices") or [{}])[0]
+                    self._last_logprobs = choice.get("logprobs")
+                    return choice.get("message", {}).get("content") or ""
                 finally:
                     release()
         finally:
@@ -274,14 +306,18 @@ class RunpodBackend(ModelBackend):
 
     async def generate_chat_stream(self, messages: List[Dict], max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None, tools=None,
-                                   response_format=None) -> AsyncGenerator[str, None]:
+                                   response_format=None, logprobs=None,
+                                   top_logprobs=None) -> AsyncGenerator[str, None]:
         import requests
         self._enter_request()
+        self._last_logprobs = None
         try:
             for attempt in (1, 2):
                 # Pod acquire may provision (blocking) — do it off the event loop.
                 base, release = await asyncio.to_thread(self._acquire_endpoint)
-                payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
+                payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop,
+                                             True, logprobs=logprobs,
+                                             top_logprobs=top_logprobs)
                 # A streamed request asks for structure as often as a buffered one,
                 # and dropped it here even for json_object: the parameter was
                 # accepted and then never looked at again.
@@ -350,6 +386,7 @@ class RunpodBackend(ModelBackend):
                 loop.call_soon_threadsafe(queue.put_nowait, text)
             if obj.get("usage"):
                 self._store_usage(obj["usage"])
+            self._collect_logprobs(choice.get("logprobs"))
             return bool(choice.get("finish_reason"))
 
         def _worker():

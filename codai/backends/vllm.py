@@ -57,6 +57,7 @@ class VllmBackend(ModelBackend):
         self._ctx = int(getattr(cfg, "ctx", 32768) or 32768)
         self._served_name = self._model_id
         self._last_usage: Dict = {}
+        self._last_logprobs: Optional[Dict] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -138,6 +139,17 @@ class VllmBackend(ModelBackend):
     def get_last_usage(self) -> dict:
         return dict(self._last_usage)
 
+    def get_last_logprobs(self):
+        """The server's per-token log-probabilities for the last call, or None.
+
+        ``generate_chat`` returns only the text, so a caller that asked for
+        ``logprobs`` reads them here — the same shape as ``get_last_usage``, and
+        for the same reason. Surya derives every line's confidence from these
+        (mean token probability); with none it reports a flat 1.0, so dropping
+        them does not merely lose a number, it invents a perfect one.
+        """
+        return self._last_logprobs
+
     def cleanup(self) -> None:
         from codai.api import vllm_worker
         key = getattr(self, "_svc_key", None) or getattr(self._cfg, "model_id", self._model_id)
@@ -160,6 +172,22 @@ class VllmBackend(ModelBackend):
                 "total_tokens": usage.get("total_tokens", 0),
             }
 
+    def _collect_logprobs(self, piece) -> None:
+        """Accumulate a streamed chunk's logprobs into one response-shaped object.
+
+        A stream carries them a few tokens at a time; a caller reading
+        ``get_last_logprobs()`` after the stream wants the whole list, as the
+        buffered path gives it.
+        """
+        if not isinstance(piece, dict):
+            return
+        content = piece.get("content")
+        if not content:
+            return
+        if not isinstance(self._last_logprobs, dict):
+            self._last_logprobs = {"content": []}
+        self._last_logprobs.setdefault("content", []).extend(content)
+
     def format_messages(self, messages) -> str:
         parts = []
         for m in messages:
@@ -168,7 +196,8 @@ class VllmBackend(ModelBackend):
             parts.append(f"{role}: {content}")
         return "\n".join(parts)
 
-    def _chat_payload(self, messages, max_tokens, temperature, top_p, stop, stream):
+    def _chat_payload(self, messages, max_tokens, temperature, top_p, stop, stream,
+                      logprobs=None, top_logprobs=None):
         payload = {
             "model": getattr(self, "_served_name", self._model_id),
             "messages": messages,
@@ -180,17 +209,24 @@ class VllmBackend(ModelBackend):
             payload["max_tokens"] = max_tokens
         if stop:
             payload["stop"] = stop
+        if logprobs:
+            payload["logprobs"] = True
+            if top_logprobs is not None:
+                payload["top_logprobs"] = int(top_logprobs)
         return payload
 
     # ------------------------------------------------------------------ #
     # chat-level generation
     # ------------------------------------------------------------------ #
     def generate_chat(self, messages: List[Dict], max_tokens=None, temperature=0.7,
-                      top_p=1.0, stop=None, tools=None, response_format=None):
+                      top_p=1.0, stop=None, tools=None, response_format=None,
+                      logprobs=None, top_logprobs=None):
         import requests
         self._enter_request()
+        self._last_logprobs = None
         try:
-            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
+            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False,
+                                         logprobs=logprobs, top_logprobs=top_logprobs)
             # Forward the structured-output request AS ASKED. This used to
             # keep only {"type":"json_object"}, so a json_schema — the strict
             # form every current client sends, Surya's guided decoding among
@@ -205,16 +241,21 @@ class VllmBackend(ModelBackend):
             r.raise_for_status()
             data = r.json()
             self._store_usage(data.get("usage", {}))
-            return data["choices"][0]["message"].get("content") or ""
+            choice = (data.get("choices") or [{}])[0]
+            self._last_logprobs = choice.get("logprobs")
+            return choice.get("message", {}).get("content") or ""
         finally:
             self._exit_request()
 
     async def generate_chat_stream(self, messages: List[Dict], max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None, tools=None,
-                                   response_format=None) -> AsyncGenerator[str, None]:
+                                   response_format=None, logprobs=None,
+                                   top_logprobs=None) -> AsyncGenerator[str, None]:
         self._enter_request()
+        self._last_logprobs = None
         try:
-            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
+            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True,
+                                         logprobs=logprobs, top_logprobs=top_logprobs)
             # Same for the streamed path, which ignored it entirely.
             if response_format:
                 payload["response_format"] = response_format
@@ -269,6 +310,7 @@ class VllmBackend(ModelBackend):
                 loop.call_soon_threadsafe(queue.put_nowait, text)
             if obj.get("usage"):
                 self._store_usage(obj["usage"])
+            self._collect_logprobs(choice.get("logprobs"))
             return bool(choice.get("finish_reason"))
 
         def _worker():

@@ -2257,6 +2257,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 }
             }
         
+        # Raw mode goes through its own formatter; a client that asked for
+        # logprobs must get them here too.
+        _lp = (current_manager.get_last_logprobs()
+               if hasattr(current_manager, "get_last_logprobs") else None)
+        if _lp and isinstance(formatted_response, dict) and formatted_response.get("choices"):
+            formatted_response["choices"][0]["logprobs"] = _lp
+
         from fastapi.responses import JSONResponse
         log_response_payload(formatted_response, streamed=False)
         return JSONResponse(content=formatted_response, headers=headers)
@@ -2286,6 +2293,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     repeat_penalty=request.repeat_penalty,
                     presence_penalty=request.presence_penalty,
                     frequency_penalty=request.frequency_penalty,
+                    logprobs=request.logprobs,
+                    top_logprobs=request.top_logprobs,
                 ):
                     yield chunk
             finally:
@@ -2313,6 +2322,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 repeat_penalty=request.repeat_penalty,
                 presence_penalty=request.presence_penalty,
                 frequency_penalty=request.frequency_penalty,
+                logprobs=request.logprobs,
+                top_logprobs=request.top_logprobs,
             )
         finally:
             _release_instance()
@@ -2520,6 +2531,8 @@ async def stream_chat_response(
     repeat_penalty: float = 1.0,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    logprobs: Optional[bool] = None,
+    top_logprobs: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2669,6 +2682,8 @@ async def stream_chat_response(
             repeat_penalty=repeat_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
         ):
             # Cooperative cancellation: stop streaming if the task was cancelled.
             if task_registry.is_cancelled(_tid):
@@ -2973,6 +2988,10 @@ async def stream_chat_response(
             context_size = current_manager.get_context_size()
 
             # Build complete final chunk with all OpenAI fields
+            # Streamed logprobs arrive a few tokens per chunk; the backend
+            # accumulated them, so the final chunk can carry the whole list.
+            _lp = (current_manager.get_last_logprobs()
+                   if hasattr(current_manager, "get_last_logprobs") else None)
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -2981,7 +3000,7 @@ async def stream_chat_response(
                 "choices": [{
                     "index": 0,
                     "finish_reason": "stop",
-                    "logprobs": None,
+                    "logprobs": _lp,
                     "native_finish_reason": "stop",
                 }],
                 "usage": {
@@ -3050,6 +3069,8 @@ async def generate_chat_response(
     repeat_penalty: float = 1.0,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    logprobs: Optional[bool] = None,
+    top_logprobs: Optional[int] = None,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -3091,6 +3112,8 @@ async def generate_chat_response(
             repeat_penalty=repeat_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
         )
         
         # Always filter out malformed content
@@ -3212,6 +3235,17 @@ async def generate_chat_response(
         if formatted_response and 'usage' in formatted_response:
             details = formatted_response['usage'].setdefault('prompt_tokens_details', {})
             details['cached_tokens'] = cached_tokens
+
+        # The server's per-token log-probabilities, when the client asked for them
+        # and the backend could answer. Only a proxy backend can: the numbers are
+        # the remote engine's. This field was hardcoded to None everywhere, which
+        # cost more than a missing number — Surya reads it to score each OCR line
+        # and, finding nothing, reports a confidence of exactly 1.0 for text it
+        # never measured.
+        _lp = (current_manager.get_last_logprobs()
+               if hasattr(current_manager, "get_last_logprobs") else None)
+        if _lp and formatted_response.get("choices"):
+            formatted_response["choices"][0]["logprobs"] = _lp
 
         # Carry the extracted reasoning onto the formatted message (the formatter
         # doesn't take a reasoning arg here). Emit both field names for client

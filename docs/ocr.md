@@ -273,6 +273,26 @@ page carries `lines[]` (text + bbox + conf), `regions[]` (layout), `tables[]`, a
 `meta` when the engine reports page metadata (olmOCR does; the others do not). The
 `ocr` **pipeline step type** chains OCR with `text_gen` in custom pipelines.
 
+### Where `conf` comes from on a served engine
+
+A VLM pipeline has no detector score to report, so surya asks the model server for
+`logprobs` and averages `exp(logprob)` over the generated tokens: that mean token
+probability becomes each line's (and each layout region's) `conf`.
+
+This matters because of surya's fallback. When the server returns no logprobs,
+surya does not report "unknown" — it uses a literal **1.0**. Every line of every
+page then looks perfectly confident, including the guesses, and nothing downstream
+can tell which page needs a human. coderai therefore forwards `logprobs` on the way
+out and returns `choices[0].logprobs` on the way back, on both the buffered and the
+streamed path, for the vLLM and RunPod proxy backends (the engines that run the
+model and can measure it). Local in-process backends still answer `null`, and a
+request that did not ask for logprobs is sent exactly as before — they are not free.
+
+In `model` mode the hop that must do this is the **pod's own coderai**, not the
+orchestrator: surya attaches straight to the endpoint the pool hands it. A pod runs
+only the code baked into its image, so an install whose pods predate this needs its
+capability image rebuilt before the numbers appear.
+
 ```bash
 curl -F file=@sentenza.pdf -F structured=true -F detect=both -F schema=italian_sentenza \
      http://localhost:8776/v1/ocr

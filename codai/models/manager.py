@@ -753,23 +753,69 @@ class ModelManager:
         return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
 
     
+    @staticmethod
+    def _logprob_kwargs(fn, logprobs, top_logprobs) -> dict:
+        """``{"logprobs": ..., "top_logprobs": ...}`` if ``fn`` takes them, else {}.
+
+        The kwargs below are negotiated by catching TypeError and retrying with
+        less; that cannot be used here, because a backend that accepts logprobs
+        and raises TypeError for its own reasons would be called twice. The
+        signature is asked instead.
+        """
+        if not logprobs:
+            return {}
+        try:
+            import inspect
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return {}
+        if "logprobs" not in params and not any(
+                pp.kind == pp.VAR_KEYWORD for pp in params.values()):
+            return {}
+        out = {"logprobs": bool(logprobs)}
+        if top_logprobs is not None and (
+                "top_logprobs" in params
+                or any(pp.kind == pp.VAR_KEYWORD for pp in params.values())):
+            out["top_logprobs"] = top_logprobs
+        return out
+
+    def get_last_logprobs(self):
+        """The backend's per-token log-probabilities for the last call, or None.
+
+        Only the HTTP-proxy backends can report them (the server computed them);
+        a backend that does not implement it answers None, and the response
+        carries ``logprobs: null`` exactly as it did before.
+        """
+        fn = getattr(self.backend, "get_last_logprobs", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
                       stop: Optional[List[str]] = None, tools: Optional[List] = None,
                       response_format: Optional[Dict] = None, enable_thinking: bool = False,
                       repeat_penalty: float = 1.0, presence_penalty: float = 0.0,
-                      frequency_penalty: float = 0.0):
+                      frequency_penalty: float = 0.0, logprobs: Optional[bool] = None,
+                      top_logprobs: Optional[int] = None):
         """Generate chat completion non-streaming.
 
-        Forwards client repetition controls to the backend (defaults are no-ops)."""
+        Forwards client repetition controls to the backend (defaults are no-ops).
+        ``logprobs`` is forwarded only to a backend whose signature accepts it, and
+        read back afterwards with :meth:`get_last_logprobs`."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
         _pen = dict(repeat_penalty=repeat_penalty, presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty)
         # Use generate_chat if available (Vulkan backend), otherwise format and use generate
         if hasattr(self.backend, 'generate_chat'):
-            for _extra in (dict(enable_thinking=enable_thinking, **_pen),
-                           dict(enable_thinking=enable_thinking), {}):
+            _lp = self._logprob_kwargs(self.backend.generate_chat, logprobs, top_logprobs)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp),
+                           dict(enable_thinking=enable_thinking, **_lp),
+                           dict(**_lp), {}):
                 try:
                     return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
                                                       stop, tools, response_format, **_extra)
@@ -798,7 +844,8 @@ class ModelManager:
                                     stop: Optional[List[str]] = None, tools: Optional[List] = None,
                                     response_format: Optional[Dict] = None, enable_thinking: bool = False,
                                     repeat_penalty: float = 1.0, presence_penalty: float = 0.0,
-                                    frequency_penalty: float = 0.0):
+                                    frequency_penalty: float = 0.0, logprobs: Optional[bool] = None,
+                                    top_logprobs: Optional[int] = None):
         """Generate chat completion streaming.
 
         Client-supplied repetition controls (repeat/presence/frequency penalty) are
@@ -812,8 +859,10 @@ class ModelManager:
         if hasattr(self.backend, 'generate_chat_stream'):
             # Try richest signature first, then progressively drop kwargs the backend
             # doesn't accept (older signatures) so we never hard-fail on plumbing.
-            for _extra in (dict(enable_thinking=enable_thinking, **_pen),
-                           dict(enable_thinking=enable_thinking), {}):
+            _lp = self._logprob_kwargs(self.backend.generate_chat_stream, logprobs, top_logprobs)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp),
+                           dict(enable_thinking=enable_thinking, **_lp),
+                           dict(**_lp), {}):
                 try:
                     _gen = self.backend.generate_chat_stream(
                         messages, max_tokens, temperature, top_p, stop, tools,
