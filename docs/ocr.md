@@ -570,7 +570,44 @@ A third, independent discriminator needs no code at all: serve the **same weight
 llama.cpp** (`datalab-to/surya-ocr-2-gguf`, with `surya_serve: "llamacpp"`). A different
 detokenizer on identical weights — accents surviving there would convict vLLM outright.
 
-### The verdict, and the repair (`surya_repair_accents`)
+### The verdict — measured, and it corrects an earlier one here
+
+**`surya_repair_accents` cannot work on vLLM 0.27.1, and an earlier version of this
+section claimed a verdict it had not earned.** Both facts come from the same
+measurement, taken through the live gateway on 2026-10-12:
+
+```
+result.raw (what surya reads) : 3 markers   'nt ? propriet? della propriet? d'
+reassembled from logprobs     : 0 markers   'nt  propriet della propriet ...'
+entries with bytes=[]         : 257
+any byte >= 0x80 in stream    : False
+```
+
+vLLM reports **`bytes: []`** for the byte-level tokens of surya-ocr-2's custom
+vocabulary, and **not one byte ≥ 0x80 appears anywhere in the stream**. The accent
+bytes are not corrupted in the logprobs — they are *absent* from them. So:
+
+* **the repair has nothing to rebuild from.** It is not a tuning problem; the data
+  does not exist. Its guards do refuse correctly (the ASCII-skeleton check catches
+  the mismatch), so a page comes back with its markers rather than with the accents
+  silently deleted — but it cannot fix anything on this stack.
+* **the trace's first verdict was vacuous.** `_reassemble` accepted an empty byte
+  list as data, built a string with the accents simply missing, found no invalid
+  UTF-8 in it, and reported `conclusive: true — the byte stream decoded cleanly, the
+  fault is in the serving path`. It was reading absence as cleanliness: the same
+  failure the envelope was built to prevent for *missing logprobs*, one level
+  further down. It now counts `tokens_without_bytes` and reports
+  `conclusive: false` with `blame: "unknown"` when the server declines to give
+  bytes.
+
+What the measurement *does* establish: the loss is **inside the serving stack**,
+which produced neither usable bytes nor usable text. It cannot say whether the
+model's own output was sound, and the honest trace now says exactly that.
+
+So on vLLM 0.27.1 the options are **`chandra`** (which reads the same pixels
+perfectly) or **`coderai-vllm-ocr`** below.
+
+### The repair, and why it is still shipped (`surya_repair_accents`)
 
 The trace was run. On a page of crisp synthetic Italian, served through the Aruba
 install on vLLM 0.27.1:

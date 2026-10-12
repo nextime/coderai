@@ -376,3 +376,58 @@ def test_the_engine_tells_the_worker_at_load():
     cfg.surya_token_trace = True
     assert SuryaEngine(cfg)._worker_opts()["token_trace"] is True
     assert SuryaEngine(OcrConfig())._worker_opts()["token_trace"] is False
+
+
+# ----------------------------- empty bytes are absence, not cleanliness #
+def test_empty_bytes_are_not_treated_as_data():
+    """MEASURED on vLLM 0.27.1 + surya-ocr-2: the server answers with logprobs
+    but gives `bytes: []` for the byte-level tokens of surya's custom vocabulary
+    — 257 of them on one page, with not a single byte >= 0x80 anywhere in the
+    stream. Accepting that as data built a string with the accents silently
+    absent, found no invalid UTF-8 in it, and reported `conclusive: true, the
+    byte stream decoded cleanly`. That is reading absence as cleanliness."""
+    assert W._reassemble([{"token": "a", "bytes": [97]},
+                          {"token": "�", "bytes": []}]) is None
+
+
+def test_a_stream_full_of_empty_bytes_is_inconclusive():
+    calls = [[{"token": "p", "bytes": [112]},
+              {"token": "i", "bytes": [105]},
+              {"token": "�", "bytes": []}]]
+    rep = W._trace_report(calls)
+    assert rep["tokens_without_bytes"] == 1
+    assert rep["conclusive"] is False
+    assert "no bytes" in rep["why"]
+    assert "nothing can be rebuilt" in rep["why"]
+
+
+def test_the_blame_is_unknown_when_the_bytes_were_not_reported():
+    """It must NOT claim the model's output was sound — that is exactly the
+    overclaim this case produced before."""
+    from codai.ocr.base import OcrPage, unreadable_report
+    page = OcrPage(index=0, text="pi�")
+    page.meta["unreadable_trace"] = {"calls": 1, "with_logprobs": 1,
+                                     "tokens_without_bytes": 257,
+                                     "conclusive": False, "findings": []}
+    assert unreadable_report([page])["blame"] == "unknown"
+
+
+def test_a_fully_reported_clean_stream_still_blames_the_serving_path():
+    """The genuine version of the verdict: every token reported its bytes AND
+    they decoded."""
+    rep = W._trace_report([[{"token": "p", "bytes": [112]},
+                            {"token": "Ã", "bytes": [195]},
+                            {"token": "ł", "bytes": [160]}]])
+    assert rep["tokens_without_bytes"] == 0
+    assert rep["conclusive"] is True
+    assert "every token reported its bytes" in rep["why"]
+
+
+def test_the_repair_refuses_when_bytes_are_empty():
+    """And so the 29 markers reached the caller untouched rather than being
+    replaced by a string with the accents quietly missing."""
+    UN = "�"
+    broken = "propriet" + UN
+    tokens = [{"token": c, "bytes": [ord(c)]} for c in "propriet"] + \
+             [{"token": UN, "bytes": []}]
+    assert W.repair_content(broken, tokens) == (None, 0)

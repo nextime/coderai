@@ -333,8 +333,15 @@ def _reassemble(tokens) -> str:
     for t in tokens:
         e = _tok_entry(t)
         raw = e.get("bytes")
-        if not isinstance(raw, list):
-            return None                 # a server that reports no bytes: no repair
+        if not isinstance(raw, list) or not raw:
+            # EMPTY counts as missing, and getting this wrong once already
+            # produced a confidently wrong answer. vLLM 0.27.1 reports
+            # ``bytes: []`` for the byte-level tokens of surya-ocr-2's custom
+            # vocabulary -- 257 of them on one page, with not a single byte
+            # >= 0x80 anywhere in the stream. Accepting that as data built a
+            # string with the accents silently absent, found no invalid UTF-8
+            # in it, and called the result clean. Absence is not cleanliness.
+            return None
         for b in raw:
             buf.append(int(b) & 0xFF)
     if not buf:
@@ -394,9 +401,21 @@ def _trace_report(calls) -> dict:
     """
     calls = list(calls or [])
     with_lp = sum(1 for c in calls if c)
+    # How many tokens the server declined to give bytes for. A token with
+    # ``bytes: []`` carries no information, and a stream full of them decodes
+    # "cleanly" only because there is nothing in it to be wrong -- so this has to
+    # be counted and reported, not quietly skipped.
+    no_bytes = 0
+    for c in calls:
+        for t in (c or []):
+            e = _tok_entry(t)
+            raw = e.get("bytes")
+            if not isinstance(raw, list) or not raw:
+                no_bytes += 1
     report = {
         "calls": len(calls),
         "with_logprobs": with_lp,
+        "tokens_without_bytes": no_bytes,
         "findings": _trace_findings(calls) if with_lp else [],
     }
     if not calls:
@@ -407,12 +426,27 @@ def _trace_report(calls) -> dict:
         report["conclusive"] = False
         report["why"] = ("the model server returned no logprobs, so the bytes "
                          "could not be read -- this says nothing about the cause")
+    elif no_bytes:
+        # The decisive case on vLLM 0.27.1 + surya-ocr-2: the server answers with
+        # logprobs but gives ``bytes: []`` for the very tokens whose characters
+        # went missing, so there is nothing to check and nothing to rebuild from.
+        # That is still an ANSWER -- it localises the loss inside the server,
+        # which produced neither usable bytes nor usable text -- but it is not
+        # the same statement as "the model's bytes were sound".
+        report["conclusive"] = False
+        report["why"] = (
+            f"the server reported no bytes for {no_bytes} token(s), including the "
+            f"ones whose characters are missing, so the byte stream could not be "
+            f"checked. The loss is inside the serving stack -- it produced neither "
+            f"usable bytes nor usable text -- but this cannot say whether the "
+            f"MODEL's own output was sound, and nothing can be rebuilt from it")
     else:
         report["conclusive"] = True
         if not report["findings"]:
-            report["why"] = ("the byte stream decoded cleanly, so the characters "
-                             "were lost AFTER the model: the fault is in the "
-                             "serving path, not the model")
+            report["why"] = ("the byte stream decoded cleanly and every token "
+                             "reported its bytes, so the characters were lost "
+                             "AFTER the model: the fault is in the serving path, "
+                             "not the model")
         else:
             kinds = {}
             for f in report["findings"]:
