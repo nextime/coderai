@@ -270,3 +270,17 @@ def test_toggling_logprobs_rebuilds_the_pools():
         cfg = OcrConfig()
         setattr(cfg, field, False)
         assert OcrManager._pool_params(cfg) != base, field
+
+
+def test_max_concurrency_is_a_ceiling_not_a_throttle():
+    """It shipped at 4, which made it the binding limit for every install — a
+    quarter of what ONE pod sustains. Measured on an A40: 16 concurrent pages is
+    the knee for both surya and chandra, and both fail outright by 32. The real
+    limiter is meant to be each engine's `*_instances`, so this only has to stay
+    out of the way while remaining finite."""
+    from codai.config import OcrConfig
+    cfg = OcrConfig()
+    assert cfg.max_concurrency >= 16, "must not bind below one pod's measured knee"
+    assert cfg.max_concurrency <= 128, (
+        "every admitted page holds a rasterised bitmap (~18 MB for A4 at 250 DPI), "
+        "so an unbounded ceiling trades one failure mode for another")

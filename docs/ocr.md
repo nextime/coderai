@@ -409,8 +409,40 @@ CPU run of a VLM pipeline, i.e. minutes a page while looking healthy. `model`
 adapts to wherever the checkpoint is actually served and tells you to set
 `surya_model_id` when it has not been told.
 
-**Concurrency on one GPU** comes from loading multiple instances of an engine
-(`paddle_instances` etc.) and fanning pages across them (bounded by `max_concurrency`).
+**Concurrency**, measured on one A40 (same page, same install):
+
+| N in flight | surya req/s | surya p50 | chandra pages/s | chandra p50 |
+|---|---|---|---|---|
+| 1 | 0.93 | 1.1s | 0.21 | 4.6s |
+| 8 | 3.79 | 2.0s | 1.31 | 6.1s |
+| **16** | **7.11** | **2.2s** | **1.88** | **8.4s** |
+| 24 | 5.89 | 4.1s | 2.09 | 10.6s |
+| 32 | 5.44 + 13 failed | 3.5s | 1.44 + 21 failed | 7.5s |
+| 48 | **all failed** | — | — | — |
+
+**Both peak at 16 and both fail outright by 32** — that is a cliff, not a graceful
+degradation, so `runpod.scale_up_inflight_per_pod` is set to 16 per model: the point
+where a second pod starts earning its cost, with margin before the edge.
+
+Three settings bound this and they are easy to confuse:
+
+* `runpod.scale_up_inflight_per_pod` (**per model**, in its models.json entry) — when
+  the pool rents *another* pod. Read per model by `placement.spill_threshold`.
+* `ocr.<engine>_instances` — how many pages that engine can have in flight. **This is
+  the real limiter**, and for the subprocess engines it is what the box can host: a
+  surya worker is a separate interpreter at ~750 MB, so 64 of them is ~45 GB.
+  chandra and olmOCR run in-process and cost a thread.
+* `ocr.max_concurrency` — a global **ceiling** across every engine, not a throughput
+  knob. It shipped at 4, which made it the binding limit everywhere; it is 64 now.
+  Each admitted page holds a rasterised bitmap (~18 MB for A4 at 250 DPI), so the
+  ceiling is finite on purpose.
+
+A note on the surya figures: surya issues one request per *layout block*, so its
+"req/s" is blocks, not pages — a real page is several requests and its page rate is
+correspondingly lower. The subprocess protocol is also synchronous (one `cmd: ocr`,
+one reply), so a worker handles one page at a time and concurrency is the process
+count. In the served modes that worker only scales an image and makes an HTTP call,
+so this is the thing to change if surya ever needs fleet-scale concurrency.
 OCR models are small, so a 24 GB card (e.g. RTX 3090) fits several instances — good
 aggregate throughput without vLLM (a continuous-batching path is a future option; see
 [vllm.md](vllm.md)).

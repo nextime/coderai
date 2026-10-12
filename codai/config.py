@@ -936,7 +936,27 @@ class OcrConfig:
     # higher still works (it supersamples, which tends to help glyphs) but costs
     # rasterisation time and memory for no extra pixels at the model.
     surya_dpi: int = 250
-    max_concurrency: int = 4             # global cap on in-flight OCR pages
+    # Global cap on in-flight OCR pages: a SAFETY CEILING, not a throughput knob.
+    #
+    # It used to ship at 4, which made it the binding limit for every install:
+    # the real limiter is meant to be each engine's own `*_instances` (the pool
+    # hands out one instance per page and an engine is not reentrant), and a
+    # RunPod fleet can hold `max_pods` x `scale_up_inflight_per_pod` pages in
+    # flight -- 64 x 16 = 1024 on the Digesta install. A ceiling of 4 capped that
+    # at a quarter of ONE pod, measured: one A40 sustains 16 concurrent pages for
+    # surya (7.1 req/s) and for chandra (1.9 pages/s), with both peaking at 16 and
+    # failing outright by 32.
+    #
+    # 64 is four pods' worth at that knee -- far above what a single-box install
+    # can feed, so it stops being the limiter, while staying finite. Not higher,
+    # because every admitted page holds a RASTERISED image: an A4 at 250 DPI is
+    # ~6 Mpixels, ~18 MB in memory, so 64 in flight is ~1.2 GB and 1024 would be
+    # ~18 GB of page bitmaps before any engine does work.
+    #
+    # Raise it when a fleet genuinely needs more, together with the per-engine
+    # instance counts -- which on this design are what the box can host (a surya
+    # worker is a SUBPROCESS at ~750 MB, so 64 of them is ~45 GB).
+    max_concurrency: int = 64            # global ceiling on in-flight OCR pages
     # Default document language when a request names none. "auto" (the shipped
     # default) means let the engine recognise what it finds: surya-2, olmOCR and
     # docTR are multilingual and have no language input at all, and PaddleOCR --
