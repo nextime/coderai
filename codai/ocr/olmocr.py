@@ -399,7 +399,18 @@ class OlmOcrEngine(OcrEngine):
         ``base``/``api_key``/``model_name`` override the configured server for one
         page, which is how model mode reaches the upstream the dispatcher chose.
         """
-        import requests
+        # pod_http, not requests: in model mode ``base`` is whatever the
+        # dispatcher chose, and that can be a RunPod pod on the direct-TCP path —
+        # https to a bare IP, serving a certificate signed by THIS install's own CA
+        # (codai/api/pod_tls.py). No public CA knows it and the address was not known
+        # when it was issued, so plain `requests` fails it twice over with
+        # CERTIFICATE_VERIFY_FAILED and the engine is simply unreachable. Surya does
+        # not hit this because it attaches through the fan-out gateway, which learned
+        # to trust pod certificates in 0.3.16; olmOCR talks to the upstream directly,
+        # so it needs the same trust itself. pod_http is a drop-in and hands every
+        # other URL — localhost, a named host, a remote coderai — straight to
+        # requests untouched.
+        from codai.api import pod_http
 
         payload = {
             "model": model_name or self._model_name(),
@@ -414,7 +425,7 @@ class OlmOcrEngine(OcrEngine):
             headers["Authorization"] = f"Bearer {key}"
         url = (base or self._base).rstrip("/") + "/chat/completions"
         try:
-            r = requests.post(url, json=payload, headers=headers,
+            r = pod_http.post(url, json=payload, headers=headers,
                               timeout=float(getattr(self.cfg, "olmocr_timeout", 300.0) or 300.0))
         except Exception as e:
             raise OcrError(f"olmOCR server {url} unreachable: {e}", status=503)

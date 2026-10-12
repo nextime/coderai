@@ -189,8 +189,6 @@ def test_http_failures_map_to_useful_statuses(monkeypatch):
     eng = OlmOcrEngine(cfg)
     eng.load()
 
-    fake = types.SimpleNamespace()
-
     class _Resp:
         status_code = 500
         text = "boom"
@@ -198,8 +196,13 @@ def test_http_failures_map_to_useful_statuses(monkeypatch):
         def json(self):
             return {}
 
-    fake.post = lambda *a, **k: _Resp()
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    # Patch pod_http.post, not the `requests` module: olmOCR goes through
+    # pod_http now so that a pod's own-CA certificate verifies (it used to fail
+    # with CERTIFICATE_VERIFY_FAILED), and swapping sys.modules["requests"] would
+    # break pod_http's own import of it. The statuses under test are unchanged.
+    from codai.api import pod_http
+
+    monkeypatch.setattr(pod_http, "post", lambda *a, **k: _Resp())
     with pytest.raises(OcrError) as e:
         eng.recognize_image(_page(64, 64))
     assert e.value.status == 502
@@ -207,7 +210,7 @@ def test_http_failures_map_to_useful_statuses(monkeypatch):
     def _raise(*a, **k):
         raise OSError("connection refused")
 
-    fake.post = _raise
+    monkeypatch.setattr(pod_http, "post", _raise)
     with pytest.raises(OcrError) as e:
         eng.recognize_image(_page(64, 64))
     assert e.value.status == 503

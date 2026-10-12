@@ -232,6 +232,25 @@ instead of dying at inference.
 Engine selection on a pod follows the usual `alias or path or id`, so an entry aliased
 `olmocr` over an HF repo path is recognised.
 
+### olmOCR reaches a pod directly, so it needs the pod's CA itself
+
+olmOCR failed against a rented pod with `CERTIFICATE_VERIFY_FAILED`. A pod on the
+direct-TCP path serves HTTPS with a certificate signed by **this install's own CA**
+(`codai/api/pod_tls.py`), at a public IP that was not known when the certificate was
+issued — so stock `requests` fails it twice over.
+
+Surya never hit this because surya attaches through the fan-out gateway, which
+learned to trust pod certificates in 0.3.16. olmOCR talks to the upstream the
+dispatcher chose **directly**, so it needed the same trust of its own, and the gap
+only surfaced when olmOCR was asked to cover for surya. It now goes through
+`codai/api/pod_http.py`, which verifies *https-to-a-bare-IP* against our CA with the
+hostname check off and hands every other URL — localhost, a named server, another
+coderai — to `requests` untouched.
+
+The lesson generalises: anything that may be handed a **pod** address uses
+`pod_http`, not `requests`. A localhost worker is unaffected either way, since
+`pod_http` passes non-pod URLs straight through.
+
 ### A document is never refused because one engine is down
 
 `ocr.fallback_engines` (default `auto`) makes a failing engine hand the document to the
@@ -336,7 +355,19 @@ Surya reads its text only from `message.content`, never from the per-token
 logprobs, and coderai's fan-out gateway forwards the upstream body as raw bytes.
 
 So the model **predicted** "there is a character here I cannot identify", and
-every hop delivered that faithfully. Two things follow.
+every hop delivered that faithfully.
+
+The decisive detail is the **count**. A charset mis-decode produces *two* markers
+per accented letter, because `à` is two UTF-8 bytes and each undecodable byte
+becomes its own U+FFFD — `pi��`. What arrives is *one*: `pi�`. One marker is one
+token. Every other hop was checked and is byte-faithful too: `_html_to_text` is
+regex plus `html.unescape` and survives both literal and entity forms; the
+isolated-venv worker returns `json.dumps` with the default `ensure_ascii=True`,
+so what crosses the pipe is pure-ASCII `\uXXXX` escapes and the locale cannot
+matter; the gateway forwards raw bytes. There is no charset conversion anywhere
+in the path that could do this.
+
+Two things follow.
 
 **It is a resolution problem.** Surya caps its own input at 3072×2048 =
 6,291,456 pixels in `scale_to_fit`, which is called with **defaults only** — no
@@ -356,6 +387,19 @@ accepts, and a diacritic sits above the x-height at ~3 pixels tall. `ocr.surya_d
 docTR have their own optima and keep `ocr.dpi`. Above ~255 nothing more reaches
 the model, though supersampling down from 300–400 can still render glyphs more
 cleanly, at the cost of rasterisation time and memory.
+
+**Raising DPI is worth doing on its own merits, but it has not been shown to fix
+U+FFFD.** A production document came back with the same markers at 200 and at
+300, which is evidence against too-few-pixels being the whole story — a
+perception failure would be stochastic, not every accent every time. Note what
+rasterisation DPI can and cannot do: if the PDF *contains a scanned image*, the
+page is re-sampled from that image, so asking for 300 DPI upscales a 150-DPI scan
+and adds no detail that was never captured. `pdfimages -list doc.pdf` reports the
+embedded resolution and is the first thing to check. The remaining candidates are
+the document's own glyph quality and the serving stack (coderai's pods run vLLM
+0.27.1, while surya's own `VLLM_DOCKER_IMAGE` pins `v0.20.1`); the way to tell
+them apart is to OCR **perfect synthetic Italian** through the same path — clean
+output indicts the document, U+FFFD on crisp vector glyphs indicts the stack.
 
 `dpi` only affects **PDF** input. An uploaded image is used at the resolution it
 arrives, so a low-resolution scan cannot be rescued by this setting.
