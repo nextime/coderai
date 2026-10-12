@@ -1,11 +1,16 @@
-# Triton JIT-compiles vLLM's kernels at run time and needs a compiler for its
-# launcher stubs; without one the engine core dies before it registers.
+# Triton and torch.inductor JIT-compile vLLM's kernels at run time, and need a
+# full build toolchain for the launcher stubs they emit; without it the engine
+# core dies before it registers and the pod answers 502.
 #
-# BOTH compilers, not just gcc. The launcher Triton builds is C++, so it invokes
-# g++ — with only gcc present the image looks right, vLLM starts, and then the
-# engine dies and the pod answers 502. Found the hard way on an olmOCR pod: the
-# TLS problem was fixed, the pod became reachable, and the next layer underneath
-# was a missing g++.
+# Found one layer at a time, each on a real olmOCR pod:
+#   gcc          — the C compiler
+#   g++          — the launcher Triton builds is C++, so gcc alone is not enough
+#   ninja-build  — inductor shells out to ninja to build its extensions
+# libc6-dev is the headers both compilers need.
+#
+# Kept (not purged) because the compilation happens at RUN time on the pod, not
+# at build time.
 gcc
 g++
+ninja-build
 libc6-dev
