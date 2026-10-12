@@ -389,11 +389,29 @@ def _token_ids(tokens):
 
 
 def _decode_ids(ids):
-    """``ids`` through surya's OWN tokenizer, which round-trips accents.
+    """``ids`` to text, using the VOCABULARY where the decoder fails.
 
-    Imported here rather than at module scope: this worker must start even when
-    the surya venv is mid-build, and a page that needs no repair must not pay for
-    loading a tokenizer. Cached on the function because a document is many pages.
+    This is the whole fix, and it rests on a measured contradiction inside
+    surya-ocr-2's own tokenizer:
+
+        id 2160  decode -> U+FFFD      vocabulary piece -> 'a-grave'
+        id 2168  decode -> U+FFFD      vocabulary piece -> 'e-grave'
+        id 2185  decode -> U+FFFD      vocabulary piece -> 'u-grave'
+
+    The model emits the RIGHT token -- 2160 really is a-grave -- and the decode
+    table cannot render it. Every decoder in the chain inherits that: surya's own,
+    and vLLM's, which reports ``decoded_token = None`` and therefore ``bytes: []``
+    and writes U+FFFD into the text. So the accents were never lost in transport,
+    at any resolution, on any vLLM version, with or without --trust-remote-code.
+    They were lost in a decode table that disagrees with its own vocabulary.
+
+    The vocabulary is the authority on what a token means, so when the decoder
+    answers with the replacement character, the piece is used instead. Per id,
+    because a bulk decode cannot be corrected after the fact.
+
+    Imported lazily: the worker must start while the surya venv is still building,
+    and a clean page must not pay for loading a tokenizer. Cached, because a
+    document is many pages.
     """
     if not ids:
         return None
@@ -403,6 +421,7 @@ def _decode_ids(ids):
             from transformers import AutoTokenizer
             ckpt = os.environ.get("SURYA_MODEL_CHECKPOINT") or "datalab-to/surya-ocr-2"
             tok = AutoTokenizer.from_pretrained(ckpt, trust_remote_code=True)
+            _decode_ids._vocab = {v: k for k, v in tok.get_vocab().items()}
         except Exception as e:
             print(f"[surya] cannot load the tokenizer for id decoding: {e}",
                   file=sys.stderr)
@@ -411,11 +430,19 @@ def _decode_ids(ids):
         _decode_ids._tok = tok
     if tok is False:
         return None
+    inv = getattr(_decode_ids, "_vocab", None) or {}
+    out = []
     try:
-        return tok.decode(ids, skip_special_tokens=True)
+        for i in ids:
+            piece = tok.decode([i], skip_special_tokens=True)
+            if UNREADABLE in piece:
+                # The decoder could not render this id. The vocabulary can.
+                piece = inv.get(i, piece)
+            out.append(piece)
     except Exception as e:
         print(f"[surya] id decoding failed: {e}", file=sys.stderr)
         return None
+    return "".join(out)
 
 
 def repair_content(raw: str, tokens):

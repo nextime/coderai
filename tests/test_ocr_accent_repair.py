@@ -420,3 +420,63 @@ def test_forwarding_it_cannot_affect_an_install_that_did_not_ask():
     from codai.api import runpod_worker
     src = inspect.getsource(runpod_worker.engine_config_for_pod)
     assert "if v in (None, \"\", 0, False):" in src
+
+
+# ----------- the actual root cause: a decode table that contradicts the vocab #
+def test_the_vocabulary_wins_where_the_decoder_fails(monkeypatch):
+    """MEASURED in surya-ocr-2's own tokenizer:
+
+        id 2160  decode -> U+FFFD    vocabulary piece -> 'à'
+        id 2168  decode -> U+FFFD    vocabulary piece -> 'è'
+        id 2185  decode -> U+FFFD    vocabulary piece -> 'ù'
+
+    The model emits the RIGHT token and the decode table cannot render it, which
+    is why every decoder in the chain produced U+FFFD — surya's own, and vLLM's,
+    which then reports `decoded_token: None` and `bytes: []`. The vocabulary is
+    the authority on what a token means, so it is consulted when the decoder
+    answers with the replacement character."""
+    UN = "�"
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            return {2046: "n", 1979: " ", 2048: "p", 2041: "i",
+                    2160: UN, 2185: UN}.get(ids[0], "?")
+
+        def get_vocab(self):
+            return {"n": 2046, " ": 1979, "p": 2048, "i": 2041,
+                    "à": 2160, "ù": 2185}
+
+    monkeypatch.setattr(W._decode_ids, "_tok", _Tok(), raising=False)
+    monkeypatch.setattr(W._decode_ids, "_vocab",
+                        {2046: "n", 1979: " ", 2048: "p", 2041: "i",
+                         2160: "à", 2185: "ù"}, raising=False)
+    got = W._decode_ids([2048, 2041, 2185, 1979, 2046, 2160])
+    assert got == "più nà"
+    assert UN not in got
+
+
+def test_an_id_the_vocabulary_also_lacks_keeps_its_marker(monkeypatch):
+    """Not every unrenderable id is a known character. One the vocabulary cannot
+    name keeps the marker, and the ASCII-skeleton guard then decides whether the
+    whole repair is safe."""
+    UN = "�"
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            return UN
+
+        def get_vocab(self):
+            return {}
+
+    monkeypatch.setattr(W._decode_ids, "_tok", _Tok(), raising=False)
+    monkeypatch.setattr(W._decode_ids, "_vocab", {}, raising=False)
+    assert W._decode_ids([9999]) == UN
+
+
+def test_decoding_is_per_id_not_bulk():
+    """A bulk decode cannot be corrected afterwards — once the decoder has
+    flattened the sequence to text, the id that failed is unidentifiable."""
+    import inspect
+    src = inspect.getsource(W._decode_ids)
+    assert "for i in ids:" in src
+    assert "tok.decode([i]" in src
