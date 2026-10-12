@@ -32,7 +32,8 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from codai.ocr.base import OcrEngine, OcrPage, OcrError, load_pages
+from codai.ocr.base import (OcrEngine, OcrPage, OcrError, load_pages,
+                            unreadable_report)
 
 
 # Engine registry: name → factory(cfg) → OcrEngine. Imports are deferred inside each
@@ -512,6 +513,29 @@ class OcrManager:
             )
         return name
 
+    def engine_dpi(self, requested: Optional[str]) -> int:
+        """PDF rasterisation DPI for the engine that will serve this request.
+
+        The DPI has to be chosen BEFORE rasterising, and the engine decides it:
+        surya-2 accepts a far larger image than the shared default was feeding it
+        (see ``OcrConfig.surya_dpi``), while paddle and docTR have their own optima
+        and are left alone. An explicit per-request ``dpi`` wins over both.
+
+        Resolving the engine here also means an unknown or disabled engine is
+        refused before a large PDF is rasterised rather than after it. If the engine
+        later fails over to another one (``_with_fallback``), the pages keep the DPI
+        chosen for the engine that was asked for — re-rasterising mid-request would
+        cost more than the slightly-off resolution does.
+        """
+        cfg = self._require_cfg()
+        try:
+            name = self.resolve_engine(requested)
+        except OcrError:
+            # Let the real failure come from the engine path, with its own message.
+            return int(cfg.dpi)
+        per_engine = int(getattr(cfg, f"{name}_dpi", 0) or 0)
+        return per_engine if per_engine > 0 else int(cfg.dpi)
+
     async def _get_pool(self, name: str) -> _Pool:
         async with self._lock:
             pool = self._pools.get(name)
@@ -593,7 +617,7 @@ class OcrManager:
         configured text model; ``schema`` overrides the extraction schema for this call.
         """
         cfg = self._require_cfg()
-        use_dpi = int(dpi) if dpi else int(cfg.dpi)
+        use_dpi = int(dpi) if dpi else self.engine_dpi(engine)
         images = load_pages(data, filename=filename, content_type=content_type, dpi=use_dpi)
         # Share the GPU thermal governor with every other workload: block here until
         # temps are safe (wait_until_safe blocks, so run it off the event loop).
@@ -608,7 +632,7 @@ class OcrManager:
             from codai.ocr.extract import extract_fields
             structured_out = await extract_fields(full_text, cfg, schema=schema)
 
-        return {
+        out = {
             "engine": name,
             "num_pages": len(pages),
             "text": full_text,
@@ -617,6 +641,10 @@ class OcrManager:
             "signatures": signatures,
             "structured": structured_out,
         }
+        report = unreadable_report(pages)
+        if report:
+            out["unreadable"] = report
+        return out
 
     async def _detect_all(self, images, pages, detect: Optional[str]):
         """Run stamp/signature detection across pages; returns (stamps, signatures)

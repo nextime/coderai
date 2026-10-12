@@ -4117,6 +4117,7 @@ def build_settings_dict(c, gpu_cards):
             "enabled": c.ocr.enabled,
             "default_engine": c.ocr.default_engine,
             "dpi": c.ocr.dpi,
+            "surya_dpi": c.ocr.surya_dpi,
             "max_concurrency": c.ocr.max_concurrency,
             "lang": c.ocr.lang,
             "paddle_enabled": c.ocr.paddle_enabled,
@@ -4914,6 +4915,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "enabled" in d: o.enabled = bool(d["enabled"])
         if "default_engine" in d: o.default_engine = (d.get("default_engine") or "paddle").strip()
         if "dpi" in d: o.dpi = _i("dpi", o.dpi, 36)
+        if "surya_dpi" in d: o.surya_dpi = _i("surya_dpi", o.surya_dpi, 0)
         if "max_concurrency" in d: o.max_concurrency = _i("max_concurrency", o.max_concurrency, 1)
         if "lang" in d: o.lang = (d.get("lang") or "it").strip()
         # PaddleOCR

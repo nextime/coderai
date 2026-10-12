@@ -247,7 +247,7 @@ back.
 ## Enable & configure
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,
-`default_engine`, `dpi`, `max_concurrency`, `lang`, `build_retry_cooldown_s`,
+`default_engine`, `dpi`, `surya_dpi`, `max_concurrency`, `lang`, `build_retry_cooldown_s`,
 `vlm_gpu_memory_utilization`, `vlm_max_num_batched_tokens`, `vlm_max_num_seqs`,
 `vlm_max_model_len`, `fallback_engines`, `evict_drain_timeout_s`;
 per-engine `*_enabled` /
@@ -320,6 +320,68 @@ In `model` mode the hop that must do this is the **pod's own coderai**, not the
 orchestrator: surya attaches straight to the endpoint the pool hands it. A pod runs
 only the code baked into its image, so an install whose pods predate this needs its
 capability image rebuilt before the numbers appear.
+
+### Unreadable glyphs, and why Italian accents were the first to go
+
+Accented letters came back from surya as `U+FFFD` — `più` as `pi?`, `facoltà` as
+`facolt?` — nine of them in one page of raw JSON, as real bytes `EF BF BD`. That
+looks exactly like a decoding bug, and it is not one.
+
+`U+FFFD` is **a real entry in surya-ocr-2's vocabulary**: id 65421 of 65425, the
+only id that decodes to it, with `<unk>` a separate token at 65424. The tokenizer
+is `WordLevel` and character-level for Latin text, so `à` is a *single* token
+(2160) and an accent cannot be split across two — no partial-UTF-8 artefact is
+possible, and per-token decoding is byte-identical to decoding the whole string.
+Surya reads its text only from `message.content`, never from the per-token
+logprobs, and coderai's fan-out gateway forwards the upstream body as raw bytes.
+
+So the model **predicted** "there is a character here I cannot identify", and
+every hop delivered that faithfully. Two things follow.
+
+**It is a resolution problem.** Surya caps its own input at 3072×2048 =
+6,291,456 pixels in `scale_to_fit`, which is called with **defaults only** — no
+surya setting raises it, `IMAGE_DPI_HIGHRES` included. Measured, for A4:
+
+| `dpi` | rasterised | Mpixels | model sees | Mpixels |
+|------:|-----------:|--------:|-----------:|--------:|
+| 200 | 1654×2338 | 3.87 | 1652×2352 | 3.89 |
+| 250 | 2067×2922 | 6.04 | 2072×2912 | 6.03 |
+| 255 | 2108×2980 | 6.28 | 2100×2968 | 6.23 |
+| 300 | 2481×3507 | 8.70 | 2100×2968 | 6.23 |
+| 400 | 3308×4676 | 15.47 | 2100×2968 | 6.23 |
+
+The shared `ocr.dpi = 200` was therefore handing the model 62% of the pixels it
+accepts, and a diacritic sits above the x-height at ~3 pixels tall. `ocr.surya_dpi`
+(default **250**) is surya's own rasterisation DPI for this reason; paddle and
+docTR have their own optima and keep `ocr.dpi`. Above ~255 nothing more reaches
+the model, though supersampling down from 300–400 can still render glyphs more
+cleanly, at the cost of rasterisation time and memory.
+
+`dpi` only affects **PDF** input. An uploaded image is used at the resolution it
+arrives, so a low-resolution scan cannot be rescued by this setting.
+
+**It must not be silent.** `pi?` indexes, searches and reads wrong for ever, and
+for judicial documents a known unknown beats a quiet corruption. Every result now
+counts its unreadable glyphs, and the key is **omitted entirely when there are
+none**, so a clean response is byte-for-byte what it always was:
+
+```json
+{ "text": "...", "pages": [ { "index": 3, "unreadable": 2,
+    "lines": [ { "text": "la pi\ufffd alta", "conf": 0.41, "unreadable": 1 } ] } ],
+  "unreadable": {
+    "count": 2,
+    "pages": [ { "page": 3, "count": 2 } ],
+    "spots": [ { "page": 3, "line": 0, "offset": 5, "conf": 0.41,
+                 "bbox": [...], "context": "la pi\ufffd alta facolt" } ] } }
+```
+
+The `conf` on a spot is the **line's** — the finest granularity that exists, since
+surya reports one mean token probability per block, not per character. It is also
+the useful signal: a low-confidence line with an unreadable glyph is a line to
+re-read at a higher DPI, while a high-confidence one is more likely a glyph that is
+genuinely not in the model's repertoire. `spots` is capped (100) with a
+`truncated` count, and the text itself is never rewritten — stripping the marker
+would destroy the only record of where the loss is.
 
 ### Scaling in `model` mode
 

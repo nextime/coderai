@@ -1103,6 +1103,15 @@
         <input type="number" id="s-ocr-dpi" class="form-input" min="72" placeholder="200">
       </div>
       <div class="form-group" style="flex:1;min-width:110px">
+        <label class="form-label">Surya PDF DPI</label>
+        <input type="number" id="s-ocr-surya-dpi" class="form-input" min="0" placeholder="250">
+        <span class="form-hint">Surya-2 only (0 = use PDF DPI). Its input is capped at
+        3072&times;2048 = 6.29&nbsp;Mpixels and that cap is not configurable, so an A4 page
+        saturates it at about 255&nbsp;DPI &mdash; at 200 the model was seeing 62% of the
+        pixels it accepts, and a diacritic is ~3 pixels tall. Higher than 250 still works
+        (it supersamples) but buys no extra pixels at the model.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:110px">
         <label class="form-label">Max concurrency</label>
         <input type="number" id="s-ocr-max-concurrency" class="form-input" min="1" placeholder="4">
       </div>
@@ -2111,6 +2120,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-enabled').checked = !!ocr.enabled;
     document.getElementById('s-ocr-default-engine').value = ocr.default_engine ?? 'paddle';
     document.getElementById('s-ocr-dpi').value = ocr.dpi ?? 200;
+    document.getElementById('s-ocr-surya-dpi').value = ocr.surya_dpi ?? 250;
     document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 4;
     document.getElementById('s-ocr-lang').value = ocr.lang ?? 'it';
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
@@ -2365,6 +2375,7 @@ async function saveSettings(silent){
       enabled: document.getElementById('s-ocr-enabled').checked,
       default_engine: document.getElementById('s-ocr-default-engine').value || 'paddle',
       dpi: parseInt(document.getElementById('s-ocr-dpi').value) || 200,
+      surya_dpi: parseInt(document.getElementById('s-ocr-surya-dpi').value) || 0,
       max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 4,
       lang: document.getElementById('s-ocr-lang').value.trim() || 'it',
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,

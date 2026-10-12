@@ -39,6 +39,43 @@ class OcrError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Unreadable glyphs
+# ---------------------------------------------------------------------------
+
+#: What a VLM OCR engine writes where it cannot identify a character.
+#:
+#: This is NOT a decoding or transport artefact, which is the natural assumption
+#: when accented letters come back as U+FFFD. In surya-ocr-2 it is a real entry in
+#: the vocabulary — id 65421 of 65425, the only id that decodes to it, and
+#: ``<unk>`` is a different token (65424). The tokenizer is ``WordLevel`` and
+#: character-level for Latin text, so ``à`` is a single token and an accent
+#: *cannot* be split across two: no partial-UTF-8 artefact is possible, and
+#: per-token decoding is byte-identical to decoding the whole string. Surya also
+#: reads its text only from ``message.content``, never from the per-token
+#: logprobs, and coderai's OCR gateway forwards the upstream body as raw bytes.
+#:
+#: So a U+FFFD in the output is the MODEL saying "there is a character here I
+#: cannot read". It is honest, and it is also silent: ``più`` becomes ``pi?`` and
+#: indexes, searches and reads wrong ever after. For Italian judicial documents
+#: that is a real loss, so it gets counted and located rather than passed through
+#: unremarked — a known unknown beats a quiet corruption.
+#:
+#: The usual cause is too few pixels: a diacritic sits above the x-height and is
+#: ~3 pixels tall at 200 DPI. See ``OcrConfig.surya_dpi``.
+UNREADABLE = "\ufffd"
+
+
+def unreadable_offsets(text: str) -> List[int]:
+    """Character offsets of every unreadable-glyph marker in ``text``."""
+    return [i for i, ch in enumerate(text or "") if ch == UNREADABLE]
+
+
+def count_unreadable(text: str) -> int:
+    """How many characters the engine could not identify."""
+    return (text or "").count(UNREADABLE)
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -50,7 +87,12 @@ class OcrLine:
     conf: float = 0.0
 
     def to_dict(self) -> dict:
-        return {"text": self.text, "bbox": self.bbox, "conf": round(self.conf, 4)}
+        out = {"text": self.text, "bbox": self.bbox, "conf": round(self.conf, 4)}
+        n = count_unreadable(self.text)
+        if n:
+            # Omitted when zero: a clean result stays exactly what it always was.
+            out["unreadable"] = n
+        return out
 
 
 @dataclass
@@ -95,6 +137,9 @@ class OcrPage:
         }
         if self.meta:
             out["meta"] = self.meta
+        n = count_unreadable(self.text)
+        if n:
+            out["unreadable"] = n
         return out
 
 
@@ -259,3 +304,56 @@ def vlm_serve_limits(cfg) -> dict:
         if v > 0:
             out[arg] = v
     return out
+
+
+#: At most this many individual markers are located in a document-level report.
+#: A page of pure noise could otherwise return thousands, and the count already
+#: tells the caller how bad it is.
+UNREADABLE_MAX_SPOTS = 100
+
+#: Characters of surrounding text kept with each located marker, each side.
+UNREADABLE_CONTEXT = 24
+
+
+def unreadable_report(pages: "List[OcrPage]") -> dict:
+    """Count and locate every character the engine could not identify.
+
+    Returns ``{}`` when the document is clean, so the key is simply absent from a
+    response that has nothing to report.
+
+    Each located marker carries the confidence of the line it sits in, which is
+    the finest granularity available: surya reports one mean token probability per
+    block (``PolygonBox.confidence``), not per character, so a per-character score
+    would have to be invented. ``conf`` is therefore the line's, and is the signal
+    worth acting on — a low-confidence line with an unreadable glyph is a line to
+    re-read at a higher DPI, while a high-confidence one is more likely a glyph
+    that genuinely is not in the model's repertoire.
+    """
+    total = 0
+    per_page = []
+    spots = []
+    for page in pages or []:
+        n_page = count_unreadable(getattr(page, "text", ""))
+        total += n_page
+        if n_page:
+            per_page.append({"page": page.index, "count": n_page})
+        for li, line in enumerate(getattr(page, "lines", []) or []):
+            text = getattr(line, "text", "") or ""
+            for off in unreadable_offsets(text):
+                if len(spots) >= UNREADABLE_MAX_SPOTS:
+                    break
+                lo = max(0, off - UNREADABLE_CONTEXT)
+                spots.append({
+                    "page": page.index,
+                    "line": li,
+                    "offset": off,
+                    "conf": round(float(getattr(line, "conf", 0.0) or 0.0), 4),
+                    "bbox": getattr(line, "bbox", None),
+                    "context": text[lo:off + UNREADABLE_CONTEXT + 1],
+                })
+    if not total:
+        return {}
+    report = {"count": total, "pages": per_page, "spots": spots}
+    if total > len(spots):
+        report["truncated"] = total - len(spots)
+    return report

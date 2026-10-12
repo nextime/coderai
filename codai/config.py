@@ -899,6 +899,17 @@ class OcrConfig:
     enabled: bool = False
     default_engine: str = "paddle"        # paddle|doctr|surya|olmocr
     dpi: int = 200                        # PDF rasterisation DPI
+    # Per-engine PDF rasterisation DPI (0 = use `dpi` above). Surya-2 gets its own
+    # because its input is capped at 3072x2048 = 6.29 Mpixels: `scale_to_fit` in
+    # surya/inference/util.py is called with DEFAULTS ONLY, so no surya setting can
+    # raise it, and anything larger is LANCZOS-downscaled to fit. An A4 page needs
+    # ~255 DPI to reach that ceiling, so the shared 200 was handing the model 3.89 of
+    # the 6.29 Mpixels it will accept -- 62% -- and an Italian accent is ~3 pixels
+    # tall at 200 DPI. That is why accented letters came back as the unreadable-glyph
+    # marker (see base.UNREADABLE). 250 saturates A4 at 1.5x the pixels of 200;
+    # higher still works (it supersamples, which tends to help glyphs) but costs
+    # rasterisation time and memory for no extra pixels at the model.
+    surya_dpi: int = 250
     max_concurrency: int = 4             # global cap on in-flight OCR pages
     lang: str = "it"                     # default document language
     # After an engine fails to come up, refuse that engine FAST for this long instead of
