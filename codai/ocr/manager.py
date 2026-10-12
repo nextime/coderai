@@ -66,6 +66,104 @@ _ENGINE_FACTORIES = {
 }
 
 
+#: What a request means when it names no language: let the engine recognise
+#: whatever is in front of it. Not a guess at a particular language — a server
+#: that has not been told what it is reading should not assume one.
+#:
+#: For surya-2, olmOCR and docTR this is simply the normal mode: they are
+#: multilingual and have no language input to constrain (surya-2's whole prompt
+#: is ``"OCR this block image to HTML."``). Only PaddleOCR must be handed a
+#: concrete language, and ``AUTO_PADDLE_LANG`` is what it gets.
+DEFAULT_LANG = "auto"
+
+#: Values a caller may use to mean DEFAULT_LANG explicitly.
+_AUTO_ALIASES = {"", "auto", "any", "multi", "multilingual", "detect"}
+
+#: What ``auto`` becomes for PaddleOCR, which has no auto mode and must be
+#: constructed for one language.
+#:
+#: This is a SCRIPT family, not detection: PaddleOCR's ``latin`` model covers
+#: Italian, French, Spanish, German, Portuguese and the rest of the Latin
+#: alphabet, and most ISO codes it accepts (``it``, ``es``, ...) resolve to it
+#: anyway. It is the honest broad default — PaddleOCR's own is ``ch``, which
+#: would be a worse guess for most documents than no guess at all. A document in
+#: another script needs its language named (``lang=arabic``, ``lang=japan``,
+#: ``lang=cyrillic``), or one of the multilingual engines, which need nothing.
+#: Override with ``ocr.paddle_auto_lang``.
+AUTO_PADDLE_LANG = "latin"
+
+#: Engines whose LOADED instance is built for ONE language, so serving another
+#: needs a separate pool.
+#:
+#: Only PaddleOCR: it loads a language-specific recognition model, and the
+#: options are sent once at load (``{"cmd": "load", "opts": ...}``) — an instance
+#: cannot be re-languaged afterwards. docTR's recognition is Latin-script-wide,
+#: and surya-2 and olmOCR are VLMs whose prompt has no language slot at all
+#: (surya-2's is the seven words ``"OCR this block image to HTML."``, and its own
+#: module warns the wording is the training-time contract).
+#:
+#: This set must stay as small as the truth allows. A language-keyed pool is a
+#: SECOND set of loaded instances holding VRAM — a production install runs 24
+#: surya instances, and multiplying those per language would be ruinous for a
+#: parameter those engines cannot use.
+_LANG_SENSITIVE = {"paddle"}
+
+
+def normalize_lang(value) -> str:
+    """A language tag reduced to the form engines expect, with the ways of saying
+    "work it out yourself" all collapsed onto ``auto``."""
+    text = str(value or "").strip().lower().replace("_", "-")
+    return DEFAULT_LANG if text in _AUTO_ALIASES else text
+
+
+def resolve_lang(cfg, name: str, requested=None) -> str:
+    """The language this request is read in, or ``auto``.
+
+    Precedence is request > engine-specific config > global config > ``auto``. The
+    REQUEST wins over ``<engine>_lang`` deliberately: a per-engine setting is an
+    install's default for that engine, while a caller who names a language is
+    telling us something about the document in hand, which is better information.
+
+    A request that explicitly says ``auto`` means auto — it is not treated as
+    "unset" and does not fall back to the configured language. Asking for
+    auto-recognition on an install configured for Italian has to be possible.
+    """
+    want = normalize_lang(requested)
+    if str(requested or "").strip():
+        return want
+    per_engine = normalize_lang(getattr(cfg, f"{name}_lang", ""))
+    if per_engine != DEFAULT_LANG:
+        return per_engine
+    return normalize_lang(getattr(cfg, "lang", ""))
+
+
+def engine_lang(cfg, name: str, lang: str) -> str:
+    """``lang`` in the form the engine itself can be built with.
+
+    Only PaddleOCR needs the translation: it has no auto mode, so ``auto`` becomes
+    a broad script model. The multilingual engines never reach here.
+    """
+    if lang != DEFAULT_LANG:
+        return lang
+    if name == "paddle":
+        # Not `normalize_lang(...) or AUTO_PADDLE_LANG`: normalize_lang("") is
+        # "auto", which is truthy, so an unset override would have returned the
+        # very value this exists to translate.
+        configured = normalize_lang(getattr(cfg, "paddle_auto_lang", ""))
+        return AUTO_PADDLE_LANG if configured == DEFAULT_LANG else configured
+    return lang
+
+
+def engine_uses_language(name: str) -> bool:
+    """Whether ``name`` actually reads differently when told a language.
+
+    Reported to clients so a caller can tell a language that was applied from one
+    that was accepted and could not be: silently ignoring ``lang`` would be the
+    worse answer.
+    """
+    return name in _LANG_SENSITIVE
+
+
 def _engine_enabled(cfg, name: str) -> bool:
     if name == "paddle":
         return bool(cfg.paddle_enabled)
@@ -396,6 +494,9 @@ class OcrManager:
     def _pool_params(cfg) -> tuple:
         return (
             cfg.max_concurrency,
+            # cfg.lang and paddle_auto_lang decide which model a paddle pool is
+            # built with, so a change to either has to invalidate the pools.
+            getattr(cfg, "lang", ""), getattr(cfg, "paddle_auto_lang", ""),
             cfg.paddle_enabled, cfg.paddle_instances, cfg.paddle_use_gpu,
             cfg.paddle_structure, cfg.paddle_lang,
             cfg.paddle_det_model_dir, cfg.paddle_rec_model_dir,
@@ -447,6 +548,11 @@ class OcrManager:
                 "enabled": bool(enabled),
                 "instances": _engine_instances(cfg, name),
                 "returns": shapes.get(name, {}),
+                # Whether `lang=` steers this engine. The multilingual ones accept
+                # it and recognise what they find regardless; saying so lets a
+                # client stop guessing which of the two it got.
+                "language_aware": engine_uses_language(name),
+                "lang": resolve_lang(cfg, name, None),
             }
             if not enabled:
                 if name == "surya" and cfg.surya_enabled and not cfg.surya_accept_license:
@@ -536,14 +642,54 @@ class OcrManager:
         per_engine = int(getattr(cfg, f"{name}_dpi", 0) or 0)
         return per_engine if per_engine > 0 else int(cfg.dpi)
 
-    async def _get_pool(self, name: str) -> _Pool:
+    async def _get_pool(self, name: str, lang: str = "") -> _Pool:
+        """The pool serving ``name``, in ``lang`` for the engines that read by it.
+
+        A language-sensitive engine gets one pool PER language, because its
+        instances are built for a language at load time and cannot be re-languaged
+        (see ``_LANG_SENSITIVE``). Every other engine keeps a single pool whatever
+        the caller asks for — keying those by language would duplicate loaded
+        instances, and VRAM, for a parameter they cannot act on.
+        """
+        cfg = self._require_cfg()
+        if engine_uses_language(name):
+            # Key on what the engine is BUILT with, not what was asked: `auto` and
+            # the language it maps to are the same loaded model, and must not be
+            # two pools holding two copies of it.
+            lang = engine_lang(cfg, name, resolve_lang(cfg, name, lang))
+            key = f"{name}:{lang}"
+        else:
+            lang, key = "", name
         async with self._lock:
-            pool = self._pools.get(name)
+            pool = self._pools.get(key)
             if pool is None:
-                cfg = self._require_cfg()
-                pool = _Pool(name, cfg, _engine_instances(cfg, name))
-                self._pools[name] = pool
+                pool = _Pool(name, self._cfg_for(cfg, name, lang),
+                             _engine_instances(cfg, name))
+                self._pools[key] = pool
             return pool
+
+    @staticmethod
+    def _cfg_for(cfg, name: str, lang: str):
+        """``cfg`` with this request's language already resolved into it.
+
+        The pool builds engines with ``factory(self.cfg)`` and each engine reads its
+        own language out of the config, so resolving it here means no engine needs
+        to know a per-request language exists. Both the global and the
+        engine-specific field are set, so the request beats ``<engine>_lang`` too.
+        """
+        if not lang:
+            return cfg
+        try:
+            import dataclasses
+            fields = {f.name for f in dataclasses.fields(cfg)}
+            changes = {"lang": lang}
+            if f"{name}_lang" in fields:
+                changes[f"{name}_lang"] = lang
+            return dataclasses.replace(cfg, **changes)
+        except Exception:
+            # Not a dataclass, or a field that will not round-trip: the shared
+            # config still serves the document, in the configured language.
+            return cfg
 
     def _fallback_order(self, failed: str) -> List[str]:
         """Enabled engines to try after ``failed`` could not serve the document.
@@ -565,8 +711,8 @@ class OcrManager:
         return [n for n in names
                 if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
 
-    async def _pages_with(self, name: str, images: List) -> List[OcrPage]:
-        pool = await self._get_pool(name)
+    async def _pages_with(self, name: str, images: List, lang: str = "") -> List[OcrPage]:
+        pool = await self._get_pool(name, lang)
         sem = self._sem or asyncio.Semaphore(4)
 
         async def _one(idx, img):
@@ -578,7 +724,8 @@ class OcrManager:
         pages = await asyncio.gather(*[_one(i, im) for i, im in enumerate(images)])
         return list(pages)
 
-    async def ocr_pages(self, images: List, engine: Optional[str] = None) -> (str, List[OcrPage]):
+    async def ocr_pages(self, images: List, engine: Optional[str] = None,
+                        lang: Optional[str] = None) -> (str, List[OcrPage]):
         """OCR a list of PIL page images. Returns (engine_name, [OcrPage]).
 
         The returned name is the engine that ACTUALLY read the pages, which is not
@@ -588,7 +735,7 @@ class OcrManager:
         it fell back."""
         name = self.resolve_engine(engine)
         try:
-            return name, await self._pages_with(name, images)
+            return name, await self._pages_with(name, images, lang)
         except Exception as first:
             chain = self._fallback_order(name)
             if not chain:
@@ -597,7 +744,7 @@ class OcrManager:
                   f"falling back to {' -> '.join(chain)}")
             for alt in chain:
                 try:
-                    pages = await self._pages_with(alt, images)
+                    pages = await self._pages_with(alt, images, lang)
                 except Exception as e:
                     print(f"[ocr] fallback engine '{alt}' also failed: {e}")
                     continue
@@ -609,12 +756,19 @@ class OcrManager:
     async def ocr_document(self, data: bytes, filename: str = "", content_type: str = "",
                            engine: Optional[str] = None, dpi: Optional[int] = None,
                            detect: Optional[str] = None, structured: bool = False,
-                           schema: Optional[str] = None) -> dict:
+                           schema: Optional[str] = None,
+                           lang: Optional[str] = None) -> dict:
         """OCR raw bytes (image/PDF) end-to-end → response dict.
 
         ``detect`` overrides the configured stamp/signature detection mode
         (off|layout|detector|both). ``structured`` triggers field extraction via the
         configured text model; ``schema`` overrides the extraction schema for this call.
+
+        ``lang`` is the document's language; omitted or ``auto`` means let the engine
+        recognise whatever it finds, which is what the multilingual engines do
+        natively. The response reports the language that was applied and whether the
+        engine that served the page can actually read by language, so a caller can
+        tell a language that took effect from one that was merely accepted.
         """
         cfg = self._require_cfg()
         use_dpi = int(dpi) if dpi else self.engine_dpi(engine)
@@ -622,7 +776,7 @@ class OcrManager:
         # Share the GPU thermal governor with every other workload: block here until
         # temps are safe (wait_until_safe blocks, so run it off the event loop).
         await asyncio.to_thread(_wait_thermal_safe)
-        name, pages = await self.ocr_pages(images, engine=engine)
+        name, pages = await self.ocr_pages(images, engine=engine, lang=lang)
         full_text = "\n\n".join(p.text for p in pages)
 
         stamps, signatures = await self._detect_all(images, pages, detect)
@@ -632,8 +786,15 @@ class OcrManager:
             from codai.ocr.extract import extract_fields
             structured_out = await extract_fields(full_text, cfg, schema=schema)
 
+        applied = resolve_lang(cfg, name, lang)
         out = {
             "engine": name,
+            "lang": applied,
+            # Whether the engine that actually served can read by language at all.
+            # surya-2, olmOCR and docTR are multilingual with no language input, so
+            # a `lang` they were given was accepted and had no effect; saying so is
+            # better than letting a caller believe it steered anything.
+            "lang_applied": engine_uses_language(name),
             "num_pages": len(pages),
             "text": full_text,
             "pages": [p.to_dict() for p in pages],

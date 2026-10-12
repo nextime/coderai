@@ -33,7 +33,10 @@ class PaddleEngine(SubprocessOcrEngine):
 
     def _worker_opts(self) -> dict:
         return {
-            "lang": self.cfg.paddle_lang or self.cfg.lang or "it",
+            # Already resolved by the manager (request > paddle_lang > lang >
+            # auto), and `auto` already translated to a script family -- an engine
+            # is built for ONE language and cannot be re-languaged afterwards.
+            "lang": self.cfg.paddle_lang or self.cfg.lang or "latin",
             "use_gpu": bool(self.cfg.paddle_use_gpu),
             "structure": bool(self.cfg.paddle_structure),
             "det_model_dir": self.cfg.paddle_det_model_dir or "",

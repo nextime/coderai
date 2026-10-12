@@ -266,7 +266,7 @@ back.
 ## Enable & configure
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,
-`default_engine`, `dpi`, `surya_dpi`, `max_concurrency`, `lang`, `build_retry_cooldown_s`,
+`default_engine`, `dpi`, `surya_dpi`, `max_concurrency`, `lang`, `paddle_auto_lang`, `build_retry_cooldown_s`,
 `vlm_gpu_memory_utilization`, `vlm_max_num_batched_tokens`, `vlm_max_num_seqs`,
 `vlm_max_model_len`, `fallback_engines`, `evict_drain_timeout_s`;
 per-engine `*_enabled` /
@@ -295,7 +295,7 @@ aggregate throughput without vLLM (a continuous-batching path is a future option
 ## Endpoints
 
 ```
-POST /v1/ocr            multipart: file=@doc.pdf [engine=] [dpi=] [detect=] [structured=] [schema=]
+POST /v1/ocr            multipart: file=@doc.pdf [engine=] [lang=] [dpi=] [detect=] [structured=] [schema=]
 POST /v1/ocr/batch      multipart: files=@a.pdf files=@b.png [...same fields...]
 GET  /v1/ocr/engines    what this install offers, and what each engine returns
 GET/POST/DELETE /v1/ocr/schemas[/{name}]   manage extraction schemas
@@ -319,6 +319,58 @@ Response: `{engine, num_pages, text, pages[], stamps[], signatures[], structured
 page carries `lines[]` (text + bbox + conf), `regions[]` (layout), `tables[]`, and
 `meta` when the engine reports page metadata (olmOCR does; the others do not). The
 `ocr` **pipeline step type** chains OCR with `text_gen` in custom pipelines.
+
+### `lang=` — and why the default is auto-recognition
+
+A client names the document's language; omitting it (or sending `lang=auto`) means
+**let the engine recognise what it finds**. The default is deliberately not a
+language: a server that has not been told what it is reading should not assume one.
+
+The parameter does not mean the same thing to every engine, and the response says
+which it was:
+
+| engine | `lang=` | why |
+|---|---|---|
+| `paddle` | **steers it** | loads a language-specific recognition model |
+| `doctr` | accepted, no effect | recognition is Latin-script-wide |
+| `surya` | accepted, no effect | VLM; its whole prompt is `"OCR this block image to HTML."` |
+| `olmocr` | accepted, no effect | VLM; fixed prompt |
+
+So every response carries both the language applied and whether the engine that
+served could act on it — silently ignoring `lang` would leave a caller believing it
+steered something:
+
+```json
+{ "engine": "surya", "lang": "it", "lang_applied": false, ... }
+```
+
+`/v1/ocr/engines` reports the same per engine (`language_aware`), so a client can
+choose before sending.
+
+**Precedence** is request > `ocr.<engine>_lang` > `ocr.lang` > auto. The request
+beats the engine-specific setting on purpose: that setting is an install's default,
+while a caller naming a language knows something about the document in hand. Asking
+for `auto` explicitly is *not* the same as sending nothing — an install configured
+for Italian can still be asked to work it out.
+
+**PaddleOCR is the exception that shapes the design.** It has no auto mode and its
+options are sent once at load (`{"cmd": "load", "opts": ...}`), so an instance is
+built for one language and cannot be re-languaged. Two consequences:
+
+* `auto` becomes `ocr.paddle_auto_lang` (default `latin`). That is a *script family*,
+  not detection — it covers Italian, French, Spanish, German, Portuguese and the rest
+  of the Latin alphabet, and most ISO codes PaddleOCR accepts resolve to it anyway.
+  PaddleOCR's own default is `ch`, a worse guess for most documents than no guess.
+  Another script needs naming: `lang=arabic|japan|cyrillic|devanagari`.
+* paddle gets **one pool per language**, keyed on the model it is built with (so
+  `auto` and `latin` share a pool rather than loading it twice). The multilingual
+  engines keep a single pool whatever is asked, which is not tidiness: a
+  language-keyed pool is a second set of loaded instances holding VRAM, and a
+  production install runs 24 surya instances.
+
+Note that `ocr.surya_langs` is a **legacy** setting. It reaches only the ≤0.17
+recognition API (`rec(images, langs, det_predictor)`); surya-2 has no language input,
+so on the pod path it does nothing.
 
 ### Where `conf` comes from on a served engine
 

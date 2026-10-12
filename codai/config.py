@@ -911,7 +911,17 @@ class OcrConfig:
     # rasterisation time and memory for no extra pixels at the model.
     surya_dpi: int = 250
     max_concurrency: int = 4             # global cap on in-flight OCR pages
-    lang: str = "it"                     # default document language
+    # Default document language when a request names none. "auto" (the shipped
+    # default) means let the engine recognise what it finds: surya-2, olmOCR and
+    # docTR are multilingual and have no language input at all, and PaddleOCR --
+    # the one engine built for a single language -- gets `paddle_auto_lang`.
+    lang: str = "auto"
+    # What "auto" becomes for PaddleOCR, which has no auto mode. A SCRIPT family,
+    # not detection: `latin` covers Italian, French, Spanish, German, Portuguese
+    # and the rest of the Latin alphabet. PaddleOCR's own default is `ch`, a worse
+    # guess for most documents than no guess. Another script needs naming
+    # (lang=arabic|japan|cyrillic|devanagari) or one of the multilingual engines.
+    paddle_auto_lang: str = "latin"
     # After an engine fails to come up, refuse that engine FAST for this long instead of
     # re-attempting the load on every request (a vLLM-backed engine burns ~35s per failed
     # boot; Surya-2 once did that 338 times in a row on a card that was 11 GB short).

@@ -1115,9 +1115,22 @@
         <label class="form-label">Max concurrency</label>
         <input type="number" id="s-ocr-max-concurrency" class="form-input" min="1" placeholder="4">
       </div>
-      <div class="form-group" style="flex:1;min-width:90px">
+      <div class="form-group" style="flex:1;min-width:140px">
         <label class="form-label">Language</label>
-        <input type="text" id="s-ocr-lang" class="form-input" placeholder="it">
+        <input type="text" id="s-ocr-lang" class="form-input" placeholder="auto">
+        <span class="form-hint">Default when a request sends no <code>lang</code>.
+        <b>auto</b> lets each engine recognise what it finds. Surya-2, olmOCR and docTR
+        are multilingual and have no language input at all, so <code>lang</code> never
+        steers them; only PaddleOCR is built for one language.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:140px">
+        <label class="form-label">Paddle "auto" language</label>
+        <input type="text" id="s-ocr-paddle-auto-lang" class="form-input" placeholder="latin">
+        <span class="form-hint">PaddleOCR has no auto mode, so <b>auto</b> becomes this.
+        A script family, not detection: <code>latin</code> covers Italian, French,
+        Spanish, German and the rest of the Latin alphabet. Another script needs naming
+        (<code>arabic</code>, <code>japan</code>, <code>cyrillic</code>,
+        <code>devanagari</code>) or one of the multilingual engines.</span>
       </div>
       <div class="form-group" style="flex:1;min-width:130px">
         <label class="form-label">Retry cooldown (s)</label>
@@ -2122,7 +2135,8 @@ async function loadSettings(){
     document.getElementById('s-ocr-dpi').value = ocr.dpi ?? 200;
     document.getElementById('s-ocr-surya-dpi').value = ocr.surya_dpi ?? 250;
     document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 4;
-    document.getElementById('s-ocr-lang').value = ocr.lang ?? 'it';
+    document.getElementById('s-ocr-lang').value = ocr.lang ?? 'auto';
+    document.getElementById('s-ocr-paddle-auto-lang').value = ocr.paddle_auto_lang ?? 'latin';
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
     document.getElementById('s-ocr-vlm-gmu').value = ocr.vlm_gpu_memory_utilization ?? 0;
     document.getElementById('s-ocr-fallback').value = ocr.fallback_engines ?? 'auto';
@@ -2377,7 +2391,8 @@ async function saveSettings(silent){
       dpi: parseInt(document.getElementById('s-ocr-dpi').value) || 200,
       surya_dpi: parseInt(document.getElementById('s-ocr-surya-dpi').value) || 0,
       max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 4,
-      lang: document.getElementById('s-ocr-lang').value.trim() || 'it',
+      lang: document.getElementById('s-ocr-lang').value.trim() || 'auto',
+      paddle_auto_lang: document.getElementById('s-ocr-paddle-auto-lang').value.trim() || 'latin',
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
       vlm_gpu_memory_utilization: parseFloat(document.getElementById('s-ocr-vlm-gmu').value) || 0,
       fallback_engines: document.getElementById('s-ocr-fallback').value.trim() || 'auto',

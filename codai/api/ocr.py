@@ -63,7 +63,7 @@ async def create_ocr(
     file: UploadFile = File(...),
     engine: Optional[str] = Form(None),        # paddle|doctr|surya|olmocr (default from config)
     dpi: Optional[int] = Form(None),           # PDF rasterisation DPI
-    lang: Optional[str] = Form(None),          # reserved (per-engine language override)
+    lang: Optional[str] = Form(None),          # document language; omit or "auto" to let the engine decide
     structured: Optional[bool] = Form(False),  # structured JSON extraction via text model
     schema_: Optional[str] = Form(None, alias="schema"),  # override extraction schema (JSON string)
     detect: Optional[str] = Form(None),        # off|layout|detector|both
@@ -89,6 +89,7 @@ async def create_ocr(
             detect=detect,
             structured=bool(structured),
             schema=schema_,
+            lang=lang,
         )
     except OcrError as e:
         raise HTTPException(status_code=e.status, detail=str(e))
@@ -101,6 +102,7 @@ async def create_ocr_batch(
     files: List[UploadFile] = File(...),
     engine: Optional[str] = Form(None),
     dpi: Optional[int] = Form(None),
+    lang: Optional[str] = Form(None),
     structured: Optional[bool] = Form(False),
     schema_: Optional[str] = Form(None, alias="schema"),
     detect: Optional[str] = Form(None),
@@ -125,7 +127,7 @@ async def create_ocr_batch(
         try:
             res = await ocr_manager.ocr_document(
                 data, filename=name, content_type=ctype, engine=engine, dpi=dpi,
-                detect=detect, structured=bool(structured), schema=schema_,
+                detect=detect, structured=bool(structured), schema=schema_, lang=lang,
             )
             res["filename"] = name
             return res
@@ -226,6 +228,7 @@ class OcrStepRequest(BaseModel):
     image: str = ""                       # data: URI, base64, or {{stepN.url}} reference
     engine: Optional[str] = None
     dpi: Optional[int] = None
+    lang: Optional[str] = None
     detect: Optional[str] = None
     structured: Optional[bool] = False
     schema_: Optional[str] = Field(default=None, alias="schema")
@@ -264,6 +267,7 @@ async def run_ocr_step(request: OcrStepRequest, http_request=None):
         return await ocr_manager.ocr_document(
             data, filename=filename, engine=request.engine, dpi=request.dpi,
             detect=request.detect, structured=bool(request.structured), schema=schema,
+            lang=getattr(request, "lang", None),
         )
     except OcrError as e:
         raise HTTPException(status_code=e.status, detail=str(e))
