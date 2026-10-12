@@ -213,6 +213,22 @@ class VllmBackend(ModelBackend):
             payload["logprobs"] = True
             if top_logprobs is not None:
                 payload["top_logprobs"] = int(top_logprobs)
+            # Ask for the RAW VOCABULARY IDS rather than rendered strings, when the
+            # operator has turned it on. This is the only lossless channel for a
+            # model whose vocabulary is byte-level: measured on vLLM 0.27.1 serving
+            # surya-ocr-2, `content` comes back with one U+FFFD per accented letter
+            # and the per-token `bytes` come back EMPTY, so neither output carries
+            # the character -- while the ids are intact and surya's own tokenizer
+            # decodes them correctly. vLLM's own words for the field: "so that
+            # tokens that are not JSON-encodable can be identified".
+            #
+            # Set here rather than relaunching the server with
+            # --return-tokens-as-token-ids, because this is a per-request field and
+            # a config change beats a pod rebuild. It only changes the `token`
+            # STRING inside logprobs; nothing in coderai reads that except the OCR
+            # worker's repair.
+            if getattr(self._cfg, "return_token_ids", False):
+                payload["return_tokens_as_token_ids"] = True
         return payload
 
     # ------------------------------------------------------------------ #

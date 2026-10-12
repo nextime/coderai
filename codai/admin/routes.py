@@ -4776,6 +4776,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "gpu_memory_utilization" in d:
             try: v.gpu_memory_utilization = float(d.get("gpu_memory_utilization") or v.gpu_memory_utilization)
             except (TypeError, ValueError): pass
+        if "return_token_ids" in d: v.return_token_ids = bool(d["return_token_ids"])
         if "tensor_parallel_size" in d:
             try: v.tensor_parallel_size = max(1, int(d.get("tensor_parallel_size") or 1))
             except (TypeError, ValueError): pass

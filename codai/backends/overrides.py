@@ -20,7 +20,11 @@ import dataclasses
 VLLM_FIELDS = ("ctx", "gpu", "gpu_memory_utilization", "tensor_parallel_size",
                "pipeline_parallel_size", "distributed_executor_backend", "ray_address",
                "ray_port", "nodes", "nodes_ready_timeout_s", "max_num_seqs", "dtype",
-               "quantization", "extra_args", "extra_env")
+               "quantization", "extra_args", "extra_env",
+               # Per model, so the one checkpoint with a byte-level vocabulary can
+               # ask for token ids without changing what every other vLLM model
+               # reports (see VllmConfig.return_token_ids).
+               "return_token_ids")
 
 KT_FIELDS = ("ctx", "kt_weight_path", "nnodes", "dist_init_addr", "tp_size", "nodes",
              "extra_args", "extra_env")

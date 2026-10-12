@@ -16,6 +16,7 @@
 # argv[1] = engine name ("paddle" | "surya").
 
 import base64
+import os
 import io
 import json
 import sys
@@ -353,6 +354,70 @@ def _reassemble(tokens) -> str:
     return None if UNREADABLE in text else text
 
 
+#: vLLM renders a token it cannot JSON-encode as this, when it is launched with
+#: ``--return-tokens-as-token-ids``. Those are exactly the tokens that lose
+#: surya's accents: byte-level pieces that are not characters on their own.
+_TOKEN_ID_PREFIX = "token_id:"
+
+
+def _token_ids(tokens):
+    """The raw vocabulary ids behind a reply, or None if they were not reported.
+
+    This is the way out of the dead end the ``bytes`` field leads to. vLLM 0.27.1
+    reports ``bytes: []`` for surya-ocr-2's byte-level tokens and renders them as
+    U+FFFD in the text, so neither output carries the character -- but the IDS are
+    not lossy, and surya's own tokenizer decodes them correctly
+    (``decode([2131, 2104]) == 'e-grave'``, measured). vLLM will report them as
+    ``token_id:2131`` when its server is launched with
+    ``--return-tokens-as-token-ids``.
+
+    All or nothing: a partial id list would decode to a partial page.
+    """
+    if not tokens:
+        return None
+    ids = []
+    for t in tokens:
+        tok = (t.get("token") if isinstance(t, dict)
+               else getattr(t, "token", None))
+        if not isinstance(tok, str) or not tok.startswith(_TOKEN_ID_PREFIX):
+            return None
+        try:
+            ids.append(int(tok[len(_TOKEN_ID_PREFIX):]))
+        except ValueError:
+            return None
+    return ids or None
+
+
+def _decode_ids(ids):
+    """``ids`` through surya's OWN tokenizer, which round-trips accents.
+
+    Imported here rather than at module scope: this worker must start even when
+    the surya venv is mid-build, and a page that needs no repair must not pay for
+    loading a tokenizer. Cached on the function because a document is many pages.
+    """
+    if not ids:
+        return None
+    tok = getattr(_decode_ids, "_tok", None)
+    if tok is None:
+        try:
+            from transformers import AutoTokenizer
+            ckpt = os.environ.get("SURYA_MODEL_CHECKPOINT") or "datalab-to/surya-ocr-2"
+            tok = AutoTokenizer.from_pretrained(ckpt, trust_remote_code=True)
+        except Exception as e:
+            print(f"[surya] cannot load the tokenizer for id decoding: {e}",
+                  file=sys.stderr)
+            _decode_ids._tok = False
+            return None
+        _decode_ids._tok = tok
+    if tok is False:
+        return None
+    try:
+        return tok.decode(ids, skip_special_tokens=True)
+    except Exception as e:
+        print(f"[surya] id decoding failed: {e}", file=sys.stderr)
+        return None
+
+
 def repair_content(raw: str, tokens):
     """``(repaired_text, characters_recovered)`` for a reply whose text lost
     characters, or ``(None, 0)`` to leave it alone.
@@ -371,7 +436,13 @@ def repair_content(raw: str, tokens):
     """
     if not raw or UNREADABLE not in raw:
         return None, 0
-    fixed = _reassemble(tokens)
+    # IDS FIRST. They are the only lossless channel on vLLM 0.27.1, which reports
+    # `bytes: []` for precisely the tokens whose characters went missing. The byte
+    # route is kept because it needs no server flag and works wherever the bytes
+    # are honestly reported.
+    fixed = _decode_ids(_token_ids(tokens))
+    if fixed is None or UNREADABLE in fixed:
+        fixed = _reassemble(tokens)
     if fixed is None:
         return None, 0
     if _ascii_skeleton(fixed) != _ascii_skeleton(raw):

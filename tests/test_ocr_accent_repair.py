@@ -297,3 +297,110 @@ def test_the_existing_vllm_image_is_unchanged():
     """A model on `coderai-vllm` must not be quietly moved to the pinned image."""
     from codai.api.runpod_worker import default_capability_image
     assert default_capability_image("vllm") == "ghcr.io/nextime/coderai-vllm:latest"
+
+
+# ------------------- token ids: the lossless channel on vLLM 0.27.1 #
+def test_token_ids_are_read_from_the_vllm_form():
+    """vLLM renders a token it cannot JSON-encode as `token_id:N` when launched
+    with --return-tokens-as-token-ids. Those are exactly surya's byte-level
+    tokens — the ones it otherwise reports as `bytes: []` and U+FFFD."""
+    toks = [{"token": "token_id:2131"}, {"token": "token_id:2104"}]
+    assert W._token_ids(toks) == [2131, 2104]
+
+
+def test_rendered_tokens_are_not_mistaken_for_ids():
+    assert W._token_ids([{"token": "a"}, {"token": "token_id:5"}]) is None
+    assert W._token_ids([{"token": "token_id:x"}]) is None
+    assert W._token_ids([]) is None
+    assert W._token_ids(None) is None
+
+
+def test_ids_are_all_or_nothing():
+    """A partial id list would decode to a partial page, which is worse than no
+    repair at all."""
+    assert W._token_ids([{"token": "token_id:1"}, {"token": "b"}]) is None
+
+
+def test_the_repair_prefers_ids_over_bytes(monkeypatch):
+    """On 0.27.1 the bytes are empty for the very tokens that matter, so the id
+    route has to be tried first or the repair falls back to a dead end."""
+    UN = "�"
+    monkeypatch.setattr(W, "_decode_ids", lambda ids: "società" if ids else None)
+    toks = [{"token": "token_id:1", "bytes": []}]
+    fixed, n = W.repair_content("societ" + UN, toks)
+    assert fixed == "società"
+    assert n == 1
+
+
+def test_a_bad_id_decode_falls_back_to_the_byte_route(monkeypatch):
+    """The byte route needs no server flag, so it stays as the fallback for any
+    stack that reports bytes honestly."""
+    UN = "�"
+    monkeypatch.setattr(W, "_decode_ids", lambda ids: None)
+    good = "società"
+    toks = [{"token": "x", "bytes": [b]} for b in good.encode()]
+    fixed, _ = W.repair_content("societ" + UN, toks)
+    assert fixed == good
+
+
+def test_an_id_decode_that_still_contains_a_marker_is_rejected(monkeypatch):
+    UN = "�"
+    monkeypatch.setattr(W, "_decode_ids", lambda ids: "societ" + UN)
+    assert W.repair_content("societ" + UN, [{"token": "token_id:1"}]) == (None, 0)
+
+
+def test_the_skeleton_guard_still_applies_to_the_id_route(monkeypatch):
+    """Ids are lossless but the decode could still be of the wrong call."""
+    UN = "�"
+    monkeypatch.setattr(W, "_decode_ids", lambda ids: "qualcosa di diverso")
+    assert W.repair_content("societ" + UN, [{"token": "token_id:1"}]) == (None, 0)
+
+
+# ------------- the other half: the proxy must stop dropping the field #
+def test_the_vllm_backend_forwards_the_token_ids_request():
+    """MEASURED: sending `return_tokens_as_token_ids` to a pod changed nothing,
+    because `_chat_payload` builds an explicit whitelist and silently dropped it —
+    the exact failure its own neighbouring comment warns about ("a proxy that
+    edits the request decides for it")."""
+    from codai.backends.vllm import VllmBackend
+    from codai.config import VllmConfig
+
+    be = VllmBackend.__new__(VllmBackend)
+    be._cfg = VllmConfig()
+    be._model_id = "m"
+    be._served_name = "m"
+
+    off = be._chat_payload([], None, 0.0, 1.0, None, False, logprobs=True)
+    assert "return_tokens_as_token_ids" not in off
+
+    be._cfg.return_token_ids = True
+    on = be._chat_payload([], None, 0.0, 1.0, None, False, logprobs=True)
+    assert on["return_tokens_as_token_ids"] is True
+
+
+def test_the_field_is_only_sent_with_logprobs():
+    """It describes how logprob tokens are rendered, so without logprobs it is
+    noise on the wire."""
+    from codai.backends.vllm import VllmBackend
+    from codai.config import VllmConfig
+
+    be = VllmBackend.__new__(VllmBackend)
+    be._cfg = VllmConfig()
+    be._cfg.return_token_ids = True
+    be._model_id = be._served_name = "m"
+    assert "return_tokens_as_token_ids" not in be._chat_payload(
+        [], None, 0.0, 1.0, None, False)
+
+
+def test_it_is_off_by_default():
+    """It changes what the `token` field looks like, and only one consumer reads
+    it."""
+    from codai.config import VllmConfig
+    assert VllmConfig().return_token_ids is False
+
+
+def test_it_can_be_set_per_model():
+    """So the one checkpoint with a byte-level vocabulary can ask for ids without
+    changing what every other vLLM model reports."""
+    from codai.backends.overrides import VLLM_FIELDS
+    assert "return_token_ids" in VLLM_FIELDS

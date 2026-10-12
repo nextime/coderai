@@ -709,6 +709,19 @@ class VllmConfig:
     the OCR subsystem passes its own model. Leave ``model_id`` blank for the model-list flow.
     Also reused by the OCR subsystem to serve Surya2 (a VLM) with continuous batching.
     """
+    # Ask vLLM to report logprob tokens as `token_id:{id}` instead of rendered
+    # strings. Off by default because it changes what that field looks like, and
+    # only one consumer reads it.
+    #
+    # It exists for a measured dead end: on vLLM 0.27.1 serving
+    # `datalab-to/surya-ocr-2`, whose vocabulary is BYTE-level, an accented letter
+    # comes back as U+FFFD in `content` AND as an empty `bytes` list in the
+    # logprobs -- 257 such tokens on one page, with no byte >= 0x80 anywhere. So
+    # there is nothing to recover from either output. The token IDS are intact,
+    # and surya's own tokenizer decodes them correctly, so with this on the OCR
+    # worker can rebuild the text itself (`ocr.surya_repair_accents`) instead of
+    # waiting for an upstream fix or pinning vLLM back to 0.20.1.
+    return_token_ids: bool = False
     enabled: bool = False
     # Point this at an engine already running somewhere else (another host, a
     # container, a rented pod) and coderai proxies to it instead of building,
@@ -1690,6 +1703,7 @@ class ConfigManager:
                 "port": self.config.vllm.port,
                 "ctx": self.config.vllm.ctx,
                 "gpu_memory_utilization": self.config.vllm.gpu_memory_utilization,
+                "return_token_ids": self.config.vllm.return_token_ids,
                 "tensor_parallel_size": self.config.vllm.tensor_parallel_size,
                 "max_num_seqs": self.config.vllm.max_num_seqs,
                 "dtype": self.config.vllm.dtype,
