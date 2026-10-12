@@ -2,7 +2,7 @@
 
 CoderAI OCRs documents with **purpose-built OCR engines** (detection + recognition) —
 faithful transcription with per-line bounding boxes and layout, GPU batching, no
-hallucinated text — and, for the pages those read badly, one **document VLM**. Four
+hallucinated text — and, for the pages those read badly, two **document VLMs**. Five
 engines are integrated and selectable per request:
 
 | engine | id | license | how it runs |
@@ -11,6 +11,7 @@ engines are integrated and selectable per request:
 | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) + PP-Structure | `paddle` | Apache-2.0 | **isolated venv subprocess** (layout + tables) |
 | [Surya](https://github.com/VikParuchuri/surya) | `surya` | GPL (compatible with coderai's GPLv3) | **isolated venv subprocess**; best layout/reading-order; opt-in |
 | [olmOCR-2](https://huggingface.co/allenai/olmOCR-2-7B-1025) | `olmocr` | Apache-2.0 | **a document VLM**, served by a coderai model, coderai's vLLM, or any OpenAI endpoint. **No bounding boxes.** |
+| [Chandra](https://huggingface.co/datalab-to/chandra-ocr-2) | `chandra` | code Apache-2.0, **weights modified OpenRAIL-M** (research/personal/under-$2M, no competitive use) | **a document VLM that returns layout** — boxes, labelled regions and tables in one pass. Served like olmOCR; opt-in. |
 
 Per document you get three outputs: **plain text**, **structured JSON fields**, and
 **stamp/signature flags**.
@@ -18,9 +19,14 @@ Per document you get three outputs: **plain text**, **structured JSON fields**, 
 **Which one?** `paddle`/`doctr`/`surya` give you boxes, layout regions and tables, which
 is what you want when something downstream has to point at a place on the page (redaction,
 stamp detection, a table's cells). `olmocr` gives you the best *reading* of a hard page —
-old scans, maths, multi-column, dense tables — and nothing positional. Stamp/signature
-detection in `layout` mode has nothing to work with under `olmocr`; `detector` mode (YOLO)
-still works, because it looks at the image, not the engine's output.
+old scans, maths, multi-column, dense tables — and nothing positional. `chandra` is the
+one that does both: it is a VLM, so it reads a hard page like olmOCR, but it is *asked*
+for its layout, so it answers with one block per region carrying a box and a label. It is
+also the only engine here whose licence has a revenue ceiling, which is the reason it is
+not simply the default. Stamp/signature detection in `layout` mode has nothing to work
+with under `olmocr`; it works under `chandra` (the regions are real) and under the three
+detector-based engines, and `detector` mode (YOLO) works everywhere because it looks at
+the image, not the engine's output.
 
 ## Why isolated venvs for Paddle & Surya
 
@@ -163,9 +169,125 @@ do not carry, so a pod asked for `olmocr` serves the request with docTR and says
 log. Point `olmocr_serve: "server"` at something the pod can reach if you want the real
 thing out there.
 
+## Chandra (`chandra`) — the document VLM that *also* gives you boxes
+
+[Chandra](https://huggingface.co/datalab-to/chandra-ocr-2) is Datalab's document VLM — the
+same lab as Surya, and a Qwen3-VL fine-tune. Like olmOCR it reads a whole page in one
+call; unlike olmOCR it is **asked for its layout**, and that is the point of having it.
+
+Its `ocr_layout` prompt tells the model to answer as one `<div>` per layout block carrying
+`data-bbox="x0 y0 x1 y1"` (normalised 0–1000) and `data-label` from a fixed set — `Text`,
+`Section-Header`, `Table`, `Figure`, `Form`, `Caption`, `Footnote`, `Equation-Block`,
+`Code-Block`, `Chemical-Block`, `Page-Header`, `Page-Footer`, `Table-Of-Contents`,
+`Diagram`, `List-Group`, `Complex-Block`, `Blank-Page`. coderai turns each block into all
+three things a page carries: a **line** (its text), a **region** (its label and box) and,
+for a table, a **table entry keeping the HTML** — because a table flattened to text has
+lost the one thing that made it a table. Maths comes back as `<math>` KaTeX and chemistry
+as `<chem>` SMILES, and both survive into the text as their source: unrendered LaTeX beats
+a formula silently deleted.
+
+The prompts are mirrored **verbatim** from `chandra/prompts.py`, down to the Python repr of
+the allowed-tag list, because that wording is what the model was trained on. Nothing of
+chandra's own package is installed: the engine is PIL plus an HTTP call, and the reply is
+split with stdlib `html.parser` rather than pulling bs4 and markdownify into the main venv
+for a tag split.
+
+### Three reasons to reach for it
+
+1. **You need boxes from a VLM.** `olmocr` has none at all; `chandra` has them for every
+   block in one pass, with no separate detector.
+2. **It is a different model family from Surya-2.** Surya-2 has its own 65k `WordLevel`
+   vocabulary; Chandra has Qwen3-VL's tokenizer. So it is the useful *second opinion* on a
+   page Surya reads badly — including a page whose accents come back as the
+   unreadable-glyph marker (see below). Running the same page through both separates "this
+   document's pixels are too few" from "this one model cannot read this glyph".
+3. **90+ languages**, with no language input to set — `lang=` is accepted and does not
+   steer it, same as surya-2 and olmOCR (`language_aware: false` in
+   `/v1/ocr/engines`).
+
+### Licence — read this before enabling it
+
+The code is Apache-2.0 but the **weights are a modified OpenRAIL-M**: free for research,
+personal use and companies under **$2M** funding/revenue, and **not for use competing with
+Datalab's own API**. Commercial self-hosting beyond that needs a licence from Datalab.
+
+That is a **narrower grant than Surya's GPL**, so the engine is gated the same way and the
+gate behaves differently in one place that matters: asking a rented pod for `surya` by name
+*is* the GPL acceptance (the deployment's own decision travelling to the pod), but
+`chandra_accept_license` is only ever **inherited from a decision already recorded in this
+install's config**. A pod cannot accept a licence on your behalf.
+
+```yaml
+ocr:
+  chandra_enabled: true
+  chandra_accept_license: true      # nothing loads until this is set deliberately
+  chandra_serve: model
+  chandra_model_id: chandra         # a vision model in models.json
+```
+
+### Serving it
+
+The same three modes as olmOCR, and for the same reasons:
+
+| mode | what it means | needs |
+|---|---|---|
+| `model` (default) | the checkpoint is a **vision model in your models.json** and Chandra goes through coderai's own model manager — VRAM accounting, eviction, the cluster/RunPod dispatcher. The only mode that works on a box with **no GPU of its own**, which is also the box whose whole job is renting one. | `chandra_model_id` |
+| `vllm` | coderai's vLLM backend serves `chandra_model` on its own instance (continuous batching). CUDA only. | the vLLM backend configured |
+| `server` | attach to an OpenAI-compatible server already running it. | `chandra_server_url` (+ `chandra_api_key` if it wants one) |
+
+In `model` mode the request goes through `pod_http`, so a RunPod pod reached over direct
+TCP — https to a bare IP, certificate signed by **this install's own CA** — is verified
+against that CA. Plain `requests` fails it twice over with `CERTIFICATE_VERIFY_FAILED`,
+which is exactly how olmOCR came to be unreachable before 0.3.22.
+
+### DPI: the ceiling is Surya's, to the pixel
+
+`chandra/model/util.py`'s `scale_to_fit` caps the input at **3072×2048 = 6,291,456
+pixels** — the same numbers as surya-2 — and snaps dimensions to a **28-pixel grid**,
+because a Qwen-family vision tower tokenises in 28×28 patches. An A4 page reaches that
+ceiling at about **255 DPI**, so `chandra_dpi` defaults to **250** for precisely the reason
+`surya_dpi` does, and rasterising higher costs time and memory for no extra pixels at the
+model. coderai does the scaling itself (same algorithm, same grid) and reports the size the
+model actually saw as the page's `width`/`height`, with the size you rasterised in
+`meta.source_size` when they differ — the boxes are normalised against what the model saw,
+and de-normalising them against the pre-scaling size would put every box on a scaled page
+in the wrong place.
+
+### Repetition loops
+
+A VLM that loses its place on a page does not fail. It repeats the last thing it saw until
+it runs out of tokens, and the server answers **200** with a page that looks plausible.
+Chandra's own client treats that as retryable and so does coderai: `chandra_max_retries`
+(default 2) re-asks when the reply ends in a repetition, raising the temperature each time,
+because a greedy decode falls into the same loop twice. If it still loops after the last
+retry the page is returned anyway with `repeat_detected: true` in its `meta` — a looping
+transcription usually has a correct beginning, and the flag is what lets you decide instead
+of being handed a silent mess. `meta.retries` records how many re-asks it took.
+
+### Fields
+
+`chandra_enabled`, `chandra_accept_license`, `chandra_serve`, `chandra_model_id`,
+`chandra_model` (default `datalab-to/chandra-ocr-2`), `chandra_server_url`,
+`chandra_api_key`, `chandra_instances` (pages in flight), `chandra_dpi`, `chandra_layout`
+(off asks for plain HTML — faster, and then there are no boxes or regions at all),
+`chandra_include_furniture` (keep `Page-Header`/`Page-Footer` in the text; on, because a
+judicial document's header carries the court and the case number), `chandra_max_tokens`
+(12384 — HTML runs far longer than the text it carries), `chandra_temperature` (0, greedy),
+`chandra_top_p` (0.1), `chandra_max_retries`, `chandra_timeout`.
+
+```bash
+curl -F file=@sentenza.pdf -F engine=chandra http://localhost:8776/v1/ocr
+```
+
+**A pod cannot serve it either**, for the same reason as Surya-2 and olmOCR: the RunPod OCR
+images carry no model server, and baking one in would put a second torch in a ~12 GB image.
+A pod asked for `chandra` serves the request with docTR and says so in the log. Point
+`chandra_serve: "server"` at something the pod can reach — including a vLLM pod — if you
+want the real thing out there.
+
 ## When an engine's server will not start
 
-The VLM engines (`surya` in `vllm` mode, `olmocr` in `vllm` mode) boot a vLLM instance
+The VLM engines in `vllm` mode (`surya`, `olmocr`, `chandra`) boot a vLLM instance
 that claims `gpu_memory_utilization` × the **whole card** before it will serve, and
 refuses to start when that much is not free. Three rules follow, all enforced by the pool:
 
@@ -266,7 +388,8 @@ back.
 ## Enable & configure
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,
-`default_engine`, `dpi`, `surya_dpi`, `max_concurrency`, `lang`, `paddle_auto_lang`, `build_retry_cooldown_s`,
+`default_engine`, `dpi`, `surya_dpi`, `chandra_dpi`, `max_concurrency`, `lang`,
+`paddle_auto_lang`, `build_retry_cooldown_s`,
 `vlm_gpu_memory_utilization`, `vlm_max_num_batched_tokens`, `vlm_max_num_seqs`,
 `vlm_max_model_len`, `fallback_engines`, `evict_drain_timeout_s`;
 per-engine `*_enabled` /
@@ -335,6 +458,7 @@ which it was:
 | `doctr` | accepted, no effect | recognition is Latin-script-wide |
 | `surya` | accepted, no effect | VLM; its whole prompt is `"OCR this block image to HTML."` |
 | `olmocr` | accepted, no effect | VLM; fixed prompt |
+| `chandra` | accepted, no effect | VLM; fixed prompt (90+ languages, no language input) |
 
 So every response carries both the language applied and whether the engine that
 served could act on it — silently ignoring `lang` would leave a caller believing it
@@ -452,6 +576,14 @@ the document's own glyph quality and the serving stack (coderai's pods run vLLM
 0.27.1, while surya's own `VLLM_DOCKER_IMAGE` pins `v0.20.1`); the way to tell
 them apart is to OCR **perfect synthetic Italian** through the same path — clean
 output indicts the document, U+FFFD on crisp vector glyphs indicts the stack.
+
+There is now a second, cheaper discriminator: **run the page through `chandra`**.
+It is a different model family with a different tokenizer (Qwen3-VL, against
+surya-2's own 65k `WordLevel` vocabulary), reached over the same transport, at the
+same pixel ceiling, from the same rasterised page. Accents intact under chandra
+and lost under surya is as close to a controlled experiment as this gets, and it
+points at the model rather than the document. Both losing them points back at the
+pixels — and then `pdfimages -list` is the next thing to read.
 
 `dpi` only affects **PDF** input. An uploaded image is used at the resolution it
 arrives, so a low-resolution scan cannot be rescued by this setting.

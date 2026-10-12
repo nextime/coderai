@@ -824,7 +824,11 @@ def test_the_catalogue_lists_every_engine_with_whether_it_is_enabled():
                paddle_enabled=False, doctr_enabled=False)
     cat = mgr.engine_catalogue()
     rows = {r["id"]: r for r in cat["data"]}
-    assert set(rows) == {"paddle", "doctr", "surya", "olmocr"}
+    # Against the REGISTRY, not a hand-written list: the point of the catalogue is that
+    # a client never has to know which engines exist, and a frozen list here would mean
+    # adding one silently left it out of the only place that answers that question.
+    from codai.ocr.manager import _ENGINE_FACTORIES
+    assert set(rows) == set(_ENGINE_FACTORIES)
     assert rows["surya"]["enabled"] is True
     assert rows["paddle"]["enabled"] is False
 

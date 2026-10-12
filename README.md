@@ -276,13 +276,18 @@ registered in the embedding model category.
 ### Document OCR
 
 A dedicated OCR subsystem (`/v1/ocr`) — real OCR engines, **not** a VLM prompted to read,
-plus one purpose-trained document VLM for the pages they struggle with:
+plus two purpose-trained document VLMs for the pages they struggle with:
 
 - **Engines**: `doctr` (in-process), `paddle` (PaddleOCR + PP-Structure layout/tables, isolated
-  venv), `surya` (opt-in, GPL; local, vLLM-served Surya-2, or an external llama-server) and
+  venv), `surya` (opt-in, GPL; local, vLLM-served Surya-2, or an external llama-server),
   `olmocr` ([olmOCR-2](https://huggingface.co/allenai/olmOCR-2-7B-1025), Apache-2.0 — best
   on old scans, maths and multi-column pages; served by one of your own models, coderai's
-  vLLM, or any OpenAI endpoint. Returns no bounding boxes.)
+  vLLM, or any OpenAI endpoint. Returns no bounding boxes.) and
+  `chandra` ([Chandra](https://huggingface.co/datalab-to/chandra-ocr-2) — a document VLM
+  that is *asked* for its layout, so unlike olmOCR it returns boxes, labelled regions and
+  tables in one pass, and being a different model family it is the useful second opinion on
+  a page surya reads badly. Opt-in: code Apache-2.0, **weights modified OpenRAIL-M** —
+  research, personal use and under-$2M companies, no competitive use.)
 - **Input**: images or PDFs (rasterised at a configurable DPI), single or batch
 - **Output**: full text plus per-page `lines[]` with bounding boxes and confidence,
   `regions[]` (layout), `tables[]`, and `meta` where the engine reports page metadata

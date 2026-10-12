@@ -980,13 +980,13 @@ def volume_env(mount: str) -> dict:
 def pod_ocr_engine(requested: str) -> str:
     """The OCR engine a pod will actually serve for a request naming ``requested``.
 
-    Mirrors the env a pod is launched with: surya needs a VLM server the image
-    does not carry, so a pod serves docTR for it. The gateway uses this to
-    rewrite the request's own `engine` field, because the pod honours what the
-    request asks for over its configured default.
+    Mirrors the env a pod is launched with: the VLM engines (surya, olmOCR,
+    chandra) need a model server the image does not carry, so a pod serves docTR
+    for them. The gateway uses this to rewrite the request's own `engine` field,
+    because the pod honours what the request asks for over its configured default.
     """
     r = (requested or "").strip().lower()
-    if r in ("surya", "olmocr"):
+    if r in ("surya", "olmocr", "chandra"):
         return "doctr"
     return r if r in ("paddle", "doctr") else "doctr"
 
@@ -997,6 +997,16 @@ def _surya_accepted() -> bool:
         from codai.admin.routes import config_manager
         return bool(getattr(getattr(config_manager, "config", None),
                             "ocr", None).surya_accept_license)
+    except Exception:
+        return False
+
+
+def _chandra_accepted() -> bool:
+    """Whether this deployment has accepted Chandra's weights licence."""
+    try:
+        from codai.admin.routes import config_manager
+        return bool(getattr(getattr(getattr(config_manager, "config", None),
+                                    "ocr", None), "chandra_accept_license", False))
     except Exception:
         return False
 
@@ -1014,7 +1024,8 @@ def _ocr_cfg():
 def _ocr_external_server(engine: str):
     """The off-box OpenAI-compatible endpoint configured for a VLM OCR engine, or "".
 
-    This is what decides whether a pod can actually serve surya/olmOCR. Both are VLMs
+    This is what decides whether a pod can actually serve surya/olmOCR/chandra. All
+    three are VLMs
     and need a model server: locally they ride coderai's own vLLM, which a pod has
     none of, and baking one in would mean a SECOND torch in the image (the vLLM venv
     alone is ~10.5 GB against a ~12 GB ceiling). But in the served modes the engine
@@ -1026,6 +1037,10 @@ def _ocr_external_server(engine: str):
     if engine == "olmocr":
         mode = str(getattr(o, "olmocr_serve", "") or "").strip().lower()
         url = str(getattr(o, "olmocr_server_url", "") or "").strip()
+        return url if (mode == "server" and url) else ""
+    if engine == "chandra":
+        mode = str(getattr(o, "chandra_serve", "") or "").strip().lower()
+        url = str(getattr(o, "chandra_server_url", "") or "").strip()
         return url if (mode == "server" and url) else ""
     if engine == "surya":
         mode = str(getattr(o, "surya_serve", "") or "").strip().lower()
@@ -1125,12 +1140,13 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         _cands = [str((entry or {}).get("alias") or "").strip().lower(),
                   str(served or "").strip().lower(),
                   str((entry or {}).get("path") or "").strip().lower()]
-        wanted = next((c for c in _cands if c in ("paddle", "doctr", "surya", "olmocr")),
+        wanted = next((c for c in _cands
+                        if c in ("paddle", "doctr", "surya", "olmocr", "chandra")),
                       _cands[-1])
         # Remember what was ASKED for: the licence decision below is made by asking
         # for surya by name, and that has to survive a downgrade to docTR.
         _asked = wanted
-        if wanted in ("surya", "olmocr"):
+        if wanted in ("surya", "olmocr", "chandra"):
             # Surya 0.22 is a VLM ("surya-ocr-2") and olmOCR-2 is one outright, not a
             # self-contained OCR library: both need a model server. Locally they ride
             # coderai's own vLLM engine, which a pod has none of, and baking one in
@@ -1154,6 +1170,14 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                         _val = str(getattr(_o, _a, "") or "").strip()
                         if _val:
                             env[_v] = _val
+                elif wanted == "chandra":
+                    env["CODERAI_OCR_CHANDRA_SERVE"] = "server"
+                    env["CODERAI_OCR_CHANDRA_SERVER_URL"] = _srv
+                    for _v, _a in (("CODERAI_OCR_CHANDRA_MODEL", "chandra_model"),
+                                   ("CODERAI_OCR_CHANDRA_MODEL_ID", "chandra_model_id")):
+                        _val = str(getattr(_o, _a, "") or "").strip()
+                        if _val:
+                            env[_v] = _val
                 else:
                     env["CODERAI_OCR_SURYA_SERVE"] = "llamacpp"
                     env["CODERAI_OCR_SURYA_SERVER_URL"] = _srv
@@ -1165,7 +1189,7 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                       f"ocr.{wanted}_server_url and the served mode) — this OCR "
                       f"request will be served by docTR", flush=True)
                 wanted = "doctr"
-        if wanted not in ("paddle", "doctr", "surya", "olmocr"):
+        if wanted not in ("paddle", "doctr", "surya", "olmocr", "chandra"):
             # The pod images ship docTR, the only engine that runs in-process.
             wanted = "doctr"
         env["CODERAI_OCR_DEFAULT_ENGINE"] = wanted
@@ -1189,6 +1213,14 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             # the decision made HERE — it cannot make it for itself, and asking
             # for surya by name is that decision.
             env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] = "1"
+        if _asked == "chandra" and _chandra_accepted():
+            # Chandra's weights are a modified OpenRAIL-M, on NARROWER terms than
+            # Surya's GPL (no competitive use against Datalab's API, $2M ceiling).
+            # So asking for it by name is NOT the acceptance — unlike surya above,
+            # this one is only ever inherited from a decision already recorded in
+            # this install's config. A pod cannot accept a licence on an
+            # operator's behalf.
+            env["CODERAI_OCR_CHANDRA_ACCEPT_LICENSE"] = "1"
 
     eng = engine_pod_backend(entry or {}, mcfg)
     if eng:

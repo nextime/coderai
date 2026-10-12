@@ -4166,6 +4166,22 @@ def build_settings_dict(c, gpu_cards):
             "olmocr_temperature": c.ocr.olmocr_temperature,
             "olmocr_timeout": c.ocr.olmocr_timeout,
             "olmocr_retry_rotation": c.ocr.olmocr_retry_rotation,
+            "chandra_enabled": c.ocr.chandra_enabled,
+            "chandra_accept_license": c.ocr.chandra_accept_license,
+            "chandra_instances": c.ocr.chandra_instances,
+            "chandra_serve": c.ocr.chandra_serve,
+            "chandra_model_id": c.ocr.chandra_model_id,
+            "chandra_model": c.ocr.chandra_model,
+            "chandra_server_url": c.ocr.chandra_server_url,
+            "chandra_api_key": c.ocr.chandra_api_key,
+            "chandra_dpi": c.ocr.chandra_dpi,
+            "chandra_layout": c.ocr.chandra_layout,
+            "chandra_include_furniture": c.ocr.chandra_include_furniture,
+            "chandra_max_tokens": c.ocr.chandra_max_tokens,
+            "chandra_temperature": c.ocr.chandra_temperature,
+            "chandra_top_p": c.ocr.chandra_top_p,
+            "chandra_max_retries": c.ocr.chandra_max_retries,
+            "chandra_timeout": c.ocr.chandra_timeout,
             "detect_mode": c.ocr.detect_mode,
             "detect_model_path": c.ocr.detect_model_path,
             "detect_conf": c.ocr.detect_conf,
@@ -4968,6 +4984,23 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "olmocr_temperature" in d: o.olmocr_temperature = _f("olmocr_temperature", o.olmocr_temperature, 0.0)
         if "olmocr_timeout" in d: o.olmocr_timeout = _f("olmocr_timeout", o.olmocr_timeout, 1.0)
         if "olmocr_retry_rotation" in d: o.olmocr_retry_rotation = bool(d["olmocr_retry_rotation"])
+        if "chandra_enabled" in d: o.chandra_enabled = bool(d["chandra_enabled"])
+        if "chandra_accept_license" in d: o.chandra_accept_license = bool(d["chandra_accept_license"])
+        if "chandra_instances" in d: o.chandra_instances = _i("chandra_instances", o.chandra_instances, 1)
+        if "chandra_serve" in d: o.chandra_serve = (d.get("chandra_serve") or "model").strip().lower()
+        if "chandra_model_id" in d: o.chandra_model_id = (d.get("chandra_model_id") or "").strip()
+        if "chandra_model" in d: o.chandra_model = (d.get("chandra_model") or "").strip()
+        if "chandra_server_url" in d: o.chandra_server_url = (d.get("chandra_server_url") or "").strip()
+        if "chandra_api_key" in d: o.chandra_api_key = (d.get("chandra_api_key") or "").strip()
+        if "chandra_dpi" in d: o.chandra_dpi = _i("chandra_dpi", o.chandra_dpi, 0)
+        if "chandra_layout" in d: o.chandra_layout = bool(d["chandra_layout"])
+        if "chandra_include_furniture" in d: o.chandra_include_furniture = bool(d["chandra_include_furniture"])
+        if "chandra_max_tokens" in d: o.chandra_max_tokens = _i("chandra_max_tokens", o.chandra_max_tokens, 64)
+        if "chandra_temperature" in d: o.chandra_temperature = _f("chandra_temperature", o.chandra_temperature, 0.0)
+        if "chandra_top_p" in d: o.chandra_top_p = _f("chandra_top_p", o.chandra_top_p, 0.0)
+        # 0 is meaningful: accept the first reply however it looks.
+        if "chandra_max_retries" in d: o.chandra_max_retries = _i("chandra_max_retries", o.chandra_max_retries, 0)
+        if "chandra_timeout" in d: o.chandra_timeout = _f("chandra_timeout", o.chandra_timeout, 1.0)
         # detection
         if "detect_mode" in d: o.detect_mode = (d.get("detect_mode") or "off").strip()
         if "detect_model_path" in d: o.detect_model_path = (d.get("detect_model_path") or "").strip()

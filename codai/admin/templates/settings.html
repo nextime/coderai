@@ -1096,6 +1096,7 @@
           <option value="doctr">docTR</option>
           <option value="surya">Surya</option>
           <option value="olmocr">olmOCR-2 (VLM)</option>
+          <option value="chandra">Chandra (VLM, boxes)</option>
         </select>
       </div>
       <div class="form-group" style="flex:1;min-width:110px">
@@ -1262,6 +1263,44 @@
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Temperature</label><input type="number" id="s-ocr-olmocr-temperature" class="form-input" min="0" max="2" step="0.1" placeholder="0.1"></div>
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Timeout (s)</label><input type="number" id="s-ocr-olmocr-timeout" class="form-input" min="1" placeholder="300"></div>
     </div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">Chandra <span class="muted" style="font-weight:400">(document VLM, with boxes)</span></div>
+    <p class="form-hint" style="margin:0 0 .4rem"><a href="https://huggingface.co/datalab-to/chandra-ocr-2" target="_blank" rel="noopener">datalab-to/chandra-ocr-2</a> is from the same lab as Surya and reads a whole page at once like olmOCR &mdash; but it is <b>asked</b> for layout, so it returns one block per region <b>with a bounding box and a label</b> (Text, Table, Section-Header, Figure, Form&hellip;), which olmOCR cannot. Tables keep their HTML, maths comes back as KaTeX, chemistry as SMILES. It is also a <b>different model family</b> from Surya-2 (Qwen3-VL, its own tokenizer), which makes it the useful second opinion on a page Surya reads badly &mdash; including one that loses its accents.</p>
+    <p class="form-hint" style="margin:0 0 .4rem;border-left:3px solid var(--warning,#c58b00);padding-left:.6rem"><b>Licence.</b> The code is Apache-2.0 but the <b>weights are a modified OpenRAIL-M</b>: free for research, personal use and companies under <b>$2M</b> funding/revenue, and <b>not</b> for use competing with Datalab's own API. Commercial self-hosting beyond that needs a licence from Datalab. Nothing loads until you accept below &mdash; this is a narrower grant than Surya's GPL, so read it before ticking it.</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-chandra-enabled"><span>Enable</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-chandra-accept-license"><span>I accept the Chandra weights licence</span></label>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Served by</label>
+        <select id="s-ocr-chandra-serve" class="form-input">
+          <option value="model">coderai model (any GPU)</option>
+          <option value="vllm">coderai vLLM (CUDA)</option>
+          <option value="server">external OpenAI server</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Instances</label><input type="number" id="s-ocr-chandra-instances" class="form-input" min="1" placeholder="1"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">Model id <span class="muted">(coderai model mode)</span></label><input type="text" id="s-ocr-chandra-model-id" class="form-input" placeholder="chandra (a vision model in models.json)"></div>
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">HF checkpoint <span class="muted">(vLLM / served name)</span></label><input type="text" id="s-ocr-chandra-model" class="form-input" placeholder="datalab-to/chandra-ocr-2"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">Server URL <span class="muted">(external mode)</span></label><input type="text" id="s-ocr-chandra-server-url" class="form-input" placeholder="http://127.0.0.1:8000/v1"></div>
+      <div class="form-group" style="flex:1;min-width:140px"><label class="form-label">API key <span class="muted">(opt)</span></label><input type="password" id="s-ocr-chandra-api-key" class="form-input" placeholder=""></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-chandra-layout"><span>Ask for layout blocks</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-chandra-include-furniture"><span>Keep headers &amp; footers</span></label>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Rasterise DPI</label><input type="number" id="s-ocr-chandra-dpi" class="form-input" min="0" placeholder="250"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Max tokens / page</label><input type="number" id="s-ocr-chandra-max-tokens" class="form-input" min="64" placeholder="12384"></div>
+    </div>
+    <p class="form-hint" style="margin:0 0 .3rem">Turning <b>layout blocks</b> off asks for plain HTML instead: faster and shorter, but then there are no boxes and no regions at all, which is the main reason to pick this engine. <b>Headers &amp; footers</b> on keeps page furniture in the text &mdash; worth it for judicial documents, whose header carries the court and the case number. <b>DPI</b> 0 follows the shared setting; Chandra's input is capped at 3072&times;2048 = 6.29&nbsp;Mpixels, the same ceiling as Surya-2, which an A4 page reaches at about 255&nbsp;DPI &mdash; above that the page is scaled down before the model sees it.</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Temperature</label><input type="number" id="s-ocr-chandra-temperature" class="form-input" min="0" max="2" step="0.1" placeholder="0"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Top-p</label><input type="number" id="s-ocr-chandra-top-p" class="form-input" min="0" max="1" step="0.05" placeholder="0.1"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Retries on a loop</label><input type="number" id="s-ocr-chandra-max-retries" class="form-input" min="0" placeholder="2"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Timeout (s)</label><input type="number" id="s-ocr-chandra-timeout" class="form-input" min="1" placeholder="300"></div>
+    </div>
+    <p class="form-hint" style="margin:0 0 .3rem">A vision model that loses its place on a page does not fail &mdash; it repeats the last thing it saw until it runs out of tokens, and answers <code>200</code> with a page that looks plausible. <b>Retries on a loop</b> re-asks when the reply ends in a repetition, raising the temperature each time, because a greedy decode falls into the same loop twice. If it still loops after the last retry the page is returned anyway with <code>repeat_detected</code> in its metadata, so you can see it rather than be handed it quietly.</p>
 
     <div class="card-title" style="font-size:13px;margin-top:.4rem">Stamp / signature detection</div>
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
@@ -2182,6 +2221,22 @@ async function loadSettings(){
     document.getElementById('s-ocr-olmocr-max-tokens').value = ocr.olmocr_max_tokens ?? 4096;
     document.getElementById('s-ocr-olmocr-temperature').value = ocr.olmocr_temperature ?? 0.1;
     document.getElementById('s-ocr-olmocr-timeout').value = ocr.olmocr_timeout ?? 300;
+    document.getElementById('s-ocr-chandra-enabled').checked = !!ocr.chandra_enabled;
+    document.getElementById('s-ocr-chandra-accept-license').checked = !!ocr.chandra_accept_license;
+    document.getElementById('s-ocr-chandra-serve').value = ocr.chandra_serve ?? 'model';
+    document.getElementById('s-ocr-chandra-instances').value = ocr.chandra_instances ?? 1;
+    document.getElementById('s-ocr-chandra-model-id').value = ocr.chandra_model_id ?? '';
+    document.getElementById('s-ocr-chandra-model').value = ocr.chandra_model ?? '';
+    document.getElementById('s-ocr-chandra-server-url').value = ocr.chandra_server_url ?? '';
+    document.getElementById('s-ocr-chandra-api-key').value = ocr.chandra_api_key ?? '';
+    document.getElementById('s-ocr-chandra-dpi').value = ocr.chandra_dpi ?? 250;
+    document.getElementById('s-ocr-chandra-layout').checked = ocr.chandra_layout !== false;
+    document.getElementById('s-ocr-chandra-include-furniture').checked = ocr.chandra_include_furniture !== false;
+    document.getElementById('s-ocr-chandra-max-tokens').value = ocr.chandra_max_tokens ?? 12384;
+    document.getElementById('s-ocr-chandra-temperature').value = ocr.chandra_temperature ?? 0;
+    document.getElementById('s-ocr-chandra-top-p').value = ocr.chandra_top_p ?? 0.1;
+    document.getElementById('s-ocr-chandra-max-retries').value = ocr.chandra_max_retries ?? 2;
+    document.getElementById('s-ocr-chandra-timeout').value = ocr.chandra_timeout ?? 300;
     document.getElementById('s-ocr-detect-mode').value = ocr.detect_mode ?? 'off';
     document.getElementById('s-ocr-detect-model').value = ocr.detect_model_path ?? '';
     document.getElementById('s-ocr-detect-conf').value = ocr.detect_conf ?? 0.35;
@@ -2197,6 +2252,17 @@ async function loadSettings(){
 
 async function saveSettings(silent){
   const strOrNull = id => document.getElementById(id).value.trim() || null;
+  // A number field whose ZERO is meaningful. `parseInt(v) || dflt` turns a
+  // deliberate 0 into the default, which is wrong wherever 0 is a setting rather
+  // than an absence (chandra_dpi 0 = follow the shared DPI, temperature 0 =
+  // greedy, retries 0 = accept the first reply). Only an EMPTY or unparseable
+  // field falls back here.
+  const _num = (id, dflt, parse) => {
+    const raw = (document.getElementById(id).value || '').trim();
+    if (!raw) return dflt;
+    const v = parse(raw);
+    return Number.isFinite(v) ? v : dflt;
+  };
   const data = {
     admin: {
       forward_auth: {
@@ -2438,6 +2504,25 @@ async function saveSettings(silent){
       olmocr_max_tokens: parseInt(document.getElementById('s-ocr-olmocr-max-tokens').value) || 4096,
       olmocr_temperature: parseFloat(document.getElementById('s-ocr-olmocr-temperature').value) || 0.1,
       olmocr_timeout: parseFloat(document.getElementById('s-ocr-olmocr-timeout').value) || 300,
+      chandra_enabled: document.getElementById('s-ocr-chandra-enabled').checked,
+      chandra_accept_license: document.getElementById('s-ocr-chandra-accept-license').checked,
+      chandra_serve: document.getElementById('s-ocr-chandra-serve').value || 'model',
+      chandra_instances: parseInt(document.getElementById('s-ocr-chandra-instances').value) || 1,
+      chandra_model_id: document.getElementById('s-ocr-chandra-model-id').value.trim(),
+      chandra_model: document.getElementById('s-ocr-chandra-model').value.trim(),
+      chandra_server_url: document.getElementById('s-ocr-chandra-server-url').value.trim(),
+      chandra_api_key: document.getElementById('s-ocr-chandra-api-key').value.trim(),
+      // 0 is a real value for these three (DPI 0 = follow the shared setting,
+      // temperature 0 = greedy, retries 0 = accept the first reply), so `|| default`
+      // would silently overwrite a deliberate zero with the default.
+      chandra_dpi: _num('s-ocr-chandra-dpi', 250, parseInt),
+      chandra_layout: document.getElementById('s-ocr-chandra-layout').checked,
+      chandra_include_furniture: document.getElementById('s-ocr-chandra-include-furniture').checked,
+      chandra_max_tokens: parseInt(document.getElementById('s-ocr-chandra-max-tokens').value) || 12384,
+      chandra_temperature: _num('s-ocr-chandra-temperature', 0, parseFloat),
+      chandra_top_p: parseFloat(document.getElementById('s-ocr-chandra-top-p').value) || 0.1,
+      chandra_max_retries: _num('s-ocr-chandra-max-retries', 2, parseInt),
+      chandra_timeout: parseFloat(document.getElementById('s-ocr-chandra-timeout').value) || 300,
       detect_mode: document.getElementById('s-ocr-detect-mode').value || 'off',
       detect_model_path: document.getElementById('s-ocr-detect-model').value.trim(),
       detect_conf: parseFloat(document.getElementById('s-ocr-detect-conf').value) || 0.35,

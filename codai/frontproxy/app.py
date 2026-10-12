@@ -1188,6 +1188,12 @@ class FrontProxy:
             external = mode == "server" and bool(
                 (getattr(o, "olmocr_server_url", "") or "").strip())
             local.append(not external)
+        if (getattr(o, "chandra_enabled", False)
+                and getattr(o, "chandra_accept_license", False)):
+            mode = (getattr(o, "chandra_serve", "model") or "model").strip().lower()
+            external = mode == "server" and bool(
+                (getattr(o, "chandra_server_url", "") or "").strip())
+            local.append(not external)
         return bool(local) and not any(local)
 
     def _resident_on(self, engine, key: str) -> bool:

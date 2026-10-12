@@ -58,11 +58,17 @@ def _olmocr_factory(cfg):
     return OlmOcrEngine(cfg)
 
 
+def _chandra_factory(cfg):
+    from codai.ocr.chandra import ChandraEngine
+    return ChandraEngine(cfg)
+
+
 _ENGINE_FACTORIES = {
     "paddle": _paddle_factory,
     "doctr": _doctr_factory,
     "surya": _surya_factory,
     "olmocr": _olmocr_factory,
+    "chandra": _chandra_factory,
 }
 
 
@@ -173,6 +179,11 @@ def _engine_enabled(cfg, name: str) -> bool:
         return bool(cfg.surya_enabled and cfg.surya_accept_license)
     if name == "olmocr":
         return bool(getattr(cfg, "olmocr_enabled", False))
+    if name == "chandra":
+        # License-gated like surya, and on narrower terms: the weights are a
+        # modified OpenRAIL-M, not GPL (see OcrConfig.chandra_accept_license).
+        return bool(getattr(cfg, "chandra_enabled", False)
+                    and getattr(cfg, "chandra_accept_license", False))
     return False
 
 
@@ -368,9 +379,9 @@ class _Pool:
         eng: OcrEngine = await self._q.get()
         self._enter_page()
         try:
-            # Engines that call back into coderai's async API (olmOCR 'model' mode) run
-            # in a worker thread and need a live loop to hand the coroutine to; give them
-            # the app's own rather than letting them spin up a second one.
+            # Engines that call back into coderai's async API (olmOCR/Chandra 'model'
+            # mode) run in a worker thread and need a live loop to hand the coroutine to;
+            # give them the app's own rather than letting them spin up a second one.
             try:
                 eng._host_loop = asyncio.get_running_loop()
             except Exception:
@@ -441,6 +452,7 @@ class OcrManager:
         # reclaim it; the next OCR request re-boots it via ensure_service.
         freed += self._stop_surya_vllm()
         freed += self._stop_olmocr_vllm()
+        freed += self._stop_chandra_vllm()
         if freed:
             print(f"[ocr] released ~{freed:.1f} GB (pools + Surya vLLM torn down for VRAM eviction)")
         return freed
@@ -490,6 +502,28 @@ class OcrManager:
             print(f"[ocr] olmOCR vLLM stop skipped: {e}")
             return 0.0
 
+    def _stop_chandra_vllm(self) -> float:
+        """Stop the managed Chandra vLLM instance (chandra_serve = "vllm"), for the same
+        reason Surya's and olmOCR's need stopping: its VRAM belongs to the subprocess,
+        not to a pool, so tearing the pool down does not reclaim it."""
+        cfg = self._cfg          # unconditional, for the reason in _stop_surya_vllm
+        if cfg is None:
+            return 0.0
+        try:
+            from codai.api import vllm_worker
+            from codai.models.manager import get_active_vllm_config
+            from codai.ocr.chandra import DEFAULT_MODEL
+            vcfg = get_active_vllm_config()
+            if vcfg is None:
+                return 0.0
+            model = (getattr(cfg, "chandra_model", "") or DEFAULT_MODEL).strip()
+            return vllm_worker.stop_service_for(
+                vcfg, model_path=model, served_name=model,
+                gpu_memory_utilization=float(getattr(cfg, "vlm_gpu_memory_utilization", 0.0) or 0.0) or None)
+        except Exception as e:
+            print(f"[ocr] Chandra vLLM stop skipped: {e}")
+            return 0.0
+
     @staticmethod
     def _pool_params(cfg) -> tuple:
         return (
@@ -509,6 +543,12 @@ class OcrManager:
             getattr(cfg, "olmocr_serve", "model"), getattr(cfg, "olmocr_model", ""),
             getattr(cfg, "olmocr_model_id", ""), getattr(cfg, "olmocr_server_url", ""),
             getattr(cfg, "olmocr_longest_side", 1288),
+            getattr(cfg, "chandra_enabled", False),
+            getattr(cfg, "chandra_accept_license", False),
+            getattr(cfg, "chandra_instances", 1),
+            getattr(cfg, "chandra_serve", "model"), getattr(cfg, "chandra_model", ""),
+            getattr(cfg, "chandra_model_id", ""), getattr(cfg, "chandra_server_url", ""),
+            getattr(cfg, "chandra_layout", True),
             getattr(cfg, "vlm_gpu_memory_utilization", 0.0),
         )
 
@@ -530,14 +570,24 @@ class OcrManager:
             "doctr":   {"boxes": True,  "regions": True,  "tables": False, "meta": False},
             "surya":   {"boxes": True,  "regions": True,  "tables": True,  "meta": False},
             "olmocr":  {"boxes": False, "regions": False, "tables": True,  "meta": True},
+            # Chandra is a VLM like olmOCR but it is ASKED for boxes: its ocr_layout
+            # prompt returns one div per block with data-bbox and data-label, so it is
+            # the only engine here that gives boxes, labelled regions, tables AND page
+            # metadata in a single pass. (With ocr.chandra_layout off it has none of
+            # the three, which is why the row is read from the setting.)
+            "chandra": {"boxes": bool(getattr(cfg, "chandra_layout", True)),
+                        "regions": bool(getattr(cfg, "chandra_layout", True)),
+                        "tables": bool(getattr(cfg, "chandra_layout", True)),
+                        "meta": True},
         }
         # A pipeline drives a model somebody else serves; an engine owns its own
         # weights and runs in process. The distinction decides whether "where does
         # it run" is even a question, so it is worth saying out loud.
         kinds = {"paddle": "engine", "doctr": "engine",
-                 "surya": "pipeline", "olmocr": "pipeline"}
+                 "surya": "pipeline", "olmocr": "pipeline", "chandra": "pipeline"}
         models = {"surya": ("surya_model_id", "surya_model"),
-                  "olmocr": ("olmocr_model_id", "olmocr_model")}
+                  "olmocr": ("olmocr_model_id", "olmocr_model"),
+                  "chandra": ("chandra_model_id", "chandra_model")}
 
         data = []
         for name in sorted(_ENGINE_FACTORIES):
@@ -558,6 +608,13 @@ class OcrManager:
                 if name == "surya" and cfg.surya_enabled and not cfg.surya_accept_license:
                     row["reason"] = ("Surya's licence has not been accepted "
                                      "(ocr.surya_accept_license)")
+                elif (name == "chandra" and getattr(cfg, "chandra_enabled", False)
+                        and not getattr(cfg, "chandra_accept_license", False)):
+                    row["reason"] = ("Chandra's licence has not been accepted "
+                                     "(ocr.chandra_accept_license) — its weights are a "
+                                     "modified OpenRAIL-M, free for research, personal "
+                                     "use and companies under $2M, and not for use "
+                                     "competing with Datalab's API")
                 else:
                     row["reason"] = f"not enabled (ocr.{name}_enabled)"
             # The ids that ALSO resolve to this engine, so a client can name the
@@ -593,7 +650,8 @@ class OcrManager:
         """
         cfg = self._require_cfg()
         for engine, fields in (("surya", ("surya_model_id", "surya_model")),
-                               ("olmocr", ("olmocr_model_id", "olmocr_model"))):
+                               ("olmocr", ("olmocr_model_id", "olmocr_model")),
+                               ("chandra", ("chandra_model_id", "chandra_model"))):
             for field in fields:
                 got = str(getattr(cfg, field, "") or "").strip().lower()
                 if got and got == wanted:
@@ -705,7 +763,7 @@ class OcrManager:
         if raw in ("off", "none", "no", "false"):
             return []
         if raw in ("auto", "", "on", "true"):
-            names = ["paddle", "doctr", "olmocr", "surya"]
+            names = ["paddle", "doctr", "olmocr", "chandra", "surya"]
         else:
             names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
         return [n for n in names

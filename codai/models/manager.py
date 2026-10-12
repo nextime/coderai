@@ -5807,6 +5807,9 @@ class MultiModelManager:
                     _ocr_engines.append("surya")
                 if getattr(ocr, "olmocr_enabled", False):
                     _ocr_engines.append("olmocr")
+                if (getattr(ocr, "chandra_enabled", False)
+                        and getattr(ocr, "chandra_accept_license", False)):
+                    _ocr_engines.append("chandra")
                 for _eng in _ocr_engines:
                     _add(_eng, "ocr", {"capabilities": ["ocr"], "backend": "ocr"})
         except Exception:

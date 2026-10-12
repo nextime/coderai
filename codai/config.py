@@ -886,6 +886,10 @@ class OcrConfig:
       best transcription fidelity on hard pages (old scans, maths, tables, multi-column),
       but NO bounding boxes. Served through coderai's own model manager, its vLLM
       backend, or any OpenAI-compatible endpoint (``olmocr_serve``).
+    - ``chandra`` — Chandra (Datalab; LICENSE-GATED — code Apache-2.0 but the WEIGHTS are
+      a modified OpenRAIL-M): also a document VLM, but one that returns layout blocks WITH
+      boxes and labels in a single pass, and from a different model family than surya-2 —
+      the second opinion on a page surya reads badly (``chandra_serve``).
 
     Heavy OCR dependencies are installed out of band (optional) so the base image
     stays lean. Concurrency on a single GPU comes from loading multiple instances of
@@ -897,7 +901,7 @@ class OcrConfig:
     stamp/signature flags (``detect_*``).
     """
     enabled: bool = False
-    default_engine: str = "paddle"        # paddle|doctr|surya|olmocr
+    default_engine: str = "paddle"        # paddle|doctr|surya|olmocr|chandra
     dpi: int = 200                        # PDF rasterisation DPI
     # Per-engine PDF rasterisation DPI (0 = use `dpi` above). Surya-2 gets its own
     # because its input is capped at 3072x2048 = 6.29 Mpixels: `scale_to_fit` in
@@ -932,7 +936,7 @@ class OcrConfig:
     # page it was mid-way through. 0 = tear down immediately.
     evict_drain_timeout_s: float = 60.0
     # The STARTING share of the card a VLM OCR engine's own vLLM instance asks for
-    # (surya in vllm mode, olmocr in vllm mode); 0 = use vllm.gpu_memory_utilization.
+    # (surya, olmocr or chandra in vllm mode); 0 = use vllm.gpu_memory_utilization.
     # It is a fraction of the card's TOTAL memory and has to cover the engine's whole
     # footprint, not just its weights: measured live, surya-ocr-2 on a 24 GB 3090 needs
     # ~10.9 GB before a single KV block (weights 1.37 + CUDA graphs 0.05 + ~9.4 GB of
@@ -955,7 +959,7 @@ class OcrConfig:
     # When the chosen engine cannot serve a document, try these engines instead rather
     # than failing the request: a 503 means a document nobody read, and that is strictly
     # worse than a transcription from the second-best engine. "auto" = every other
-    # ENABLED engine, fewest-ways-to-fail first (paddle, doctr, olmocr, surya);
+    # ENABLED engine, fewest-ways-to-fail first (paddle, doctr, olmocr, chandra, surya);
     # "off"/"none" = no fallback (fail with the original error); or an explicit
     # comma/space separated order.
     fallback_engines: str = "auto"
@@ -1049,6 +1053,49 @@ class OcrConfig:
     olmocr_temperature: float = 0.1
     olmocr_timeout: float = 300.0        # per-page ceiling on the model call
     olmocr_retry_rotation: bool = True   # re-ask once on a page the model reports rotated
+
+    # --- Chandra (Datalab; code Apache-2.0, WEIGHTS modified OpenRAIL-M) --- a document
+    # VLM like olmOCR, but its `ocr_layout` prompt returns one <div> per layout block with
+    # data-bbox (normalised 0-1000) and data-label, so unlike olmOCR it gives boxes AND
+    # labelled regions in a single pass. Qwen3-VL family, so a different tokenizer and
+    # different failure modes from surya-2 — which makes it the second opinion worth
+    # having on a page surya cannot read. See codai/ocr/chandra.py.
+    chandra_enabled: bool = False
+    # LICENSE-GATED, and on NARROWER terms than Surya's GPL: the weights are free for
+    # research, personal use and companies under $2M funding/revenue, and may not be used
+    # competitively with Datalab's own API. Commercial self-hosting needs a licence from
+    # Datalab. Nothing loads until this is set deliberately.
+    chandra_accept_license: bool = False
+    chandra_instances: int = 1           # in-flight pages against the serving model
+    # Served exactly like olmOCR: "model" (coderai's own model manager — the only mode
+    # that works on a GPU-less box, including one whose job is renting a pod), "vllm"
+    # (coderai's vLLM backend on its own instance), "server" (an endpoint already up).
+    chandra_serve: str = "model"         # model | vllm | server
+    chandra_model_id: str = ""           # ("model" mode) a vision model id from models.json
+    chandra_model: str = "datalab-to/chandra-ocr-2"   # ("vllm"/"server") HF id / served name
+    chandra_server_url: str = ""         # ("server" mode) OpenAI base URL of that model
+    chandra_api_key: str = ""            # ("server" mode) bearer token, if it wants one
+    # Chandra's input is capped at 3072x2048 = 6.29 Mpixels — the SAME ceiling as surya-2
+    # (chandra/model/util.py `scale_to_fit`, same numbers), reached by an A4 page at about
+    # 255 DPI. Above it the page is downscaled before the model sees it, so rasterising
+    # higher costs time and buys nothing. 250 saturates A4; see `surya_dpi`.
+    chandra_dpi: int = 250
+    # Ask for layout blocks (the `ocr_layout` prompt) rather than plain HTML. On by
+    # default because it is the whole reason to choose this engine over olmOCR: with it
+    # off the reply is one unlocated blob and every bbox comes back empty.
+    chandra_layout: bool = True
+    # Keep Page-Header/Page-Footer blocks in the text. On: a judicial document's header
+    # carries the court, the section and the case number.
+    chandra_include_furniture: bool = True
+    chandra_max_tokens: int = 12384      # chandra's own MAX_OUTPUT_TOKENS; HTML runs long
+    chandra_temperature: float = 0.0     # chandra's own default: greedy
+    chandra_top_p: float = 0.1
+    # A VLM that loses its place on a page does not fail — it repeats the last thing it
+    # saw until it runs out of tokens, and answers 200 with a plausible-looking page. Each
+    # retry raises the temperature (a greedy decode falls into the same loop twice), which
+    # is what chandra's own client does. 0 = accept the first reply whatever it looks like.
+    chandra_max_retries: int = 2
+    chandra_timeout: float = 300.0       # per-page ceiling on the model call
 
     # --- stamp / signature detection ---  [O3]
     detect_mode: str = "off"             # off|layout|detector|both
@@ -1682,6 +1729,22 @@ class ConfigManager:
                 "olmocr_temperature": self.config.ocr.olmocr_temperature,
                 "olmocr_timeout": self.config.ocr.olmocr_timeout,
                 "olmocr_retry_rotation": self.config.ocr.olmocr_retry_rotation,
+                "chandra_enabled": self.config.ocr.chandra_enabled,
+                "chandra_accept_license": self.config.ocr.chandra_accept_license,
+                "chandra_instances": self.config.ocr.chandra_instances,
+                "chandra_serve": self.config.ocr.chandra_serve,
+                "chandra_model_id": self.config.ocr.chandra_model_id,
+                "chandra_model": self.config.ocr.chandra_model,
+                "chandra_server_url": self.config.ocr.chandra_server_url,
+                "chandra_api_key": self.config.ocr.chandra_api_key,
+                "chandra_dpi": self.config.ocr.chandra_dpi,
+                "chandra_layout": self.config.ocr.chandra_layout,
+                "chandra_include_furniture": self.config.ocr.chandra_include_furniture,
+                "chandra_max_tokens": self.config.ocr.chandra_max_tokens,
+                "chandra_temperature": self.config.ocr.chandra_temperature,
+                "chandra_top_p": self.config.ocr.chandra_top_p,
+                "chandra_max_retries": self.config.ocr.chandra_max_retries,
+                "chandra_timeout": self.config.ocr.chandra_timeout,
                 "detect_mode": self.config.ocr.detect_mode,
                 "detect_model_path": self.config.ocr.detect_model_path,
                 "detect_conf": self.config.ocr.detect_conf,
@@ -1762,7 +1825,7 @@ class ConfigManager:
             # the three default to off. Enabling the subsystem alone got a pod as
             # far as "OCR engine 'surya' is not enabled" — a second refusal from
             # a second flag, one round later.
-            for name in ("paddle", "doctr", "surya", "olmocr"):
+            for name in ("paddle", "doctr", "surya", "olmocr", "chandra"):
                 if _flag(f"CODERAI_OCR_{name.upper()}_ENABLED"):
                     setattr(self.config.ocr, f"{name}_enabled", True)
                 # Where that engine's interpreter lives. A pod image that ships
@@ -1785,6 +1848,10 @@ class ConfigManager:
                                 ("CODERAI_OCR_SURYA_MODEL", "surya_model"),
                                 ("CODERAI_OCR_SURYA_MODEL_ID", "surya_model_id"),
                                 ("CODERAI_OCR_SURYA_SERVER_URL", "surya_server_url"),
+                                ("CODERAI_OCR_CHANDRA_SERVE", "chandra_serve"),
+                                ("CODERAI_OCR_CHANDRA_MODEL", "chandra_model"),
+                                ("CODERAI_OCR_CHANDRA_MODEL_ID", "chandra_model_id"),
+                                ("CODERAI_OCR_CHANDRA_SERVER_URL", "chandra_server_url"),
                                 ("CODERAI_OCR_FALLBACK_ENGINES", "fallback_engines")):
                 _val = (_os.environ.get(_env) or "").strip()
                 if _val:
@@ -1793,6 +1860,11 @@ class ConfigManager:
                 # Surya is GPL and gated on an explicit acceptance. The pod
                 # inherits the decision made here; it cannot make it itself.
                 self.config.ocr.surya_accept_license = True
+            if _flag("CODERAI_OCR_CHANDRA_ACCEPT_LICENSE"):
+                # Chandra's weights are a modified OpenRAIL-M, and on narrower
+                # terms than Surya's GPL. Same rule: the pod inherits the
+                # decision made here and cannot make it itself.
+                self.config.ocr.chandra_accept_license = True
 
         # The native engines — ds4, colibri, k3 — ship disabled for the same
         # reason OCR does, and an engines pod is rented to run exactly one of
