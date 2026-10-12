@@ -399,3 +399,43 @@ def test_a_base_and_its_adapter_both_reach_the_pod(monkeypatch):
     seeded = json.loads((plan.get("env") or {}).get("CODERAI_SEED_MODELS") or "[]")
     assert len(seeded) == 2, seeded
     assert any(m.get("loras") for m in seeded), "the adapter's entry was dropped"
+
+
+def test_teaching_a_pod_carries_the_name_the_request_asked_for(monkeypatch):
+    """teach_model passed served="", so the entry registered under its `path`.
+    For an adapter the path IS its base, so diogene-alpha was registered as
+    cyankiwi/Qwen3.8-27B-AWQ-INT4 and collapsed into the base: taught
+    successfully, still 404. Measured live before the fix."""
+    from codai.api import remote_gateway as rg
+
+    entry = {"id": "diogene-alpha",
+             "loras": [{"name": "diogene-alpha", "path": "sha256:" + "b" * 64}],
+             "runpod": {"hf_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+                        "served_model": "diogene-alpha"}}
+
+    class _MM:
+        @staticmethod
+        def _model_entry_for(name):
+            return entry if name == "diogene-alpha" else None
+
+    monkeypatch.setitem(sys.modules, "codai.models.manager", _MM)
+    posted = {}
+
+    class _Http:
+        @staticmethod
+        def post(url, **kw):
+            posted["url"] = url
+            posted["body"] = kw.get("data")
+
+            class _R:
+                ok = True
+                status_code = 200
+                text = "{}"
+            return _R()
+
+    monkeypatch.setattr(rg, "pod_http", _Http)
+    rg._REGISTERED.clear()
+    assert rg.teach_model("http://pod:8000", "k", "diogene-alpha") is True
+    sent = json.loads(posted["body"])[0]
+    assert sent.get("alias") == "diogene-alpha", sent
+    assert sent.get("loras"), "the adapter must travel with it"

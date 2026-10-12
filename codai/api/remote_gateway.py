@@ -1110,7 +1110,15 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
               flush=True)
         return False
 
-    payload = seed_model_env(entry, "", value)
+    # The NAME the request asked for has to travel, or the pod registers the entry
+    # under its `path` and the model is unreachable by the name it was asked for.
+    # For an adapter that is fatal rather than cosmetic: a LoRA's path IS its base,
+    # so `diogene-alpha` registered as `cyankiwi/Qwen3.8-27B-AWQ-INT4` and
+    # collapsed into the base — taught successfully, still 404, and the base
+    # answering under the adapter's name would have been the silent version.
+    served = (getattr(mcfg, "served_model", "") or "").strip() \
+        or str(entry.get("id") or "").strip() or str(model or "").strip()
+    payload = seed_model_env(entry, served, value)
     if not payload:
         return False
     headers = {"Content-Type": "application/json"}
