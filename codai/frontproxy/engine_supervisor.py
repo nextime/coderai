@@ -1411,6 +1411,17 @@ class EngineSupervisor:
                 self.registry.update_state(engine_id, healthy=False)
                 deadline = time.time() + drain_grace
                 waited = False
+                # A leaked in-flight entry would make this wait the whole grace
+                # period for a request that finished long ago, so clear the stale
+                # ones before believing the count. The ceiling comes from config
+                # (0 = never reap) and is far above any real request.
+                try:
+                    _ttl = float(getattr(self.config.server,
+                                         "inflight_max_age_s", 3600.0) or 0.0)
+                    if _ttl > 0:
+                        engine.reap_stale_requests(_ttl)
+                except Exception:
+                    pass
                 while engine.inflight > 0 and time.time() < deadline \
                         and not self._stopped.is_set():
                     if not waited:

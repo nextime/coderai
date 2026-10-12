@@ -73,6 +73,15 @@ class ServerConfig:
                                         # generous enough that a GIL-busy engine's
                                         # health poll doesn't time out mid-generation
     proxy_max_inflight: int = 64        # max concurrent proxied requests through the front
+    # Release an in-flight request the front has held for longer than this, so a
+    # leaked one cannot wedge the install. The count is what the hourly
+    # autoupgrade's idle guard reads, and with MAX_DEFERRALS=0 a non-zero count
+    # stops upgrading ALTOGETHER -- a leak is therefore not a cosmetic metric
+    # problem, it silently freezes the host on old code. Well above the slowest
+    # legitimate request: a cold RunPod pod can make one OCR page take 14 minutes,
+    # so this is an hour, not a minute. Training is unaffected (it is tracked as a
+    # JOB; the request that starts it returns at once). 0 disables the reaper.
+    inflight_max_age_s: float = 3600.0
     gpu_swap_batch: int = 10            # on a shared GPU (GGUF-isolation split), serve up to
                                         # this many requests for the model that currently owns
                                         # the card before swapping to a queued different model
@@ -1440,6 +1449,7 @@ class ConfigManager:
                 "engine_gpus": self.config.server.engine_gpus,
                 "proxy_status_timeout": self.config.server.proxy_status_timeout,
                 "proxy_max_inflight": self.config.server.proxy_max_inflight,
+                "inflight_max_age_s": self.config.server.inflight_max_age_s,
                 "gpu_swap_batch": self.config.server.gpu_swap_batch,
                 "engine_restart_drain_grace": self.config.server.engine_restart_drain_grace,
                 "isolate_gguf_engine": self.config.server.isolate_gguf_engine,

@@ -2571,7 +2571,27 @@ class FrontProxy:
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
 
+        # Released from TWO places, and neither alone is enough.
+        #
+        # Starlette awaits a response's background task only AFTER the body has
+        # been sent: `await self.stream_response(send)` then `await
+        # self.background()`. When the client disconnects mid-stream the send
+        # raises, the exception propagates, and the background task never runs --
+        # so the in-flight count keeps the request for ever. That count is what
+        # the hourly autoupgrade's idle guard reads, and with MAX_DEFERRALS=0 a
+        # non-zero count stops the install upgrading at all: one leaked entry and
+        # the host silently sits on old code until someone restarts it by hand.
+        #
+        # The relay generator's `finally` DOES run on a disconnect (Starlette
+        # closes the iterator), but not when the body is returned without
+        # streaming. So both call this, and exit_request is idempotent per rid.
+        _released = False
+
         async def _release():
+            nonlocal _released
+            if _released:
+                return
+            _released = True
             try:
                 await rp_resp.aclose()
             finally:
@@ -2633,6 +2653,11 @@ class FrontProxy:
                 print(f"[front] upstream engine#{engine.id} ({engine.name}) closed the "
                       f"stream early on {path}: {exc!r}", flush=True)
                 return
+            finally:
+                # Runs on normal completion AND when Starlette closes the iterator
+                # because the client went away -- which is the case the background
+                # task below never reaches.
+                await _release()
 
         resp_headers = self._filter_headers(rp_resp.headers, _DROP_RESP)
         return StreamingResponse(

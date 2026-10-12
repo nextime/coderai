@@ -99,6 +99,11 @@ class Engine:
     # front can synthesize Tasks-page entries for work it dispatched — visible even
     # when the engine is too GIL-busy generating to answer its own /admin/api/tasks.
     active: dict = field(default_factory=dict, repr=False, compare=False)
+    #: rid -> time the request was admitted, for EVERY in-flight request (``active``
+    #: only holds the inference ones, which is why a leaked non-inference request
+    #: used to be uncountable as well as unreleasable). Read by
+    #: :meth:`reap_stale_requests`.
+    inflight_since: dict = field(default_factory=dict, repr=False, compare=False)
     # A cluster NODE: another coderai install used as an engine of this front.
     # Nothing is spawned; the node's own front is polled on ``state_path`` and
     # proxied to through ``http_short``/``http_long`` (clients carrying the
@@ -165,6 +170,13 @@ class Engine:
         rid = _u.uuid4().hex[:12]
         with self._inflight_lock:
             self.inflight += 1
+            # EVERY request gets a timestamp, not just the inference ones that get
+            # ``meta``. Without this a leaked non-inference request is invisible:
+            # the count says "13 in flight" and the Tasks page shows nothing, which
+            # is exactly how one went unnoticed long enough to wedge the hourly
+            # autoupgrade (its idle guard reads this count, and MAX_DEFERRALS=0
+            # means a non-zero count stops upgrading for ever).
+            self.inflight_since[rid] = _t.time()
             if meta is not None:
                 m = dict(meta)
                 m["started_at"] = _t.time()
@@ -172,11 +184,53 @@ class Engine:
         return rid
 
     def exit_request(self, rid: Optional[str] = None) -> None:
+        """Release a request. Safe to call twice for the same ``rid``.
+
+        Idempotence is required, not a nicety: the streaming path releases from
+        both the relay generator's ``finally`` and the response's background task,
+        because neither alone is reliable (see FrontApp._proxy). Without the rid
+        bookkeeping the second call would decrement someone else's request and the
+        count would drift NEGATIVE-wards, hiding real work.
+        """
         with self._inflight_lock:
+            if rid is not None:
+                if rid not in self.inflight_since:
+                    return                      # already released
+                self.inflight_since.pop(rid, None)
             if self.inflight > 0:
                 self.inflight -= 1
             if rid:
                 self.active.pop(rid, None)
+
+    def reap_stale_requests(self, max_age_s: float) -> int:
+        """Release in-flight entries older than ``max_age_s``. Returns how many.
+
+        The safety net under the two release paths. A request that leaks is worse
+        than a request that is wrongly reaped: the count is read to decide whether
+        it is safe to restart, so a stuck entry does not merely misreport, it stops
+        the install taking upgrades at all. ``max_age_s`` therefore has to be well
+        above the slowest legitimate request — a cold RunPod pod can make one OCR
+        page take 14 minutes — which is why the default is an hour and not a
+        minute. Training does not count here: it is tracked as a JOB, and the
+        request that started it returns immediately.
+        """
+        if max_age_s <= 0:
+            return 0
+        import time as _t
+        cutoff = _t.time() - float(max_age_s)
+        with self._inflight_lock:
+            stale = [rid for rid, at in self.inflight_since.items() if at < cutoff]
+            for rid in stale:
+                age = _t.time() - self.inflight_since.pop(rid, _t.time())
+                meta = self.active.pop(rid, None)
+                if self.inflight > 0:
+                    self.inflight -= 1
+                print(f"[front] engine#{self.id}: releasing in-flight request {rid} "
+                      f"stuck for {age:.0f}s "
+                      f"({(meta or {}).get('path') or 'non-inference'}) — the count "
+                      f"is what decides whether a restart is safe, so a leaked "
+                      f"entry cannot be left in it", flush=True)
+            return len(stale)
 
 
 class EngineRegistry:

@@ -239,6 +239,22 @@ def render(front) -> str:
         pass
 
     # Queue / active requests as the overview counts them.
+    #
+    # Reaped FIRST, deliberately. This gauge is not merely watched: the hourly
+    # autoupgrade's idle guard reads it to decide whether a restart is safe, and
+    # with MAX_DEFERRALS=0 a stuck non-zero value stops the install upgrading for
+    # ever. So the scrape that would report a lie is the right moment to correct
+    # it, rather than reporting it and hoping somebody notices.
+    try:
+        _max_age = float(getattr(getattr(front, "config", None), "server", None)
+                         and front.config.server.inflight_max_age_s or 3600.0)
+    except Exception:
+        _max_age = 3600.0
+    for _e in front.registry.all():
+        try:
+            _e.reap_stale_requests(_max_age)
+        except Exception:
+            pass
     try:
         active = sum(int(getattr(e, "inflight", 0) or 0) for e in front.registry.all())
         lines += ["# HELP coderai_requests_active Requests in flight through the front.",
