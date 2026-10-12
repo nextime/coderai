@@ -385,6 +385,40 @@ failed pages are re-read by the next engine instead of failing the request. Set 
 explicit order (`"doctr, paddle"`) to override it, or `off` to get the original error
 back.
 
+### A closed keep-alive socket is not a dead pod
+
+A pod dropped from the pool is **terminated** — it is a rented GPU, and the bill stops
+when it does. So what counts as "nothing is at that address" has to be narrow, and for a
+while it was not.
+
+`httpx.RemoteProtocolError("Server disconnected without sending a response")` was in the
+dead-upstream set. That error does not mean the server is gone: it is what httpx raises
+when a **pooled** connection was closed by the far end between two requests. uvicorn
+closes an idle connection after 5s by default and nothing in coderai raised that, while
+the OCR gateway held pooled connections for 60s — so the first page sent after any quiet
+gap hit a socket the pod had already closed, and the pool killed the pod for it.
+
+On 2026-10-12 that cost five A40s between 19:14 and 20:11. None of them was broken: each
+pod's own log ended in `"POST /v1/chat/completions HTTP/1.1" 200 OK` at 4664 tokens/s,
+seconds before it was reaped, and every replacement needed a ~6-minute image pull before
+it could read a page. From outside it looked like OCR flapping; it was coderai killing
+its own workers.
+
+Three things changed, all on the orchestrator (no pod image is involved):
+
+* a closed pooled connection is **retried on a fresh connection**, against the *same*
+  upstream — re-choosing would send the page to a different pod, or rent one;
+* a pod is **asked before it is dropped**: `/healthz` (then `/health`) on a new
+  connection, with any answer below 500 counting as alive — a 401 is a server,
+  authenticating. Only silence drops it;
+* idle pooled connections are now released after 4s (`CODERAI_OCR_KEEPALIVE_EXPIRY_S`),
+  under the server's own keep-alive, so the race is rare rather than routine. Reuse
+  *within* a burst of pages — the reason the pool exists — is unaffected.
+
+A pod that RunPod really has reclaimed mid-document is still dropped immediately, which
+is what this logic was added for: left in the pool, every following page picks the corpse
+and the in-flight count climbs with nothing draining.
+
 ## Enable & configure
 
 Settings → **OCR** card, or `config.json` `"ocr"`. Key fields: `enabled`,

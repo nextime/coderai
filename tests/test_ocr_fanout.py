@@ -1334,3 +1334,222 @@ def test_the_candidate_set_is_rebuilt_after_a_death():
     lease = dispatch.Lease("http://a/v1", "", "node:a", "node")
     lease.dead()
     assert "m" not in dispatch._candidates
+
+
+# ------------------------------- a closed keep-alive socket is not a dead pod #
+# On 2026-10-12 the OCR pool burned through five A40s between 19:14 and 20:11.
+# Not one of them was broken: each was killed mid-document while its own log
+# still read `"POST /v1/chat/completions HTTP/1.1" 200 OK` at 4664 tokens/s.
+# What killed them was `httpx.RemoteProtocolError("Server disconnected without
+# sending a response")` — the error httpx raises when a POOLED connection was
+# closed by the far end between two requests. uvicorn closes an idle connection
+# after 5s and nothing in coderai raises that; this module held them for 60. So
+# the first page after any quiet gap raised it, the gateway read it as "nothing
+# is at that address", and the pool TERMINATED a rented GPU. Each pod then cost
+# a 6-minute image pull to replace, which is what the operator saw as OCR
+# flapping.
+def _stale_socket(monkeypatch, failures=1, alive=True, fresh_ok=True):
+    """An upstream whose pooled connection is closed, but which is perfectly fine.
+
+    ``alive`` is whether its health check answers — the difference between a
+    closed socket and a pod that really has gone. ``fresh_ok`` is whether the
+    resend on a brand-new connection succeeds, which is how a stale socket is
+    told apart from a server that is dropping every connection it is given.
+    """
+    import httpx
+    state = {"posts": 0, "fresh_posts": 0, "probes": 0}
+
+    class _Stale(_CapturingClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            # A one-shot client is the one built with keep-alive disabled.
+            limits = kw.get("limits")
+            self.pooled = not (limits is not None
+                               and getattr(limits, "max_keepalive_connections", 1) == 0)
+
+        @property
+        def is_closed(self):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, timeout=None):
+            state["probes"] += 1
+            if not alive:
+                raise httpx.ConnectError("connection refused")
+
+            class _R:
+                status_code = 200
+            return _R()
+
+        async def post(self, url, content=None, headers=None):
+            if self.pooled:
+                state["posts"] += 1
+                if state["posts"] <= failures:
+                    raise httpx.RemoteProtocolError(
+                        "Server disconnected without sending a response.")
+            else:
+                state["fresh_posts"] += 1
+                if not fresh_ok:
+                    raise httpx.RemoteProtocolError(
+                        "Server disconnected without sending a response.")
+            return await super().post(url, content=content, headers=headers)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Stale)
+    return state
+
+
+def test_a_closed_pooled_connection_is_not_a_dead_address():
+    """The classification itself: this is the line that cost five GPUs."""
+    import httpx
+    exc = httpx.RemoteProtocolError("Server disconnected without sending a response.")
+    assert gateway._is_stale_socket(exc)
+    assert not gateway._is_dead_upstream(exc)
+    # What a genuinely empty address looks like, by contrast.
+    assert gateway._is_dead_upstream(httpx.ConnectError("connection refused"))
+    assert not gateway._is_stale_socket(httpx.ConnectError("connection refused"))
+
+
+def test_a_stale_socket_resends_the_page_and_keeps_the_pod(monkeypatch):
+    """The page is read, on a connection of its own, and nothing is terminated."""
+    _reset()
+    import asyncio
+    discarded = []
+    state = _stale_socket(monkeypatch, failures=1)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 200          # the page was read
+    assert reply.body == UPSTREAM_REPLY      # and verbatim, as always
+    assert state["fresh_posts"] == 1         # resent off the pool
+    assert discarded == []                   # the $0.59/hr A40 is still rented
+    assert dispatch.inflight() == 0
+
+
+def test_the_resend_goes_to_the_same_pod_not_a_new_one(monkeypatch):
+    """Re-choosing would send the page to a different pod, or rent one. The
+    upstream we have is fine; only its socket was not."""
+    _reset()
+    import asyncio
+    seen = []
+    _stale_socket(monkeypatch, failures=1)
+
+    def _acquire():
+        seen.append(1)
+        return ("https://10.0.0.9:8000/v1", "k", lambda: None, lambda: None)
+    cand = dispatch.Candidate(key="pod:m", kind="pod", base="", priority=2,
+                              acquire=_acquire, primary=True)
+    monkeypatch.setattr(dispatch, "candidates", lambda m: [cand])
+    monkeypatch.setattr(dispatch, "_node_reported_load", lambda c: 0)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 200
+    assert len(seen) == 1                    # one lease, not two
+
+
+def test_a_pod_that_answers_its_health_check_is_never_terminated(monkeypatch):
+    """Even when the resend fails too: dropping a pod is irreversible, so the
+    address is asked directly before anything is billed away."""
+    _reset()
+    import asyncio
+    discarded = []
+    state = _stale_socket(monkeypatch, failures=99, alive=True, fresh_ok=False)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 502          # this page failed, honestly reported
+    assert discarded == []                   # but the pod kept
+    assert state["probes"] >= 1              # because it was asked
+    assert dispatch.inflight() == 0
+
+
+def test_a_pod_that_answers_nothing_at_all_is_still_dropped(monkeypatch):
+    """The original bug must stay fixed: a pod RunPod reclaimed mid-document
+    still has to leave the pool, or every following page picks the corpse."""
+    _reset()
+    import asyncio
+    discarded = []
+    _stale_socket(monkeypatch, failures=99, alive=False, fresh_ok=False)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 503          # both attempts, then give up
+    assert len(discarded) == 2               # and the pool was told, both times
+
+
+def test_the_health_probe_counts_a_401_as_alive(monkeypatch):
+    """A 401 is a server, authenticating. Only silence means nothing is there."""
+    import asyncio
+    import httpx
+
+    class _Guarded(_CapturingClient):
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, timeout=None):
+            class _R:
+                status_code = 401
+            return _R()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Guarded)
+    assert asyncio.run(gateway._still_alive("https://10.0.0.9:8000/v1", "k"))
+
+
+def test_the_health_probe_asks_the_root_not_the_v1_path(monkeypatch):
+    """/healthz lives at the root; asking /v1/healthz would 404 and read as dead."""
+    import asyncio
+    import httpx
+    asked = []
+
+    class _Noting(_CapturingClient):
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, timeout=None):
+            asked.append(url)
+            raise httpx.ConnectError("nothing here")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Noting)
+    assert not asyncio.run(gateway._still_alive("https://10.0.0.9:8000/v1"))
+    assert asked == ["https://10.0.0.9:8000/healthz",
+                     "https://10.0.0.9:8000/health"]
+
+
+def test_idle_connections_are_dropped_before_the_server_drops_them():
+    """uvicorn's default keep-alive is 5s. Holding a pooled connection longer
+    than the server does guarantees the stale-socket race on every quiet gap,
+    which is how this outage started."""
+    assert gateway._KEEPALIVE_EXPIRY_S < 5.0
+    # Still long enough to reuse a connection within a burst of pages, which is
+    # the whole reason the pool exists.
+    assert gateway._KEEPALIVE_EXPIRY_S >= 1.0
+
+
+def test_a_read_timeout_still_never_probes_or_drops(monkeypatch):
+    """Unchanged: a dense page is slow, not dead — and must not even cost a probe."""
+    _reset()
+    import asyncio
+    import httpx
+    discarded = []
+    probes = []
+
+    class _Slow(_CapturingClient):
+        @property
+        def is_closed(self):
+            return False
+
+        async def get(self, url, headers=None, timeout=None):
+            probes.append(url)
+            raise httpx.ConnectError("x")
+
+        async def post(self, url, content=None, headers=None):
+            raise httpx.ReadTimeout("too slow")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Slow)
+    _pod_cands(monkeypatch, discarded)
+    token = gateway.issue("m", "m")
+    reply = asyncio.run(gateway.chat_completions(token, _Req(SURYA_BODY)))
+    assert reply.status_code == 502
+    assert discarded == []
+    assert probes == []
