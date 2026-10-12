@@ -382,3 +382,20 @@ def test_the_limiter_can_be_turned_off_by_env(monkeypatch):
     assert ratelimit._limits_enabled() is True
     monkeypatch.setenv("CODERAI_SERVER_RATE_LIMIT_ENABLED", "0")
     assert ratelimit._limits_enabled() is False
+
+
+def test_a_base_and_its_adapter_both_reach_the_pod(monkeypatch):
+    """Seeds were de-duplicated by PATH, and a base model and a LoRA of it share
+    one path by definition — so the adapter was dropped and the pod was told
+    about one model when it needed two. Observed live: "told about 1 model(s)"."""
+    from codai.api import runpod_worker as rw
+    base = {"id": "qwen38-awq", "path": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+            "alias": "qwen38"}
+    tuned = {"id": "diogene-alpha", "path": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+             "loras": [{"name": "diogene-alpha", "path": "sha256:" + "a" * 64}]}
+    mcfg = rw.parse_model_runpod({})
+    plan = rw._plan("vllm", "img", "", mcfg, "key", base, "qwen38-awq",
+                    seed_entries=[tuned])
+    seeded = json.loads((plan.get("env") or {}).get("CODERAI_SEED_MODELS") or "[]")
+    assert len(seeded) == 2, seeded
+    assert any(m.get("loras") for m in seeded), "the adapter's entry was dropped"

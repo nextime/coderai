@@ -1104,13 +1104,18 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         if one:
             seeds.extend(_json.loads(one))
     if seeds:
-        # De-duplicate by path: a capability pod's list can overlap the one model
-        # a per-model pool also seeds.
+        # De-duplicate by what the pod will SERVE it as, not by path: a capability
+        # pod's list can overlap the one model a per-model pool also seeds, which
+        # is what this guards against — but a base model and a LoRA of it share
+        # one path by definition, so keying on path silently dropped the adapter
+        # and the pod was "told about 1 model(s)" when it needed two.
         seen, unique = set(), []
         for s in seeds:
-            if s.get("path") in seen:
+            key = (s.get("path"), s.get("alias") or "", s.get("id") or "",
+                   _json.dumps(s.get("loras") or [], sort_keys=True))
+            if key in seen:
                 continue
-            seen.add(s.get("path"))
+            seen.add(key)
             unique.append(s)
         env["CODERAI_SEED_MODELS"] = _json.dumps(unique)
         print(f"[runpod] pod will be told about {len(unique)} model(s)", flush=True)
