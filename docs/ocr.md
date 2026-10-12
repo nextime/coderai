@@ -496,6 +496,65 @@ Note that `ocr.surya_langs` is a **legacy** setting. It reaches only the ≤0.17
 recognition API (`rec(images, langs, det_predictor)`); surya-2 has no language input,
 so on the pod path it does nothing.
 
+### `surya_token_trace` — whose fault is an unreadable character?
+
+"Surya's path" is two things, and only one of them is ours:
+
+1. the **model** emits a broken byte sequence — then the text faithfully renders a wrong
+   answer and nothing on our side can fix it;
+2. the model emits a **correct** sequence and the serving stack mis-assembles it — then
+   the model was right and the bug is ours.
+
+The finished text cannot tell them apart, for the reason above. The *bytes* can, so
+`ocr.surya_token_trace` surfaces them. It is **off by default**: it is a diagnostic, it
+adds response weight, and it reaches into surya's internals.
+
+It has to, because surya drops the data on the floor. Its recognition predictor really
+does pass the per-token logprobs on — `BlockOCRResult(..., raw_logprobs=out.logprobs)` —
+but the model never declares that field and pydantic's default is `extra="ignore"`, so
+the value is constructed and silently discarded (their own comment calls it "phase 2
+use"). Verified by construction: the attribute does not exist on the result. coderai
+therefore takes it one layer earlier, wrapping `_generate_one`, which still has it. The
+wrapper only reads, and swallows every error — a diagnostic that could break a page would
+be far worse than no diagnostic.
+
+With it on, a document that lost characters carries its own diagnosis under
+`unreadable.tokens`:
+
+```json
+{ "unreadable": {
+    "count": 29,
+    "tokens": [
+      { "page": 0, "call": 3, "index": 41, "kind": "invalid-utf8",
+        "token":   {"token": "Ã", "bytes": [195], "logprob": -0.0021},
+        "why":     "byte 0xC3 does not form valid UTF-8 here",
+        "context": [ {"token": "p", "bytes": [112]}, {"token": "i", "bytes": [105]},
+                     {"token": "Ã", "bytes": [195]}, {"token": " ", "bytes": [32]} ] }
+    ] } }
+```
+
+How to read it:
+
+| what you see | verdict |
+|---|---|
+| `kind: "invalid-utf8"`, a lone `[195]` with nothing to complete it | the **model** emitted a broken sequence — report it to Datalab |
+| `kind: "model-emitted"`, the token *is* the replacement character | the model chose the marker, or something upstream substituted it before we saw a byte |
+| **no `tokens` at all** on a page full of markers | the bytes were sound and the loss happened after them — **ours**, in the serving stack |
+
+That last row is why an empty trace is a result and not a failure. The scan reassembles
+the whole byte stream and walks it as UTF-8 rather than judging tokens one at a time: per
+token is meaningless here, since one character legitimately arrives as two or three
+tokens and each is "invalid" alone. The first version of this did judge them pairwise and
+duly flagged every accent *and* every em dash — exactly the false positive that would
+make the diagnostic worthless.
+
+Findings are capped (`TRACE_MAX`, 40 per page) with two tokens of context each side,
+because a lead byte is only wrong in the light of what followed it.
+
+A third, independent discriminator needs no code at all: serve the **same weights through
+llama.cpp** (`datalab-to/surya-ocr-2-gguf`, with `surya_serve: "llamacpp"`). A different
+detokenizer on identical weights — accents surviving there would convict vLLM outright.
+
 ### Where `conf` comes from on a served engine
 
 A VLM pipeline has no detector score to report, so surya asks the model server for
@@ -577,7 +636,26 @@ the document's own glyph quality and the serving stack (coderai's pods run vLLM
 them apart is to OCR **perfect synthetic Italian** through the same path — clean
 output indicts the document, U+FFFD on crisp vector glyphs indicts the stack.
 
-There is now a second, cheaper discriminator: **run the page through `chandra`**.
+**Correction, measured 2026-10-12.** An earlier version of this section argued that
+U+FFFD could not be a byte-level artefact, because `à` was a single token and one marker
+therefore meant the model had chosen it. **That was wrong.** surya-ocr-2's vocabulary is
+**byte-level**, and an accented letter is two tokens:
+
+```
+'à' utf8=[195, 160]  ids=[2131, 2258]  pieces=['Ã', 'ł']
+'è' utf8=[195, 168]  ids=[2131, 2104]  pieces=['Ã', '¨']
+
+decode([2131])       = '?'     <- a lone lead byte gives exactly ONE marker
+decode([2131, 2104]) = 'è'
+```
+
+So **one marker per accented letter is exactly the signature of a byte-level failure** —
+the thing it was claimed to rule out. The vocabulary lookup was misread too: `vocab['à']
+= 2160` does not mean the letter is token 2160; in a byte-mapped vocabulary that key is
+the glyph standing for byte `0xA0`, and `decode([2160])` is a single marker as well. The
+"one marker vs two" discriminator does not exist.
+
+There is a second, cheaper discriminator that does: **run the page through `chandra`**.
 It is a different model family with a different tokenizer (Qwen3-VL, against
 surya-2's own 65k `WordLevel` vocabulary), reached over the same transport, at the
 same pixel ceiling, from the same rasterised page. Accents intact under chandra

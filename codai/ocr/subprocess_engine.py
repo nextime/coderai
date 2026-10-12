@@ -204,4 +204,10 @@ class SubprocessOcrEngine(OcrEngine):
         page.regions = [OcrRegion(label=r.get("label", ""), bbox=list(r.get("bbox", [0, 0, 0, 0])),
                                   conf=float(r.get("conf", 0.0))) for r in d.get("regions", [])]
         page.tables = list(d.get("tables", []))
+        # The worker's byte-level diagnosis of an unreadable page, when it made one.
+        # Carried on meta rather than a field of its own so engines that cannot
+        # produce it change nothing about the response shape.
+        trace = d.get("unreadable_tokens")
+        if trace:
+            page.meta["unreadable_tokens"] = trace
         return page

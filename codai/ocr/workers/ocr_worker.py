@@ -233,6 +233,154 @@ def _construct_tolerant(cls, kwargs):
 # Surya
 # ---------------------------------------------------------------------------
 
+#: What a model writes where it could not read a character.
+UNREADABLE = "\ufffd"
+
+#: At most this many anomalies are reported per page. A page that has gone
+#: completely wrong would otherwise return its entire token stream.
+TRACE_MAX = 40
+
+#: Tokens of surrounding stream kept with each anomaly, each side.
+TRACE_CONTEXT = 2
+
+
+def _utf8_bad_offsets(buf) -> list:
+    """Byte offsets in ``buf`` where the stream is not valid UTF-8.
+
+    A real scan rather than a per-token guess, because per-token is meaningless
+    here: surya-ocr-2's vocabulary is byte-level, so ONE character arrives as two
+    or three tokens and every one of them is "invalid" in isolation. The first
+    version of this checked each token against its immediate successor and duly
+    flagged every accent and every em dash — the exact false positive that would
+    make the diagnostic worthless.
+
+    So the tokens are reassembled into the byte stream the server decoded, and the
+    stream is walked as UTF-8: a lead byte declares its length, the continuations
+    must be 0x80-0xBF, and anything else is a genuine break. Both the bytes that
+    can never begin a character (0x80-0xC1, 0xF5+) and the sequences that run off
+    the end are breaks.
+    """
+    bad = []
+    i, n = 0, len(buf)
+    while i < n:
+        b = buf[i]
+        if b < 0x80:                       # plain ASCII
+            i += 1
+            continue
+        if 0xC2 <= b <= 0xDF:
+            need = 1
+        elif 0xE0 <= b <= 0xEF:
+            need = 2
+        elif 0xF0 <= b <= 0xF4:
+            need = 3
+        else:
+            # 0x80-0xC1 is a continuation or an overlong lead; 0xF5+ is out of
+            # range. Neither can start a character.
+            bad.append(i)
+            i += 1
+            continue
+        if i + need >= n:                  # runs off the end of the stream
+            bad.append(i)
+            i += 1
+            continue
+        if not all(0x80 <= buf[i + k] <= 0xBF for k in range(1, need + 1)):
+            bad.append(i)
+            i += 1
+            continue
+        i += need + 1
+    return bad
+
+
+def _tok_entry(entry) -> dict:
+    """One OpenAI-style logprob entry reduced to what diagnoses a byte problem."""
+    if not isinstance(entry, dict):
+        entry = {"token": getattr(entry, "token", None),
+                 "bytes": getattr(entry, "bytes", None),
+                 "logprob": getattr(entry, "logprob", None)}
+    raw = entry.get("bytes")
+    out = {"token": entry.get("token")}
+    if isinstance(raw, (list, tuple)):
+        out["bytes"] = [int(b) for b in raw]
+    lp = entry.get("logprob")
+    if isinstance(lp, (int, float)):
+        out["logprob"] = round(float(lp), 4)
+    return out
+
+
+def _trace_findings(calls) -> list:
+    """Where in the model's own token stream the text stopped being readable.
+
+    This is the measurement that separates two faults which look identical in the
+    finished text:
+
+      * the MODEL emitted a broken byte sequence -- a lone UTF-8 lead byte with no
+        continuation, say -- in which case the text faithfully renders a wrong
+        answer and nothing on our side can fix it;
+      * the model emitted a CORRECT sequence and the serving stack mis-assembled
+        it, in which case the model was right and the bug is ours.
+
+    A single marker per accented letter is equally the signature of both, because
+    the vocabulary is byte-level and either byte of an accented letter decodes
+    alone to exactly one replacement character. Only the bytes tell them apart.
+
+    Two kinds of finding, and the difference matters:
+
+      ``invalid-utf8``  the reassembled stream does not decode. The server had
+                        nothing good to work with, so the model is at fault.
+      ``model-emitted`` the stream decodes cleanly and a token IS the replacement
+                        character -- the model chose it, or something upstream
+                        had already substituted it before we saw a byte.
+
+    What is NOT a finding: a stream that decodes. If the bytes are sound and the
+    text still shows markers, the loss happened after this point, which is itself
+    the answer -- an empty trace on an unreadable page indicts the stack.
+    """
+    findings = []
+    for call_idx, tokens in enumerate(calls or []):
+        if not tokens:
+            continue
+        entries = [_tok_entry(t) for t in tokens]
+
+        # Reassemble the stream, remembering which token each byte came from.
+        buf, owner = bytearray(), []
+        for ti, e in enumerate(entries):
+            for b in (e.get("bytes") or []):
+                buf.append(b & 0xFF)
+                owner.append(ti)
+
+        def _add(ti, why, kind):
+            if len(findings) >= TRACE_MAX:
+                return False
+            lo = max(0, ti - TRACE_CONTEXT)
+            hi = min(len(entries), ti + TRACE_CONTEXT + 1)
+            findings.append({
+                "call": call_idx, "index": ti, "kind": kind,
+                "token": entries[ti], "why": why, "context": entries[lo:hi],
+            })
+            return True
+
+        seen = set()
+        for off in _utf8_bad_offsets(buf):
+            ti = owner[off] if off < len(owner) else len(entries) - 1
+            if ti in seen:
+                continue
+            seen.add(ti)
+            if not _add(ti, "byte 0x%02X does not form valid UTF-8 here" % buf[off],
+                        "invalid-utf8"):
+                return findings
+
+        # Markers the model produced outright. EF BF BD is perfectly valid UTF-8,
+        # so the scan above cannot see these.
+        for ti, e in enumerate(entries):
+            tok = e.get("token")
+            if isinstance(tok, str) and UNREADABLE in tok and ti not in seen:
+                seen.add(ti)
+                if not _add(ti, "the token itself is the replacement character",
+                            "model-emitted"):
+                    return findings
+    return findings
+
+
 class SuryaWorker:
     def __init__(self, opts):
         self.opts = opts
@@ -243,6 +391,9 @@ class SuryaWorker:
         self._rec_proc = None
         self._run_ocr = None
         self._langs = [l.strip() for l in str(opts.get("langs", "it")).split(",") if l.strip()] or ["it"]
+        #: Per-call token logprobs, collected by the hook installed in load().
+        self._calls = []
+        self._trace = bool(opts.get("token_trace", False))
 
     def load(self):
         """Load surya, matching the API of whichever release is installed.
@@ -271,7 +422,52 @@ class SuryaWorker:
             self._rec = RecognitionPredictor()
         self._det = DetectionPredictor()
         self._mode = "predictor"
+        self._install_trace_hook()
         return
+
+    def _install_trace_hook(self):
+        """Keep the per-token logprobs surya asks for but then throws away.
+
+        surya's recognition predictor DOES pass them on
+        (``BlockOCRResult(..., raw_logprobs=out.logprobs)``) but the model never
+        declares the field, and pydantic's default is ``extra="ignore"`` -- so the
+        data is constructed and silently dropped. Their own comment calls it
+        "phase 2 use", which is presumably why nobody noticed. Verified by
+        construction: the attribute does not exist on the result.
+
+        So the value is taken one layer earlier, where it still exists:
+        ``_generate_one`` returns the ``GenerationResult`` that carries it. The
+        wrapper only reads, never alters, and swallows everything -- a diagnostic
+        that can break OCR would be far worse than no diagnostic.
+        """
+        if not self._trace:
+            return
+        try:
+            from surya.inference.backends import openai_client as _oc
+        except Exception as e:
+            print(f"[surya] token trace unavailable: {e}", file=sys.stderr)
+            return
+        if getattr(_oc, "_coderai_traced", False):
+            _oc._coderai_sink = self._calls          # re-point at this worker
+            return
+        inner = getattr(_oc, "_generate_one", None)
+        if inner is None:
+            print("[surya] token trace: no _generate_one to hook", file=sys.stderr)
+            return
+        _oc._coderai_sink = self._calls
+
+        def _wrapped(*args, **kwargs):
+            result = inner(*args, **kwargs)
+            try:
+                sink = getattr(_oc, "_coderai_sink", None)
+                if sink is not None:
+                    sink.append(getattr(result, "logprobs", None))
+            except Exception:
+                pass
+            return result
+
+        _oc._generate_one = _wrapped
+        _oc._coderai_traced = True
 
     def _load_legacy(self):
         # very old (<0.6): the functional run_ocr API. Kept reachable but no
@@ -307,6 +503,10 @@ class SuryaWorker:
 
     def ocr(self, img):
         img = img.convert("RGB")
+        # One page per call, so the trace is cleared here rather than accumulated:
+        # a long document would otherwise report the first page's anomalies on the
+        # hundredth.
+        del self._calls[:]
         if self._mode == "predictor":
             preds = self._predict(img)
         else:
@@ -348,8 +548,19 @@ class SuryaWorker:
                     conf = b.get("confidence", conf)
                 lines.append({"text": text, "bbox": _poly_to_xyxy(poly or [0, 0, 0, 0]),
                               "conf": float(conf or 0.0)})
-        return {"index": 0, "width": img.width, "height": img.height,
-                "lines": lines, "regions": [], "tables": [], "text": "\n".join(l["text"] for l in lines)}
+        page = {"index": 0, "width": img.width, "height": img.height,
+                "lines": lines, "regions": [], "tables": [],
+                "text": "\n".join(l["text"] for l in lines)}
+        # Only when something actually went unread: a clean page stays byte-identical
+        # to what it has always returned.
+        if self._trace and UNREADABLE in page["text"]:
+            try:
+                findings = _trace_findings(self._calls)
+            except Exception as e:
+                findings = [{"error": f"trace analysis failed: {e}"}]
+            if findings:
+                page["unreadable_tokens"] = findings
+        return page
 
 
 # ---------------------------------------------------------------------------

@@ -988,6 +988,16 @@ class OcrConfig:
     surya_accept_license: bool = False   # MUST be explicitly set (GPL — compatible with coderai GPLv3)
     surya_instances: int = 1
     surya_langs: str = "it"
+    # Return the model's own per-token bytes for the places a page came back
+    # unreadable (see base.UNREADABLE). Off by default: it is a diagnostic, it
+    # costs response weight, and it reaches into surya's internals to get data
+    # surya itself constructs and then drops. Turn it on when a document is
+    # losing characters and you need to know WHOSE fault it is -- the model
+    # emitting a broken byte sequence, or our serving stack mis-assembling a
+    # correct one. The two are indistinguishable in the finished text, because
+    # surya-ocr-2's vocabulary is byte-level and decoding either byte of an
+    # accented letter alone yields exactly one replacement character.
+    surya_token_trace: bool = False
     surya_venv: str = ""               # isolated venv dir; blank = ~/.coderai/surya_venv
     surya_auto_build: bool = False     # create the venv + pip install requirements-surya.txt on first use
     # Surya serving mode: "local" = classic det+recognition on torch in the isolated venv
@@ -1702,6 +1712,7 @@ class ConfigManager:
                 "surya_accept_license": self.config.ocr.surya_accept_license,
                 "surya_instances": self.config.ocr.surya_instances,
                 "surya_langs": self.config.ocr.surya_langs,
+                "surya_token_trace": self.config.ocr.surya_token_trace,
                 "surya_venv": self.config.ocr.surya_venv,
                 "surya_auto_build": self.config.ocr.surya_auto_build,
                 "surya_use_gpu": self.config.ocr.surya_use_gpu,

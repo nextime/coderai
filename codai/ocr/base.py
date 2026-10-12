@@ -44,24 +44,32 @@ class OcrError(RuntimeError):
 
 #: What a VLM OCR engine writes where it cannot identify a character.
 #:
-#: This is NOT a decoding or transport artefact, which is the natural assumption
-#: when accented letters come back as U+FFFD. In surya-ocr-2 it is a real entry in
-#: the vocabulary — id 65421 of 65425, the only id that decodes to it, and
-#: ``<unk>`` is a different token (65424). The tokenizer is ``WordLevel`` and
-#: character-level for Latin text, so ``à`` is a single token and an accent
-#: *cannot* be split across two: no partial-UTF-8 artefact is possible, and
-#: per-token decoding is byte-identical to decoding the whole string. Surya also
-#: reads its text only from ``message.content``, never from the per-token
-#: logprobs, and coderai's OCR gateway forwards the upstream body as raw bytes.
+#: It may be the model's own answer OR a byte-level accident, and the text alone
+#: cannot tell you which. An earlier version of this comment claimed otherwise —
+#: that ``à`` was a single token, so one marker had to mean the model chose it.
+#: That was wrong, and measurement settled it: surya-ocr-2's vocabulary is
+#: BYTE-level, and an accented letter is two tokens.
 #:
-#: So a U+FFFD in the output is the MODEL saying "there is a character here I
-#: cannot read". It is honest, and it is also silent: ``più`` becomes ``pi?`` and
-#: indexes, searches and reads wrong ever after. For Italian judicial documents
-#: that is a real loss, so it gets counted and located rather than passed through
-#: unremarked — a known unknown beats a quiet corruption.
+#:     'à' utf8=[195, 160]  ids=[2131, 2258]  pieces=['Ã', 'ł']
+#:     decode([2131])       = U+FFFD          <- a lone lead byte, ONE marker
+#:     decode([2131, 2104]) = 'è'
 #:
-#: The usual cause is too few pixels: a diacritic sits above the x-height and is
-#: ~3 pixels tall at 200 DPI. See ``OcrConfig.surya_dpi``.
+#: So one marker per accented letter is exactly what a byte-level failure looks
+#: like, and ``vocab['à'] = 2160`` does not mean the letter is token 2160 — in a
+#: byte-mapped vocabulary that key is the glyph standing for byte 0xA0, which
+#: alone also decodes to one marker.
+#:
+#: Either way the loss is silent: ``più`` becomes ``pi?`` and indexes, searches
+#: and reads wrong ever after. For Italian judicial documents that is real, so it
+#: gets counted and located rather than passed through unremarked — a known
+#: unknown beats a quiet corruption. To find out WHOSE fault a given document's
+#: markers are, turn on ``OcrConfig.surya_token_trace``, which reports the model's
+#: own bytes at each break (see docs/ocr.md).
+#:
+#: Too few pixels can also cause it — a diacritic is ~3 pixels tall at 200 DPI
+#: (see ``OcrConfig.surya_dpi``) — but that has been RULED OUT for the Italian
+#: case: a crisp synthetic page at 250 DPI lost every accent under surya and none
+#: under chandra.
 UNREADABLE = "\ufffd"
 
 
@@ -136,7 +144,12 @@ class OcrPage:
             "tables": self.tables,
         }
         if self.meta:
-            out["meta"] = self.meta
+            # The byte-level trace is reported ONCE, document-wide, by
+            # unreadable_report(). Repeating it on every page would put the same
+            # findings in the response twice.
+            meta = {k: v for k, v in self.meta.items() if k != "unreadable_tokens"}
+            if meta:
+                out["meta"] = meta
         n = count_unreadable(self.text)
         if n:
             out["unreadable"] = n
@@ -356,4 +369,19 @@ def unreadable_report(pages: "List[OcrPage]") -> dict:
     report = {"count": total, "pages": per_page, "spots": spots}
     if total > len(spots):
         report["truncated"] = total - len(spots)
+    # The byte-level diagnosis, when the engine produced one (surya with
+    # ``ocr.surya_token_trace`` on). This is the part that says WHOSE fault the
+    # loss is: a marker in the text is equally consistent with the model emitting
+    # a broken byte sequence and with our serving stack mis-assembling a correct
+    # one, because surya-ocr-2's vocabulary is byte-level and either byte of an
+    # accented letter decodes alone to exactly one marker. The tokens tell them
+    # apart; the text never can.
+    tokens = []
+    for page in pages or []:
+        for finding in (getattr(page, "meta", {}) or {}).get("unreadable_tokens", []):
+            entry = dict(finding)
+            entry["page"] = page.index
+            tokens.append(entry)
+    if tokens:
+        report["tokens"] = tokens
     return report

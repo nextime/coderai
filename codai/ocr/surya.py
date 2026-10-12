@@ -66,7 +66,11 @@ class SuryaEngine(SubprocessOcrEngine):
         return bool(getattr(self.cfg, "surya_auto_build", False))
 
     def _worker_opts(self) -> dict:
-        return {"langs": self.cfg.surya_langs or "it"}
+        return {"langs": self.cfg.surya_langs or "it",
+                # Sent at LOAD, like everything else here: the hook it switches on
+                # patches surya's backend, which has to happen before the first page
+                # rather than per request.
+                "token_trace": bool(getattr(self.cfg, "surya_token_trace", False))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")
