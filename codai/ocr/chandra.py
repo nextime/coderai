@@ -46,7 +46,7 @@ from html.parser import HTMLParser
 from typing import List, Optional
 
 from codai.ocr.base import (OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError,
-                            vlm_serve_limits)
+                            logprobs_of, mean_token_prob, vlm_serve_limits)
 
 
 DEFAULT_MODEL = "datalab-to/chandra-ocr-2"
@@ -376,7 +376,8 @@ def parse_bbox(value, width: int, height: int, scale: int = BBOX_SCALE
 
 
 def parse_page(content: str, width: int, height: int, index: int = 0,
-               include_furniture: bool = True) -> OcrPage:
+               include_furniture: bool = True,
+               conf: Optional[float] = None) -> OcrPage:
     """Chandra's reply → an :class:`OcrPage`.
 
     One top-level div is one layout block, and becomes all three of the things coderai's
@@ -385,6 +386,7 @@ def parse_page(content: str, width: int, height: int, index: int = 0,
     only thing that made it a table.
     """
     page = OcrPage(index=index, width=int(width), height=int(height))
+    score = float(conf) if isinstance(conf, (int, float)) else 0.0
     parser = _Blocks()
     parser.feed(content or "")
     parser.close()
@@ -401,13 +403,19 @@ def parse_page(content: str, width: int, height: int, index: int = 0,
         text = html_to_text(blk["html"])
         labels[label] = labels.get(label, 0) + 1
         if box is not None:
-            page.regions.append(OcrRegion(label=label, bbox=box, conf=0.0))
+            page.regions.append(OcrRegion(label=label, bbox=box, conf=score))
         if not text:
             continue
-        # conf 0.0 throughout: the model reports none, and inventing one would be
-        # read as a measurement. Callers that gate on confidence must not be fed a
-        # number nobody computed.
-        page.lines.append(OcrLine(text=text, bbox=box or [0.0, 0.0, 0.0, 0.0], conf=0.0))
+        # ``score`` is the mean token probability of the whole reply, because
+        # chandra generates the ENTIRE page in one call -- unlike surya, which
+        # calls per block and so has a genuinely per-block figure. The same number
+        # is therefore put on every line, and ``meta.confidence_scope`` says
+        # "page" so nobody reads it as per-line precision it does not have. 0.0
+        # when the server reported no logprobs, and ``confidence_measured`` says
+        # which, because a 0.0 that means "not measured" must not be mistaken for
+        # a 0.0 that means "unsure".
+        page.lines.append(OcrLine(text=text, bbox=box or [0.0, 0.0, 0.0, 0.0],
+                                  conf=score))
         texts.append(text)
         if label == "Table":
             page.tables.append({"bbox": box, "html": blk["html"]})
@@ -417,16 +425,21 @@ def parse_page(content: str, width: int, height: int, index: int = 0,
         loose = html_to_text("".join(parser.loose))
         if loose:
             texts.append(loose)
-            page.lines.append(OcrLine(text=loose, bbox=[0.0, 0.0, 0.0, 0.0], conf=0.0))
+            page.lines.append(OcrLine(text=loose, bbox=[0.0, 0.0, 0.0, 0.0],
+                                      conf=score))
     if not texts and not parser.blocks:
         loose = html_to_text(content or "")
         if loose:
             texts.append(loose)
-            page.lines.append(OcrLine(text=loose, bbox=[0.0, 0.0, 0.0, 0.0], conf=0.0))
+            page.lines.append(OcrLine(text=loose, bbox=[0.0, 0.0, 0.0, 0.0],
+                                      conf=score))
 
     page.text = "\n\n".join(texts)
     if labels:
         page.meta["labels"] = labels
+    page.meta["confidence"] = round(score, 4)
+    page.meta["confidence_measured"] = isinstance(conf, (int, float))
+    page.meta["confidence_scope"] = "page"
     return page
 
 
@@ -566,10 +579,11 @@ class ChandraEngine(OcrEngine):
     def recognize_image(self, image) -> OcrPage:
         src_w, src_h = image.size
         data_uri, (w, h) = prepare_image(image)
-        content, meta = self._ask_with_retries(data_uri)
+        content, meta, conf = self._ask_with_retries(data_uri)
         page = parse_page(
             content, w, h,
-            include_furniture=bool(getattr(self.cfg, "chandra_include_furniture", True)))
+            include_furniture=bool(getattr(self.cfg, "chandra_include_furniture", True)),
+            conf=conf)
         # The boxes are the model's, normalised against the image the model saw; the page
         # dimensions reported are the same ones, so a client scaling boxes back onto its
         # own render has a consistent pair. The source size is reported too, since it is
@@ -579,7 +593,7 @@ class ChandraEngine(OcrEngine):
         page.meta.update(meta)
         return page
 
-    def _ask_with_retries(self, data_uri) -> (str, dict):
+    def _ask_with_retries(self, data_uri) -> (str, dict, "Optional[float]"):
         """The page, re-asked while the reply is degenerate.
 
         A repetition loop is not an error the server reports — it answers 200 with a
@@ -591,26 +605,26 @@ class ChandraEngine(OcrEngine):
         top_p = float(getattr(self.cfg, "chandra_top_p", 0.1) or 0.1)
         max_retries = max(0, int(getattr(self.cfg, "chandra_max_retries", 2) or 0))
         meta = {}
-        content = ""
+        content, conf = "", None
         for attempt in range(max_retries + 1):
             if attempt == 0:
                 temp, p = base_temp, top_p
             else:
                 temp, p = min(base_temp + 0.2 * attempt, 0.8), 0.95
-            content = self._ask(data_uri, temp, p)
+            content, conf = self._ask(data_uri, temp, p)
             if not detect_repeat_token(content):
                 if attempt:
                     meta["retries"] = attempt
-                return content, meta
+                return content, meta, conf
         # Out of retries, and the last reply still loops. Returned anyway, flagged: a
         # looping transcription usually has a correct beginning, and the flag is what lets
         # a caller decide rather than be handed a silent mess.
         meta["retries"] = max_retries
         meta["repeat_detected"] = True
-        return content, meta
+        return content, meta, conf
 
-    def _ask(self, data_uri, temperature: float, top_p: float) -> str:
-        """One page → the model's raw reply text."""
+    def _ask(self, data_uri, temperature: float, top_p: float):
+        """One page → ``(raw reply text, mean token probability or None)``."""
         messages = [{
             "role": "user",
             "content": [
@@ -627,7 +641,15 @@ class ChandraEngine(OcrEngine):
             return self._ask_model(messages, max_tokens, temperature, top_p)
         return self._ask_http(messages, max_tokens, temperature, top_p)
 
-    def _ask_model(self, messages, max_tokens, temperature, top_p) -> str:
+    def _want_logprobs(self) -> bool:
+        """Whether to ask the server to report per-token logprobs.
+
+        They are what makes ``conf`` a measurement rather than a guess (see
+        base.mean_token_prob). Cheap — a float per token — and the only reason to
+        turn it off is a server that refuses the field outright."""
+        return bool(getattr(self.cfg, "chandra_logprobs", True))
+
+    def _ask_model(self, messages, max_tokens, temperature, top_p):
         """Model mode: ask the dispatcher which server should take this page.
 
         The in-process path is right for a model this machine serves and wrong for one
@@ -650,7 +672,7 @@ class ChandraEngine(OcrEngine):
         finally:
             lease.release()
 
-    def _ask_local(self, messages, max_tokens, temperature, top_p) -> str:
+    def _ask_local(self, messages, max_tokens, temperature, top_p):
         """Through coderai's own in-process chat handler (model mode)."""
         import asyncio
 
@@ -674,10 +696,13 @@ class ChandraEngine(OcrEngine):
         content = _content_of(result)
         if not content.strip():
             raise OcrError(f"Chandra model '{model_id}' returned no text", status=500)
-        return content
+        # No confidence from this path: coderai's in-process chat handler does not
+        # surface per-token logprobs. Reported as "not measured" rather than 0.0
+        # pretending to be one.
+        return content, None
 
     def _ask_http(self, messages, max_tokens, temperature, top_p, base: str = "",
-                  api_key: str = "", model_name: str = "") -> str:
+                  api_key: str = "", model_name: str = ""):
         """Against an OpenAI-compatible server (vllm/server modes).
 
         ``base``/``api_key``/``model_name`` override the configured server for one page,
@@ -698,6 +723,8 @@ class ChandraEngine(OcrEngine):
             "top_p": top_p,
             "stream": False,
         }
+        if self._want_logprobs():
+            payload["logprobs"] = True
         headers = {"Content-Type": "application/json"}
         key = api_key or (getattr(self.cfg, "chandra_api_key", "") or "").strip()
         if key:
@@ -713,12 +740,16 @@ class ChandraEngine(OcrEngine):
             raise OcrError(f"Chandra server {url} returned HTTP {r.status_code}: "
                            f"{r.text[:300]}", status=502)
         try:
-            content = _content_of(r.json())
+            body = r.json()
+            content = _content_of(body)
         except Exception as e:
             raise OcrError(f"Chandra server returned unparseable JSON: {e}", status=502)
         if not content.strip():
             raise OcrError("Chandra server returned no text", status=502)
-        return content
+        # None when the server declined logprobs, which the page then reports as
+        # confidence_measured: false. A server that ignores the field is a
+        # configuration, not an error.
+        return content, mean_token_prob(logprobs_of(body))
 
 
 def _content_of(result) -> str:

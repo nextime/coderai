@@ -109,7 +109,10 @@ class _Stub:
     def __call__(self, messages, max_tokens, temperature):
         self.calls.append({"messages": messages, "max_tokens": max_tokens,
                            "temperature": temperature})
-        return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        # (text, mean token probability) since v0.3.30 — the engines report a
+        # measured confidence now, and the ask helpers carry it.
+        return reply, 0.9
 
 
 def _engine(cfg, stub):

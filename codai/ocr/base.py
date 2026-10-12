@@ -297,6 +297,55 @@ def _rasterize_pdf(data: bytes, dpi: int) -> List["Any"]:
         raise OcrError(f"failed to rasterise PDF (pdf2image): {e}", status=400)
 
 
+def mean_token_prob(logprobs) -> Optional[float]:
+    """Mean ``exp(logprob)`` over a reply's tokens, or None if none were reported.
+
+    The measured confidence a VLM engine can actually offer. It is the same
+    computation surya's own client does (``_mean_token_prob`` in
+    ``surya/inference/backends/openai_client.py``), so a number from here is
+    comparable with the one surya reports rather than a second, differently
+    defined "confidence".
+
+    ``None``, never a default, when the server reported nothing. A 0.0 that means
+    "not measured" is indistinguishable from a 0.0 that means "the model was
+    certain it was unsure", and that confusion already produced one confidently
+    wrong verdict in this subsystem (see ``UNREADABLE``). Callers must be able to
+    tell the two apart, which is why every engine that uses this also reports
+    whether the figure was measured.
+
+    Accepts the OpenAI shape — ``choices[0].logprobs.content`` — as dicts or as
+    model objects, since the client library returns either depending on version.
+    """
+    import math
+    if not logprobs:
+        return None
+    total, n = 0.0, 0
+    for entry in logprobs:
+        lp = (entry.get("logprob") if isinstance(entry, dict)
+              else getattr(entry, "logprob", None))
+        if not isinstance(lp, (int, float)):
+            continue
+        try:
+            total += math.exp(float(lp))
+        except (OverflowError, ValueError):
+            continue
+        n += 1
+    return (total / n) if n else None
+
+
+def logprobs_of(result) -> Optional[list]:
+    """``choices[0].logprobs.content`` out of a chat-completions reply, or None."""
+    try:
+        choices = (result or {}).get("choices") or []
+        if not choices:
+            return None
+        lp = (choices[0] or {}).get("logprobs") or {}
+        content = lp.get("content")
+        return content or None
+    except Exception:
+        return None
+
+
 def vlm_serve_limits(cfg) -> dict:
     """The serving limits a VLM OCR engine imposes on its own vLLM instance, as kwargs
     for ``vllm_worker.ensure_service``.

@@ -664,6 +664,43 @@ model with `runpod.engine: "coderai-vllm-ocr"`; build it with
 `coderai-vllm`: 0.20.1 is seven minor releases behind, and anything else on that image
 is pinned back with it, so rent it for the OCR model only.
 
+### What `conf` means, per engine
+
+Every engine now reports a **measured** confidence, and `/v1/ocr/engines` says what
+one number covers before you send anything:
+
+| engine | scope | source |
+|---|---|---|
+| `paddle` | line | recogniser score |
+| `doctr` | line | recogniser score |
+| `surya` | **block** | mean token probability |
+| `chandra` | **page** | mean token probability |
+| `olmocr` | **page** | mean token probability |
+
+The scope is not cosmetic. A per-line score can single out the line to re-read; a
+page-level one can only tell you the page went badly. surya calls the model once per
+layout block, so its figure is genuinely per-block; chandra and olmOCR generate a
+whole page in one call, so theirs is page-level — chandra puts that same number on
+every line and region (which is what `unreadable`'s per-spot `conf` reads) and says
+`meta.confidence_scope: "page"` so it is not mistaken for per-line precision.
+
+All three VLM figures are the mean of `exp(logprob)` over the generation's tokens —
+the same computation surya's own client does, so they are comparable with each
+other rather than three different notions of "confidence". It costs one float per
+token; `ocr.chandra_logprobs` and `ocr.olmocr_logprobs` turn the request off.
+
+**A server may decline to report logprobs**, and then `conf` is `0.0` — which must
+not be read as "the model was hopeless". `meta.confidence_measured` distinguishes
+the two. That is the same distinction the unreadable-glyph trace needs and twice
+got wrong (see the correction above): a zero that means *not measured* and a zero
+that means *measured as bad* are different facts, and code that conflates them
+produces confident nonsense.
+
+(chandra used to hard-code `conf=0.0`, with a comment arguing that the model
+reported none and inventing one would be read as a measurement. The first half was
+right; the conclusion was wrong, because the number was obtainable all along by the
+route surya already used.)
+
 ### Where `conf` comes from on a served engine
 
 A VLM pipeline has no detector score to report, so surya asks the model server for

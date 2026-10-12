@@ -1084,6 +1084,10 @@ class OcrConfig:
     olmocr_temperature: float = 0.1
     olmocr_timeout: float = 300.0        # per-page ceiling on the model call
     olmocr_retry_rotation: bool = True   # re-ask once on a page the model reports rotated
+    # As chandra_logprobs, for olmOCR. It returns no lines, so its figure lives on
+    # the page's meta — there is nowhere per-line to put one and nothing per-line
+    # to measure.
+    olmocr_logprobs: bool = True
 
     # --- Chandra (Datalab; code Apache-2.0, WEIGHTS modified OpenRAIL-M) --- a document
     # VLM like olmOCR, but its `ocr_layout` prompt returns one <div> per layout block with
@@ -1127,6 +1131,13 @@ class OcrConfig:
     # is what chandra's own client does. 0 = accept the first reply whatever it looks like.
     chandra_max_retries: int = 2
     chandra_timeout: float = 300.0       # per-page ceiling on the model call
+    # Ask the server for per-token logprobs, which is what makes the reported
+    # `conf` a MEASUREMENT (the mean of exp(logprob), the same computation surya
+    # does) rather than a placeholder. Cheap: one float per token. Chandra
+    # generates a whole page in one call, so the figure is page-level and every
+    # line carries it, with meta.confidence_scope saying so; a server that
+    # declines the field leaves conf at 0.0 and confidence_measured false.
+    chandra_logprobs: bool = True
 
     # --- stamp / signature detection ---  [O3]
     detect_mode: str = "off"             # off|layout|detector|both
@@ -1763,6 +1774,7 @@ class ConfigManager:
                 "olmocr_temperature": self.config.ocr.olmocr_temperature,
                 "olmocr_timeout": self.config.ocr.olmocr_timeout,
                 "olmocr_retry_rotation": self.config.ocr.olmocr_retry_rotation,
+                "olmocr_logprobs": self.config.ocr.olmocr_logprobs,
                 "chandra_enabled": self.config.ocr.chandra_enabled,
                 "chandra_accept_license": self.config.ocr.chandra_accept_license,
                 "chandra_instances": self.config.ocr.chandra_instances,
@@ -1779,6 +1791,7 @@ class ConfigManager:
                 "chandra_top_p": self.config.ocr.chandra_top_p,
                 "chandra_max_retries": self.config.ocr.chandra_max_retries,
                 "chandra_timeout": self.config.ocr.chandra_timeout,
+                "chandra_logprobs": self.config.ocr.chandra_logprobs,
                 "detect_mode": self.config.ocr.detect_mode,
                 "detect_model_path": self.config.ocr.detect_model_path,
                 "detect_conf": self.config.ocr.detect_conf,

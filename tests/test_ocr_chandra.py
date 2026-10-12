@@ -252,7 +252,8 @@ def test_the_boxes_are_read_against_the_scaled_size_not_the_original():
     seen = {}
 
     def _ask(uri, temp, top_p):
-        return '<div data-bbox="0 0 1000 1000" data-label="Text"><p>x</p></div>'
+        return ('<div data-bbox="0 0 1000 1000" data-label="Text"><p>x</p></div>',
+                0.9)
     eng._ask = _ask
     page = eng.recognize_image(Image.new("RGB", (4960, 7016)))
     assert page.width * page.height <= 3072 * 2048
@@ -280,9 +281,9 @@ def test_a_loop_is_re_asked_with_a_higher_temperature():
 
     def _ask(uri, temp, top_p):
         temps.append(temp)
-        return replies[min(len(temps) - 1, len(replies) - 1)]
+        return replies[min(len(temps) - 1, len(replies) - 1)], 0.9
     eng._ask = _ask
-    content, meta = eng._ask_with_retries("data:,")
+    content, meta, _conf = eng._ask_with_retries("data:,")
     assert temps == [0.0, 0.2]
     assert meta["retries"] == 1
     assert "buono" in content
@@ -293,8 +294,8 @@ def test_a_page_that_loops_to_the_end_is_returned_flagged_not_dropped():
     lets a caller decide instead of being handed a silent mess."""
     eng = ch.ChandraEngine(_cfg(chandra_max_retries=1))
     eng._mode = lambda: "server"
-    eng._ask = lambda uri, temp, top_p: "loop " * 60
-    content, meta = eng._ask_with_retries("data:,")
+    eng._ask = lambda uri, temp, top_p: ("loop " * 60, 0.5)
+    content, meta, _conf = eng._ask_with_retries("data:,")
     assert meta["repeat_detected"] is True
     assert meta["retries"] == 1
     assert content
@@ -307,9 +308,9 @@ def test_retries_off_accepts_the_first_reply():
 
     def _ask(uri, temp, top_p):
         calls.append(temp)
-        return "loop " * 60
+        return "loop " * 60, 0.5
     eng._ask = _ask
-    _, meta = eng._ask_with_retries("data:,")
+    _, meta, _conf = eng._ask_with_retries("data:,")
     assert len(calls) == 1
     assert meta["repeat_detected"] is True
 
@@ -317,8 +318,9 @@ def test_retries_off_accepts_the_first_reply():
 def test_a_clean_first_reply_reports_no_retries():
     eng = ch.ChandraEngine(_cfg())
     eng._mode = lambda: "server"
-    eng._ask = lambda uri, temp, top_p: '<div data-label="Text"><p>ok</p></div>'
-    _, meta = eng._ask_with_retries("data:,")
+    eng._ask = lambda uri, temp, top_p: ('<div data-label="Text"><p>ok</p></div>',
+                                         0.9)
+    _, meta, _conf = eng._ask_with_retries("data:,")
     assert "retries" not in meta and "repeat_detected" not in meta
 
 
@@ -426,7 +428,7 @@ def test_the_request_goes_through_pod_http_so_a_pods_own_ca_is_trusted(monkeypat
                                 chandra_server_url="https://10.0.0.9:8000",
                                 chandra_api_key="tok"))
     eng.load()
-    assert "ok" in eng._ask("data:image/png;base64,AA", 0.0, 0.1)
+    assert "ok" in eng._ask("data:image/png;base64,AA", 0.0, 0.1)[0]
     assert seen["url"] == "https://10.0.0.9:8000/v1/chat/completions"
     assert seen["headers"]["Authorization"] == "Bearer tok"
 

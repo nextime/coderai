@@ -98,6 +98,24 @@ _AUTO_ALIASES = {"", "auto", "any", "multi", "multilingual", "detect"}
 #: Override with ``ocr.paddle_auto_lang``.
 AUTO_PADDLE_LANG = "latin"
 
+#: What this engine's ``conf`` actually is. ``scope`` says what one number
+#: covers, which is not cosmetic: a per-line score can single out the line to
+#: re-read, while a page-level one can only say the page went badly. The VLMs
+#: report the mean of ``exp(logprob)`` over one generation's tokens (the same
+#: computation surya's own client does), and surya calls per block where chandra
+#: and olmOCR generate the whole page at once. ``measured`` false would mean the
+#: number is invented; nothing here does that, but the per-page
+#: ``confidence_measured`` flag still reports when a server declined logprobs and
+#: left the figure at 0.0.
+_CONFIDENCE = {
+    "paddle":  {"measured": True, "scope": "line", "source": "recogniser score"},
+    "doctr":   {"measured": True, "scope": "line", "source": "recogniser score"},
+    "surya":   {"measured": True, "scope": "block", "source": "mean token probability"},
+    "chandra": {"measured": True, "scope": "page", "source": "mean token probability"},
+    "olmocr":  {"measured": True, "scope": "page", "source": "mean token probability"},
+}
+
+
 #: Engines whose LOADED instance is built for ONE language, so serving another
 #: needs a separate pool.
 #:
@@ -553,6 +571,8 @@ class OcrManager:
             getattr(cfg, "chandra_serve", "model"), getattr(cfg, "chandra_model", ""),
             getattr(cfg, "chandra_model_id", ""), getattr(cfg, "chandra_server_url", ""),
             getattr(cfg, "chandra_layout", True),
+            getattr(cfg, "chandra_logprobs", True),
+            getattr(cfg, "olmocr_logprobs", True),
             getattr(cfg, "vlm_gpu_memory_utilization", 0.0),
         )
 
@@ -607,6 +627,12 @@ class OcrManager:
                 # client stop guessing which of the two it got.
                 "language_aware": engine_uses_language(name),
                 "lang": resolve_lang(cfg, name, None),
+                # Whether `conf` on this engine is a measurement or a placeholder,
+                # and over what. The detector engines score each line; the VLMs
+                # average exp(logprob) over the tokens of one generation, which for
+                # chandra and olmOCR covers a whole page and for surya a block. A
+                # client that gates on confidence has to know which it is getting.
+                "confidence": _CONFIDENCE[name],
             }
             if not enabled:
                 if name == "surya" and cfg.surya_enabled and not cfg.surya_accept_license:

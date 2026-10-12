@@ -36,7 +36,8 @@ import json
 import threading
 from typing import Optional
 
-from codai.ocr.base import OcrEngine, OcrPage, OcrError, vlm_serve_limits
+from codai.ocr.base import (OcrEngine, OcrPage, OcrError, logprobs_of,
+                            mean_token_prob, vlm_serve_limits)
 
 
 #: olmocr.prompts.build_no_anchoring_v4_yaml_prompt() — kept verbatim: the model was
@@ -294,7 +295,7 @@ class OlmOcrEngine(OcrEngine):
         w, h = image.size
         page = OcrPage(index=0, width=int(w), height=int(h))
 
-        content = self._ask(image)
+        content, conf = self._ask(image)
         meta, body = parse_front_matter(content)
 
         rotation = meta.get("rotation_correction") or 0
@@ -308,21 +309,33 @@ class OlmOcrEngine(OcrEngine):
                 # PIL rotates counter-clockwise; olmOCR reports the correction to APPLY,
                 # so expand=True and the same sign the toolkit uses.
                 retry_img = image.rotate(-turned, expand=True)
-                retry = self._ask(retry_img)
+                retry, retry_conf = self._ask(retry_img)
                 rmeta, rbody = parse_front_matter(retry)
                 if rbody.strip():
                     meta, body = rmeta, rbody
                     meta["rotation_applied"] = turned
+                    # The retry is the answer that is kept, so its confidence is
+                    # the one that describes it.
+                    conf = retry_conf
                     rw, rh = retry_img.size
                     page.width, page.height = int(rw), int(rh)
 
         page.text = body
         page.meta = {k: v for k, v in meta.items() if v is not None}
-        # No detector, so no lines/regions/tables boxes — the text IS the result.
+        # PAGE-level, because olmOCR has no detector and returns no lines: there is
+        # nowhere per-line to put a number and nothing per-line to measure. The
+        # figure is the mean token probability of the one generation that produced
+        # the whole page (base.mean_token_prob), the same computation surya uses, so
+        # it is comparable with surya's rather than a second notion of
+        # "confidence". ``confidence_measured`` distinguishes a real 0.0 from a
+        # server that reported no logprobs.
+        page.meta["confidence"] = round(float(conf), 4) if conf is not None else 0.0
+        page.meta["confidence_measured"] = conf is not None
+        page.meta["confidence_scope"] = "page"
         return page
 
-    def _ask(self, image) -> str:
-        """One page → the model's raw reply text."""
+    def _ask(self, image):
+        """One page → ``(raw reply text, mean token probability or None)``."""
         data_uri = prepare_image(
             image, int(getattr(self.cfg, "olmocr_longest_side", DEFAULT_LONGEST_SIDE) or
                        DEFAULT_LONGEST_SIDE))
@@ -340,7 +353,7 @@ class OlmOcrEngine(OcrEngine):
             return self._ask_model(messages, max_tokens, temperature)
         return self._ask_http(messages, max_tokens, temperature)
 
-    def _ask_model(self, messages, max_tokens, temperature) -> str:
+    def _ask_model(self, messages, max_tokens, temperature):
         """Model mode: ask the dispatcher which server should take this page.
 
         The in-process path below is the right one for a model this machine
@@ -367,7 +380,7 @@ class OlmOcrEngine(OcrEngine):
         finally:
             lease.release()
 
-    def _ask_local(self, messages, max_tokens, temperature) -> str:
+    def _ask_local(self, messages, max_tokens, temperature):
         """Through coderai's own in-process chat handler (model mode)."""
         import asyncio
 
@@ -390,10 +403,12 @@ class OlmOcrEngine(OcrEngine):
         content = _content_of(result)
         if not content.strip():
             raise OcrError(f"olmOCR model '{model_id}' returned no text", status=500)
-        return content
+        # coderai's in-process chat handler surfaces no per-token logprobs, so this
+        # path reports "not measured" rather than a 0.0 posing as one.
+        return content, None
 
     def _ask_http(self, messages, max_tokens, temperature, base: str = "",
-                  api_key: str = "", model_name: str = "") -> str:
+                  api_key: str = "", model_name: str = ""):
         """Against an OpenAI-compatible server (vllm/server modes).
 
         ``base``/``api_key``/``model_name`` override the configured server for one
@@ -419,6 +434,8 @@ class OlmOcrEngine(OcrEngine):
             "temperature": temperature,
             "stream": False,
         }
+        if bool(getattr(self.cfg, "olmocr_logprobs", True)):
+            payload["logprobs"] = True
         headers = {"Content-Type": "application/json"}
         key = api_key or (getattr(self.cfg, "olmocr_api_key", "") or "").strip()
         if key:
@@ -433,12 +450,13 @@ class OlmOcrEngine(OcrEngine):
             raise OcrError(f"olmOCR server {url} returned HTTP {r.status_code}: "
                            f"{r.text[:300]}", status=502)
         try:
-            content = _content_of(r.json())
+            body = r.json()
+            content = _content_of(body)
         except Exception as e:
             raise OcrError(f"olmOCR server returned unparseable JSON: {e}", status=502)
         if not content.strip():
             raise OcrError("olmOCR server returned no text", status=502)
-        return content
+        return content, mean_token_prob(logprobs_of(body))
 
 
 def _content_of(result) -> str:
