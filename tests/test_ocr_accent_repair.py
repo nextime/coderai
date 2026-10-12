@@ -404,3 +404,19 @@ def test_it_can_be_set_per_model():
     changing what every other vLLM model reports."""
     from codai.backends.overrides import VLLM_FIELDS
     assert "return_token_ids" in VLLM_FIELDS
+
+
+def test_a_pod_can_be_told_to_return_token_ids():
+    """The pod's vLLM backend is configured by what this install forwards, so the
+    field has to be in the forwarded set or a pod could never ask for ids."""
+    from codai.api.runpod_worker import _ENGINE_FORWARDED_FIELDS
+    assert "return_token_ids" in _ENGINE_FORWARDED_FIELDS["vllm"]
+
+
+def test_forwarding_it_cannot_affect_an_install_that_did_not_ask():
+    """engine_config_for_pod skips falsey values, so adding the field to the
+    forwarded set is inert until someone sets it True."""
+    import inspect
+    from codai.api import runpod_worker
+    src = inspect.getsource(runpod_worker.engine_config_for_pod)
+    assert "if v in (None, \"\", 0, False):" in src

@@ -919,7 +919,12 @@ _ENGINE_FORWARDED_FIELDS = {
            "model_id"),
     "kt": ("ctx", "extra_args", "extra_env", "model_id"),
     "vllm": ("ctx", "gpu_memory_utilization", "tensor_parallel_size", "max_num_seqs",
-             "dtype", "quantization", "extra_args", "extra_env"),
+             "dtype", "quantization", "extra_args", "extra_env",
+             # Only ever forwarded when TRUE: the loop below skips False, so
+             # adding it here cannot change an install that has not asked for it.
+             # A pod needs it to recover a byte-level vocabulary's characters from
+             # the token ids (see VllmConfig.return_token_ids).
+             "return_token_ids"),
 }
 #: The config attribute behind each engine name (ktransformers is the odd one).
 _ENGINE_CONFIG_ATTR = {"kt": "ktransformers"}
