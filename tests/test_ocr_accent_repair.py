@@ -480,3 +480,26 @@ def test_decoding_is_per_id_not_bulk():
     src = inspect.getsource(W._decode_ids)
     assert "for i in ids:" in src
     assert "tok.decode([i]" in src
+
+
+def test_the_repair_receipt_reaches_the_response():
+    """The first successful repair reported `accents_repaired: null` while having
+    visibly fixed the page: the worker emitted the key and _page_from_dict never
+    carried it across. A silent fix is nearly as bad as a silent corruption —
+    nobody can tell the text was rewritten."""
+    from codai.ocr.subprocess_engine import SubprocessOcrEngine
+    page = SubprocessOcrEngine._page_from_dict({
+        "index": 0, "text": "società", "width": 10, "height": 10,
+        "lines": [], "regions": [], "tables": [],
+        "accents_repaired": {"blocks": 1, "recovered": 29, "how": "…"},
+    })
+    assert page.meta["accents_repaired"]["recovered"] == 29
+
+
+def test_a_page_with_nothing_repaired_carries_no_receipt():
+    from codai.ocr.subprocess_engine import SubprocessOcrEngine
+    page = SubprocessOcrEngine._page_from_dict({
+        "index": 0, "text": "ok", "width": 1, "height": 1,
+        "lines": [], "regions": [], "tables": [],
+    })
+    assert "accents_repaired" not in page.meta

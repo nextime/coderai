@@ -210,4 +210,12 @@ class SubprocessOcrEngine(OcrEngine):
         trace = d.get("unreadable_trace")
         if trace:
             page.meta["unreadable_trace"] = trace
+        # What the worker had to rebuild. Carried for the same reason the trace is:
+        # the text is no longer byte-for-byte what the server sent, and a caller
+        # comparing the two needs to know why. Missing this is why the first
+        # successful repair reported `accents_repaired: null` while visibly having
+        # fixed the page -- the fix worked and only its receipt was dropped.
+        repaired = d.get("accents_repaired")
+        if repaired:
+            page.meta["accents_repaired"] = repaired
         return page
