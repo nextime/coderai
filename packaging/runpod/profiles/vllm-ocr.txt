@@ -1,0 +1,37 @@
+# vLLM pinned to the version Surya validates against, for Surya-2 OCR.
+#
+# Same shape as the `vllm` profile — vLLM in its own venv on the LIGHT core,
+# driven by coderai's vLLM proxy backend — but pinned to **v0.20.1** instead of
+# 0.27.1, because that is the version `surya-ocr` itself spawns and tests:
+#
+#     surya/settings.py:96   VLLM_DOCKER_IMAGE = "vllm/vllm-openai:v0.20.1"
+#     surya/inference/backends/vllm.py:1  "...docker image with MTP=2"
+#
+# WHY A SEPARATE IMAGE EXISTS AT ALL. Measured on the Digesta orchestrator,
+# 2026-10-12, serving `datalab-to/surya-ocr-2` on vLLM 0.27.1: a page of crisp
+# synthetic Italian came back with one U+FFFD per accented letter — 29 of them,
+# zero accents surviving — while
+#
+#   * the model's OWN byte stream decoded cleanly as UTF-8 (ocr.surya_token_trace
+#     reported conclusive: true, no findings, blame: "the serving path"),
+#   * the model reported ~96% confidence on every line,
+#   * chandra-ocr-2 read the identical pixels with all 12 accents intact,
+#   * and it was a single model call, so batching was not involved.
+#
+# The characters are therefore lost between vLLM's own per-token bytes and the
+# `message.content` surya reads. Note what that does and does not implicate:
+# surya-ocr-2 and chandra-ocr-2 are the SAME architecture
+# (`Qwen3_5ForConditionalGeneration`) on the same vLLM, so this is not vLLM
+# mishandling qwen3_5 — it is vLLM mishandling SURYA'S CUSTOM 65,425-entry
+# BYTE-LEVEL vocabulary, in which one accented letter is two tokens and either
+# byte alone decodes to a replacement character.
+#
+# `ocr.surya_repair_accents` (on by default) already repairs this from the
+# logprob bytes, which is cheaper and needs no new image. This profile is the
+# other half of the answer: it serves the model on the stack its authors test,
+# so the repair can be checked against a reference rather than trusted, and so
+# the upstream bug report has a known-good comparison.
+#
+# NOT a drop-in replacement for `vllm`: 0.20.1 is seven minor releases behind,
+# and anything else that image serves would be pinned back with it. Rent this
+# one for the OCR model only.

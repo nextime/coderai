@@ -70,7 +70,8 @@ class SuryaEngine(SubprocessOcrEngine):
                 # Sent at LOAD, like everything else here: the hook it switches on
                 # patches surya's backend, which has to happen before the first page
                 # rather than per request.
-                "token_trace": bool(getattr(self.cfg, "surya_token_trace", False))}
+                "token_trace": bool(getattr(self.cfg, "surya_token_trace", False)),
+                "repair_accents": bool(getattr(self.cfg, "surya_repair_accents", True))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")

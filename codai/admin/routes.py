@@ -4140,6 +4140,7 @@ def build_settings_dict(c, gpu_cards):
             "surya_instances": c.ocr.surya_instances,
             "surya_langs": c.ocr.surya_langs,
             "surya_token_trace": c.ocr.surya_token_trace,
+            "surya_repair_accents": c.ocr.surya_repair_accents,
             "surya_venv": c.ocr.surya_venv,
             "surya_auto_build": c.ocr.surya_auto_build,
             "surya_serve": c.ocr.surya_serve,
@@ -4958,6 +4959,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_accept_license" in d: o.surya_accept_license = bool(d["surya_accept_license"])
         if "surya_instances" in d: o.surya_instances = _i("surya_instances", o.surya_instances, 1)
         if "surya_token_trace" in d: o.surya_token_trace = bool(d["surya_token_trace"])
+        if "surya_repair_accents" in d: o.surya_repair_accents = bool(d["surya_repair_accents"])
         if "surya_langs" in d: o.surya_langs = (d.get("surya_langs") or "it").strip()
         if "surya_venv" in d: o.surya_venv = (d.get("surya_venv") or "").strip()
         if "surya_auto_build" in d: o.surya_auto_build = bool(d["surya_auto_build"])

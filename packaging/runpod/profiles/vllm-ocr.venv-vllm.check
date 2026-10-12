@@ -1,0 +1,28 @@
+# Deep check for the pinned-0.20.1 vllm venv: the OpenAI server module must
+# import, and the version must be the one this image exists to pin — a silent
+# resolve to something newer would defeat the whole point of the image.
+import vllm.entrypoints.openai.api_server                 # noqa
+import torch, vllm
+print("vllm", vllm.__version__, "torch", torch.__version__, "cuda", torch.version.cuda)
+assert vllm.__version__.startswith("0.20."), (
+    "this image exists to pin vLLM 0.20.x (what surya-ocr validates against); "
+    "got %s" % vllm.__version__)
+
+# Surya-2 is Qwen3.5-VL, so the architecture has to be in this vLLM's registry or
+# the pod cannot serve the model at all. Checked through the registry's own
+# lookup where one is exposed and reported-not-enforced otherwise: the private
+# table has been renamed before, and failing a BUILD on the name of a private
+# symbol would be failing for the wrong reason.
+_ARCH = "Qwen3_5ForConditionalGeneration"
+try:
+    from vllm.model_executor.models import registry as _reg
+    _names = set()
+    for _attr in ("_MULTIMODAL_MODELS", "_TEXT_GENERATION_MODELS", "_VLLM_MODELS"):
+        _names |= set(getattr(_reg, _attr, {}) or {})
+    if _names:
+        assert _ARCH in _names, "this vLLM cannot serve datalab-to/surya-ocr-2"
+        print("registry:", _ARCH, "present")
+    else:
+        print("registry: could not enumerate architectures on this vLLM; skipped")
+except ImportError as exc:
+    print("registry: not inspectable (%s); skipped" % exc)

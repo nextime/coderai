@@ -324,6 +324,12 @@ PUBLISHED_CAPABILITY_IMAGES = (
     # core, driven by coderai's vLLM proxy backend.
     "llama",
     "vllm",
+    # The same vLLM pod pinned to 0.20.1 — the version `surya-ocr` spawns and
+    # validates against — because serving surya-ocr-2 on 0.27.1 loses every
+    # accented character while the model's own bytes decode cleanly. Rent it for
+    # the OCR model only; everything else on it is pinned back seven minor
+    # releases. See packaging/runpod/profiles/vllm-ocr.txt for the measurement.
+    "vllm-ocr",
 )
 
 #: Model backends served by an engine image, and which image. ds4, colibri
@@ -334,7 +340,15 @@ _ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm")
 _ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm"}
 #: runpod-block `engine` values that mean "a coderai pod running THIS server",
 #: as opposed to `vllm`/`llamacpp`, which mean the upstream images.
-_CODERAI_SERVER_ENGINES = {"coderai-vllm": "vllm", "coderai-llama": "llama"}
+#:
+#: `coderai-vllm-ocr` is the same server pinned to vLLM **0.20.1**, the version
+#: `surya-ocr` itself spawns and validates against (surya/settings.py:96). It
+#: exists because serving surya-ocr-2 on 0.27.1 loses every accented character
+#: while the model's own bytes decode cleanly — see
+#: packaging/runpod/profiles/vllm-ocr.txt for the measurement. Rent it for the
+#: OCR model only: everything else on that image would be pinned back with it.
+_CODERAI_SERVER_ENGINES = {"coderai-vllm": "vllm", "coderai-llama": "llama",
+                           "coderai-vllm-ocr": "vllm-ocr"}
 
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {
@@ -555,7 +569,9 @@ def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
     want = str(getattr(mcfg, "engine", "") or "").strip().lower() if mcfg else ""
     if want in _ENGINE_POD_BACKENDS:
         return want
-    if want == "coderai-vllm":
+    if want in ("coderai-vllm", "coderai-vllm-ocr"):
+        # Both are coderai's vLLM backend; they differ only in which vLLM the
+        # image carries, which is the image's business and not the engine's.
         return "vllm"
     b = str((entry or {}).get("backend") or "").strip().lower()
     return b if b in _ENGINE_POD_BACKENDS else ""

@@ -542,6 +542,7 @@ class OcrManager:
             # The token trace patches surya's backend at load, so toggling it has
             # to rebuild the pool rather than quietly taking effect never.
             getattr(cfg, "surya_token_trace", False),
+            getattr(cfg, "surya_repair_accents", True),
             getattr(cfg, "olmocr_enabled", False), getattr(cfg, "olmocr_instances", 1),
             getattr(cfg, "olmocr_serve", "model"), getattr(cfg, "olmocr_model", ""),
             getattr(cfg, "olmocr_model_id", ""), getattr(cfg, "olmocr_server_url", ""),

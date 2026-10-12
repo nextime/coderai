@@ -307,6 +307,71 @@ def _tok_entry(entry) -> dict:
     return out
 
 
+def _ascii_skeleton(text: str) -> str:
+    """``text`` with every non-ASCII character dropped.
+
+    The guard that makes the repair provably safe. If two strings have the same
+    ASCII skeleton they are the same text differing ONLY in their non-ASCII
+    characters -- which is exactly the difference between a reply whose accents
+    were destroyed and the same reply with them intact. Any other difference
+    (a truncation, a different block, a shifted offset) changes the skeleton and
+    the repair is refused.
+    """
+    return "".join(c for c in (text or "") if ord(c) < 128)
+
+
+def _reassemble(tokens) -> str:
+    """The model's own bytes, decoded strictly, or None if they are not clean.
+
+    ``None`` on anything doubtful: missing bytes, a stream that does not decode,
+    or a decode that still contains the marker. The repair must never make a
+    reply worse, so every uncertain case leaves the original alone.
+    """
+    if not tokens:
+        return None
+    buf = bytearray()
+    for t in tokens:
+        e = _tok_entry(t)
+        raw = e.get("bytes")
+        if not isinstance(raw, list):
+            return None                 # a server that reports no bytes: no repair
+        for b in raw:
+            buf.append(int(b) & 0xFF)
+    if not buf:
+        return None
+    try:
+        text = bytes(buf).decode("utf-8")        # strict: errors are a refusal
+    except UnicodeDecodeError:
+        return None
+    return None if UNREADABLE in text else text
+
+
+def repair_content(raw: str, tokens):
+    """``(repaired_text, characters_recovered)`` for a reply whose text lost
+    characters, or ``(None, 0)`` to leave it alone.
+
+    The measured fault this exists for: surya-ocr-2 emits perfectly good UTF-8 --
+    the byte trace confirms the stream decodes cleanly and the model reports ~96%
+    confidence -- and the text we read back from ``message.content`` has one
+    U+FFFD per accented letter. The correct bytes are right there in the same
+    response's logprobs, so the reply can simply be rebuilt from them.
+
+    Guarded three ways, because silently rewriting a model's output is a serious
+    thing to do: the reassembled stream must decode strictly, it must contain no
+    marker of its own, and its ASCII skeleton must match the original's exactly.
+    The last one is what makes this a repair rather than a substitution -- it can
+    only ever change non-ASCII characters.
+    """
+    if not raw or UNREADABLE not in raw:
+        return None, 0
+    fixed = _reassemble(tokens)
+    if fixed is None:
+        return None, 0
+    if _ascii_skeleton(fixed) != _ascii_skeleton(raw):
+        return None, 0
+    return fixed, raw.count(UNREADABLE)
+
+
 def _trace_report(calls) -> dict:
     """``_trace_findings`` plus the one fact that makes it safe to read.
 
@@ -445,6 +510,12 @@ class SuryaWorker:
         #: Per-call token logprobs, collected by the hook installed in load().
         self._calls = []
         self._trace = bool(opts.get("token_trace", False))
+        #: Rebuild a reply's text from the model's own bytes when the text we are
+        #: handed has lost characters. On by default: the alternative is shipping
+        #: text we have MEASURED to be corrupt (see repair_content).
+        self._repair = bool(opts.get("repair_accents", True))
+        #: [{"block": i, "recovered": n}] for this page.
+        self._repairs = []
 
     def load(self):
         """Load surya, matching the API of whichever release is installed.
@@ -491,7 +562,7 @@ class SuryaWorker:
         wrapper only reads, never alters, and swallows everything -- a diagnostic
         that can break OCR would be far worse than no diagnostic.
         """
-        if not self._trace:
+        if not (self._trace or self._repair):
             return
         try:
             from surya.inference.backends import openai_client as _oc
@@ -499,13 +570,18 @@ class SuryaWorker:
             print(f"[surya] token trace unavailable: {e}", file=sys.stderr)
             return
         if getattr(_oc, "_coderai_traced", False):
-            _oc._coderai_sink = self._calls          # re-point at this worker
+            # The module is patched once per process; re-point it at THIS worker.
+            _oc._coderai_sink = self._calls
+            _oc._coderai_repairs = self._repairs
+            _oc._coderai_repair = self._repair
             return
         inner = getattr(_oc, "_generate_one", None)
         if inner is None:
             print("[surya] token trace: no _generate_one to hook", file=sys.stderr)
             return
         _oc._coderai_sink = self._calls
+        _oc._coderai_repairs = self._repairs
+        _oc._coderai_repair = self._repair
 
         def _wrapped(*args, **kwargs):
             result = inner(*args, **kwargs)
@@ -513,7 +589,21 @@ class SuryaWorker:
                 sink = getattr(_oc, "_coderai_sink", None)
                 if sink is not None:
                     sink.append(getattr(result, "logprobs", None))
+                # Repaired HERE, before surya parses the reply, so the blocks, the
+                # HTML, the plain text and the confidences downstream are all built
+                # from correct characters. Repairing further down would mean fixing
+                # the same text in several places and missing one.
+                if getattr(_oc, "_coderai_repair", False):
+                    fixed, n = repair_content(getattr(result, "raw", ""),
+                                              getattr(result, "logprobs", None))
+                    if fixed is not None:
+                        result.raw = fixed
+                        reps = getattr(_oc, "_coderai_repairs", None)
+                        if reps is not None:
+                            reps.append({"recovered": n})
             except Exception:
+                # A repair that can break a page would be worse than the corruption
+                # it fixes; the untouched reply is always an acceptable answer.
                 pass
             return result
 
@@ -558,6 +648,7 @@ class SuryaWorker:
         # a long document would otherwise report the first page's anomalies on the
         # hundredth.
         del self._calls[:]
+        del self._repairs[:]
         if self._mode == "predictor":
             preds = self._predict(img)
         else:
@@ -604,6 +695,16 @@ class SuryaWorker:
                 "text": "\n".join(l["text"] for l in lines)}
         # Only when something actually went unread: a clean page stays byte-identical
         # to what it has always returned.
+        if self._repairs:
+            # Said out loud rather than silently: the text the caller gets is not
+            # byte-for-byte what the server sent, and anyone comparing the two
+            # needs to know why.
+            page["accents_repaired"] = {
+                "blocks": len(self._repairs),
+                "recovered": sum(int(r.get("recovered", 0)) for r in self._repairs),
+                "how": ("rebuilt from the model's own per-token bytes, which "
+                        "decoded cleanly where message.content did not"),
+            }
         if self._trace and UNREADABLE in page["text"]:
             try:
                 page["unreadable_trace"] = _trace_report(self._calls)

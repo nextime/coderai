@@ -1007,6 +1007,18 @@ class OcrConfig:
     # surya-ocr-2's vocabulary is byte-level and decoding either byte of an
     # accented letter alone yields exactly one replacement character.
     surya_token_trace: bool = False
+    # Rebuild a surya reply's text from the model's OWN per-token bytes when the
+    # text we are handed has lost characters. On by default, because the
+    # alternative is shipping text measured to be corrupt: on 2026-10-12 a page of
+    # crisp synthetic Italian came back from surya-ocr-2 with one U+FFFD per
+    # accented letter while the model's byte stream decoded cleanly and it
+    # reported ~96% confidence, and chandra read the identical pixels perfectly.
+    # The correct bytes arrive in the same response's logprobs, so the reply is
+    # simply rebuilt from them. Guarded three ways (strict decode, no marker in
+    # the result, and an identical ASCII skeleton) so it can only ever change
+    # non-ASCII characters, and it does nothing at all when the text is clean.
+    # Set false to see exactly what the server sent.
+    surya_repair_accents: bool = True
     surya_venv: str = ""               # isolated venv dir; blank = ~/.coderai/surya_venv
     surya_auto_build: bool = False     # create the venv + pip install requirements-surya.txt on first use
     # Surya serving mode: "local" = classic det+recognition on torch in the isolated venv
@@ -1723,6 +1735,7 @@ class ConfigManager:
                 "surya_instances": self.config.ocr.surya_instances,
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_token_trace": self.config.ocr.surya_token_trace,
+                "surya_repair_accents": self.config.ocr.surya_repair_accents,
                 "surya_venv": self.config.ocr.surya_venv,
                 "surya_auto_build": self.config.ocr.surya_auto_build,
                 "surya_use_gpu": self.config.ocr.surya_use_gpu,

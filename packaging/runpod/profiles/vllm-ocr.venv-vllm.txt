@@ -1,0 +1,30 @@
+# vLLM 0.20.1 — the version `surya-ocr` 0.22.1 spawns and validates against
+# (surya/settings.py:96). See vllm-ocr.txt for why this image exists.
+#
+# The CUDA trap is the same one the 0.27.1 profile documents: the PyPI wheel is
+# built against a CUDA the pod hosts do not have, so the +cu129 variant from
+# vLLM's own index is used, with torch's matching cu129 builds. CUDA 12.x
+# minor-version compatibility runs a 12.9 runtime on a 12.8 driver. Resolved
+# with uv (the .uv marker); pip cannot cope with the pin set.
+#
+# The torch triple is NOT a guess: it is what vLLM 0.20.1's own metadata pins
+# (torch==2.11.0, torchvision==0.26.0, torchaudio==2.11.0), and every one of
+# those exists as a +cu129 cp313 wheel on torch's index — checked before this
+# file was written, because a profile that cannot build is worse than none.
+--extra-index-url https://wheels.vllm.ai/0.20.1/cu129
+--extra-index-url https://download.pytorch.org/whl/cu129
+vllm==0.20.1+cu129
+torch==2.11.0+cu129
+torchvision==0.26.0+cu129
+torchaudio==2.11.0+cu129
+# NO torchcodec pin here, deliberately. 0.27.1 needs one (>=0.14) and pinning it
+# to a cu129 build is what stops `import vllm.entrypoints.openai.api_server`
+# dying on libnvrtc.so.13 — but 0.20.1's PyPI metadata does not list torchcodec
+# at all (checked), and pinning a package nothing requires is its own hazard. If
+# a build ever resolves one from PyPI and the server import fails on an nvrtc
+# soname, add `torchcodec==0.11.1+cu129` (it exists for cp313 and matches torch
+# 2.11).
+#
+# transformers: 0.20.1 excludes 5.0-5.4 and 5.5.0, so uv lands on 5.5.1+. That
+# is required anyway — surya-ocr-2 is `qwen3_5`, which only transformers 5.x
+# knows.

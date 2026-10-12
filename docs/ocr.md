@@ -570,6 +570,63 @@ A third, independent discriminator needs no code at all: serve the **same weight
 llama.cpp** (`datalab-to/surya-ocr-2-gguf`, with `surya_serve: "llamacpp"`). A different
 detokenizer on identical weights — accents surviving there would convict vLLM outright.
 
+### The verdict, and the repair (`surya_repair_accents`)
+
+The trace was run. On a page of crisp synthetic Italian, served through the Aruba
+install on vLLM 0.27.1:
+
+```
+unreadable: count=29  blame='the serving path'
+page 0: calls=1  with_logprobs=1  conclusive=True  kinds=None
+   why: the byte stream decoded cleanly, so the characters were lost AFTER the
+        model: the fault is in the serving path, not the model
+```
+
+**surya-ocr-2's own byte stream was valid UTF-8**, with every line reported at
+`conf: 0.9605`. The model read the page correctly and something after it destroyed
+the accents. Note what that does *not* implicate: surya-ocr-2 and chandra-ocr-2 are
+the **same architecture** (`Qwen3_5ForConditionalGeneration`) on the same vLLM, and
+chandra's accents survive — so this is not vLLM mishandling `qwen3_5`, it is vLLM
+mishandling **surya's custom 65,425-entry byte-level vocabulary**, where one accented
+letter is two tokens and either byte alone decodes to a marker. It was also a single
+model call, so concurrency is not involved.
+
+Since the correct bytes arrive in the same response's logprobs,
+`ocr.surya_repair_accents` (**on by default**) rebuilds the reply from them. It is
+applied inside the backend wrapper *before* surya parses the HTML, so the blocks, the
+boxes, the plain text and the confidences downstream are all built from correct
+characters — repairing further down would mean fixing the same text in several places
+and missing one.
+
+Rewriting a model's output is a serious thing to do, so it is guarded three ways and
+refuses unless all three hold:
+
+1. the reassembled byte stream decodes **strictly** as UTF-8;
+2. the result contains **no marker of its own**;
+3. its **ASCII skeleton is identical** to the original's.
+
+The third is what makes this a repair rather than a substitution: it can only ever
+change non-ASCII characters. A truncation, a different block or a shifted offset all
+change the skeleton and the original is kept, markers and all. Nothing happens when
+the text is clean — not even a reassembly attempt — and a page that was repaired says
+so:
+
+```json
+{ "accents_repaired": { "blocks": 1, "recovered": 29,
+                        "how": "rebuilt from the model's own per-token bytes, …" } }
+```
+
+Set it false to see exactly what the server sent.
+
+**The other half: `coderai-vllm-ocr`.** A pod image pinned to **vLLM 0.20.1** — the
+version `surya-ocr` itself spawns (`surya/settings.py:96`) — so the model can be served
+on the stack its authors validate, the repair can be checked against a reference rather
+than trusted, and an upstream bug report has a known-good comparison. Select it per
+model with `runpod.engine: "coderai-vllm-ocr"`; build it with
+`./packaging/runpod/build_capability_image.sh vllm-ocr`. It is **not** a drop-in for
+`coderai-vllm`: 0.20.1 is seven minor releases behind, and anything else on that image
+is pinned back with it, so rent it for the OCR model only.
+
 ### Where `conf` comes from on a served engine
 
 A VLM pipeline has no detector score to report, so surya asks the model server for
