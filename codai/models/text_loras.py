@@ -144,14 +144,67 @@ def is_portable(source: str) -> bool:
         and src.count("/") == 1
 
 
+def bundle_dir(path: str) -> bytes:
+    """A PEFT adapter DIRECTORY as one deterministic tar, for the blob store.
+
+    vLLM loads a text LoRA from a directory — ``adapter_config.json`` plus the
+    weights — but the blob store holds single files, so a trained adapter could
+    not travel to a pod at all: it was reported and dropped, and the only way to
+    serve one was to publish it to HuggingFace. Tarring makes it one blob, which
+    is the thing the store can carry.
+
+    Deterministic on purpose: members sorted, uid/gid/mtime/mode fixed. The id is
+    the content hash, so the same adapter must hash the same on every call —
+    otherwise a pod would be re-sent 159 MB because a timestamp moved.
+    """
+    import io
+    import tarfile
+    if not path or not os.path.isdir(path):
+        return b""
+    names = []
+    for root, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            names.append((os.path.relpath(full, path), full))
+    names.sort()
+    buf = io.BytesIO()
+    # No gzip: safetensors do not compress, and gzip would stamp an mtime.
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for rel, full in names:
+            info = tar.gettarinfo(full, arcname=rel)
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mtime = 0
+            info.mode = 0o644
+            with open(full, "rb") as fh:
+                tar.addfile(info, fh)
+    return buf.getvalue()
+
+
+def is_bundle(data: bytes) -> bool:
+    """True when these bytes are a tar — i.e. an adapter directory, not a file.
+
+    Read from the tar header's own magic rather than from a filename, so the
+    receiving end does not have to be told which shape it was sent.
+    """
+    return len(data) > 262 and data[257:262] == b"ustar"
+
+
 def blob_id(path: str) -> str:
-    """The ``sha256:<hex>`` id an adapter file will have in any blob store.
+    """The ``sha256:<hex>`` id an adapter will have in any blob store.
 
     Computed here, so a pod can be TOLD the id when it is created and be SENT the
-    bytes afterwards — the two agree without the pod having to exist yet.
+    bytes afterwards — the two agree without the pod having to exist yet. A
+    directory hashes as its bundle, so the id matches what is actually sent.
     """
     import hashlib
-    if not path or not os.path.isfile(path):
+    if not path:
+        return ""
+    if os.path.isdir(path):
+        data = bundle_dir(path)
+        return f"sha256:{hashlib.sha256(data).hexdigest()}" if data else ""
+    if not os.path.isfile(path):
         return ""
     h = hashlib.sha256()
     with open(path, "rb") as fh:

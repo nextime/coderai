@@ -187,25 +187,99 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     return cmd
 
 
-def _lora_args(model_config: dict) -> list:
-    """`--enable-lora --lora-modules …` for the adapters a model config asks for."""
+def _base_of(entry: dict) -> str:
+    """What weights a model entry loads, for deciding which models share a base."""
+    block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+    return str(entry.get("path") or block.get("hf_repo") or entry.get("id") or "").strip().lower()
+
+
+def _sibling_lora_specs(model_config: dict) -> list:
+    """Adapters of this model AND of every other model loading the same base.
+
+    vLLM registers adapters at LAUNCH, and one vLLM serves one base model — so a
+    pod launched for the base alone could never serve an adapter of it, however
+    the request was routed. Observed as the whole point of a shared pool not
+    working: ``qwen38-awq`` creates the pool, its vLLM starts with no
+    ``--enable-lora``, and a later ``diogene-alpha`` request has nowhere to go.
+
+    Collecting siblings here makes one engine serve the base and each adapter
+    under its own served name, which is what lets different requests select a
+    different adapter with no restart.
+    """
+    from codai.models.text_loras import configured_specs
+
+    specs = list(configured_specs(model_config or {}))
+    base = _base_of(model_config or {})
+    if not base:
+        return specs
     try:
-        from codai.models.text_loras import configured_specs, describe
-        specs = configured_specs(model_config or {})
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+    except Exception:
+        return specs
+    mine = str((model_config or {}).get("id") or "")
+    for entry in (md.get("text_models") or []):
+        if not isinstance(entry, dict) or str(entry.get("id") or "") == mine:
+            continue
+        if _base_of(entry) != base:
+            continue
+        for spec in configured_specs(entry):
+            # A sibling's adapter is served under the sibling's OWN name: that is
+            # the name the request will ask for.
+            spec = dict(spec)
+            spec["name"] = str(entry.get("id") or spec.get("name"))
+            specs.append(spec)
+    seen, unique = set(), []
+    for spec in specs:
+        if spec.get("name") in seen:
+            continue
+        seen.add(spec.get("name"))
+        unique.append(spec)
+    return unique
+
+
+def _lora_args(model_config: dict) -> list:
+    """`--enable-lora --lora-modules …` for the adapters this engine must serve."""
+    try:
+        from codai.models.text_loras import describe, is_portable, local_path
+        specs = _sibling_lora_specs(model_config or {})
     except Exception:
         return []
     if not specs:
         return []
-    args = ["--enable-lora"]
-    mods = []
+    mods, usable = [], []
     for spec in specs:
-        mods.append(f"{spec['name']}={spec['source']}")
-    args += ["--lora-modules"] + mods
+        src = str(spec.get("source") or "")
+        if src.startswith(("sha256:", "name:")):
+            # An uploaded adapter is named by CONTENT id, which is not a path: it
+            # has to be looked up in the blob store first. Passing the id straight
+            # through produced `--lora-modules name=sha256:…`, which vLLM cannot
+            # open — and the launch failed minutes later, inside a pod.
+            resolved = local_path(src)
+            if not resolved:
+                print(f"[lora] {spec.get('name')!r}: adapter {src} is not in this "
+                      f"machine's blob store — serving without it", flush=True)
+                continue
+        else:
+            # A path or a repo id is passed as configured: vLLM resolves both,
+            # and second-guessing a path here would drop an adapter that a
+            # mount makes appear a moment later.
+            resolved = src
+        mods.append(f"{spec['name']}={resolved}")
+        usable.append(spec)
+    if not mods:
+        return []
+    args = ["--enable-lora", "--lora-modules"] + mods
     # vLLM rejects an adapter whose rank exceeds --max-lora-rank (default 16),
     # and the message points at the flag rather than the adapter, so raise the
     # ceiling to what vLLM supports rather than have a trained LoRA refused.
     args += ["--max-lora-rank", "64"]
-    print(f"[lora] vLLM will serve adapters: {describe(specs)}", flush=True)
+    # How many DISTINCT adapters may be active in one batch. The default is 1,
+    # so with several registered, requests naming different ones cannot batch
+    # together and serialise instead — the cost lands on latency, not on an
+    # error, which is why it goes unnoticed.
+    args += ["--max-loras", str(max(1, min(len(mods), 8)))]
+    print(f"[lora] vLLM will serve adapters: {describe(usable)}", flush=True)
     return args
 
 

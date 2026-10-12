@@ -935,22 +935,51 @@ def sync_loras(base: str, api_key: str, body: bytes) -> bytes:
 _UPLOADED: set = set()
 
 
+#: (base, path, size, mtime) -> blob id, for adapters this process has already
+#: put on that pod. A Target is rebuilt for EVERY request, so without this the
+#: adapter was re-read and re-hashed on each one — 159 MB of disk and a round
+#: trip per request — only to learn the pod already had it. Keyed on the pod's
+#: URL, so a new pod re-sends; keyed on size+mtime, so a RETRAINED adapter at the
+#: same path is sent again rather than served stale.
+_LORA_SENT: dict = {}
+
+
 def push_lora_file(base: str, api_key: str, path: str) -> str:
-    """Put one adapter file in a remote's blob store; return its ``sha256:`` id.
+    """Put one adapter in a remote's blob store; return its ``sha256:`` id.
+
+    Takes a single file, or a PEFT adapter DIRECTORY — vLLM loads a text LoRA
+    from a directory (``adapter_config.json`` plus weights), so a trained adapter
+    is bundled into one deterministic tar and unpacked on the far side. Without
+    that, the only adapters that could reach a pod were HuggingFace repo ids.
 
     Content-addressed, so a pod that already has it is told nothing and a repeat
-    costs one HEAD-shaped check. Returns '' when the transfer fails, which the
-    caller reports rather than silently serving a model without its adapter.
+    costs one existence check — or nothing at all, once this process knows. Returns
+    '' when the transfer fails, which the caller reports rather than silently
+    serving a model without its adapter.
     """
     import hashlib
-    import requests
 
-    if not path or not os.path.isfile(path):
+    from codai.models.text_loras import bundle_dir
+
+    if not path or not os.path.exists(path):
         return ""
+    is_dir = os.path.isdir(path)
+    try:
+        stamp = _lora_stamp(path)
+    except Exception:
+        stamp = None
+    cached = _LORA_SENT.get((base, path, stamp)) if stamp else None
+    if cached:
+        return cached
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        with open(path, "rb") as fh:
-            data = fh.read()
+        if is_dir:
+            data = bundle_dir(path)
+            if not data:
+                return ""
+        else:
+            with open(path, "rb") as fh:
+                data = fh.read()
         digest = hashlib.sha256(data).hexdigest()
         have = pod_http.get(f"{base}/v1/loras/blob/{digest}", headers=headers, timeout=30)
         if have.status_code != 200:
@@ -959,13 +988,35 @@ def push_lora_file(base: str, api_key: str, path: str) -> str:
                                         "Content-Type": "application/octet-stream"},
                                timeout=1800)
             up.raise_for_status()
-            print(f"[remote-gateway] sent adapter {os.path.basename(path)} "
+            print(f"[remote-gateway] sent adapter {os.path.basename(path.rstrip('/'))}"
+                  f"{' (bundled directory)' if is_dir else ''} "
                   f"({len(data) / 1e6:.0f} MB) to {base}", flush=True)
-        return f"sha256:{digest}"
+        blob = f"sha256:{digest}"
+        if stamp:
+            _LORA_SENT[(base, path, stamp)] = blob
+        return blob
     except Exception as exc:
         print(f"[remote-gateway] could not send adapter {path} to {base}: {exc}",
               flush=True)
         return ""
+
+
+def _lora_stamp(path: str):
+    """(size, mtime) for a file, or for every file in an adapter directory.
+
+    What makes the cache safe to trust: retrain the adapter in place and the
+    stamp moves, so it is sent again instead of the pod keeping the old weights.
+    """
+    if os.path.isfile(path):
+        st = os.stat(path)
+        return (st.st_size, int(st.st_mtime))
+    out = []
+    for root, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            st = os.stat(os.path.join(root, name))
+            out.append((name, st.st_size, int(st.st_mtime)))
+    return tuple(out)
 
 
 def ensure_text_loras(base: str, api_key: str, entry: dict) -> dict:
@@ -997,13 +1048,8 @@ def ensure_text_loras(base: str, api_key: str, entry: dict) -> dict:
         if not path:
             dropped.append(source)
             continue
-        if os.path.isdir(path):
-            # A PEFT adapter directory is several files; the blob store holds
-            # single files. Publishing it to HuggingFace is the way to move it.
-            dropped.append(source)
-            print(f"[remote-gateway] {source} is a directory — publish it to "
-                  "HuggingFace to use it on a pod", flush=True)
-            continue
+        # A PEFT adapter directory travels as one bundled blob; push_lora_file
+        # takes either shape.
         blob = push_lora_file(base, api_key, path)
         if blob:
             rewritten.append({**spec, "source": blob})

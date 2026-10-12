@@ -579,7 +579,7 @@ Each runtime applies them its own way, and what reaches a pod differs:
 |---|---|---|
 | transformers (HF) | PEFT `load_adapter`, several at once | via a coderai pod, adapters travel with the seed |
 | llama.cpp (GGUF) | one adapter, **GGUF-converted** | needs the file; use a HF repo id or a coderai pod |
-| vLLM | `--enable-lora --lora-modules` at launch | **HuggingFace repo ids only** |
+| vLLM | `--enable-lora --lora-modules` at launch | a repo id, or an adapter sent to a coderai pod |
 | diffusers (image/video) | `load_lora_weights` | uploaded to the remote automatically, content-addressed |
 
 The asymmetry is worth knowing: a **diffusion** LoRA is sent with the request
@@ -599,9 +599,41 @@ endpoint that can receive one. The sequence:
 3. the pod resolves `sha256:<hex>` back to a file and applies it with PEFT.
 
 A **published** adapter (a HuggingFace repo id) skips all of that and goes to a
-vLLM pod, which fetches it itself — cheaper and faster, so publish adapters you
-use often. A PEFT adapter **directory** cannot be sent (the blob store holds
-single files); publish that one.
+plain vLLM pod, which fetches it itself — cheaper and faster, so publish adapters
+you use often.
+
+A PEFT adapter **directory** travels too, which matters because that is the shape
+a trainer writes: `adapter_config.json` plus the weights. It is bundled into one
+deterministic tar (sorted names, fixed uid/gid/mtime, so the content id is
+stable), stored under its hash, and unpacked on the far side — vLLM needs the
+*directory*, since the config carries the rank and target modules, and a bare
+`.safetensors` is not loadable. For ten days this was the gap that kept a trained
+client adapter off its pod, with "publish it to HuggingFace" as the only advice.
+
+#### Selecting an adapter per request
+
+vLLM registers adapters **at launch**, and one vLLM serves one base model, so the
+engine for a base must be launched knowing every adapter of it. Each model in
+`models.json` that names the same base contributes its adapter under **its own
+model id**, which is the name a request asks for:
+
+```jsonc
+{"id": "qwen38-awq",     "runpod": {"hf_repo": "…/Qwen3.8-27B-AWQ-INT4", "pool": "qwen38"}}
+{"id": "diogene-alpha",  "loras": [{"path": "/root/.coderai/loras/diogene-alpha"}],
+                         "runpod": {"hf_repo": "…/Qwen3.8-27B-AWQ-INT4", "pool": "qwen38"}}
+```
+
+One pod, one copy of the weights: `model: "qwen38-awq"` answers from the base and
+`model: "diogene-alpha"` from the adapter, request by request, with no reload. Register
+two versions of an adapter as two ids and you can A/B them on the same GPU.
+
+`--max-loras` is set to the number registered (capped at 8). Left at its default
+of 1, requests naming *different* adapters cannot share a batch and serialise
+instead — which costs latency rather than raising an error, so it goes unnoticed.
+
+A shared `pool` requires a coderai pod image: `shared_pool_key` refuses a plain
+`vllm`/`llamacpp` engine, because such a pod is launched for one model and would
+answer for another one's name with the wrong weights.
 
 Build and push the text image before using it:
 

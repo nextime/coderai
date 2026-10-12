@@ -268,25 +268,84 @@ def _lora_blob_dir() -> str:
     return d
 
 
-def _lora_blob_path(h: str) -> str:
-    """Local path for a blob given its hex sha256 (accepts an optional
-    'sha256:' prefix). Returns the path whether or not the file exists yet."""
+def _lora_blob_hex(h: str) -> str:
+    """The bare lowercase hex of a blob id (accepts an optional 'sha256:')."""
     h = (h or "").strip()
     if h.lower().startswith("sha256:"):
         h = h[7:]
-    h = h.lower()
+    return h.lower()
+
+
+def _lora_blob_path(h: str) -> str:
+    """Local path for a blob given its hex sha256 (accepts an optional
+    'sha256:' prefix). Returns the path whether or not the file exists yet.
+
+    A blob is normally one file. A text LoRA for vLLM is a DIRECTORY, so it is
+    stored unpacked under the same hash; when that directory is present it is
+    what the caller wants, because that is the path vLLM can load.
+    """
+    h = _lora_blob_hex(h)
+    unpacked = os.path.join(_lora_blob_dir(), h)
+    if os.path.isdir(unpacked):
+        return unpacked
     return os.path.join(_lora_blob_dir(), f"{h}.safetensors")
 
 
 def lora_blob_exists(h: str) -> bool:
-    return os.path.isfile(_lora_blob_path(h))
+    p = _lora_blob_path(h)
+    return os.path.isfile(p) or os.path.isdir(p)
+
+
+def _unpack_lora_bundle(data: bytes, dest: str) -> None:
+    """Extract an adapter bundle into `dest`, refusing anything that escapes it.
+
+    The bytes arrive over the network, so a member named ``../../etc/something``
+    would write outside the blob store. Names are checked here AND the extraction
+    uses tar's data filter, because either alone has been bypassed before.
+    """
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        for info in tar.getmembers():
+            if not (info.isfile() or info.isdir()):
+                raise HTTPException(status_code=400,
+                                    detail=f"adapter bundle member {info.name!r} "
+                                           "is not a regular file")
+            target = os.path.realpath(os.path.join(dest, info.name))
+            if target != os.path.realpath(dest) and not target.startswith(
+                    os.path.realpath(dest) + os.sep):
+                raise HTTPException(status_code=400,
+                                    detail=f"adapter bundle member {info.name!r} "
+                                           "escapes the blob store")
+        os.makedirs(dest, exist_ok=True)
+        try:
+            tar.extractall(dest, filter="data")
+        except TypeError:          # filter= is newer than some runtimes
+            tar.extractall(dest)
 
 
 def save_lora_blob(data: bytes) -> tuple:
-    """Write `data` to the content-addressed store. Returns (hex_sha256, existed)."""
+    """Write `data` to the content-addressed store. Returns (hex_sha256, existed).
+
+    Tar bytes are a bundled adapter DIRECTORY (a PEFT adapter: config plus
+    weights) and are unpacked, because vLLM loads a text LoRA from a directory
+    and cannot do anything with the tar. Detected from the tar magic rather than
+    from a flag, so the sender does not have to declare the shape.
+    """
     import hashlib
+    from codai.models.text_loras import is_bundle
     h = hashlib.sha256(data).hexdigest()
-    p = _lora_blob_path(h)
+    if is_bundle(data):
+        dest = os.path.join(_lora_blob_dir(), h)
+        if os.path.isdir(dest):
+            return h, True
+        tmp = dest + ".tmp"
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        _unpack_lora_bundle(data, tmp)
+        os.replace(tmp, dest)
+        return h, False
+    p = os.path.join(_lora_blob_dir(), f"{h}.safetensors")
     if os.path.isfile(p):
         return h, True
     tmp = p + ".tmp"
@@ -2846,6 +2905,11 @@ async def lora_blob_info(hash: str, _auth=Depends(_require_api_auth)):
     if not lora_blob_exists(hash):
         raise HTTPException(status_code=404, detail="blob not found")
     p = _lora_blob_path(hash)
+    if os.path.isdir(p):
+        size = sum(os.path.getsize(os.path.join(r, f))
+                   for r, _d, fs in os.walk(p) for f in fs)
+        return {"id": f"sha256:{os.path.basename(p)}", "bytes": size,
+                "exists": True, "unpacked": True}
     return {"id": f"sha256:{os.path.basename(p)[:-len('.safetensors')]}",
             "bytes": os.path.getsize(p), "exists": True}
 
