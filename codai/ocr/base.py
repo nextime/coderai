@@ -147,7 +147,7 @@ class OcrPage:
             # The byte-level trace is reported ONCE, document-wide, by
             # unreadable_report(). Repeating it on every page would put the same
             # findings in the response twice.
-            meta = {k: v for k, v in self.meta.items() if k != "unreadable_tokens"}
+            meta = {k: v for k, v in self.meta.items() if k != "unreadable_trace"}
             if meta:
                 out["meta"] = meta
         n = count_unreadable(self.text)
@@ -376,12 +376,21 @@ def unreadable_report(pages: "List[OcrPage]") -> dict:
     # one, because surya-ocr-2's vocabulary is byte-level and either byte of an
     # accented letter decodes alone to exactly one marker. The tokens tell them
     # apart; the text never can.
-    tokens = []
+    traces = []
     for page in pages or []:
-        for finding in (getattr(page, "meta", {}) or {}).get("unreadable_tokens", []):
-            entry = dict(finding)
+        trace = (getattr(page, "meta", {}) or {}).get("unreadable_trace")
+        if trace:
+            entry = dict(trace)
             entry["page"] = page.index
-            tokens.append(entry)
-    if tokens:
-        report["tokens"] = tokens
+            traces.append(entry)
+    if traces:
+        report["trace"] = traces
+        # One line a human can act on without reading the findings: the whole
+        # point is to stop guessing whose fault this is.
+        if all(t.get("conclusive") for t in traces):
+            blamed = ("the model" if any(t.get("findings") for t in traces)
+                      else "the serving path")
+            report["blame"] = blamed
+        else:
+            report["blame"] = "unknown"
     return report

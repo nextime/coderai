@@ -207,7 +207,7 @@ class SubprocessOcrEngine(OcrEngine):
         # The worker's byte-level diagnosis of an unreadable page, when it made one.
         # Carried on meta rather than a field of its own so engines that cannot
         # produce it change nothing about the response shape.
-        trace = d.get("unreadable_tokens")
+        trace = d.get("unreadable_trace")
         if trace:
-            page.meta["unreadable_tokens"] = trace
+            page.meta["unreadable_trace"] = trace
         return page

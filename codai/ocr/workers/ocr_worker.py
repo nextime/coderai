@@ -307,6 +307,57 @@ def _tok_entry(entry) -> dict:
     return out
 
 
+def _trace_report(calls) -> dict:
+    """``_trace_findings`` plus the one fact that makes it safe to read.
+
+    An empty finding list has two completely different meanings:
+
+      * logprobs ARRIVED and the byte stream was sound -> the loss happened after
+        the model, so the serving stack is at fault. A real verdict.
+      * logprobs never arrived -> there was nothing to analyse, and the emptiness
+        says nothing at all.
+
+    Reporting a bare list would make those indistinguishable, and the second one
+    would read as the first: a confident conclusion drawn from missing data. So
+    the envelope always says how many calls were seen and how many carried
+    logprobs, and ``conclusive`` is false whenever they did not.
+
+    (surya asks for them by default -- ``SURYA_INFERENCE_LOGPROBS = True`` -- and
+    coderai's OCR gateway forwards the body verbatim precisely so they survive.
+    But an upstream that declines them is a configuration, not a bug, and has to
+    be visible rather than silently inverted into a verdict.)
+    """
+    calls = list(calls or [])
+    with_lp = sum(1 for c in calls if c)
+    report = {
+        "calls": len(calls),
+        "with_logprobs": with_lp,
+        "findings": _trace_findings(calls) if with_lp else [],
+    }
+    if not calls:
+        report["conclusive"] = False
+        report["why"] = ("no model calls were recorded -- the trace hook did not "
+                         "fire, so this says nothing about the cause")
+    elif not with_lp:
+        report["conclusive"] = False
+        report["why"] = ("the model server returned no logprobs, so the bytes "
+                         "could not be read -- this says nothing about the cause")
+    else:
+        report["conclusive"] = True
+        if not report["findings"]:
+            report["why"] = ("the byte stream decoded cleanly, so the characters "
+                             "were lost AFTER the model: the fault is in the "
+                             "serving path, not the model")
+        else:
+            kinds = {}
+            for f in report["findings"]:
+                kinds[f.get("kind")] = kinds.get(f.get("kind"), 0) + 1
+            report["kinds"] = kinds
+            report["why"] = ("the model's own byte stream is broken at the places "
+                             "listed: the model is at fault, not the serving path")
+    return report
+
+
 def _trace_findings(calls) -> list:
     """Where in the model's own token stream the text stopped being readable.
 
@@ -555,11 +606,15 @@ class SuryaWorker:
         # to what it has always returned.
         if self._trace and UNREADABLE in page["text"]:
             try:
-                findings = _trace_findings(self._calls)
+                page["unreadable_trace"] = _trace_report(self._calls)
             except Exception as e:
-                findings = [{"error": f"trace analysis failed: {e}"}]
-            if findings:
-                page["unreadable_tokens"] = findings
+                # Always a report, never an absence: "the analysis broke" and "the
+                # bytes were fine" must not look the same.
+                page["unreadable_trace"] = {
+                    "conclusive": False,
+                    "why": f"trace analysis failed: {e}",
+                    "findings": [],
+                }
         return page
 
 

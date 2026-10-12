@@ -204,7 +204,7 @@ def test_a_clean_page_reports_nothing(monkeypatch):
     from PIL import Image
     page = w.ocr(Image.new("RGB", (10, 10)))
     # ...but the text has no marker, so there is nothing to diagnose.
-    assert "unreadable_tokens" not in page
+    assert "unreadable_trace" not in page
 
 
 def test_an_unreadable_page_carries_the_diagnosis(monkeypatch):
@@ -220,7 +220,9 @@ def test_an_unreadable_page_carries_the_diagnosis(monkeypatch):
                              "confidence": 0.4, "reading_order": 0}]}]
     monkeypatch.setattr(w, "_predict", _predict)
     page = w.ocr(Image.new("RGB", (10, 10)))
-    assert page["unreadable_tokens"][0]["token"]["bytes"] == [195]
+    tr = page["unreadable_trace"]
+    assert tr["conclusive"] is True
+    assert tr["findings"][0]["token"]["bytes"] == [195]
 
 
 def test_the_trace_is_cleared_between_pages(monkeypatch):
@@ -244,7 +246,7 @@ def test_analysis_failure_is_reported_not_raised(monkeypatch):
 
     def _boom(calls):
         raise RuntimeError("bad trace")
-    monkeypatch.setattr(W, "_trace_findings", _boom)
+    monkeypatch.setattr(W, "_trace_report", _boom)
 
     def _predict(img):
         return [{"blocks": [{"html": "<p>pi�</p>",
@@ -252,26 +254,89 @@ def test_analysis_failure_is_reported_not_raised(monkeypatch):
                              "confidence": 0.4, "reading_order": 0}]}]
     monkeypatch.setattr(w, "_predict", _predict)
     page = w.ocr(Image.new("RGB", (10, 10)))
-    assert "bad trace" in page["unreadable_tokens"][0]["error"]
+    tr = page["unreadable_trace"]
+    assert tr["conclusive"] is False
+    assert "bad trace" in tr["why"]
+
+
+# --------------------------------------------- an empty trace must not lie #
+def test_missing_logprobs_are_not_reported_as_a_clean_byte_stream():
+    """The flaw this envelope exists to close. With no logprobs there is nothing
+    to analyse, and a bare empty finding list would read as "the bytes were sound,
+    so the serving path is at fault" — a confident verdict from missing data."""
+    rep = W._trace_report([None, None])
+    assert rep["findings"] == []
+    assert rep["conclusive"] is False
+    assert "no logprobs" in rep["why"]
+    assert rep["with_logprobs"] == 0
+
+
+def test_a_hook_that_never_fired_is_also_inconclusive():
+    rep = W._trace_report([])
+    assert rep["conclusive"] is False
+    assert "did not" in rep["why"]
+
+
+def test_a_sound_stream_with_logprobs_present_blames_the_serving_path():
+    """The real verdict, and the one that would mean we can fix this ourselves."""
+    rep = W._trace_report([[_tok("p", [112]), _tok("\u00c3", [195]),
+                            _tok("\u0142", [160])]])
+    assert rep["conclusive"] is True
+    assert rep["findings"] == []
+    assert "serving path" in rep["why"]
+
+
+def test_a_broken_stream_blames_the_model():
+    rep = W._trace_report([[_tok("p", [112]), _tok("\u00c3", [195])]])
+    assert rep["conclusive"] is True
+    assert rep["kinds"] == {"invalid-utf8": 1}
+    assert "the model is at fault" in rep["why"]
+
+
+def test_the_envelope_always_counts_the_calls():
+    rep = W._trace_report([None, [_tok("a", [97])], []])
+    assert rep["calls"] == 3
+    assert rep["with_logprobs"] == 1
 
 
 # ------------------------------------------------------ and out through the API #
-def test_the_report_carries_the_tokens():
+def test_the_report_carries_the_trace():
     from codai.ocr.base import OcrPage, OcrLine, unreadable_report
-    page = OcrPage(index=0, text="pi�")
-    page.lines = [OcrLine(text="pi�", bbox=[0, 0, 1, 1], conf=0.4)]
-    page.meta["unreadable_tokens"] = [{"index": 2, "token": {"bytes": [195]},
-                                       "why": "x", "context": []}]
+    page = OcrPage(index=0, text="pi\ufffd")
+    page.lines = [OcrLine(text="pi\ufffd", bbox=[0, 0, 1, 1], conf=0.4)]
+    page.meta["unreadable_trace"] = {
+        "calls": 1, "with_logprobs": 1, "conclusive": True,
+        "findings": [{"index": 2, "kind": "invalid-utf8",
+                      "token": {"bytes": [195]}, "why": "x", "context": []}],
+    }
     rep = unreadable_report([page])
     assert rep["count"] == 1
-    assert rep["tokens"][0]["token"]["bytes"] == [195]
-    assert rep["tokens"][0]["page"] == 0
+    assert rep["trace"][0]["findings"][0]["token"]["bytes"] == [195]
+    assert rep["trace"][0]["page"] == 0
+    assert rep["blame"] == "the model"
+
+
+def test_the_blame_line_says_the_serving_path_when_the_bytes_were_sound():
+    from codai.ocr.base import OcrPage, unreadable_report
+    page = OcrPage(index=0, text="pi\ufffd")
+    page.meta["unreadable_trace"] = {"calls": 1, "with_logprobs": 1,
+                                     "conclusive": True, "findings": []}
+    assert unreadable_report([page])["blame"] == "the serving path"
+
+
+def test_the_blame_line_says_unknown_when_the_trace_could_not_be_read():
+    """Rather than defaulting to either culprit."""
+    from codai.ocr.base import OcrPage, unreadable_report
+    page = OcrPage(index=0, text="pi\ufffd")
+    page.meta["unreadable_trace"] = {"calls": 2, "with_logprobs": 0,
+                                     "conclusive": False, "findings": []}
+    assert unreadable_report([page])["blame"] == "unknown"
 
 
 def test_a_clean_document_has_no_report_at_all():
     from codai.ocr.base import OcrPage, unreadable_report
     page = OcrPage(index=0, text="tutto bene")
-    page.meta["unreadable_tokens"] = [{"anything": 1}]
+    page.meta["unreadable_trace"] = {"conclusive": True, "findings": []}
     assert unreadable_report([page]) == {}
 
 
@@ -279,18 +344,18 @@ def test_the_trace_is_not_repeated_on_every_page():
     """It is reported once, document-wide. Repeating it per page would put the
     same findings in the response twice."""
     from codai.ocr.base import OcrPage
-    page = OcrPage(index=0, text="pi�")
-    page.meta["unreadable_tokens"] = [{"index": 2}]
+    page = OcrPage(index=0, text="pi\ufffd")
+    page.meta["unreadable_trace"] = {"findings": [{"index": 2}]}
     page.meta["primary_language"] = "it"
     d = page.to_dict()
-    assert "unreadable_tokens" not in d.get("meta", {})
+    assert "unreadable_trace" not in d.get("meta", {})
     assert d["meta"]["primary_language"] == "it"      # other metadata survives
 
 
 def test_a_page_whose_only_meta_was_the_trace_reports_no_meta():
     from codai.ocr.base import OcrPage
     page = OcrPage(index=0, text="x")
-    page.meta["unreadable_tokens"] = [{"index": 1}]
+    page.meta["unreadable_trace"] = {"findings": [{"index": 1}]}
     assert "meta" not in page.to_dict()
 
 

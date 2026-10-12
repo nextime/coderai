@@ -519,29 +519,44 @@ wrapper only reads, and swallows every error — a diagnostic that could break a
 be far worse than no diagnostic.
 
 With it on, a document that lost characters carries its own diagnosis under
-`unreadable.tokens`:
+`unreadable`, with a one-word `blame` for the impatient:
 
 ```json
 { "unreadable": {
     "count": 29,
-    "tokens": [
-      { "page": 0, "call": 3, "index": 41, "kind": "invalid-utf8",
-        "token":   {"token": "Ã", "bytes": [195], "logprob": -0.0021},
-        "why":     "byte 0xC3 does not form valid UTF-8 here",
-        "context": [ {"token": "p", "bytes": [112]}, {"token": "i", "bytes": [105]},
-                     {"token": "Ã", "bytes": [195]}, {"token": " ", "bytes": [32]} ] }
-    ] } }
+    "blame": "the model",
+    "trace": [
+      { "page": 0, "calls": 7, "with_logprobs": 7, "conclusive": true,
+        "kinds": {"invalid-utf8": 29},
+        "why": "the model's own byte stream is broken at the places listed: ...",
+        "findings": [
+          { "call": 3, "index": 41, "kind": "invalid-utf8",
+            "token":   {"token": "Ã", "bytes": [195], "logprob": -0.0021},
+            "why":     "byte 0xC3 does not form valid UTF-8 here",
+            "context": [ {"token": "p", "bytes": [112]}, {"token": "i", "bytes": [105]},
+                         {"token": "Ã", "bytes": [195]}, {"token": " ", "bytes": [32]} ] }
+        ] } ] } }
 ```
 
 How to read it:
 
-| what you see | verdict |
-|---|---|
-| `kind: "invalid-utf8"`, a lone `[195]` with nothing to complete it | the **model** emitted a broken sequence — report it to Datalab |
-| `kind: "model-emitted"`, the token *is* the replacement character | the model chose the marker, or something upstream substituted it before we saw a byte |
-| **no `tokens` at all** on a page full of markers | the bytes were sound and the loss happened after them — **ours**, in the serving stack |
+| `conclusive` | findings | verdict (`blame`) |
+|---|---|---|
+| `true` | `kind: "invalid-utf8"` — a lone `[195]` with nothing to complete it | **the model** emitted a broken sequence — report it to Datalab |
+| `true` | `kind: "model-emitted"` — the token *is* the replacement character | **the model** chose the marker, or something upstream substituted it before we saw a byte |
+| `true` | **none**, on a page full of markers | **the serving path** — the bytes were sound and the loss happened after them, so it is ours |
+| `false` | — | **unknown**. `with_logprobs: 0` means the upstream returned none, so there was nothing to read |
 
-That last row is why an empty trace is a result and not a failure. The scan reassembles
+**That last row is the point of the envelope.** An empty finding list has two
+incompatible meanings — "the bytes were sound" and "there were no bytes to look at" —
+and reporting a bare list would make the second read as the first: a confident verdict
+drawn from missing data. So the trace always says how many calls it saw, how many
+carried logprobs, and whether it is `conclusive`. surya asks for logprobs by default
+(`SURYA_INFERENCE_LOGPROBS = True`) and coderai's gateway forwards the body verbatim
+precisely so they survive, but an upstream that declines them is a configuration rather
+than a bug, and has to be visible instead of silently inverted into a conclusion.
+
+The scan reassembles
 the whole byte stream and walks it as UTF-8 rather than judging tokens one at a time: per
 token is meaningless here, since one character legitimately arrives as two or three
 tokens and each is "invalid" alone. The first version of this did judge them pairwise and
