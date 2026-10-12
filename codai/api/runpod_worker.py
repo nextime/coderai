@@ -1386,7 +1386,11 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
                                       "name": spec.get("name")})
                     continue
                 local = local_path(src)
-                bid = blob_id(local) if local and os.path.isfile(local) else ""
+                # exists(), not isfile(): a PEFT adapter is a DIRECTORY, and
+                # isfile() dropped it from the seed without a word. The pod then
+                # launched with no --enable-lora and answered under the adapter's
+                # name with BASE weights — untuned, and nothing failed.
+                bid = blob_id(local) if local and os.path.exists(local) else ""
                 if bid:
                     rewritten.append({"path": bid, "weight": spec.get("weight", 1.0),
                                       "name": spec.get("name")})
@@ -3340,6 +3344,54 @@ def shared_pool_key(mcfg: "RunpodModelConfig", model_key: str,
     return f"pool:{shared}"
 
 
+def shared_pool_seed_entries(pool_name: str, exclude_id: str = "") -> list:
+    """The OTHER models that joined this named pool, ready to seed.
+
+    A pod is seeded with the entry of whichever model happened to create the
+    pool, and ``seed_entries`` is filled only for CAPABILITY pools — so the
+    second model sharing a pool arrived at a pod that had never heard of it. The
+    point of sharing is one pod serving several names (a base and its adapters,
+    on one copy of the weights), which cannot work if only one name is known.
+
+    Each entry's ``path`` is set to what the POD can fetch, because a seed with
+    no path, or a local one, is dropped: these models are normally described by
+    ``runpod.hf_repo`` and carry no path at all.
+    """
+    want = (pool_name or "").strip().lower()
+    if not want:
+        return []
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+    except Exception:
+        return []
+    out = []
+    for lst in md.values():
+        if not isinstance(lst, list):
+            continue
+        for entry in lst:
+            if not isinstance(entry, dict) or entry.get("enabled") is False:
+                continue
+            block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+            if (block.get("pool") or "").strip().lower() != want:
+                continue
+            if str(entry.get("id") or "") == str(exclude_id or ""):
+                continue
+            try:
+                xcfg = parse_model_runpod(block)
+                kind, value = resolve_model_source(entry, xcfg)
+            except Exception:
+                continue
+            if kind not in ("hf", "url") or not value:
+                # Nothing the pod could fetch; registering it would turn a clear
+                # "not available" into a load failure on a path nobody can see.
+                continue
+            copy = dict(entry)
+            copy["path"] = value
+            out.append(copy)
+    return out
+
+
 def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
                  shared: bool = False, entry: dict = None) -> RunpodPodPool:
     """The pool for ``model_key``, created on first use.
@@ -3357,6 +3409,15 @@ def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
         elif not shared:
             # refresh config each load so edits take effect
             pool.account, pool.mcfg, pool.served = account_cfg, mcfg, served_name
+        if shared and not pool.seed_entries and str(model_key).startswith("pool:"):
+            # Every name this pod must answer for, not just the one that rented
+            # it: the adapters are registered when its engine STARTS, so a model
+            # that arrives afterwards would need the engine restarted.
+            pool.seed_entries = shared_pool_seed_entries(
+                str(model_key)[5:], (entry or {}).get("id") or "")
+            if pool.seed_entries:
+                names = ", ".join(str(e.get("id")) for e in pool.seed_entries)
+                print(f"[runpod] pool {model_key!r} is shared with: {names}", flush=True)
     _ensure_scaler()
     return pool
 

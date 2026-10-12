@@ -294,3 +294,58 @@ def test_a_huggingface_adapter_still_travels_as_a_repo_id(monkeypatch):
                         raising=False)
     mods = vllm_worker._lora_args(entry)
     assert "tuned=someone/an-adapter" in mods
+
+
+# ---------------------------------------------------------------- the seed
+
+def test_the_seed_names_a_directory_adapter_by_content_id(adapter, monkeypatch):
+    """`isfile()` is False for a directory, so the adapter was dropped from the
+    seed without a word: the pod launched with no --enable-lora and answered
+    under the adapter's name with BASE weights, untuned, nothing failing."""
+    from codai.api import runpod_worker as rw
+    entry = {"id": "diogene-alpha", "path": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+             "loras": [{"name": "diogene-alpha", "path": str(adapter), "weight": 1.0}]}
+    seeded = json.loads(rw.seed_model_env(entry, "diogene-alpha",
+                                          "cyankiwi/Qwen3.8-27B-AWQ-INT4"))[0]
+    assert seeded.get("loras"), "the adapter must travel with the seed"
+    assert seeded["loras"][0]["path"].startswith("sha256:")
+    assert seeded["loras"][0]["name"] == "diogene-alpha"
+
+
+def test_a_shared_pool_seeds_every_model_that_joined_it(monkeypatch):
+    """seed_entries was filled for CAPABILITY pools only, so the second model to
+    share a named pool reached a pod that had never heard of it — and sharing a
+    pool exists precisely so one pod answers for several names."""
+    from codai.api import runpod_worker as rw
+    base = {"id": "qwen38-awq", "enabled": True,
+            "runpod": {"pool": "digesta-qwen38", "engine": "coderai-vllm",
+                       "hf_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4"}}
+    tuned = {"id": "diogene-alpha", "enabled": True,
+             "loras": [{"name": "diogene-alpha", "path": "x/y"}],
+             "runpod": {"pool": "digesta-qwen38", "engine": "coderai-vllm",
+                        "hf_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4"}}
+    other = {"id": "unrelated", "enabled": True,
+             "runpod": {"pool": "something-else", "hf_repo": "a/b"}}
+
+    class _CM:
+        models_data = {"text_models": [base, tuned, other]}
+
+    monkeypatch.setattr("codai.admin.routes.config_manager", _CM, raising=False)
+    got = rw.shared_pool_seed_entries("digesta-qwen38", exclude_id="qwen38-awq")
+    ids = [e.get("id") for e in got]
+    assert ids == ["diogene-alpha"], ids
+    # The pod needs something it can FETCH: these entries carry no `path` of
+    # their own, and a seed without one is discarded.
+    assert got[0]["path"] == "cyankiwi/Qwen3.8-27B-AWQ-INT4"
+
+
+def test_a_disabled_model_is_not_seeded_onto_a_shared_pod(monkeypatch):
+    from codai.api import runpod_worker as rw
+    off = {"id": "diogene-alpha", "enabled": False,
+           "runpod": {"pool": "digesta-qwen38", "hf_repo": "a/b"}}
+
+    class _CM:
+        models_data = {"text_models": [off]}
+
+    monkeypatch.setattr("codai.admin.routes.config_manager", _CM, raising=False)
+    assert rw.shared_pool_seed_entries("digesta-qwen38") == []
