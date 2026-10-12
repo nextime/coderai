@@ -417,12 +417,28 @@ adapts to wherever the checkpoint is actually served and tells you to set
 | 8 | 3.79 | 2.0s | 1.31 | 6.1s |
 | **16** | **7.11** | **2.2s** | **1.88** | **8.4s** |
 | 24 | 5.89 | 4.1s | 2.09 | 10.6s |
-| 32 | 5.44 + 13 failed | 3.5s | 1.44 + 21 failed | 7.5s |
-| 48 | **all failed** | — | — | — |
+| 32 | 5.44 + 13 *rejected* | 3.5s | 1.44 + 21 *rejected* | 7.5s |
+| 48 | **all 48 rejected** | — | — | — |
 
-**Both peak at 16 and both fail outright by 32** — that is a cliff, not a graceful
-degradation, so `runpod.scale_up_inflight_per_pod` is set to 16 per model: the point
-where a second pod starts earning its cost, with margin before the edge.
+> **The failures in the last two rows were not the GPU.** They were HTTP 429 from
+> coderai's own rate limiter — `/v1/chat/completions` was capped at 60 requests per
+> 60 seconds per client IP, as a module constant with no config. These ladders ran
+> every level inside one window, so the rejections begin exactly where the
+> cumulative count crosses 60: surya 16+24=40 then 20 of 32 pass and 12 are
+> refused (13 measured); chandra and olmOCR 8+16+24=48 then 12 pass and 20 are
+> refused (21 measured, twice). Re-running one level alone returns 32/32 OK.
+>
+> So the reading once given here — "both peak at 16 and both fail outright by 32,
+> a cliff" — was wrong: the engines never fell over, and the true knee is **above**
+> what these numbers show. A pod now ships with the limiter off
+> (`CODERAI_SERVER_RATE_LIMIT_ENABLED=0`), since a pod has exactly one client — the
+> install that rented it — and its admission is governed by
+> `pod_max_parallel_requests` and `pod_queue_max_size` instead. **Any ladder like
+> this must either keep each level under the limit or pace itself across windows.**
+
+`runpod.scale_up_inflight_per_pod` is 16 for all three engines. That remains a
+defensible spill point — latency is already climbing at 16 on these cards — but it
+is a *chosen* setting, not the measured edge of the hardware.
 
 Three settings bound this and they are easy to confuse:
 

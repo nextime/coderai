@@ -177,6 +177,41 @@ _QUEUED_PREFIXES = ("/v1/",)
 RATE_LIMITING_ENABLED = True
 
 
+def _env_limits() -> Dict[str, Tuple[int, int]]:
+    """Per-prefix overrides from the environment, as ``prefix=count/window``.
+
+    This exists because the limit was a module constant: 60 requests per minute
+    on /v1/chat/completions, with no config and no way to move it. On a RENTED
+    POD that is the orchestrator's own ceiling — one client IP, so one bucket —
+    and it silently discarded most of a GPU that was being paid for by the hour.
+    It was also measured as if it were hardware: three OCR engines appeared to
+    "fall over" at 32 concurrent pages, and all three were simply out of window.
+
+        CODERAI_SERVER_RATE_LIMITS="/v1/chat/completions=600/60,/v1/audio/=300/60"
+        CODERAI_SERVER_RATE_LIMIT_ENABLED=0     # off entirely
+    """
+    raw = (os.environ.get("CODERAI_SERVER_RATE_LIMITS") or "").strip()
+    out: Dict[str, Tuple[int, int]] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        prefix, _, spec = item.partition("=")
+        count, _, window = spec.partition("/")
+        try:
+            out[prefix.strip()] = (int(count), int(window or 60))
+        except ValueError:
+            continue
+    return out
+
+
+def _limits_enabled() -> bool:
+    flag = (os.environ.get("CODERAI_SERVER_RATE_LIMIT_ENABLED") or "").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return RATE_LIMITING_ENABLED
+
+
 class _Bucket:
     """Fixed-window counter."""
     __slots__ = ("count", "window_start")
@@ -192,7 +227,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     def __init__(self, app, limits: Dict[str, Tuple[int, int]] = None):
         super().__init__(app)
-        self._limits = limits or _DEFAULT_LIMITS
+        self._limits = dict(limits or _DEFAULT_LIMITS)
+        self._limits.update(_env_limits())
+        self._enabled = _limits_enabled()
+        if not self._enabled:
+            print("[ratelimit] disabled by CODERAI_SERVER_RATE_LIMIT_ENABLED",
+                  flush=True)
+        else:
+            moved = {k: v for k, v in _env_limits().items()}
+            if moved:
+                print(f"[ratelimit] overridden: {moved}", flush=True)
         # (client_ip, prefix) → _Bucket
         self._buckets: Dict[Tuple[str, str], _Bucket] = defaultdict(lambda: _Bucket(time.monotonic()))
         self._lock = threading.Lock()
@@ -207,7 +251,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     _EXEMPT_PATHS = _PROGRESS_PATHS
 
     async def dispatch(self, request: Request, call_next):
-        if not RATE_LIMITING_ENABLED:
+        if not self._enabled:
             return await call_next(request)
 
         path = request.url.path

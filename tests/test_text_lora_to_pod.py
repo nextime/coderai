@@ -349,3 +349,36 @@ def test_a_disabled_model_is_not_seeded_onto_a_shared_pod(monkeypatch):
 
     monkeypatch.setattr("codai.admin.routes.config_manager", _CM, raising=False)
     assert rw.shared_pool_seed_entries("digesta-qwen38") == []
+
+
+# ---------------------------------------------------------------- the limiter
+
+def test_a_pod_does_not_rate_limit_the_install_that_rented_it():
+    """60 requests/min per IP is below one A40's output, and a pod has exactly
+    one client: its owner. Three OCR engines were measured "falling over" at 32
+    concurrent pages when all three had simply run out of window."""
+    from codai.api import runpod_worker as rw
+    mcfg = rw.parse_model_runpod({"pod_max_parallel_requests": 16,
+                                  "pod_queue_max_size": 64})
+    plan = rw._plan("vllm", "img", "", mcfg, "key", None, "")
+    env = plan.get("env") or {}
+    assert env.get("CODERAI_SERVER_RATE_LIMIT_ENABLED") == "0"
+    # The real admission controls must still be passed.
+    assert env.get("CODERAI_SERVER_MAX_PARALLEL_REQUESTS") == "16"
+    assert env.get("CODERAI_SERVER_QUEUE_MAX_SIZE") == "64"
+
+
+def test_the_rate_limit_can_be_moved_without_editing_the_source(monkeypatch):
+    from codai.api import ratelimit
+    monkeypatch.setenv("CODERAI_SERVER_RATE_LIMITS",
+                       "/v1/chat/completions=600/60,/v1/audio/=300/30")
+    got = ratelimit._env_limits()
+    assert got["/v1/chat/completions"] == (600, 60)
+    assert got["/v1/audio/"] == (300, 30)
+
+
+def test_the_limiter_can_be_turned_off_by_env(monkeypatch):
+    from codai.api import ratelimit
+    assert ratelimit._limits_enabled() is True
+    monkeypatch.setenv("CODERAI_SERVER_RATE_LIMIT_ENABLED", "0")
+    assert ratelimit._limits_enabled() is False

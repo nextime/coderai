@@ -1084,6 +1084,13 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         env["CODERAI_SERVER_MAX_PARALLEL_REQUESTS"] = str(int(mcfg.pod_max_parallel_requests))
     if getattr(mcfg, "pod_queue_max_size", 0):
         env["CODERAI_SERVER_QUEUE_MAX_SIZE"] = str(int(mcfg.pod_queue_max_size))
+    # A pod has ONE client — the install that rented it — so per-IP rate limiting
+    # throttles its owner and nobody else. The default 60 requests/min on
+    # /v1/chat/completions is below what a single A40 serves, so it threw away
+    # GPU time that is being paid for by the hour, and made three OCR engines
+    # look like they fell over at 32 concurrent pages when they were simply out
+    # of window. Admission here is the pod's parallel-request and queue limits.
+    env["CODERAI_SERVER_RATE_LIMIT_ENABLED"] = "0"
     seeds = []
     if entry:
         kind, value = resolve_model_source(entry, mcfg)
