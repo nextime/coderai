@@ -47,16 +47,42 @@ def _emit(obj):
 #: and `surya_repair_accents` would rewrite the wrong text.
 _TRACE = threading.local()
 
+#: How many RE-tries of a repeating page coderai allows, or None for surya's
+#: own number. One cell, not a per-worker attribute: the hook it feeds is
+#: module-level, so every lane in this process shares it.
+_RETRY_BUDGET = [None]
+
 
 def _trace_begin():
     """Start a page's trace. Returns its (calls, repairs) — this thread's own."""
     _TRACE.calls = []
     _TRACE.repairs = []
+    _TRACE.attempts = 0
     return _TRACE.calls, _TRACE.repairs
 
 
 def _trace_calls():
     return getattr(_TRACE, "calls", None)
+
+
+def _attempts_bump():
+    """One more call to the model for THIS page. Returns the new count.
+
+    surya retries a page whose generation repeated itself, up to three times at
+    rising temperature, and each attempt may run to its token cap. Measured on
+    the Digesta orchestrator on 2026-10-13: 2,644 generated tokens per request
+    against a page whose text is ~400, and a 25-27% multimodal cache hit rate on
+    the pod — i.e. a quarter of all requests were re-sends of an image it had
+    already read. None of it was visible from outside: a retried page looks
+    exactly like a slow one.
+    """
+    n = getattr(_TRACE, "attempts", 0) + 1
+    _TRACE.attempts = n
+    return n
+
+
+def _attempts():
+    return getattr(_TRACE, "attempts", 0)
 
 
 def _trace_repairs():
@@ -680,6 +706,10 @@ class SuryaWorker:
         #: handed has lost characters. On by default: the alternative is shipping
         #: text we have MEASURED to be corrupt (see repair_content).
         self._repair = bool(opts.get("repair_accents", True))
+        #: Our ceiling on surya's own page retries (None = surya's 3). Written to
+        #: the module cell because the hook that reads it is module-level.
+        budget = opts.get("max_retries", None)
+        _RETRY_BUDGET[0] = None if budget is None else max(0, int(budget))
         #: The page's token logprobs and accent repairs live in _TRACE, per
         #: thread — see _trace_begin(). They were per-worker-object until lanes
         #: put several pages in one process.
@@ -749,6 +779,7 @@ class SuryaWorker:
         def _wrapped(*args, **kwargs):
             result = inner(*args, **kwargs)
             try:
+                _attempts_bump()
                 sink = _trace_calls()
                 if sink is not None:
                     sink.append(getattr(result, "logprobs", None))
@@ -771,6 +802,33 @@ class SuryaWorker:
             return result
 
         _oc._generate_one = _wrapped
+
+        # surya decides on its own to re-run a page whose generation repeated
+        # itself: up to `max_retries` (3) more calls, each at a higher
+        # temperature, each able to run to its token cap. On a page the model
+        # genuinely cannot read that is 4 x 2048 tokens of GPU time to arrive at
+        # the same unreadable answer — and the repeat detector cannot tell
+        # "repeated because the model broke" from "repeated because the page
+        # really does say the same thing twenty times", which a tax table does.
+        #
+        # The retry stays (it does rescue pages), but the budget is ours and the
+        # spend is logged. `max_retries` is not reachable from surya's settings:
+        # the vLLM backend never passes it, so the default was the only value
+        # available. Hooking the decision is the only seam there is.
+        inner_retry = getattr(_oc, "_should_retry", None)
+        if inner_retry is not None:
+            def _wrapped_retry(result, retries, max_retries, *a, **kw):
+                budget = _RETRY_BUDGET[0]
+                if budget is not None:
+                    max_retries = min(int(max_retries or 0), int(budget))
+                again = inner_retry(result, retries, max_retries, *a, **kw)
+                if again:
+                    print(f"[surya] page repeated itself — retry "
+                          f"{retries + 1}/{max_retries} (temperature rises; a "
+                          f"retried page costs another full generation)",
+                          file=sys.stderr, flush=True)
+                return again
+            _oc._should_retry = _wrapped_retry
         _oc._coderai_traced = True
 
     def _load_legacy(self):
@@ -866,6 +924,19 @@ class SuryaWorker:
                 "recovered": sum(int(r.get("recovered", 0)) for r in repairs),
                 "how": ("rebuilt from the model's own per-token bytes, which "
                         "decoded cleanly where message.content did not"),
+            }
+        # A page the model had to be asked for more than once. Reported always,
+        # not only under token_trace: this is the difference between a page that
+        # was slow and a page that was generated two, three or four times over,
+        # and without it the only visible symptom is a batch that produces far
+        # fewer completions than the GPU's throughput says it should.
+        tries = _attempts()
+        if tries > 1:
+            page["model_attempts"] = {
+                "calls": tries,
+                "why": ("surya re-ran this page because the generation repeated "
+                        "itself; each re-run is a full generation at a higher "
+                        "temperature"),
             }
         if self._trace and UNREADABLE in page["text"]:
             try:

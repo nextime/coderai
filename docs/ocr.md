@@ -1005,7 +1005,91 @@ Both halves are now bounded:
   is down, since the replacement asks that same front for its lease. A 503 means
   the pool has nothing rented this second, which the lease does not care about.
 
-#### Lanes: concurrency without another process
+#### A batch can be GPU-idle and still look stalled
+
+Measured on the Digesta orchestrator on 2026-10-13, ten minutes of batch OCR at
+four client workers, read from the pod's own drained log
+(`pod-logs/<pod_id>.log`):
+
+```
+Running: 15-19 reqs, Waiting: 0 reqs, GPU KV cache usage: 5-7%
+Avg generation throughput: ~1,900-2,100 tokens/s, every minute, for ten minutes
+524 x "POST /v1/chat/completions HTTP/1.1" 200 OK, no aborts
+2,644 generated tokens PER REQUEST (second pod: 4,010)
+MM cache hit rate: 25-27%
+```
+
+The client reported a stall: one opening burst, then ~0 completions. Three
+separate things are in those numbers, and only the last is a defect.
+
+**The GPU was never the bottleneck.** 5-7% of the KV cache, `Waiting: 0` for ten
+minutes. The card could have taken several times the load. So giving Surya a
+card to itself does not help, and a co-loaded model on the same pod (pyannote,
+in that run) costs nothing measurable — the limit was never VRAM or batch slots.
+Check `Waiting:` and `KV cache usage:` in the pod log before moving anything.
+
+**Oversubscription converts throughput into latency, not into stalling.** The
+pool queues pages beyond `max_pods x scale_up_inflight_per_pod` and serves them
+perfectly correctly, but every page's latency rises by the queue — and a client
+that counts finished DOCUMENTS sees nothing at all until the first document's
+LAST page lands. Spread 64 pages over sixteen documents and all sixteen advance
+while none completes. That reads exactly like a stall. The pool logs the
+mismatch at build time:
+
+```
+[ocr] engine 'surya': 64 pages at once, but the fleet serves 32
+      (max_pods x scale_up_inflight_per_pod). The surplus waits in the gateway —
+      it does not go faster, and a pod takes ~12 min to appear, so a burst
+      cannot be scaled into.
+```
+
+**The defect: 2,644 generated tokens for a page whose text is ~400.** Surya
+re-runs a page whose generation repeated itself — `_should_retry` in
+`surya.inference.backends.openai_client` — up to `max_retries` (3) more times,
+each at a higher temperature and each able to run to its token cap. On a page
+the model genuinely cannot read that is four full generations to reach the same
+unreadable answer, and the repeat detector cannot distinguish "the model broke"
+from "this page really does repeat", which a tax table does. The 25-27%
+multimodal cache hit rate is the direct evidence: a quarter of all requests were
+re-sends of an image the pod had already read.
+
+`max_retries` is unreachable from Surya's settings — its vLLM backend calls
+`chat_completions_batch` without it, so the default was the only value
+available. CoderAI therefore hooks the decision, beside the token-trace hook it
+already installs in that module, and `ocr.surya_max_retries` is the ceiling:
+
+| value | meaning |
+|---|---|
+| `1` (default) | one re-run — keeps the rescue a retry does buy, drops the long tail |
+| `0` | no re-runs; a repeating page is returned as it came |
+| `-1` | whatever Surya decides (its own 3) |
+| `n` | at most `n`, and never more than Surya would have allowed |
+
+It is a ceiling, not a setting: asking for 10 where Surya allows 3 gets 3.
+
+Every retry is logged, and a page that needed more than one call carries it in
+the result — always, not only under `surya_token_trace`:
+
+```json
+"model_attempts": {"calls": 3, "why": "surya re-ran this page because the
+                   generation repeated itself; each re-run is a full generation
+                   at a higher temperature"}
+```
+
+A page read on the first attempt stays byte-identical to what it has always
+returned. Without this, a page generated four times over and a page that was
+merely slow look the same from outside — which is why ten minutes of this was
+invisible.
+
+CoderAI also pins `SURYA_INFERENCE_PARALLEL=1` in the served modes. A **lane**
+is coderai's unit of concurrency; left unset, Surya sizes its own thread pool
+from a built-in GPU table and fans out inside the worker, so `instances x lanes`
+would stop being the real number of pages in flight the moment one call carried
+more than one page.
+
+---
+
+## Lanes: concurrency without another process
 
 The worker protocol was one request, one reply, strictly in order, so **pages in
 flight was the process count** — and that is the whole reason 64 pages meant 64

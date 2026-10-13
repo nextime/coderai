@@ -71,7 +71,11 @@ class SuryaEngine(SubprocessOcrEngine):
                 # patches surya's backend, which has to happen before the first page
                 # rather than per request.
                 "token_trace": bool(getattr(self.cfg, "surya_token_trace", False)),
-                "repair_accents": bool(getattr(self.cfg, "surya_repair_accents", True))}
+                "repair_accents": bool(getattr(self.cfg, "surya_repair_accents", True)),
+                # None hands the decision back to surya; anything else is a
+                # ceiling on how often it may re-run a repeating page.
+                "max_retries": (None if int(getattr(self.cfg, "surya_max_retries", 1)) < 0
+                                else int(getattr(self.cfg, "surya_max_retries", 1)))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")
@@ -132,6 +136,13 @@ class SuryaEngine(SubprocessOcrEngine):
             "SURYA_INFERENCE_BACKEND": "llamacpp" if mode == "llamacpp" else "vllm",
             "SURYA_INFERENCE_URL": url,
         }
+        # One page per call, because a LANE is our unit of concurrency. Left
+        # unset, surya sizes its own thread pool from a built-in GPU table
+        # (min(max_num_seqs, MAX_AUTO_PARALLEL)) and fans out inside the worker
+        # — so instances x lanes would stop being the real number of pages in
+        # flight the moment a call carried more than one page. Pinning it keeps
+        # the arithmetic in the admin UI true.
+        env["SURYA_INFERENCE_PARALLEL"] = "1"
         if self._served_name:
             env["SURYA_MODEL_CHECKPOINT"] = self._served_name
         if self._server_key:

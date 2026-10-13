@@ -1038,6 +1038,19 @@ class OcrConfig:
     #: concurrency is instances x lanes. In `local` mode this is ignored (a lane
     #: would be a second copy of the model on the card).
     surya_lanes: int = 4
+    #: How many times surya may RE-run a page whose generation repeated itself.
+    #: surya's own number is 3, and it is unreachable from its settings (the vLLM
+    #: backend never passes `max_retries`), so this is a ceiling we apply by
+    #: hooking the decision. Each retry is another full generation at a higher
+    #: temperature: measured on the Digesta orchestrator on 2026-10-13, a batch
+    #: ran at 2,644 generated tokens per request against pages whose text is
+    #: ~400, with a 25-27% multimodal cache hit rate on the pod — a quarter of
+    #: all requests were re-sends of an image it had already read. The GPU was
+    #: never the limit (18 concurrent, `Waiting: 0`, 5-7% KV cache); the tokens
+    #: were being spent re-reading pages the model had already failed to read.
+    #: 1 keeps the rescue a retry does buy and drops the long tail; 0 disables
+    #: it; -1 means "whatever surya decides".
+    surya_max_retries: int = 1
     surya_langs: str = "it"
     # Return the model's own per-token bytes for the places a page came back
     # unreadable (see base.UNREADABLE). Off by default: it is a diagnostic, it
@@ -1788,6 +1801,7 @@ class ConfigManager:
                 "surya_accept_license": self.config.ocr.surya_accept_license,
                 "surya_instances": self.config.ocr.surya_instances,
                 "surya_lanes": getattr(self.config.ocr, "surya_lanes", 4),
+                "surya_max_retries": getattr(self.config.ocr, "surya_max_retries", 1),
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_token_trace": self.config.ocr.surya_token_trace,
                 "surya_repair_accents": self.config.ocr.surya_repair_accents,

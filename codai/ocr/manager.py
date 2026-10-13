@@ -276,6 +276,66 @@ def _engine_instances(cfg, name: str) -> int:
     return want
 
 
+def _fleet_page_slots(name: str):
+    """How many pages the remote fleet can actually have in flight, or None.
+
+    ``max_pods x scale_up_inflight_per_pod``. Not a limit we impose — the pool
+    queues the excess perfectly correctly — but a number worth comparing with
+    ours, because pages beyond it do not go faster, they only wait, and a pod
+    takes ~12 minutes to appear so the fleet cannot grow into a burst.
+    """
+    try:
+        from codai.models.manager import _model_entry_for
+        from codai.api.runpod_worker import parse_model_runpod
+    except Exception:
+        return None
+    for served in _SERVED_NAMES.get(name, ()):
+        try:
+            entry = _model_entry_for(served)
+            block = (entry or {}).get("runpod")
+            if not isinstance(block, dict) or not block:
+                continue
+            mcfg = parse_model_runpod(block)
+            if (mcfg.mode or "").lower() != "pods":
+                continue
+            pods = max(1, int(getattr(mcfg, "max_pods", 1) or 1))
+            per = int(getattr(mcfg, "scale_up_inflight_per_pod", 0) or 0)
+            if per <= 0:
+                per = int(getattr(mcfg, "max_inflight_per_pod", 0) or 0)
+            if per > 0:
+                return pods * per
+        except Exception:
+            continue
+    return None
+
+
+#: The served model names an engine may be reading from, for the slot estimate.
+_SERVED_NAMES = {"surya": ("datalab-to/surya-ocr-2", "surya-ocr-2"),
+                 "chandra": ("datalab-to/chandra-ocr-2", "chandra-ocr-2"),
+                 "olmocr": ("allenai/olmOCR-2-7B-1025-FP8", "olmocr")}
+
+
+def _warn_if_oversubscribed(name: str, pages: int) -> None:
+    """Say so when we fan out more pages than the fleet can serve at once.
+
+    Oversubscription does not lose work and it does not go faster: the surplus
+    waits in the gateway, every page's latency rises by the queue, and because a
+    client usually counts finished DOCUMENTS, spreading N pages over many
+    documents at once means they all advance and none completes until near the
+    end. That reads from outside as "one opening burst, then silence" — which is
+    exactly how the 2026-10-13 batch was reported, while the pod sat at 18
+    concurrent requests, `Waiting: 0` and 5-7% KV cache the entire time.
+    """
+    slots = _fleet_page_slots(name)
+    if not slots or pages <= slots:
+        return
+    print(f"[ocr] engine {name!r}: {pages} pages at once, but the fleet serves "
+          f"{slots} (max_pods x scale_up_inflight_per_pod). The surplus waits in "
+          f"the gateway — it does not go faster, and a pod takes ~12 min to "
+          f"appear, so a burst cannot be scaled into. Lower instances/lanes, or "
+          f"raise the pod's inflight ceiling.", flush=True)
+
+
 def _engine_lanes(eng) -> int:
     """How many pages one instance of ``eng`` serves at once, asked politely.
 
@@ -458,6 +518,7 @@ class _Pool:
                       f"{lanes} lane(s) each — {self.size * lanes} pages at once")
             else:
                 print(f"[ocr] engine '{self.name}': {self.size} instance(s) ready")
+            _warn_if_oversubscribed(self.name, self.size * lanes)
 
     def release_sync(self) -> float:
         """Tear down all instances (free VRAM). SYNC — safe to call from the model
