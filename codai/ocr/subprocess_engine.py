@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 
-from codai.ocr.base import OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError
+from codai.ocr.base import page_options, OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError
 
 _WORKER = os.path.join(os.path.dirname(__file__), "workers", "ocr_worker.py")
 
@@ -292,11 +292,18 @@ class SubprocessOcrEngine(OcrEngine):
         buf = io.BytesIO()
         image.convert("RGB").save(buf, "PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        # Per-request overrides travel WITH the page, not with the load: a pool
+        # is built once and then serves every caller, so anything set at load
+        # time is the same for all of them.
+        msg = {"cmd": "ocr", "image": b64}
+        opts = page_options()
+        if opts:
+            msg["opts"] = opts
         if self._mux:
-            resp = self._rpc_mux({"cmd": "ocr", "image": b64})
+            resp = self._rpc_mux(msg)
         else:
             with self._lock:                   # one request at a time per subprocess
-                resp = self._rpc({"cmd": "ocr", "image": b64})
+                resp = self._rpc(msg)
         if not resp.get("ok"):
             raise OcrError(resp.get("error") or f"{self.name}: ocr failed",
                            status=int(resp.get("status", 500)))

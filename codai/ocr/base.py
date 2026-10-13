@@ -23,6 +23,7 @@ extraction) speaks only these types, so engines stay interchangeable.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import contextvars
 from typing import Any, List, Optional
 
 
@@ -229,6 +230,29 @@ class OcrEngine(ABC):
 
 # Extensions we accept directly as raster images.
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif", ".ppm"}
+
+
+#: Per-REQUEST engine options, for the one page being read right now.
+#:
+#: A ContextVar rather than an argument because an engine is anything with
+#: `recognize_image(image)` -- the fallback chain and several tests drive
+#: duck-typed ones -- so widening that signature would break every engine to
+#: serve the two that can use it. A ContextVar also survives the hop into
+#: `asyncio.to_thread`, which copies the context, so it reaches a pooled
+#: subprocess engine on a worker thread and a lane inside it.
+#:
+#: Why per request at all: one global cap cannot serve a public deployment.
+#: A four-page contract and a fifty-page judgment need different budgets, and
+#: the caller is the only one who knows which it is sending.
+PAGE_OPTIONS = contextvars.ContextVar("ocr_page_options", default=None)
+
+
+def page_options() -> dict:
+    """Options the caller set for this request, or {}."""
+    try:
+        return dict(PAGE_OPTIONS.get() or {})
+    except Exception:
+        return {}
 
 
 def ink_coverage(image, threshold: int = 200) -> float:

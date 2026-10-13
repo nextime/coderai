@@ -1076,11 +1076,20 @@ class OcrConfig:
     #: prefilled assistant turn (`continue_final_message`) so the model carries
     #: on the exact string rather than answering afresh about the same image.
     #:
-    #: 2 by default, because silently returning a page known to be incomplete is
-    #: a correctness failure rather than a speed/cost trade-off. 0 restores the
-    #: old behaviour. Each resumption is one more request, so the ceiling is
-    #: what stops a pathological page costing without bound.
-    surya_max_continuations: int = 2
+    #: PER PAGE, not per document: a fifty-page document is fifty independent
+    #: pages, each with its own budget, so what this number has to cover is the
+    #: densest SINGLE page, not the longest document.
+    #:
+    #: 8 by default, because returning a page known to be incomplete is a
+    #: correctness failure rather than a speed/cost trade-off, and because the
+    #: real ceiling is the model's context rather than this number: each
+    #: resumption re-sends the text so far as input, so with surya-ocr-2's
+    #: 32,768-token context and ~4,000 of it spent on the page image, roughly
+    #: thirteen 2,048-token segments exhaust the window whatever is set here.
+    #: Raising `surya_max_tokens` lowers that count in proportion. A page that
+    #: stops making progress stops early regardless, so a generous budget costs
+    #: nothing on a page that cannot use it. 0 disables resumption.
+    surya_max_continuations: int = 8
     #: A page whose text is this short gets its ink measured, so a short result
     #: can be explained rather than guessed at. 0 disables the measurement.
     blank_page_max_chars: int = 200

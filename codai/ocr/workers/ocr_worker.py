@@ -11,7 +11,10 @@
 # Protocol: newline-delimited JSON on stdin/stdout.
 #   startup            → worker prints {"ready": true}
 #   {"cmd":"load","opts":{...}}   → {"ok":true} | {"ok":false,"error":..,"status":..}
-#   {"cmd":"ocr","image":"<b64 png>"} → {"ok":true,"page":{...}} | {"ok":false,...}
+#   {"cmd":"ocr","image":"<b64 png>","opts":{...}} → {"ok":true,"page":{...}} | {...}
+#       `opts` are PER-REQUEST overrides for this page only (max_tokens,
+#       max_continuations). Applied thread-locally, so lanes cannot overwrite
+#       each other's budgets. Absent = the values sent at load.
 #   {"cmd":"ping"}     → {"ok":true}
 # argv[1] = engine name ("paddle" | "surya").
 
@@ -75,6 +78,13 @@ def _trace_begin():
     return _TRACE.calls, _TRACE.repairs
 
 
+def _trace_opts(opts) -> None:
+    """Per-request overrides for the page this thread is about to read."""
+    _TRACE.opts = {k: int(v) for k, v in (opts or {}).items()
+                   if k in ("max_tokens", "max_continuations")
+                   and str(v).strip() not in ("", "None")}
+
+
 def _trace_calls():
     return getattr(_TRACE, "calls", None)
 
@@ -112,6 +122,23 @@ def _attempt_tokens(n: int) -> None:
         lst.append(int(n or 0))
     except Exception:
         pass
+
+
+def _page_override(name: str, default):
+    """A per-request value for the page this THREAD is reading, else the default.
+
+    The hooks these feed are module-level -- there is one `_generate_one` per
+    process -- so a per-request value cannot live in a module cell: with lanes,
+    several pages are in flight in one process and they would overwrite each
+    other's budgets. Same reasoning as the token trace.
+    """
+    try:
+        ov = getattr(_TRACE, "opts", None) or {}
+        if name in ov:
+            return ov[name]
+    except Exception:
+        pass
+    return default
 
 
 def _attempts():
@@ -810,6 +837,27 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
             break
         if not more:
             break
+        # A resumption that adds nothing new is the end of what this page is
+        # going to give. Without this, a budget raised for the one genuinely
+        # enormous page also buys a degenerate page that many more full
+        # generations -- which is the failure the retry ceiling exists to stop,
+        # arriving through the other door.
+        if more == segments[-1]:
+            print(f"[surya] resumption repeated the previous segment verbatim — "
+                  f"stopping", file=sys.stderr, flush=True)
+            break
+        repeats = getattr(oc, "detect_repeat_token", None)
+        try:
+            if repeats is not None and repeats(more):
+                print(f"[surya] resumption came back repeating itself — stopping "
+                      f"rather than spending the rest of the budget on it",
+                      file=sys.stderr, flush=True)
+                segments.append(more)
+                rounds += 1
+                total += int(last or 0)
+                break
+        except Exception:
+            pass
         segments.append(more)
         # Counted only now. `rounds` is reported to the caller as "the page was
         # resumed n times, so it is whole" — an ATTEMPT that failed must not
@@ -935,7 +983,7 @@ class SuryaWorker:
             # 2048 was the only value available -- the same reason `max_retries`
             # needed hooking. It arrives here as a keyword, so it can be raised
             # without touching surya.
-            cap = _MAX_TOKENS[0]
+            cap = _page_override("max_tokens", _MAX_TOKENS[0])
             if cap and "max_tokens_default" in kwargs:
                 kwargs["max_tokens_default"] = int(cap)
             result = inner(*args, **kwargs)
@@ -943,7 +991,8 @@ class SuryaWorker:
             # it: raising the cap only moves the cliff, and incomplete block
             # markup parses to a fragment or to nothing at all.
             try:
-                budget = int(_CONTINUE_BUDGET[0] or 0)
+                budget = int(_page_override("max_continuations",
+                                            _CONTINUE_BUDGET[0]) or 0)
                 item = args[0] if args else kwargs.get("item")
                 eff_cap = int(getattr(item, "max_tokens", 0) or 0) or int(
                     kwargs.get("max_tokens_default") or 0)
@@ -1114,7 +1163,8 @@ class SuryaWorker:
         # fewer completions than the GPU's throughput says it should.
         tries = _attempts()
         toks = _attempt_token_counts()
-        cap = int(_MAX_TOKENS[0] or _SURYA_DEFAULT_MAX_TOKENS)
+        cap = int(_page_override("max_tokens", _MAX_TOKENS[0])
+                  or _SURYA_DEFAULT_MAX_TOKENS)
         # Reported whenever there is anything to report -- a retry, or a reply
         # that stopped at its cap. A page cut off mid-markup parses to a few
         # blocks or to none, which is indistinguishable in the finished text
@@ -1241,6 +1291,10 @@ def _serve_page(lanes: "_Lanes", msg: dict, engine: str) -> None:
         from PIL import Image
         data = base64.b64decode(msg["image"])
         img = Image.open(io.BytesIO(data)); img.load()
+        # On THIS thread, before the page is read. _trace_begin() inside ocr()
+        # resets the page's trace but not the options, so they survive it -- and
+        # being thread-local they cannot leak into another lane's page.
+        _trace_opts(msg.get("opts"))
         _emit({"ok": True, "id": rid, "page": worker.ocr(img)})
     except Exception as e:
         _emit({"ok": False, "id": rid, "error": f"{engine} ocr failed: {e}",
@@ -1291,6 +1345,7 @@ def main():
                     from PIL import Image
                     data = base64.b64decode(msg["image"])
                     img = Image.open(io.BytesIO(data)); img.load()
+                    _trace_opts(msg.get("opts"))
                     _emit({"ok": True, "page": worker.ocr(img)})
                 except Exception as e:
                     _emit({"ok": False, "error": f"{engine} ocr failed: {e}",

@@ -34,6 +34,7 @@ import time
 from typing import Dict, List, Optional
 
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, load_pages, ink_coverage,
+                            PAGE_OPTIONS,
                             unreadable_report)
 
 
@@ -1049,7 +1050,8 @@ class OcrManager:
                            engine: Optional[str] = None, dpi: Optional[int] = None,
                            detect: Optional[str] = None, structured: bool = False,
                            schema: Optional[str] = None,
-                           lang: Optional[str] = None) -> dict:
+                           lang: Optional[str] = None,
+                           page_opts: Optional[dict] = None) -> dict:
         """OCR raw bytes (image/PDF) end-to-end → response dict.
 
         ``detect`` overrides the configured stamp/signature detection mode
@@ -1068,7 +1070,14 @@ class OcrManager:
         # Share the GPU thermal governor with every other workload: block here until
         # temps are safe (wait_until_safe blocks, so run it off the event loop).
         await asyncio.to_thread(_wait_thermal_safe)
-        name, pages = await self.ocr_pages(images, engine=engine, lang=lang)
+        token = None
+        if page_opts:
+            token = PAGE_OPTIONS.set(dict(page_opts))
+        try:
+            name, pages = await self.ocr_pages(images, engine=engine, lang=lang)
+        finally:
+            if token is not None:
+                PAGE_OPTIONS.reset(token)
         blank = _mark_blank_pages(cfg, images, pages)
         full_text = "\n\n".join(p.text for p in pages)
 

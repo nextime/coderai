@@ -61,6 +61,22 @@ def _ocr_config():
 
 
 @router.post("/v1/ocr", summary="OCR an image or PDF with a dedicated OCR engine")
+def _page_opts(max_tokens, max_continuations) -> dict:
+    """Per-request engine overrides, or {} when the caller said nothing.
+
+    One global cap cannot serve a public deployment: a four-page contract and a
+    fifty-page judgment need different budgets, and only the caller knows which
+    it is sending. Omitted means "use the configured value" -- NOT zero, which
+    is a meaningful setting for both of these.
+    """
+    out = {}
+    if max_tokens is not None:
+        out["max_tokens"] = max(0, int(max_tokens))
+    if max_continuations is not None:
+        out["max_continuations"] = max(0, int(max_continuations))
+    return out
+
+
 async def create_ocr(
     file: UploadFile = File(...),
     engine: Optional[str] = Form(None),        # paddle|doctr|surya|olmocr|chandra (default from config)
@@ -69,6 +85,8 @@ async def create_ocr(
     structured: Optional[bool] = Form(False),  # structured JSON extraction via text model
     schema_: Optional[str] = Form(None, alias="schema"),  # override extraction schema (JSON string)
     detect: Optional[str] = Form(None),        # off|layout|detector|both
+    max_tokens: Optional[int] = Form(None),    # cap on the model's reply for ONE page (engine default if unset)
+    max_continuations: Optional[int] = Form(None),  # resumptions allowed for a page that hits the cap
 ):
     cfg = _ocr_config()
     if cfg is None:
@@ -92,6 +110,7 @@ async def create_ocr(
             structured=bool(structured),
             schema=schema_,
             lang=lang,
+            page_opts=_page_opts(max_tokens, max_continuations),
         )
     except OcrError as e:
         raise HTTPException(status_code=e.status, detail=str(e))

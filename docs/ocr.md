@@ -1074,6 +1074,44 @@ deliberately *raises* temperature to break a repetition. A page still unfinished
 after its budget is marked `"complete": false`, so a caller can refuse a partial
 rather than store it as read.
 
+**The budget is per PAGE, not per document.** A fifty-page document is fifty
+independent pages, each with its own budget, so what the number has to cover is
+the densest *single* page — not the longest document.
+
+The real ceiling is not this number but the model's context. Each resumption
+re-sends the text so far as *input*, so with surya-ocr-2's 32,768-token window
+and roughly 4,000 of it spent on the page image, about thirteen 2,048-token
+segments exhaust it whatever is configured; raising `surya_max_tokens` lowers
+that count in proportion. The default is **8**, which covers any plausible
+single page while staying inside the window.
+
+A generous budget is safe because a page that stops making progress stops
+costing: a resumption that comes back repeating itself, or that returns the text
+already in hand, ends the loop. That second case is also how a server that
+**ignores** `continue_final_message` is caught — a model that starts the page
+over returns what we already have, and without the check a budget of 8 would buy
+eight full generations of the same page.
+
+### Per-request budgets
+
+One global cap cannot serve a public deployment: a four-page contract and a
+fifty-page judgment need different budgets, and only the caller knows which it is
+sending. `/v1/ocr` and `/v1/ocr/batch` therefore accept `max_tokens` and
+`max_continuations` per request, overriding the configured values for that call
+only. Omitting them means "use the configured value" — **not** zero, which is a
+meaningful setting for both (no override, and resumption off).
+
+They travel *with the page* rather than with the engine load, because a pool is
+built once and then serves every caller, and they are applied **thread-locally**
+in the worker, because several pages are in flight in one process and the hooks
+they feed are module-level — a per-request value in a module cell would be
+overwritten by the next page to arrive.
+
+One caveat worth knowing, since it cost a day of wrong conclusions: FastAPI
+drops unknown form fields **silently**. Before these parameters existed, a
+caller could send `max_tokens=8000` on every request for a week and never be
+told it did nothing.
+
 ---
 
 ## An empty page and a 71-character page are the same bug

@@ -569,7 +569,8 @@ def test_the_engine_sends_the_resumption_budget():
     from codai.ocr.surya import SuryaEngine
     from codai.config import OcrConfig
     cfg = OcrConfig()
-    assert SuryaEngine(cfg)._worker_opts()["max_continuations"] == 2
+    assert (SuryaEngine(cfg)._worker_opts()["max_continuations"]
+            == cfg.surya_max_continuations)
     cfg.surya_max_continuations = 0
     assert SuryaEngine(cfg)._worker_opts()["max_continuations"] == 0
 
@@ -579,3 +580,107 @@ def test_resumption_is_on_by_default():
     cost trade-off, so this is not opt-in."""
     from codai.config import OcrConfig
     assert OcrConfig().surya_max_continuations >= 1
+
+
+# ------------------------------------------- per-request budgets, and safety #
+#
+# One global cap cannot serve a public deployment: a four-page contract and a
+# fifty-page judgment need different budgets, and only the caller knows which it
+# is sending. /v1/ocr took engine, dpi, lang, structured, schema and detect —
+# anything else a caller sent was silently dropped by FastAPI, so a `max_tokens`
+# in the request was discarded and the page ran at the configured value.
+
+def test_the_request_can_set_the_budgets():
+    from codai.api.ocr import _page_opts
+    assert _page_opts(8000, 20) == {"max_tokens": 8000, "max_continuations": 20}
+
+
+def test_omitting_them_is_not_the_same_as_zero():
+    """0 is meaningful for both — no cap override, and resumption off. A caller
+    that said nothing must get the configured value, not zero."""
+    from codai.api.ocr import _page_opts
+    assert _page_opts(None, None) == {}
+    assert _page_opts(0, 0) == {"max_tokens": 0, "max_continuations": 0}
+
+
+def test_the_endpoint_actually_accepts_them():
+    """The bug this fixes: FastAPI drops unknown form fields silently, so a
+    caller can send max_tokens for a week and never be told it did nothing."""
+    import inspect
+    from codai.api.ocr import create_ocr
+    params = inspect.signature(create_ocr).parameters
+    assert "max_tokens" in params and "max_continuations" in params
+
+
+def test_the_page_carries_the_options_to_the_worker():
+    src = (ROOT / "codai/ocr/subprocess_engine.py").read_text()
+    blk = src.split("def recognize_image")[1].split("\n    @staticmethod")[0]
+    assert '"cmd": "ocr"' in blk and 'msg["opts"] = opts' in blk
+
+
+def test_overrides_are_per_thread_so_lanes_cannot_cross():
+    """Several pages are in flight in one process, and the hooks they feed are
+    module-level. A per-request value in a module cell would be overwritten by
+    the next page to arrive."""
+    mod = _worker_module()
+    import threading as _th
+    seen = {}
+
+    def lane(name, opts, expect):
+        mod._trace_opts(opts)
+        mod._trace_begin()
+        seen[name] = mod._page_override("max_tokens", 2048)
+
+    a = _th.Thread(target=lane, args=("a", {"max_tokens": 9000}, 9000))
+    b = _th.Thread(target=lane, args=("b", {}, 2048))
+    a.start(); b.start(); a.join(); b.join()
+    assert seen == {"a": 9000, "b": 2048}
+
+
+def test_beginning_a_page_does_not_clear_its_options():
+    """`_trace_begin()` resets the page's trace; the options are set just before
+    it and have to survive."""
+    mod = _worker_module()
+    mod._trace_opts({"max_continuations": 5})
+    mod._trace_begin()
+    assert mod._page_override("max_continuations", 2) == 5
+
+
+def test_only_known_options_are_accepted():
+    mod = _worker_module()
+    mod._trace_opts({"max_tokens": 10, "rm": "-rf", "lanes": 99})
+    assert mod._page_override("lanes", 1) == 1
+    assert mod._page_override("max_tokens", 0) == 10
+
+
+def test_a_resumption_that_repeats_itself_stops_early():
+    """A budget raised for the one enormous page must not also buy a degenerate
+    page that many more full generations.
+
+    It also catches the server ignoring `continue_final_message`: a model that
+    starts the page over returns the text we already have, which is a verbatim
+    repeat of the previous segment. Resuming eight times against a server that
+    does not support resumption would otherwise cost eight full generations and
+    produce the page eight times over.
+    """
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, cl = _resume(mod, m, ("aaa", 100),
+                                         [("aaa", 100), ("aaa", 100)], budget=8)
+    finally:
+        m.undo()
+    # Nothing was added, so nothing was resumed: reporting a successful
+    # resumption here would be the claim the counter was fixed to stop making.
+    assert rounds == 0
+    assert len(cl.sent) == 1, "it kept paying after the repeat"
+    assert out.raw == "aaa", "the repeat must not be appended"
+    assert still is True, "an unfinished page must still say so"
+
+
+def test_the_default_budget_covers_a_dense_page():
+    """Per PAGE, not per document: a fifty-page document is fifty pages each
+    with its own budget. What this has to cover is the densest SINGLE page."""
+    from codai.config import OcrConfig
+    assert OcrConfig().surya_max_continuations >= 8
