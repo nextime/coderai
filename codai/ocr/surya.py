@@ -83,7 +83,16 @@ class SuryaEngine(SubprocessOcrEngine):
                     self.cfg, "surya_max_continuations", 2) or 0)),
                 # 0 = ask the server for its own max_model_len.
                 "context_tokens": max(0, int(getattr(
-                    self.cfg, "surya_context_tokens", 0) or 0))}
+                    self.cfg, "surya_context_tokens", 0) or 0)),
+                # The repetition detector's thresholds, when retuned. 0 leaves
+                # surya's own, which is what every install gets until someone
+                # measures their corpus and decides otherwise.
+                "repeat_max_repeats": max(0, int(getattr(
+                    self.cfg, "surya_repeat_max_repeats", 0) or 0)),
+                "repeat_window": max(0, int(getattr(
+                    self.cfg, "surya_repeat_window", 0) or 0)),
+                "repeat_scaling": max(0.0, float(getattr(
+                    self.cfg, "surya_repeat_scaling", 0.0) or 0.0))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")

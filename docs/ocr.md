@@ -253,6 +253,48 @@ model actually saw as the page's `width`/`height`, with the size you rasterised 
 and de-normalising them against the pre-scaling size would put every box on a scaled page
 in the wrong place.
 
+### A page that was still looping when the engine gave up
+
+A VLM that loses its place repeats the last thing it saw until it runs out of
+tokens. Both VLM engines retry such a page at rising temperature — chandra's own
+client does, and surya's — and when the retries run out the looping reply is
+what the page is parsed from. That parses to a few blocks or to none, so the
+page arrives short or empty.
+
+**Short or empty is also what an unreadable scan looks like, and the two need
+opposite handling**: a looping page is a cascade candidate (hand it to another
+engine), an unreadable one means the document itself is bad. chandra has flagged
+this since it shipped; surya said nothing, so a cascade had to infer it from
+emptiness. Both now report it:
+
+```json
+"repeat_detected": true,
+"repeat_chars": 4096
+```
+
+`repeat_chars` is the length of the reply that was still looping — "looped and
+produced four thousand characters" has a usable beginning, "looped and produced
+nothing" does not.
+
+#### Retuning the detector (`ocr.surya_repeat_*`)
+
+surya's thresholds — 4 repetitions, a 500-character window, scaling 3.0 — are
+defaults, not universal truths. A corpus of tables, dotted leaders or form
+fields repeats short strings legitimately, and a page wrongly judged degenerate
+is re-run up to `surya_max_retries` times at rising temperature and then parsed
+from a reply nobody wanted: a false positive costs several full generations and
+usually returns LESS text than the first reply had.
+
+| setting | 0 means | raise it to |
+|---|---|---|
+| `surya_repeat_max_repeats` | surya's 4 | be more forgiving — more repetitions before a reply counts as looping |
+| `surya_repeat_window` | surya's 500 characters | look further back |
+| `surya_repeat_scaling` | surya's 3.0 | be more forgiving of SHORT repeated sequences (the threshold is multiplied by `1 + scaling / sequence length`) |
+
+Operator settings, deliberately not per-request: they describe the corpus, not
+the page. An explicit argument from surya's own code still wins, so
+`cut_from_end` keeps working.
+
 ### Repetition loops
 
 A VLM that loses its place on a page does not fail. It repeats the last thing it saw until

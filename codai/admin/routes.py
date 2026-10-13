@@ -4155,6 +4155,9 @@ def build_settings_dict(c, gpu_cards):
             "surya_max_retries": getattr(c.ocr, "surya_max_retries", 1),
             "surya_max_tokens": getattr(c.ocr, "surya_max_tokens", 0),
             "surya_max_continuations": getattr(c.ocr, "surya_max_continuations", 2),
+            "surya_repeat_max_repeats": getattr(c.ocr, "surya_repeat_max_repeats", 0),
+            "surya_repeat_window": getattr(c.ocr, "surya_repeat_window", 0),
+            "surya_repeat_scaling": getattr(c.ocr, "surya_repeat_scaling", 0.0),
             "surya_context_tokens": getattr(c.ocr, "surya_context_tokens", 0),
             "surya_langs": c.ocr.surya_langs,
             "surya_token_trace": c.ocr.surya_token_trace,
@@ -4999,6 +5002,16 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             o.surya_max_continuations = _i(
                 "surya_max_continuations",
                 getattr(o, "surya_max_continuations", 2), 0)
+        if "surya_repeat_max_repeats" in d:
+            o.surya_repeat_max_repeats = _i(
+                "surya_repeat_max_repeats",
+                getattr(o, "surya_repeat_max_repeats", 0), 0)
+        if "surya_repeat_window" in d:
+            o.surya_repeat_window = _i(
+                "surya_repeat_window", getattr(o, "surya_repeat_window", 0), 0)
+        if "surya_repeat_scaling" in d:
+            o.surya_repeat_scaling = _f(
+                "surya_repeat_scaling", getattr(o, "surya_repeat_scaling", 0.0), 0.0)
         if "surya_context_tokens" in d:
             o.surya_context_tokens = _i(
                 "surya_context_tokens",

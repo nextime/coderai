@@ -87,6 +87,13 @@ _PROMPT_TOKENS_GUESS = 4096
 #: the log, and the number is the same every time.
 _CAP_NOTED = [False]
 
+#: Thresholds for surya's own repetition detector, when the operator has set
+#: them. Empty = surya's defaults (4 repeats, a 500-character window, scaling
+#: 3.0). A corpus property rather than a per-document one: a page of tables and
+#: dotted leaders legitimately repeats short strings, and whether that counts as
+#: degeneration depends on the documents, not on the request.
+_REPEAT_OPTS: dict = {}
+
 #: Below this there is no point asking for more: a segment this short cannot
 #: close an open block, so it would spend a round to add nothing. It is a floor
 #: on the room LEFT, never on the cap -- a deployment whose cap is smaller than
@@ -217,6 +224,8 @@ def _trace_begin():
     st["still_truncated"] = False
     st.pop("no_resume", None)
     st.pop("budget", None)
+    st.pop("looping", None)
+    st.pop("loop_chars", None)
     return st["calls"], st["repairs"]
 
 
@@ -316,6 +325,26 @@ def _no_resume(reason: str) -> None:
         _state()["no_resume"] = str(reason)
     except Exception:
         pass
+
+
+def _note_loop(raw: str) -> None:
+    """Record that this page's generation ended still repeating itself.
+
+    Only when surya has stopped retrying: a loop it then rescues is not a
+    property of the page. The character count goes with it because "looped and
+    produced four thousand characters of garbage" and "looped and produced
+    nothing" need different handling — the first has a usable beginning.
+    """
+    try:
+        from surya.inference.backends import openai_client as _oc
+        repeats = getattr(_oc, "detect_repeat_token", None)
+        if repeats is None or not repeats(raw):
+            return
+    except Exception:
+        return
+    st = _state()
+    st["looping"] = True
+    st["loop_chars"] = len(raw or "")
 
 
 def _page_override(name: str, default):
@@ -1163,6 +1192,18 @@ class SuryaWorker:
         #: does not report one, or when it serves a shorter window than the
         #: checkpoint advertises.
         _CONTEXT_TOKENS[0] = max(0, int(opts.get("context_tokens", 0) or 0))
+        _REPEAT_OPTS.clear()
+        for key, name in (("repeat_max_repeats", "base_max_repeats"),
+                          ("repeat_window", "window_size"),
+                          ("repeat_scaling", "scaling_factor")):
+            val = opts.get(key)
+            try:
+                num = float(val or 0)
+            except (TypeError, ValueError):
+                num = 0.0
+            if num > 0:
+                _REPEAT_OPTS[name] = (num if name == "scaling_factor"
+                                      else int(num))
         #: The page's token logprobs and accent repairs live in _TRACE, per
         #: thread — see _trace_begin(). They were per-worker-object until lanes
         #: put several pages in one process.
@@ -1337,6 +1378,22 @@ class SuryaWorker:
         # spend is logged. `max_retries` is not reachable from surya's settings:
         # the vLLM backend never passes it, so the default was the only value
         # available. Hooking the decision is the only seam there is.
+        # The detector itself, when the operator has retuned it. surya's
+        # thresholds are sensible defaults, not universal truths: a corpus of
+        # tables and dotted leaders repeats short strings legitimately, and a
+        # page wrongly judged degenerate is re-run three times at rising
+        # temperature and then parsed from a reply nobody wanted.
+        detector = getattr(_oc, "detect_repeat_token", None)
+        if detector is not None and _REPEAT_OPTS:
+            def _tuned_detector(text, *a, **kw):
+                for name, value in _REPEAT_OPTS.items():
+                    kw.setdefault(name, value)
+                return detector(text, *a, **kw)
+            _oc.detect_repeat_token = _tuned_detector
+            print(f"[surya] repetition detector: "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(_REPEAT_OPTS.items())),
+                  file=sys.stderr, flush=True)
+
         inner_retry = getattr(_oc, "_should_retry", None)
         if inner_retry is not None:
             def _wrapped_retry(result, retries, max_retries, *a, **kw):
@@ -1349,6 +1406,15 @@ class SuryaWorker:
                           f"{retries + 1}/{max_retries} (temperature rises; a "
                           f"retried page costs another full generation)",
                           file=sys.stderr, flush=True)
+                else:
+                    # The last word on this page. If it STILL repeats, surya has
+                    # given up and the looping reply is what the page will be
+                    # parsed from — which usually yields a few blocks or none,
+                    # and then reads downstream exactly like a page the model
+                    # could not see. chandra has said "repeat_detected" since it
+                    # shipped; surya said nothing, so a cascade had to guess
+                    # from an empty page. Recorded here, where the verdict is.
+                    _note_loop(getattr(result, "raw", "") or "")
                 return again
             _oc._should_retry = _wrapped_retry
 
@@ -1477,6 +1543,14 @@ class SuryaWorker:
         # was slow and a page that was generated two, three or four times over,
         # and without it the only visible symptom is a batch that produces far
         # fewer completions than the GPU's throughput says it should.
+        # A page whose generation was still looping when surya gave up. The
+        # text below it is parsed from that reply, so it is usually short or
+        # empty — and this flag is the difference between "route this one to
+        # another engine" and "the scan is unreadable", which are opposite
+        # conclusions from the same blank page.
+        if _state().get("looping"):
+            page["repeat_detected"] = True
+            page["repeat_chars"] = int(_state().get("loop_chars") or 0)
         tries = _attempts()
         toks = _attempt_token_counts()
         cap = int(_page_override("max_tokens", _MAX_TOKENS[0])

@@ -1102,6 +1102,22 @@ class OcrConfig:
     #: stops making progress stops early regardless, so a generous budget costs
     #: nothing on a page that cannot use it. 0 disables resumption.
     surya_max_continuations: int = 8
+    #: surya's repetition detector, retuned. 0 on all three leaves its own
+    #: defaults (4 repeats, a 500-character window, scaling 3.0).
+    #:
+    #: A page it judges degenerate is re-run up to `surya_max_retries` times at
+    #: rising temperature and then parsed from whatever came back, so a FALSE
+    #: positive costs several full generations and usually returns less text
+    #: than the first reply had. Whether a repetition is degeneration depends on
+    #: the documents — a corpus of tables, dotted leaders or form fields repeats
+    #: short strings legitimately — which is why this is an operator setting and
+    #: not a per-request one: it describes the corpus, not the page.
+    #:
+    #: Raise `surya_repeat_max_repeats` to be more forgiving (more repetitions
+    #: before a reply counts as looping), lower it to be stricter.
+    surya_repeat_max_repeats: int = 0
+    surya_repeat_window: int = 0
+    surya_repeat_scaling: float = 0.0
     #: The serving model's context window, or 0 to ask the server for its own
     #: `max_model_len` (vLLM reports it on `/v1/models`).
     #:
@@ -1899,6 +1915,12 @@ class ConfigManager:
                 "surya_max_tokens": getattr(self.config.ocr, "surya_max_tokens", 0),
                 "surya_max_continuations": getattr(self.config.ocr,
                                                    "surya_max_continuations", 2),
+                "surya_repeat_max_repeats": getattr(
+                    self.config.ocr, "surya_repeat_max_repeats", 0),
+                "surya_repeat_window": getattr(self.config.ocr,
+                                               "surya_repeat_window", 0),
+                "surya_repeat_scaling": getattr(self.config.ocr,
+                                                "surya_repeat_scaling", 0.0),
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_token_trace": self.config.ocr.surya_token_trace,
                 "surya_repair_accents": self.config.ocr.surya_repair_accents,
