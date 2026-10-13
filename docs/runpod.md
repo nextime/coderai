@@ -334,6 +334,58 @@ Consequences worth knowing:
 
 `atexit` also tears down every pool on a clean shutdown.
 
+### Growing the fleet: demand, not one pod per boot
+
+Scale-up is triggered in `acquire()`. It used to be gated on a boolean,
+`_provisioning`, held for the whole provision — and a provision is a pod boot,
+~12 minutes. So however much work was queued, **the fleet grew by at most one
+pod per boot**: a burst needing four pods took forty minutes to be served by
+four, whatever `max_pods` said. Measured on 2026-10-13 with 64 pages in flight
+at `scale_up_inflight_per_pod: 16` (four pods of demand) and `max_pods: 64`: two
+pods, ready ten minutes apart.
+
+The grower also could not see the *size* of the demand. It asked
+`min(p.inflight) >= threshold`, which answers "is the fleet full?" — so the only
+request it could formulate was "one more". The requests blocked in `acquire()`
+waiting for a slot, which are the actual measure of unmet demand, were invisible.
+
+Both are now counts rather than flags:
+
+- **`_booting`** — pods this process is provisioning right now. Booting pods
+  count as capacity, so the same demand is never provisioned for twice.
+- **`_waiting`** — callers blocked for a slot, added to what the pods carry to
+  give the demand in pods: `ceil((inflight + waiting) / scale_up_inflight_per_pod)`.
+
+Growth continues while `pods + booting < demand`, bounded by `max_pods` and by
+**`scale_up_max_parallel_boots`** (default 4). That last one is a real limit and
+not a formality: the pods the demand justifies are also the GPUs that start
+billing together, so it is the knob that says how fast an operator is willing to
+spend to absorb a burst. The per-pod cost caps still refuse each pod
+individually.
+
+The original single-flight trigger is kept beside it — every pod at its
+in-flight threshold grows **one** more, single-flight, because
+`max_inflight_per_pod` defaults to unlimited and requests are then never
+blocked, so `_waiting` stays 0 and a merely-saturated fleet would never grow at
+all. A prediction gets one pod; measured demand may get several.
+
+Growth says so before it spends:
+
+```
+[runpod] 'datalab-to/surya-ocr-2': growing to meet 4 pod(s) of demand — 1 up, 2 booting
+```
+
+Two things found while fixing this, both worth knowing:
+
+- **A pod's boot time bounds the first burst, not `max_pods`.** Twelve minutes
+  pass before the first new pod answers anything, so a burst is served by
+  whatever is already warm. Raising `max_pods` does not help it.
+- **`acquire()` ignored its own timeout** when a *sibling process* was booting a
+  pod for the same pool: it waited a flat 15 s and looped straight back into the
+  same decision, never re-checking the deadline, for as long as the sibling's
+  registry entry survived (up to `REAP_GRACE_SECONDS`, 15 minutes). It now
+  raises when the caller's deadline passes.
+
 ### The same sweep reconciles the pools (a pod that dies behind our back)
 
 The listing is not only used to find pods that should not exist. It is also the

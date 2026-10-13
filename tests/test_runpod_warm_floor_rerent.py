@@ -70,13 +70,18 @@ def _install(monkeypatch, pool, ledger=None, unregistered=None):
                         lambda pid: (unregistered if unregistered is not None
                                      else []).append(pid))
 
-    class _Ledger:
-        @staticmethod
-        def record_spend(key, cost, meta):
-            if ledger is not None:
-                ledger.append((key, round(cost, 4), meta.get("pod_id")))
+    # Patch the FUNCTION on the real module, not the module in sys.modules:
+    # `from codai.api import runpod_ledger` reads the attribute already set on
+    # the `codai.api` package at first import, so a sys.modules stub is ignored
+    # the moment anything else has imported the real one — which made this pass
+    # alone and fail in a full run.
+    from codai.api import runpod_ledger as _real
 
-    monkeypatch.setitem(sys.modules, "codai.api.runpod_ledger", _Ledger)
+    def _record(key, cost, meta):
+        if ledger is not None:
+            ledger.append((key, round(cost, 4), meta.get("pod_id")))
+
+    monkeypatch.setattr(_real, "record_spend", _record)
 
 
 # -------------------------------------------- what the pool knows on its own #

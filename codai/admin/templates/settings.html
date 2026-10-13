@@ -1206,6 +1206,7 @@
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label" title="Worker PROCESSES, ~600 MB each. Capped at one per CPU core and half of free RAM.">Instances</label><input type="number" id="s-ocr-surya-instances" class="form-input" min="1" placeholder="1"></div>
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label" title="Pages in flight per worker process (served modes only — in Local mode a lane would be a second copy of the model on the card). Effective concurrency is Instances x Lanes, and a lane costs almost nothing because the recognition runs on the serving model.">Lanes / inst.</label><input type="number" id="s-ocr-surya-lanes" class="form-input" min="1" placeholder="4"></div>
       <div class="form-group" style="flex:1;min-width:130px"><label class="form-label" title="How many times Surya may RE-run a page whose generation repeated itself. Surya's own number is 3 and each retry is another FULL generation at a higher temperature: a batch measured on 2026-10-13 spent 2,644 generated tokens per page on text worth ~400, with a quarter of all requests re-sending an image the pod had already read. 1 keeps the rescue a retry does buy and drops the long tail; 0 disables it; -1 means whatever Surya decides. A retried page is reported as model_attempts in the result.">Retries / page</label><input type="number" id="s-ocr-surya-max-retries" class="form-input" min="-1" placeholder="1"></div>
+      <div class="form-group" style="flex:1;min-width:140px"><label class="form-label" title="Cap on the tokens Surya may generate for ONE page. 0 uses Surya's own 2048, which its vLLM backend never overrides. Surya-ocr-2 emits block markup (a category and a bbox per block) BEFORE the text, so a reply stopped at the cap is incomplete markup and parses to a few blocks or to none — the page then arrives as a short fragment or as no text at all, which looks exactly like a page the model could not read. A dense page can legitimately need several thousand tokens. model_attempts.truncated in a page's result tells you when this is what went wrong.">Max tokens / page</label><input type="number" id="s-ocr-surya-max-tokens" class="form-input" min="0" placeholder="0 = 2048"></div>
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer" title="Local mode only. On, Surya runs on this machine's GPU or refuses to load — it will not quietly fall back to the CPU, where a page takes minutes. Off, the CPU is used deliberately."><input type="checkbox" id="s-ocr-surya-use-gpu" checked><span>Require GPU (Local)</span></label>
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Langs</label><input type="text" id="s-ocr-surya-langs" class="form-input" placeholder="it"></div>
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer" title="Return the model's own per-token bytes wherever a page came back unreadable. A diagnostic — leave off unless you are chasing lost characters."><input type="checkbox" id="s-ocr-surya-token-trace"><span>Trace unreadable tokens</span></label>
@@ -2206,6 +2207,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-surya-instances').value = ocr.surya_instances ?? 1;
     document.getElementById('s-ocr-surya-lanes').value = ocr.surya_lanes ?? 4;
     document.getElementById('s-ocr-surya-max-retries').value = ocr.surya_max_retries ?? 1;
+    document.getElementById('s-ocr-surya-max-tokens').value = ocr.surya_max_tokens ?? 0;
     document.getElementById('s-ocr-surya-use-gpu').checked = ocr.surya_use_gpu !== false;
     document.getElementById('s-ocr-surya-langs').value = ocr.surya_langs ?? 'it';
     document.getElementById('s-ocr-surya-token-trace').checked = !!ocr.surya_token_trace;
@@ -2495,6 +2497,7 @@ async function saveSettings(silent){
       // 0 and -1 are both meaningful, so an explicit NaN check, not `|| 1`.
       surya_max_retries: (function(v){ v = parseInt(v); return isNaN(v) ? 1 : v; })(
         document.getElementById('s-ocr-surya-max-retries').value),
+      surya_max_tokens: parseInt(document.getElementById('s-ocr-surya-max-tokens').value) || 0,
       surya_langs: document.getElementById('s-ocr-surya-langs').value.trim() || 'it',
       surya_token_trace: document.getElementById('s-ocr-surya-token-trace').checked,
       surya_repair_accents: document.getElementById('s-ocr-surya-repair-accents').checked,

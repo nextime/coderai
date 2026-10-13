@@ -55,6 +55,11 @@ def _resolve_venv_dir(configured: str, name: str, baked_aliases: tuple = ()) -> 
     return os.path.expanduser(f"~/.coderai/{name}")
 
 
+#: Keys of the worker's page dict that are OcrPage FIELDS. Everything else it
+#: sends is a diagnostic and is forwarded onto `page.meta` untouched.
+_PAGE_FIELDS = ("index", "text", "width", "height", "lines", "regions", "tables")
+
+
 class SubprocessOcrEngine(OcrEngine):
     """Base for engines that run in an isolated venv subprocess."""
 
@@ -299,6 +304,7 @@ class SubprocessOcrEngine(OcrEngine):
 
     @staticmethod
     def _page_from_dict(d: dict) -> OcrPage:
+        """Rebuild an OcrPage from the worker's JSON."""
         page = OcrPage(index=int(d.get("index", 0)), text=d.get("text", ""),
                        width=int(d.get("width", 0)), height=int(d.get("height", 0)))
         page.lines = [OcrLine(text=l.get("text", ""), bbox=list(l.get("bbox", [0, 0, 0, 0])),
@@ -320,4 +326,14 @@ class SubprocessOcrEngine(OcrEngine):
         repaired = d.get("accents_repaired")
         if repaired:
             page.meta["accents_repaired"] = repaired
+        # Everything else the worker chose to say. Forwarded by exclusion, not by
+        # name: this reassembly has now dropped a diagnostic TWICE for the same
+        # reason -- `accents_repaired` once, so a working repair reported null,
+        # and `model_attempts` again, which was being hunted for in a live batch
+        # at the moment it was noticed. A key-by-key copy means every future
+        # diagnostic is born broken and nobody finds out until they need it.
+        for k, v in d.items():
+            if k in _PAGE_FIELDS or k in page.meta or v in (None, "", [], {}):
+                continue
+            page.meta[k] = v
         return page

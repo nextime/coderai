@@ -52,12 +52,21 @@ _TRACE = threading.local()
 #: module-level, so every lane in this process shares it.
 _RETRY_BUDGET = [None]
 
+#: Our override for surya's per-reply token cap, or 0 for surya's own 2048.
+#: Module-level for the same reason the retry budget is: the hook is.
+_MAX_TOKENS = [0]
+
+#: What surya uses when nobody tells it otherwise
+#: (`chat_completions_batch(max_tokens_default=2048)`).
+_SURYA_DEFAULT_MAX_TOKENS = 2048
+
 
 def _trace_begin():
     """Start a page's trace. Returns its (calls, repairs) — this thread's own."""
     _TRACE.calls = []
     _TRACE.repairs = []
     _TRACE.attempts = 0
+    _TRACE.tokens = []
     return _TRACE.calls, _TRACE.repairs
 
 
@@ -81,8 +90,31 @@ def _attempts_bump():
     return n
 
 
+def _attempt_tokens(n: int) -> None:
+    """How many tokens THIS attempt generated.
+
+    The number that separates a page the model could not read from a page whose
+    reply was cut off. surya-ocr-2 emits block markup -- a bbox and a tag per
+    block before any of the text -- so a generation stopped at its cap yields
+    markup that parses to a few blocks, or to none at all. "A few" is a page of
+    ~71 characters; "none" is a page with no text whatsoever. Both look like a
+    model that cannot read, and neither is.
+    """
+    try:
+        lst = getattr(_TRACE, "tokens", None)
+        if lst is None:
+            lst = _TRACE.tokens = []
+        lst.append(int(n or 0))
+    except Exception:
+        pass
+
+
 def _attempts():
     return getattr(_TRACE, "attempts", 0)
+
+
+def _attempt_token_counts():
+    return list(getattr(_TRACE, "tokens", None) or ())
 
 
 def _trace_repairs():
@@ -710,6 +742,8 @@ class SuryaWorker:
         #: the module cell because the hook that reads it is module-level.
         budget = opts.get("max_retries", None)
         _RETRY_BUDGET[0] = None if budget is None else max(0, int(budget))
+        #: 0 leaves surya's own 2048 in place.
+        _MAX_TOKENS[0] = max(0, int(opts.get("max_tokens", 0) or 0))
         #: The page's token logprobs and accent repairs live in _TRACE, per
         #: thread — see _trace_begin(). They were per-worker-object until lanes
         #: put several pages in one process.
@@ -777,9 +811,17 @@ class SuryaWorker:
             return
 
         def _wrapped(*args, **kwargs):
+            # surya's vLLM backend never passes `max_tokens_default`, so its
+            # 2048 was the only value available -- the same reason `max_retries`
+            # needed hooking. It arrives here as a keyword, so it can be raised
+            # without touching surya.
+            cap = _MAX_TOKENS[0]
+            if cap and "max_tokens_default" in kwargs:
+                kwargs["max_tokens_default"] = int(cap)
             result = inner(*args, **kwargs)
             try:
                 _attempts_bump()
+                _attempt_tokens(getattr(result, "token_count", 0))
                 sink = _trace_calls()
                 if sink is not None:
                     sink.append(getattr(result, "logprobs", None))
@@ -931,13 +973,29 @@ class SuryaWorker:
         # and without it the only visible symptom is a batch that produces far
         # fewer completions than the GPU's throughput says it should.
         tries = _attempts()
-        if tries > 1:
-            page["model_attempts"] = {
-                "calls": tries,
-                "why": ("surya re-ran this page because the generation repeated "
-                        "itself; each re-run is a full generation at a higher "
-                        "temperature"),
-            }
+        toks = _attempt_token_counts()
+        cap = int(_MAX_TOKENS[0] or _SURYA_DEFAULT_MAX_TOKENS)
+        # Reported whenever there is anything to report -- a retry, or a reply
+        # that stopped at its cap. A page cut off mid-markup parses to a few
+        # blocks or to none, which is indistinguishable in the finished text
+        # from a page the model genuinely could not read. This is the only place
+        # the difference is visible.
+        capped = [t for t in toks if t >= cap * 0.98]
+        if tries > 1 or capped:
+            info = {"calls": tries or 1, "tokens": toks, "cap": cap}
+            if capped:
+                info["truncated"] = True
+                info["why"] = (
+                    f"the reply stopped at the {cap}-token cap, so the block "
+                    f"markup it was in the middle of is incomplete and parses "
+                    f"to less text than the page holds (or to none). This is a "
+                    f"cut-off reply, NOT a page the model could not read -- "
+                    f"raise ocr.surya_max_tokens.")
+            else:
+                info["why"] = ("surya re-ran this page because the generation "
+                               "repeated itself; each re-run is a full "
+                               "generation at a higher temperature")
+            page["model_attempts"] = info
         if self._trace and UNREADABLE in page["text"]:
             try:
                 page["unreadable_trace"] = _trace_report(calls)

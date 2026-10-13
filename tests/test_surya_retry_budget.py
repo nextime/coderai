@@ -197,14 +197,86 @@ def test_a_retried_page_says_so_in_its_result():
     between a slow page and a page generated four times over."""
     src = SRC.read_text()
     assert '"model_attempts"' in src
-    blk = src.split("tries = _attempts()")[1][:400]
-    assert "if tries > 1" in blk          # a clean page stays byte-identical
+    blk = src.split("tries = _attempts()")[1][:1600]
+    assert "if tries > 1 or capped:" in blk      # a clean page stays untouched
+
+
+def test_a_truncated_reply_is_distinguished_from_an_unreadable_page():
+    """The two failure modes a live batch produced: ~98 pages of ~71 characters
+    and 100 with no text at all. Both are what a reply cut off mid-markup parses
+    to, and both look exactly like a page the model could not read."""
+    src = SRC.read_text()
+    blk = src.split("tries = _attempts()")[1][:1600]
+    assert '"truncated"' in blk
+    assert "cap" in blk and "NOT a page the model could not read" in blk
 
 
 def test_a_clean_page_carries_no_attempt_block():
+    """One attempt, well under the cap: byte-identical to what it always
+    returned."""
     src = SRC.read_text()
     i = src.index("tries = _attempts()")
-    assert "if tries > 1:" in src[i:i + 200]
+    assert "if tries > 1 or capped:" in src[i:i + 1600]
+
+
+def test_the_token_counts_are_per_thread():
+    """Like the trace and the attempt count: one lane must not report another
+    lane's token counts, or the truncation verdict lands on the wrong page."""
+    mod = _worker_module()
+    import threading as _th
+    seen = {}
+
+    def lane(name, counts):
+        mod._trace_begin()
+        for c in counts:
+            mod._attempt_tokens(c)
+        seen[name] = mod._attempt_token_counts()
+
+    a = _th.Thread(target=lane, args=("a", [2048]))
+    b = _th.Thread(target=lane, args=("b", [11, 12]))
+    a.start(); b.start(); a.join(); b.join()
+    assert seen == {"a": [2048], "b": [11, 12]}
+
+
+def test_the_cap_can_be_raised_without_touching_surya(monkeypatch):
+    """surya's vLLM backend never passes max_tokens_default, so 2048 was the
+    only value available. It arrives at _generate_one as a keyword, so the hook
+    can raise it."""
+    mod = _worker_module()
+    oc = _fake_surya(monkeypatch, mod)
+    seen = {}
+
+    def _gen(*a, **k):
+        seen.update(k)
+        return _Result()
+
+    oc._generate_one = _gen
+    w = _worker(mod, token_trace=True, max_tokens=8192)
+    w._install_trace_hook()
+    oc._generate_one(max_tokens_default=2048)
+    assert seen["max_tokens_default"] == 8192
+
+
+def test_zero_leaves_suryas_own_cap_alone(monkeypatch):
+    """Raising it costs tokens on every page, so it is opt-in."""
+    mod = _worker_module()
+    oc = _fake_surya(monkeypatch, mod)
+    seen = {}
+    oc._generate_one = lambda *a, **k: (seen.update(k), _Result())[1]
+    w = _worker(mod, token_trace=True, max_tokens=0)
+    w._install_trace_hook()
+    oc._generate_one(max_tokens_default=2048)
+    assert seen["max_tokens_default"] == 2048
+    from codai.config import OcrConfig
+    assert OcrConfig().surya_max_tokens == 0
+
+
+def test_the_engine_sends_the_token_cap_at_load():
+    from codai.ocr.surya import SuryaEngine
+    from codai.config import OcrConfig
+    cfg = OcrConfig()
+    cfg.surya_max_tokens = 6000
+    assert SuryaEngine(cfg)._worker_opts()["max_tokens"] == 6000
 
 
 # -------------------------------------------- the engine passes it through #

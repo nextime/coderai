@@ -1005,7 +1005,63 @@ Both halves are now bounded:
   is down, since the replacement asks that same front for its lease. A 503 means
   the pool has nothing rented this second, which the lease does not care about.
 
-#### A batch can be GPU-idle and still look stalled
+#### An empty page and a 71-character page are the same bug
+
+Two failure modes from one live batch: ~98 pages of about **71 characters** and
+**100 with no text at all**, against 13 that read perfectly. Neither is a model
+that cannot read.
+
+`surya-ocr-2` emits **block markup** — a category and a bounding box per block,
+*before* that block's text. A reply stopped at its token cap is therefore
+incomplete markup, and incomplete markup parses to a handful of blocks, or to
+none:
+
+| what the reply had room for | what the page looks like |
+|---|---|
+| all of it | the page, correctly |
+| some blocks, then the cap | a short fragment — the uniform low chars-per-page |
+| only markup, then the cap | **no text at all** |
+
+The cap is surya's `chat_completions_batch(max_tokens_default=2048)`, which its
+vLLM backend never overrides — so 2048 was the only value there has ever been.
+A dense page can legitimately need several thousand tokens, and a batch measured
+on 2026-10-13 averaged **2,644 generated tokens per request**, i.e. above the
+cap.
+
+`ocr.surya_max_tokens` raises it (0 = leave surya's 2048). It is opt-in because
+a higher cap costs tokens on every page and the right value depends on the
+documents. What is **not** optional is being able to tell the two cases apart,
+so every page that hit the cap says so in its own result:
+
+```json
+"model_attempts": {
+  "calls": 1, "tokens": [2048], "cap": 2048, "truncated": true,
+  "why": "the reply stopped at the 2048-token cap, so the block markup it was in
+          the middle of is incomplete and parses to less text than the page holds
+          (or to none). This is a cut-off reply, NOT a page the model could not
+          read — raise ocr.surya_max_tokens."
+}
+```
+
+A page whose reply fitted carries nothing, and is byte-identical to what it
+always returned. The per-attempt token counts are kept **per thread**, like the
+token trace, so one lane never reports another lane's verdict.
+
+### A diagnostic that does not arrive is not a diagnostic
+
+`model_attempts` was added, shipped, and then hunted for in a live batch that
+could not have contained it: `SubprocessOcrEngine._page_from_dict` copied the
+worker's diagnostics onto `page.meta` **by name**, and it knew only
+`unreadable_trace` and `accents_repaired`. The same reassembly had already
+dropped `accents_repaired` once, so a working repair reported `null`.
+
+It now forwards by exclusion — every key that is not an `OcrPage` field becomes
+`page.meta`. A key-by-key copy means each new diagnostic is born broken and
+nobody finds out until the moment they need it.
+
+---
+
+## A batch can be GPU-idle and still look stalled
 
 Measured on the Digesta orchestrator on 2026-10-13, ten minutes of batch OCR at
 four client workers, read from the pod's own drained log

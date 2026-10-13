@@ -158,6 +158,15 @@ class RunpodModelConfig:
     # pool only ever grows when it has NO healthy pod, so fifty concurrent
     # requests would all pile onto pod #1 while max_pods sat unused.
     scale_up_inflight_per_pod: int = 4
+    # How many pods may be BOOTING at once when the load justifies them. 1 was
+    # the old behaviour, and it was not a choice: the grower held a single
+    # boolean for the whole ~12-minute boot, so a burst needing four pods took
+    # forty minutes to be served by four. It is still a real limit and not just
+    # a formality, because the pods the demand justifies are also the GPUs that
+    # start billing together — so this is the knob that says how fast an
+    # operator is willing to spend to absorb a burst. Growth never exceeds
+    # max_pods, and the cost caps still refuse each pod individually.
+    scale_up_max_parallel_boots: int = 4
     # Scaling DOWN again when the pressure that justified the pods is gone.
     # Idle teardown alone is not enough: it only fires on a pod with NO work and
     # no request for idle_timeout_s, so a fleet that grew to absorb a burst and
@@ -1745,6 +1754,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
                                              cfg.client_scale_ttl_s) or 1800)
     cfg.scale_up_inflight_per_pod = max(1, _as_int(b.get("scale_up_inflight_per_pod"),
                                                    cfg.scale_up_inflight_per_pod))
+    cfg.scale_up_max_parallel_boots = max(1, _as_int(
+        b.get("scale_up_max_parallel_boots"), cfg.scale_up_max_parallel_boots))
     # 0 disables shedding entirely (pods then go only when idle_timeout_s says so).
     cfg.scale_down_after_s = max(0, _as_int(b.get("scale_down_after_s"),
                                             cfg.scale_down_after_s))
@@ -2190,6 +2201,14 @@ class RunpodPodPool:
     busy pod for a dead one.
     """
 
+    #: Class-level so an instance built without __init__ (several tests, and
+    #: any future path that skips it) reads 0 rather than raising. `_booting` is
+    #: pods THIS process is provisioning right now; `_waiting` is acquire()
+    #: callers blocked for a slot. Both are counts, because the grower has to
+    #: know how MUCH demand there is, not merely whether the fleet is full.
+    _booting = 0
+    _waiting = 0
+
     def __init__(self, model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
                  entry: dict = None):
         #: The model's models.json entry, when this pool serves one specific
@@ -2222,7 +2241,16 @@ class RunpodPodPool:
         self._client_floor = 0
         self._client_floor_until = 0.0
         self._client_floor_logged = -1
-        self._provisioning = False
+        #: Pods THIS process is provisioning right now. A count, not a flag: it
+        #: used to be a boolean, and because a pod takes minutes to boot, the
+        #: pool could grow by at most one pod per boot however much work was
+        #: queued. Measured on 2026-10-13: 64 pages wanting 4 pods got 2, ready
+        #: ten minutes apart, and the client reported "no real scale-out".
+        self._booting = 0
+        #: acquire() callers blocked waiting for a slot. Without this the grower
+        #: can see THAT the fleet is full (every pod at its ceiling) but not BY
+        #: HOW MUCH, so it could only ever ask for one more pod.
+        self._waiting = 0
         self._closed = False
         #: When the fleet first looked larger than the load needs. Scale-down
         #: waits out scale_down_after_s from here, so a momentary dip in a burst
@@ -2833,9 +2861,9 @@ class RunpodPodPool:
             # self.pods until it does. Without this flag the 15 s scaler sees
             # "0 healthy, floor 1" and rents a second one — two A40s where the
             # configuration asked for one.
-            if self._provisioning:
+            if self._booting:
                 return
-            self._provisioning = True
+            self._booting += 1
         try:
             # A pod for this pool may already be up — a sibling engine's, or our
             # own from before the last restart. Renting beside it is how a warm
@@ -2860,7 +2888,7 @@ class RunpodPodPool:
                     raise
         finally:
             with self._cv:
-                self._provisioning = False
+                self._booting = max(0, self._booting - 1)
 
     def _pick(self, healthy: list, affinity: str):
         """Which pod serves this request: the one that already holds the
@@ -2885,13 +2913,42 @@ class RunpodPodPool:
         while len(self._affinity) > 4096:
             self._affinity.popitem(last=False)
 
+    def _pods_for_demand(self, serving: list) -> int:
+        """How many pods the work we can SEE justifies, capped at max_pods.
+
+        The work we can see is what the pods are carrying plus what is blocked
+        in acquire() waiting for a slot. The waiters are the part that was
+        missing: without them the grower knew the fleet was full but not by how
+        much, so the only question it could answer was "one more?".
+        """
+        threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
+        load = sum(p.inflight for p in serving) + max(0, self._waiting)
+        want = (load + threshold - 1) // threshold
+        return max(1, min(int(self.mcfg.max_pods), want))
+
     def _should_grow(self, healthy: list) -> bool:
         """True when real concurrency justifies another pod.
 
         The pool used to grow only when it had NO healthy pod, so every request
         beyond the first piled onto pod #1 and max_pods never came into play.
+
+        Then it grew one pod at a time — and since `_provisioning` stayed true
+        for the whole boot, "at a time" meant one per BOOT. A pod takes ~12
+        minutes to become ready (image pull plus warm-up), so a burst needing
+        four pods took forty minutes to be served by four, whatever max_pods
+        said. Measured on 2026-10-13: 64 pages in flight at 16 per pod, two pods
+        rented, ready ten minutes apart.
+
+        So the bound is the DEMAND, not the number one — while never exceeding
+        max_pods, and never more than `scale_up_max_parallel_boots` on the way
+        at once, because the demand-derived number is also the number of GPUs
+        that start billing together.
         """
-        if len(self.pods) >= self.mcfg.max_pods or self._provisioning:
+        in_hand = len(self.pods) + self._booting
+        if in_hand >= self.mcfg.max_pods:
+            return False
+        parallel = max(1, int(getattr(self.mcfg, "scale_up_max_parallel_boots", 1) or 1))
+        if self._booting >= parallel:
             return False
         # A draining pod is on its way out and takes no new work, so counting it
         # as capacity would answer "no need to grow" with the one pod that cannot
@@ -2899,9 +2956,25 @@ class RunpodPodPool:
         # opposite. It is simply not part of the fleet any more.
         serving = [p for p in healthy if not p.draining]
         if not serving:
+            # Nothing can serve a request. One on the way is enough to wait for;
+            # a second here would be two cards for the same first request, which
+            # is how a warm floor of one became two.
+            return self._booting == 0
+        # Demand we can measure: what the pods carry plus what is blocked. This
+        # is the part that may grow SEVERAL pods at once, because the number is
+        # real rather than a guess about the future.
+        if in_hand < self._pods_for_demand(serving):
             return True
+        # And the original, anticipatory trigger: every pod is at its in-flight
+        # threshold, so the next request has nowhere good to go. Kept because
+        # `max_inflight_per_pod` defaults to unlimited, so requests are often
+        # never blocked and `_waiting` stays 0 — without this a fleet whose pods
+        # are merely saturated would never grow at all. Single-flight, because
+        # unlike the demand above this is a prediction, and a prediction should
+        # not rent four cards.
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-        return min(p.inflight for p in serving) >= threshold
+        return (self._booting == 0
+                and min(p.inflight for p in serving) >= threshold)
 
     def _grow_in_background(self):
         """Provision another pod without making the triggering request wait for it.
@@ -2918,7 +2991,10 @@ class RunpodPodPool:
                 print(f"[runpod] scale-up for {self.model_key!r} failed: {exc}", flush=True)
             finally:
                 with self._cv:
-                    self._provisioning = False
+                    # Decrement, not reset: several boots may be on the way, and
+                    # zeroing here would let the grower start the whole fleet
+                    # again for demand that is already being provisioned for.
+                    self._booting = max(0, self._booting - 1)
                     self._cv.notify_all()
         threading.Thread(target=_run, daemon=True,
                          name=f"runpod-grow-{self.model_key}").start()
@@ -2939,8 +3015,9 @@ class RunpodPodPool:
                 healthy = [p for p in self.pods if p.healthy]
                 chosen = self._pick(healthy, affinity) if healthy else None
                 if self._should_grow(healthy):
-                    self._provisioning = True
+                    self._booting += 1
                     grow_now = True
+                    want = self._pods_for_demand([p for p in healthy if not p.draining])
                 if chosen is not None:
                     chosen.inflight += 1
                     chosen.last_used = time.time()
@@ -2948,6 +3025,9 @@ class RunpodPodPool:
                     url = chosen.url
             if chosen is not None:
                 if grow_now:
+                    print(f"[runpod] {self.model_key!r}: growing to meet "
+                          f"{want} pod(s) of demand — {len(self.pods)} up, "
+                          f"{self._booting} booting", flush=True)
                     self._grow_in_background()      # absorbs the NEXT request
                 return chosen, url
 
@@ -2961,13 +3041,24 @@ class RunpodPodPool:
                     print(f"[runpod] another engine is booting a pod for "
                           f"{self.model_key!r} — waiting for it", flush=True)
                     with self._cv:
-                        self._provisioning = False
+                        self._booting = max(0, self._booting - 1)
                         self._cv.notify_all()
-                        self._cv.wait(15.0)
+                        # Never past the caller's deadline. This waited a flat
+                        # 15s and looped straight back into _should_grow, which
+                        # answers the same way while the sibling is still
+                        # booting — so the deadline was never reached and the
+                        # caller's timeout was ignored for as long as a sibling
+                        # entry survived (up to REAP_GRACE_SECONDS).
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            raise RunpodError(
+                                f"RunPod: another process is still booting a pod "
+                                f"for {self.model_key!r} after {timeout}s.")
+                        self._cv.wait(min(remaining, 15.0))
                     continue
                 if self._adopt_shared_pod():
                     with self._cv:
-                        self._provisioning = False
+                        self._booting = max(0, self._booting - 1)
                         self._cv.notify_all()
                     continue
                 # Nothing to serve this request yet — provision inline and retry.
@@ -2975,12 +3066,15 @@ class RunpodPodPool:
                     self._provision_one()
                 finally:
                     with self._cv:
-                        self._provisioning = False
+                        self._booting = max(0, self._booting - 1)
                         self._cv.notify_all()
                 continue
 
             # At max_pods with every pod at its in-flight ceiling, or someone else
-            # is provisioning: wait for a slot rather than piling on.
+            # is provisioning: wait for a slot rather than piling on. Counted
+            # while waiting, so the next pass through _should_grow can see how
+            # much work is actually queued rather than only that the fleet is
+            # full.
             with self._cv:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -2989,7 +3083,11 @@ class RunpodPodPool:
                         f"(max_pods={self.mcfg.max_pods}, "
                         f"max_inflight_per_pod={self.mcfg.max_inflight_per_pod}) "
                         f"within {timeout}s.")
-                self._cv.wait(min(remaining, 10.0))
+                self._waiting += 1
+                try:
+                    self._cv.wait(min(remaining, 10.0))
+                finally:
+                    self._waiting = max(0, self._waiting - 1)
 
     def release(self, pod: PodHandle):
         with self._cv:
@@ -3345,16 +3443,16 @@ class RunpodPodPool:
             healthy_n = len([p for p in self.pods if p.healthy])
             if self._release_pending and healthy_n <= keep_min:
                 self._release_pending = False          # satisfied
-        if healthy_n < keep_min and not self._closed and not self._provisioning:
+        if healthy_n < keep_min and not self._closed and not self._booting:
             # One already on the way (from here, from ensure_ready, or from a
             # sibling engine sharing this pool) is one pod, not none: topping up
             # against a booting pod is how a warm floor of 1 became two.
             if sibling_is_provisioning(str(self.model_key)):
                 return
             with self._cv:
-                if self._provisioning:
+                if self._booting:
                     return
-                self._provisioning = True
+                self._booting += 1
             # Say so before spending. A warm floor silently failing to be
             # re-established is indistinguishable, from outside, from a warm
             # floor that is fine — which is how a pod terminated out of band
@@ -3368,7 +3466,7 @@ class RunpodPodPool:
                 print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
             finally:
                 with self._cv:
-                    self._provisioning = False
+                    self._booting = max(0, self._booting - 1)
 
     def close(self):
         self._closed = True

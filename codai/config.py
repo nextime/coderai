@@ -1051,6 +1051,20 @@ class OcrConfig:
     #: 1 keeps the rescue a retry does buy and drops the long tail; 0 disables
     #: it; -1 means "whatever surya decides".
     surya_max_retries: int = 1
+    #: Cap on the tokens surya may generate for one page, or 0 for surya's own
+    #: 2048 (`chat_completions_batch(max_tokens_default=2048)`, which its vLLM
+    #: backend never overrides, so 2048 was the only value available).
+    #:
+    #: It matters because surya-ocr-2 emits BLOCK MARKUP -- a category and a
+    #: bbox per block, before the text -- so a reply stopped at the cap is
+    #: incomplete markup, and incomplete markup parses to a few blocks or to
+    #: none. The page then arrives as a short fragment or as no text at all,
+    #: which is indistinguishable in the finished text from a page the model
+    #: could not read. A dense page can legitimately need several thousand
+    #: tokens. 0 by default because raising it costs tokens on every page and
+    #: the right value depends on the documents; `model_attempts.truncated` in a
+    #: page's result says when this is what went wrong.
+    surya_max_tokens: int = 0
     surya_langs: str = "it"
     # Return the model's own per-token bytes for the places a page came back
     # unreadable (see base.UNREADABLE). Off by default: it is a diagnostic, it
@@ -1802,6 +1816,7 @@ class ConfigManager:
                 "surya_instances": self.config.ocr.surya_instances,
                 "surya_lanes": getattr(self.config.ocr, "surya_lanes", 4),
                 "surya_max_retries": getattr(self.config.ocr, "surya_max_retries", 1),
+                "surya_max_tokens": getattr(self.config.ocr, "surya_max_tokens", 0),
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_token_trace": self.config.ocr.surya_token_trace,
                 "surya_repair_accents": self.config.ocr.surya_repair_accents,
