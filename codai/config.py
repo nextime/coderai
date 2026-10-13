@@ -1028,7 +1028,16 @@ class OcrConfig:
     # --- Surya (LICENSE-GATED) --- runs in an ISOLATED venv subprocess (pillow<11 clash)
     surya_enabled: bool = False
     surya_accept_license: bool = False   # MUST be explicitly set (GPL — compatible with coderai GPLv3)
-    surya_instances: int = 1
+    surya_instances: int = 1             # WORKER PROCESSES (~600 MB each)
+    #: Pages in flight PER worker process, in the served modes only. The
+    #: protocol used to be one page per process, so concurrency was the process
+    #: count: `surya_instances: 64` meant 64 processes and 37 GB, and on
+    #: 2026-10-12 it meant a nine-minute stall with the GPU idle. In a served
+    #: mode the process only rasterises a page and waits on a socket, so lanes
+    #: buy the same concurrency for one torch import instead of N. Effective
+    #: concurrency is instances x lanes. In `local` mode this is ignored (a lane
+    #: would be a second copy of the model on the card).
+    surya_lanes: int = 4
     surya_langs: str = "it"
     # Return the model's own per-token bytes for the places a page came back
     # unreadable (see base.UNREADABLE). Off by default: it is a diagnostic, it
@@ -1778,6 +1787,7 @@ class ConfigManager:
                 "surya_enabled": self.config.ocr.surya_enabled,
                 "surya_accept_license": self.config.ocr.surya_accept_license,
                 "surya_instances": self.config.ocr.surya_instances,
+                "surya_lanes": getattr(self.config.ocr, "surya_lanes", 4),
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_token_trace": self.config.ocr.surya_token_trace,
                 "surya_repair_accents": self.config.ocr.surya_repair_accents,

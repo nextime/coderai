@@ -4138,6 +4138,7 @@ def build_settings_dict(c, gpu_cards):
             "surya_enabled": c.ocr.surya_enabled,
             "surya_accept_license": c.ocr.surya_accept_license,
             "surya_instances": c.ocr.surya_instances,
+            "surya_lanes": getattr(c.ocr, "surya_lanes", 4),
             "surya_langs": c.ocr.surya_langs,
             "surya_token_trace": c.ocr.surya_token_trace,
             "surya_repair_accents": c.ocr.surya_repair_accents,
@@ -4961,6 +4962,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_enabled" in d: o.surya_enabled = bool(d["surya_enabled"])
         if "surya_accept_license" in d: o.surya_accept_license = bool(d["surya_accept_license"])
         if "surya_instances" in d: o.surya_instances = _i("surya_instances", o.surya_instances, 1)
+        if "surya_lanes" in d: o.surya_lanes = _i("surya_lanes", getattr(o, "surya_lanes", 4), 1)
         if "surya_token_trace" in d: o.surya_token_trace = bool(d["surya_token_trace"])
         if "surya_repair_accents" in d: o.surya_repair_accents = bool(d["surya_repair_accents"])
         if "surya_langs" in d: o.surya_langs = (d.get("surya_langs") or "it").strip()

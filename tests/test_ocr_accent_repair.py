@@ -178,9 +178,10 @@ def test_a_repaired_page_says_so(monkeypatch):
     w._mode = "predictor"
 
     def _predict(img):
-        # The hook registers the repair DURING the call; ocr() clears the list
-        # first, so pre-populating it would prove nothing.
-        w._repairs.append({"recovered": 4})
+        # The hook registers the repair DURING the call, into the calling
+        # THREAD's list; ocr() starts a fresh one, so pre-populating would prove
+        # nothing.
+        W._trace_repairs().append({"recovered": 4})
         return [{"blocks": [{"html": "<p>società</p>",
                              "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
                              "confidence": 0.96, "reading_order": 0}]}]
@@ -208,9 +209,21 @@ def test_repairs_are_cleared_between_pages(monkeypatch):
     monkeypatch.setattr(w, "_predict", lambda img: [
         {"blocks": [{"html": "<p>ok</p>", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
                      "confidence": 0.9, "reading_order": 0}]}])
-    w._repairs.append({"recovered": 1})
-    w.ocr(Image.new("RGB", (10, 10)))
-    assert w._repairs == []
+    pages = []
+
+    def _repairing(img):
+        if not pages:
+            W._trace_repairs().append({"recovered": 1})
+        pages.append(1)
+        return [{"blocks": [{"html": "<p>ok</p>",
+                             "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                             "confidence": 0.9, "reading_order": 0}]}]
+    monkeypatch.setattr(w, "_predict", _repairing)
+    first = w.ocr(Image.new("RGB", (10, 10)))
+    second = w.ocr(Image.new("RGB", (10, 10)))
+    assert "accents_repaired" in first
+    assert "accents_repaired" not in second       # page 2 does not inherit it
+    assert W._trace_repairs() == []
 
 
 # ---------------------------------------------------------------- and the wiring #

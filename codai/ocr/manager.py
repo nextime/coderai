@@ -276,6 +276,20 @@ def _engine_instances(cfg, name: str) -> int:
     return want
 
 
+def _engine_lanes(eng) -> int:
+    """How many pages one instance of ``eng`` serves at once, asked politely.
+
+    `OcrEngine` has `lanes()`, but an engine is anything with `recognize_image` —
+    the fallback chain and several tests drive duck-typed ones — and a pool must
+    not refuse to build because an engine does not know about a capability it
+    simply does not have. Unknown means one.
+    """
+    try:
+        return max(1, int(eng.lanes() or 1))
+    except Exception:
+        return 1
+
+
 def _evict_for_ocr(needed_gb: float) -> None:
     """Ask the model manager to free ``needed_gb`` of VRAM before an OCR pool loads,
     so OCR instances contend for VRAM on equal footing with LLM/diffusion models
@@ -424,7 +438,12 @@ class _Pool:
                     if first and need <= 0:
                         await asyncio.to_thread(_evict_for_ocr, self.size * eng.vram_gb())
                     self._instances.append(eng)
-                    await self._q.put(eng)
+                    # A lane is a page this instance can serve CONCURRENTLY, so
+                    # the instance is offered once per lane. The queue is what
+                    # bounds concurrency, and handing out the same engine twice
+                    # is exactly what a multi-lane worker is for.
+                    for _ in range(_engine_lanes(eng)):
+                        await self._q.put(eng)
             except Exception as e:
                 self.release_sync()
                 self._fail_at = time.time()
@@ -433,7 +452,12 @@ class _Pool:
                 raise self._fail_err
             self._fail_err = None
             self._built = True
-            print(f"[ocr] engine '{self.name}': {self.size} instance(s) ready")
+            lanes = _engine_lanes(self._instances[0]) if self._instances else 1
+            if lanes > 1:
+                print(f"[ocr] engine '{self.name}': {self.size} instance(s) ready, "
+                      f"{lanes} lane(s) each — {self.size * lanes} pages at once")
+            else:
+                print(f"[ocr] engine '{self.name}': {self.size} instance(s) ready")
 
     def release_sync(self) -> float:
         """Tear down all instances (free VRAM). SYNC — safe to call from the model

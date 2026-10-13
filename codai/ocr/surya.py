@@ -76,6 +76,25 @@ class SuryaEngine(SubprocessOcrEngine):
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")
 
+    def lanes(self) -> int:
+        """Pages in flight per worker process.
+
+        Only in the SERVED modes, and that is the whole point: there the
+        recognition VLM is somewhere else, the predictor holds no weights (1.7 MB
+        of tokenizer and config on disk) and this process rasterises a page and
+        then waits on a socket. Several pages can wait at once for the price of
+        the torch import that is already paid.
+
+        In `local` mode a lane would be a second copy of the model on this
+        machine's GPU, so there is exactly one.
+        """
+        if self._serve_mode() not in self.SERVED_MODES:
+            return 1
+        try:
+            return max(1, int(getattr(self.cfg, "surya_lanes", 4) or 1))
+        except (TypeError, ValueError):
+            return 4
+
     def _serve_mode(self) -> str:
         mode = (getattr(self.cfg, "surya_serve", "model") or "model").strip().lower()
         return "llamacpp" if mode == "server" else mode

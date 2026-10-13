@@ -65,7 +65,12 @@ class SubprocessOcrEngine(OcrEngine):
     def __init__(self, cfg):
         super().__init__(cfg)
         self._proc = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()        # guards _pending
+        self._wlock = threading.Lock()       # one writer on the worker's stdin
+        self._pending = {}                   # request id -> {"event", "reply"}
+        self._next_id = 0
+        self._mux = False                    # replies carry ids and arrive out of order
+        self._reader = None
 
     # -- subclass hooks ----------------------------------------------------
 
@@ -78,6 +83,15 @@ class SubprocessOcrEngine(OcrEngine):
 
     def _auto_build(self) -> bool:
         return False
+
+    def lanes(self) -> int:
+        """How many pages this engine's worker may have in flight at once.
+
+        One, unless a subclass knows better. A lane costs a worker OBJECT inside
+        the existing process, not a process — which is only cheap when the
+        engine's heavy part lives somewhere else (see SuryaEngine.lanes).
+        """
+        return 1
 
     def _worker_opts(self) -> dict:
         return {}
@@ -142,11 +156,25 @@ class SubprocessOcrEngine(OcrEngine):
         ready = self._readline()
         if not ready.get("ready"):
             raise OcrError(f"{self.name}: worker did not signal ready", status=500)
-        resp = self._rpc({"cmd": "load", "opts": self._worker_opts()})
+        opts = dict(self._worker_opts())
+        want = max(1, int(self.lanes() or 1))
+        opts["lanes"] = want
+        resp = self._rpc({"cmd": "load", "opts": opts})
         if not resp.get("ok"):
             self._kill()
             raise OcrError(resp.get("error") or f"{self.name}: load failed",
                            status=int(resp.get("status", 500)))
+        # The worker echoes the lanes it will actually serve. Only then does the
+        # parent start reading replies out of order: a worker that did not answer
+        # with a lane count is driven exactly as before, one page at a time.
+        got = int(resp.get("lanes") or 1)
+        self._mux = got > 1
+        if self._mux:
+            self._reader = threading.Thread(target=self._read_replies, daemon=True,
+                                            name=f"ocr-{self.name}-reader")
+            self._reader.start()
+            print(f"[ocr] {self.name}: worker serves {got} page(s) at once "
+                  f"in one process", flush=True)
 
     def _readline(self) -> dict:
         line = self._proc.stdout.readline()
@@ -164,6 +192,75 @@ class SubprocessOcrEngine(OcrEngine):
         self._proc.stdin.flush()
         return self._readline()
 
+    def _read_replies(self) -> None:
+        """Hand each reply to the page that asked for it, until the pipe closes.
+
+        A reply with no id belongs to a sequential RPC (load, ping) and cannot
+        reach here: those run before the reader starts. Anything unrecognised is
+        dropped rather than guessed at — attributing a page's text to the wrong
+        request is the one failure worse than losing it.
+        """
+        proc = self._proc
+        while True:
+            try:
+                line = proc.stdout.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            rid = msg.get("id")
+            if rid is None:
+                continue
+            with self._lock:
+                slot = self._pending.pop(rid, None)
+            if slot is not None:
+                slot["reply"] = msg
+                slot["event"].set()
+        # The worker is gone. Everyone still waiting would otherwise wait for ever.
+        self._fail_pending(f"{self.name}: worker closed the pipe")
+
+    def _fail_pending(self, why: str) -> None:
+        with self._lock:
+            waiting = list(self._pending.values())
+            self._pending.clear()
+        for slot in waiting:
+            slot["reply"] = {"ok": False, "error": why, "status": 500}
+            slot["event"].set()
+
+    def _rpc_mux(self, msg: dict) -> dict:
+        """One page, tagged, answered by the reader thread whenever it lands."""
+        if self._proc is None or self._proc.poll() is not None:
+            raise OcrError(f"{self.name}: worker not running", status=500)
+        slot = {"event": threading.Event(), "reply": None}
+        with self._lock:
+            self._next_id += 1
+            rid = self._next_id
+            self._pending[rid] = slot
+        try:
+            line = json.dumps(dict(msg, id=rid)) + "\n"
+            with self._wlock:
+                self._proc.stdin.write(line)
+                self._proc.stdin.flush()
+        except Exception as e:
+            with self._lock:
+                self._pending.pop(rid, None)
+            raise OcrError(f"{self.name}: worker not running ({e})", status=500)
+        # No deadline on the page itself — a dense scan legitimately takes
+        # minutes, and the engine above has its own timeout. But a worker that
+        # DIED must not read as a page still being worked on, so the wait is
+        # broken up to check that it is still there.
+        while not slot["event"].wait(5.0):
+            if self._proc is None or self._proc.poll() is not None:
+                with self._lock:
+                    self._pending.pop(rid, None)
+                raise OcrError(f"{self.name}: worker died while reading a page",
+                               status=500)
+        return slot["reply"] or {"ok": False, "error": f"{self.name}: no reply"}
+
     def _kill(self):
         try:
             if self._proc:
@@ -171,6 +268,8 @@ class SubprocessOcrEngine(OcrEngine):
         except Exception:
             pass
         self._proc = None
+        self._mux = False
+        self._fail_pending(f"{self.name}: worker stopped")
 
     def cleanup(self) -> None:
         """Stop the worker subprocess (frees its VRAM). SYNC."""
@@ -188,8 +287,11 @@ class SubprocessOcrEngine(OcrEngine):
         buf = io.BytesIO()
         image.convert("RGB").save(buf, "PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        with self._lock:                       # one request at a time per subprocess
-            resp = self._rpc({"cmd": "ocr", "image": b64})
+        if self._mux:
+            resp = self._rpc_mux({"cmd": "ocr", "image": b64})
+        else:
+            with self._lock:                   # one request at a time per subprocess
+                resp = self._rpc({"cmd": "ocr", "image": b64})
         if not resp.get("ok"):
             raise OcrError(resp.get("error") or f"{self.name}: ocr failed",
                            status=int(resp.get("status", 500)))

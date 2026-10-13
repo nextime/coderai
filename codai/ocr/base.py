@@ -192,6 +192,16 @@ class OcrEngine(ABC):
         manager's VRAM-eviction thread). Overridden per engine."""
         self._loaded = False
 
+    def lanes(self) -> int:
+        """How many pages ONE instance may serve at once.
+
+        One by default: an engine is only safe to drive concurrently if it says
+        so. The in-process engines (chandra, olmOCR) get their concurrency from
+        the instance count instead, each instance being a slot rather than a
+        process, so they have no reason to raise this.
+        """
+        return 1
+
     def vram_gb(self) -> float:
         """Rough VRAM footprint (GB) of one loaded instance, for eviction accounting."""
         return 1.0

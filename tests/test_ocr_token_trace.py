@@ -197,10 +197,14 @@ def test_a_clean_page_reports_nothing(monkeypatch):
     """The whole response shape has to stay byte-identical when nothing is wrong."""
     w = W.SuryaWorker({"token_trace": True})
     w._mode = "predictor"
-    w._calls.append([_tok("Ã", [195])])          # an anomaly is present...
-    monkeypatch.setattr(w, "_predict", lambda img: [
-        {"blocks": [{"html": "<p>tutto bene</p>", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
-                     "confidence": 0.9, "reading_order": 0}]}])
+
+    def _predict(img):
+        # An anomaly IS present in what the model sent...
+        W._trace_calls().append([_tok("Ã", [195])])
+        return [{"blocks": [{"html": "<p>tutto bene</p>",
+                             "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                             "confidence": 0.9, "reading_order": 0}]}]
+    monkeypatch.setattr(w, "_predict", _predict)
     from PIL import Image
     page = w.ocr(Image.new("RGB", (10, 10)))
     # ...but the text has no marker, so there is nothing to diagnose.
@@ -213,8 +217,10 @@ def test_an_unreadable_page_carries_the_diagnosis(monkeypatch):
     from PIL import Image
 
     def _predict(img):
-        # The hook would have filled this during the real call.
-        w._calls.append([_tok("p", [112]), _tok("i", [105]), _tok("Ã", [195])])
+        # The hook would have filled this during the real call. It is the
+        # calling THREAD's trace, not the worker's: one process now serves
+        # several pages at once (lanes).
+        W._trace_calls().append([_tok("p", [112]), _tok("i", [105]), _tok("Ã", [195])])
         return [{"blocks": [{"html": "<p>pi�</p>",
                              "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
                              "confidence": 0.4, "reading_order": 0}]}]
@@ -230,12 +236,22 @@ def test_the_trace_is_cleared_between_pages(monkeypatch):
     w = W.SuryaWorker({"token_trace": True})
     w._mode = "predictor"
     from PIL import Image
-    monkeypatch.setattr(w, "_predict", lambda img: [
-        {"blocks": [{"html": "<p>ok</p>", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
-                     "confidence": 0.9, "reading_order": 0}]}])
-    w._calls.append([_tok("Ã", [195])])
-    w.ocr(Image.new("RGB", (10, 10)))
-    assert w._calls == []
+    pages = []
+
+    def _predict(img):
+        # Only the first page's model output is anomalous.
+        if not pages:
+            W._trace_calls().append([_tok("Ã", [195])])
+        pages.append(1)
+        return [{"blocks": [{"html": "<p>pi\ufffd</p>",
+                             "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                             "confidence": 0.4, "reading_order": 0}]}]
+    monkeypatch.setattr(w, "_predict", _predict)
+    first = w.ocr(Image.new("RGB", (10, 10)))
+    second = w.ocr(Image.new("RGB", (10, 10)))
+    assert first["unreadable_trace"]["findings"]          # page 1 diagnosed
+    assert not second["unreadable_trace"]["findings"]     # page 2 carries none of it
+    assert W._trace_calls() == []                         # and the page left it clean
 
 
 def test_analysis_failure_is_reported_not_raised(monkeypatch):

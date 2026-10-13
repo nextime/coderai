@@ -976,6 +976,7 @@ The two numbers look interchangeable on the OCR card and are not:
 |---|---|---|
 | `runpod.scale_up_inflight_per_pod`, `runpod.max_pods` | concurrent pages **per rented GPU**, and how many GPUs | the pod |
 | `ocr.surya_instances` (also `paddle`, `doctr`) | **worker processes on this machine** | ~600 MB RSS and a core's rendering, each |
+| `ocr.surya_lanes` | pages in flight **per worker process** (served modes) | almost nothing — see below |
 | `ocr.chandra_instances`, `ocr.olmocr_instances` | concurrency slots, in-process | a slot |
 
 Only surya, paddle and docTR spawn a process per instance — they run in their own
@@ -1004,9 +1005,48 @@ Both halves are now bounded:
   is down, since the replacement asks that same front for its lease. A 503 means
   the pool has nothing rented this second, which the lease does not care about.
 
-To raise OCR throughput, raise the pod-side numbers, not these. The local worker
-pool is a hard ceiling on how many pods surya can keep fed at all — which is the
-standing argument for running it in-process, as chandra and olmOCR already do.
+#### Lanes: concurrency without another process
+
+The worker protocol was one request, one reply, strictly in order, so **pages in
+flight was the process count** — and that is the whole reason 64 pages meant 64
+processes and 37 GB.
+
+In a served mode that memory buys nothing. The recognition VLM is on the pod; the
+local predictor holds **no weights** (1.7 MB of tokenizer and config on disk, and
+surya-2 returns its own boxes so the detection model is never fetched); and the
+process spends a page rasterising it and then waiting on a socket. So a **lane**
+is a worker *object* inside the process that already exists, with its own
+predictor and its own page, sharing the one torch import:
+
+```
+effective concurrency = <engine>_instances x <engine>_lanes
+```
+
+`surya_lanes` defaults to **4** and applies to the served modes only — in `local`
+mode a lane would be a second copy of the model on the card, so there is exactly
+one. Lanes are built on demand, so a quiet install still pays for one.
+
+Three details make it safe to drive one process concurrently:
+
+* **every reply carries the id of the request it answers.** Out-of-order replies
+  are the point — a short page must not wait behind a dense one — and attributing
+  one page's text to another request would be worse than losing it. A reply whose
+  id is unknown is dropped, never guessed at;
+* **the token trace and the accent repairs are per THREAD.** surya's hook is
+  module-level, one `_generate_one` per process, and its sink used to be a list
+  belonging to whichever worker object installed it last. Shared between lanes it
+  would have filed one page's logprobs — and `surya_repair_accents`' rewrites —
+  under a different page;
+* **a worker that dies fails its pages** instead of leaving them parked on a
+  reply that is never coming: the wait is broken up to check the process is still
+  there, and killing the engine wakes everything waiting.
+
+A single-lane engine sends no ids and reads replies in order, exactly as before,
+which is how paddle, docTR and surya-`local` are still driven.
+
+To raise OCR throughput, raise lanes and the pod-side numbers, not the process
+count. Instances still bound how much of this host OCR may take; lanes are what
+turn one process into many pages.
 
 ```bash
 curl -F file=@sentenza.pdf -F structured=true -F detect=both -F schema=italian_sentenza \

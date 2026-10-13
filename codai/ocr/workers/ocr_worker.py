@@ -19,12 +19,48 @@ import base64
 import os
 import io
 import json
+import queue
 import sys
+import threading
+
+
+#: stdout is now written by several threads (one per page in flight), and a
+#: half-written JSON line is an unparseable reply for a page that actually
+#: succeeded. One lock, held for exactly one line.
+_OUT_LOCK = threading.Lock()
 
 
 def _emit(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(obj) + "\n"
+    with _OUT_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+#: Per-PAGE trace state, kept per THREAD.
+#:
+#: surya's hook is module-level — there is one ``_generate_one`` per process —
+#: and the sink used to be a list belonging to whichever worker object installed
+#: the hook last. With one page per process that was exact. With several pages in
+#: flight in one process it would attribute one page's logprobs, and its accent
+#: repairs, to another page entirely: a diagnostic that lies is worse than none,
+#: and `surya_repair_accents` would rewrite the wrong text.
+_TRACE = threading.local()
+
+
+def _trace_begin():
+    """Start a page's trace. Returns its (calls, repairs) — this thread's own."""
+    _TRACE.calls = []
+    _TRACE.repairs = []
+    return _TRACE.calls, _TRACE.repairs
+
+
+def _trace_calls():
+    return getattr(_TRACE, "calls", None)
+
+
+def _trace_repairs():
+    return getattr(_TRACE, "repairs", None)
 
 
 def _html_to_text(html: str) -> str:
@@ -639,15 +675,14 @@ class SuryaWorker:
         self._rec_proc = None
         self._run_ocr = None
         self._langs = [l.strip() for l in str(opts.get("langs", "it")).split(",") if l.strip()] or ["it"]
-        #: Per-call token logprobs, collected by the hook installed in load().
-        self._calls = []
         self._trace = bool(opts.get("token_trace", False))
         #: Rebuild a reply's text from the model's own bytes when the text we are
         #: handed has lost characters. On by default: the alternative is shipping
         #: text we have MEASURED to be corrupt (see repair_content).
         self._repair = bool(opts.get("repair_accents", True))
-        #: [{"block": i, "recovered": n}] for this page.
-        self._repairs = []
+        #: The page's token logprobs and accent repairs live in _TRACE, per
+        #: thread — see _trace_begin(). They were per-worker-object until lanes
+        #: put several pages in one process.
 
     def load(self):
         """Load surya, matching the API of whichever release is installed.
@@ -701,24 +736,20 @@ class SuryaWorker:
         except Exception as e:
             print(f"[surya] token trace unavailable: {e}", file=sys.stderr)
             return
+        _oc._coderai_repair = self._repair
         if getattr(_oc, "_coderai_traced", False):
-            # The module is patched once per process; re-point it at THIS worker.
-            _oc._coderai_sink = self._calls
-            _oc._coderai_repairs = self._repairs
-            _oc._coderai_repair = self._repair
+            # Patched once per process. Nothing to re-point: the sink is the
+            # calling THREAD's, so every lane lands in its own page's trace.
             return
         inner = getattr(_oc, "_generate_one", None)
         if inner is None:
             print("[surya] token trace: no _generate_one to hook", file=sys.stderr)
             return
-        _oc._coderai_sink = self._calls
-        _oc._coderai_repairs = self._repairs
-        _oc._coderai_repair = self._repair
 
         def _wrapped(*args, **kwargs):
             result = inner(*args, **kwargs)
             try:
-                sink = getattr(_oc, "_coderai_sink", None)
+                sink = _trace_calls()
                 if sink is not None:
                     sink.append(getattr(result, "logprobs", None))
                 # Repaired HERE, before surya parses the reply, so the blocks, the
@@ -730,7 +761,7 @@ class SuryaWorker:
                                               getattr(result, "logprobs", None))
                     if fixed is not None:
                         result.raw = fixed
-                        reps = getattr(_oc, "_coderai_repairs", None)
+                        reps = _trace_repairs()
                         if reps is not None:
                             reps.append({"recovered": n})
             except Exception:
@@ -776,11 +807,10 @@ class SuryaWorker:
 
     def ocr(self, img):
         img = img.convert("RGB")
-        # One page per call, so the trace is cleared here rather than accumulated:
+        # One page per call, so the trace is started here rather than accumulated:
         # a long document would otherwise report the first page's anomalies on the
-        # hundredth.
-        del self._calls[:]
-        del self._repairs[:]
+        # hundredth. Per-thread, because several pages share this process.
+        calls, repairs = _trace_begin()
         if self._mode == "predictor":
             preds = self._predict(img)
         else:
@@ -827,19 +857,19 @@ class SuryaWorker:
                 "text": "\n".join(l["text"] for l in lines)}
         # Only when something actually went unread: a clean page stays byte-identical
         # to what it has always returned.
-        if self._repairs:
+        if repairs:
             # Said out loud rather than silently: the text the caller gets is not
             # byte-for-byte what the server sent, and anyone comparing the two
             # needs to know why.
             page["accents_repaired"] = {
-                "blocks": len(self._repairs),
-                "recovered": sum(int(r.get("recovered", 0)) for r in self._repairs),
+                "blocks": len(repairs),
+                "recovered": sum(int(r.get("recovered", 0)) for r in repairs),
                 "how": ("rebuilt from the model's own per-token bytes, which "
                         "decoded cleanly where message.content did not"),
             }
         if self._trace and UNREADABLE in page["text"]:
             try:
-                page["unreadable_trace"] = _trace_report(self._calls)
+                page["unreadable_trace"] = _trace_report(calls)
             except Exception as e:
                 # Always a report, never an absence: "the analysis broke" and "the
                 # bytes were fine" must not look the same.
@@ -855,12 +885,88 @@ class SuryaWorker:
 # Main loop
 # ---------------------------------------------------------------------------
 
+class _Lanes:
+    """Several pages in flight in ONE worker process.
+
+    The protocol was one request, one reply, strictly in order — so pages in
+    flight WAS the process count, and a process costs ~600 MB. In the served
+    modes (`surya_serve: model`) that memory buys nothing: the page is rasterised
+    here and recognised on a GPU somewhere else, so the worker spends its life
+    waiting on a socket. Raising concurrency by forking more of them is how
+    Aruba ended up with 64 processes, 37 GB and a nine-minute stall.
+
+    So a lane is a worker OBJECT, not a process: each has its own predictor and
+    its own page, and they share the one torch import. In the served modes a
+    predictor holds no weights (1.7 MB of tokenizer and config on disk), which is
+    what makes this nearly free. Lanes are built on demand, so a quiet install
+    pays for exactly one.
+    """
+
+    def __init__(self, make, lanes: int, first):
+        self._make = make
+        self._limit = max(1, int(lanes or 1))
+        self._idle = queue.Queue()
+        self._idle.put(first)
+        self._built = 1
+        self._lock = threading.Lock()
+        self._slots = threading.Semaphore(self._limit)
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def borrow(self):
+        """A lane of our own, waiting for one if every lane is busy."""
+        self._slots.acquire()
+        try:
+            try:
+                return self._idle.get_nowait()
+            except queue.Empty:
+                pass
+            with self._lock:
+                worker = self._make()
+                self._built += 1
+            return worker
+        except BaseException:
+            self._slots.release()      # never strand a slot on a failed build
+            raise
+
+    def give_back(self, worker) -> None:
+        if worker is not None:
+            self._idle.put(worker)
+        self._slots.release()
+
+
+def _build(engine: str, opts: dict):
+    worker = PaddleWorker(opts) if engine == "paddle" else SuryaWorker(opts)
+    worker.load()
+    return worker
+
+
+def _serve_page(lanes: "_Lanes", msg: dict, engine: str) -> None:
+    """One page, on a lane of its own, answered with the id it was asked under."""
+    rid = msg.get("id")
+    worker = None
+    try:
+        worker = lanes.borrow()
+        from PIL import Image
+        data = base64.b64decode(msg["image"])
+        img = Image.open(io.BytesIO(data)); img.load()
+        _emit({"ok": True, "id": rid, "page": worker.ocr(img)})
+    except Exception as e:
+        _emit({"ok": False, "id": rid, "error": f"{engine} ocr failed: {e}",
+               "status": 500})
+    finally:
+        if worker is not None:
+            lanes.give_back(worker)
+
+
 def main():
     engine = sys.argv[1] if len(sys.argv) > 1 else "paddle"
     from PIL import Image  # noqa: F401 (ensure Pillow present before READY)
     _emit({"ready": True})
 
-    worker = None
+    lanes = None
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -875,22 +981,38 @@ def main():
         if cmd == "load":
             try:
                 opts = msg.get("opts") or {}
-                worker = PaddleWorker(opts) if engine == "paddle" else SuryaWorker(opts)
-                worker.load()
-                _emit({"ok": True})
+                # The first lane is loaded HERE, synchronously, so a missing
+                # dependency is still a load failure and not a failed page.
+                first = _build(engine, opts)
+                lanes = _Lanes(lambda: _build(engine, opts),
+                               int(opts.get("lanes") or 1), first)
+                _emit({"ok": True, "lanes": lanes.limit})
             except Exception as e:
                 _emit({"ok": False, "error": f"{engine} load failed: {e}", "status": 503})
             continue
         if cmd == "ocr":
-            if worker is None:
-                _emit({"ok": False, "error": "not loaded", "status": 500}); continue
-            try:
-                from PIL import Image
-                data = base64.b64decode(msg["image"])
-                img = Image.open(io.BytesIO(data)); img.load()
-                _emit({"ok": True, "page": worker.ocr(img)})
-            except Exception as e:
-                _emit({"ok": False, "error": f"{engine} ocr failed: {e}", "status": 500})
+            if lanes is None:
+                _emit({"ok": False, "id": msg.get("id"), "error": "not loaded",
+                       "status": 500}); continue
+            if msg.get("id") is None:
+                # No id: the caller is reading replies in order, one at a time.
+                worker = None
+                try:
+                    worker = lanes.borrow()
+                    from PIL import Image
+                    data = base64.b64decode(msg["image"])
+                    img = Image.open(io.BytesIO(data)); img.load()
+                    _emit({"ok": True, "page": worker.ocr(img)})
+                except Exception as e:
+                    _emit({"ok": False, "error": f"{engine} ocr failed: {e}",
+                           "status": 500})
+                finally:
+                    if worker is not None:
+                        lanes.give_back(worker)
+                continue
+            # Answered out of order, under its id, while the loop reads the next.
+            threading.Thread(target=_serve_page, args=(lanes, msg, engine),
+                             daemon=True).start()
             continue
         if cmd == "shutdown":
             _emit({"ok": True}); return
