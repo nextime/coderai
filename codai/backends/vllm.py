@@ -196,8 +196,80 @@ class VllmBackend(ModelBackend):
             parts.append(f"{role}: {content}")
         return "\n".join(parts)
 
+    @staticmethod
+    def _raise_for_status(r, what="request"):
+        """`raise_for_status`, but carrying what the server actually said.
+
+        `requests` reports only "400 Client Error: Bad Request for url: ...",
+        which names the symptom and nothing else. vLLM puts the reason -- which
+        field it rejected, which template failed to render, by how much the
+        context was overrun -- in the response BODY, and that body was being
+        discarded on the way up. A whole diagnosis cycle was spent guessing at a
+        400 whose explanation had already been sent and thrown away.
+        """
+        code = getattr(r, "status_code", None)
+        if code is None:
+            # An object that does not report a code is not something to crash
+            # on inside the request path: fall back to whatever it does offer.
+            r.raise_for_status()
+            return
+        if code < 400:
+            return
+        detail = ""
+        try:
+            body = r.json()
+            detail = (body.get("message") or body.get("detail")
+                      or body.get("error") or "")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or str(detail)
+            detail = str(detail) or str(body)
+        except Exception:
+            try:
+                detail = (r.text or "").strip()
+            except Exception:
+                detail = ""
+        if len(detail) > 2000:
+            detail = detail[:2000] + " ...[truncated]"
+        import requests as _rq
+        raise _rq.HTTPError(
+            f"{code} {getattr(r, 'reason', '')} from "
+            f"{getattr(r, 'url', '?')} on {what}"
+            + (f": {detail}" if detail else " (the server sent no explanation)"),
+            response=r)
+
+    #: Never overridable by a caller: these are the request's structure, not its
+    #: sampling. Letting `passthrough` rewrite them would let a client retarget
+    #: the server at another model or flip streaming under the response parser.
+    _PAYLOAD_STRUCTURE = ("model", "messages", "stream")
+
+    def _apply_passthrough(self, payload, passthrough):
+        """Merge fields coderai does not itself understand into the request.
+
+        A proxy that forwards only the fields it knows about decides, on the
+        server's behalf, which of the server's own features exist. vLLM grows
+        request fields faster than any allow-list here can be updated
+        (`continue_final_message`, `add_generation_prompt`,
+        `chat_template_kwargs`, `truncate_prompt_tokens`, guided-decoding
+        parameters), and a dropped field fails in the worst possible way: the
+        server answers something plausible for a DIFFERENT request, or rejects
+        it with a 400 that names nothing.
+
+        Measured 2026-10-13: OCR page resumption sends `continue_final_message`
+        so the model carries on the exact string it was cut off in. It never
+        arrived, so what reached vLLM was a conversation ending in an assistant
+        turn with no instruction to continue it -- rejected 400, every resumed
+        page lost, at every token cap low enough to need one.
+        """
+        if not passthrough:
+            return payload
+        for k, v in dict(passthrough).items():
+            if k in self._PAYLOAD_STRUCTURE:
+                continue
+            payload[k] = v
+        return payload
+
     def _chat_payload(self, messages, max_tokens, temperature, top_p, stop, stream,
-                      logprobs=None, top_logprobs=None):
+                      logprobs=None, top_logprobs=None, passthrough=None):
         payload = {
             "model": getattr(self, "_served_name", self._model_id),
             "messages": messages,
@@ -229,20 +301,23 @@ class VllmBackend(ModelBackend):
             # worker's repair.
             if getattr(self._cfg, "return_token_ids", False):
                 payload["return_tokens_as_token_ids"] = True
-        return payload
+        # Last, so a caller that asks for a field coderai also computes gets the
+        # value it asked for -- it is talking to this server deliberately.
+        return self._apply_passthrough(payload, passthrough)
 
     # ------------------------------------------------------------------ #
     # chat-level generation
     # ------------------------------------------------------------------ #
     def generate_chat(self, messages: List[Dict], max_tokens=None, temperature=0.7,
                       top_p=1.0, stop=None, tools=None, response_format=None,
-                      logprobs=None, top_logprobs=None):
+                      logprobs=None, top_logprobs=None, passthrough=None):
         import requests
         self._enter_request()
         self._last_logprobs = None
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False,
-                                         logprobs=logprobs, top_logprobs=top_logprobs)
+                                         logprobs=logprobs, top_logprobs=top_logprobs,
+                                         passthrough=passthrough)
             # Forward the structured-output request AS ASKED. This used to
             # keep only {"type":"json_object"}, so a json_schema — the strict
             # form every current client sends, Surya's guided decoding among
@@ -254,7 +329,7 @@ class VllmBackend(ModelBackend):
             if tools:
                 payload["tools"] = tools
             r = requests.post(self._base() + "/v1/chat/completions", json=payload, timeout=3600)
-            r.raise_for_status()
+            self._raise_for_status(r, "chat/completions")
             data = r.json()
             self._store_usage(data.get("usage", {}))
             choice = (data.get("choices") or [{}])[0]
@@ -266,12 +341,14 @@ class VllmBackend(ModelBackend):
     async def generate_chat_stream(self, messages: List[Dict], max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None, tools=None,
                                    response_format=None, logprobs=None,
-                                   top_logprobs=None) -> AsyncGenerator[str, None]:
+                                   top_logprobs=None,
+                                   passthrough=None) -> AsyncGenerator[str, None]:
         self._enter_request()
         self._last_logprobs = None
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True,
-                                         logprobs=logprobs, top_logprobs=top_logprobs)
+                                         logprobs=logprobs, top_logprobs=top_logprobs,
+                                         passthrough=passthrough)
             # Same for the streamed path, which ignored it entirely.
             if response_format:
                 payload["response_format"] = response_format
@@ -333,7 +410,7 @@ class VllmBackend(ModelBackend):
             import requests
             try:
                 with requests.post(url, json=payload, stream=True, timeout=3600) as r:
-                    r.raise_for_status()
+                    self._raise_for_status(r, "streamed chat/completions")
                     buf = b""
                     done = False
                     for bchunk in r.iter_content(chunk_size=8192):

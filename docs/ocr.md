@@ -1154,6 +1154,65 @@ So coderai now establishes the window and respects it:
 - Not knowing the window is survivable, and nothing is guessed: with no number,
   resumption behaves exactly as it did before and the budget rules.
 
+### The resumption flags never arrived (and why that looked like repetition)
+
+Resumption asks the server for two things beyond an ordinary request:
+`continue_final_message`, so the model carries on the exact string, and
+`add_generation_prompt: false`, so no new turn is opened after the prefilled
+text. coderai sends both. For three days neither reached the model.
+
+The vLLM backend built its outgoing request from an **allow-list** of fields it
+recognised, so anything else was dropped on the floor — silently, since a
+dropped field is indistinguishable from a field never sent. What reached vLLM
+was a conversation ending in an assistant turn with `add_generation_prompt` left
+at its default **true**. surya-ocr-2's chat template then does exactly what it
+is told:
+
+```jinja
+{%- elif message.role == "assistant" %}
+    {{- '<|im_start|>' + message.role + '\n' + content }}
+    {{- '<|im_end|>\n' }}
+...
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}
+```
+
+A fresh `<|im_start|>assistant` after the text so far. The model was being asked
+to **start a new answer about the same image**, which is precisely what it did.
+
+The failure then hid behind the guard built to catch it: the new answer repeated
+the beginning of the page, the no-progress check saw text it already had, logged
+"came back repeating itself" and threw the segment away. 253 of 262 resumptions
+on a live install, read for a day as a model that degenerates on dense pages. It
+was a model being asked the wrong question, answering it correctly, and having
+the answer discarded.
+
+Two lessons worth keeping, because both recur:
+
+- **Forward by exclusion, never by allow-list.** coderai now names the request
+  fields it *consumes* (`_CHAT_CONSUMED_FIELDS`); everything else goes to the
+  server, which is the thing entitled to decide what it supports. An allow-list
+  means every field a server gains after the list was written is born broken.
+  The same reasoning as forwarding page diagnostics by exclusion.
+- **A guard that catches a bug is not a diagnosis of it.** "Came back repeating
+  itself" was true every time and explained nothing. The log now has to say
+  *which* of the two it saw, because "the model looped" and "the server ignored
+  our flag" look identical from the text alone and need opposite fixes.
+
+Structural fields (`model`, `messages`, `stream`) are never overridable this
+way: retargeting the server at another model, or flipping streaming under the
+response parser, is not a feature.
+
+### A server's 4xx explains itself — if nobody discards it
+
+`requests.raise_for_status()` produces `400 Client Error: Bad Request for url:
+http://127.0.0.1:53601/v1/chat/completions` — the symptom and nothing else. vLLM
+puts the reason in the response **body**: which field it rejected, which template
+failed to render, by how much the context was overrun. That body was being
+dropped, so a 400 that had already explained itself cost a diagnosis cycle of
+guesswork. The error now carries the server's own words.
+
 ### A reply that repeats itself did not run out of room
 
 A generation that trips surya's repeat detector hit the cap because it is

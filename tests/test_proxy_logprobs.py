@@ -33,6 +33,12 @@ LOGPROBS = {"content": [{"token": "A", "logprob": 0.0, "bytes": [65], "top_logpr
 
 
 class _Reply:
+    #: A real response reports its code, and the backend reads it so that a
+    #: server's own explanation of a 4xx survives the trip up.
+    status_code = 200
+    reason = "OK"
+    url = "http://stub/v1/chat/completions"
+
     def __init__(self, payload):
         self._payload = payload
 

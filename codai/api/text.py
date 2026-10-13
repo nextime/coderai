@@ -2295,6 +2295,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     frequency_penalty=request.frequency_penalty,
                     logprobs=request.logprobs,
                     top_logprobs=request.top_logprobs,
+                    passthrough=_chat_passthrough(request),
                 ):
                     yield chunk
             finally:
@@ -2324,9 +2325,54 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 frequency_penalty=request.frequency_penalty,
                 logprobs=request.logprobs,
                 top_logprobs=request.top_logprobs,
+                passthrough=_chat_passthrough(request),
             )
         finally:
             _release_instance()
+
+
+#: Fields of a chat request coderai reads itself. Everything ELSE a caller sends
+#: is the caller's business with the serving backend, and is forwarded there.
+#:
+#: Named here rather than naming the fields to forward, because the forward list
+#: is the one that cannot be kept current: vLLM and its peers add request fields
+#: continuously, and a proxy that passes only what it recognises silently
+#: decides, for the server, which of the server's features exist. Every new
+#: field would be born broken -- the same failure as a diagnostic copied key by
+#: key. coderai's OCR page resumption was the first casualty: it sends
+#: `continue_final_message`, the proxy dropped it, and vLLM rejected the
+#: resulting conversation with a 400 at every token cap low enough to need one.
+#:
+#: Adding a field to THIS set is the deliberate act, and it means "coderai acts
+#: on this one".
+_CHAT_CONSUMED_FIELDS = frozenset({
+    "model", "messages", "temperature", "top_p", "n", "max_tokens",
+    "max_completion_tokens", "stream", "stop", "presence_penalty",
+    "frequency_penalty", "repeat_penalty", "tools", "tool_choice", "seed",
+    "logprobs", "top_logprobs", "response_format", "user", "enable_thinking",
+    "reasoning", "reasoning_effort", "suppress_reasoning",
+    # Transport and bookkeeping, never sampling.
+    "api_key", "stream_options", "metadata", "store",
+})
+
+
+def _chat_passthrough(request) -> Optional[Dict]:
+    """The request fields coderai does not consume, for the backend to forward.
+
+    Only reaches a backend whose signature accepts it (see
+    ``ModelManager._passthrough_kwargs``), so a backend that cannot carry an
+    unknown field is unaffected rather than broken.
+    """
+    try:
+        extra = getattr(request, "model_extra", None)
+        if not extra:
+            return None
+        out = {k: v for k, v in extra.items()
+               if k not in _CHAT_CONSUMED_FIELDS and not k.startswith("_")}
+        return out or None
+    except Exception:
+        # A request that cannot be inspected is still a request to serve.
+        return None
 
 
 _TOOL_SPAN_RE = _re.compile(r'<(tool|tool_call)\b[\s\S]*?</\1\s*>', _re.IGNORECASE)
@@ -2533,6 +2579,7 @@ async def stream_chat_response(
     frequency_penalty: float = 0.0,
     logprobs: Optional[bool] = None,
     top_logprobs: Optional[int] = None,
+    passthrough: Optional[Dict] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2684,6 +2731,7 @@ async def stream_chat_response(
             frequency_penalty=frequency_penalty,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
+            passthrough=passthrough,
         ):
             # Cooperative cancellation: stop streaming if the task was cancelled.
             if task_registry.is_cancelled(_tid):
@@ -3071,6 +3119,7 @@ async def generate_chat_response(
     frequency_penalty: float = 0.0,
     logprobs: Optional[bool] = None,
     top_logprobs: Optional[int] = None,
+    passthrough: Optional[Dict] = None,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -3114,6 +3163,7 @@ async def generate_chat_response(
             frequency_penalty=frequency_penalty,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
+            passthrough=passthrough,
         )
         
         # Always filter out malformed content

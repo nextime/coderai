@@ -754,6 +754,26 @@ class ModelManager:
 
     
     @staticmethod
+    def _passthrough_kwargs(fn, passthrough) -> dict:
+        """``{"passthrough": {...}}`` if ``fn`` takes it, else {}.
+
+        Asked of the signature rather than negotiated by TypeError, for the same
+        reason as ``_logprob_kwargs``: a backend that accepts it and raises
+        TypeError for its own reasons must not be called twice.
+        """
+        if not passthrough:
+            return {}
+        try:
+            import inspect
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return {}
+        if "passthrough" not in params and not any(
+                pp.kind == pp.VAR_KEYWORD for pp in params.values()):
+            return {}
+        return {"passthrough": dict(passthrough)}
+
+    @staticmethod
     def _logprob_kwargs(fn, logprobs, top_logprobs) -> dict:
         """``{"logprobs": ..., "top_logprobs": ...}`` if ``fn`` takes them, else {}.
 
@@ -800,7 +820,8 @@ class ModelManager:
                       response_format: Optional[Dict] = None, enable_thinking: bool = False,
                       repeat_penalty: float = 1.0, presence_penalty: float = 0.0,
                       frequency_penalty: float = 0.0, logprobs: Optional[bool] = None,
-                      top_logprobs: Optional[int] = None):
+                      top_logprobs: Optional[int] = None,
+                      passthrough: Optional[Dict] = None):
         """Generate chat completion non-streaming.
 
         Forwards client repetition controls to the backend (defaults are no-ops).
@@ -813,7 +834,12 @@ class ModelManager:
         # Use generate_chat if available (Vulkan backend), otherwise format and use generate
         if hasattr(self.backend, 'generate_chat'):
             _lp = self._logprob_kwargs(self.backend.generate_chat, logprobs, top_logprobs)
-            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp),
+            # Tried FIRST and dropped first: an unknown field is the caller's
+            # business with the upstream server, never a reason to fail the
+            # request on a backend that cannot carry it.
+            _pt = self._passthrough_kwargs(self.backend.generate_chat, passthrough)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp, **_pt),
+                           dict(enable_thinking=enable_thinking, **_pen, **_lp),
                            dict(enable_thinking=enable_thinking, **_lp),
                            dict(**_lp), {}):
                 try:
@@ -845,7 +871,8 @@ class ModelManager:
                                     response_format: Optional[Dict] = None, enable_thinking: bool = False,
                                     repeat_penalty: float = 1.0, presence_penalty: float = 0.0,
                                     frequency_penalty: float = 0.0, logprobs: Optional[bool] = None,
-                                    top_logprobs: Optional[int] = None):
+                                    top_logprobs: Optional[int] = None,
+                                    passthrough: Optional[Dict] = None):
         """Generate chat completion streaming.
 
         Client-supplied repetition controls (repeat/presence/frequency penalty) are
@@ -860,7 +887,9 @@ class ModelManager:
             # Try richest signature first, then progressively drop kwargs the backend
             # doesn't accept (older signatures) so we never hard-fail on plumbing.
             _lp = self._logprob_kwargs(self.backend.generate_chat_stream, logprobs, top_logprobs)
-            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp),
+            _pt = self._passthrough_kwargs(self.backend.generate_chat_stream, passthrough)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp, **_pt),
+                           dict(enable_thinking=enable_thinking, **_pen, **_lp),
                            dict(enable_thinking=enable_thinking, **_lp),
                            dict(**_lp), {}):
                 try:
