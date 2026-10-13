@@ -83,6 +83,9 @@ _CONTEXT_CACHE = {}
 #: number only has to be an over-estimate, because its whole job is to keep the
 #: LAST segment inside the window.
 _PROMPT_TOKENS_GUESS = 4096
+#: Said once per worker, not per page: 8 lanes x hundreds of pages would bury
+#: the log, and the number is the same every time.
+_CAP_NOTED = [False]
 
 #: Below this there is no point asking for more: a segment this short cannot
 #: close an open block, so it would spend a round to add nothing. It is a floor
@@ -1147,6 +1150,36 @@ class SuryaWorker:
             cap = _page_override("max_tokens", _MAX_TOKENS[0])
             if cap and "max_tokens_default" in kwargs:
                 kwargs["max_tokens_default"] = int(cap)
+            if cap:
+                # …and the PER-ITEM budget, which is the one that actually
+                # decides. surya's own client does
+                #     max_tokens = item.max_tokens or max_tokens_default
+                # and its full-page path builds every item with
+                #     max_tokens=settings.SURYA_MAX_TOKENS_FULL_PAGE   # 12288
+                # so `item.max_tokens` was always set and the default we just
+                # rewrote was never read. Every configured or per-request
+                # max_tokens was silently discarded, and each page ran at
+                # surya's 12288 — which on a 32k window leaves room for two
+                # segments, so a dense page hit the ceiling mid-answer. It read
+                # from outside like the pod ignoring the field; the pod never
+                # sees it.
+                _it = args[0] if args else kwargs.get("item")
+                _own = int(getattr(_it, "max_tokens", 0) or 0)
+                if _it is not None and _own != int(cap):
+                    try:
+                        _it.max_tokens = int(cap)
+                    except Exception as exc:
+                        # A frozen item would make the cap unreachable again, so
+                        # this must be visible rather than silently ignored.
+                        print(f"[surya] could not apply the {cap}-token cap to "
+                              f"the page item ({exc}) — surya's own {_own} "
+                              f"stands", file=sys.stderr, flush=True)
+                    else:
+                        if not _CAP_NOTED[0]:
+                            _CAP_NOTED[0] = True
+                            print(f"[surya] page budget {cap} tokens "
+                                  f"(overriding surya's own {_own})",
+                                  file=sys.stderr, flush=True)
             result = inner(*args, **kwargs)
             # A reply that ran out of room is finished here, before surya parses
             # it: raising the cap only moves the cliff, and incomplete block

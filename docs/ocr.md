@@ -1265,10 +1265,26 @@ A dense page can legitimately need several thousand tokens, and a batch measured
 on 2026-10-13 averaged **2,644 generated tokens per request**, i.e. above the
 cap.
 
-`ocr.surya_max_tokens` raises it (0 = leave surya's 2048). It is opt-in because
-a higher cap costs tokens on every page and the right value depends on the
-documents. What is **not** optional is being able to tell the two cases apart,
-so every page that hit the cap says so in its own result:
+`ocr.surya_max_tokens` raises it (0 = leave surya's own budget). It is opt-in
+because a higher cap costs tokens on every page and the right value depends on
+the documents.
+
+> **Up to v0.3.56 that setting, and a request's own `max_tokens`, were
+> silently discarded on the vLLM path.** surya resolves a page's budget as
+> `item.max_tokens or max_tokens_default`, and its full-page path builds every
+> item with `max_tokens=settings.SURYA_MAX_TOKENS_FULL_PAGE` — **12288** — so
+> the per-item value was always set and the `max_tokens_default` coderai
+> rewrote was never read. Every page ran at 12288 whatever was configured, and
+> on a 32,768-token window that leaves room for about two segments once the
+> image prefill is counted, so a dense page reached the ceiling mid-answer.
+> From outside it looked exactly like the *server* ignoring `max_tokens` — it
+> was reported that way, against the pod, which never sees the field. v0.3.57
+> applies the cap to the item as well, and says so once per worker:
+> `[surya] page budget 3072 tokens (overriding surya's own 12288)`. With no cap
+> configured, surya's own budget is left alone.
+
+What is **not** optional is being able to tell the two cases apart, so every
+page that hit the cap says so in its own result:
 
 ```json
 "model_attempts": {
