@@ -530,6 +530,86 @@ def _drop_prefix_caches() -> int:
     return n
 
 
+def _live_context_length(manager, model_id: str):
+    """Ask the backend actually serving ``model_id``, or None.
+
+    Two shapes, because the listing is built by the MULTI manager while the
+    backend lives on a per-model one: a `ModelManager` carries `.backend`
+    itself, a `MultiModelManager` carries a dict of loaded sub-managers in
+    `.models`. Handling only the first was the bug -- `list_models` is a method
+    of the second, so the live path could never have fired.
+
+    Matched on what the backend says it SERVES. `current_model` holds a resolved
+    path rather than an id, so it alone would miss almost every time.
+    """
+    def _ask(owner):
+        b = getattr(owner, "backend", None)
+        if b is None or not hasattr(b, "context_length"):
+            return None
+        names = {getattr(owner, "current_model", None),
+                 getattr(b, "_served_name", None),
+                 getattr(b, "_model_id", None)}
+        return b.context_length() if model_id in names else None
+
+    got = _ask(manager)
+    if got:
+        return got
+    loaded = getattr(manager, "models", None)
+    if isinstance(loaded, dict):
+        sub = loaded.get(model_id)
+        if sub is not None:
+            got = _ask(sub)
+            if got:
+                return got
+        # The dict is keyed by the manager's own scheme ("whisper:x", a path),
+        # so a direct hit is not guaranteed even when the model IS loaded.
+        for sub in list(loaded.values()):
+            got = _ask(sub)
+            if got:
+                return got
+    return None
+
+
+def context_window_for(manager, model_id: str, meta: Dict[str, Any]):
+    """The context window to publish for ``model_id``, or None if unknown.
+
+    Order matters. A LOADED backend that can be asked wins, because the
+    configured number and the served number disagree in practice and only the
+    served one is true: an operator can set a per-model ``ctx`` that never
+    reaches the launch arguments (measured on one install 2026-10-13 --
+    ``ctx: 18432`` configured, ``--max-model-len 32768`` actually served), and a
+    client trusting the config would plan around a window the model does not
+    have. Config is the fallback, and ``None`` is a legitimate answer: a client
+    must read it as "unknown", never as "unlimited".
+
+    Module level rather than a closure inside the listing, so it can be tested
+    for what it prefers and what it tolerates without building a whole listing.
+    """
+    try:
+        live = _live_context_length(manager, model_id)
+        if live:
+            return int(live)
+    except Exception:
+        pass
+    # Several spellings, because several backends own this number: the entry's
+    # own keys, then the per-backend blocks a pod or a server is launched from.
+    if not isinstance(meta, dict):
+        return None
+    for src in (meta, meta.get("vllm"), meta.get("runpod"), meta.get("llamacpp")):
+        if not isinstance(src, dict):
+            continue
+        for k in ("max_model_len", "n_ctx", "ctx", "context_length"):
+            v = src.get(k)
+            if isinstance(v, (list, tuple)):
+                v = v[0] if v else None
+            try:
+                if v and int(v) > 0:
+                    return int(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 class ModelManager:
     """Manages the loaded model and tokenizer."""
 
@@ -5772,6 +5852,7 @@ class MultiModelManager:
                 languages=meta.get("languages") or None,
                 supports_translation=meta.get("supports_translation"),
                 video=video_geom,
+                max_model_len=context_window_for(self, model_id, meta),
             ))
 
         # --- Models from config (the authoritative source) ---

@@ -29,6 +29,12 @@ ENV PROFILE=${PROFILE}
 # whether the pod ran the new image or an old one. Now it says so at boot.
 ARG IMAGE_TAG=unknown
 ENV CODERAI_IMAGE_TAG=${IMAGE_TAG}
+# The commit the app layer was built from. The version alone cannot distinguish
+# two builds of the same version, which is exactly the case while a fix is being
+# chased: boot.sh prints both so "which code is this pod running" is answerable
+# from the pod's own log instead of inferred from timestamps.
+ARG GIT_SHA=unknown
+ENV CODERAI_GIT_SHA=${GIT_SHA}
 
 WORKDIR /opt/coderai/app
 COPY packaging/runpod/profiles/ /tmp/profiles/

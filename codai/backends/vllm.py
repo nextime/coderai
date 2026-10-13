@@ -164,6 +164,38 @@ class VllmBackend(ModelBackend):
             raise RuntimeError("vLLM service not started")
         return self._url
 
+    def context_length(self):
+        """The context window the SERVER reports, in tokens, or None.
+
+        Asked of the running server rather than read from config, because the
+        two disagree and only one of them is true: an operator can set a
+        per-model `ctx` that never reaches the launch arguments (measured on one
+        install 2026-10-13 -- `ctx: 18432` configured, `--max-model-len 32768`
+        actually served), and a client that trusted the config would plan around
+        a window the model does not have.
+
+        Cached: a served model cannot change shape under us, so one question per
+        process is enough. Failure is cached as None and not retried hard, since
+        not knowing is survivable and a probe on every listing is not.
+        """
+        if getattr(self, "_ctx_len", "unset") != "unset":
+            return self._ctx_len
+        self._ctx_len = None
+        try:
+            import requests
+            r = requests.get(self._base() + "/v1/models", timeout=5)
+            for m in (r.json().get("data") or []):
+                if m.get("id") != getattr(self, "_served_name", None):
+                    continue
+                for k in ("max_model_len", "max_context_length", "context_length"):
+                    if m.get(k):
+                        self._ctx_len = int(m[k])
+                        break
+                break
+        except Exception:
+            pass
+        return self._ctx_len
+
     def _store_usage(self, usage: dict) -> None:
         if usage:
             self._last_usage = {

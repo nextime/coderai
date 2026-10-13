@@ -37,6 +37,19 @@ phase "profile=${PROFILE:-unknown} image=${CODERAI_IMAGE_TAG:-unknown}"
 phase "user=$(id -un 2>/dev/null || echo unknown) cwd=$(pwd 2>/dev/null || echo unknown)"
 phase "python=$(python -V 2>&1)"
 
+# WHICH BUILD IS THIS POD RUNNING. A mutable tag like `:latest` is a perfectly
+# good way to publish "the current release", but it makes the question
+# unanswerable from the outside: two pods started minutes apart can carry
+# different code and look identical in the account listing. Working that out by
+# comparing pod creation times against a push time is inference, not fact -- and
+# on 2026-10-13 that inference cost two pods being restarted that already had
+# the fix, because nothing in their logs named their own version.
+#
+# One line, at boot, from the code that is actually loaded (not the tag, which
+# is a label someone else controls, and not a build arg, which records what the
+# builder intended rather than what got layered on).
+phase "coderai=$(python -c 'import codai; print(codai.__version__)' 2>/dev/null || echo unknown) git=${CODERAI_GIT_SHA:-unknown}"
+
 # What the pod was actually told to serve. A pod that answers "not available"
 # for its own model is the single most common failure, and the seed list is the
 # first place to look — it is worth one line at boot rather than an exec into a

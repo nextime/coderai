@@ -155,6 +155,22 @@ class ModelInfo(BaseModel):
     languages: Optional[List[str]] = None
     supports_translation: Optional[bool] = None
     speaker_diarization: Optional[bool] = None
+    # The context window this model is being SERVED with, in tokens.
+    #
+    # Named as vLLM names it, so a client written against a vLLM server reads it
+    # without changes. It is published because a client cannot otherwise plan:
+    # anything that sends a growing conversation -- a continued generation, a
+    # resumed OCR page, a long tool loop -- needs to know when the window runs
+    # out, and the alternative is to find out from a 400 after the work is done.
+    # coderai's own OCR page resumption was the first casualty: it probed
+    # /v1/models for this field, coderai did not publish it, so the resumption
+    # budget could not see the ceiling it was about to hit.
+    #
+    # The number is what the model is served with, not what the checkpoint
+    # advertises: an operator may serve a shorter window deliberately. None means
+    # "not established here", which a client must treat as unknown rather than
+    # unlimited.
+    max_model_len: Optional[int] = None
     # Video generation: what this model can actually emit — native frame rate, the
     # legal frame-count grid, how long ONE render may be and whether continuation is
     # native. Published so a client can PLAN around the model (how long a scene can

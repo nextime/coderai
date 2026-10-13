@@ -101,6 +101,7 @@ echo "==> building $TAG from profile '$PROFILE' ($DOCKERFILE)"
 DOCKER_BUILDKIT=1 docker build -f "$DOCKERFILE" \
     --build-arg "PROFILE=$PROFILE" \
     --build-arg "IMAGE_TAG=$TAG" \
+    --build-arg "GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     --build-arg "CORE_BASE=$CORE_BASE" \
     -t "$TAG" .
 

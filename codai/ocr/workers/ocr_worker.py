@@ -106,12 +106,21 @@ def _context_limit(client, model_name):
     if key in _CONTEXT_CACHE:
         return _CONTEXT_CACHE[key]
     limit = 0
+    answered = False
     try:
         for m in (client.models.list().data or []):
             if getattr(m, "id", None) != model_name:
                 continue
+            answered = True
             for attr in ("max_model_len", "max_context_length", "context_length"):
+                # `max_model_len` is not in the OpenAI model schema, so the
+                # client parks it as an EXTRA field rather than an attribute.
+                # Reading only attributes found nothing and said nothing.
                 v = getattr(m, attr, None)
+                if v is None:
+                    extra = getattr(m, "model_extra", None)
+                    if isinstance(extra, dict):
+                        v = extra.get(attr)
                 if v is None and isinstance(getattr(m, "__dict__", None), dict):
                     v = m.__dict__.get(attr)
                 if v:
@@ -126,6 +135,15 @@ def _context_limit(client, model_name):
               file=sys.stderr, flush=True)
     if limit:
         print(f"[surya] {model_name} serves a {limit}-token context window",
+              file=sys.stderr, flush=True)
+    elif answered:
+        # The case that actually happened, and the one that used to pass in
+        # silence: the server answered, listed the model, and named no window.
+        # Resumption then runs with no ceiling and the log shows '?', with
+        # nothing to say why -- a degradation indistinguishable from working.
+        print(f"[surya] {model_name} does not report a context window on "
+              f"/v1/models; resumption cannot stop before the server does — "
+              f"set ocr.surya_context_tokens to the served --max-model-len",
               file=sys.stderr, flush=True)
     _CONTEXT_CACHE[key] = limit
     return limit

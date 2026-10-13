@@ -1139,8 +1139,14 @@ the full cap dry, and the third segment of any page was **rejected outright** â€
 So coderai now establishes the window and respects it:
 
 - `surya_context_tokens`, or `0` to read the server's own `max_model_len` from
-  `/v1/models` (vLLM reports it). Configuration wins, because an operator may
-  serve with a shorter `--max-model-len` than the checkpoint advertises.
+  `/v1/models`. Configuration wins, because an operator may serve with a
+  shorter `--max-model-len` than the checkpoint advertises.
+- coderai **publishes** that number on its own `/v1/models`, under vLLM's
+  name, so this probe works when the engine is reached through coderai
+  rather than a raw vLLM. It did not at first, and the probe then degraded
+  in silence: the log printed `? of the context window left` with nothing
+  to say why, and the clamp never fired. A server that answers without the
+  field now says so and names the setting to use instead.
 - Each segment asks for **the smaller of the cap and the room left**, and the
   room left is measured from what the server said the prompt actually cost
   (`usage.prompt_tokens`), not guessed â€” the guess is used for the first
