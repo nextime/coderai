@@ -2176,8 +2176,18 @@ class RunpodPodPool:
       ``max_pods``, subject to the cost caps) and bumps its in-flight count.
     * ``release()`` drops the in-flight count and stamps last-used.
     * the shared scaler thread (``_scaler_loop``) tears down idle pods to
-      ``min_pods`` after ``idle_timeout_s``, re-checks health, reaps dead pods,
-      and keeps ``min_pods`` warm.
+      ``min_pods`` after ``idle_timeout_s``, reconciles the pool against what
+      RunPod actually has, and keeps ``min_pods`` warm.
+
+    Note what the pool does NOT do: probe its own pods on a timer. Nothing here
+    re-checks health (this docstring claimed it did for months, and it never
+    has). A handle's ``healthy`` flag only goes false when something tried to
+    USE the pod and failed, or when the pool itself retired it. So a pod that
+    dies with no traffic on it — which is precisely a warm-floor pod — stays
+    ``healthy=True`` forever and the floor is satisfied by a machine that no
+    longer exists. ``reconcile_pools`` closes that, from the account listing the
+    reaper already fetches: authoritative, free, and incapable of mistaking a
+    busy pod for a dead one.
     """
 
     def __init__(self, model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
@@ -3004,6 +3014,46 @@ class RunpodPodPool:
         print(f"[runpod] pod {pod.pod_id} dropped from the pool: {reason}", flush=True)
         threading.Thread(target=self._terminate, args=(pod, reason), daemon=True).start()
 
+    def forget(self, pod: PodHandle, reason: str = "gone") -> bool:
+        """Drop a pod that no longer exists. Like ``discard``, minus the kill.
+
+        ``discard`` terminates, because it is called when OUR use of a pod
+        failed and the pod may well still be running and billing. This one is
+        for a pod RunPod has positively told us is gone — terminated from the
+        console, reclaimed as spot, lost with its host — where there is nothing
+        left to terminate and an API call would only error. The bill still has
+        to be closed, so the ledger entry is written here exactly as
+        ``_terminate`` writes it.
+
+        Returns True if this call is what removed it.
+        """
+        with self._cv:
+            if pod not in self.pods:
+                return False
+            pod.healthy = False
+            self.pods.remove(pod)
+        if getattr(pod, "gpu", "") == "(shared)":
+            # Another process owns the bill; it writes the ledger entry.
+            print(f"[runpod] borrowed pod {pod.pod_id} is gone ({reason}) — "
+                  f"dropped from {self.model_key!r}", flush=True)
+            return True
+        from codai.api import runpod_ledger
+        # To NOW, which over-counts by however long it was dead before we
+        # noticed. The same approximation _terminate makes, and the reconcile
+        # runs every ~30s, so the error is bounded by that.
+        cost = (time.time() - pod.started_at) / 3600.0 * pod.hourly_usd
+        unregister_pod(pod.pod_id)
+        try:
+            runpod_ledger.record_spend(
+                self.model_key, cost,
+                {"pod_id": pod.pod_id, "gpu": pod.gpu, "is_spot": pod.is_spot})
+        except Exception as exc:
+            print(f"[runpod] ledger for gone pod {pod.pod_id}: {exc}", flush=True)
+        print(f"[runpod] pod {pod.pod_id} for {self.model_key!r} is gone from "
+              f"RunPod ({reason}) — dropped from the pool; billed ~${cost:.3f}. "
+              f"The warm floor is re-checked on the next scaler pass.", flush=True)
+        return True
+
     def _terminate(self, pod: PodHandle, reason: str):
         if getattr(pod, "gpu", "") == "(shared)":
             # Borrowed from another engine: it owns the lifecycle and the bill.
@@ -3305,6 +3355,12 @@ class RunpodPodPool:
                 if self._provisioning:
                     return
                 self._provisioning = True
+            # Say so before spending. A warm floor silently failing to be
+            # re-established is indistinguishable, from outside, from a warm
+            # floor that is fine — which is how a pod terminated out of band
+            # went unnoticed until the next request paid a cold boot.
+            print(f"[runpod] {self.model_key!r}: warm floor {keep_min}, "
+                  f"{healthy_n} pod(s) healthy — renting one", flush=True)
             try:
                 if not self._adopt_shared_pod():
                     self._provision_one()
@@ -3965,6 +4021,90 @@ def registered_pod_ids() -> set:
     return set(data.keys()) if isinstance(data, dict) else set()
 
 
+#: Pod ids a successful listing did not mention, from the PREVIOUS sweep. A pod
+#: has to be missing from two listings in a row before the pool gives up on it:
+#: the RunPod API is eventually consistent, a partial page or a brief backend
+#: hiccup can omit a pod that is running perfectly well, and the cost of
+#: believing one such listing is a second rented GPU. Guarded by _pools_lock.
+_absent_before: set = set()
+
+#: Statuses that are RunPod telling us, in so many words, that the machine is
+#: finished. No second opinion needed for these.
+_DEAD_STATUSES = ("TERMINATED", "EXITED", "DEAD", "FAILED")
+
+
+def reconcile_pools(live_status: dict, candidates=None) -> set:
+    """Reconcile pools (and the registry) against what RunPod actually has.
+
+    Returns the set of pod ids now CONFIRMED gone — the caller unregisters
+    those; any that were in a pool have already been forgotten here.
+
+    The bug this exists for: ``keep_warm`` would not re-rent after a pod was
+    terminated out of band, and nothing was logged. Both halves had the same
+    cause — a pool only learns a pod is bad by FAILING to use it, and a
+    warm-floor pod by definition has no traffic to fail. ``maintain()`` counted
+    it as healthy, so ``healthy_n < keep_min`` was never true, so it never
+    topped up and never had anything to say. The floor stayed "satisfied" by a
+    machine that had not existed for hours, and the first real request paid a
+    full cold boot — the exact cost keep_warm is there to avoid.
+
+    ``live_status`` maps pod id -> status string, from one successful account
+    listing. Only positive evidence acts: a dead status immediately, an absence
+    only when the previous sweep saw it absent too. An empty or failed listing
+    must never reach this function — see the caller.
+    """
+    global _absent_before
+    with _pools_lock:
+        pools = list(_pools.values())
+        previously_absent = set(_absent_before)
+        shielded = set(_provisioning_ids)
+    #: id -> the pool handle holding it, for the ids we are judging.
+    owned = {}
+    for pool in pools:
+        with pool._cv:
+            for h in pool.pods:
+                owned[str(h.pod_id)] = (pool, h)
+    ids = {str(c) for c in (candidates or ())} | set(owned)
+    absent_now, confirmed = set(), set()
+    for pid in sorted(ids):
+        if pid in shielded:
+            continue
+        ph = owned[pid][1] if pid in owned else None
+        status = live_status.get(pid)
+        if status is None:
+            absent_now.add(pid)
+            if pid not in previously_absent:
+                # First listing without it. Say so when it is a pod we are
+                # actively holding — one that flickers in and out of the
+                # account listing is itself worth knowing about — but never act
+                # on one data point.
+                if pid in owned:
+                    print(f"[runpod] pod {pid} ({owned[pid][0].model_key!r}) is not "
+                          f"in the RunPod account listing; confirming on the next "
+                          f"sweep before dropping it", flush=True)
+                continue
+            # A pod that served a request seconds ago exists, whatever the
+            # listing says — traffic is better evidence than an API page. Only
+            # the absence branch gets this: an explicit dead status is RunPod
+            # telling us directly, and is trusted even mid-request. A warm-floor
+            # pod, the case this whole function is for, has no traffic to speak
+            # for it, so the guard never masks it.
+            if (time.time() - float(getattr(ph, "last_used", 0) or 0)) < 60.0:
+                continue
+            reason = "not in the account listing twice running"
+        elif str(status).upper() in _DEAD_STATUSES:
+            reason = f"status {str(status).upper()}"
+        else:
+            continue
+        confirmed.add(pid)
+        if pid in owned:
+            pool, h = owned[pid]
+            pool.forget(h, reason)
+    with _pools_lock:
+        _absent_before = absent_now
+    return confirmed
+
+
 def _known_pod_ids() -> set:
     """Every pod id this DEPLOYMENT owns — not just this process's."""
     ids = set()
@@ -4035,12 +4175,22 @@ def reap_orphans() -> int:
         return 0
     known = _known_pod_ids()
     reaped = 0
-    # Drop registry entries for pods RunPod no longer has. They are shielded
-    # from reaping by being "known", and they accumulate for the life of the
-    # install — including pods terminated out of band.
-    live = {str(p.get("id")) for p in pods if p.get("id")}
-    for gone in (known - live):
-        unregister_pod(gone)
+    # Reconcile what we BELIEVE we have against what the account actually has,
+    # before reaping anything. This listing is the only place a pod that died
+    # out of band becomes visible: a pool never probes its own pods, so a
+    # warm-floor pod with no traffic on it is never found dead by use. Pools
+    # drop such a handle (and close its bill) here; registry entries for pods
+    # RunPod no longer has go the same way — they are shielded from reaping by
+    # being "known", so they would otherwise accumulate for the life of the
+    # install. An empty listing is not evidence of an empty account, so a
+    # successful-but-empty response is left to the two-sweep rule inside.
+    live_status = {str(p.get("id")): str(p.get("status") or "")
+                   for p in pods if p.get("id")}
+    try:
+        for gone in reconcile_pools(live_status, known):
+            unregister_pod(gone)
+    except Exception as exc:
+        print(f"[runpod-reaper] reconcile: {exc}", flush=True)
     for p in pods:
         pid, name = p.get("id"), (p.get("name") or "")
         status = str(p.get("status") or "").upper()

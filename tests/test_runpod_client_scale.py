@@ -467,10 +467,18 @@ def test_a_booting_pod_from_a_previous_process_counts():
 
 def test_the_reaper_prunes_entries_for_pods_that_are_gone():
     """A terminated-but-registered id stays 'known', so it is shielded from
-    reaping and accumulates for the life of the install."""
+    reaping and accumulates for the life of the install.
+
+    The pruning moved into `reconcile_pools`, which judges the pools' own pods
+    and the registry from the same listing — and gates an ABSENCE on two
+    listings in a row, because the API is eventually consistent and one page
+    that omits a live pod used to be enough to unregister it. Behaviour pinned
+    in tests/test_runpod_warm_floor_rerent.py; what matters here is that
+    reap_orphans still feeds it the listing and acts on what comes back."""
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def reap_orphans")[1].split("def _scaler_loop")[0]
-    assert "known - live" in blk and "unregister_pod(gone)" in blk
+    assert "reconcile_pools(live_status, known)" in blk
+    assert "unregister_pod(gone)" in blk
 
 
 # ------------------------------- the pid in a container is not an identity

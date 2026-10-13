@@ -334,6 +334,56 @@ Consequences worth knowing:
 
 `atexit` also tears down every pool on a clean shutdown.
 
+### The same sweep reconciles the pools (a pod that dies behind our back)
+
+The listing is not only used to find pods that should not exist. It is also the
+only place a pod that **should** exist and no longer does becomes visible.
+
+Nothing in a pool probes its own pods on a timer. A `PodHandle`'s `healthy` flag
+goes false when something tried to **use** the pod and failed, or when the pool
+itself retired it — which means a pod with no traffic on it is never discovered
+dead. That is exactly a warm-floor pod. So a `keep_warm` pod terminated from the
+RunPod console, reclaimed as spot, or lost with its host left the pool believing
+its floor was satisfied, **indefinitely and silently**: `maintain()` counted the
+handle, found `healthy >= min_pods`, and neither topped up nor logged. The first
+real request then paid a full cold boot — around 12 minutes on the Digesta
+orchestrator — which is the precise cost `keep_warm` is bought to avoid.
+
+Each successful listing is now reconciled against what the pools believe:
+
+- A pod RunPod reports as `TERMINATED`/`EXITED`/`DEAD`/`FAILED` is dropped
+  immediately. That is RunPod telling us directly; a second opinion adds nothing.
+- A pod simply **missing** from the listing is dropped only after it is missing
+  from **two listings in a row** (~30s apart). The API is eventually consistent
+  and pages; one response that omits a running pod used to be enough to
+  unregister it, and believing it costs a second rented GPU for work already
+  being done. A pod that reappears resets the count.
+- A pod that **served a request in the last 60s** is kept whatever the listing
+  says — traffic is better evidence than an API page. This cannot mask the bug
+  above, because a warm-floor pod has no traffic to speak for it.
+- A pod still being **provisioned** is shielded, and a **failed** listing never
+  reaches the reconcile at all: `reap_orphans` returns early on a `RunpodError`,
+  so an API outage cannot empty every pool and re-rent the fleet.
+
+Dropping such a handle does **not** call the API — there is nothing left to
+terminate — but it does close the bill: the ledger entry is written exactly as a
+real termination writes it, estimated up to the moment we noticed, because a
+pod that died out of band was billed right up to its death. A borrowed
+(`(shared)`) pod is dropped without a ledger entry; its owner holds the bill.
+
+Once the handle is gone, the next scaler pass sees the pool below its floor and
+says so before it spends:
+
+```
+[runpod] pod qb9ap… for 'pool:digesta-qwen38' is gone from RunPod (status TERMINATED)
+         — dropped from the pool; billed ~$0.412
+[runpod] 'pool:digesta-qwen38': warm floor 1, 0 pod(s) healthy — renting one
+```
+
+A pool with `min_pods: 0` re-rents nothing: a pod dying out of band there is
+simply gone, and renting a replacement nobody asked for is how an idle install
+bills overnight.
+
 ---
 
 ## 5. Budgets and the ledger
