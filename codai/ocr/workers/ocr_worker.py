@@ -215,6 +215,8 @@ def _trace_begin():
     st["tokens"] = []
     st["continued"] = 0
     st["still_truncated"] = False
+    st.pop("no_resume", None)
+    st.pop("budget", None)
     return st["calls"], st["repairs"]
 
 
@@ -295,6 +297,23 @@ def _attempt_tokens(n: int) -> None:
         if lst is None:
             lst = st["tokens"] = []
         lst.append(int(n or 0))
+    except Exception:
+        pass
+
+
+def _no_resume(reason: str) -> None:
+    """Why a reply that hit its cap was NOT resumed.
+
+    The report used to assert one: "resumption is off
+    (ocr.surya_max_continuations = 0)" was a hardcoded string in the branch for
+    "hit the cap and did not resume", which is reached for four different
+    reasons. A caller read it exactly as written and went looking for a setting
+    that was not set — the real cause was a looping generation, and the budget
+    was never 0. A diagnostic that names the wrong cause is worse than one that
+    says nothing, because it is acted on.
+    """
+    try:
+        _state()["no_resume"] = str(reason)
     except Exception:
         pass
 
@@ -975,6 +994,7 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
         base_messages = oc._build_messages(oc.scale_to_fit(item.image), prompt)
     except Exception as exc:
         print(f"[surya] cannot resume a cut-off page: {exc}", file=sys.stderr, flush=True)
+        _no_resume(f"the reply could not be resumed ({exc})")
         return result, 0, True
 
     # A reply that is already repeating itself did not run out of room -- it ran
@@ -990,6 +1010,10 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
                   f"itself — it stopped at the {cap}-token cap because it is "
                   f"looping, not because the page is long",
                   file=sys.stderr, flush=True)
+            _no_resume("the generation was already repeating itself, so it "
+                       "stopped at the cap because it is LOOPING, not because "
+                       "the page is long; resuming would only extend the loop "
+                       "and surya re-runs the page anyway")
             return result, 0, False
     except Exception:
         pass
@@ -1254,6 +1278,11 @@ class SuryaWorker:
             try:
                 budget = int(_page_override("max_continuations",
                                             _CONTINUE_BUDGET[0]) or 0)
+                _state()["budget"] = budget
+                if not budget:
+                    _no_resume("resumption is off for this page "
+                               "(max_continuations = 0, from the request or "
+                               "ocr.surya_max_continuations)")
                 item = args[0] if args else kwargs.get("item")
                 eff_cap = int(getattr(item, "max_tokens", 0) or 0) or int(
                     kwargs.get("max_tokens_default") or 0)
@@ -1466,6 +1495,12 @@ class SuryaWorker:
         incomplete = bool(_state().get("still_truncated"))
         if tries > 1 or capped or resumed:
             info = {"calls": tries or 1, "tokens": toks, "cap": cap}
+            # The budget actually in force for this page. Printing the cap but
+            # not this is why a caller could not tell a request that landed from
+            # one that was ignored.
+            _budget = _state().get("budget")
+            if _budget is not None:
+                info["max_continuations"] = int(_budget)
             if resumed:
                 info["resumed"] = resumed
                 info["why"] = (f"the reply ran past the {cap}-token cap and was "
@@ -1483,11 +1518,14 @@ class SuryaWorker:
             elif capped and not resumed:
                 info["truncated"] = True
                 info["complete"] = False
+                why = _state().get("no_resume")
                 info["why"] = (
-                    f"the reply stopped at the {cap}-token cap and resumption is "
-                    f"off (ocr.surya_max_continuations = 0), so this page is "
-                    f"INCOMPLETE. A cut-off reply, NOT a page the model could "
-                    f"not read.")
+                    f"the reply stopped at the {cap}-token cap and was not "
+                    f"resumed: {why}. So this page is INCOMPLETE."
+                    if why else
+                    f"the reply stopped at the {cap}-token cap and was not "
+                    f"resumed. So this page is INCOMPLETE. A cut-off reply, NOT "
+                    f"a page the model could not read.")
             elif not resumed:
                 info["why"] = ("surya re-ran this page because the generation "
                                "repeated itself; each re-run is a full "

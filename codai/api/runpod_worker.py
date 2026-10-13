@@ -3202,7 +3202,17 @@ class RunpodPodPool:
         """
         def _run():
             try:
-                self._provision_one()
+                # Adopt before renting, here too. Only the cold paths did —
+                # `ensure_ready`, `acquire` with nothing healthy, and the warm
+                # floor — so GROWTH always rented, even with a healthy pod for
+                # this very pool sitting in the registry under another process.
+                # Seen live: a run adopted one surviving pod, grew by one, and
+                # rented a card beside a second idle pod it already owned, which
+                # then billed for nothing. Adoption refuses by itself when it
+                # would mix two tokens in one pool, so this cannot make that
+                # worse.
+                if not self._adopt_shared_pod():
+                    self._provision_one()
             except Exception as exc:
                 print(f"[runpod] scale-up for {self.model_key!r} failed: {exc}", flush=True)
             finally:

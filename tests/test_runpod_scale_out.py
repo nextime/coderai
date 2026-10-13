@@ -53,6 +53,11 @@ def _pool(max_pods=64, threshold=16, parallel=4, pods=(), booting=0, waiting=0):
     cfg.scale_up_inflight_per_pod = threshold
     cfg.scale_up_max_parallel_boots = parallel
     pool.mcfg = cfg
+    # Growth tries adoption before renting (a pod already running for this pool
+    # is cheaper than a new card). These tests are about the counting and the
+    # scale-up, so there is nothing to adopt unless a test says otherwise —
+    # left real, it would read this machine's own pod registry.
+    pool._adopt_shared_pod = lambda: False
     return pool
 
 
@@ -252,3 +257,22 @@ def test_growth_is_announced_with_the_numbers():
     that does not need to — which is how ten minutes of this went unnoticed."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
     assert "growing to meet" in src and "booting" in src
+
+
+def test_growth_prefers_a_pod_already_running_over_renting():
+    """Live, 2026-10-13: a run adopted one surviving pod, then grew — and rented
+    a card beside a SECOND healthy pod it already owned, which billed for
+    nothing until the reaper's grace expired. Only the cold paths adopted."""
+    pool = _pool(pods=[_pod("a", inflight=16)], waiting=48)
+    provisioned, adopted = [], []
+    pool._provision_one = lambda: provisioned.append(1)
+    pool._adopt_shared_pod = lambda: (adopted.append(1), True)[1]
+    pool._pick = lambda healthy, affinity: healthy[0]
+    pool._remember_affinity = lambda a, p: None
+    pool.acquire(timeout=5)
+    for _ in range(200):
+        if pool._booting == 0 and adopted:
+            break
+        __import__("time").sleep(0.01)
+    assert adopted == [1]
+    assert provisioned == [], "rented a card beside a pod we already had"

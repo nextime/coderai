@@ -169,3 +169,58 @@ def test_the_batch_hook_is_reported_when_surya_has_no_such_entry_point(monkeypat
     w = _worker(mod, token_trace=True, max_tokens=3072)
     w._install_trace_hook()
     assert "no chat_completions_batch to hook" in capsys.readouterr().err
+
+
+# --- the report must name the real reason, not assert a config value --------
+
+def test_a_looping_page_is_not_reported_as_resumption_being_off():
+    """The message was a hardcoded string in a branch reached four ways.
+
+    A caller read "resumption is off (ocr.surya_max_continuations = 0)" exactly
+    as written and went looking for a setting that was never set; the real cause
+    was a generation that had already started repeating itself, with a budget of
+    4 in force. A diagnostic that names the wrong cause is worse than silence,
+    because it is acted on.
+    """
+    mod = _worker_module()
+    mod._trace_begin()
+    mod._state()["budget"] = 4
+    mod._no_resume("the generation was already repeating itself")
+    assert mod._state()["no_resume"] == "the generation was already repeating itself"
+    src = (ROOT / "codai/ocr/workers/ocr_worker.py").read_text()
+    # The old text claimed a value it never read. It must not come back.
+    assert "off (ocr.surya_max_continuations = 0)" not in src
+    assert 'why = _state().get("no_resume")' in src
+
+
+def test_the_budget_in_force_is_published():
+    """So a caller can tell a request that landed from one that was ignored."""
+    src = (ROOT / "codai/ocr/workers/ocr_worker.py").read_text()
+    assert 'info["max_continuations"] = int(_budget)' in src
+
+
+def test_a_new_page_does_not_inherit_the_previous_reason():
+    mod = _worker_module()
+    mod._trace_begin()
+    mod._no_resume("looping")
+    mod._trace_begin()
+    assert "no_resume" not in mod._state()
+    assert "budget" not in mod._state()
+
+
+def test_zero_budget_still_says_resumption_is_off(monkeypatch):
+    """That message was right in ONE of the four cases; it must survive there."""
+    mod = _worker_module()
+    oc = _fake_surya(monkeypatch, mod)
+    def _at_the_cap(*a, **k):
+        r = _Result()
+        r.token_count = 3072        # the reply filled its budget
+        return r
+
+    oc._generate_one = _at_the_cap
+    w = _worker(mod, token_trace=True, max_tokens=3072, max_continuations=0)
+    w._install_trace_hook()
+    mod._trace_begin()
+    mod._trace_opts({"max_tokens": 3072, "max_continuations": 0})
+    oc._generate_one(_Item(3072), max_tokens_default=3072)
+    assert "max_continuations = 0" in (mod._state().get("no_resume") or "")
