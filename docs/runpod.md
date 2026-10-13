@@ -324,6 +324,24 @@ carrying this deployment's tag that is not in a live pool and not currently bein
 provisioned**. That covers pods orphaned by a crash, a kill -9, or a container
 restart mid-provision.
 
+"Not in a live pool" is decided from a shared registry file, and an entry in it
+**shields** the pod it names from reaping — a sibling engine must not kill a pod
+another process is managing. So every process heartbeats its own entries once a
+minute, and an entry goes quiet for `CODERAI_RUNPOD_REAP_GRACE` (1200 s) when
+its process is gone. Without that heartbeat an entry vouched for its pod for
+the life of the install: observed 2026-10-13, where an unattended upgrade
+restarted coderai and the surviving qwen38 pod was then both unmanaged (its
+pool's warm floor was 0 outside its schedule window, so nothing adopted it and
+nothing applied `idle_timeout_s` to it) and un-reapable (the dead process's
+entry still vouched for it). It billed on. A pod the reaper kills is now also
+written to the ledger, from the `created` timestamp in its entry — those hours
+used to be invisible, because only a pool-tracked termination recorded spend.
+
+One caveat that follows: a process whose maintenance loop is dead but which is
+still running stops heartbeating, and a sibling will reap its pods after the
+grace. That is the intended trade — twenty minutes of silence from the loop
+that is supposed to manage a pod is itself the failure.
+
 Consequences worth knowing:
 
 - Pods from **another** `deployment_id` are never touched, so two CoderAI

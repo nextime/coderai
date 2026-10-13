@@ -4390,11 +4390,45 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
     _registry_update(lambda d: d.__setitem__(
         str(pod_id), {"pool": str(pool_key), "pid": os.getpid(),
                       "proc": _PROC_ID, "at": time.time(),
+                      # Distinct from "at", which is now a heartbeat: the hours
+                      # a reaped pod billed can only be computed from when it
+                      # was CREATED, and that number must survive the owner.
+                      "created": time.time(),
                       "url": str(url or ""), "key": str(api_key or ""),
                       # So a pod adopted after a restart is still attributed its
                       # real $/hr instead of looking free.
                       "hourly_usd": float(hourly_usd or 0.0)})
         or True)
+
+
+def touch_registered_pods() -> int:
+    """Refresh this process's registry entries. Returns how many were touched.
+
+    ``at`` is what tells a sibling's reaper that an entry still has an owner.
+    Without a heartbeat it only ever said when the pod was REGISTERED, so an
+    entry outlived its process forever — and because the reaper skips anything
+    "known", the pod it named was shielded from reaping for the life of the
+    install while no pool was managing it either. Exactly what happened to a
+    qwen38 pod across an unattended upgrade: its pool had a warm floor of 0
+    (outside its schedule window), so nothing adopted it, nothing applied
+    ``idle_timeout_s`` to it, and the reaper left it alone because the dead
+    process's entry still vouched for it. It billed on.
+
+    So: a live owner says so every pass, and silence past REAP_GRACE_SECONDS
+    lets the pod be reaped like any other leftover.
+    """
+    touched = [0]
+
+    def _fn(d):
+        now = time.time()
+        for info in d.values():
+            if isinstance(info, dict) and _is_this_process(info):
+                info["at"] = now
+                touched[0] += 1
+        return bool(touched[0])
+
+    _registry_update(_fn)
+    return touched[0]
 
 
 def sibling_is_provisioning(pool_key: str) -> bool:
@@ -4466,6 +4500,32 @@ def unregister_pod(pod_id: str) -> None:
 def registered_pod_ids() -> set:
     data = _registry_update(lambda d: False)
     return set(data.keys()) if isinstance(data, dict) else set()
+
+
+def live_registered_pod_ids() -> set:
+    """Registered pods whose owner is still around to manage them.
+
+    Ours count unconditionally. A sibling's count while its heartbeat is fresh.
+    Everything else is a pod with no manager, which is the reaper's job.
+    """
+    data = _registry_update(lambda d: False)
+    if not isinstance(data, dict):
+        return set()
+    now, out = time.time(), set()
+    for pod_id, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        if _is_this_process(info) or (now - float(info.get("at") or 0)
+                                      < REAP_GRACE_SECONDS):
+            out.add(pod_id)
+    return out
+
+
+def registry_entry(pod_id: str) -> dict:
+    """One registry entry, or {}."""
+    data = _registry_update(lambda d: False)
+    info = (data or {}).get(str(pod_id))
+    return dict(info) if isinstance(info, dict) else {}
 
 
 #: Pod ids a successful listing did not mention, from the PREVIOUS sweep. A pod
@@ -4553,14 +4613,21 @@ def reconcile_pools(live_status: dict, candidates=None) -> set:
 
 
 def _known_pod_ids() -> set:
-    """Every pod id this DEPLOYMENT owns — not just this process's."""
+    """Every pod id this DEPLOYMENT owns — not just this process's.
+
+    A registry entry counts only while it still has an owner: ours always, and
+    a sibling's for as long as it keeps heartbeating (see
+    touch_registered_pods). An entry whose process is gone stops vouching for
+    its pod after REAP_GRACE_SECONDS, because otherwise nothing ever reaps it
+    and nothing manages it either — the pod simply bills.
+    """
     ids = set()
     with _pools_lock:
         for pool in _pools.values():
             with pool._cv:
                 ids.update(p.pod_id for p in pool.pods)
         ids.update(_provisioning_ids)
-    ids.update(registered_pod_ids())
+    ids.update(live_registered_pod_ids())
     return ids
 
 
@@ -4669,10 +4736,30 @@ def reap_orphans() -> int:
         if age < REAP_GRACE_SECONDS:
             continue                      # too young to be a leftover
         try:
+            info = registry_entry(pid)
             client.terminate_pod(pid)
             reaped += 1
+            # A pod the reaper kills billed real money, and until now it left no
+            # trace in the ledger: the spend was recorded by _terminate, which
+            # only runs for a pod a pool was tracking. An orphan's hours were
+            # therefore invisible in exactly the case where they are most
+            # surprising.
+            try:
+                from codai.api import runpod_ledger
+                rate = float(info.get("hourly_usd") or 0.0)
+                began = float(info.get("created") or info.get("at") or 0.0)
+                if rate and began:
+                    runpod_ledger.record_spend(
+                        str(info.get("pool") or "(orphan)"),
+                        (time.time() - began) / 3600.0 * rate,
+                        {"pod_id": pid, "gpu": "(orphan)", "reaped": True})
+            except Exception as exc:
+                print(f"[runpod-reaper] could not attribute {pid}'s spend: {exc}",
+                      flush=True)
+            unregister_pod(pid)
             print(f"[runpod-reaper] terminated STALE pod {pid} ({name}) — "
-                  "not tracked by any pool", flush=True)
+                  "not tracked by any pool and its owner stopped reporting",
+                  flush=True)
         except Exception as exc:
             print(f"[runpod-reaper] failed to terminate {pid}: {exc}", flush=True)
     return reaped
@@ -4688,6 +4775,14 @@ def _scaler_loop():
     while True:
         time.sleep(15)
         tick += 1
+        # Say we are still here, for every pod we own. Cheap (one locked file
+        # write), and what keeps a sibling's reaper off our pods — and, when
+        # this process dies, what stops ours being shielded forever.
+        if tick % 4 == 1:
+            try:
+                touch_registered_pods()
+            except Exception as exc:
+                print(f"[runpod] registry heartbeat: {exc}", flush=True)
         try:
             with _pools_lock:
                 pools = list(_pools.values())
