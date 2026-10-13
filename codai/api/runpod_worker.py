@@ -2383,6 +2383,8 @@ class RunpodPodPool:
         #: Set only for the duration of a volume seed, naming the one region
         #: being filled (see seed_region).
         self._seed_dc = ""
+        #: The image this pool launches, learned from the first plan it builds.
+        self._image = ""
         self.served = served_name
         self.pods: list = []
         #: affinity key -> pod_id, bounded. A conversation that comes back finds
@@ -2525,6 +2527,10 @@ class RunpodPodPool:
                         _model_path_for(self.model_key), api_key=self.api_key,
                         entry=self.entry, seed_entries=self.seed_entries)
         image, args = plan["image"], plan["args"]
+        #: What this pool launches. Recorded with every pod, because "the same
+        #: model" is not "the same code" — a pinned tag beside :latest is the
+        #: difference between a fix being live and only looking live.
+        self._image = image
         self.health_path = plan["health_path"]
         # The plan's env, then the model's OWN env on top: an explicit
         # per-model value must beat one the plan resolved from the ambient
@@ -2783,8 +2789,31 @@ class RunpodPodPool:
         unattended upgrade rented a fresh A40 each time and left the previous
         one billing until the reaper's 20-minute grace expired.
         """
+        # What this pool would launch, and on what. Adoption is only sound when
+        # the running pod matches both: the same model on a different image is
+        # different code, and a pod rented as a fallback is a card this
+        # configuration accepts only when its preferred one is unavailable.
+        want_image, want_gpus = "", []
+        try:
+            plan = pod_plan(self.mcfg, self.served, str(self.model_key),
+                            _model_path_for(self.model_key), api_key=self.api_key,
+                            entry=self.entry, seed_entries=self.seed_entries)
+            want_image = str(plan.get("image") or "")
+        except Exception as exc:
+            # Without the image this check cannot be made, and making it badly
+            # would reject every candidate. Say so and fall back to the model
+            # match alone.
+            print(f"[runpod] cannot tell which image {self.model_key!r} would "
+                  f"launch ({exc}) — adopting on the model match alone",
+                  flush=True)
+        try:
+            narrow = narrow_gpu_choice(self.mcfg, **(self.client_gpu_narrow() or {}))
+            want_gpus = list(narrow.get("gpu_types") or [])
+        except Exception:
+            want_gpus = list(getattr(self.mcfg, "gpu_types", []) or [])
         shared_id, shared_url, shared_key, shared_rate = find_shared_pod(
-            str(self.model_key), self.health_path, self.api_key)
+            str(self.model_key), self.health_path, self.api_key,
+            image=want_image, gpus=want_gpus)
         if not shared_url:
             return False
         if shared_key and shared_key != self.api_key:
@@ -2825,13 +2854,23 @@ class RunpodPodPool:
                            # inheriting after our own restart is ours to pay for,
                            # and reporting it free hides it from the $/hr cap.
                            hourly_usd=float(shared_rate or 0.0),
-                           started_at=time.time(), gpu="(adopted)",
+                           # When it was CREATED, not when we took it over. An
+                           # adopted pod has been billing since it was rented,
+                           # and the hours before the adoption were charged to
+                           # nobody: a pod created at 22:27 and adopted at 23:10
+                           # was ledgered for 16 minutes when it had run for an
+                           # hour. Only cost and uptime reporting read this, so
+                           # backdating it corrects the bill and nothing else.
+                           started_at=float(
+                               registry_entry(shared_id).get("created")
+                               or time.time()),
+                           gpu="(adopted)",
                            healthy=True, last_used=time.time())
         with self._cv:
             self.pods.append(handle)
             self._cv.notify_all()
         register_pod(shared_id, str(self.model_key), shared_url, self.api_key,
-                     hourly_usd=float(shared_rate or 0.0))
+                     hourly_usd=float(shared_rate or 0.0))  # image/gpu kept
         return True
 
     def _warmup(self, pod_id: str, url: str) -> bool:
@@ -2981,7 +3020,9 @@ class RunpodPodPool:
                     "console_url": console, "started_at": time.time()}
             # …and from every SIBLING engine's reaper, which cannot see the set
             # above: each engine has its own pools and its own reaper.
-            register_pod(pod_id, str(self.model_key), api_key=self.api_key)  # url once ready
+            register_pod(pod_id, str(self.model_key), api_key=self.api_key,
+                         image=str(self._image or ""),
+                         gpu=str(sel["display_name"]))   # url once ready
             _warn = weight_transfer_warning(_model_entry(self.served or self.model_key),
                                             self.mcfg, self.account)
             if _warn:
@@ -3061,7 +3102,12 @@ class RunpodPodPool:
             # Publish the URL so a sibling engine needing the same pool reuses
             # this pod instead of renting a second GPU for the same work.
             register_pod(pod_id, str(self.model_key), url, self.api_key,
-                         hourly_usd=sel["price"])
+                         hourly_usd=sel["price"],
+                         # So a sibling — or we, after a restart — can tell
+                         # whether this pod is even adoptable: same image, and a
+                         # card the pool prefers rather than someone's fallback.
+                         image=str(self._image or ""),
+                         gpu=str(sel["display_name"]))
             print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
             return h
         raise last_exc or RunpodError("RunPod: could not provision a pod.")
@@ -4397,7 +4443,8 @@ def _is_this_process(info: dict) -> bool:
 
 
 def register_pod(pod_id: str, pool_key: str = "", url: str = "",
-                 api_key: str = "", hourly_usd: float = 0.0) -> None:
+                 api_key: str = "", hourly_usd: float = 0.0,
+                 image: str = "", gpu: str = "") -> None:
     """Record a pod as owned by this deployment.
 
     Two reasons, both about processes that cannot see each other: no sibling's
@@ -4428,6 +4475,16 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
                           # owner.
                           "created": born or time.time(),
                           "url": str(url or ""), "key": str(api_key or ""),
+                          # What it is RUNNING and what it is running ON.
+                          # Adoption is only sound when both match what this
+                          # pool would launch: the same model is not the same
+                          # image (a pinned tag beside :latest serves different
+                          # code, invisibly), and inheriting a fallback card
+                          # would quietly break a lease that asked for one card
+                          # and nothing else. Carried over on re-registration
+                          # so an adoption does not erase them.
+                          "image": str(image or (was or {}).get("image") or ""),
+                          "gpu": str(gpu or (was or {}).get("gpu") or ""),
                           # So a pod adopted after a restart is still attributed
                           # its real $/hr instead of looking free.
                           "hourly_usd": float(hourly_usd or 0.0)}
@@ -4489,8 +4546,14 @@ def sibling_is_provisioning(pool_key: str) -> bool:
     return False
 
 
+def _gpu_name_matches(name: str, want: str) -> bool:
+    """Whether a recorded GPU name is the card ``want`` names."""
+    return _gpu_matches({"id": name, "display_name": name}, want)
+
+
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
-                    api_key: str = "") -> tuple:
+                    api_key: str = "", image: str = "",
+                    gpus: Optional[list] = None) -> tuple:
     """A pod already running for this pool: (pod_id, url, key, hourly_usd).
 
     ``key`` is the token that pod was launched with, which is not necessarily
@@ -4507,10 +4570,27 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
     re-established at every boot — an hourly unattended upgrade would otherwise
     rent a fresh A40 each time and leave the last one billing until the reaper's
     grace ran out.
+
+    Serving the same model is not enough to inherit a pod, so ``image`` and
+    ``gpus`` are checked when given:
+
+    * **the image** must be the one this pool would launch. The same model on a
+      pinned tag and on ``:latest`` is different CODE, and adopting the wrong
+      one is invisible from outside — a whole evening went into chasing an OCR
+      result that came from a pod nobody believed was running;
+    * **the card** must be one the pool prefers (``gpu_types``, as narrowed by a
+      client lease). A pod rented as a FALLBACK is a card the configuration
+      accepts only when the preferred one is unavailable; inheriting it would
+      quietly serve a lease that asked for one card and nothing else on another.
+
+    An entry that records neither is refused rather than trusted: it was written
+    before this check existed, and the cost of refusing is one extra pod once
+    (the old one is reaped), while the cost of trusting is a silent answer from
+    the wrong code.
     """
     data = _registry_update(lambda d: False)
     if not isinstance(data, dict):
-        return None, "", ""
+        return None, "", "", 0.0
     for pod_id, info in data.items():
         if not isinstance(info, dict) or info.get("pool") != str(pool_key):
             continue
@@ -4519,6 +4599,20 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
         url = str(info.get("url") or "")
         if not url:
             continue
+        if image:
+            theirs = str(info.get("image") or "")
+            if theirs != str(image):
+                print(f"[runpod] not adopting pod {pod_id}: it runs "
+                      f"{theirs or '(an unrecorded image)'}, this pool runs "
+                      f"{image}", flush=True)
+                continue
+        if gpus:
+            card = str(info.get("gpu") or "")
+            if not card or not any(_gpu_name_matches(card, w) for w in gpus):
+                print(f"[runpod] not adopting pod {pod_id}: it runs on "
+                      f"{card or '(an unrecorded card)'}, this pool asks for "
+                      f"{', '.join(gpus)}", flush=True)
+                continue
         key = str(info.get("key") or "") or api_key
         if _pod_health_ok(url, path=health_path, api_key=key):
             return pod_id, url, key, float(info.get("hourly_usd") or 0.0)

@@ -342,6 +342,23 @@ still running stops heartbeating, and a sibling will reap its pods after the
 grace. That is the intended trade — twenty minutes of silence from the loop
 that is supposed to manage a pod is itself the failure.
 
+### Inheriting a pod instead of renting one
+
+A pool reuses a pod already running for it — a sibling engine's, or its own from
+before a restart — rather than renting a second card. Three things must match,
+and all three are checked against the registry before the pod is taken over:
+
+| must match | why |
+|---|---|
+| the pool (model) | it has to serve what the caller asked for |
+| the **image** | the same model on a pinned tag and on `:latest` is different CODE, and inheriting the wrong one is invisible from outside |
+| the **card** | a pod rented as a fallback is on a card the configuration accepts only when the preferred one is unavailable; inheriting it would serve a lease that asked for one card *and nothing else* on another |
+
+The pod's own bearer token is adopted with it (it answers to nothing else), and
+an entry recording neither image nor card — written before this check existed —
+is refused rather than trusted: one extra pod once, against a silent answer from
+the wrong code. Every refusal says which pod and why.
+
 Consequences worth knowing:
 
 - Pods from **another** `deployment_id` are never touched, so two CoderAI

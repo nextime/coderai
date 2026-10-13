@@ -193,3 +193,33 @@ def test_a_pod_registered_for_the_first_time_gets_a_created_stamp(monkeypatch, t
     rw.register_pod("p2", pool_key="m", url="u", api_key="k")
     info = json.loads(path.read_text())["p2"]
     assert abs(info["created"] - time.time()) < 5
+
+
+def test_an_adopted_pod_is_billed_from_when_it_was_created(monkeypatch, tmp_path):
+    """Its hours before the adoption were charged to nobody.
+
+    Live: a pod created 22:27 and adopted 23:10 was ledgered for 16 minutes
+    when it had been running for an hour — `_terminate` computes the spend from
+    `started_at`, which was set to the moment of adoption. The registry already
+    records `created`, and only cost and uptime reporting read `started_at`, so
+    backdating it corrects the bill and nothing else.
+    """
+    import json
+    import time
+
+    from codai.api import runpod_worker as rw
+
+    born = time.time() - 3600
+    path = tmp_path / "runpod-pods.json"
+    path.write_text(json.dumps({"p1": {"pool": "m", "proc": "old-1",
+                                       "created": born, "at": born,
+                                       "url": "https://h/v1", "key": "k",
+                                       "hourly_usd": 0.59}}))
+    monkeypatch.setattr(rw, "_pod_registry_path", lambda: str(path))
+
+    src = (ROOT / "codai/api/runpod_worker.py").read_text()
+    blk = src.split("reusing the pod already running")[1][:1400]
+    assert 'registry_entry(shared_id).get("created")' in blk
+
+    # …and the helper really returns it, so the handle gets an hour-old start.
+    assert abs(rw.registry_entry("p1")["created"] - born) < 1
