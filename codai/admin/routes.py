@@ -4141,6 +4141,7 @@ def build_settings_dict(c, gpu_cards):
             "surya_lanes": getattr(c.ocr, "surya_lanes", 4),
             "surya_max_retries": getattr(c.ocr, "surya_max_retries", 1),
             "surya_max_tokens": getattr(c.ocr, "surya_max_tokens", 0),
+            "surya_max_continuations": getattr(c.ocr, "surya_max_continuations", 2),
             "surya_langs": c.ocr.surya_langs,
             "surya_token_trace": c.ocr.surya_token_trace,
             "surya_repair_accents": c.ocr.surya_repair_accents,
@@ -4966,6 +4967,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_instances" in d: o.surya_instances = _i("surya_instances", o.surya_instances, 1)
         if "surya_lanes" in d: o.surya_lanes = _i("surya_lanes", getattr(o, "surya_lanes", 4), 1)
         # -1 is meaningful here ("whatever surya decides"), so the floor is -1.
+        if "surya_max_continuations" in d:
+            o.surya_max_continuations = _i(
+                "surya_max_continuations",
+                getattr(o, "surya_max_continuations", 2), 0)
         if "surya_max_tokens" in d:
             o.surya_max_tokens = _i("surya_max_tokens",
                                     getattr(o, "surya_max_tokens", 0), 0)

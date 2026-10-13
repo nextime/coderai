@@ -33,7 +33,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from codai.ocr.base import (OcrEngine, OcrPage, OcrError, load_pages,
+from codai.ocr.base import (OcrEngine, OcrPage, OcrError, load_pages, ink_coverage,
                             unreadable_report)
 
 
@@ -343,6 +343,53 @@ def _warn_if_oversubscribed(name: str, pages: int) -> None:
     elif need > 1:
         print(f"[ocr] engine {name!r}: {pages} pages at once spreads over {need} "
               f"pods ({per} in flight each); {tail}.", flush=True)
+
+
+def _mark_blank_pages(cfg, images, pages) -> list:
+    """Attach an ink measurement to any page that came back with little text.
+
+    Returns the indices judged blank. Only short pages are measured: a page that
+    read normally needs no explanation, and the measurement is only interesting
+    where someone is about to ask why there is no text.
+    """
+    try:
+        max_chars = int(getattr(cfg.ocr, "blank_page_max_chars", 200) or 0)
+        floor = float(getattr(cfg.ocr, "blank_page_ink", 0.005) or 0.0)
+    except Exception:
+        max_chars, floor = 200, 0.005
+    if max_chars <= 0:
+        return []
+    found = []
+    for i, page in enumerate(pages):
+        try:
+            if len((page.text or "").strip()) > max_chars:
+                continue
+            img = images[i] if i < len(images) else None
+            if img is None:
+                continue
+            ink = ink_coverage(img)
+            if ink < 0:
+                continue
+            info = {"ink": round(ink, 5), "threshold": floor}
+            if ink < floor:
+                info["blank"] = True
+                info["why"] = (
+                    f"{ink * 100:.3f}% of this page's pixels are not background, "
+                    f"below {floor * 100:.3f}% -- there is essentially nothing on "
+                    f"it to read. A short result here is the page being empty, "
+                    f"NOT the engine failing to read it; look at the source "
+                    f"document.")
+                found.append(i)
+            else:
+                info["blank"] = False
+                info["why"] = (
+                    f"{ink * 100:.3f}% of this page's pixels are not background, "
+                    f"so there IS something on it -- a short result here is the "
+                    f"engine failing to read it, not an empty page.")
+            page.meta["page_ink"] = info
+        except Exception:
+            continue
+    return found
 
 
 def _engine_lanes(eng) -> int:
@@ -1022,6 +1069,7 @@ class OcrManager:
         # temps are safe (wait_until_safe blocks, so run it off the event loop).
         await asyncio.to_thread(_wait_thermal_safe)
         name, pages = await self.ocr_pages(images, engine=engine, lang=lang)
+        blank = _mark_blank_pages(cfg, images, pages)
         full_text = "\n\n".join(p.text for p in pages)
 
         stamps, signatures = await self._detect_all(images, pages, detect)
@@ -1047,6 +1095,13 @@ class OcrManager:
             "signatures": signatures,
             "structured": structured_out,
         }
+        # Pages with (almost) nothing on them. Reported at the top level as well
+        # as per page, because a caller deciding whether to accept a document
+        # should not have to walk the pages to discover that it is empty -- and
+        # because "the OCR failed" and "the document is blank" lead to entirely
+        # different places.
+        if blank:
+            out["blank_pages"] = blank
         report = unreadable_report(pages)
         if report:
             out["unreadable"] = report

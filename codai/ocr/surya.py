@@ -77,7 +77,10 @@ class SuryaEngine(SubprocessOcrEngine):
                 "max_retries": (None if int(getattr(self.cfg, "surya_max_retries", 1)) < 0
                                 else int(getattr(self.cfg, "surya_max_retries", 1))),
                 # 0 leaves surya's own 2048 alone.
-                "max_tokens": max(0, int(getattr(self.cfg, "surya_max_tokens", 0) or 0))}
+                "max_tokens": max(0, int(getattr(self.cfg, "surya_max_tokens", 0) or 0)),
+                # Resumptions allowed for a page whose reply hit the cap.
+                "max_continuations": max(0, int(getattr(
+                    self.cfg, "surya_max_continuations", 2) or 0))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")

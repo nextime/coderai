@@ -1065,6 +1065,31 @@ class OcrConfig:
     #: the right value depends on the documents; `model_attempts.truncated` in a
     #: page's result says when this is what went wrong.
     surya_max_tokens: int = 0
+    #: How many times a page whose reply hit the token cap may be RESUMED from
+    #: where it stopped, before the page is returned partial and marked
+    #: `model_attempts.complete = false`.
+    #:
+    #: Raising `surya_max_tokens` only moves the cliff -- a dense enough page
+    #: overflows any fixed number, and what comes back is incomplete block
+    #: markup that parses to a fragment or to nothing. Resumption is the only
+    #: answer that holds for every document: the text so far goes back as a
+    #: prefilled assistant turn (`continue_final_message`) so the model carries
+    #: on the exact string rather than answering afresh about the same image.
+    #:
+    #: 2 by default, because silently returning a page known to be incomplete is
+    #: a correctness failure rather than a speed/cost trade-off. 0 restores the
+    #: old behaviour. Each resumption is one more request, so the ceiling is
+    #: what stops a pathological page costing without bound.
+    surya_max_continuations: int = 2
+    #: A page whose text is this short gets its ink measured, so a short result
+    #: can be explained rather than guessed at. 0 disables the measurement.
+    blank_page_max_chars: int = 200
+    #: Below this fraction of non-background pixels a page is reported blank.
+    #: 0.5% is well under any page carrying text (a typical text page at 200 DPI
+    #: is several per cent) and above the scan edges, specks and watermarks that
+    #: an empty scanned page still carries -- a real one measured 0.13%, all of
+    #: it a page edge and a diagonal "copia non ufficiale".
+    blank_page_ink: float = 0.005
     surya_langs: str = "it"
     # Return the model's own per-token bytes for the places a page came back
     # unreadable (see base.UNREADABLE). Off by default: it is a diagnostic, it
@@ -1817,6 +1842,8 @@ class ConfigManager:
                 "surya_lanes": getattr(self.config.ocr, "surya_lanes", 4),
                 "surya_max_retries": getattr(self.config.ocr, "surya_max_retries", 1),
                 "surya_max_tokens": getattr(self.config.ocr, "surya_max_tokens", 0),
+                "surya_max_continuations": getattr(self.config.ocr,
+                                                   "surya_max_continuations", 2),
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_token_trace": self.config.ocr.surya_token_trace,
                 "surya_repair_accents": self.config.ocr.surya_repair_accents,

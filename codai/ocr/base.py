@@ -231,6 +231,33 @@ class OcrEngine(ABC):
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif", ".ppm"}
 
 
+def ink_coverage(image, threshold: int = 200) -> float:
+    """Fraction of a page's pixels that are not background, 0.0-1.0.
+
+    The cheapest question nobody was asking: **is there anything on this page?**
+
+    Three outcomes are otherwise indistinguishable in a short OCR result -- a
+    page the model could not read, a reply that was cut off, and a page with
+    nothing on it. The first needs a better model, the second a bigger budget,
+    and the third needs the document fixed upstream, so confusing them sends the
+    operator looking in the wrong place. Measured on a real one (2026-10-13): a
+    four-page court PDF returned 47 characters and was reported as a model
+    failure; every page was a ~900-byte CCITT Group 4 image -- what an EMPTY
+    page costs -- carrying 0.13% ink, all of it a diagonal scan edge and a
+    diagonal watermark. The OCR was perfect. The document was blank.
+
+    A greyscale histogram over an image already in memory, so it costs nothing
+    worth measuring.
+    """
+    try:
+        grey = image.convert("L")
+        hist = grey.histogram()
+        total = float(max(1, image.width * image.height))
+        return float(sum(hist[:max(0, min(256, int(threshold)))])) / total
+    except Exception:
+        return -1.0
+
+
 def load_pages(data: bytes, filename: str = "", content_type: str = "", dpi: int = 200) -> List["Any"]:
     """Decode ``data`` (an image or a PDF) into a list of RGB ``PIL.Image`` pages.
 

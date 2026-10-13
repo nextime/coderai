@@ -197,8 +197,8 @@ def test_a_retried_page_says_so_in_its_result():
     between a slow page and a page generated four times over."""
     src = SRC.read_text()
     assert '"model_attempts"' in src
-    blk = src.split("tries = _attempts()")[1][:1600]
-    assert "if tries > 1 or capped:" in blk      # a clean page stays untouched
+    blk = src.split("tries = _attempts()")[1].split("return page")[0]
+    assert "if tries > 1 or capped or resumed:" in blk   # clean pages untouched
 
 
 def test_a_truncated_reply_is_distinguished_from_an_unreadable_page():
@@ -206,17 +206,19 @@ def test_a_truncated_reply_is_distinguished_from_an_unreadable_page():
     and 100 with no text at all. Both are what a reply cut off mid-markup parses
     to, and both look exactly like a page the model could not read."""
     src = SRC.read_text()
-    blk = src.split("tries = _attempts()")[1][:1600]
-    assert '"truncated"' in blk
-    assert "cap" in blk and "NOT a page the model could not read" in blk
+    blk = src.split("tries = _attempts()")[1].split("return page")[0]
+    assert '"truncated"' in blk and '"complete"' in blk
+    # Wrapped across f-string lines in the source, so match the fragments that
+    # are contiguous rather than the sentence they form.
+    assert "INCOMPLETE." in blk and "cut-off reply" in blk
 
 
 def test_a_clean_page_carries_no_attempt_block():
     """One attempt, well under the cap: byte-identical to what it always
     returned."""
     src = SRC.read_text()
-    i = src.index("tries = _attempts()")
-    assert "if tries > 1 or capped:" in src[i:i + 1600]
+    blk = src.split("tries = _attempts()")[1].split("return page")[0]
+    assert "if tries > 1 or capped or resumed:" in blk
 
 
 def test_the_token_counts_are_per_thread():
@@ -383,3 +385,197 @@ def test_a_serverless_model_has_no_pod_shape(monkeypatch):
                                                  "scale_up_inflight_per_pod": 16}},
                         raising=False)
     assert m._fleet_shape("surya") is None
+
+
+# ------------------------------------------------- resuming a cut-off reply #
+#
+# Raising the cap only moves the cliff: a dense enough page overflows any fixed
+# number, and incomplete block markup parses to a fragment or to nothing. A live
+# document (4 pages) came back as 47 characters with `truncated: false` — the
+# other failure mode — which is exactly why the two must be distinguishable and
+# why a page known to be incomplete must say so rather than pass as read.
+
+class _Img:
+    width = height = 100
+
+    def save(self, *a, **k):
+        pass
+
+
+class _Item:
+    prompt = "ocr"
+    prompt_type = "ocr"
+    max_tokens = 0
+    image = _Img()
+    request_logprobs = True
+    temperature = None
+    top_p = None
+    guided_json = None
+    guided_regex = None
+
+
+class _Completion:
+    def __init__(self, text, tokens, logprobs=None):
+        lp = type("_LP", (), {"content": logprobs or []})()
+        choice = type("_C", (), {"message": type("_M", (), {"content": text})(),
+                                 "logprobs": lp, "finish_reason": "length"})()
+        self.choices = [choice]
+        self.usage = type("_U", (), {"completion_tokens": tokens})()
+
+
+def _client(segments, reject_flag=False, reject_all=False):
+    """A chat client that hands back `segments` in order."""
+    sent = []
+
+    class _Chat:
+        class completions:
+            @staticmethod
+            def create(**kwargs):
+                sent.append(kwargs)
+                if reject_all:
+                    raise RuntimeError("no")
+                if reject_flag and "extra_body" in kwargs:
+                    raise RuntimeError("unknown field continue_final_message")
+                if not segments:
+                    raise AssertionError("asked for more than it was given")
+                text, tokens = segments.pop(0)
+                return _Completion(text, tokens)
+
+    c = type("_Client", (), {"chat": _Chat()})()
+    c.sent = sent
+    return c
+
+
+def _resume(mod, monkeypatch, first, segments, budget=2, cap=100, **kw):
+    oc = _fake_surya(monkeypatch, mod)
+    oc._build_messages = lambda img, prompt: [{"role": "user", "content": prompt}]
+    oc.scale_to_fit = lambda img: img
+    oc.PROMPT_MAPPING = {"ocr": "ocr"}
+    res = _Result(raw=first[0])
+    res.token_count = first[1]
+    cl = _client(list(segments), **kw)
+    out, rounds, still = mod._continue_reply(
+        oc, res, _Item(), cl, "m", cap, 0.0, 0.1, 60.0, False, budget)
+    return out, rounds, still, cl
+
+
+def test_a_cut_off_reply_is_resumed_and_joined():
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, _ = _resume(mod, m, ("<block>aaa", 100),
+                                        [("bbb</block>", 20)])
+    finally:
+        m.undo()
+    assert out.raw == "<block>aaabbb</block>"
+    assert rounds == 1 and still is False
+    assert out.token_count == 120
+
+
+def test_it_keeps_going_while_each_segment_fills_the_cap():
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, _ = _resume(mod, m, ("a", 100),
+                                        [("b", 100), ("c", 5)], budget=3)
+    finally:
+        m.undo()
+    assert out.raw == "abc" and rounds == 2 and still is False
+
+
+def test_the_budget_stops_it_and_the_page_says_it_is_incomplete():
+    """A pathological page must not cost without bound — and must not pass as
+    read either."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, _ = _resume(mod, m, ("a", 100),
+                                        [("b", 100), ("c", 100)], budget=2)
+    finally:
+        m.undo()
+    assert rounds == 2 and still is True
+
+
+def test_resumption_prefills_the_assistant_turn():
+    """It must CONTINUE the exact string, not answer afresh about the same
+    image — otherwise the second reply restarts the page and the join is
+    nonsense."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        _, _, _, cl = _resume(mod, m, ("partial text", 100), [("rest", 5)])
+    finally:
+        m.undo()
+    msgs = cl.sent[0]["messages"]
+    assert msgs[-1]["role"] == "assistant" and msgs[-1]["content"] == "partial text"
+    assert cl.sent[0]["extra_body"]["continue_final_message"] is True
+    assert cl.sent[0]["extra_body"]["add_generation_prompt"] is False
+
+
+def test_a_server_that_rejects_the_flag_gets_a_plain_instruction():
+    """`continue_final_message` is a vLLM extension; llama.cpp rejects it."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, _, cl = _resume(mod, m, ("a", 100), [("b", 5)],
+                                     reject_flag=True)
+    finally:
+        m.undo()
+    assert out.raw == "ab" and rounds == 1
+    assert "extra_body" not in cl.sent[-1]
+    assert cl.sent[-1]["messages"][-1]["role"] == "user"
+
+
+def test_a_server_that_rejects_both_leaves_the_page_partial_not_broken():
+    """A page that cannot be finished is still a page. Raising here would turn
+    a degraded result into no result."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, _ = _resume(mod, m, ("a", 100), [], reject_all=True)
+    finally:
+        m.undo()
+    assert out.raw == "a" and rounds == 0 and still is True
+
+
+def test_resumption_is_at_temperature_zero():
+    """The retry path deliberately RAISES temperature to break a repetition.
+    Resumption is the opposite: it must continue the same text deterministically."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        _, _, _, cl = _resume(mod, m, ("a", 100), [("b", 5)])
+    finally:
+        m.undo()
+    assert cl.sent[0]["temperature"] == 0.0
+
+
+def test_at_cap_allows_for_a_server_stopping_a_token_short():
+    mod = _worker_module()
+    assert mod._at_cap(2048, 2048) is True
+    assert mod._at_cap(2040, 2048) is True
+    assert mod._at_cap(1000, 2048) is False
+    assert mod._at_cap(2048, 0) is False      # no cap known = no verdict
+
+
+def test_the_engine_sends_the_resumption_budget():
+    from codai.ocr.surya import SuryaEngine
+    from codai.config import OcrConfig
+    cfg = OcrConfig()
+    assert SuryaEngine(cfg)._worker_opts()["max_continuations"] == 2
+    cfg.surya_max_continuations = 0
+    assert SuryaEngine(cfg)._worker_opts()["max_continuations"] == 0
+
+
+def test_resumption_is_on_by_default():
+    """Returning a page KNOWN to be incomplete is a correctness failure, not a
+    cost trade-off, so this is not opt-in."""
+    from codai.config import OcrConfig
+    assert OcrConfig().surya_max_continuations >= 1

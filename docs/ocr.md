@@ -1005,7 +1005,78 @@ Both halves are now bounded:
   is down, since the replacement asks that same front for its lease. A 503 means
   the pool has nothing rented this second, which the lease does not care about.
 
-#### An empty page and a 71-character page are the same bug
+#### Is there anything on the page at all?
+
+Three outcomes are indistinguishable in a short OCR result, and they lead to
+completely different places:
+
+| what happened | what it needs | how to tell |
+|---|---|---|
+| the engine could not read the page | a better engine, or the page is bad | ink present, no text |
+| the reply was cut off | a bigger budget | `model_attempts.truncated` |
+| **the page is blank** | fix the document upstream | `page_ink.blank` |
+
+The third was not detectable at all, and it cost most of a day. A four-page
+court PDF came back with **47 characters** and was reported as an OCR failure.
+It was not. Every page was a ~900-byte CCITT Group 4 image — which is what an
+*empty* page costs, a couple of bytes per all-white row — carrying **0.13% ink**,
+all of it a diagonal scan edge and a diagonal "copia non ufficiale" watermark.
+The 47 characters *were* the watermark. The engine had read the page perfectly.
+
+So any page whose text comes back shorter than `ocr.blank_page_max_chars` (200)
+now carries the one measurement that separates the three — the fraction of its
+pixels that are not background, taken from an image already in memory:
+
+```json
+"page_ink": {"ink": 0.00137, "threshold": 0.005, "blank": true,
+             "why": "0.137% of this page's pixels are not background, below
+                     0.500% — there is essentially nothing on it to read. A short
+                     result here is the page being empty, NOT the engine failing
+                     to read it; look at the source document."}
+```
+
+The opposite verdict is just as useful: a short page **above** the floor says
+there *is* something there, so the engine's failure is real and worth chasing.
+Blank page indices are also listed at the top of the response as `blank_pages`,
+because a caller deciding whether to accept a document should not have to walk
+the pages to discover that it is empty.
+
+`ocr.blank_page_ink` (0.5%) sits well under any page carrying text — a typical
+text page at 200 DPI is several per cent — and comfortably above the edges,
+specks and watermarks an empty scan still carries. It applies to **every
+engine**: the measurement is of the image, not of the model.
+
+This is a diagnostic, not a gate. Nothing is skipped, refused or altered because
+of it; a blank page is still OCR'd and still returns whatever it returns.
+
+---
+
+## Finishing a page the model ran out of room for
+
+`ocr.surya_max_tokens` raises the cap, but raising a cap only moves the cliff: a
+dense enough page overflows any fixed number. `ocr.surya_max_continuations`
+(default **2**) resumes instead — the text so far goes back as a prefilled
+assistant turn with vLLM's `continue_final_message`, so the model carries on the
+exact string rather than answering afresh about the same image. A server that
+rejects the flag (llama.cpp) gets a plain "continue" instruction; a server that
+rejects both leaves the page partial and honestly marked, because a page that
+cannot be finished is still a page and raising would turn a degraded result into
+no result.
+
+The logprobs are concatenated with the text, in step. That is not bookkeeping:
+`surya_repair_accents` rebuilds characters from the model's own per-token bytes,
+so text from a later segment paired with logprobs from an earlier one would
+corrupt exactly the accented characters the repair exists to fix. If they cannot
+be kept aligned, the repair is given up on rather than fed a mismatch.
+
+Resumption runs at temperature 0 — the opposite of the retry path, which
+deliberately *raises* temperature to break a repetition. A page still unfinished
+after its budget is marked `"complete": false`, so a caller can refuse a partial
+rather than store it as read.
+
+---
+
+## An empty page and a 71-character page are the same bug
 
 Two failure modes from one live batch: ~98 pages of about **71 characters** and
 **100 with no text at all**, against 13 that read perfectly. Neither is a model

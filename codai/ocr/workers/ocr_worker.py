@@ -56,6 +56,9 @@ _RETRY_BUDGET = [None]
 #: Module-level for the same reason the retry budget is: the hook is.
 _MAX_TOKENS = [0]
 
+#: How many times a cut-off reply may be resumed. 0 returns it partial.
+_CONTINUE_BUDGET = [0]
+
 #: What surya uses when nobody tells it otherwise
 #: (`chat_completions_batch(max_tokens_default=2048)`).
 _SURYA_DEFAULT_MAX_TOKENS = 2048
@@ -67,6 +70,8 @@ def _trace_begin():
     _TRACE.repairs = []
     _TRACE.attempts = 0
     _TRACE.tokens = []
+    _TRACE.continued = 0
+    _TRACE.still_truncated = False
     return _TRACE.calls, _TRACE.repairs
 
 
@@ -723,6 +728,119 @@ def _trace_findings(calls) -> list:
     return findings
 
 
+
+def _at_cap(tokens: int, cap: int) -> bool:
+    """Did this reply stop because it ran out of room rather than finishing?
+
+    `finish_reason` would say so directly, but surya's GenerationResult does not
+    carry it — it keeps `raw`, `token_count`, `error`, `mean_token_prob` and
+    `logprobs` and drops the rest of the completion. The token count against the
+    cap is the same signal one step removed, and 98% rather than equality
+    because a server may stop a token or two short.
+    """
+    return bool(cap) and int(tokens or 0) >= int(cap * 0.98)
+
+
+def _continue_reply(oc, result, item, client, model_name, cap, temperature,
+                    top_p, timeout, want_logprobs, budget):
+    """Finish a page whose reply hit the cap, by resuming the generation.
+
+    Raising the cap only moves the cliff: a dense enough page overflows any
+    fixed number, and what comes back is incomplete block markup that parses to
+    a fragment or to nothing (see `_at_cap`'s callers). The only answer that
+    holds for every document is to carry on generating.
+
+    Resumption is a **prefilled assistant turn**: the text so far goes back as
+    the assistant's own message with `continue_final_message`, so the model
+    continues the exact string instead of starting a new answer about the same
+    image. A server that does not understand that flag gets a plain "continue"
+    instruction instead, and a server that understands neither leaves the page
+    partial and honestly marked.
+
+    The logprobs are concatenated with the text, in step. They are not a
+    diagnostic here: `surya_repair_accents` rebuilds characters from the model's
+    own per-token bytes, so text from a later segment paired with logprobs from
+    an earlier one would corrupt exactly the accented characters it exists to
+    fix.
+    """
+    segments = [getattr(result, "raw", "") or ""]
+    logprobs = list(getattr(result, "logprobs", None) or [])
+    total = int(getattr(result, "token_count", 0) or 0)
+    last = total
+    rounds = 0
+    try:
+        prompt = item.prompt or oc.PROMPT_MAPPING[item.prompt_type]
+        base_messages = oc._build_messages(oc.scale_to_fit(item.image), prompt)
+    except Exception as exc:
+        print(f"[surya] cannot resume a cut-off page: {exc}", file=sys.stderr, flush=True)
+        return result, 0, True
+
+    attempts = 0
+    while attempts < budget and _at_cap(last, cap):
+        attempts += 1
+        prefix = "".join(segments)
+        kwargs = dict(model=model_name, messages=base_messages + [
+            {"role": "assistant", "content": prefix}],
+            max_tokens=cap, temperature=temperature, top_p=top_p, timeout=timeout,
+            extra_body={"continue_final_message": True,
+                        "add_generation_prompt": False})
+        if want_logprobs:
+            kwargs["logprobs"] = True
+        try:
+            completion = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # The flag is a vLLM extension; llama.cpp and others reject it.
+            try:
+                kwargs.pop("extra_body", None)
+                kwargs["messages"] = base_messages + [
+                    {"role": "assistant", "content": prefix},
+                    {"role": "user", "content": "Continue exactly where you "
+                                                "stopped. Do not repeat."}]
+                completion = client.chat.completions.create(**kwargs)
+            except Exception as exc2:
+                print(f"[surya] could not resume a cut-off page "
+                      f"({type(exc).__name__}: {exc}; then {exc2}) — returning it "
+                      f"partial and marked", file=sys.stderr, flush=True)
+                break
+        try:
+            more = completion.choices[0].message.content or ""
+            last = (completion.usage.completion_tokens
+                    if getattr(completion, "usage", None) else 0)
+        except Exception:
+            break
+        if not more:
+            break
+        segments.append(more)
+        # Counted only now. `rounds` is reported to the caller as "the page was
+        # resumed n times, so it is whole" — an ATTEMPT that failed must not
+        # make that claim.
+        rounds += 1
+        total += int(last or 0)
+        if want_logprobs:
+            try:
+                lp = getattr(completion.choices[0], "logprobs", None)
+                content = getattr(lp, "content", None) if lp is not None else None
+                for c in (content or []):
+                    logprobs.append(c.model_dump() if hasattr(c, "model_dump") else c)
+            except Exception:
+                # Text without its bytes would mis-align the accent repair, so
+                # the repair is given up on rather than fed a mismatch.
+                logprobs = []
+        print(f"[surya] page resumed after the {cap}-token cap "
+              f"(segment {rounds + 1}, {last} more tokens)",
+              file=sys.stderr, flush=True)
+
+    if rounds:
+        try:
+            result.raw = "".join(segments)
+            result.token_count = total
+            if logprobs:
+                result.logprobs = logprobs
+        except Exception:
+            pass
+    return result, rounds, _at_cap(last, cap)
+
+
 class SuryaWorker:
     def __init__(self, opts):
         self.opts = opts
@@ -744,6 +862,8 @@ class SuryaWorker:
         _RETRY_BUDGET[0] = None if budget is None else max(0, int(budget))
         #: 0 leaves surya's own 2048 in place.
         _MAX_TOKENS[0] = max(0, int(opts.get("max_tokens", 0) or 0))
+        #: Resumptions allowed for one page. 0 = return a cut-off page partial.
+        _CONTINUE_BUDGET[0] = max(0, int(opts.get("max_continuations", 2) or 0))
         #: The page's token logprobs and accent repairs live in _TRACE, per
         #: thread — see _trace_begin(). They were per-worker-object until lanes
         #: put several pages in one process.
@@ -819,6 +939,26 @@ class SuryaWorker:
             if cap and "max_tokens_default" in kwargs:
                 kwargs["max_tokens_default"] = int(cap)
             result = inner(*args, **kwargs)
+            # A reply that ran out of room is finished here, before surya parses
+            # it: raising the cap only moves the cliff, and incomplete block
+            # markup parses to a fragment or to nothing at all.
+            try:
+                budget = int(_CONTINUE_BUDGET[0] or 0)
+                item = args[0] if args else kwargs.get("item")
+                eff_cap = int(getattr(item, "max_tokens", 0) or 0) or int(
+                    kwargs.get("max_tokens_default") or 0)
+                if (budget and item is not None and eff_cap
+                        and _at_cap(getattr(result, "token_count", 0), eff_cap)):
+                    result, rounds, still = _continue_reply(
+                        _oc, result, item,
+                        kwargs.get("client"), kwargs.get("model_name"), eff_cap,
+                        0.0, kwargs.get("top_p", 0.1), kwargs.get("timeout", 600.0),
+                        bool(kwargs.get("request_logprobs_default", True)),
+                        budget)
+                    _TRACE.continued = getattr(_TRACE, "continued", 0) + rounds
+                    _TRACE.still_truncated = bool(still)
+            except Exception as exc:
+                print(f"[surya] resume failed: {exc}", file=sys.stderr, flush=True)
             try:
                 _attempts_bump()
                 _attempt_tokens(getattr(result, "token_count", 0))
@@ -981,17 +1121,37 @@ class SuryaWorker:
         # from a page the model genuinely could not read. This is the only place
         # the difference is visible.
         capped = [t for t in toks if t >= cap * 0.98]
-        if tries > 1 or capped:
+        resumed = int(getattr(_TRACE, "continued", 0) or 0)
+        # Still short of the end after every resumption we were allowed. The
+        # caller needs this to refuse a partial page, so it is reported
+        # separately from "a segment hit the cap", which resumption may have
+        # since fixed.
+        incomplete = bool(getattr(_TRACE, "still_truncated", False))
+        if tries > 1 or capped or resumed:
             info = {"calls": tries or 1, "tokens": toks, "cap": cap}
-            if capped:
+            if resumed:
+                info["resumed"] = resumed
+                info["why"] = (f"the reply ran past the {cap}-token cap and was "
+                               f"resumed {resumed} time(s) from where it stopped, "
+                               f"so the page is whole")
+            if incomplete:
                 info["truncated"] = True
+                info["complete"] = False
                 info["why"] = (
-                    f"the reply stopped at the {cap}-token cap, so the block "
-                    f"markup it was in the middle of is incomplete and parses "
-                    f"to less text than the page holds (or to none). This is a "
-                    f"cut-off reply, NOT a page the model could not read -- "
-                    f"raise ocr.surya_max_tokens.")
-            else:
+                    f"the reply stopped at the {cap}-token cap and was still "
+                    f"unfinished after {resumed} resumption(s), so this page is "
+                    f"INCOMPLETE. It is a cut-off reply, NOT a page the model "
+                    f"could not read -- raise ocr.surya_max_continuations or "
+                    f"ocr.surya_max_tokens.")
+            elif capped and not resumed:
+                info["truncated"] = True
+                info["complete"] = False
+                info["why"] = (
+                    f"the reply stopped at the {cap}-token cap and resumption is "
+                    f"off (ocr.surya_max_continuations = 0), so this page is "
+                    f"INCOMPLETE. A cut-off reply, NOT a page the model could "
+                    f"not read.")
+            elif not resumed:
                 info["why"] = ("surya re-ran this page because the generation "
                                "repeated itself; each re-run is a full "
                                "generation at a higher temperature")
