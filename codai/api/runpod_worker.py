@@ -4669,6 +4669,43 @@ _absent_before: set = set()
 _DEAD_STATUSES = ("TERMINATED", "EXITED", "DEAD", "FAILED")
 
 
+def close_bill_from_registry(pod_id: str, reason: str) -> float:
+    """Ledger the hours of a pod NO POOL was holding. Returns what was recorded.
+
+    A pool closes its own pods' bills — ``_terminate`` for one it retires,
+    ``forget`` for one RunPod says is gone. Neither runs for a pod that only the
+    registry knew about: one orphaned by a restart, or killed from the console or
+    straight through the RunPod API. Those hours were billed and went into the
+    ledger as nothing at all, which is the one place they must appear: a cost
+    that is invisible cannot be budgeted against, and the surprise always
+    arrives later, on the invoice.
+
+    Computed from the registry's own ``created`` — the only record of when the
+    pod started once no handle exists — so it survives the owner that rented it.
+    """
+    info = registry_entry(pod_id)
+    rate = float(info.get("hourly_usd") or 0.0)
+    began = float(info.get("created") or info.get("at") or 0.0)
+    if not (rate and began):
+        print(f"[runpod] cannot attribute {pod_id}'s spend: the registry records "
+              f"{'no rate' if not rate else 'no start time'} for it", flush=True)
+        return 0.0
+    cost = (time.time() - began) / 3600.0 * rate
+    try:
+        from codai.api import runpod_ledger
+        runpod_ledger.record_spend(
+            str(info.get("pool") or "(orphan)"), cost,
+            {"pod_id": str(pod_id), "gpu": str(info.get("gpu") or "(orphan)"),
+             "reaped": True, "reason": reason})
+    except Exception as exc:
+        print(f"[runpod] could not write {pod_id}'s spend to the ledger: {exc}",
+              flush=True)
+        return 0.0
+    print(f"[runpod] pod {pod_id} ({reason}) billed ~${cost:.3f} — recorded "
+          f"against {info.get('pool') or '(orphan)'}", flush=True)
+    return cost
+
+
 def reconcile_pools(live_status: dict, candidates=None) -> set:
     """Reconcile pools (and the registry) against what RunPod actually has.
 
@@ -4830,7 +4867,21 @@ def reap_orphans() -> int:
     live_status = {str(p.get("id")): str(p.get("status") or "")
                    for p in pods if p.get("id")}
     try:
-        for gone in reconcile_pools(live_status, known):
+        # Whose bill a POOL will close, read before the reconcile removes them
+        # from their pools: `forget` ledgers those, and attributing them again
+        # here would double-count every pod RunPod reclaims.
+        with _pools_lock:
+            _pooled = {str(h.pod_id) for p in _pools.values()
+                       for h in list(p.pods)}
+        # Judged against the WHOLE registry, not just the entries that still
+        # have an owner. `known` is about shielding a pod from the reaper;
+        # deciding whether a pod still exists is this function's own job, and
+        # when 0.3.56 made a stale entry stop counting as known it also stopped
+        # it being reconciled — so an entry for a pod that no longer exists was
+        # never cleaned up and its hours were never attributed.
+        for gone in reconcile_pools(live_status, known | registered_pod_ids()):
+            if str(gone) not in _pooled:
+                close_bill_from_registry(gone, "gone from the account listing")
             unregister_pod(gone)
     except Exception as exc:
         print(f"[runpod-reaper] reconcile: {exc}", flush=True)
@@ -4865,26 +4916,13 @@ def reap_orphans() -> int:
         if age < REAP_GRACE_SECONDS:
             continue                      # too young to be a leftover
         try:
-            info = registry_entry(pid)
             client.terminate_pod(pid)
             reaped += 1
-            # A pod the reaper kills billed real money, and until now it left no
-            # trace in the ledger: the spend was recorded by _terminate, which
-            # only runs for a pod a pool was tracking. An orphan's hours were
-            # therefore invisible in exactly the case where they are most
-            # surprising.
-            try:
-                from codai.api import runpod_ledger
-                rate = float(info.get("hourly_usd") or 0.0)
-                began = float(info.get("created") or info.get("at") or 0.0)
-                if rate and began:
-                    runpod_ledger.record_spend(
-                        str(info.get("pool") or "(orphan)"),
-                        (time.time() - began) / 3600.0 * rate,
-                        {"pod_id": pid, "gpu": "(orphan)", "reaped": True})
-            except Exception as exc:
-                print(f"[runpod-reaper] could not attribute {pid}'s spend: {exc}",
-                      flush=True)
+            # A pod the reaper kills billed real money, and it used to leave no
+            # trace: the spend was recorded by _terminate, which only runs for a
+            # pod a pool was tracking. Same helper as the vanished case, so the
+            # two paths cannot drift apart.
+            close_bill_from_registry(pid, "reaped as a stale pod")
             unregister_pod(pid)
             print(f"[runpod-reaper] terminated STALE pod {pid} ({name}) — "
                   "not tracked by any pool and its owner stopped reporting",

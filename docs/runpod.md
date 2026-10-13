@@ -359,6 +359,14 @@ an entry recording neither image nor card — written before this check existed 
 is refused rather than trusted: one extra pod once, against a silent answer from
 the wrong code. Every refusal says which pod and why.
 
+Every pod's hours reach the ledger, whichever way it ends: a pool retires one
+(`_terminate`), RunPod takes one away (`forget`), the reaper kills a stale one,
+or it disappears entirely — terminated from the console, or straight through the
+RunPod API. The last two have no pool to close the bill, so it is computed from
+the registry's own `created` and recorded against the pool the pod belonged to,
+marked `reaped` with the reason. A cost that is invisible cannot be budgeted
+against, and the surprise arrives later, on the invoice.
+
 Consequences worth knowing:
 
 - Pods from **another** `deployment_id` are never touched, so two CoderAI

@@ -481,7 +481,13 @@ def test_the_reaper_prunes_entries_for_pods_that_are_gone():
     reap_orphans still feeds it the listing and acts on what comes back."""
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def reap_orphans")[1].split("def _scaler_loop")[0]
-    assert "reconcile_pools(live_status, known)" in blk
+    # Against the WHOLE registry since v0.3.63, not only the entries that
+    # still have an owner: `known` decides what is shielded from the
+    # reaper, while deciding what still EXISTS is the reconcile's own
+    # job. When v0.3.56 made a stale entry stop counting as known, it
+    # also stopped it being reconciled — so the entry was never pruned
+    # and the pod's hours were never attributed.
+    assert "reconcile_pools(live_status, known | registered_pod_ids())" in blk
     assert "unregister_pod(gone)" in blk
 
 

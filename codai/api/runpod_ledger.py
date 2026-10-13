@@ -80,7 +80,17 @@ def record_spend(model_key: str, usd: float, meta: dict = None) -> None:
     now = time.time()
     rec = {"ts": now, "usd": float(usd)}
     if meta:
-        rec.update({k: meta[k] for k in ("pod_id", "gpu", "is_spot") if k in meta})
+        # A deliberate allow-list, not the whole of ``meta``: the ledger is
+        # persisted and pruned, and anything kept here is kept for every pod for
+        # as long as the window lasts. It has to include the fields a reader
+        # needs to tell one kind of charge from another, though — `reaped` was
+        # being passed and silently dropped, so a pod the reaper killed looked
+        # in the file exactly like one a pool retired on purpose, and `reason`
+        # was not recorded at all. Both answer "why am I being billed for this",
+        # which is the question a ledger exists for.
+        rec.update({k: meta[k] for k in
+                    ("pod_id", "gpu", "is_spot", "reaped", "reason")
+                    if k in meta})
     with _lock:
         data = _load()
         for key in (model_key or "?", _GLOBAL_KEY):
