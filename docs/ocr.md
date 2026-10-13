@@ -1112,6 +1112,69 @@ drops unknown form fields **silently**. Before these parameters existed, a
 caller could send `max_tokens=8000` on every request for a week and never be
 told it did nothing.
 
+### The context window is the ceiling, not the budget
+
+Resumption re-sends the text so far as **input**. The continuation budget is
+therefore not what limits how long a page may be — the model's context window
+is, and the budget only decides how much of that window gets spent before
+coderai gives up.
+
+That arithmetic is the whole reason `surya_max_tokens` should be *modest* rather
+than as large as it will go. The two settings multiply into the same total
+capacity, but a large cap spends the window in coarse lumps:
+
+| `surya_max_tokens` | segments that fit a 32,768-token window (image ≈ 4,000) |
+|---|---|
+| 2,048 | ~13 |
+| 4,096 | ~7 |
+| 12,288 | **2** |
+
+A 12,288-token cap buys no more text than a 2,048-token cap — it buys the same
+text in two steps instead of thirteen, and it makes every wasted step six times
+more expensive. Measured on one install on 2026-10-13, with the cap at 12,288:
+262 resumption segments spent 1.6 million generated tokens, 122 of them running
+the full cap dry, and the third segment of any page was **rejected outright** —
+12,288 asked on top of ~28,500 already in the window.
+
+So coderai now establishes the window and respects it:
+
+- `surya_context_tokens`, or `0` to read the server's own `max_model_len` from
+  `/v1/models` (vLLM reports it). Configuration wins, because an operator may
+  serve with a shorter `--max-model-len` than the checkpoint advertises.
+- Each segment asks for **the smaller of the cap and the room left**, and the
+  room left is measured from what the server said the prompt actually cost
+  (`usage.prompt_tokens`), not guessed — the guess is used for the first
+  resumption only.
+- A page with no usable room left stops, **keeps what it has**, and is marked
+  incomplete. Previously it was refused by the server and reported as a page
+  that could not be resumed at all, discarding text already paid for.
+- A refusal *for length* is not retried. The fallback resumption adds a user
+  turn, so it is longer than the request just refused; retrying it only spends
+  another round trip to be told the same thing.
+- Not knowing the window is survivable, and nothing is guessed: with no number,
+  resumption behaves exactly as it did before and the budget rules.
+
+### A reply that repeats itself did not run out of room
+
+A generation that trips surya's repeat detector hit the cap because it is
+**looping**, not because the page is long. Resuming it can only extend the loop
+— and surya is about to re-run the whole page anyway, which is what its repeat
+detector does, so every token spent resuming is spent on text that is then
+thrown away.
+
+This was the single largest waste the cap-and-resumption combination could
+produce. On the same install, **253 of 262** resumptions ended in "came back
+repeating itself", and 187 of those pages were then re-run in full: one page on
+the bad path cost four full generations at 12,288 tokens each. Such a reply is
+now not resumed at all, and it is **not** marked truncated either — it is a
+degenerate reply, which is surya's retry to make. Calling it truncated would
+send the caller looking for a bigger budget it cannot use.
+
+Worth keeping in mind when reading a throughput regression: a fixed token cap is
+also an accidental repetition circuit-breaker. Raising it does not slow a page
+down by the ratio of the caps; it slows down the *looping* pages by that ratio,
+and they are the ones that were already costing the most.
+
 ---
 
 ## An empty page and a 71-character page are the same bug

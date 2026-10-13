@@ -1090,6 +1090,19 @@ class OcrConfig:
     #: stops making progress stops early regardless, so a generous budget costs
     #: nothing on a page that cannot use it. 0 disables resumption.
     surya_max_continuations: int = 8
+    #: The serving model's context window, or 0 to ask the server for its own
+    #: `max_model_len` (vLLM reports it on `/v1/models`).
+    #:
+    #: This is the ceiling resumption actually runs into, and the one it used to
+    #: hit the hard way: each round re-sends the text so far as INPUT, so asking
+    #: for another full `surya_max_tokens` once the window is nearly full is not
+    #: a bigger segment, it is an HTTP 400 -- and a page that was nearly whole
+    #: gets reported as a page that could not be resumed at all. Knowing the
+    #: number lets a page stop one segment early, keep what it has, and say so.
+    #:
+    #: Set it when the server does not report a window, or when it is served
+    #: with a shorter `--max-model-len` than the checkpoint advertises.
+    surya_context_tokens: int = 0
     #: A page whose text is this short gets its ink measured, so a short result
     #: can be explained rather than guessed at. 0 disables the measurement.
     blank_page_max_chars: int = 200

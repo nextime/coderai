@@ -80,7 +80,10 @@ class SuryaEngine(SubprocessOcrEngine):
                 "max_tokens": max(0, int(getattr(self.cfg, "surya_max_tokens", 0) or 0)),
                 # Resumptions allowed for a page whose reply hit the cap.
                 "max_continuations": max(0, int(getattr(
-                    self.cfg, "surya_max_continuations", 2) or 0))}
+                    self.cfg, "surya_max_continuations", 2) or 0)),
+                # 0 = ask the server for its own max_model_len.
+                "context_tokens": max(0, int(getattr(
+                    self.cfg, "surya_context_tokens", 0) or 0))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")

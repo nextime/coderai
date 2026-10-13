@@ -415,16 +415,23 @@ class _Item:
 
 
 class _Completion:
-    def __init__(self, text, tokens, logprobs=None):
+    def __init__(self, text, tokens, logprobs=None, prompt_tokens=0):
         lp = type("_LP", (), {"content": logprobs or []})()
         choice = type("_C", (), {"message": type("_M", (), {"content": text})(),
                                  "logprobs": lp, "finish_reason": "length"})()
         self.choices = [choice]
-        self.usage = type("_U", (), {"completion_tokens": tokens})()
+        self.usage = type("_U", (), {"completion_tokens": tokens,
+                                     "prompt_tokens": prompt_tokens})()
 
 
-def _client(segments, reject_flag=False, reject_all=False):
-    """A chat client that hands back `segments` in order."""
+def _client(segments, reject_flag=False, reject_all=False, context=None,
+            prompt_tokens=0, reject_length=False):
+    """A chat client that hands back `segments` in order.
+
+    `context` makes it a server that reports a `max_model_len`, the way vLLM
+    does; `prompt_tokens` makes it report what the prefix cost, which is how
+    resumption learns how much of the window is left.
+    """
     sent = []
 
     class _Chat:
@@ -434,15 +441,29 @@ def _client(segments, reject_flag=False, reject_all=False):
                 sent.append(kwargs)
                 if reject_all:
                     raise RuntimeError("no")
+                if reject_length:
+                    raise RuntimeError(
+                        "This model's maximum context length is 32768 tokens. "
+                        "However, you requested 40000 tokens. Please reduce "
+                        "the length of the messages.")
                 if reject_flag and "extra_body" in kwargs:
                     raise RuntimeError("unknown field continue_final_message")
                 if not segments:
                     raise AssertionError("asked for more than it was given")
                 text, tokens = segments.pop(0)
-                return _Completion(text, tokens)
+                return _Completion(text, tokens, prompt_tokens=prompt_tokens)
+
+    class _Models:
+        @staticmethod
+        def list():
+            m = type("_M", (), {"id": "m", "max_model_len": context})()
+            return type("_L", (), {"data": [m]})()
 
     c = type("_Client", (), {"chat": _Chat()})()
     c.sent = sent
+    c.base_url = f"http://stub/{id(sent)}"
+    if context is not None:
+        c.models = _Models()
     return c
 
 
@@ -684,3 +705,190 @@ def test_the_default_budget_covers_a_dense_page():
     with its own budget. What this has to cover is the densest SINGLE page."""
     from codai.config import OcrConfig
     assert OcrConfig().surya_max_continuations >= 8
+
+
+# --- the context window is the real ceiling, not the continuation budget -----
+#
+# Each resumption re-sends the text so far as INPUT. A budget that ignores that
+# does not fail gracefully: the server refuses the request for length, and a
+# page that was nearly whole is reported as a page that could not be resumed at
+# all. Measured on Aruba 2026-10-13: at a 12288-token cap, segment 3 asked for
+# 12288 more on top of ~28.5k of prefix and image against a 32768-token window,
+# and eight pages came back as "could not resume" that were really "out of
+# room".
+
+
+def _resume_ctx(mod, monkeypatch, first, segments, budget=8, cap=12288, **kw):
+    oc = _fake_surya(monkeypatch, mod)
+    oc._build_messages = lambda img, prompt: [{"role": "user", "content": prompt}]
+    oc.scale_to_fit = lambda img: img
+    oc.PROMPT_MAPPING = {"ocr": "ocr"}
+    res = _Result(raw=first[0])
+    res.token_count = first[1]
+    cl = _client(list(segments), **kw)
+    out, rounds, still = mod._continue_reply(
+        oc, res, _Item(), cl, "m", cap, 0.0, 0.1, 60.0, False, budget)
+    return out, rounds, still, cl
+
+
+def test_a_segment_never_asks_for_more_room_than_the_window_has_left():
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, cl = _resume_ctx(
+            mod, m, ("a", 12288), [("b", 12288), ("c", 12288), ("d", 12288)],
+            context=32768, prompt_tokens=17000)
+    finally:
+        m.undo()
+    # Whatever it asked for, every request had to fit: the window minus what the
+    # server said the prompt cost.
+    assert cl.sent, "it never resumed at all"
+    for i, k in enumerate(cl.sent):
+        assert k["max_tokens"] <= 32768, f"request {i} asked past the window"
+    # The second request onwards knows the real prompt cost (17000), so it may
+    # ask for at most 32768 - 17000 - the segment just added.
+    assert cl.sent[1]["max_tokens"] <= 32768 - 17000
+    assert still is True, "out of room is still an incomplete page"
+
+
+def test_it_stops_one_segment_early_instead_of_being_refused():
+    """The page keeps what it has, and says why — a refusal would have thrown
+    the whole resumption away."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, cl = _resume_ctx(
+            mod, m, ("a", 12288), [("b", 12288), ("c", 12288), ("d", 12288)],
+            context=32768, prompt_tokens=32700)
+    finally:
+        m.undo()
+    assert out.raw == "ab", "it lost the text it had already paid for"
+    assert rounds == 1
+    assert len(cl.sent) == 1, "it asked again with no room left"
+    assert still is True
+
+
+def test_a_refusal_for_length_is_not_retried_with_a_longer_request():
+    """The fallback resumption ADDS a user turn, so it is longer than the one
+    just refused. Retrying a length refusal only buys the same answer twice."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, cl = _resume_ctx(
+            mod, m, ("a", 12288), [("b", 12288)], reject_length=True,
+            context=None)
+    finally:
+        m.undo()
+    assert len(cl.sent) == 1, "it tried a longer request after a length refusal"
+    assert rounds == 0 and still is True
+
+
+def test_a_window_the_server_will_not_name_does_not_stop_resumption():
+    """Not knowing the window is survivable; guessing it is not. Without a
+    number, resumption behaves exactly as it did before — the budget rules."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, cl = _resume_ctx(
+            mod, m, ("a", 12288), [("b", 12288), ("c", 5)], context=None)
+    finally:
+        m.undo()
+    assert out.raw == "abc" and rounds == 2 and still is False
+    assert all(k["max_tokens"] == 12288 for k in cl.sent)
+
+
+def test_a_configured_window_overrides_what_the_server_reports():
+    """An operator serving with a shorter --max-model-len than the checkpoint
+    advertises is the case the server cannot tell us about."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        mod._CONTEXT_TOKENS[0] = 32768
+        out, rounds, still, cl = _resume_ctx(
+            mod, m, ("a", 12288), [("b", 12288), ("c", 12288)], cap=12288,
+            context=100000, prompt_tokens=24000)
+        # After the first segment the server has said the prefix costs 24000,
+        # so the next round's input would be 36288 — past the configured 32768
+        # but nowhere near the 100000 the server advertises. The configured
+        # number is the one that must decide.
+        assert len(cl.sent) == 1, "it trusted the server over the operator"
+        assert rounds == 1 and still is True
+    finally:
+        mod._CONTEXT_TOKENS[0] = 0
+        m.undo()
+
+
+def test_a_cap_smaller_than_the_floor_is_never_mistaken_for_a_full_window():
+    """The 256-token floor is a floor on the room LEFT. A deployment whose cap
+    is below it must simply never be clamped."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        out, rounds, still, cl = _resume_ctx(
+            mod, m, ("a", 100), [("b", 100), ("c", 5)], cap=100,
+            context=100000, prompt_tokens=10)
+    finally:
+        m.undo()
+    assert out.raw == "abc" and rounds == 2, "a small cap stopped resumption"
+
+
+# --- a looping reply is not a long page -------------------------------------
+#
+# surya's own repeat detector re-runs such a page from scratch, so anything
+# resumption spends on it is spent on text that is about to be thrown away.
+# Measured on Aruba 2026-10-13: 253 of 262 resumptions ended in "came back
+# repeating itself", and 187 of those pages were then re-run in full.
+
+
+def test_a_reply_that_is_already_repeating_is_not_resumed_at_all():
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        oc = _fake_surya(m, mod)
+        oc._build_messages = lambda img, prompt: [{"role": "user", "content": prompt}]
+        oc.scale_to_fit = lambda img: img
+        oc.PROMPT_MAPPING = {"ocr": "ocr"}
+        oc.detect_repeat_token = lambda text: "loop" in (text or "")
+        res = _Result(raw="loop loop loop")
+        res.token_count = 12288
+        cl = _client([("more", 12288)])
+        out, rounds, still = mod._continue_reply(
+            oc, res, _Item(), cl, "m", 12288, 0.0, 0.1, 60.0, False, 8)
+    finally:
+        m.undo()
+    assert cl.sent == [], "it paid to extend a loop"
+    assert rounds == 0
+    # NOT truncated: it is a degenerate reply, which is surya's retry to make,
+    # not a page cut off for room. Calling it truncated would send the caller
+    # looking for a bigger budget it cannot use.
+    assert still is False
+    assert out.raw == "loop loop loop", "it altered a reply it did not resume"
+
+
+def test_a_page_that_really_is_long_is_still_resumed():
+    """The guard must key on repetition, not on having hit the cap."""
+    mod = _worker_module()
+    import _pytest.monkeypatch as _mp
+    m = _mp.MonkeyPatch()
+    try:
+        oc = _fake_surya(m, mod)
+        oc._build_messages = lambda img, prompt: [{"role": "user", "content": prompt}]
+        oc.scale_to_fit = lambda img: img
+        oc.PROMPT_MAPPING = {"ocr": "ocr"}
+        oc.detect_repeat_token = lambda text: "loop" in (text or "")
+        res = _Result(raw="<block>real text")
+        res.token_count = 12288
+        cl = _client([(" more real text", 40)])
+        out, rounds, still = mod._continue_reply(
+            oc, res, _Item(), cl, "m", 12288, 0.0, 0.1, 60.0, False, 8)
+    finally:
+        m.undo()
+    assert rounds == 1 and still is False
+    assert out.raw == "<block>real text more real text"

@@ -66,6 +66,96 @@ _CONTINUE_BUDGET = [0]
 #: (`chat_completions_batch(max_tokens_default=2048)`).
 _SURYA_DEFAULT_MAX_TOKENS = 2048
 
+#: The serving model's context window, or 0 to ask the server for it once.
+#: Resumption re-sends the text so far as INPUT, so the window -- not the
+#: continuation budget -- is the real ceiling on how long a page may be. A
+#: budget that ignores it does not fail gracefully: the server rejects the
+#: request outright (HTTP 400) and a page that was nearly whole is reported as
+#: a page that could not be resumed at all.
+_CONTEXT_TOKENS = [0]
+
+#: Probed `max_model_len` per (server, model). A served model cannot change
+#: shape under us, so one question per server is enough.
+_CONTEXT_CACHE = {}
+
+#: What to assume the image and prompt cost when the server will not say and
+#: nothing is configured. surya-2 at the 6.29 Mpix cap is in this region; the
+#: number only has to be an over-estimate, because its whole job is to keep the
+#: LAST segment inside the window.
+_PROMPT_TOKENS_GUESS = 4096
+
+#: Below this there is no point asking for more: a segment this short cannot
+#: close an open block, so it would spend a round to add nothing. It is a floor
+#: on the room LEFT, never on the cap -- a deployment whose cap is smaller than
+#: this is simply never clamped, and must not be mistaken for a full window.
+_MIN_SEGMENT_TOKENS = 256
+
+
+def _context_limit(client, model_name):
+    """The serving model's context window, or 0 if it cannot be established.
+
+    Configuration wins, because an operator may be serving with a shorter
+    `--max-model-len` than the checkpoint advertises. Otherwise vLLM reports
+    `max_model_len` on `/v1/models`, which is the number that will actually
+    reject us.
+    """
+    fixed = int(_page_override("context_tokens", _CONTEXT_TOKENS[0]) or 0)
+    if fixed > 0:
+        return fixed
+    key = (str(getattr(client, "base_url", "")), str(model_name))
+    if key in _CONTEXT_CACHE:
+        return _CONTEXT_CACHE[key]
+    limit = 0
+    try:
+        for m in (client.models.list().data or []):
+            if getattr(m, "id", None) != model_name:
+                continue
+            for attr in ("max_model_len", "max_context_length", "context_length"):
+                v = getattr(m, attr, None)
+                if v is None and isinstance(getattr(m, "__dict__", None), dict):
+                    v = m.__dict__.get(attr)
+                if v:
+                    limit = int(v)
+                    break
+            break
+    except Exception as exc:
+        # Not knowing is survivable -- `_segment_cap` simply stops clamping.
+        # Being wrong is not, so nothing is guessed here.
+        print(f"[surya] could not read the model's context window ({exc}); "
+              f"resumption will not be able to stop before the server does",
+              file=sys.stderr, flush=True)
+    if limit:
+        print(f"[surya] {model_name} serves a {limit}-token context window",
+              file=sys.stderr, flush=True)
+    _CONTEXT_CACHE[key] = limit
+    return limit
+
+
+def _segment_cap(cap, limit, prompt_tokens):
+    """How many tokens the next segment may ask for.
+
+    `cap` is what the page is allowed per reply; the window is what the server
+    will accept. Asking for more than the room left is not a bigger segment, it
+    is an error instead of a segment.
+    """
+    if not limit:
+        return int(cap)
+    room = int(limit) - int(prompt_tokens or 0)
+    return max(0, min(int(cap), room))
+
+
+def _is_context_error(exc):
+    """A rejection for length, as opposed to any other 400.
+
+    Worth separating because the fallback resumption (a plain "continue" turn)
+    is LONGER than the one that was just refused, so retrying a length refusal
+    only spends another round trip to be told the same thing.
+    """
+    t = f"{exc}".lower()
+    return (("context" in t and ("length" in t or "window" in t))
+            or "maximum context" in t or "longer than the maximum" in t
+            or "reduce the length" in t or "max_model_len" in t)
+
 
 def _trace_begin():
     """Start a page's trace. Returns its (calls, repairs) — this thread's own."""
@@ -81,7 +171,8 @@ def _trace_begin():
 def _trace_opts(opts) -> None:
     """Per-request overrides for the page this thread is about to read."""
     _TRACE.opts = {k: int(v) for k, v in (opts or {}).items()
-                   if k in ("max_tokens", "max_continuations")
+                   if k in ("max_tokens", "max_continuations",
+                            "context_tokens")
                    and str(v).strip() not in ("", "None")}
 
 
@@ -802,13 +893,47 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
         print(f"[surya] cannot resume a cut-off page: {exc}", file=sys.stderr, flush=True)
         return result, 0, True
 
+    # A reply that is already repeating itself did not run out of room -- it ran
+    # out of page and kept going. Resuming it can only extend the loop, and
+    # surya is about to re-run the page anyway (that is what its own repeat
+    # detector does), so every token spent resuming here is spent twice over on
+    # a page that will be thrown away. This is the single largest waste the
+    # cap-plus-resumption combination can produce.
+    repeats = getattr(oc, "detect_repeat_token", None)
+    try:
+        if repeats is not None and repeats(segments[0]):
+            print(f"[surya] not resuming a reply that is already repeating "
+                  f"itself — it stopped at the {cap}-token cap because it is "
+                  f"looping, not because the page is long",
+                  file=sys.stderr, flush=True)
+            return result, 0, False
+    except Exception:
+        pass
+
+    limit = _context_limit(client, model_name)
+    # Until the server tells us what the prompt really costs, assume the image
+    # and the instructions, plus everything generated so far (it all comes back
+    # as input on the next round).
+    prompt_tokens = _PROMPT_TOKENS_GUESS + total
     attempts = 0
     while attempts < budget and _at_cap(last, cap):
         attempts += 1
+        seg_cap = _segment_cap(cap, limit, prompt_tokens)
+        if limit and seg_cap < min(int(cap), _MIN_SEGMENT_TOKENS):
+            # Honest and specific: this page is not short of budget, it is out
+            # of context. Raising `surya_max_continuations` cannot help it;
+            # LOWERING `surya_max_tokens` can, because a smaller segment leaves
+            # the window to be spent on text rather than on one huge reply.
+            print(f"[surya] page filled the model's {limit}-token context "
+                  f"window after {rounds} resumption(s) — returning it partial "
+                  f"and marked (a smaller ocr.surya_max_tokens fits more text "
+                  f"in the same window)", file=sys.stderr, flush=True)
+            break
         prefix = "".join(segments)
         kwargs = dict(model=model_name, messages=base_messages + [
             {"role": "assistant", "content": prefix}],
-            max_tokens=cap, temperature=temperature, top_p=top_p, timeout=timeout,
+            max_tokens=seg_cap, temperature=temperature, top_p=top_p,
+            timeout=timeout,
             extra_body={"continue_final_message": True,
                         "add_generation_prompt": False})
         if want_logprobs:
@@ -816,6 +941,11 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
         try:
             completion = client.chat.completions.create(**kwargs)
         except Exception as exc:
+            if _is_context_error(exc):
+                print(f"[surya] page filled the model's context window after "
+                      f"{rounds} resumption(s) ({exc}) — returning it partial "
+                      f"and marked", file=sys.stderr, flush=True)
+                break
             # The flag is a vLLM extension; llama.cpp and others reject it.
             try:
                 kwargs.pop("extra_body", None)
@@ -831,8 +961,16 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
                 break
         try:
             more = completion.choices[0].message.content or ""
-            last = (completion.usage.completion_tokens
-                    if getattr(completion, "usage", None) else 0)
+            usage = getattr(completion, "usage", None)
+            last = usage.completion_tokens if usage else 0
+            # The guess above is only needed for the first round. From here the
+            # server has told us exactly what the prefix and image cost, so the
+            # next round's input is that plus the segment just produced.
+            used = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+            if used:
+                prompt_tokens = used + int(last or 0)
+            else:
+                prompt_tokens += int(last or 0)
         except Exception:
             break
         if not more:
@@ -846,7 +984,6 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
             print(f"[surya] resumption repeated the previous segment verbatim — "
                   f"stopping", file=sys.stderr, flush=True)
             break
-        repeats = getattr(oc, "detect_repeat_token", None)
         try:
             if repeats is not None and repeats(more):
                 print(f"[surya] resumption came back repeating itself — stopping "
@@ -875,7 +1012,9 @@ def _continue_reply(oc, result, item, client, model_name, cap, temperature,
                 # the repair is given up on rather than fed a mismatch.
                 logprobs = []
         print(f"[surya] page resumed after the {cap}-token cap "
-              f"(segment {rounds + 1}, {last} more tokens)",
+              f"(segment {rounds + 1}, {last} more tokens, "
+              f"{max(0, limit - prompt_tokens) if limit else '?'} of the "
+              f"context window left)",
               file=sys.stderr, flush=True)
 
     if rounds:
@@ -912,6 +1051,10 @@ class SuryaWorker:
         _MAX_TOKENS[0] = max(0, int(opts.get("max_tokens", 0) or 0))
         #: Resumptions allowed for one page. 0 = return a cut-off page partial.
         _CONTINUE_BUDGET[0] = max(0, int(opts.get("max_continuations", 2) or 0))
+        #: 0 asks the server for its own `max_model_len`. Set it when the server
+        #: does not report one, or when it serves a shorter window than the
+        #: checkpoint advertises.
+        _CONTEXT_TOKENS[0] = max(0, int(opts.get("context_tokens", 0) or 0))
         #: The page's token logprobs and accent repairs live in _TRACE, per
         #: thread — see _trace_begin(). They were per-worker-object until lanes
         #: put several pages in one process.
