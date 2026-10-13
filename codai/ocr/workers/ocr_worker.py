@@ -178,27 +178,88 @@ def _is_context_error(exc):
             or "reduce the length" in t or "max_model_len" in t)
 
 
+#: id(surya batch item) -> the page state of the lane that submitted it.
+#:
+#: Thread-local state was not enough, and the gap was invisible. surya's
+#: `chat_completions_batch` runs each item through a ThreadPoolExecutor, so the
+#: hook around `_generate_one` executes on an executor thread — NOT the lane
+#: thread where `_trace_opts` installed this page's options. Every per-request
+#: budget therefore read as absent: `max_tokens=3072` was discarded and each
+#: page ran at surya's own `item.max_tokens` (12288 for a full page, or an
+#: `image_token_budget` estimate like 1360), and `max_continuations` and
+#: `context_tokens` went the same way. The per-page trace was lost to the same
+#: boundary — attempts, token counts, logprobs and accent repairs were all
+#: recorded against the executor thread and never read.
+#:
+#: The one object that crosses the boundary is the ITEM, so it is the key. The
+#: state is shared BY REFERENCE: the executor thread adopts it, writes into it,
+#: and the lane reads it back when the page is done.
+_ITEM_STATE: dict = {}
+_ITEM_LOCK = threading.Lock()
+
+
+def _state() -> dict:
+    """This thread's current page state, created on demand."""
+    st = getattr(_TRACE, "state", None)
+    if st is None:
+        st = _TRACE.state = {}
+    return st
+
+
 def _trace_begin():
-    """Start a page's trace. Returns its (calls, repairs) — this thread's own."""
-    _TRACE.calls = []
-    _TRACE.repairs = []
-    _TRACE.attempts = 0
-    _TRACE.tokens = []
-    _TRACE.continued = 0
-    _TRACE.still_truncated = False
-    return _TRACE.calls, _TRACE.repairs
+    """Start a page's trace. Returns its (calls, repairs) — this page's own."""
+    st = _state()
+    st["calls"] = []
+    st["repairs"] = []
+    st["attempts"] = 0
+    st["tokens"] = []
+    st["continued"] = 0
+    st["still_truncated"] = False
+    return st["calls"], st["repairs"]
 
 
 def _trace_opts(opts) -> None:
     """Per-request overrides for the page this thread is about to read."""
-    _TRACE.opts = {k: int(v) for k, v in (opts or {}).items()
-                   if k in ("max_tokens", "max_continuations",
-                            "context_tokens")
-                   and str(v).strip() not in ("", "None")}
+    _state()["opts"] = {k: int(v) for k, v in (opts or {}).items()
+                        if k in ("max_tokens", "max_continuations",
+                                 "context_tokens")
+                        and str(v).strip() not in ("", "None")}
+
+
+def _bind_items(items) -> list:
+    """Register this page's state against the batch items, and return the keys.
+
+    Called on the LANE thread, before surya hands the items to its executor.
+    """
+    st = _state()
+    keys = []
+    with _ITEM_LOCK:
+        for it in items or ():
+            if it is None:
+                continue
+            _ITEM_STATE[id(it)] = st
+            keys.append(id(it))
+    return keys
+
+
+def _unbind_items(keys) -> None:
+    with _ITEM_LOCK:
+        for k in keys or ():
+            _ITEM_STATE.pop(k, None)
+
+
+def _adopt_item_state(item) -> None:
+    """On an executor thread: work on the page state that submitted ``item``."""
+    if item is None:
+        return
+    with _ITEM_LOCK:
+        st = _ITEM_STATE.get(id(item))
+    if st is not None and getattr(_TRACE, "state", None) is not st:
+        _TRACE.state = st
 
 
 def _trace_calls():
-    return getattr(_TRACE, "calls", None)
+    return _state().get("calls")
 
 
 def _attempts_bump():
@@ -212,8 +273,9 @@ def _attempts_bump():
     already read. None of it was visible from outside: a retried page looks
     exactly like a slow one.
     """
-    n = getattr(_TRACE, "attempts", 0) + 1
-    _TRACE.attempts = n
+    st = _state()
+    n = int(st.get("attempts") or 0) + 1
+    st["attempts"] = n
     return n
 
 
@@ -228,9 +290,10 @@ def _attempt_tokens(n: int) -> None:
     model that cannot read, and neither is.
     """
     try:
-        lst = getattr(_TRACE, "tokens", None)
+        st = _state()
+        lst = st.get("tokens")
         if lst is None:
-            lst = _TRACE.tokens = []
+            lst = st["tokens"] = []
         lst.append(int(n or 0))
     except Exception:
         pass
@@ -245,7 +308,7 @@ def _page_override(name: str, default):
     other's budgets. Same reasoning as the token trace.
     """
     try:
-        ov = getattr(_TRACE, "opts", None) or {}
+        ov = _state().get("opts") or {}
         if name in ov:
             return ov[name]
     except Exception:
@@ -254,15 +317,15 @@ def _page_override(name: str, default):
 
 
 def _attempts():
-    return getattr(_TRACE, "attempts", 0)
+    return int(_state().get("attempts") or 0)
 
 
 def _attempt_token_counts():
-    return list(getattr(_TRACE, "tokens", None) or ())
+    return list(_state().get("tokens") or ())
 
 
 def _trace_repairs():
-    return getattr(_TRACE, "repairs", None)
+    return _state().get("repairs")
 
 
 def _html_to_text(html: str) -> str:
@@ -1143,6 +1206,10 @@ class SuryaWorker:
             return
 
         def _wrapped(*args, **kwargs):
+            # surya dispatches this through a ThreadPoolExecutor, so the page's
+            # options and trace live on ANOTHER thread. Adopt them, by the one
+            # object that crossed over.
+            _adopt_item_state(args[0] if args else kwargs.get("item"))
             # surya's vLLM backend never passes `max_tokens_default`, so its
             # 2048 was the only value available -- the same reason `max_retries`
             # needed hooking. It arrives here as a keyword, so it can be raised
@@ -1198,8 +1265,9 @@ class SuryaWorker:
                         0.0, kwargs.get("top_p", 0.1), kwargs.get("timeout", 600.0),
                         bool(kwargs.get("request_logprobs_default", True)),
                         budget)
-                    _TRACE.continued = getattr(_TRACE, "continued", 0) + rounds
-                    _TRACE.still_truncated = bool(still)
+                    _st = _state()
+                    _st["continued"] = int(_st.get("continued") or 0) + rounds
+                    _st["still_truncated"] = bool(still)
             except Exception as exc:
                 print(f"[surya] resume failed: {exc}", file=sys.stderr, flush=True)
             try:
@@ -1254,6 +1322,31 @@ class SuryaWorker:
                           file=sys.stderr, flush=True)
                 return again
             _oc._should_retry = _wrapped_retry
+
+        # And the batch entry point, which runs on the LANE thread. This is
+        # where the page's state is tied to the items, because it is the last
+        # point before surya's ThreadPoolExecutor takes them somewhere this
+        # thread's locals cannot follow.
+        batch = getattr(_oc, "chat_completions_batch", None)
+        if batch is not None:
+            def _wrapped_batch(*args, **kwargs):
+                items = args[0] if args else kwargs.get("batch")
+                keys = _bind_items(items)
+                try:
+                    return batch(*args, **kwargs)
+                finally:
+                    _unbind_items(keys)
+            _oc.chat_completions_batch = _wrapped_batch
+            # surya's predictor imported the function by name before we got
+            # here, so rebinding the module attribute alone can miss the caller.
+            for _modname in ("surya.recognition", "surya.inference.manager",
+                             "surya.layout", "surya.table_rec"):
+                _m = sys.modules.get(_modname)
+                if _m is not None and getattr(_m, "chat_completions_batch", None) is batch:
+                    _m.chat_completions_batch = _wrapped_batch
+        else:
+            print("[surya] no chat_completions_batch to hook — per-request "
+                  "budgets cannot reach this surya", file=sys.stderr, flush=True)
         _oc._coderai_traced = True
 
     def _load_legacy(self):
@@ -1365,12 +1458,12 @@ class SuryaWorker:
         # from a page the model genuinely could not read. This is the only place
         # the difference is visible.
         capped = [t for t in toks if t >= cap * 0.98]
-        resumed = int(getattr(_TRACE, "continued", 0) or 0)
+        resumed = int(_state().get("continued") or 0)
         # Still short of the end after every resumption we were allowed. The
         # caller needs this to refuse a partial page, so it is reported
         # separately from "a segment hit the cap", which resumption may have
         # since fixed.
-        incomplete = bool(getattr(_TRACE, "still_truncated", False))
+        incomplete = bool(_state().get("still_truncated"))
         if tries > 1 or capped or resumed:
             info = {"calls": tries or 1, "tokens": toks, "cap": cap}
             if resumed:

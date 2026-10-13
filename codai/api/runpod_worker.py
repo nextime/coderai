@@ -1312,6 +1312,21 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         if eng == "vllm":
             env.setdefault("CODERAI_VLLM_VENV", "/opt/coderai/venvs/vllm")
         forwarded = engine_config_for_pod(eng)
+        # The MODEL's own engine settings beat this install's. engine_config_for_pod
+        # reads config.json, which describes the local engine, so a pod was
+        # launched with the install-wide context window and a per-model `ctx` on
+        # the runpod block did nothing: an entry asking for 18432 got a pod
+        # serving 32768. Harmless-looking until something publishes the window —
+        # an OCR engine's resumption arithmetic is driven by it, and two
+        # different numbers for one pod is how a resume either stops early or
+        # overruns and 400s.
+        _own = int(getattr(mcfg, "ctx", 0) or 0)
+        if _own:
+            if int(forwarded.get("ctx") or 0) != _own:
+                print(f"[runpod] pod context window {_own} (this model's own "
+                      f"ctx, over the install's "
+                      f"{forwarded.get('ctx') or 'default'})", flush=True)
+            forwarded["ctx"] = _own
         if eng == "vllm" and "tensor_parallel_size" in forwarded:
             # The pod was rented with gpu_count cards; the local setting
             # describes this machine's cards. The pod's count wins.

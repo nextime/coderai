@@ -1282,6 +1282,29 @@ the documents.
 > applies the cap to the item as well, and says so once per worker:
 > `[surya] page budget 3072 tokens (overriding surya's own 12288)`. With no cap
 > configured, surya's own budget is left alone.
+>
+> **v0.3.57 was still not enough on the served path**, for a second reason.
+> surya's `chat_completions_batch` runs every item through a
+> `ThreadPoolExecutor`, so the hook executes on an executor thread while the
+> page's options were installed, thread-locally, on the lane thread that
+> submitted it. Every per-request budget read as absent — `max_tokens`,
+> `max_continuations` and `context_tokens` alike — and the per-page trace
+> (attempts, token counts, logprobs, accent repairs) was written where nothing
+> read it. v0.3.59 binds the page's state to the batch's ITEMS, the one object
+> that crosses that boundary, and the executor thread adopts it by `id(item)`.
+>
+> **The window an attached engine reads comes from the GATEWAY**, not from the
+> pod and not from this install's `/v1/models`: a leased engine talks to
+> `…/v1/ocr/attach/<token>/v1`. That answer named no `max_model_len` until
+> v0.3.59, so resumption had no ceiling to respect and said so —
+> "surya-ocr-2 does not report a context window on /v1/models" — which reads
+> like the pod failing to advertise it. The pod was never asked. The gateway now
+> publishes the window it will actually serve: one an upstream reported if it
+> has, else the model's configured `ctx`. And a pod now serves the MODEL's
+> `ctx` rather than this install's — a runpod block asking for 18432 used to get
+> a pod serving 32768, because the pod was handed `config.json`'s engine
+> settings. Publishing one number while serving another is worse than publishing
+> none: resumption stops early, or overruns and takes a 400.
 
 What is **not** optional is being able to tell the two cases apart, so every
 page that hit the cap says so in its own result:

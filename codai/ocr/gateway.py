@@ -335,6 +335,47 @@ async def health(token: str):
     return Response(status_code=200, content=b"OK", media_type="text/plain")
 
 
+#: model_id -> context window an upstream actually reported, learned while
+#: forwarding. Preferred over configuration: a pod serves whatever its own
+#: launch arguments say, which is not always what the model entry asks for
+#: (a pod serving --max-model-len 32768 for an entry that configured 18432 is a
+#: live example), and resumption that believes the smaller number merely stops
+#: early while one that believes a larger one gets a 400.
+_windows: dict = {}
+
+
+def _window_for(model_id: str) -> int:
+    """The context window to publish for ``model_id``, or 0 when unknown.
+
+    Learned-from-upstream first, then the model entry. Never a guess: an engine
+    told a window it does not have will either waste it or overrun it, and
+    "unknown" is a case the engine already handles by refusing to resume.
+    """
+    got = int(_windows.get(model_id) or 0)
+    if got:
+        return got
+    try:
+        from codai.models.manager import context_window_for, multi_model_manager
+        from codai.models.placement import model_entry
+        win = context_window_for(multi_model_manager, model_id,
+                                 model_entry(model_id) or {})
+        return int(win or 0)
+    except Exception:
+        return 0
+
+
+def learn_window(model_id: str, window: int) -> None:
+    """Record a window an upstream reported for this model."""
+    try:
+        w = int(window or 0)
+    except (TypeError, ValueError):
+        return
+    if w > 0 and _windows.get(model_id) != w:
+        _windows[model_id] = w
+        print(f"[ocr] {model_id} serves a {w}-token context window "
+              f"(reported by the upstream)", flush=True)
+
+
 @router.get(PREFIX + "/{token}/v1/models", include_in_schema=False)
 async def models(token: str):
     """The id the engine expects, which is also what we will send upstream.
@@ -347,11 +388,19 @@ async def models(token: str):
     got = lease(token)
     if got is None:
         return _unknown_lease()
-    return JSONResponse(content={
-        "object": "list",
-        "data": [{"id": got["served_name"], "object": "model",
-                  "owned_by": "coderai"}],
-    })
+    entry = {"id": got["served_name"], "object": "model", "owned_by": "coderai"}
+    # The served context window, because an attached engine's resumption math
+    # needs it and THIS is the /v1/models it reads. coderai publishes
+    # max_model_len on its own /v1/models (and a pod publishes it on the pod's),
+    # but an engine attached through a lease never sees either of those — it
+    # sees this answer, which named nothing. The worker then said "surya-ocr-2
+    # does not report a context window on /v1/models; resumption cannot stop
+    # before the server does", which reads as the POD failing to advertise it
+    # and was reported that way. The pod was never asked.
+    win = _window_for(got["model_id"])
+    if win:
+        entry["max_model_len"] = int(win)
+    return JSONResponse(content={"object": "list", "data": [entry]})
 
 
 @router.post(PREFIX + "/{token}/v1/chat/completions", include_in_schema=False)

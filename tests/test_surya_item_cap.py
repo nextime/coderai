@@ -90,12 +90,11 @@ def test_the_per_page_override_reaches_the_item(monkeypatch):
     w = _worker(mod, token_trace=True, max_tokens=0)
     w._install_trace_hook()
     item = _Item(12288)
-    # Per-page overrides are thread-local (several lanes share one hook).
-    mod._TRACE.opts = {"max_tokens": 4096}
-    try:
-        oc._generate_one(item, max_tokens_default=2048)
-    finally:
-        mod._TRACE.opts = {}
+    # Per-page overrides arrive with the page, exactly as the worker installs
+    # them before reading it.
+    mod._trace_begin()
+    mod._trace_opts({"max_tokens": 4096})
+    oc._generate_one(item, max_tokens_default=2048)
     assert item.max_tokens == 4096
 
 
