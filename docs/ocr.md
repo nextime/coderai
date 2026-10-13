@@ -1053,9 +1053,24 @@ of it; a blank page is still OCR'd and still returns whatever it returns.
 
 ## Finishing a page the model ran out of room for
 
+> **Every VLM engine does this, not just surya** (v0.3.62). chandra and olmOCR
+> have the same settings — `chandra_max_continuations` / `chandra_context_tokens`
+> and `olmocr_max_continuations` / `olmocr_context_tokens`, both defaulting to
+> **8** resumptions — honour the same per-request `max_tokens` /
+> `max_continuations`, and return the same `model_attempts` report, so a caller
+> reads one decision table instead of three. The rules live once, in
+> `codai/ocr/resume.py`.
+>
+> They needed it as much as surya did, and in chandra's and olmOCR's case the
+> failure is uglier: chandra emits HTML, so a reply cut off at the cap is
+> unclosed markup that parses to a fragment of the page or to nothing, and
+> olmOCR's reply opens with YAML front matter, so one cut off before the body
+> closes parses to metadata and **no text at all**. Both are indistinguishable,
+> in the finished page, from a model that could not read it.
+
 `ocr.surya_max_tokens` raises the cap, but raising a cap only moves the cliff: a
 dense enough page overflows any fixed number. `ocr.surya_max_continuations`
-(default **2**) resumes instead — the text so far goes back as a prefilled
+resumes instead — the text so far goes back as a prefilled
 assistant turn with vLLM's `continue_final_message`, so the model carries on the
 exact string rather than answering afresh about the same image. A server that
 rejects the flag (llama.cpp) gets a plain "continue" instruction; a server that

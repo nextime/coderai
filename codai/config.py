@@ -1209,6 +1209,18 @@ class OcrConfig:
     olmocr_api_key: str = ""             # ("server" mode) bearer token, if it wants one
     olmocr_longest_side: int = 1288      # page render size the model was trained on
     olmocr_max_tokens: int = 4096        # a dense page runs long; this is the page budget
+    #: Resumptions allowed for a page whose reply hit the cap. The reply is sent
+    #: back as a prefilled assistant turn and continued from where it stopped,
+    #: so a page longer than one budget still arrives whole. 0 disables it, and
+    #: a request may raise or lower it for one document (`max_continuations`).
+    #: olmOCR needs this more than most: its reply opens with YAML front matter,
+    #: so a generation cut off before the body closes parses to metadata and no
+    #: text at all.
+    olmocr_max_continuations: int = 8
+    #: The serving model's context window, or 0 to leave resumption uncapped by
+    #: one. Resumption re-sends everything so far as INPUT, so the window — not
+    #: the budget — is what a long page runs out of.
+    olmocr_context_tokens: int = 0
     olmocr_temperature: float = 0.1
     olmocr_timeout: float = 300.0        # per-page ceiling on the model call
     olmocr_retry_rotation: bool = True   # re-ask once on a page the model reports rotated
@@ -1251,6 +1263,14 @@ class OcrConfig:
     # carries the court, the section and the case number.
     chandra_include_furniture: bool = True
     chandra_max_tokens: int = 12384      # chandra's own MAX_OUTPUT_TOKENS; HTML runs long
+    #: Resumptions allowed for a page whose reply hit the cap (see
+    #: olmocr_max_continuations). chandra emits HTML, so a cut-off reply is
+    #: unclosed markup — which parses to a fragment of the page or to nothing,
+    #: and reads in the finished text exactly like a page the model could not
+    #: transcribe. 0 disables it; a request may override it per document.
+    chandra_max_continuations: int = 8
+    #: The serving model's context window, or 0 for no ceiling of our own.
+    chandra_context_tokens: int = 0
     chandra_temperature: float = 0.0     # chandra's own default: greedy
     chandra_top_p: float = 0.1
     # A VLM that loses its place on a page does not fail — it repeats the last thing it
@@ -1906,6 +1926,8 @@ class ConfigManager:
                 "olmocr_api_key": self.config.ocr.olmocr_api_key,
                 "olmocr_longest_side": self.config.ocr.olmocr_longest_side,
                 "olmocr_max_tokens": self.config.ocr.olmocr_max_tokens,
+                "olmocr_max_continuations": self.config.ocr.olmocr_max_continuations,
+                "olmocr_context_tokens": self.config.ocr.olmocr_context_tokens,
                 "olmocr_temperature": self.config.ocr.olmocr_temperature,
                 "olmocr_timeout": self.config.ocr.olmocr_timeout,
                 "olmocr_retry_rotation": self.config.ocr.olmocr_retry_rotation,
@@ -1922,6 +1944,8 @@ class ConfigManager:
                 "chandra_layout": self.config.ocr.chandra_layout,
                 "chandra_include_furniture": self.config.ocr.chandra_include_furniture,
                 "chandra_max_tokens": self.config.ocr.chandra_max_tokens,
+                "chandra_max_continuations": self.config.ocr.chandra_max_continuations,
+                "chandra_context_tokens": self.config.ocr.chandra_context_tokens,
                 "chandra_temperature": self.config.ocr.chandra_temperature,
                 "chandra_top_p": self.config.ocr.chandra_top_p,
                 "chandra_max_retries": self.config.ocr.chandra_max_retries,

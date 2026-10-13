@@ -134,7 +134,7 @@ def test_chandra_reports_the_measured_figure(monkeypatch):
     eng = ch.ChandraEngine(_cfg("chandra"))
     eng._mode = lambda: "server"
     eng._ask = lambda uri, t, p: ('<div data-label="Text" data-bbox="0 0 500 500">'
-                                  "<p>società</p></div>", 0.9312)
+                                  "<p>società</p></div>", 0.9312, {})
     page = eng.recognize_image(Image.new("RGB", (100, 100)))
     assert page.meta["confidence"] == 0.9312
     assert page.meta["confidence_measured"] is True
@@ -151,7 +151,7 @@ def test_chandra_says_when_it_was_not_measured(monkeypatch):
     from PIL import Image
     eng = ch.ChandraEngine(_cfg("chandra"))
     eng._mode = lambda: "server"
-    eng._ask = lambda uri, t, p: ("<p>x</p>", None)
+    eng._ask = lambda uri, t, p: ("<p>x</p>", None, {})
     page = eng.recognize_image(Image.new("RGB", (100, 100)))
     assert page.meta["confidence"] == 0.0
     assert page.meta["confidence_measured"] is False
@@ -172,7 +172,10 @@ def test_the_local_model_path_reports_no_confidence():
     not pretend otherwise."""
     import inspect
     src = inspect.getsource(ch.ChandraEngine._ask_local)
-    assert "return content, None" in src
+    # The value is carried on a resume.Reply since v0.3.62 (which also brings the
+    # finish reason, so a cut-off page can be continued) — but this path still
+    # has to say "not measured" rather than hand back a 0.0 posing as one.
+    assert "conf=None)" in src
 
 
 # -------------------------------------------------------------------- olmOCR #
@@ -193,7 +196,7 @@ def test_olmocr_asks_for_logprobs(monkeypatch):
 def test_olmocr_reports_a_page_level_figure(monkeypatch):
     from PIL import Image
     eng = om.OlmOcrEngine(_cfg("olmocr"))
-    eng._ask = lambda image: ("primary_language: it\n---\nLa società", 0.77)
+    eng._ask = lambda image: ("primary_language: it\n---\nLa società", 0.77, {})
     page = eng.recognize_image(Image.new("RGB", (50, 50)))
     assert page.meta["confidence"] == 0.77
     assert page.meta["confidence_measured"] is True
@@ -205,7 +208,7 @@ def test_olmocr_has_no_lines_so_the_figure_can_only_be_page_level():
     to measure."""
     from PIL import Image
     eng = om.OlmOcrEngine(_cfg("olmocr"))
-    eng._ask = lambda image: ("hello", 0.5)
+    eng._ask = lambda image: ("hello", 0.5, {})
     page = eng.recognize_image(Image.new("RGB", (50, 50)))
     assert page.lines == []
 
@@ -213,7 +216,7 @@ def test_olmocr_has_no_lines_so_the_figure_can_only_be_page_level():
 def test_olmocr_says_when_it_was_not_measured():
     from PIL import Image
     eng = om.OlmOcrEngine(_cfg("olmocr"))
-    eng._ask = lambda image: ("hello", None)
+    eng._ask = lambda image: ("hello", None, {})
     page = eng.recognize_image(Image.new("RGB", (50, 50)))
     assert page.meta["confidence"] == 0.0
     assert page.meta["confidence_measured"] is False
@@ -229,8 +232,9 @@ def test_a_rotated_retry_reports_the_retrys_confidence():
     def _ask(image):
         calls.append(image.size)
         if len(calls) == 1:
-            return ("is_rotation_valid: false\nrotation_correction: 90\n---\nbad", 0.11)
-        return ("primary_language: it\n---\ngood", 0.95)
+            return ("is_rotation_valid: false\nrotation_correction: 90\n---\nbad",
+                    0.11, {})
+        return ("primary_language: it\n---\ngood", 0.95, {})
     eng._ask = _ask
     page = eng.recognize_image(Image.new("RGB", (40, 60)))
     assert len(calls) == 2

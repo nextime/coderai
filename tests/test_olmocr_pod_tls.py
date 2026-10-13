@@ -54,8 +54,10 @@ def test_a_pod_url_goes_through_pod_http(monkeypatch):
         seen["url"] = url
         return _Reply()
     monkeypatch.setattr(pod_http, "post", _post)
-    out, _conf = _engine()._ask_http([], 16, 0.0)
-    assert out == "testo"
+    # _ask_http returns a resume.Reply since v0.3.62 (it carries the finish
+    # reason and token counts, so a cut-off page can be continued).
+    reply = _engine()._ask_http([], 16, 0.0)
+    assert reply.text == "testo"
     assert seen["url"] == "https://1.2.3.4:8000/v1/chat/completions"
 
 

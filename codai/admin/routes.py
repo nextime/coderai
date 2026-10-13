@@ -4183,6 +4183,8 @@ def build_settings_dict(c, gpu_cards):
             "olmocr_api_key": c.ocr.olmocr_api_key,
             "olmocr_longest_side": c.ocr.olmocr_longest_side,
             "olmocr_max_tokens": c.ocr.olmocr_max_tokens,
+            "olmocr_max_continuations": c.ocr.olmocr_max_continuations,
+            "olmocr_context_tokens": c.ocr.olmocr_context_tokens,
             "olmocr_temperature": c.ocr.olmocr_temperature,
             "olmocr_timeout": c.ocr.olmocr_timeout,
             "olmocr_retry_rotation": c.ocr.olmocr_retry_rotation,
@@ -4199,6 +4201,8 @@ def build_settings_dict(c, gpu_cards):
             "chandra_layout": c.ocr.chandra_layout,
             "chandra_include_furniture": c.ocr.chandra_include_furniture,
             "chandra_max_tokens": c.ocr.chandra_max_tokens,
+            "chandra_max_continuations": c.ocr.chandra_max_continuations,
+            "chandra_context_tokens": c.ocr.chandra_context_tokens,
             "chandra_temperature": c.ocr.chandra_temperature,
             "chandra_top_p": c.ocr.chandra_top_p,
             "chandra_max_retries": c.ocr.chandra_max_retries,
@@ -5032,6 +5036,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "olmocr_api_key" in d: o.olmocr_api_key = (d.get("olmocr_api_key") or "").strip()
         if "olmocr_longest_side" in d: o.olmocr_longest_side = _i("olmocr_longest_side", o.olmocr_longest_side, 64)
         if "olmocr_max_tokens" in d: o.olmocr_max_tokens = _i("olmocr_max_tokens", o.olmocr_max_tokens, 64)
+        if "olmocr_max_continuations" in d: o.olmocr_max_continuations = _i("olmocr_max_continuations", o.olmocr_max_continuations, 0)
+        if "olmocr_context_tokens" in d: o.olmocr_context_tokens = _i("olmocr_context_tokens", o.olmocr_context_tokens, 0)
         if "olmocr_temperature" in d: o.olmocr_temperature = _f("olmocr_temperature", o.olmocr_temperature, 0.0)
         if "olmocr_timeout" in d: o.olmocr_timeout = _f("olmocr_timeout", o.olmocr_timeout, 1.0)
         if "olmocr_retry_rotation" in d: o.olmocr_retry_rotation = bool(d["olmocr_retry_rotation"])
@@ -5048,6 +5054,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "chandra_layout" in d: o.chandra_layout = bool(d["chandra_layout"])
         if "chandra_include_furniture" in d: o.chandra_include_furniture = bool(d["chandra_include_furniture"])
         if "chandra_max_tokens" in d: o.chandra_max_tokens = _i("chandra_max_tokens", o.chandra_max_tokens, 64)
+        if "chandra_max_continuations" in d: o.chandra_max_continuations = _i("chandra_max_continuations", o.chandra_max_continuations, 0)
+        if "chandra_context_tokens" in d: o.chandra_context_tokens = _i("chandra_context_tokens", o.chandra_context_tokens, 0)
         if "chandra_temperature" in d: o.chandra_temperature = _f("chandra_temperature", o.chandra_temperature, 0.0)
         if "chandra_top_p" in d: o.chandra_top_p = _f("chandra_top_p", o.chandra_top_p, 0.0)
         # 0 is meaningful: accept the first reply however it looks.

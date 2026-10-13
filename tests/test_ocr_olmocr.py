@@ -106,13 +106,18 @@ class _Stub:
         self.replies = list(replies)
         self.calls = []
 
-    def __call__(self, messages, max_tokens, temperature):
+    def __call__(self, messages, max_tokens, temperature, prefix="", **kw):
         self.calls.append({"messages": messages, "max_tokens": max_tokens,
-                           "temperature": temperature})
+                           "temperature": temperature, "prefix": prefix})
         reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
-        # (text, mean token probability) since v0.3.30 — the engines report a
-        # measured confidence now, and the ask helpers carry it.
-        return reply, 0.9
+        # A resume.Reply since v0.3.62: the ask helpers carry the measured
+        # confidence (v0.3.30) and now also the two facts that say whether the
+        # reply is FINISHED — the finish reason and the token counts — because a
+        # page that stopped at its cap is continued rather than returned half
+        # written. "stop" here means these canned pages are complete.
+        from codai.ocr.resume import Reply
+        return Reply(text=reply, finish_reason="stop", completion_tokens=10,
+                     conf=0.9)
 
 
 def _engine(cfg, stub):

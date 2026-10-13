@@ -45,6 +45,7 @@ import threading
 from html.parser import HTMLParser
 from typing import List, Optional
 
+from codai.ocr import resume
 from codai.ocr.base import (OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError,
                             logprobs_of, mean_token_prob, vlm_serve_limits)
 
@@ -605,26 +606,43 @@ class ChandraEngine(OcrEngine):
         top_p = float(getattr(self.cfg, "chandra_top_p", 0.1) or 0.1)
         max_retries = max(0, int(getattr(self.cfg, "chandra_max_retries", 2) or 0))
         meta = {}
-        content, conf = "", None
+        content, conf, info = "", None, {}
         for attempt in range(max_retries + 1):
             if attempt == 0:
                 temp, p = base_temp, top_p
             else:
                 temp, p = min(base_temp + 0.2 * attempt, 0.8), 0.95
-            content, conf = self._ask(data_uri, temp, p)
+            content, conf, info = self._ask(data_uri, temp, p)
             if not detect_repeat_token(content):
                 if attempt:
                     meta["retries"] = attempt
+                if info:
+                    # The retries belong in the same block as the resumptions:
+                    # a caller deciding whether to accept this page should not
+                    # have to add up two different reports.
+                    info["calls"] = int(info.get("calls") or 1) + attempt
+                    meta["model_attempts"] = info
                 return content, meta, conf
         # Out of retries, and the last reply still loops. Returned anyway, flagged: a
         # looping transcription usually has a correct beginning, and the flag is what lets
         # a caller decide rather than be handed a silent mess.
         meta["retries"] = max_retries
         meta["repeat_detected"] = True
+        if info:
+            info["calls"] = int(info.get("calls") or 1) + max_retries
+            meta["model_attempts"] = info
         return content, meta, conf
 
     def _ask(self, data_uri, temperature: float, top_p: float):
-        """One page → ``(raw reply text, mean token probability or None)``."""
+        """One page → ``(raw reply text, mean token probability or None, info)``.
+
+        ``info`` is the ``model_attempts`` block when there is anything to
+        report. A dense page that fills `chandra_max_tokens` used to end there:
+        the half-written markup parsed to a fragment, and in the finished text
+        that is indistinguishable from a page the model could not read. It is
+        now continued from where it stopped, under the shared rules in
+        :mod:`codai.ocr.resume`.
+        """
         messages = [{
             "role": "user",
             "content": [
@@ -635,11 +653,22 @@ class ChandraEngine(OcrEngine):
                 {"type": "text", "text": self._prompt()},
             ],
         }]
-        max_tokens = int(getattr(self.cfg, "chandra_max_tokens", DEFAULT_MAX_TOKENS)
-                         or DEFAULT_MAX_TOKENS)
-        if self._mode() == "model":
-            return self._ask_model(messages, max_tokens, temperature, top_p)
-        return self._ask_http(messages, max_tokens, temperature, top_p)
+        budgets = resume.budgets(self.cfg, "chandra", DEFAULT_MAX_TOKENS)
+        cap = budgets["cap"]
+
+        def _send(prefix: str, seg_cap: int):
+            if self._mode() == "model":
+                return self._ask_model(messages, seg_cap, temperature, top_p,
+                                       prefix=prefix)
+            return self._ask_http(messages, seg_cap, temperature, top_p,
+                                  prefix=prefix)
+
+        first = _send("", cap)
+        res = resume.resume(_send, first, cap, budgets["continuations"],
+                            limit=budgets["context_tokens"],
+                            repeats=detect_repeat_token, label="chandra")
+        info = resume.report(res, cap, budgets["continuations"], label="chandra")
+        return res.text, res.conf, info
 
     def _want_logprobs(self) -> bool:
         """Whether to ask the server to report per-token logprobs.
@@ -649,7 +678,7 @@ class ChandraEngine(OcrEngine):
         turn it off is a server that refuses the field outright."""
         return bool(getattr(self.cfg, "chandra_logprobs", True))
 
-    def _ask_model(self, messages, max_tokens, temperature, top_p):
+    def _ask_model(self, messages, max_tokens, temperature, top_p, prefix=""):
         """Model mode: ask the dispatcher which server should take this page.
 
         The in-process path is right for a model this machine serves and wrong for one
@@ -662,27 +691,44 @@ class ChandraEngine(OcrEngine):
             lease = placement.choose(
                 model_id, spill_after=placement.spill_threshold(model_id))
         except Exception:
-            return self._ask_local(messages, max_tokens, temperature, top_p)
+            return self._ask_local(messages, max_tokens, temperature, top_p,
+                                   prefix=prefix)
         try:
             if lease.kind == "local":
-                return self._ask_local(messages, max_tokens, temperature, top_p)
+                return self._ask_local(messages, max_tokens, temperature, top_p,
+                                       prefix=prefix)
             return self._ask_http(messages, max_tokens, temperature, top_p,
                                   base=lease.base, api_key=lease.api_key,
-                                  model_name=model_id)
+                                  model_name=model_id, prefix=prefix)
         finally:
             lease.release()
 
-    def _ask_local(self, messages, max_tokens, temperature, top_p):
-        """Through coderai's own in-process chat handler (model mode)."""
+    def _ask_local(self, messages, max_tokens, temperature, top_p, prefix=""):
+        """Through coderai's own in-process chat handler (model mode).
+
+        ``prefix`` resumes: the text so far goes back as a prefilled assistant
+        turn, with the two flags vLLM needs to CONTINUE it rather than start a
+        new answer about the same image.
+        """
         import asyncio
 
         from codai.api.text import chat_completions
         from codai.pydantic.textrequest import ChatCompletionRequest
 
         model_id = (getattr(self.cfg, "chandra_model_id", "") or "").strip()
+        extra = {}
+        if prefix:
+            messages = list(messages) + [{"role": "assistant", "content": prefix}]
+            # Both, always: with add_generation_prompt left at its default the
+            # chat template appends a fresh assistant turn and the model starts
+            # a NEW answer about the same image. They ride as extra fields,
+            # which the proxy forwards verbatim (v0.3.51).
+            extra = {"continue_final_message": True,
+                     "add_generation_prompt": False}
         req = ChatCompletionRequest(
             model=model_id, messages=messages, stream=False,
             temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+            **extra,
         )
         loop = self._host_loop
         if loop is None or loop.is_closed():
@@ -694,15 +740,18 @@ class ChandraEngine(OcrEngine):
         except Exception as e:
             raise OcrError(f"Chandra model '{model_id}' call failed: {e}", status=500)
         content = _content_of(result)
-        if not content.strip():
+        if not content.strip() and not prefix:
             raise OcrError(f"Chandra model '{model_id}' returned no text", status=500)
+        reason, used_in, used_out = resume.finish_and_usage(result)
         # No confidence from this path: coderai's in-process chat handler does not
         # surface per-token logprobs. Reported as "not measured" rather than 0.0
         # pretending to be one.
-        return content, None
+        return resume.Reply(text=content, finish_reason=reason,
+                            prompt_tokens=used_in, completion_tokens=used_out,
+                            conf=None)
 
     def _ask_http(self, messages, max_tokens, temperature, top_p, base: str = "",
-                  api_key: str = "", model_name: str = ""):
+                  api_key: str = "", model_name: str = "", prefix: str = ""):
         """Against an OpenAI-compatible server (vllm/server modes).
 
         ``base``/``api_key``/``model_name`` override the configured server for one page,
@@ -715,6 +764,8 @@ class ChandraEngine(OcrEngine):
         # pod_http is a drop-in that hands every other URL straight to requests.
         from codai.api import pod_http
 
+        if prefix:
+            messages = list(messages) + [{"role": "assistant", "content": prefix}]
         payload = {
             "model": model_name or self._model_name(),
             "messages": messages,
@@ -723,6 +774,10 @@ class ChandraEngine(OcrEngine):
             "top_p": top_p,
             "stream": False,
         }
+        if prefix:
+            # See _ask_local: both flags or neither.
+            payload["continue_final_message"] = True
+            payload["add_generation_prompt"] = False
         if self._want_logprobs():
             payload["logprobs"] = True
         headers = {"Content-Type": "application/json"}
@@ -744,12 +799,15 @@ class ChandraEngine(OcrEngine):
             content = _content_of(body)
         except Exception as e:
             raise OcrError(f"Chandra server returned unparseable JSON: {e}", status=502)
-        if not content.strip():
+        if not content.strip() and not prefix:
             raise OcrError("Chandra server returned no text", status=502)
+        reason, used_in, used_out = resume.finish_and_usage(body)
         # None when the server declined logprobs, which the page then reports as
         # confidence_measured: false. A server that ignores the field is a
         # configuration, not an error.
-        return content, mean_token_prob(logprobs_of(body))
+        return resume.Reply(text=content, finish_reason=reason,
+                            prompt_tokens=used_in, completion_tokens=used_out,
+                            conf=mean_token_prob(logprobs_of(body)))
 
 
 def _content_of(result) -> str:

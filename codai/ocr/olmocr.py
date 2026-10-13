@@ -36,6 +36,11 @@ import json
 import threading
 from typing import Optional
 
+from codai.ocr import resume
+# chandra's port of its upstream's detector, which is not chandra-specific: it
+# answers "has this reply fallen into a repetition loop", and a looping reply
+# must not be resumed whichever engine produced it.
+from codai.ocr.chandra import detect_repeat_token
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, logprobs_of,
                             mean_token_prob, vlm_serve_limits)
 
@@ -295,7 +300,7 @@ class OlmOcrEngine(OcrEngine):
         w, h = image.size
         page = OcrPage(index=0, width=int(w), height=int(h))
 
-        content, conf = self._ask(image)
+        content, conf, attempts = self._ask(image)
         meta, body = parse_front_matter(content)
 
         rotation = meta.get("rotation_correction") or 0
@@ -309,11 +314,14 @@ class OlmOcrEngine(OcrEngine):
                 # PIL rotates counter-clockwise; olmOCR reports the correction to APPLY,
                 # so expand=True and the same sign the toolkit uses.
                 retry_img = image.rotate(-turned, expand=True)
-                retry, retry_conf = self._ask(retry_img)
+                retry, retry_conf, retry_attempts = self._ask(retry_img)
                 rmeta, rbody = parse_front_matter(retry)
                 if rbody.strip():
                     meta, body = rmeta, rbody
                     meta["rotation_applied"] = turned
+                    # The retry is the answer being kept, so its report is the
+                    # one that describes this page.
+                    attempts = retry_attempts
                     # The retry is the answer that is kept, so its confidence is
                     # the one that describes it.
                     conf = retry_conf
@@ -332,10 +340,18 @@ class OlmOcrEngine(OcrEngine):
         page.meta["confidence"] = round(float(conf), 4) if conf is not None else 0.0
         page.meta["confidence_measured"] = conf is not None
         page.meta["confidence_scope"] = "page"
+        if attempts:
+            page.meta["model_attempts"] = attempts
         return page
 
     def _ask(self, image):
-        """One page → ``(raw reply text, mean token probability or None)``."""
+        """One page → ``(raw reply text, mean token probability or None, info)``.
+
+        ``info`` is the ``model_attempts`` block when there is anything to say.
+        A page that filled `olmocr_max_tokens` used to end there, mid-sentence,
+        and olmOCR's front matter made that worse: a reply cut off before the
+        body closes parses to metadata and no text at all.
+        """
         data_uri = prepare_image(
             image, int(getattr(self.cfg, "olmocr_longest_side", DEFAULT_LONGEST_SIDE) or
                        DEFAULT_LONGEST_SIDE))
@@ -346,14 +362,24 @@ class OlmOcrEngine(OcrEngine):
                 {"type": "image_url", "image_url": {"url": data_uri}},
             ],
         }]
-        max_tokens = int(getattr(self.cfg, "olmocr_max_tokens", 4096) or 4096)
         temperature = float(getattr(self.cfg, "olmocr_temperature", 0.1) or 0.0)
+        budgets = resume.budgets(self.cfg, "olmocr", 4096)
+        cap = budgets["cap"]
 
-        if self._mode() == "model":
-            return self._ask_model(messages, max_tokens, temperature)
-        return self._ask_http(messages, max_tokens, temperature)
+        def _send(prefix: str, seg_cap: int):
+            if self._mode() == "model":
+                return self._ask_model(messages, seg_cap, temperature,
+                                       prefix=prefix)
+            return self._ask_http(messages, seg_cap, temperature, prefix=prefix)
 
-    def _ask_model(self, messages, max_tokens, temperature):
+        first = _send("", cap)
+        res = resume.resume(_send, first, cap, budgets["continuations"],
+                            limit=budgets["context_tokens"],
+                            repeats=detect_repeat_token, label="olmocr")
+        return (res.text, res.conf,
+                resume.report(res, cap, budgets["continuations"], label="olmocr"))
+
+    def _ask_model(self, messages, max_tokens, temperature, prefix=""):
         """Model mode: ask the dispatcher which server should take this page.
 
         The in-process path below is the right one for a model this machine
@@ -370,27 +396,42 @@ class OlmOcrEngine(OcrEngine):
             lease = placement.choose(
                 model_id, spill_after=placement.spill_threshold(model_id))
         except Exception:
-            return self._ask_local(messages, max_tokens, temperature)
+            return self._ask_local(messages, max_tokens, temperature,
+                                   prefix=prefix)
         try:
             if lease.kind == "local":
-                return self._ask_local(messages, max_tokens, temperature)
+                return self._ask_local(messages, max_tokens, temperature,
+                                       prefix=prefix)
             return self._ask_http(messages, max_tokens, temperature,
                                   base=lease.base, api_key=lease.api_key,
-                                  model_name=model_id)
+                                  model_name=model_id, prefix=prefix)
         finally:
             lease.release()
 
-    def _ask_local(self, messages, max_tokens, temperature):
-        """Through coderai's own in-process chat handler (model mode)."""
+    def _ask_local(self, messages, max_tokens, temperature, prefix=""):
+        """Through coderai's own in-process chat handler (model mode).
+
+        ``prefix`` resumes: the text so far goes back as a prefilled assistant
+        turn, with the two flags vLLM needs to CONTINUE it instead of starting a
+        new answer about the same image.
+        """
         import asyncio
 
         from codai.api.text import chat_completions
         from codai.pydantic.textrequest import ChatCompletionRequest
 
         model_id = (getattr(self.cfg, "olmocr_model_id", "") or "").strip()
+        extra = {}
+        if prefix:
+            messages = list(messages) + [{"role": "assistant", "content": prefix}]
+            # Both, always — see codai/ocr/resume.py: with add_generation_prompt
+            # left at its default the template starts a fresh answer and the
+            # "continuation" is a second transcription of the same page.
+            extra = {"continue_final_message": True,
+                     "add_generation_prompt": False}
         req = ChatCompletionRequest(
             model=model_id, messages=messages, stream=False,
-            temperature=temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens, **extra,
         )
         loop = self._host_loop
         if loop is None or loop.is_closed():
@@ -401,14 +442,17 @@ class OlmOcrEngine(OcrEngine):
         except Exception as e:
             raise OcrError(f"olmOCR model '{model_id}' call failed: {e}", status=500)
         content = _content_of(result)
-        if not content.strip():
+        if not content.strip() and not prefix:
             raise OcrError(f"olmOCR model '{model_id}' returned no text", status=500)
+        reason, used_in, used_out = resume.finish_and_usage(result)
         # coderai's in-process chat handler surfaces no per-token logprobs, so this
         # path reports "not measured" rather than a 0.0 posing as one.
-        return content, None
+        return resume.Reply(text=content, finish_reason=reason,
+                            prompt_tokens=used_in, completion_tokens=used_out,
+                            conf=None)
 
     def _ask_http(self, messages, max_tokens, temperature, base: str = "",
-                  api_key: str = "", model_name: str = ""):
+                  api_key: str = "", model_name: str = "", prefix: str = ""):
         """Against an OpenAI-compatible server (vllm/server modes).
 
         ``base``/``api_key``/``model_name`` override the configured server for one
@@ -427,6 +471,8 @@ class OlmOcrEngine(OcrEngine):
         # requests untouched.
         from codai.api import pod_http
 
+        if prefix:
+            messages = list(messages) + [{"role": "assistant", "content": prefix}]
         payload = {
             "model": model_name or self._model_name(),
             "messages": messages,
@@ -434,6 +480,9 @@ class OlmOcrEngine(OcrEngine):
             "temperature": temperature,
             "stream": False,
         }
+        if prefix:
+            payload["continue_final_message"] = True
+            payload["add_generation_prompt"] = False
         if bool(getattr(self.cfg, "olmocr_logprobs", True)):
             payload["logprobs"] = True
         headers = {"Content-Type": "application/json"}
@@ -454,9 +503,12 @@ class OlmOcrEngine(OcrEngine):
             content = _content_of(body)
         except Exception as e:
             raise OcrError(f"olmOCR server returned unparseable JSON: {e}", status=502)
-        if not content.strip():
+        if not content.strip() and not prefix:
             raise OcrError("olmOCR server returned no text", status=502)
-        return content, mean_token_prob(logprobs_of(body))
+        reason, used_in, used_out = resume.finish_and_usage(body)
+        return resume.Reply(text=content, finish_reason=reason,
+                            prompt_tokens=used_in, completion_tokens=used_out,
+                            conf=mean_token_prob(logprobs_of(body)))
 
 
 def _content_of(result) -> str:

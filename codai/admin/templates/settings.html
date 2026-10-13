@@ -1272,6 +1272,8 @@
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Longest side (px)</label><input type="number" id="s-ocr-olmocr-longest-side" class="form-input" min="64" placeholder="1288"></div>
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Max tokens / page</label><input type="number" id="s-ocr-olmocr-max-tokens" class="form-input" min="64" placeholder="4096"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Resumptions</label><input type="number" id="s-ocr-olmocr-max-continuations" class="form-input" min="0" placeholder="8"><span class="form-hint" style="font-size:11px">A page whose reply fills the budget is continued from where it stopped, up to this many times. 0 = off (the page is returned truncated and marked). Its front matter makes a cut-off reply parse to metadata and no text.</span></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Context window</label><input type="number" id="s-ocr-olmocr-context-tokens" class="form-input" min="0" placeholder="0 = no ceiling"><span class="form-hint" style="font-size:11px">Resumption re-sends everything so far as input, so the window is what a long page runs out of. Set it to the served max-model-len.</span></div>
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Temperature</label><input type="number" id="s-ocr-olmocr-temperature" class="form-input" min="0" max="2" step="0.1" placeholder="0.1"></div>
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Timeout (s)</label><input type="number" id="s-ocr-olmocr-timeout" class="form-input" min="1" placeholder="300"></div>
     </div>
@@ -1304,6 +1306,8 @@
       <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-chandra-include-furniture"><span>Keep headers &amp; footers</span></label>
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Rasterise DPI</label><input type="number" id="s-ocr-chandra-dpi" class="form-input" min="0" placeholder="250"></div>
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Max tokens / page</label><input type="number" id="s-ocr-chandra-max-tokens" class="form-input" min="64" placeholder="12384"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Resumptions</label><input type="number" id="s-ocr-chandra-max-continuations" class="form-input" min="0" placeholder="8"><span class="form-hint" style="font-size:11px">A page whose reply fills the budget is continued from where it stopped, up to this many times. 0 = off. chandra emits HTML, so a cut-off reply is unclosed markup and parses to a fragment or to nothing.</span></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Context window</label><input type="number" id="s-ocr-chandra-context-tokens" class="form-input" min="0" placeholder="0 = no ceiling"><span class="form-hint" style="font-size:11px">Resumption re-sends the text so far as input; this is the ceiling it must respect.</span></div>
     </div>
     <p class="form-hint" style="margin:0 0 .3rem">Turning <b>layout blocks</b> off asks for plain HTML instead: faster and shorter, but then there are no boxes and no regions at all, which is the main reason to pick this engine. <b>Headers &amp; footers</b> on keeps page furniture in the text &mdash; worth it for judicial documents, whose header carries the court and the case number. <b>DPI</b> 0 follows the shared setting; Chandra's input is capped at 3072&times;2048 = 6.29&nbsp;Mpixels, the same ceiling as Surya-2, which an A4 page reaches at about 255&nbsp;DPI &mdash; above that the page is scaled down before the model sees it.</p>
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
@@ -2242,6 +2246,8 @@ async function loadSettings(){
     document.getElementById('s-ocr-olmocr-api-key').value = ocr.olmocr_api_key ?? '';
     document.getElementById('s-ocr-olmocr-longest-side').value = ocr.olmocr_longest_side ?? 1288;
     document.getElementById('s-ocr-olmocr-max-tokens').value = ocr.olmocr_max_tokens ?? 4096;
+    document.getElementById('s-ocr-olmocr-max-continuations').value = ocr.olmocr_max_continuations ?? 8;
+    document.getElementById('s-ocr-olmocr-context-tokens').value = ocr.olmocr_context_tokens ?? 0;
     document.getElementById('s-ocr-olmocr-temperature').value = ocr.olmocr_temperature ?? 0.1;
     document.getElementById('s-ocr-olmocr-timeout').value = ocr.olmocr_timeout ?? 300;
     document.getElementById('s-ocr-chandra-enabled').checked = !!ocr.chandra_enabled;
@@ -2256,6 +2262,8 @@ async function loadSettings(){
     document.getElementById('s-ocr-chandra-layout').checked = ocr.chandra_layout !== false;
     document.getElementById('s-ocr-chandra-include-furniture').checked = ocr.chandra_include_furniture !== false;
     document.getElementById('s-ocr-chandra-max-tokens').value = ocr.chandra_max_tokens ?? 12384;
+    document.getElementById('s-ocr-chandra-max-continuations').value = ocr.chandra_max_continuations ?? 8;
+    document.getElementById('s-ocr-chandra-context-tokens').value = ocr.chandra_context_tokens ?? 0;
     document.getElementById('s-ocr-chandra-temperature').value = ocr.chandra_temperature ?? 0;
     document.getElementById('s-ocr-chandra-top-p').value = ocr.chandra_top_p ?? 0.1;
     document.getElementById('s-ocr-chandra-max-retries').value = ocr.chandra_max_retries ?? 2;
@@ -2537,6 +2545,10 @@ async function saveSettings(silent){
       olmocr_api_key: document.getElementById('s-ocr-olmocr-api-key').value.trim(),
       olmocr_longest_side: parseInt(document.getElementById('s-ocr-olmocr-longest-side').value) || 1288,
       olmocr_max_tokens: parseInt(document.getElementById('s-ocr-olmocr-max-tokens').value) || 4096,
+      // 0 is a real setting here (resumption off), so an empty field must not
+      // become the default — parse it and only fall back when it is not a number.
+      olmocr_max_continuations: (function(v){ return isNaN(v) ? 8 : v; })(parseInt(document.getElementById('s-ocr-olmocr-max-continuations').value)),
+      olmocr_context_tokens: (function(v){ return isNaN(v) ? 0 : v; })(parseInt(document.getElementById('s-ocr-olmocr-context-tokens').value)),
       olmocr_temperature: parseFloat(document.getElementById('s-ocr-olmocr-temperature').value) || 0.1,
       olmocr_timeout: parseFloat(document.getElementById('s-ocr-olmocr-timeout').value) || 300,
       chandra_enabled: document.getElementById('s-ocr-chandra-enabled').checked,
@@ -2554,6 +2566,8 @@ async function saveSettings(silent){
       chandra_layout: document.getElementById('s-ocr-chandra-layout').checked,
       chandra_include_furniture: document.getElementById('s-ocr-chandra-include-furniture').checked,
       chandra_max_tokens: parseInt(document.getElementById('s-ocr-chandra-max-tokens').value) || 12384,
+      chandra_max_continuations: (function(v){ return isNaN(v) ? 8 : v; })(parseInt(document.getElementById('s-ocr-chandra-max-continuations').value)),
+      chandra_context_tokens: (function(v){ return isNaN(v) ? 0 : v; })(parseInt(document.getElementById('s-ocr-chandra-context-tokens').value)),
       chandra_temperature: _num('s-ocr-chandra-temperature', 0, parseFloat),
       chandra_top_p: parseFloat(document.getElementById('s-ocr-chandra-top-p').value) || 0.1,
       chandra_max_retries: _num('s-ocr-chandra-max-retries', 2, parseInt),
