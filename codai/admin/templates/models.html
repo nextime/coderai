@@ -1036,6 +1036,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <span class="form-hint" style="font-size:11px">Weights, uploads and adapters land here and outlive the pod. Secure Cloud only; pods are pinned to the volume's region.</span>
             </div>
             <div class="form-row" style="margin:0">
+              <label class="form-label">Per-region volumes <span class="muted">(this model)</span></label>
+              <input type="text" id="cfg-rp-volumes" class="form-input" placeholder="EU-SE-1=vol-a, EU-RO-1=vol-b">
+              <span class="form-hint" style="font-size:11px">Keeps this model's region fallback list AND its storage, which one volume id cannot. The region is picked first, then its volume. Regions missing here are not rented for this model.</span>
+            </div>
+            <div class="form-row" style="margin:0">
               <label class="form-label">Weights already on the volume <span class="muted">(path)</span></label>
               <input type="text" id="cfg-rp-volume-path" class="form-input" placeholder="models/DeepSeek-V4-Q4.gguf, or a container dir">
               <span class="form-hint" style="font-size:11px">Relative to the volume mount. The pod loads this instead of downloading — the only sane way to run a 150 GB+ engine model (ds4, colibri, k3).</span>
@@ -4898,6 +4903,8 @@ function _populateRunpod(s){
   set('cfg-rp-hf-gguf', rp.hf_gguf || '');
   set('cfg-rp-pool', rp.pool || '');
   set('cfg-rp-volume', rp.network_volume_id || '');
+  set('cfg-rp-volumes', Object.entries(rp.network_volumes || {})
+      .map(function(e){ return e[0] + '=' + e[1]; }).join(', '));
   set('cfg-rp-volume-path', rp.volume_path || '');
   chk('cfg-rp-venv-volume', rp.venv_on_volume);
   set('cfg-rp-direct-tcp', rp.direct_tcp === true ? 'on' : (rp.direct_tcp === false ? 'off' : 'auto'));
@@ -5100,6 +5107,7 @@ function _collectRunpod(){
     hf_gguf:            (val('cfg-rp-hf-gguf') || '').trim(),
     pool:               (val('cfg-rp-pool') || '').trim(),
     network_volume_id:  (val('cfg-rp-volume') || '').trim(),
+    network_volumes:    (val('cfg-rp-volumes') || '').trim(),
     volume_path:        (val('cfg-rp-volume-path') || '').trim(),
     venv_on_volume:     document.getElementById('cfg-rp-venv-volume').checked,
     direct_tcp:         val('cfg-rp-direct-tcp') || 'auto',

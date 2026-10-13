@@ -55,6 +55,7 @@ In `config.json` the same block is:
     "cloud_type": "SECURE",
     "default_gpu_type": "",
     "data_center": "",
+    "network_volumes": {"EU-SE-1": "vol-a", "EU-RO-1": "vol-b"},
     "deployment_id": "default",
     "global_max_hourly_usd": 2.0,
     "global_cost_limit_usd": 100.0,
@@ -147,6 +148,7 @@ sync.) In `models.json` that is a `backend` pin plus a `runpod` block:
 | `pod_max_parallel_requests` | `0` (the pod's own default, 2) | How many requests the **pod's** coderai server admits at once. The default is sized for a shared workstation and throttles a dedicated card long before its GPU is busy — requests over the limit get `429` while vLLM's `max_num_seqs` sits unused. Set it to roughly the remote engine's batch width. Rides to the pod as `CODERAI_SERVER_MAX_PARALLEL_REQUESTS`. |
 | `pod_queue_max_size` | `0` (the pod's own default, 6) | How deep the pod queues admitted-but-waiting requests. Rides as `CODERAI_SERVER_QUEUE_MAX_SIZE`. |
 | `data_center` | — | Pin this model's pods to one RunPod data centre (region), e.g. `EU-RO-1`. Blank uses the account-wide setting. A network volume still wins over both: a volume lives in one region and a pod elsewhere cannot attach it. |
+| `network_volumes` | — | One network volume **per region**: `{"EU-SE-1": "vol-a", "EU-RO-1": "vol-b"}`, or `"EU-SE-1=vol-a,EU-RO-1=vol-b"`. This is how a model keeps BOTH a region fallback list and persistent storage — a single `network_volume_id` pins every pod to its own region and the `data_centers` list is discarded. The region is chosen first and that region's volume is attached. A region with no volume here is dropped from the list and said so, never rented without storage. Supersedes `network_volume_id`; a one-entry map behaves exactly like it. Falls back to the account-wide map. |
 | `schedule_enabled` | `false` | Apply the warm floor (`min_pods`/`keep_warm`) only inside a daily window. Outside it the floor is `0` and the warm pod is terminated, so a model used in office hours stops billing overnight. It does **not** block requests: one arriving out of hours cold-starts a pod exactly as `min_pods: 0` always has. Ignored unless both `schedule_start` and `schedule_end` are set. |
 | `schedule_start` / `schedule_end` | — | `HH:MM`. The start is inclusive, the end exclusive. An end **earlier** than the start runs overnight and belongs to the day it started on, so `22:00`–`06:00` on `fri` covers Friday night into Saturday morning. |
 | `schedule_days` | every day | Which days the window opens on: `0`=Mon … `6`=Sun, or names (`mon,tue`). Empty means every day. |
@@ -544,7 +546,73 @@ Admin API:
 
 ---
 
-## 8. RunPod-only deployments
+## 8. Several regions, and storage in each
+
+RunPod ties a network volume to one data centre: a pod elsewhere cannot attach
+it. So a single `network_volume_id` forces a choice nobody should have to make
+— rent wherever a card is free, and re-download the weights onto every cold
+pod, or keep the storage and wait for capacity in one region. On a contended
+card that is the difference between a lease that fills and one that waits.
+
+`network_volumes` removes the choice. Give each region its own volume, on the
+account block or a model's:
+
+```json
+{"runpod": {"network_volumes": {"EU-SE-1": "vol-a", "EU-RO-1": "vol-b"},
+            "data_centers": ["EU-SE-1", "EU-RO-1", "EU-FR-1"]}}
+```
+
+The scaler pairs every candidate card with every allowed region (as it already
+did), and the volume now follows the region the candidate was ranked for. So in
+the example above a pod in `EU-RO-1` attaches `vol-b`, and `EU-FR-1` is dropped
+from the list with a line saying why — a pod rented there would have no storage,
+re-download everything and boot minutes slower, which is the cost the volumes
+were added to remove. If no allowed region has a volume, provisioning refuses
+and names both sets rather than quietly placing the data somewhere else.
+
+`network_volume_id` keeps working and keeps meaning exactly what it meant; a
+one-entry map behaves identically to it. A model's map replaces the account's
+whole, not merged: a model that lists its regions is stating where its data may
+live, and inheriting an extra region from the account would put weights
+somewhere it never named.
+
+### Seeding a new region
+
+A volume in a new region is empty, and the first pod there pays for the whole
+download — the cost the volume exists to remove, landing on whoever happens to
+send the first request. Pay it deliberately instead:
+
+```
+POST /admin/api/runpod/seed-volumes
+{"model": "datalab-to/surya-ocr-2", "regions": ["EU-RO-1"]}
+```
+
+It boots one ordinary pod per region, in order, with that region's volume
+attached — booting it *is* the download, because the caches already point at
+the volume — then terminates each one. No new pod shape and nothing to
+maintain. Sequential on purpose: N regions at once means N cards billing for
+the same minutes, and nobody is waiting on this. Admin-only, it rents cards,
+and the account's $/hr and spend caps still apply. It returns as soon as the
+work starts; the per-region result goes to the server log.
+
+The **venv** needs no seeding. `venv_on_volume` builds it under a lock with its
+`.ready` marker written last, so the first pod in a region builds it once and
+every pod after finds it — which is what makes the dependency-free slim image
+usable in every region instead of pulling a 12–27 GB capability image.
+
+### Why not a global volume
+
+RunPod's **global** volume (beta) is region-independent and `global_volume_id`
+supports it, but it cannot be the answer: the type cannot be created through
+the public API at all (`POST /v2/network-volumes` accepts only
+`STANDARD|HIGH_PERFORMANCE` and demands a `dataCenter`), so it exists only for
+an operator who made one by hand in the console. It is also object storage —
+no locking, no atomic rename, eventual consistency — which is fine for
+read-mostly weights and wrong for anything that writes.
+
+---
+
+## 9. RunPod-only deployments
 
 CoderAI can run as a pure orchestrator: **no local GPU, no local models, no
 weights on disk.** Every node's capability set includes `runpod` (including an
@@ -557,7 +625,7 @@ loop and reaper, and forwards chat requests to RunPod.
 
 ---
 
-## 9. Operational notes
+## 10. Operational notes
 
 These come from live testing on a real account, not from the docs:
 

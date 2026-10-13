@@ -169,8 +169,18 @@ def test_candidates_are_expanded_across_regions_for_the_capacity_fallback():
 
 
 def test_the_pod_is_created_in_and_records_the_region_it_got():
+    """create, log and handle must all name the SAME region.
+
+    Previously counted three copies of the expression. Once the region also
+    chose which network volume to attach, that expression became a named local
+    resolved once per candidate — which is what the invariant wanted all along,
+    so the test now checks the one resolution and its uses instead of counting
+    duplicates of it.
+    """
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    assert src.count('sel.get("_dc") or self._data_center()') >= 3   # create, log, handle
+    assert '_dc = sel.get("_dc") or self._data_center()' in src
+    assert "data_center_id=_dc," in src              # the pod is created there
+    assert src.count("sel.get(\"_dc\") or self._data_center()") >= 2   # + the handle
 
 
 # ----------------------------- no A40 free must not mean "no pod for you"

@@ -21,7 +21,7 @@ import re
 import shutil
 from typing import Optional
 
-from fastapi import APIRouter, Request, Response, Form, HTTPException, Depends
+from fastapi import APIRouter, Request, Response, Form, HTTPException, Depends, Body
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
@@ -3131,6 +3131,18 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             dcs = [d.strip() for d in dcs.replace(",", " ").split() if d.strip()]
         if isinstance(dcs, list) and dcs:
             rpo["data_centers"] = [str(d).strip().upper() for d in dcs if str(d).strip()]
+        # One volume per region: a dict, or "EU-SE-1=vol-a,EU-RO-1=vol-b".
+        # Normalised here so the admin API and a hand-edited models.json agree;
+        # the worker re-parses it anyway, which is what actually guards it.
+        nv = src.get("network_volumes")
+        if isinstance(nv, str):
+            nv = {k.strip(): v.strip() for k, _, v in
+                  (p.partition("=") for p in nv.replace(";", ",").split(","))
+                  if k.strip() and v.strip()}
+        if isinstance(nv, dict) and nv:
+            rpo["network_volumes"] = {str(k).strip().upper(): str(v).strip()
+                                      for k, v in nv.items()
+                                      if str(k).strip() and str(v).strip()}
         gts = src.get("gpu_types")
         if isinstance(gts, str):
             gts = [g.strip() for g in gts.split(",") if g.strip()]
@@ -4107,6 +4119,7 @@ def build_settings_dict(c, gpu_cards):
             "data_center": c.runpod.data_center,
             "registry_auth_id": c.runpod.registry_auth_id,
             "network_volume_id": c.runpod.network_volume_id,
+            "network_volumes": dict(c.runpod.network_volumes or {}),
             "volume_mount_path": c.runpod.volume_mount_path,
             "deployment_id": c.runpod.deployment_id,
             "global_max_hourly_usd": c.runpod.global_max_hourly_usd,
@@ -4904,6 +4917,16 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             rp.registry_auth_id = (d.get("registry_auth_id") or "").strip()
         if "network_volume_id" in d:
             rp.network_volume_id = (d.get("network_volume_id") or "").strip()
+        if "network_volumes" in d:
+            nv = d.get("network_volumes")
+            if isinstance(nv, str):
+                nv = {k.strip(): v.strip() for k, _, v in
+                      (p.partition("=") for p in nv.replace(";", ",").split(","))
+                      if k.strip() and v.strip()}
+            rp.network_volumes = {str(k).strip().upper(): str(v).strip()
+                                  for k, v in (nv or {}).items()
+                                  if str(k).strip() and str(v).strip()} \
+                if isinstance(nv, dict) else {}
         if "volume_mount_path" in d:
             rp.volume_mount_path = ((d.get("volume_mount_path") or "").strip()
                                     or "/workspace")
@@ -5127,6 +5150,57 @@ async def api_runpod_gpu_types(username: str = Depends(require_admin)):
     except RunpodError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"success": True, "gpu_types": gpus, "count": len(gpus)}
+
+
+@router.post("/admin/api/runpod/seed-volumes",
+             summary="Pre-fill a model's regional volumes")
+async def api_runpod_seed_volumes(payload: dict = Body(...),
+                                  username: str = Depends(require_admin)):
+    """Boot one pod per region so each regional volume gets the weights once.
+
+    An empty volume makes the FIRST pod in that region pull everything, which
+    is the delay the volume was configured to remove — and it lands on whoever
+    happens to send the first request there. Seeding moves that cost to a
+    moment nobody is waiting on.
+
+    Admin-only and it rents cards: a region takes a pod's whole boot, serially,
+    and the usual $/hr and spend caps still apply. Returns as soon as the work
+    is started; progress and the per-region result go to the server log.
+
+    Body: {"model": "<id>", "regions": ["EU-SE-1", …]}  — regions optional,
+    default every region in the model's network_volumes map.
+    """
+    import threading
+    from codai.api import runpod_worker
+    model = str((payload or {}).get("model") or "").strip()
+    regions = (payload or {}).get("regions") or None
+    if isinstance(regions, str):
+        regions = [r.strip() for r in regions.replace(",", " ").split() if r.strip()]
+    # Resolved here, synchronously, so a mistake in the request is a 4xx the
+    # caller can read — not a line in a log file it never looks at.
+    try:
+        block = runpod_worker.model_runpod_block(model) if model else None
+        if not model or not block:
+            raise LookupError(f"{model!r} has no runpod block")
+        mcfg = runpod_worker.parse_model_runpod(block)
+        vmap = runpod_worker.volume_map_for(mcfg, runpod_worker._account_hint())
+        if not vmap:
+            raise LookupError(f"{model!r} has no network_volumes map to seed")
+        want = [str(r).strip().upper() for r in (regions or list(vmap))]
+        unknown = [r for r in want if r not in vmap]
+        if unknown:
+            raise ValueError(f"no volume configured for {', '.join(unknown)} — "
+                             f"network_volumes has {', '.join(sorted(vmap))}")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    threading.Thread(target=runpod_worker.seed_region_volumes,
+                     args=(model, want), daemon=True,
+                     name=f"seed-volumes-{model[:20]}").start()
+    return {"success": True, "model": model, "regions": want,
+            "note": "one pod per region, in order; watch the server log"}
 
 
 @router.get("/admin/api/runpod/status", summary="RunPod account pods + live cost")

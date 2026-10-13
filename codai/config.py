@@ -798,6 +798,18 @@ class RunpodConfig:
     # Constraints RunPod imposes: Secure Cloud only, and the pod MUST run in the
     # volume's own data center.
     network_volume_id: str = ""
+    # One volume PER REGION, which is how a multi-region install keeps both.
+    # RunPod ties a network volume to a single data centre, so the id above
+    # pins every pod to that volume's region and the `data_centers` fallback
+    # list is discarded — an install had to choose between renting wherever a
+    # card is free and not re-downloading the weights onto every cold pod.
+    # A map {"EU-SE-1": "vol-a", "EU-RO-1": "vol-b"} lets the scaler pick the
+    # region first and attach that region's own volume, so the fallback list
+    # keeps working. Regions with no volume here are dropped from the list
+    # rather than rented without storage, because a pod that silently has none
+    # is the slow boot this exists to prevent. Supersedes network_volume_id
+    # when set; a one-entry map behaves exactly like the single id.
+    network_volumes: dict = field(default_factory=dict)
     volume_mount_path: str = "/workspace"    # where pods mount it
     # A RunPod GLOBAL volume (beta, Sept 2026): region-INDEPENDENT storage, so
     # unlike network_volume_id above it does NOT pin pods to one data centre —
@@ -1832,6 +1844,7 @@ class ConfigManager:
                 "data_center": self.config.runpod.data_center,
                 "registry_auth_id": self.config.runpod.registry_auth_id,
                 "network_volume_id": self.config.runpod.network_volume_id,
+                "network_volumes": dict(self.config.runpod.network_volumes or {}),
                 "volume_mount_path": self.config.runpod.volume_mount_path,
                 "deployment_id": self.config.runpod.deployment_id,
                 "global_max_hourly_usd": self.config.runpod.global_max_hourly_usd,

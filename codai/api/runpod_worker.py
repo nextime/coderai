@@ -82,6 +82,12 @@ class RunpodModelConfig:
     # Attach a RunPod network volume to this pool's pods. Blank falls back to the
     # account-wide one. Weights, uploads and adapters on it outlive the pod.
     network_volume_id: str = ""
+    # One volume per region: {"EU-SE-1": "vol-a", "EU-RO-1": "vol-b"}. Lets this
+    # pool keep its `data_centers` fallback list AND persistent storage, which a
+    # single network_volume_id cannot (it pins every pod to its own region).
+    # Supersedes network_volume_id for this pool when set; falls back to the
+    # account-wide map. A one-entry map behaves exactly like the single id.
+    network_volumes: dict = field(default_factory=dict)
     # Per-model override for the account's GLOBAL volume (see RunpodConfig).
     # Region-independent, so it never pins the pod's data centre.
     global_volume_id: str = ""
@@ -836,10 +842,38 @@ def disk_for(entry: dict, mcfg: "RunpodModelConfig", account=None) -> tuple:
                     f"~{_DISK_HEADROOM_GB} GB beside them")
 
 
-def volume_for(mcfg: "RunpodModelConfig", account) -> tuple:
-    """(volume_id, mount_path) for this pool, or ('', '')."""
-    vol = (getattr(mcfg, "network_volume_id", "") or "").strip() \
-        or (getattr(account, "network_volume_id", "") or "").strip()
+def volume_map_for(mcfg: "RunpodModelConfig", account) -> dict:
+    """{REGION: volume_id} for this pool, or {}.
+
+    The pool's own map wins whole — not merged with the account's. A model that
+    lists its regions' volumes is making a complete statement about where its
+    data may live, and silently inheriting another region from the account map
+    would place weights somewhere it did not name.
+    """
+    own = _parse_volume_map(getattr(mcfg, "network_volumes", None))
+    if own:
+        return own
+    return _parse_volume_map(getattr(account, "network_volumes", None))
+
+
+def volume_for(mcfg: "RunpodModelConfig", account, dc: str = "") -> tuple:
+    """(volume_id, mount_path) for this pool in region ``dc``, or ('', '').
+
+    With a per-region map configured, ``dc`` selects the volume — so the caller
+    that creates a pod must pass the region its candidate was ranked for, and
+    does. Callers with no region in hand (sizing the container disk, warning
+    about huge weights, validating venv_on_volume, building a path under the
+    mount) ask only whether storage exists and where it is mounted, both of
+    which are the same for every region; they get the first entry so those
+    checks keep working, and the mount path is shared by construction.
+    """
+    vmap = volume_map_for(mcfg, account)
+    if vmap:
+        key = str(dc or "").strip().upper()
+        vol = vmap.get(key) or ("" if key else next(iter(vmap.values())))
+    else:
+        vol = (getattr(mcfg, "network_volume_id", "") or "").strip() \
+            or (getattr(account, "network_volume_id", "") or "").strip()
     if not vol:
         return "", ""
     mount = (getattr(mcfg, "volume_mount_path", "") or "").strip() \
@@ -1548,6 +1582,34 @@ def _gpu_matches(gpu: dict, want: str) -> bool:
     return False
 
 
+def _parse_volume_map(value) -> dict:
+    """{REGION: volume_id} from a dict or a "REGION=id,REGION=id" string.
+
+    Region ids are upper-cased (RunPod's own spelling) so a map written in
+    lower case still matches the region a candidate was ranked for — the whole
+    feature turns on those two strings being equal. Blank ids are dropped
+    rather than kept as a region with no storage, which is the one outcome this
+    map exists to make impossible.
+    """
+    if value in (None, ""):
+        return {}
+    items = []
+    if isinstance(value, dict):
+        items = list(value.items())
+    else:
+        for part in str(value).replace(";", ",").split(","):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                items.append((k, v))
+    out = {}
+    for k, v in items:
+        key = str(k or "").strip().upper()
+        vol = str(v or "").strip()
+        if key and vol:
+            out[key] = vol
+    return out
+
+
 def _parse_dc_list(value) -> list:
     """A region allow-list from a list or a comma/space string, order kept.
 
@@ -1714,7 +1776,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.data_centers = _parse_dc_list(b.get("data_centers"))
     cfg.gpu_types = _parse_name_list(b.get("gpu_types"))
     cfg.allow_other_gpus = _as_bool(b.get("allow_other_gpus"), cfg.allow_other_gpus)
-    if cfg.network_volume_id:
+    cfg.network_volumes = _parse_volume_map(b.get("network_volumes"))
+    if cfg.network_volume_id or cfg.network_volumes:
         # RunPod offers network volumes on Secure Cloud only; leaving COMMUNITY
         # in the list just produces candidates the attach would reject.
         cfg.cloud_types = ["SECURE"]
@@ -2302,6 +2365,9 @@ class RunpodPodPool:
         self.model_key = model_key
         self.account = account_cfg
         self.mcfg = mcfg
+        #: Set only for the duration of a volume seed, naming the one region
+        #: being filled (see seed_region).
+        self._seed_dc = ""
         self.served = served_name
         self.pods: list = []
         #: affinity key -> pod_id, bounded. A conversation that comes back finds
@@ -2456,10 +2522,15 @@ class RunpodPodPool:
         # it so weights survive the pod. RunPod requires Secure Cloud and the
         # pod's data center to match the volume's, so both are forced here rather
         # than surfacing later as an unexplained capacity error.
+        vol_map = volume_map_for(self.mcfg, self.account)
         vol_id, vol_mount = volume_for(self.mcfg, self.account)
         if vol_id:
             env.update(volume_env(vol_mount))
-            if getattr(self, "_volume_dc", None) is None:
+            # With a per-region map the region is chosen FIRST and the volume
+            # follows it (resolved per candidate below), so there is nothing to
+            # pin — pinning is what a single volume forces, and the map exists
+            # to stop paying for it.
+            if not vol_map and getattr(self, "_volume_dc", None) is None:
                 self._volume_dc = self._data_center_for_volume(vol_id)
         # A GLOBAL volume instead: same caches, no data-centre pinning. RunPod
         # mounts it at /workspace by itself when it is the only volume, which is
@@ -2502,6 +2573,11 @@ class RunpodPodPool:
             # different GPU than the configuration names is correct here — it is
             # what allow_other_gpus is for — but it must never be silent.
             _alt = "" if sel.get("preferred", True) else " [FALLBACK — no preferred card available]"
+            if vol_map:
+                _v = volume_for(self.mcfg, self.account, _dc)[0]
+                print(f"[runpod] {_dc or '(no region)'}: attaching volume "
+                      f"{_v or '(none — this region has no volume configured)'}",
+                      flush=True)
             print(f"[runpod] provisioning pod for {self.model_key!r}: {sel['display_name']} "
                   f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr"
                   + (f" in {_dc}" if _dc else " (region: RunPod's choice)") + _alt,
@@ -2517,8 +2593,9 @@ class RunpodPodPool:
                     cloud_type=sel["cloud_type"], container_disk_gb=_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],
-                    data_center_id=(sel.get("_dc") or self._data_center()),
-                    network_volume_id=vol_id,
+                    data_center_id=_dc,
+                    network_volume_id=(volume_for(self.mcfg, self.account, _dc)[0]
+                                       if vol_map else vol_id),
                     global_volume_id=global_vol,
                     volume_mount_path=(vol_mount or "/workspace"),
                     registry_auth_id=(self.mcfg.registry_auth_id
@@ -2793,18 +2870,53 @@ class RunpodPodPool:
         single setting, the account's list, the account's single setting, and
         finally [""] — let RunPod choose, which is what blank has always meant.
         """
+        # A seed run names the ONE region it is filling. It bypasses the
+        # have-a-volume filter below on purpose: the volume is there, empty,
+        # and the pod about to boot is how it stops being empty.
+        seeding = (getattr(self, "_seed_dc", "") or "").strip().upper()
+        if seeding:
+            return [seeding]
+        vol_map = volume_map_for(self.mcfg, self.account)
         pinned = getattr(self, "_volume_dc", "") or ""
-        if pinned:
+        if pinned and not vol_map:
             return [pinned]
         for src in (getattr(self.mcfg, "data_centers", None),
                     [self.mcfg.data_center] if self.mcfg.data_center else None,
                     getattr(self.account, "data_centers", None),
                     [getattr(self.account, "data_center", "")]
                     if getattr(self.account, "data_center", "") else None):
-            vals = [str(v).strip() for v in (src or []) if str(v).strip()]
+            vals = [str(v).strip().upper() for v in (src or []) if str(v).strip()]
             if vals:
-                return vals
-        return [""]
+                return self._with_volumes(vals, vol_map)
+        # No region list at all. With a map, its own regions ARE the list: the
+        # operator put a volume in each, which is a statement about where this
+        # model may run. Without one, blank keeps meaning "RunPod chooses".
+        return list(vol_map) if vol_map else [""]
+
+    def _with_volumes(self, regions: list, vol_map: dict) -> list:
+        """``regions`` that have a volume in ``vol_map``, order kept.
+
+        A region with no volume is dropped rather than rented without storage:
+        that pod would re-download every byte and boot minutes slower, which is
+        the cost the map exists to remove, and it would do it invisibly. Saying
+        which regions were dropped is the point of the message.
+        """
+        if not vol_map:
+            return regions
+        keep = [r for r in regions if r in vol_map]
+        drop = [r for r in regions if r not in vol_map]
+        if drop:
+            print(f"[runpod] {self.model_key!r}: no volume configured for "
+                  f"{', '.join(drop)} — not renting there (network_volumes has "
+                  f"{', '.join(sorted(vol_map))})", flush=True)
+        if not keep:
+            from codai.api.runpod_client import RunpodError
+            raise RunpodError(
+                f"RunPod: none of the allowed regions for {self.model_key!r} "
+                f"({', '.join(regions)}) has a volume in network_volumes "
+                f"({', '.join(sorted(vol_map))}). Add a volume in one of those "
+                f"regions, or widen data_centers to a region that has one.")
+        return keep
 
     def _data_center(self) -> str:
         """Which RunPod region this pool's pods go to.
@@ -3291,6 +3403,42 @@ class RunpodPodPool:
             out["gpu_types"] = list(self._client_gpu_types)
         if self._client_allow_other is not None:
             out["allow_other_gpus"] = bool(self._client_allow_other)
+        return out
+
+    def seed_region(self, dc: str) -> dict:
+        """Fill one region's volume by booting a pod there once, then dropping it.
+
+        No new pod shape: a normal pod for this model, pinned to ``dc``, with
+        that region's volume attached. Booting it IS the download — the weights
+        land on the volume because the volume is where the caches point — so
+        the only thing this adds is doing it deliberately, before a user's
+        request is waiting on it, and tearing the pod down afterwards.
+
+        Blocking, and minutes long. Every later pod in that region starts from
+        a warm volume instead of pulling the weights again.
+        """
+        dc = str(dc or "").strip().upper()
+        vmap = volume_map_for(self.mcfg, self.account)
+        vol = vmap.get(dc, "")
+        if not vol:
+            raise ValueError(
+                f"RunPod: no volume configured for {dc} in network_volumes "
+                f"({', '.join(sorted(vmap)) or 'empty'}) — there is nothing to "
+                f"seed there. Create the volume and add it to the map first.")
+        started = time.time()
+        before = set(p.pod_id for p in list(self.pods))
+        self._seed_dc = dc
+        try:
+            self._provision_one()
+        finally:
+            self._seed_dc = ""
+        fresh = [p for p in list(self.pods) if p.pod_id not in before]
+        out = {"region": dc, "volume_id": vol, "took_s": round(time.time() - started, 1),
+               "pods": [p.pod_id for p in fresh]}
+        for pod in fresh:
+            # The seed's product is on the volume, not in the pod. Keeping it
+            # would bill a card nobody asked to rent.
+            self._terminate(pod, f"volume seed for {dc} finished")
         return out
 
     def set_client_floor(self, pods: int, gpu_types=None,
@@ -3977,7 +4125,58 @@ def pools_schedule_status() -> list:
             # an unexpected card should have a visible cause too, not only a
             # bill.
             "client_gpu_narrow": pool.client_gpu_narrow(),
+            # Which regions this pool may use and the volume each one attaches:
+            # a slow region is only attributable if its storage is visible.
+            # getattr: a status report must never be the thing that raises.
+            "network_volumes": volume_map_for(getattr(pool, "mcfg", None),
+                                              getattr(pool, "account", None)),
         })
+    return out
+
+
+def seed_region_volumes(model: str, regions=None) -> dict:
+    """Pre-fill this model's regional volumes, one region at a time.
+
+    An empty volume costs the first pod in that region the whole download —
+    the cost the volume was added to remove. Seeding pays it once, on purpose,
+    instead of making a user's first request wait for it.
+
+    Sequential by design: N regions at once means N cards billing for the same
+    minutes, and the point of the operation is that nobody is waiting on it.
+    Blocking and minutes per region, so an HTTP caller should run it in the
+    background and read the result from the log.
+    """
+    key = str(model or "").strip()
+    if not key:
+        raise LookupError("no model named")
+    block = model_runpod_block(key)
+    if not block:
+        raise LookupError(f"{key!r} has no runpod block")
+    mcfg = parse_model_runpod(block)
+    if mcfg.is_serverless:
+        raise PermissionError(
+            f"{key!r} runs serverless — it has no volume of its own to seed")
+    vmap = volume_map_for(mcfg, _account_hint())
+    if not vmap:
+        raise LookupError(
+            f"{key!r} has no network_volumes map — a single network_volume_id "
+            "needs no seeding across regions, since it only has one")
+    want = [str(r).strip().upper() for r in (regions or list(vmap)) if str(r).strip()]
+    unknown = [r for r in want if r not in vmap]
+    if unknown:
+        raise ValueError(
+            f"no volume configured for {', '.join(unknown)} — network_volumes "
+            f"has {', '.join(sorted(vmap))}")
+    pool = get_model_pod_pool(key, _model_entry(key), block)
+    out = {"model": key, "regions": [], "failed": []}
+    for dc in want:
+        print(f"[runpod] seeding {key!r} onto the volume in {dc}", flush=True)
+        try:
+            out["regions"].append(pool.seed_region(dc))
+        except Exception as exc:
+            # One region's capacity miss must not cost the others their turn.
+            print(f"[runpod] seeding {dc} failed: {exc}", flush=True)
+            out["failed"].append({"region": dc, "error": str(exc)})
     return out
 
 
