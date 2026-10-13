@@ -251,44 +251,57 @@ def test_local_mode_gets_no_client_parallel():
 
 
 # ------------------------------------------------- the oversubscription note #
-def test_more_pages_than_the_fleet_can_serve_is_reported(capsys, monkeypatch):
-    """64 pages into 2 pods x 16 slots does not go faster — it queues, every
-    page's latency rises, and a client counting DOCUMENTS sees one opening
-    burst then silence."""
+def test_how_many_pods_this_many_pages_implies(capsys, monkeypatch):
+    """The useful number. 64 pages at 16 per pod is 4 pods — and a pod takes
+    ~12 minutes, so the first burst gets whatever is already warm, however
+    high max_pods is."""
     from codai.ocr import manager as m
-    monkeypatch.setattr(m, "_fleet_page_slots", lambda name: 32)
+    monkeypatch.setattr(m, "_fleet_shape", lambda name: (16, 64))
     m._warn_if_oversubscribed("surya", 64)
     out = capsys.readouterr().out
-    assert "64 pages at once" in out and "fleet serves 32" in out
+    assert "64 pages at once spreads over 4 pods" in out
+    assert "12 min" in out and "already warm" in out
 
 
-def test_a_fleet_that_can_take_it_says_nothing(capsys, monkeypatch):
+def test_more_pods_than_max_pods_is_called_out(capsys, monkeypatch):
+    """Here the surplus genuinely cannot be served: it queues until a pod frees
+    up, and no amount of waiting grows the fleet past max_pods."""
     from codai.ocr import manager as m
-    monkeypatch.setattr(m, "_fleet_page_slots", lambda name: 64)
+    monkeypatch.setattr(m, "_fleet_shape", lambda name: (16, 2))
     m._warn_if_oversubscribed("surya", 64)
+    out = capsys.readouterr().out
+    assert "needs 4 pods" in out and "max_pods is 2" in out and "32 will be served" in out
+
+
+def test_one_pod_is_worth_no_remark(capsys, monkeypatch):
+    """8 pages at 16 per pod fits one pod. Saying so would be noise."""
+    from codai.ocr import manager as m
+    monkeypatch.setattr(m, "_fleet_shape", lambda name: (16, 64))
+    m._warn_if_oversubscribed("surya", 8)
     assert capsys.readouterr().out == ""
 
 
 def test_an_unknown_fleet_says_nothing(capsys, monkeypatch):
     """No RunPod config, a local engine, a lookup that failed — none of those
-    are oversubscription, and guessing would cry wolf on every build."""
+    are a fleet, and guessing would cry wolf on every build."""
     from codai.ocr import manager as m
-    monkeypatch.setattr(m, "_fleet_page_slots", lambda name: None)
+    monkeypatch.setattr(m, "_fleet_shape", lambda name: None)
     m._warn_if_oversubscribed("surya", 9999)
     assert capsys.readouterr().out == ""
 
 
-def test_the_slot_estimate_reads_the_models_own_runpod_block(monkeypatch):
+def test_the_estimate_reads_the_models_own_runpod_block(monkeypatch):
+    """Per-pod concurrency is one knob per model, not an OCR setting."""
     from codai.ocr import manager as m
     import codai.models.manager as mm
     monkeypatch.setattr(mm, "_model_entry_for",
                         lambda name: {"runpod": {"mode": "pods", "max_pods": 4,
                                                  "scale_up_inflight_per_pod": 16}},
                         raising=False)
-    assert m._fleet_page_slots("surya") == 64
+    assert m._fleet_shape("surya") == (16, 4)
 
 
-def test_a_serverless_model_has_no_pod_slots(monkeypatch):
+def test_a_serverless_model_has_no_pod_shape(monkeypatch):
     """The arithmetic is about pods; serverless scales on its own terms."""
     from codai.ocr import manager as m
     import codai.models.manager as mm
@@ -297,4 +310,4 @@ def test_a_serverless_model_has_no_pod_slots(monkeypatch):
                                                  "max_pods": 4,
                                                  "scale_up_inflight_per_pod": 16}},
                         raising=False)
-    assert m._fleet_page_slots("surya") is None
+    assert m._fleet_shape("surya") is None

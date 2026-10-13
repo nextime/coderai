@@ -276,13 +276,11 @@ def _engine_instances(cfg, name: str) -> int:
     return want
 
 
-def _fleet_page_slots(name: str):
-    """How many pages the remote fleet can actually have in flight, or None.
+def _fleet_shape(name: str):
+    """``(inflight_per_pod, max_pods)`` for the model this engine reads from.
 
-    ``max_pods x scale_up_inflight_per_pod``. Not a limit we impose — the pool
-    queues the excess perfectly correctly — but a number worth comparing with
-    ours, because pages beyond it do not go faster, they only wait, and a pod
-    takes ~12 minutes to appear so the fleet cannot grow into a burst.
+    Taken from the model's own ``runpod`` block, which is where per-pod
+    concurrency lives — one knob per model, not an OCR setting.
     """
     try:
         from codai.models.manager import _model_entry_for
@@ -298,42 +296,53 @@ def _fleet_page_slots(name: str):
             mcfg = parse_model_runpod(block)
             if (mcfg.mode or "").lower() != "pods":
                 continue
-            pods = max(1, int(getattr(mcfg, "max_pods", 1) or 1))
             per = int(getattr(mcfg, "scale_up_inflight_per_pod", 0) or 0)
             if per <= 0:
                 per = int(getattr(mcfg, "max_inflight_per_pod", 0) or 0)
             if per > 0:
-                return pods * per
+                return per, max(1, int(getattr(mcfg, "max_pods", 1) or 1))
         except Exception:
             continue
     return None
 
 
-#: The served model names an engine may be reading from, for the slot estimate.
+#: The served model names an engine may be reading from, for the fleet estimate.
 _SERVED_NAMES = {"surya": ("datalab-to/surya-ocr-2", "surya-ocr-2"),
                  "chandra": ("datalab-to/chandra-ocr-2", "chandra-ocr-2"),
                  "olmocr": ("allenai/olmOCR-2-7B-1025-FP8", "olmocr")}
 
+#: Measured on the Digesta orchestrator: ~7 min image pull + ~5 min warm-up.
+_POD_READY_MINUTES = 12
+
 
 def _warn_if_oversubscribed(name: str, pages: int) -> None:
-    """Say so when we fan out more pages than the fleet can serve at once.
+    """Say how many pods this many pages implies, at the moment they are set up.
 
-    Oversubscription does not lose work and it does not go faster: the surplus
-    waits in the gateway, every page's latency rises by the queue, and because a
-    client usually counts finished DOCUMENTS, spreading N pages over many
-    documents at once means they all advance and none completes until near the
-    end. That reads from outside as "one opening burst, then silence" — which is
-    exactly how the 2026-10-13 batch was reported, while the pod sat at 18
-    concurrent requests, `Waiting: 0` and 5-7% KV cache the entire time.
+    Not a limit — the pool queues the surplus perfectly correctly. But pages
+    beyond what the READY pods can hold do not go faster, they only wait, and
+    because a pod takes ~12 minutes to appear the fleet cannot be scaled into a
+    burst: the first burst is served by whatever is already warm, however high
+    ``max_pods`` is. That matters most to a client counting finished DOCUMENTS,
+    which completes none of them until one document's LAST page lands — so 64
+    pages spread over sixteen documents reads from outside as a stall while
+    every pod is busy. Exactly how the 2026-10-13 batch was reported, with the
+    pod at 18 concurrent requests, ``Waiting: 0`` and 5-7% KV cache throughout.
     """
-    slots = _fleet_page_slots(name)
-    if not slots or pages <= slots:
+    shape = _fleet_shape(name)
+    if not shape:
         return
-    print(f"[ocr] engine {name!r}: {pages} pages at once, but the fleet serves "
-          f"{slots} (max_pods x scale_up_inflight_per_pod). The surplus waits in "
-          f"the gateway — it does not go faster, and a pod takes ~12 min to "
-          f"appear, so a burst cannot be scaled into. Lower instances/lanes, or "
-          f"raise the pod's inflight ceiling.", flush=True)
+    per, max_pods = shape
+    need = (pages + per - 1) // per
+    tail = (f"a pod takes ~{_POD_READY_MINUTES} min to become ready, so the "
+            f"first burst is served by whatever is already warm")
+    if need > max_pods:
+        print(f"[ocr] engine {name!r}: {pages} pages at once needs {need} pods at "
+              f"{per} in flight each, but max_pods is {max_pods} — "
+              f"{max_pods * per} will be served and the rest will queue. "
+              f"Lower instances/lanes, or raise max_pods.", flush=True)
+    elif need > 1:
+        print(f"[ocr] engine {name!r}: {pages} pages at once spreads over {need} "
+              f"pods ({per} in flight each); {tail}.", flush=True)
 
 
 def _engine_lanes(eng) -> int:

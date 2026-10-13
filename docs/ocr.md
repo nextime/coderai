@@ -1033,15 +1033,25 @@ pool queues pages beyond `max_pods x scale_up_inflight_per_pod` and serves them
 perfectly correctly, but every page's latency rises by the queue — and a client
 that counts finished DOCUMENTS sees nothing at all until the first document's
 LAST page lands. Spread 64 pages over sixteen documents and all sixteen advance
-while none completes. That reads exactly like a stall. The pool logs the
-mismatch at build time:
+while none completes. That reads exactly like a stall. The pool therefore says, when the
+pages are set up, how many pods they imply:
 
 ```
-[ocr] engine 'surya': 64 pages at once, but the fleet serves 32
-      (max_pods x scale_up_inflight_per_pod). The surplus waits in the gateway —
-      it does not go faster, and a pod takes ~12 min to appear, so a burst
-      cannot be scaled into.
+[ocr] engine 'surya': 64 pages at once spreads over 4 pods (16 in flight each);
+      a pod takes ~12 min to become ready, so the first burst is served by
+      whatever is already warm.
 ```
+
+and, when the arithmetic exceeds `max_pods`, that the surplus simply queues:
+
+```
+[ocr] engine 'surya': 64 pages at once needs 4 pods at 16 in flight each, but
+      max_pods is 2 — 32 will be served and the rest will queue.
+```
+
+A high `max_pods` does not help a burst: it is the pods already **warm** that
+serve it, because the twelve minutes are spent before the first of the new ones
+answers anything.
 
 **The defect: 2,644 generated tokens for a page whose text is ~400.** Surya
 re-runs a page whose generation repeated itself — `_should_retry` in
