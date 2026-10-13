@@ -28,6 +28,7 @@ bounds the whole subsystem.
 """
 
 import asyncio
+import os
 import threading
 import time
 from typing import Dict, List, Optional
@@ -205,12 +206,74 @@ def _engine_enabled(cfg, name: str) -> bool:
     return False
 
 
+#: Engines that spawn ONE OS PROCESS per instance, in their own venv. For these
+#: ``*_instances`` is not a concurrency slot count — it is a process count, and
+#: each process costs ~600 MB of RSS and a core's worth of page rendering. The
+#: in-process engines (chandra, olmOCR) cost a slot and nothing more.
+_PROCESS_PER_INSTANCE = ("surya", "paddle", "doctr")
+
+#: Measured RSS of one idle surya worker on Aruba, 2026-10-12: 586-677 MB across
+#: 64 of them. Rounded up for headroom, because the figure that matters is the
+#: one *after* a page has been rendered in it.
+_WORKER_RSS_GB = 0.8
+
+
+def _host_instance_ceiling(name: str) -> int:
+    """How many worker PROCESSES this host can actually run for one engine.
+
+    `surya_instances: 64` was set on Aruba as though it were the GPU-side
+    concurrency (it reads like it), and on 2026-10-12 it did exactly what it
+    says: 64 worker processes, 37 GB of RSS, swap exhausted, load 25 on 16
+    cores — on a box that also runs ~30 other containers. A batch then behaved
+    precisely as the operator reported: one perfect 19-second burst, then no
+    completions at all for nine minutes while the rented A40 sat at 2% KV-cache
+    usage with `Waiting: 0`. The GPU was never the bottleneck; the host was.
+
+    GPU-side concurrency is `runpod.scale_up_inflight_per_pod` and
+    `runpod.max_pods`. This number is a local process pool and has to be bounded
+    by local resources, so it is: one worker per core, and never more than half
+    of free RAM. `CODERAI_OCR_INSTANCE_CEILING` overrides it for an operator who
+    has measured their own host.
+    """
+    forced = (os.environ.get("CODERAI_OCR_INSTANCE_CEILING") or "").strip()
+    if forced:
+        try:
+            return max(1, int(forced))
+        except ValueError:
+            pass
+    if name not in _PROCESS_PER_INSTANCE:
+        return 0                      # in-process: a slot, not a process
+    try:
+        by_cpu = max(1, os.cpu_count() or 4)
+    except Exception:
+        by_cpu = 4
+    by_ram = by_cpu
+    try:
+        # Free RAM, not total: the rest of the host is someone else's working set.
+        with open("/proc/meminfo") as fh:
+            avail_kb = next(int(l.split()[1]) for l in fh
+                            if l.startswith("MemAvailable:"))
+        by_ram = max(1, int((avail_kb / 1048576.0) * 0.5 / _WORKER_RSS_GB))
+    except Exception:
+        pass
+    return max(1, min(by_cpu, by_ram))
+
+
 def _engine_instances(cfg, name: str) -> int:
     n = getattr(cfg, f"{name}_instances", 1)
     try:
-        return max(1, int(n))
+        want = max(1, int(n))
     except Exception:
-        return 1
+        want = 1
+    ceiling = _host_instance_ceiling(name)
+    if ceiling and want > ceiling:
+        print(f"[ocr] engine {name!r}: {want} instances asked for, running "
+              f"{ceiling} — each one is a worker PROCESS (~{_WORKER_RSS_GB} GB) "
+              f"and this host has {os.cpu_count()} cores. GPU-side concurrency "
+              f"is runpod.scale_up_inflight_per_pod / max_pods; raise "
+              f"CODERAI_OCR_INSTANCE_CEILING to override.", flush=True)
+        return ceiling
+    return want
 
 
 def _evict_for_ocr(needed_gb: float) -> None:

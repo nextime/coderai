@@ -223,14 +223,44 @@ class SuryaEngine(SubprocessOcrEngine):
     # ------------------------------------------------------------------ leases
 
     def _endpoint_alive(self) -> bool:
-        """Whether the server this worker was pinned to still answers /health."""
+        """Whether the address this worker was pinned to is still OURS to use.
+
+        A `False` here is expensive: the caller kills this worker process and
+        spawns a replacement, which costs ~600 MB and several seconds of torch
+        import. So only a definite answer may return False.
+
+        In `model` mode the address is always coderai's own OCR gateway, never a
+        pod directly — the gateway is what holds the pool and drops a reaped pod.
+        It answers 404 "unknown OCR engine lease" when the lease really is gone
+        (the front restarted), and that is the one case re-resolving fixes. A 503
+        means no upstream *right now*; the lease is fine.
+
+        A probe that times out is not an answer at all, and it used to return
+        False. On 2026-10-12, with 64 of these workers on a 16-core host, the
+        5-second probe began timing out under the load the workers themselves
+        were creating — so coderai killed and respawned them, which added load,
+        which timed out more probes. The batch stalled for nine minutes with the
+        GPU idle. Respawning cannot fix a front that is down (the replacement
+        asks the same front for a lease), so a timeout now means "busy, keep
+        working" and the page's real error is reported as it stands.
+        """
         import requests
         from codai.ocr.served_model import health_url
-        try:
-            r = requests.get(health_url(self._server_url) + "/health", timeout=5)
-            return r.status_code == 200
-        except Exception:
-            return False
+        url = health_url(self._server_url) + "/health"
+        last = None
+        for timeout in (10, 20):
+            try:
+                r = requests.get(url, timeout=timeout)
+            except Exception as exc:
+                last = exc
+                continue
+            if r.status_code == 404:
+                return False              # the lease is genuinely gone
+            return True                   # 200, or 503 "no upstream yet"
+        print(f"[ocr] surya: {url} did not answer the health probe "
+              f"({type(last).__name__ if last else 'timeout'}) — treating it as "
+              f"busy, not gone; the worker stays up", flush=True)
+        return True
 
     def recognize_image(self, image):
         """One page, re-resolving the endpoint if the lease expired underneath us.

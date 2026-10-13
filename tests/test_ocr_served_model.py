@@ -511,3 +511,128 @@ def test_runpod_wins_over_a_node_that_also_lists_it(monkeypatch):
     assert (lease.base, lease.api_key) == ("https://pod/v1", "podtok")
     assert pool_taken == [1]
     lease.release()
+
+
+# ------------------- a busy gateway is not a vanished one, and 64 is not 64 #
+# On 2026-10-12 a batch of documents produced one perfect 19-second burst and
+# then no completions for nine minutes, while the rented A40 sat at 2% KV-cache
+# usage with `Waiting: 0`. Two mistakes compounded, both local to the host:
+#
+#   * `surya_instances: 64` reads like GPU concurrency but is a count of worker
+#     PROCESSES: 64 of them, 37 GB of RSS, swap exhausted, load 25 on 16 cores;
+#   * the 5s `/health` probe then began timing out under the load those workers
+#     were creating, and a timed-out probe counted as "the endpoint is gone", so
+#     coderai killed and respawned each worker — adding load, timing out more
+#     probes. The GPU was never the bottleneck.
+def _probe_engine(monkeypatch, replies):
+    """A surya engine whose health probe gets ``replies`` (status or exception)."""
+    import requests
+    from codai.ocr.surya import SuryaEngine
+
+    eng = SuryaEngine.__new__(SuryaEngine)
+    eng._server_url = "http://127.0.0.1:8780/v1/ocr/attach/tok/v1"
+    seen = []
+
+    def _get(url, timeout=None):
+        seen.append(timeout)
+        got = replies[min(len(seen) - 1, len(replies) - 1)]
+        if isinstance(got, Exception):
+            raise got
+
+        class _R:
+            status_code = got
+        return _R()
+
+    monkeypatch.setattr(requests, "get", _get)
+    return eng, seen
+
+
+def test_a_timed_out_health_probe_keeps_the_worker(monkeypatch):
+    """Respawning cannot fix a front that is down — the replacement asks the same
+    front for a lease. So a probe that never answered must not cost a process."""
+    import requests
+    eng, seen = _probe_engine(monkeypatch, [requests.Timeout("too busy")])
+    assert eng._endpoint_alive() is True          # "busy, keep working"
+    assert len(seen) == 2                         # retried, with a longer budget
+    assert seen[1] > seen[0]
+
+
+def test_only_an_unknown_lease_means_the_endpoint_is_gone(monkeypatch):
+    """404 is the one answer re-resolving fixes: the front restarted and does not
+    know this lease any more."""
+    eng, _ = _probe_engine(monkeypatch, [404])
+    assert eng._endpoint_alive() is False
+
+
+def test_no_upstream_yet_is_not_a_dead_lease(monkeypatch):
+    """503 means the pool has nothing rented this second. The lease is fine, and
+    killing the worker would not rent anything."""
+    eng, _ = _probe_engine(monkeypatch, [503])
+    assert eng._endpoint_alive() is True
+
+
+def test_a_healthy_gateway_answers_once(monkeypatch):
+    eng, seen = _probe_engine(monkeypatch, [200])
+    assert eng._endpoint_alive() is True
+    assert len(seen) == 1                         # no retry needed
+
+
+def test_a_slow_probe_that_recovers_is_not_a_death(monkeypatch):
+    import requests
+    eng, seen = _probe_engine(monkeypatch, [requests.Timeout("busy"), 200])
+    assert eng._endpoint_alive() is True
+    assert len(seen) == 2
+
+
+def test_the_worker_pool_is_bounded_by_the_host_not_the_config(monkeypatch):
+    """`surya_instances` is a process count. 64 of them is 37 GB and 64 cores'
+    worth of rendering, whatever the operator meant by the number."""
+    from codai.ocr import manager
+
+    monkeypatch.delenv("CODERAI_OCR_INSTANCE_CEILING", raising=False)
+    monkeypatch.setattr(manager.os, "cpu_count", lambda: 16)
+
+    class _Cfg:
+        surya_instances = 64
+        chandra_instances = 128
+
+    got = manager._engine_instances(_Cfg(), "surya")
+    assert 1 <= got <= 16
+    assert got < 64
+
+
+def test_an_in_process_engine_is_not_clamped(monkeypatch):
+    """chandra and olmOCR cost a concurrency slot, not a process: 128 is fine."""
+    from codai.ocr import manager
+
+    monkeypatch.delenv("CODERAI_OCR_INSTANCE_CEILING", raising=False)
+
+    class _Cfg:
+        chandra_instances = 128
+
+    assert manager._engine_instances(_Cfg(), "chandra") == 128
+
+
+def test_an_operator_who_has_measured_can_override(monkeypatch):
+    from codai.ocr import manager
+
+    monkeypatch.setenv("CODERAI_OCR_INSTANCE_CEILING", "40")
+
+    class _Cfg:
+        surya_instances = 64
+
+    assert manager._engine_instances(_Cfg(), "surya") == 40
+
+
+def test_the_ceiling_never_goes_below_one(monkeypatch):
+    """A busy host must still be able to read a page."""
+    from codai.ocr import manager
+
+    monkeypatch.delenv("CODERAI_OCR_INSTANCE_CEILING", raising=False)
+    monkeypatch.setattr(manager.os, "cpu_count", lambda: 0)
+    assert manager._host_instance_ceiling("surya") >= 1
+
+    class _Cfg:
+        surya_instances = 8
+
+    assert manager._engine_instances(_Cfg(), "surya") >= 1

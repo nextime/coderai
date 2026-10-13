@@ -968,6 +968,46 @@ The address is a lease: a secret minted per attachment, carried in the URL (the
 engine's `/health` and `/v1/models` probes send no headers, so it cannot be a
 bearer alone) and valid for nothing but that one gateway path.
 
+#### `*_instances` is a local worker count, not GPU concurrency
+
+The two numbers look interchangeable on the OCR card and are not:
+
+| setting | what it bounds | where it costs |
+|---|---|---|
+| `runpod.scale_up_inflight_per_pod`, `runpod.max_pods` | concurrent pages **per rented GPU**, and how many GPUs | the pod |
+| `ocr.surya_instances` (also `paddle`, `doctr`) | **worker processes on this machine** | ~600 MB RSS and a core's rendering, each |
+| `ocr.chandra_instances`, `ocr.olmocr_instances` | concurrency slots, in-process | a slot |
+
+Only surya, paddle and docTR spawn a process per instance — they run in their own
+venv, driven over a pipe. `surya_instances: 64` was set on Aruba as though it were
+the GPU-side figure, and on 2026-10-12 it did exactly what it says: **64 worker
+processes, 37 GB of RSS, swap exhausted, load 25 on 16 cores**, on a host also
+running some thirty other containers. A batch then behaved as the operator
+reported — one flawless 19-second burst of 22 documents, then **no completions at
+all for nine minutes** — while the rented A40 sat at 2% KV-cache usage with
+`Waiting: 0`. The GPU was never the bottleneck. The host was.
+
+It got worse on its own, because the workers' `/health` probe (5s) started timing
+out under the load the workers themselves were creating, and a timed-out probe
+counted as *"the endpoint is gone"*: coderai killed each worker and spawned a
+replacement, which added load, which timed out more probes.
+
+Both halves are now bounded:
+
+* the process-per-instance engines are capped at **one worker per core, and never
+  more than half of free RAM**, with a log line naming the figure it is running
+  and why (`CODERAI_OCR_INSTANCE_CEILING` overrides it for an operator who has
+  measured their own host);
+* a health probe only means *gone* on a definite **404 "unknown OCR engine
+  lease"** — which is the real case it was written for, a front that restarted. A
+  timeout means busy, and the worker stays up: respawning cannot fix a front that
+  is down, since the replacement asks that same front for its lease. A 503 means
+  the pool has nothing rented this second, which the lease does not care about.
+
+To raise OCR throughput, raise the pod-side numbers, not these. The local worker
+pool is a hard ceiling on how many pods surya can keep fed at all — which is the
+standing argument for running it in-process, as chandra and olmOCR already do.
+
 ```bash
 curl -F file=@sentenza.pdf -F structured=true -F detect=both -F schema=italian_sentenza \
      http://localhost:8776/v1/ocr
