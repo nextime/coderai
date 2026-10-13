@@ -60,7 +60,6 @@ def _ocr_config():
     return None
 
 
-@router.post("/v1/ocr", summary="OCR an image or PDF with a dedicated OCR engine")
 def _page_opts(max_tokens, max_continuations) -> dict:
     """Per-request engine overrides, or {} when the caller said nothing.
 
@@ -77,6 +76,7 @@ def _page_opts(max_tokens, max_continuations) -> dict:
     return out
 
 
+@router.post("/v1/ocr", summary="OCR an image or PDF with a dedicated OCR engine")
 async def create_ocr(
     file: UploadFile = File(...),
     engine: Optional[str] = Form(None),        # paddle|doctr|surya|olmocr|chandra (default from config)
@@ -127,9 +127,17 @@ async def create_ocr_batch(
     structured: Optional[bool] = Form(False),
     schema_: Optional[str] = Form(None, alias="schema"),
     detect: Optional[str] = Form(None),
+    max_tokens: Optional[int] = Form(None),
+    max_continuations: Optional[int] = Form(None),
 ):
     """Fan a batch of documents across the engine's instance pool. Per-file failures are
-    reported inline (not fatal) so one bad scan doesn't sink the batch."""
+    reported inline (not fatal) so one bad scan doesn't sink the batch.
+
+    Takes the same per-request budgets as ``/v1/ocr``, and must: a batch is how
+    a caller sends real work, so a budget this endpoint did not accept was a
+    budget that never applied to anything that mattered. FastAPI drops an
+    unknown form field silently, so a caller could set ``max_tokens`` on every
+    batch for a week and never be told it did nothing."""
     cfg = _ocr_config()
     if cfg is None:
         raise HTTPException(status_code=503, detail="OCR subsystem is not available")
@@ -149,6 +157,7 @@ async def create_ocr_batch(
             res = await ocr_manager.ocr_document(
                 data, filename=name, content_type=ctype, engine=engine, dpi=dpi,
                 detect=detect, structured=bool(structured), schema=schema_, lang=lang,
+                page_opts=_page_opts(max_tokens, max_continuations),
             )
             res["filename"] = name
             return res
