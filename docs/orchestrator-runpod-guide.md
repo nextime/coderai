@@ -774,6 +774,57 @@ curl -fsS -X POST http://127.0.0.1:8776/v1/runpod/scale \
  "max_pods": 3, "expires_in_s": 1800, "clamped": false}
 ```
 
+#### Choosing the card for one lease
+
+A pool configured with a preference and `allow_other_gpus: true` will take
+another card when the preferred one is not free — which is usually what you
+want, and occasionally exactly what you do not. A caller measuring throughput
+knows something the operator cannot: that a number taken on a different card is
+not comparable with yesterday's, and that waiting for the right card beats
+paying a fallback's price for a result it cannot use.
+
+So a lease may say which cards it accepts:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8776/v1/runpod/scale \
+     -H "Authorization: Bearer sk-coderai-…" -H "Content-Type: application/json" \
+     -d '{"model": "qwen38-awq", "pods": 1,
+          "gpu_types": ["NVIDIA A40"], "allow_other_gpus": false}'
+```
+
+```json
+{"model": "qwen38-awq", "requested": 1, "granted": 1, "max_pods": 3,
+ "expires_in_s": 1800, "clamped": false,
+ "gpu_types": ["NVIDIA A40"], "allow_other_gpus": false}
+```
+
+The rule is one-directional: **a request may narrow the operator's choice, never
+widen it.**
+
+| asked | result |
+|---|---|
+| a card in the model's `gpu_types` | honoured, in the order the caller listed |
+| a card the model does **not** list | dropped, and named in `notes` |
+| only cards the model forbids | **400**, naming what is allowed — never a silent fall back to the default |
+| `allow_other_gpus: false` | honoured: this lease waits rather than falling back |
+| `allow_other_gpus: true` where the model says false | ignored, and said so in `notes` |
+| `max_hourly_usd`, `min_vram_gb`, `cloud_types`, `max_pods` | not reachable from a request at all |
+
+Two properties worth knowing:
+
+- **It dies with the lease.** The narrowing is held on the lease, not the pool,
+  so an "A40 only" cannot outlive the thirty minutes it asked for, and the pool
+  returns to your preference by itself. There is deliberately **no way for a
+  request to change a model's configuration** — that stays yours.
+- **A dropped constraint is reported, never silent.** Otherwise a caller reads
+  its numbers as having come from the card it asked for. `/v1/runpod/status`
+  shows any narrowing in force as `client_gpu_narrow`, so a pod on an unexpected
+  card has a visible cause and not only a bill.
+
+It is per model, like every other pod setting: the gate is the same
+`allow_client_scale`, and the bounds are that model's own `gpu_types`,
+`allow_other_gpus` and cost ceiling.
+
 It is a **lease**, bounded three ways, because a client that can raise the floor
 can raise the bill:
 

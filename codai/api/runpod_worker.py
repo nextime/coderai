@@ -1870,7 +1870,80 @@ def _pod_health_ok(url: str, timeout: float = 4.0, path: str = "/v1/models",
         return False
 
 
-def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
+def narrow_gpu_choice(mcfg: "RunpodModelConfig", gpu_types=None,
+                      allow_other_gpus=None) -> dict:
+    """Apply a caller's GPU constraints to the operator's, and report the result.
+
+    Returns ``{"gpu_types": [...], "allow_other_gpus": bool, "notes": [...]}``.
+
+    The rule is one-directional and deliberately so: **a caller may narrow the
+    operator's choices, never widen them.** Picking the card is normally the
+    operator's business -- they set the preference, the cost ceiling and the VRAM
+    floor -- but a caller legitimately knows things the operator cannot: that
+    this batch must be comparable with yesterday's numbers, that a measurement is
+    worthless on a different card, that it would rather wait than pay a
+    fallback's price. Letting it say so costs nothing. Letting it widen would
+    hand it the operator's budget.
+
+    So:
+
+    * a requested card that the operator did not list is DROPPED, not honoured,
+      and said so in `notes`;
+    * `allow_other_gpus` may be turned OFF by a caller, never ON;
+    * `max_hourly_usd`, `min_vram_gb`, `cloud_types` and `max_pods` are the
+      operator's alone and are not reachable from here at all.
+
+    Narrowing to nothing is refused rather than silently ignored: a caller asking
+    only for cards the operator forbids has made a mistake worth hearing about,
+    and dropping to "anything" would be the opposite of what it asked.
+    """
+    configured = [str(g).strip() for g in (getattr(mcfg, "gpu_types", None) or [])
+                  if str(g).strip()]
+    allow_other = bool(getattr(mcfg, "allow_other_gpus", False))
+    notes = []
+
+    want = gpu_types
+    if isinstance(want, str):
+        want = [w.strip() for w in want.split(",") if w.strip()]
+    want = [str(w).strip() for w in (want or []) if str(w).strip()]
+
+    out_types = list(configured)
+    if want:
+        if configured:
+            # Case-insensitively, keep the caller's order: it is a preference
+            # order, and the caller's ranking is the point of asking.
+            lower = {c.lower(): c for c in configured}
+            kept, dropped = [], []
+            for w in want:
+                hit = lower.get(w.lower())
+                (kept.append(hit) if hit else dropped.append(w))
+            if dropped:
+                notes.append(
+                    f"ignored {dropped}: not in the operator's gpu_types "
+                    f"{configured}")
+            if not kept:
+                raise ValueError(
+                    f"none of the requested GPUs {want} is allowed here; this "
+                    f"model's gpu_types is {configured}")
+            out_types = kept
+        else:
+            # No operator preference means "any card within the limits", so a
+            # caller naming one is strictly more restrictive.
+            out_types = want
+
+    out_allow = allow_other
+    if allow_other_gpus is not None:
+        if bool(allow_other_gpus):
+            if not allow_other:
+                notes.append(
+                    "ignored allow_other_gpus=true: the operator set it false, "
+                    "and a request may only narrow the choice")
+        else:
+            out_allow = False
+    return {"gpu_types": out_types, "allow_other_gpus": out_allow, "notes": notes}
+
+
+def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg, narrow=None) -> list:
     """Ranked list of GPU options across the model's allowed pools per its selection
     criteria (best first). Each item: {gpu_type_id, display_name, memory_gb,
     cloud_type, price, is_spot, bid}. Raises RunpodError if nothing fits the
@@ -1894,6 +1967,14 @@ def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
                   if str(getattr(account_cfg, "default_gpu_type", "") or "").strip()
                   else []))
     allow_other = bool(getattr(mcfg, "allow_other_gpus", False))
+    # A caller's narrowed choice, if one is in force (see `narrow_gpu_choice`).
+    # Applied here rather than on the config, so it cannot outlive the lease that
+    # asked for it or leak into another caller's provisioning.
+    if narrow:
+        if narrow.get("gpu_types"):
+            prefer = list(narrow["gpu_types"])
+        if narrow.get("allow_other_gpus") is not None:
+            allow_other = bool(narrow["allow_other_gpus"])
 
     cands = []   # (pref_rank, price, is_spot, cloud_type, gpu, on_demand_price)
     for g in catalog:
@@ -2241,6 +2322,11 @@ class RunpodPodPool:
         self._client_floor = 0
         self._client_floor_until = 0.0
         self._client_floor_logged = -1
+        #: GPU constraints a client attached to its lease. They expire with it.
+        #: Only ever NARROWER than the operator's own settings -- see
+        #: `narrow_gpu_choice`.
+        self._client_gpu_types: list = []
+        self._client_allow_other = None
         #: Pods THIS process is provisioning right now. A count, not a flag: it
         #: used to be a boolean, and because a pod takes minutes to boot, the
         #: pool could grow by at most one pod per boot however much work was
@@ -2741,7 +2827,10 @@ class RunpodPodPool:
         Retries on a different machine when a pod is accepted but never boots."""
         from codai.api.runpod_client import RunpodClient, RunpodError, pod_console_url
         client = RunpodClient(self.account)
-        ranked = _rank_gpus(client, self.mcfg, self.account)
+        # The caller's narrowing, if a lease is in force. Read per provision so
+        # a lapsed lease stops constraining the very next pod.
+        ranked = _rank_gpus(client, self.mcfg, self.account,
+                            narrow=self.client_gpu_narrow())
         # Each (card, region) pair is its own candidate, so the existing
         # capacity fallback walks regions too: no A40 in the first EU region
         # falls through to the next instead of failing the request.
@@ -3187,7 +3276,25 @@ class RunpodPodPool:
             return 0
         return min(self._client_floor, max(1, self.mcfg.max_pods))
 
-    def set_client_floor(self, pods: int) -> dict:
+    def client_gpu_narrow(self) -> dict:
+        """The GPU narrowing in force right now, or {} once the lease lapses.
+
+        Tied to the lease rather than to the pool, so a caller's "A40 only"
+        cannot outlive the 30 minutes it asked for, and the pool goes back to the
+        operator's own preference by itself. Nothing persists it: there is
+        deliberately no way for a request to change the model's configuration.
+        """
+        if self.client_floor() <= 0:
+            return {}
+        out = {}
+        if self._client_gpu_types:
+            out["gpu_types"] = list(self._client_gpu_types)
+        if self._client_allow_other is not None:
+            out["allow_other_gpus"] = bool(self._client_allow_other)
+        return out
+
+    def set_client_floor(self, pods: int, gpu_types=None,
+                         allow_other_gpus=None) -> dict:
         """Lease (or release, with 0) a client-requested warm floor.
 
         Clamped to max_pods: the configured ceiling is the budget, and a client
@@ -3202,15 +3309,43 @@ class RunpodPodPool:
             # its mind, and retiring what it just asked for would be absurd.
             self._release_pending = False
         ttl = max(60, int(getattr(self.mcfg, "client_scale_ttl_s", 1800) or 1800))
+        # Raises ValueError when the caller narrowed to nothing it is allowed to
+        # have; the endpoint turns that into a 400 that names the allowed set.
+        narrow = narrow_gpu_choice(self.mcfg, gpu_types, allow_other_gpus)
         with self._cv:
             self._client_floor = granted
             self._client_floor_until = (time.time() + ttl) if granted else 0.0
             self._client_floor_logged = -1
+            if granted:
+                self._client_gpu_types = (list(narrow["gpu_types"])
+                                          if gpu_types else [])
+                self._client_allow_other = (narrow["allow_other_gpus"]
+                                            if allow_other_gpus is not None
+                                            else None)
+            else:
+                # Releasing the lease releases its constraints too, or an
+                # "A40 only" would quietly outlive the request that wanted it.
+                self._client_gpu_types = []
+                self._client_allow_other = None
         print(f"[runpod] {self.model_key!r}: client asked for {want} warm pod(s), "
               f"granted {granted} (max_pods {cap}) for {ttl}s", flush=True)
-        return {"model": self.model_key, "requested": want, "granted": granted,
-                "max_pods": cap, "expires_in_s": ttl if granted else 0,
-                "clamped": want > cap}
+        if granted and (gpu_types or allow_other_gpus is not None):
+            print(f"[runpod] {self.model_key!r}: this lease asks for "
+                  f"{narrow['gpu_types'] or 'any card'}"
+                  f"{'' if narrow['allow_other_gpus'] else ' and nothing else'}"
+                  + ("".join(f"; {n}" for n in narrow["notes"])), flush=True)
+        out = {"model": self.model_key, "requested": want, "granted": granted,
+               "max_pods": cap, "expires_in_s": ttl if granted else 0,
+               "clamped": want > cap}
+        if granted and (gpu_types or allow_other_gpus is not None):
+            # Reported back, because a constraint that was silently dropped is
+            # worse than one refused: the caller would read the numbers as
+            # having come from the card it asked for.
+            out["gpu_types"] = narrow["gpu_types"]
+            out["allow_other_gpus"] = narrow["allow_other_gpus"]
+            if narrow["notes"]:
+                out["notes"] = narrow["notes"]
+        return out
 
     def effective_min_pods(self) -> int:
         """The warm floor that applies right now.
@@ -3838,11 +3973,16 @@ def pools_schedule_status() -> list:
             "client_pods": pool.client_floor(),
             "client_lease_expires_in_s": max(
                 0, int(pool._client_floor_until - time.time())) if pool.client_floor() else 0,
+            # What the lease narrowed the card choice to, if anything: a pod on
+            # an unexpected card should have a visible cause too, not only a
+            # bill.
+            "client_gpu_narrow": pool.client_gpu_narrow(),
         })
     return out
 
 
-def set_client_pods(model: str, pods: int, teardown: bool = False) -> dict:
+def set_client_pods(model: str, pods: int, teardown: bool = False,
+                    gpu_types=None, allow_other_gpus=None) -> dict:
     """Lease a warm floor for one model on a client's behalf.
 
     Raises LookupError when the model has no RunPod block, and PermissionError
@@ -3853,6 +3993,15 @@ def set_client_pods(model: str, pods: int, teardown: bool = False) -> dict:
     scale-down window: the client that just finished a batch knows the work has
     stopped, which the autoscaler can only infer slowly. It cannot go below the
     operator's warm floor, and it drains rather than dropping work.
+
+    ``gpu_types`` and ``allow_other_gpus`` constrain the cards this lease will
+    accept, and may only NARROW what the operator configured -- see
+    `narrow_gpu_choice`. They are the answer to a real need: a caller measuring
+    throughput knows that a number taken on a different card is not comparable
+    with yesterday's, and would rather wait for the right one than pay a
+    fallback's price for a result it cannot use. Raises ValueError when the
+    narrowing leaves nothing allowed, so the caller hears about a mistake
+    instead of silently getting the operator's default.
     """
     key = str(model or "").strip()
     if not key:
@@ -3872,7 +4021,8 @@ def set_client_pods(model: str, pods: int, teardown: bool = False) -> dict:
     # Creating the pool is the point: asking for a warm floor on a model nobody
     # has called yet is exactly when it is worth pre-warming.
     pool = get_model_pod_pool(key, _model_entry(key), block)
-    out = pool.set_client_floor(pods)
+    out = pool.set_client_floor(pods, gpu_types=gpu_types,
+                                allow_other_gpus=allow_other_gpus)
     if teardown:
         # After the floor is lowered, so the shed measures against the new one.
         out["teardown"] = pool.shed_now()

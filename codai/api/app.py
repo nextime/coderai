@@ -23,7 +23,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -902,6 +902,21 @@ class RunpodScaleRequest(BaseModel):
                                        "waiting out scale_down_after_s. Never goes "
                                        "below the model's own min_pods, and a pod "
                                        "with requests on it drains first.")
+    gpu_types: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Cards THIS lease will accept, in preference order (a list, "
+                    "or a comma-separated string). May only NARROW the model's "
+                    "configured gpu_types: a card the operator did not list is "
+                    "ignored and reported back in `notes`, and narrowing to "
+                    "nothing allowed is a 400. Omit to use the model's own "
+                    "preference.")
+    allow_other_gpus: Optional[bool] = Field(
+        None,
+        description="false makes this lease wait for one of its gpu_types "
+                    "instead of taking whatever else fits. May only be turned "
+                    "OFF by a request: asking for true where the operator set "
+                    "false is ignored and reported. Omit to use the model's own "
+                    "setting.")
     model_config = ConfigDict(extra="allow")
 
 
@@ -922,6 +937,14 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     still cannot scale through the operator's own ``min_pods``, and a pod with
     requests on it drains rather than dying under them.
 
+    ``gpu_types`` and ``allow_other_gpus`` let a lease say which cards it will
+    accept. A caller measuring throughput knows something the operator cannot --
+    that a number taken on a different card is not comparable with yesterday's,
+    and that waiting for the right one beats paying a fallback's price for a
+    result it cannot use. It may only ever NARROW the model's own choice, never
+    widen it, and the narrowing dies with the lease: there is deliberately no way
+    for a request to change a model's configuration.
+
     Deliberately NOT admin-scoped: the gate is per model
     (``allow_client_scale``), the number is clamped to ``max_pods``, and the
     lease expires (``client_scale_ttl_s``, default 30 min) so a client that dies
@@ -930,10 +953,15 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     """
     from codai.api import runpod_worker
     try:
-        return runpod_worker.set_client_pods(body.model, body.pods,
-                                            teardown=bool(body.teardown))
+        return runpod_worker.set_client_pods(
+            body.model, body.pods, teardown=bool(body.teardown),
+            gpu_types=body.gpu_types, allow_other_gpus=body.allow_other_gpus)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        # A narrowing that leaves nothing allowed: the caller's mistake, and it
+        # must not quietly fall back to the operator's default.
+        raise HTTPException(status_code=400, detail=str(exc))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except Exception as exc:

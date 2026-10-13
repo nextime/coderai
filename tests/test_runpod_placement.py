@@ -160,7 +160,10 @@ def test_candidates_are_expanded_across_regions_for_the_capacity_fallback():
     """The existing retry walks `ranked` on a capacity miss; pairing each card
     with each region makes it walk regions too, with no new control flow."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    blk = src.split("ranked = _rank_gpus(client, self.mcfg, self.account)")[1][:700]
+    # Anchored on the assignment alone: the call's ARGUMENTS are not what this
+    # test is about, and spelling them out made it fail the day a parameter was
+    # added and wrapped the line.
+    blk = src.split("ranked = _rank_gpus(")[1][:900]
     assert 'dict(sel, _dc=dc) for sel in ranked for dc in dcs' in blk
     assert "if len(dcs) > 1:" in blk
 
