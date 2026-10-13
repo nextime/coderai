@@ -296,7 +296,11 @@ def _pod_candidate(model_id: str) -> Optional[Candidate]:
 
     def _acquire():
         base, release = backend._acquire_endpoint()
-        auth = (backend._headers or {}).get("Authorization", "")
+        # AFTER the acquire, and from the live accessor: acquiring is what can
+        # change the pool's token (it adopts a running pod's instead of renting
+        # another), and the snapshot taken at load_model time would be the old
+        # one — which the pod answers 401 to.
+        auth = (backend._auth() or {}).get("Authorization", "")
         key = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         # _unreachable() drops the pod the backend just handed out, which is
         # what stops the next page choosing the same dead one.

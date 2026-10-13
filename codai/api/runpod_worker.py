@@ -4387,18 +4387,28 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
     """
     if not pod_id:
         return
-    _registry_update(lambda d: d.__setitem__(
-        str(pod_id), {"pool": str(pool_key), "pid": os.getpid(),
-                      "proc": _PROC_ID, "at": time.time(),
-                      # Distinct from "at", which is now a heartbeat: the hours
-                      # a reaped pod billed can only be computed from when it
-                      # was CREATED, and that number must survive the owner.
-                      "created": time.time(),
-                      "url": str(url or ""), "key": str(api_key or ""),
-                      # So a pod adopted after a restart is still attributed its
-                      # real $/hr instead of looking free.
-                      "hourly_usd": float(hourly_usd or 0.0)})
-        or True)
+
+    def _write(d):
+        # An ADOPTION re-registers a pod that already exists, so "created" must
+        # survive the new owner: taking time.time() again would reset the age
+        # the reaper's ledger attribution is computed from, and a pod adopted
+        # every hour would look newly born every hour.
+        was = d.get(str(pod_id))
+        born = float((was or {}).get("created") or 0.0) if isinstance(was, dict) else 0.0
+        d[str(pod_id)] = {"pool": str(pool_key), "pid": os.getpid(),
+                          "proc": _PROC_ID, "at": time.time(),
+                          # Distinct from "at", which is a heartbeat: the
+                          # hours a reaped pod billed can only be computed from
+                          # when it was CREATED, and that must survive a new
+                          # owner.
+                          "created": born or time.time(),
+                          "url": str(url or ""), "key": str(api_key or ""),
+                          # So a pod adopted after a restart is still attributed
+                          # its real $/hr instead of looking free.
+                          "hourly_usd": float(hourly_usd or 0.0)}
+        return True
+
+    _registry_update(_write)
 
 
 def touch_registered_pods() -> int:

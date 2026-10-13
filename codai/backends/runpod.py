@@ -127,6 +127,10 @@ class RunpodBackend(ModelBackend):
             # configured) and every request we send must carry it.
             _key = getattr(self._pool, "api_key", "")
             self._headers = {"Authorization": f"Bearer {_key}"} if _key else {}
+            # NOTE: that snapshot is only a starting value. A pool can CHANGE its
+            # token after this point — it adopts the token of a pod already
+            # running rather than renting a second one — so every send reads the
+            # pool again through _auth(). See _auth().
             # Eagerly warm a pod only when min_pods >= 1; otherwise provision lazily
             # on the first request (min_pods=0 = scale-to-zero when idle).
             if self._mcfg.min_pods >= 1:
@@ -178,6 +182,27 @@ class RunpodBackend(ModelBackend):
         self._last_pod = pod
         return url.rstrip("/") + "/v1", (lambda: self._pool.release(pod))
 
+    def _auth(self) -> dict:
+        """The bearer header for THIS send, read from the pool now.
+
+        Not the snapshot taken in load_model. A pool may replace its token
+        between loading the model and sending a request: when a pod for this
+        pool is already running — a sibling engine's, or ours from before a
+        restart — the pool adopts that pod's token instead of renting a second
+        card, and `pool.api_key` changes under us.
+
+        A request that read the header before that happened carried the old
+        token and the pod answered 401. Observed live: 64 OCR pages in flight
+        when a pool adopted a running pod all failed with "Invalid API key",
+        every one of them lost, while the same lease worked seconds later. The
+        snapshot stays for serverless, which has no pool and no such event.
+        """
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            return dict(self._headers or {})
+        key = getattr(pool, "api_key", "") or ""
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
     def openai_endpoint(self):
         """``(base_url ending /v1, api_key)`` for a client that will speak to this
         model over HTTP ITSELF, instead of going through us.
@@ -193,7 +218,7 @@ class RunpodBackend(ModelBackend):
         answering rather than treating it as permanent."""
         base, release = self._acquire_endpoint()
         try:
-            auth = (self._headers or {}).get("Authorization", "")
+            auth = (self._auth() or {}).get("Authorization", "")
             key = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
             return base, key
         finally:
@@ -283,7 +308,7 @@ class RunpodBackend(ModelBackend):
                     if tools:
                         payload["tools"] = tools
                     r = pod_http.post(base + "/chat/completions", json=payload,
-                                      headers=self._headers, timeout=3600)
+                                      headers=self._auth(), timeout=3600)
                 except requests.exceptions.ConnectionError:
                     # Nothing answered at all: the pod is gone. Once, on a
                     # fresh pod — a second refusal is a real outage.
@@ -368,7 +393,7 @@ class RunpodBackend(ModelBackend):
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
-        headers = self._headers
+        headers = self._auth()
 
         def _handle_line(line: str) -> bool:
             if not line or not line.startswith("data:"):

@@ -417,6 +417,20 @@ async def chat_completions(token: str, request: Request):
                         await client.aclose()
                     except Exception:
                         pass
+            if reply.status_code in (401, 403) and attempt == 1:
+                # The upstream refused our credential. A pod only answers to the
+                # token it was launched with, and a pool CHANGES its token when
+                # it adopts a pod that is already running instead of renting a
+                # second card — so a page in flight across that moment carries
+                # the token from before it. Re-choosing reads the pool again,
+                # which is enough; this is the last line of defence behind
+                # RunpodBackend._auth(), because the alternative is a page
+                # thrown away for a credential that was already correct by the
+                # time the error arrived. 64 pages were lost that way.
+                print(f"[ocr] upstream {chosen.base} refused our token "
+                      f"(HTTP {reply.status_code}) — re-resolving and sending "
+                      f"this page once more", flush=True)
+                continue
             # The reply goes back as it came: a re-serialised response is how
             # logprobs got lost in the first place.
             media = reply.headers.get("content-type", "application/json")
