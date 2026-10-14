@@ -449,3 +449,22 @@ def test_an_unreachable_pod_is_a_503(monkeypatch):
         om._post_page_to_pod("https://1.2.3.4:8000/v1", "", b"x", "0.pdf",
                              0, {}, None)
     assert e.value.status == 503
+
+
+# ------------------------------------------- which path ran must be visible #
+def test_a_silent_fallback_would_make_a_test_prove_nothing():
+    """An install configured for the pod-side pipeline that falls back on every
+    request looks EXACTLY like a success. Without a line in the log an operator
+    would conclude the new path worked when it had never run -- so both the
+    fallback and the success say which one happened."""
+    src = (ROOT / "codai/ocr/manager.py").read_text()
+    fn = src.split("async def _read_on_pods")[1].split("\n    def ")[0]
+    assert "but {_n} of {len(parts)} page(s) had no pod" in fn
+    assert "ON THE PODS" in fn
+
+
+def test_the_fallback_message_names_the_cause_not_just_the_effect():
+    src = (ROOT / "codai/ocr/manager.py").read_text()
+    fn = src.split("async def _read_on_pods")[1].split("\n    def ")[0]
+    assert "placement answered 'local'" in fn
+    assert "nothing rented" in fn

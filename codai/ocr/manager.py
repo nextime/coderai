@@ -1328,11 +1328,27 @@ class OcrManager:
             # At least one page had no pod. Do the WHOLE document locally rather
             # than stitch two pipelines together: a document read half one way
             # and half the other is the hardest kind of result to explain.
+            #
+            # SAY SO. This used to return None in silence, which meant a
+            # deployment could be configured for the pod-side pipeline, fall
+            # back to the local one on every request, and look exactly like a
+            # success -- the operator would conclude the new path worked when it
+            # had never run. One line is the difference between a test that
+            # proves something and a test that proves nothing.
+            _n = sum(1 for r in got if r is None)
+            print(f"[ocr] the pod-side pipeline was configured for {model_id!r} "
+                  f"but {_n} of {len(parts)} page(s) had no pod to run it "
+                  f"(placement answered 'local' — nothing rented, or the pool "
+                  f"could not serve) — reading the WHOLE document here instead",
+                  flush=True)
             return None
         bad = [r for r in got if isinstance(r, BaseException)]
         if bad:
             raise bad[0]
 
+        print(f"[ocr] read {len(parts)} page(s) ON THE PODS for {model_id!r}: "
+              f"each page went as a one-page PDF and was rasterised and read "
+              f"there, not here", flush=True)
         pages, blank, stamps, sigs = [], [], [], []
         served = ""
         for idx, res in enumerate(got):
