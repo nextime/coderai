@@ -968,7 +968,30 @@ class OcrConfig:
     # Raise it when a fleet genuinely needs more, together with the per-engine
     # instance counts -- which on this design are what the box can host (a surya
     # worker is a SUBPROCESS at ~750 MB, so 64 of them is ~45 GB).
+    #
+    # CORRECTION (0.3.65): the paragraph above reasons as if resident == admitted.
+    # It was not. `ocr_document` rasterised EVERY page of a document up front and
+    # held the list for the whole request, so the pages waiting on this semaphore
+    # were resident too and the real figure was (in-flight documents x their page
+    # count), which this setting does not bound at all. A production install was
+    # OOM-killed at 90.7 GB with this at 1024 and again at 92.7 GB with it at 128 --
+    # eight times smaller, half a gigabyte worse. Memory is bounded by
+    # `max_resident_mb` below; this stays what its first line always said it was,
+    # a ceiling on concurrent page WORK.
     max_concurrency: int = 64            # global ceiling on in-flight OCR pages
+    # Ceiling on the bytes that in-flight documents may hold in RASTERISED pages,
+    # charged before a page exists (codai/ocr/budget.py prices a document from its
+    # page tree). 0 = derive it from the cgroup limit or host RAM, which is the
+    # shipped default because the installs that most need a ceiling are the ones
+    # that will never set one. A document bigger than the whole budget still runs,
+    # alone -- a gate that can refuse forever is just a deadlock.
+    max_resident_mb: int = 0
+    # How many pages of one document are rasterised at a time. The document is read
+    # in windows, so residency is O(window) instead of O(document): a 400-page
+    # filing costs the same as an 8-page one. 0 = follow `max_concurrency` (capped
+    # at 32), so a window is never smaller than the work the engines can take nor
+    # large enough to reintroduce the problem.
+    page_window: int = 0
     # Default document language when a request names none. "auto" (the shipped
     # default) means let the engine recognise what it finds: surya-2, olmOCR and
     # docTR are multilingual and have no language input at all, and PaddleOCR --
@@ -1892,6 +1915,8 @@ class ConfigManager:
                 "default_engine": self.config.ocr.default_engine,
                 "dpi": self.config.ocr.dpi,
                 "max_concurrency": self.config.ocr.max_concurrency,
+                "max_resident_mb": self.config.ocr.max_resident_mb,
+                "page_window": self.config.ocr.page_window,
                 "lang": self.config.ocr.lang,
                 "paddle_enabled": self.config.ocr.paddle_enabled,
                 "paddle_use_gpu": self.config.ocr.paddle_use_gpu,

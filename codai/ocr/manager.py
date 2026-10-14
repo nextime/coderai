@@ -33,9 +33,10 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from codai.ocr.base import (OcrEngine, OcrPage, OcrError, load_pages, ink_coverage,
-                            PAGE_OPTIONS,
+from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
+                            PAGE_OPTIONS, page_estimate, render_pages,
                             unreadable_report)
+from codai.ocr.budget import get_budget
 
 
 # Engine registry: name → factory(cfg) → OcrEngine. Imports are deferred inside each
@@ -344,6 +345,21 @@ def _warn_if_oversubscribed(name: str, pages: int) -> None:
     elif need > 1:
         print(f"[ocr] engine {name!r}: {pages} pages at once spreads over {need} "
               f"pods ({per} in flight each); {tail}.", flush=True)
+
+
+def _drain(stream, n: int) -> list:
+    """Pull up to ``n`` pages off a page generator. Empty list = document finished.
+
+    Separate from the loop that uses it so the whole pull can be handed to
+    `asyncio.to_thread` in one call rather than per page.
+    """
+    out = []
+    for _ in range(max(1, n)):
+        try:
+            out.append(next(stream))
+        except StopIteration:
+            break
+    return out
 
 
 def _mark_blank_pages(cfg, images, pages) -> list:
@@ -1004,21 +1020,26 @@ class OcrManager:
         return [n for n in names
                 if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
 
-    async def _pages_with(self, name: str, images: List, lang: str = "") -> List[OcrPage]:
+    async def _pages_with(self, name: str, images: List, lang: str = "",
+                          base: int = 0) -> List[OcrPage]:
         pool = await self._get_pool(name, lang)
         sem = self._sem or asyncio.Semaphore(4)
 
         async def _one(idx, img):
             async with sem:
                 page = await pool.recognize(img)
-                page.index = idx
+                # `base` is the document-wide index of this window's first page, so
+                # a windowed read numbers pages the same way a whole-document read
+                # always did -- callers index into `pages` by page number.
+                page.index = base + idx
                 return page
 
         pages = await asyncio.gather(*[_one(i, im) for i, im in enumerate(images)])
         return list(pages)
 
     async def ocr_pages(self, images: List, engine: Optional[str] = None,
-                        lang: Optional[str] = None) -> (str, List[OcrPage]):
+                        lang: Optional[str] = None,
+                        base: int = 0) -> (str, List[OcrPage]):
         """OCR a list of PIL page images. Returns (engine_name, [OcrPage]).
 
         The returned name is the engine that ACTUALLY read the pages, which is not
@@ -1028,7 +1049,7 @@ class OcrManager:
         it fell back."""
         name = self.resolve_engine(engine)
         try:
-            return name, await self._pages_with(name, images, lang)
+            return name, await self._pages_with(name, images, lang, base)
         except Exception as first:
             chain = self._fallback_order(name)
             if not chain:
@@ -1037,7 +1058,7 @@ class OcrManager:
                   f"falling back to {' -> '.join(chain)}")
             for alt in chain:
                 try:
-                    pages = await self._pages_with(alt, images, lang)
+                    pages = await self._pages_with(alt, images, lang, base)
                 except Exception as e:
                     print(f"[ocr] fallback engine '{alt}' also failed: {e}")
                     continue
@@ -1066,22 +1087,30 @@ class OcrManager:
         """
         cfg = self._require_cfg()
         use_dpi = int(dpi) if dpi else self.engine_dpi(engine)
-        images = load_pages(data, filename=filename, content_type=content_type, dpi=use_dpi)
+
+        # Price the document BEFORE rendering it: once the pages exist the memory is
+        # already spent, so admission control has to work from the page tree.
+        n_pages, est_bytes = page_estimate(data, filename=filename,
+                                           content_type=content_type, dpi=use_dpi)
+        window = self._page_window(cfg)
+        # Charge for the WINDOW, not the document -- windowing is what makes that
+        # honest, and charging whole documents would queue work that never coexists.
+        # Plus two pages of headroom: `page_estimate` reports what a page retains,
+        # and rendering the next one briefly holds pdfium's bitmap and its RGB copy
+        # on top of the window already in hand.
+        per_page = max(1, est_bytes // max(1, n_pages))
+        reserve = per_page * (max(1, min(n_pages, window)) + 2)
+        budget = get_budget(int(getattr(cfg, "max_resident_mb", 0) or 0))
+
         # Share the GPU thermal governor with every other workload: block here until
         # temps are safe (wait_until_safe blocks, so run it off the event loop).
         await asyncio.to_thread(_wait_thermal_safe)
-        token = None
-        if page_opts:
-            token = PAGE_OPTIONS.set(dict(page_opts))
-        try:
-            name, pages = await self.ocr_pages(images, engine=engine, lang=lang)
-        finally:
-            if token is not None:
-                PAGE_OPTIONS.reset(token)
-        blank = _mark_blank_pages(cfg, images, pages)
-        full_text = "\n\n".join(p.text for p in pages)
 
-        stamps, signatures = await self._detect_all(images, pages, detect)
+        async with budget.reserve(reserve):
+            name, pages, blank, stamps, signatures = await self._read_windowed(
+                data, filename, content_type, use_dpi, window,
+                engine=engine, lang=lang, detect=detect, page_opts=page_opts, cfg=cfg)
+        full_text = "\n\n".join(p.text for p in pages)
 
         structured_out = None
         if structured:
@@ -1116,7 +1145,83 @@ class OcrManager:
             out["unreadable"] = report
         return out
 
-    async def _detect_all(self, images, pages, detect: Optional[str]):
+    def _page_window(self, cfg) -> int:
+        """How many pages of one document to hold rasterised at a time.
+
+        0 means follow `max_concurrency`, capped at 32: the window should be at
+        least as large as the work the engines will take concurrently (a smaller
+        one would idle them between windows) without being large enough to bring
+        back the unbounded residency it exists to prevent.
+        """
+        try:
+            w = int(getattr(cfg, "page_window", 0) or 0)
+        except Exception:
+            w = 0
+        if w > 0:
+            return w
+        try:
+            mc = int(getattr(cfg, "max_concurrency", 64) or 64)
+        except Exception:
+            mc = 64
+        return max(1, min(32, mc))
+
+    async def _read_windowed(self, data: bytes, filename: str, content_type: str,
+                             dpi: int, window: int, *, engine, lang, detect,
+                             page_opts, cfg):
+        """Read a document a window of pages at a time.
+
+        Residency is O(window) rather than O(document): each window's bitmaps are
+        rendered, read, measured, detected on, and dropped before the next window
+        is rendered. A 400-page filing now costs what an 8-page one does.
+
+        The engine is STICKY across windows. `ocr_pages` falls back per call, so
+        without stickiness a document could be read by a different engine in every
+        window and report only the last one. Pages already read keep their results
+        when a later window has to fall back -- the whole-document path re-read
+        them from page one.
+        """
+        stream = render_pages(data, filename=filename, content_type=content_type,
+                              dpi=dpi)
+        pages_all: List[OcrPage] = []
+        blank_all: list = []
+        stamps_all: list = []
+        sigs_all: list = []
+        served = None
+        base = 0
+        token = PAGE_OPTIONS.set(dict(page_opts)) if page_opts else None
+        try:
+            while True:
+                # Rendering is CPU-bound C (pypdfium2) and used to run on the event
+                # loop, where a long PDF stalled every other request in the process.
+                imgs = await asyncio.to_thread(_drain, stream, window)
+                if not imgs:
+                    break
+                name, wpages = await self.ocr_pages(
+                    imgs, engine=served or engine, lang=lang, base=base)
+                if served is None:
+                    served = name
+                elif name != served:
+                    print(f"[ocr] page {base}: engine switched '{served}' -> "
+                          f"'{name}' mid-document", flush=True)
+                    served = name
+                blank_all.extend(base + i
+                                 for i in _mark_blank_pages(cfg, imgs, wpages))
+                st, sg = await self._detect_all(imgs, wpages, detect, base=base)
+                stamps_all.extend(st)
+                sigs_all.extend(sg)
+                pages_all.extend(wpages)
+                base += len(imgs)
+                # Drop this window's bitmaps BEFORE the next is rendered -- holding
+                # both is the whole thing being fixed.
+                imgs = None
+        finally:
+            if token is not None:
+                PAGE_OPTIONS.reset(token)
+            stream.close()
+        return (served or self.resolve_engine(engine), pages_all, blank_all,
+                stamps_all, sigs_all)
+
+    async def _detect_all(self, images, pages, detect: Optional[str], base: int = 0):
         """Run stamp/signature detection across pages; returns (stamps, signatures)
         with each detection tagged by page index. Empty when mode is 'off'."""
         from codai.ocr.detect import resolve_detect_mode, detect_page
@@ -1132,9 +1237,9 @@ class OcrManager:
             async with sem:
                 res = await asyncio.to_thread(detect_page, img, page, cfg, mode)
                 for d in res["stamps"]:
-                    d["page"] = idx
+                    d["page"] = base + idx
                 for d in res["signatures"]:
-                    d["page"] = idx
+                    d["page"] = base + idx
                 return res
 
         results = await asyncio.gather(*[_one(i, im, pg) for i, (im, pg) in enumerate(zip(images, pages))])

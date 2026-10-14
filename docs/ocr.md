@@ -1488,6 +1488,69 @@ more than one page.
 
 ---
 
+## What a document costs while it is being read
+
+`ocr.max_concurrency` bounds how many pages are **being read**. Until 0.3.65 nothing
+bounded how many were **resident**, and those were different numbers by a factor of
+the document length: `ocr_document` rasterised every page up front and held the list
+until the response was written, so the pages queued behind the semaphore were in
+memory too.
+
+The real figure was *(documents in flight x their page count)*, which no setting
+expressed. A production install was OOM-killed twice inside forty minutes:
+
+```
+11:46:04  Killed coderai-cpu  anon-rss 90.7 GB   max_concurrency = 1024
+12:25:13  Killed coderai-cpu  anon-rss 92.7 GB   max_concurrency = 128
+```
+
+Eight times smaller, half a gigabyte **worse**. That is the proof the semaphore was
+never what held the memory — and a warning about tuning the knob whose name matches
+the symptom instead of measuring which one the memory is behind.
+
+### Two bounds, on the two things that actually grow
+
+**A page window** (`ocr.page_window`, 0 = follow `max_concurrency`, capped at 32).
+A document is read a window of pages at a time: rendered, read, measured, detected
+on, dropped, then the next window is rendered. Residency becomes O(window) rather
+than O(document), so a 400-page filing costs what an 8-page one does. Measured on a
+40-page A4 PDF at 250 DPI, fresh process, RSS delta:
+
+| pages held | peak RSS |
+|---|---|
+| 40 (the old whole-document path) | +974 MB |
+| 32 | +768 MB |
+| 8 | +215 MB |
+
+**A resident-bytes ceiling** (`ocr.max_resident_mb`, 0 = derive it). Documents are
+charged for their window before a page exists — `page_estimate()` prices a PDF from
+its page tree without rendering it — and wait when the budget is full. Deriving it
+takes the smaller of the container limit and host RAM and claims a quarter, floored
+at 512 MB. The cgroup limit is checked **first**: a 2 GB container on a 128 GB host
+that sizes itself from the host has no ceiling at all.
+
+The estimate carries a measured overhead factor (`PAGE_OVERHEAD`, 1.6), because the
+RGB pixel arithmetic under-predicts real residency by 40-55% — decode transients and
+allocator slack. A budget built on the raw pixel count admits about half again as
+much as it meant to, and under-charging defeats the gate exactly when it matters.
+
+Two rules keep the gate from being worse than the problem:
+
+* **A document larger than the whole budget still runs**, clamped, alone. A gate
+  that can refuse forever is a deadlock with a polite error message.
+* **Reservations are returned on cancellation**, not just on success. A client that
+  disconnects mid-document would otherwise shrink the budget permanently.
+
+### What this does not bound
+
+`/v1/ocr/batch` still reads every uploaded file fully into memory before any gating.
+Source bytes are small next to rasterised pages — a 40-page PDF is a few MB of PDF
+and ~700 MB of bitmaps — so this was not the term that caused the kills, and it has
+not been measured. It is the next thing to look at if a batch endpoint grows
+unexpectedly, not a known cause.
+
+---
+
 ## Lanes: concurrency without another process
 
 The worker protocol was one request, one reply, strictly in order, so **pages in

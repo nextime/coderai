@@ -321,6 +321,144 @@ def load_pages(data: bytes, filename: str = "", content_type: str = "", dpi: int
     return pages
 
 
+#: Measured ratio of real resident bytes to the RGB pixel arithmetic for a decoded
+#: page -- decode transients plus allocator slack. See :func:`page_estimate` for the
+#: measurements this comes from. Rounded UP from the worst observed 1.56.
+PAGE_OVERHEAD = 1.6
+
+
+def page_estimate(data: bytes, filename: str = "", content_type: str = "",
+                  dpi: int = 200) -> "tuple[int, int]":
+    """``(num_pages, estimated_resident_bytes)`` for ``data`` WITHOUT rasterising it.
+
+    The point is to know what a document will cost before paying it, so admission
+    control can refuse or queue it rather than discover the size by running out of
+    memory. pypdfium2 reports each page's point size from the page tree alone, which
+    is cheap; scaling that by ``dpi`` gives the pixel area, and RGB is 3 bytes a pixel.
+
+    The figure is what a page actually COSTS resident: RGB at 3 bytes a pixel, times
+    :data:`PAGE_OVERHEAD` for the decode transients and allocator slack that the
+    pixel arithmetic alone does not predict.
+
+    That factor is measured, not guessed. Holding N A4 pages at 250 DPI and reading
+    RSS in a fresh process (40-page PDF, pypdfium2):
+
+        pages held     pixel arithmetic     measured RSS     ratio
+            40              691 MB            +974 MB        1.41
+            32              553 MB            +768 MB        1.39
+             8              138 MB            +215 MB        1.56
+
+    So the pixel count under-predicts by 40-55%, and a budget built on it would
+    admit about half again as much as it meant to. Under-charging defeats the gate
+    at exactly the moment it matters, which is why the factor rounds up.
+
+    Falls back to a size-derived guess when the document cannot be inspected: an
+    unknown document still has to be charged for SOMETHING, and charging it nothing
+    is how an unbounded one slips through.
+    """
+    name = (filename or "").lower()
+    is_pdf = ((content_type or "").lower() == "application/pdf"
+              or name.endswith(".pdf") or data[:5] == b"%PDF-")
+    _BYTES_PER_PIXEL = 3           # decoded RGB
+
+    if is_pdf:
+        try:
+            import pypdfium2 as pdfium
+            pdf = pdfium.PdfDocument(data)
+            scale = max(0.5, dpi / 72.0)
+            total = 0
+            n = len(pdf)
+            for i in range(n):
+                w, h = pdf[i].get_size()          # points, no render
+                total += int(w * scale) * int(h * scale)
+            return n, int(total * _BYTES_PER_PIXEL * PAGE_OVERHEAD)
+        except Exception:
+            # Unreadable page tree, or no pypdfium2. A PDF page is ~A4 far more often
+            # than not; assume that rather than zero.
+            a4 = int(int(8.27 * dpi) * int(11.69 * dpi)
+                     * _BYTES_PER_PIXEL * PAGE_OVERHEAD)
+            return 1, max(a4, len(data) * 4)
+
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(data))        # header only; no .load()
+        n = max(1, int(getattr(img, "n_frames", 1)))
+        w, h = img.size
+        return n, int(w * h * _BYTES_PER_PIXEL * n * PAGE_OVERHEAD)
+    except Exception:
+        return 1, max(len(data) * 4, 1)
+
+
+def render_pages(data: bytes, filename: str = "", content_type: str = "",
+                 dpi: int = 200):
+    """Yield RGB ``PIL.Image`` pages ONE AT A TIME instead of returning them all.
+
+    Same decoding rules as :func:`load_pages` — this is that function with the list
+    turned inside out, so a caller can hold a window of pages rather than the whole
+    document. For a 40-page PDF at 250 DPI that is the difference between ~720 MB
+    resident for the life of the request and ~18 MB per page in flight.
+
+    A generator, so nothing is rendered until it is asked for and an abandoned
+    document stops costing at the page the caller stopped on.
+    """
+    try:
+        from PIL import Image
+    except Exception as e:  # pragma: no cover - Pillow is a base dep
+        raise OcrError(f"Pillow (PIL) is required for OCR: {e}", status=503)
+
+    import io
+
+    name = (filename or "").lower()
+    is_pdf = ((content_type or "").lower() == "application/pdf"
+              or name.endswith(".pdf") or data[:5] == b"%PDF-")
+
+    if is_pdf:
+        yield from _render_pdf_pages(data, dpi)
+        return
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception as e:
+        raise OcrError(f"could not decode image: {e}", status=400)
+
+    n = getattr(img, "n_frames", 1)
+    for i in range(n):
+        try:
+            img.seek(i)
+        except Exception:
+            pass
+        yield img.convert("RGB")
+
+
+def _render_pdf_pages(data: bytes, dpi: int):
+    """Yield one rasterised RGB page at a time (pypdfium2, else pdf2image)."""
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        pdfium = None
+
+    if pdfium is not None:
+        try:
+            pdf = pdfium.PdfDocument(data)
+            scale = max(0.5, dpi / 72.0)
+            n = len(pdf)
+        except Exception as e:
+            raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
+        for i in range(n):
+            try:
+                yield pdf[i].render(scale=scale).to_pil().convert("RGB")
+            except Exception as e:
+                raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
+        return
+
+    # pdf2image has no per-page API that avoids the whole document, so this path
+    # keeps the old behaviour: correctness first, and pypdfium2 is the shipped dep.
+    for im in _rasterize_pdf(data, dpi):
+        yield im
+
+
 def _rasterize_pdf(data: bytes, dpi: int) -> List["Any"]:
     """Rasterise a PDF to a list of RGB PIL pages (pypdfium2 first, then pdf2image)."""
     from PIL import Image  # noqa: F401  (imported for type parity / already validated)

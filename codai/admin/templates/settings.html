@@ -1119,7 +1119,26 @@
       </div>
       <div class="form-group" style="flex:1;min-width:110px">
         <label class="form-label">Max concurrency</label>
-        <input type="number" id="s-ocr-max-concurrency" class="form-input" min="1" placeholder="4">
+        <input type="number" id="s-ocr-max-concurrency" class="form-input" min="1" placeholder="64">
+        <span class="form-hint">A ceiling on concurrent page WORK, not on memory. It does
+        not bound how much a document holds &mdash; use the two settings below for that.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:140px">
+        <label class="form-label">Max resident pages (MB)</label>
+        <input type="number" id="s-ocr-max-resident-mb" class="form-input" min="0" placeholder="0">
+        <span class="form-hint">Ceiling on the memory in-flight documents may hold as
+        rasterised pages, charged before a page exists. <b>0 = derive it</b> from the
+        container limit or host RAM (a quarter of it), which is what most installs want.
+        A document larger than the whole budget still runs, alone. This is the setting
+        that prevents an out-of-memory kill; max concurrency never did.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">Page window</label>
+        <input type="number" id="s-ocr-page-window" class="form-input" min="0" placeholder="0">
+        <span class="form-hint">How many pages of one document are held rasterised at a
+        time, so a 400-page filing costs what an 8-page one does. <b>0 = follow max
+        concurrency</b> (capped at 32). Lower it on a small host; raising it trades
+        memory for fewer render pauses.</span>
       </div>
       <div class="form-group" style="flex:1;min-width:140px">
         <label class="form-label">Language</label>
@@ -2196,7 +2215,9 @@ async function loadSettings(){
     document.getElementById('s-ocr-default-engine').value = ocr.default_engine ?? 'paddle';
     document.getElementById('s-ocr-dpi').value = ocr.dpi ?? 200;
     document.getElementById('s-ocr-surya-dpi').value = ocr.surya_dpi ?? 250;
-    document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 4;
+    document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 64;
+    document.getElementById('s-ocr-max-resident-mb').value = ocr.max_resident_mb ?? 0;
+    document.getElementById('s-ocr-page-window').value = ocr.page_window ?? 0;
     document.getElementById('s-ocr-lang').value = ocr.lang ?? 'auto';
     document.getElementById('s-ocr-paddle-auto-lang').value = ocr.paddle_auto_lang ?? 'latin';
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
@@ -2494,7 +2515,9 @@ async function saveSettings(silent){
       default_engine: document.getElementById('s-ocr-default-engine').value || 'paddle',
       dpi: parseInt(document.getElementById('s-ocr-dpi').value) || 200,
       surya_dpi: parseInt(document.getElementById('s-ocr-surya-dpi').value) || 0,
-      max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 4,
+      max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 64,
+      max_resident_mb: parseInt(document.getElementById('s-ocr-max-resident-mb').value) || 0,
+      page_window: parseInt(document.getElementById('s-ocr-page-window').value) || 0,
       lang: document.getElementById('s-ocr-lang').value.trim() || 'auto',
       paddle_auto_lang: document.getElementById('s-ocr-paddle-auto-lang').value.trim() || 'latin',
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
