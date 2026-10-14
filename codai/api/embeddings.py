@@ -1400,6 +1400,12 @@ async def _bge_m3_response(request, model_obj, texts, _emb_cfg):
             raise HTTPException(status_code=400,
                                 detail=f"This model has no {t} head.")
     max_len = int(_emb_cfg.get('n_ctx') or _raw.get('n_ctx') or 8192)
+    # CLAMP TO WHAT THE MODEL ACTUALLY ACCEPTS. `n_ctx` is a number an operator
+    # typed; the tokenizer knows the truth. Set it too high and the windows are
+    # too big, the tokenizer truncates each one at its real limit anyway, and
+    # chunking silently stops protecting anything -- the same invisible loss
+    # this code exists to remove, reached through a config typo instead.
+    max_len = min(max_len, _tokenizer_window(model_obj.model[0], max_len))
     # Long inputs: window them rather than letting the tokenizer's
     # `truncation=True` keep the opening and say nothing. bge-m3's window is
     # 8192 tokens -- roughly 6000 words, 15-20 pages -- so this bites on whole
@@ -1472,9 +1478,38 @@ async def _bge_m3_response(request, model_obj, texts, _emb_cfg):
             obj.colbert_embedding = r['colbert']
         data.append(obj)
     total_tokens = sum(len(t.split()) for t in texts)
-    return EmbeddingsResponse(
+    _resp = EmbeddingsResponse(
         data=data, model=request.model,
         usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens})
+    # The multi-vector path builds its OWN response, so the dense path's report
+    # does not cover it. Collecting the counts and dropping them here would
+    # leave chunking invisible on exactly the path that needs it most.
+    if any(c > 1 for c in _chunks):
+        _resp.chunked = {"windows": list(_chunks), "pool": _pool,
+                         "token_limit": max_len}
+        _n = sum(1 for c in _chunks if c > 1)
+        print(f"[embeddings] {_n} of {len(_chunks)} input(s) exceeded the "
+              f"model's {max_len}-token window; merged from up to "
+              f"{max(_chunks)} window(s) (dense={_pool}, sparse=max, "
+              f"colbert=concat)", flush=True)
+    return _resp
+
+
+def _tokenizer_window(tokenizer, fallback: int) -> int:
+    """The tokenizer's real maximum input length.
+
+    `model_max_length` is authoritative when it is a real number -- but HF sets
+    it to a sentinel (~1e30) when the checkpoint does not declare one, and
+    treating that as a window means never chunking at all. So a value that large
+    is read as "unknown" and the caller's own number stands.
+    """
+    try:
+        n = int(getattr(tokenizer, "model_max_length", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return int(fallback)
+    if n <= 0 or n > 1_000_000:
+        return int(fallback)
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -1621,14 +1656,24 @@ def _embed_long(texts: List[str], tok_limit: int, encode, decode, embed_batch,
 def _st_token_limit(model) -> int:
     """A sentence-transformers model's usable token window.
 
-    `max_seq_length` is the model's own number; the margin is for the specials
-    `encode` re-adds, the same reason the GGUF path keeps 64 back from n_ctx.
+    `max_seq_length` is what the model will actually accept -- it is what ST
+    truncates at -- and the tokenizer's own `model_max_length` is the second
+    opinion. The SMALLER wins: windowing above what either will take means the
+    tokenizer silently truncates each window, which is the loss this exists to
+    prevent reached by a longer route.
+
+    The margin is for the specials `encode` re-adds, the same reason the GGUF
+    path keeps 64 back from n_ctx.
     """
     try:
         n = int(getattr(model, "max_seq_length", 0) or 0)
     except (TypeError, ValueError):
         n = 0
-    return max(64, (n or 512) - 16)
+    n = n or 512
+    tok = getattr(model, "tokenizer", None)
+    if tok is not None:
+        n = min(n, _tokenizer_window(tok, n))
+    return max(64, n - 16)
 
 
 def _embed_texts(model_obj, texts: List[str], dimensions=None,

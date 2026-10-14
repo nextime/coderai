@@ -357,3 +357,68 @@ def test_dense_only_requests_are_untouched():
     src = (ROOT / "codai/api/embeddings.py").read_text()
     blk = src.split("_want_types = [")[1].split("raise HTTPException")[0]
     assert "t != 'dense'" in blk
+
+
+# ------------------------------------- the window must be the MODEL's window #
+#
+# "How do we make sure a long input is chunked?" comes down to this: the
+# threshold has to be what the model ACTUALLY accepts. `n_ctx` and
+# `max_seq_length` are numbers an operator typed. Window above the real limit
+# and the tokenizer truncates each window anyway -- the same silent loss,
+# reached through a config typo instead of a missing feature.
+class _Tok:
+    def __init__(self, n):
+        self.model_max_length = n
+
+
+def test_a_real_tokenizer_limit_is_used():
+    assert em._tokenizer_window(_Tok(8192), 99999) == 8192
+
+
+def test_the_huggingface_sentinel_is_not_a_window():
+    """HF sets model_max_length to ~1e30 when the checkpoint declares none.
+    Believing it means never chunking at all."""
+    assert em._tokenizer_window(_Tok(int(1e30)), 8192) == 8192
+
+
+def test_a_zero_or_missing_limit_falls_back():
+    assert em._tokenizer_window(_Tok(0), 4096) == 4096
+    assert em._tokenizer_window(object(), 4096) == 4096
+
+
+def test_the_multi_vector_path_clamps_n_ctx_to_the_tokenizer():
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    fn = src.split("async def _bge_m3_response")[1].split("\ndef ")[0]
+    assert "min(max_len, _tokenizer_window(" in fn, (
+        "a too-large n_ctx would window above what the tokenizer accepts")
+
+
+def test_the_st_limit_takes_the_smaller_of_the_two():
+    class _M:
+        max_seq_length = 8192
+        tokenizer = _Tok(512)
+    assert em._st_token_limit(_M()) == 512 - 16
+
+    class _N:
+        max_seq_length = 512
+        tokenizer = _Tok(8192)
+    assert em._st_token_limit(_N()) == 512 - 16
+
+
+def test_the_st_limit_leaves_room_for_specials():
+    class _M:
+        max_seq_length = 512
+        tokenizer = _Tok(512)
+    assert em._st_token_limit(_M()) < 512
+
+
+def test_the_multi_vector_response_reports_chunking():
+    """Collected and then dropped is no better than never measured -- and this
+    path builds its own response, so the dense path's report does not cover
+    it."""
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    fn = src.split("async def _bge_m3_response")[1].split("\ndef ")[0]
+    assert "_resp.chunked = {" in fn
+    assert '"token_limit": max_len' in fn, (
+        "the report must say WHICH window was applied, or a wrong n_ctx stays "
+        "invisible")
