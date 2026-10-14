@@ -644,3 +644,87 @@ def test_the_estimate_does_not_undercharge_a_real_page():
     drops the factor has to face the number."""
     assert bse.PAGE_OVERHEAD >= 1.56, (
         "the worst measured ratio was 1.56; anything lower under-charges")
+
+
+# -------------------------------------------- pdfium is not thread-safe #
+#
+# 0.3.65 moved rendering into `asyncio.to_thread` so a long PDF would stop
+# stalling the event loop. That was correct in intent and broke OCR in
+# production within the hour: until then `load_pages` ran ON the loop, which
+# serialised every rasterisation BY ACCIDENT, and removing the accident let
+# documents into pdfium concurrently. pdfium permits one caller at a time;
+# concurrent use corrupts its state and reports
+#
+#     failed to rasterise PDF (pypdfium2): PDFium: Data format error
+#
+# on documents that are perfectly valid -- so the failure accuses the input.
+# Measured before the fix: 1 document OK, 8 concurrent = 8 failures, 24 = 24.
+#
+# The lesson in test form: this path is only ever exercised concurrently, so
+# testing it sequentially tests the one case that cannot fail.
+def test_many_documents_rasterise_concurrently_without_corrupting_pdfium():
+    import pypdfium2 as pdfium
+    from codai.ocr.manager import _drain
+
+    doc = pdfium.PdfDocument.new()
+    for _ in range(4):
+        doc.new_page(595, 842)
+    buf = io.BytesIO()
+    doc.save(buf)
+    data = buf.getvalue()
+
+    async def _one(k):
+        page_estimate(data, filename=f"d{k}.pdf", dpi=100)
+        g = render_pages(data, filename=f"d{k}.pdf", dpi=100)
+        n = 0
+        while True:
+            imgs = await asyncio.to_thread(_drain, g, 2)
+            if not imgs:
+                break
+            for im in imgs:
+                im.tobytes()[:16]          # touch the pixels, as an engine would
+            n += len(imgs)
+        return n
+
+    async def _run():
+        return await asyncio.gather(*[_one(i) for i in range(16)],
+                                    return_exceptions=True)
+    got = asyncio.run(_run())
+    bad = [g for g in got if isinstance(g, BaseException)]
+    assert not bad, f"concurrent rasterisation failed: {bad[:3]}"
+    assert got == [4] * 16, got
+
+
+def test_the_whole_document_path_is_also_serialised():
+    """`load_pages` is still used as the pdf2image fallback and by callers
+    outside the manager, and it reaches the same unsafe library."""
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument.new()
+    for _ in range(3):
+        doc.new_page(595, 842)
+    buf = io.BytesIO()
+    doc.save(buf)
+    data = buf.getvalue()
+
+    async def _run():
+        return await asyncio.gather(
+            *[asyncio.to_thread(load_pages, data, f"w{i}.pdf", "", 100)
+              for i in range(12)], return_exceptions=True)
+    got = asyncio.run(_run())
+    bad = [g for g in got if isinstance(g, BaseException)]
+    assert not bad, f"concurrent load_pages failed: {bad[:3]}"
+    assert [len(g) for g in got] == [3] * 12
+
+
+def test_the_lock_is_held_around_every_pdfium_call():
+    """Source-anchored: a later edit that adds a pdfium call outside the lock
+    reintroduces a bug whose symptom blames the document, not the code."""
+    src = (ROOT / "codai/ocr/base.py").read_text()
+    for marker in ("pdfium.PdfDocument(data)", "page.render(scale=scale)",
+                   "get_size()"):
+        assert marker in src
+    # Every PdfDocument construction sits under a `with _PDFIUM_LOCK:`
+    for chunk in src.split("pdfium.PdfDocument(data)")[:-1]:
+        assert "_PDFIUM_LOCK" in chunk.rsplit("try:", 1)[-1], (
+            "a PdfDocument is built without holding _PDFIUM_LOCK")

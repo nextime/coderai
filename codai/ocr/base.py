@@ -24,6 +24,7 @@ extraction) speaks only these types, so engines stay interchangeable.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import contextvars
+import threading
 from typing import Any, List, Optional
 
 
@@ -321,6 +322,18 @@ def load_pages(data: bytes, filename: str = "", content_type: str = "", dpi: int
     return pages
 
 
+#: pdfium is NOT thread-safe: concurrent calls corrupt its state and surface as
+#: "PDFium: Data format error" on documents that are perfectly valid. Until 0.3.65
+#: this was invisible because `load_pages` ran on the event loop, which serialised
+#: every rasterisation by accident; moving rendering into a thread (so a long PDF
+#: stops stalling the loop) removed that accident and broke OCR for every install
+#: doing more than one document at a time. Rendering still happens OFF the loop --
+#: it just happens one call at a time.
+#:
+#: Held per CALL, not per document, so documents interleave page by page instead of
+#: queueing behind each other's full length.
+_PDFIUM_LOCK = threading.RLock()
+
 #: Measured ratio of real resident bytes to the RGB pixel arithmetic for a decoded
 #: page -- decode transients plus allocator slack. See :func:`page_estimate` for the
 #: measurements this comes from. Rounded UP from the worst observed 1.56.
@@ -364,13 +377,14 @@ def page_estimate(data: bytes, filename: str = "", content_type: str = "",
     if is_pdf:
         try:
             import pypdfium2 as pdfium
-            pdf = pdfium.PdfDocument(data)
-            scale = max(0.5, dpi / 72.0)
-            total = 0
-            n = len(pdf)
-            for i in range(n):
-                w, h = pdf[i].get_size()          # points, no render
-                total += int(w * scale) * int(h * scale)
+            with _PDFIUM_LOCK:
+                pdf = pdfium.PdfDocument(data)
+                scale = max(0.5, dpi / 72.0)
+                total = 0
+                n = len(pdf)
+                for i in range(n):
+                    w, h = pdf[i].get_size()      # points, no render
+                    total += int(w * scale) * int(h * scale)
             return n, int(total * _BYTES_PER_PIXEL * PAGE_OVERHEAD)
         except Exception:
             # Unreadable page tree, or no pypdfium2. A PDF page is ~A4 far more often
@@ -441,16 +455,24 @@ def _render_pdf_pages(data: bytes, dpi: int):
 
     if pdfium is not None:
         try:
-            pdf = pdfium.PdfDocument(data)
-            scale = max(0.5, dpi / 72.0)
-            n = len(pdf)
+            with _PDFIUM_LOCK:
+                pdf = pdfium.PdfDocument(data)
+                scale = max(0.5, dpi / 72.0)
+                n = len(pdf)
         except Exception as e:
             raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
         for i in range(n):
             try:
-                yield pdf[i].render(scale=scale).to_pil().convert("RGB")
+                # The yield is OUTSIDE the lock: the caller does OCR between pages,
+                # and holding pdfium while an engine reads a page would serialise
+                # the whole subsystem behind one document.
+                with _PDFIUM_LOCK:
+                    page = pdf[i]
+                    bitmap = page.render(scale=scale)
+                    img = bitmap.to_pil().convert("RGB")
             except Exception as e:
                 raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
+            yield img
         return
 
     # pdf2image has no per-page API that avoids the whole document, so this path
@@ -471,13 +493,14 @@ def _rasterize_pdf(data: bytes, dpi: int) -> List["Any"]:
 
     if pdfium is not None:
         try:
-            pdf = pdfium.PdfDocument(data)
-            scale = max(0.5, dpi / 72.0)
-            pages = []
-            for i in range(len(pdf)):
-                page = pdf[i]
-                bitmap = page.render(scale=scale)
-                pages.append(bitmap.to_pil().convert("RGB"))
+            with _PDFIUM_LOCK:
+                pdf = pdfium.PdfDocument(data)
+                scale = max(0.5, dpi / 72.0)
+                pages = []
+                for i in range(len(pdf)):
+                    page = pdf[i]
+                    bitmap = page.render(scale=scale)
+                    pages.append(bitmap.to_pil().convert("RGB"))
             return pages
         except Exception as e:
             raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
