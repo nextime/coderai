@@ -29,6 +29,8 @@ Configurable via ``ocr.detect_mode``:
 The detector model is loaded once per weights path and reused across requests.
 """
 
+import json
+import os
 import threading
 from typing import Dict, List, Optional
 
@@ -69,27 +71,109 @@ _detector_cache: Dict[str, "YoloDetector"] = {}
 _cache_lock = threading.Lock()
 
 
+class _DetectWorker:
+    """The YOLO detector, driven in whichever venv actually has ultralytics.
+
+    One process per install, shared by every weights path (the worker caches
+    models by path), because loading YOLO twice costs memory for nothing.
+
+    Deliberately NOT a hard dependency: `get()` returns None when no such venv
+    exists, and the caller then raises the ordinary "ultralytics is not
+    installed" error. A detector that cannot be reached must look like a missing
+    detector, not like a broken install.
+    """
+
+    _inst = None
+    _lock = threading.Lock()
+
+    #: Where a baked venv carrying ultralytics may be. `surya` first: that is
+    #: where the pod image puts it, sharing the CPU torch already there.
+    _VENVS = ("/opt/coderai/venvs/surya", "/opt/coderai/venvs/detect",
+              "/opt/coderai/venvs/ocr-paddle")
+
+    def __init__(self, python: str):
+        import subprocess
+        worker = os.path.join(os.path.dirname(__file__), "workers",
+                              "detect_worker.py")
+        self._proc = subprocess.Popen([python, "-I", worker],
+                                      stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=None,
+                                      bufsize=0)
+        hello = self._reply()
+        if not hello.get("ready"):
+            self.kill()
+            raise OcrError(hello.get("error") or "detector worker not ready",
+                           status=503)
+        self._io = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        """The shared worker, or None when no venv carrying ultralytics exists."""
+        with cls._lock:
+            if cls._inst is not None:
+                return cls._inst
+            for vdir in cls._VENVS:
+                py = os.path.join(vdir, "bin", "python")
+                if not os.path.isfile(py):
+                    continue
+                try:
+                    cls._inst = cls(py)
+                except Exception as exc:
+                    print(f"[ocr] detector venv {vdir} would not start ({exc})",
+                          flush=True)
+                    continue
+                print(f"[ocr] stamp/signature detector runs in {vdir}",
+                      flush=True)
+                return cls._inst
+            return None
+
+    def _reply(self) -> dict:
+        line = self._proc.stdout.readline()
+        if not line:
+            raise OcrError("detector worker exited", status=500)
+        return json.loads(line.decode("utf-8"))
+
+    def detect(self, image, model_path: str, conf: float) -> List[dict]:
+        import numpy as np
+        rgb = image.convert("RGB")
+        raw = np.array(rgb).tobytes()
+        hdr = {"cmd": "detect", "model": model_path, "conf": float(conf),
+               "w": rgb.width, "h": rgb.height, "nbytes": len(raw)}
+        # One page at a time down one pipe: the frame is header-then-bytes, and
+        # two callers interleaving would desynchronise it.
+        with self._io:
+            self._proc.stdin.write(json.dumps(hdr).encode("utf-8") + b"\n")
+            self._proc.stdin.write(raw)
+            self._proc.stdin.flush()
+            r = self._reply()
+        if not r.get("ok"):
+            raise OcrError(r.get("error") or "YOLO detection failed",
+                           status=int(r.get("status", 500)))
+        return list(r.get("boxes") or [])
+
+    def kill(self):
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
+
 class YoloDetector:
     def __init__(self, model_path: str, conf: float):
         self.model_path = model_path
         self.conf = conf
         self._model = None
+        #: Set instead of `_model` when ultralytics is not importable in this
+        #: process but a venv carrying it is available (see _DetectWorker).
+        self._remote = None
         self._load_lock = threading.Lock()
 
     def ensure_loaded(self):
-        if self._model is not None:
+        if self._model is not None or self._remote is not None:
             return
         with self._load_lock:
-            if self._model is not None:
+            if self._model is not None or self._remote is not None:
                 return
-            try:
-                from ultralytics import YOLO
-            except Exception as e:
-                raise OcrError(
-                    "ultralytics is not installed (needed for detector mode). Install: "
-                    f"`pip install ultralytics`. Import error: {e}",
-                    status=503,
-                )
             import os
             if not self.model_path or not os.path.isfile(self.model_path):
                 raise OcrError(
@@ -98,12 +182,30 @@ class YoloDetector:
                     status=400,
                 )
             try:
+                from ultralytics import YOLO
+            except Exception as in_process_error:
+                # Not importable HERE is not the same as not installed. On a
+                # light-core pod image ultralytics lives beside surya, sharing
+                # the CPU torch already in that venv -- which is what makes the
+                # detector cost ~30 MB instead of a third torch. Reach it.
+                self._remote = _DetectWorker.get()
+                if self._remote is None:
+                    raise OcrError(
+                        "ultralytics is not installed (needed for detector mode) and no "
+                        "venv carrying it was found. Install: `pip install ultralytics`, "
+                        f"or bake it beside surya. Import error: {in_process_error}",
+                        status=503,
+                    )
+                return
+            try:
                 self._model = YOLO(self.model_path)
             except Exception as e:
                 raise OcrError(f"failed to load YOLO detector: {e}", status=500)
 
     def detect(self, image) -> List[dict]:
         self.ensure_loaded()
+        if self._remote is not None:
+            return self._remote.detect(image, self.model_path, self.conf)
         import numpy as np
 
         arr = np.array(image.convert("RGB"))

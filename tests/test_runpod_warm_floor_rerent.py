@@ -25,6 +25,7 @@ API.
 
 import pathlib
 import sys
+import time
 import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -279,8 +280,18 @@ def test_the_floor_is_re_established_once_the_ghost_is_gone(monkeypatch):
     monkeypatch.setattr("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a))))
     pool.maintain()
     monkeypatch.undo()
+    # Since 0.3.69 the floor is filled on BACKGROUND threads: _provision_one is
+    # "Blocking (minutes)" and calling it inline from the scaler loop stalled
+    # the registry heartbeat that shares that loop. So wait for the boot this
+    # pass started rather than reading `rented` the instant maintain() returns.
+    for _ in range(100):
+        if rented:
+            break
+        time.sleep(0.02)
     assert rented == ["rented"]
-    assert any("warm floor 1" in line and "renting one" in line for line in out), out
+    # And the wording carries the wave size now: a floor of 8 says "renting 4"
+    # when four may boot at once, which is the number an operator needs to see.
+    assert any("warm floor 1" in line and "renting 1" in line for line in out), out
 
 
 def test_a_sibling_already_renting_is_one_pod_not_none(monkeypatch):

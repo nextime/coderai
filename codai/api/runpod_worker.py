@@ -172,6 +172,13 @@ class RunpodModelConfig:
     # start billing together — so this is the knob that says how fast an
     # operator is willing to spend to absorb a burst. Growth never exceeds
     # max_pods, and the cost caps still refuse each pod individually.
+    #
+    # Also bounds filling a WARM FLOOR (min_pods, keep_warm, or a client
+    # lease). That used to rent one pod per scaler pass and block the
+    # thread until it was ready, so a declared floor of 8 took ~40 minutes
+    # to exist. A floor is a declaration rather than a prediction, so the
+    # deficit is filled at once -- but still no more of them booting
+    # together than this, because it is the same question about money.
     scale_up_max_parallel_boots: int = 4
     # Scaling DOWN again when the pressure that justified the pods is gone.
     # Idle teardown alone is not enough: it only fires on a pod with NO work and
@@ -3803,7 +3810,7 @@ class RunpodPodPool:
             healthy_n = len([p for p in self.pods if p.healthy])
             if self._release_pending and healthy_n <= keep_min:
                 self._release_pending = False          # satisfied
-        if healthy_n < keep_min and not self._closed and not self._booting:
+        if healthy_n < keep_min and not self._closed:
             # A pod that is ALREADY RUNNING for this pool beats waiting for one
             # that is booting, and beats renting a second. Tried before the
             # sibling check on purpose: after a restart the pods this deployment
@@ -3811,33 +3818,88 @@ class RunpodPodPool:
             # deferring to a sibling's boot marker left them unowned -- the pool
             # empty, the account full. Adoption is the recovery path, so it must
             # not sit behind the thing it recovers from.
+            #
+            # In a LOOP: one adoption fills one slot, and a restart orphans the
+            # whole fleet. Adopting eleven pods one scaler tick at a time took
+            # six minutes where it should take one pass.
+            # Bounded TWO ways, because `_adopt_shared_pod` returning True is a
+            # report, not a guarantee: it can succeed without the pool gaining a
+            # healthy pod (a pod registered but not yet probed, a race with the
+            # reaper). `while ... and adopt()` spun forever the first time that
+            # happened and took the scaler thread -- and with it the registry
+            # heartbeat -- down with it.
+            adopted = False
             try:
-                if self._adopt_shared_pod():
-                    return
+                for _ in range(max(0, keep_min - healthy_n)):
+                    if healthy_n >= keep_min or not self._adopt_shared_pod():
+                        break
+                    adopted = True
+                    with self._cv:
+                        got = len([p for p in self.pods if p.healthy])
+                    if got <= healthy_n:
+                        print(f"[runpod] {self.model_key!r}: adoption reported "
+                              f"success without adding a pod — not asking again "
+                              f"this pass", flush=True)
+                        break
+                    healthy_n = got
             except Exception as exc:
                 print(f"[runpod] maintain: adoption failed: {exc}", flush=True)
+            # Adopted something? Then rent NOTHING this pass, even if the floor
+            # is still short. The next pass is 15s away and will count what we
+            # just took; renting beside a fresh adoption is how one job ends up
+            # paying for two cards -- and a pool whose adoption reports success
+            # without adding a pod must not be charged for the discrepancy.
+            if healthy_n >= keep_min or adopted:
+                return
             # One already on the way (from here, from ensure_ready, or from a
             # sibling engine sharing this pool) is one pod, not none: topping up
             # against a booting pod is how a warm floor of 1 became two.
             if sibling_is_provisioning(str(self.model_key)):
                 return
+            # Fill the WHOLE deficit, not one pod per tick. A pod needs ~5
+            # minutes to have weights resident, and this used to rent exactly one
+            # per pass and then BLOCK the scaler thread until it was ready, so a
+            # client lease of 8 took ~40 minutes to become real -- measured on
+            # 2026-10-14, 15:15 to 15:42 for four of them. Bounded by the model's
+            # own `scale_up_max_parallel_boots`, which already means "how many
+            # pods may be booting at once", and by max_pods.
             with self._cv:
-                if self._booting:
+                in_hand = len([p for p in self.pods if p.healthy]) + self._booting
+                parallel = max(1, int(getattr(self.mcfg,
+                                              "scale_up_max_parallel_boots", 4) or 4))
+                want = min(keep_min - in_hand,
+                           max(0, parallel - self._booting),
+                           max(0, int(self.mcfg.max_pods or 0) - in_hand))
+                if want <= 0:
                     return
-                self._booting += 1
+                self._booting += want
             # Say so before spending. A warm floor silently failing to be
             # re-established is indistinguishable, from outside, from a warm
             # floor that is fine — which is how a pod terminated out of band
             # went unnoticed until the next request paid a cold boot.
             print(f"[runpod] {self.model_key!r}: warm floor {keep_min}, "
-                  f"{healthy_n} pod(s) healthy — renting one", flush=True)
-            try:
-                self._provision_one()
-            except Exception as exc:
-                print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
-            finally:
-                with self._cv:
-                    self._booting = max(0, self._booting - 1)
+                  f"{healthy_n} pod(s) healthy — renting {want} "
+                  f"(up to {parallel} may boot at once)", flush=True)
+            for _ in range(want):
+                # OFF the scaler thread. _provision_one blocks for minutes, and
+                # this ran inline: one warm boot stalled the registry heartbeat
+                # (same loop, every 60s) and every other pool's maintain() for
+                # the whole boot. A stalled heartbeat is what makes a sibling
+                # treat our booting pod as abandoned.
+                threading.Thread(target=self._warm_provision_one, daemon=True,
+                                 name=f"runpod-warm-{self.model_key}").start()
+
+    def _warm_provision_one(self):
+        """One warm-floor boot, on its own thread. Always gives `_booting` back:
+        a leaked increment is a pool that can never grow again."""
+        try:
+            self._provision_one()
+        except Exception as exc:
+            print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
+        finally:
+            with self._cv:
+                self._booting = max(0, self._booting - 1)
+                self._cv.notify_all()
 
     def close(self):
         self._closed = True

@@ -1,0 +1,37 @@
+# The surya CLIENT and the stamp/signature detector, on the POD — beside the
+# model they drive. CPU torch, deliberately.
+#
+# profiles/ocr.venv-surya.txt says of the same venv: "So the venv goes on the
+# ORCHESTRATOR image, never on the rented card." That was right while the
+# orchestrator held the pipeline; this image exists to invert it, and the
+# measurements are why:
+#
+#   * every page crosses the network as a base64 PNG today — ~1.06 MB per A4
+#     page at 250 DPI, where the source PDF page is ~474 KB;
+#   * a page RESUMED four times makes four internet round trips, each carrying
+#     the image again, where on the pod they are loopback;
+#   * the orchestrator pays ~105 ms/page to rasterise and holds the bitmap five
+#     times over (window, pipe, worker, surya, request body) — the accounting
+#     that got it OOM-killed twice at ~91 GB on 2026-10-14;
+#   * and surya's LOCAL line detector (DetectionPredictor, constructed in
+#     ocr_worker.load and passed into every recognition call) is a torch model
+#     running per page on a box with no GPU at all.
+#
+# WHY CPU TORCH AND NOT CUDA. Measured in the orchestrator's surya venv: nvidia
+# wheels 3196 MB + triton 896 MB + torch 1175 MB = ~5.3 GB of GPU stack. On this
+# image the GPU is already fully committed to vLLM serving the model, and the
+# one local torch workload — line detection — is small. Giving it the card would
+# take VRAM and SMs from the thing that matters; giving it the pod's spare vCPUs
+# costs nothing anyone is waiting on. So: ~250 MB instead of ~5.3 GB, and no
+# contention with vLLM.
+#
+# The detector rides the same CPU torch, which is what makes it ~30 MB here
+# rather than a third torch in the image. It is NOT accompanied by weights:
+# ocr.detect_model_path defaults to "" and the model is operator-supplied, and a
+# released image must contain no models, configs, keys or secrets.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+surya-ocr==0.22.1
+pillow<11
+# detector mode (ocr.detect_mode=detector|both). Shares the torch above.
+ultralytics>=8.1.0

@@ -80,9 +80,25 @@ def test_every_provisioning_path_tries_adoption_first():
     by booting a pod THERE, and adopting a pod elsewhere would not do that.
     """
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    calls = src.count("self._provision_one()")
-    guarded = src.count("if not self._adopt_shared_pod():")
-    adopt_first = src.count("if self._adopt_shared_pod():")
     # 5 call sites: ensure_ready, acquire, growth, warm floor, seed_region.
-    assert calls == 5
-    assert guarded + adopt_first == 4
+    assert src.count("self._provision_one()") == 5
+
+    # Per PATH rather than a global count of one spelling. The warm floor stopped
+    # matching `if not self._adopt_shared_pod():` in 0.3.69 when it became a
+    # BOUNDED loop (adoption can report success without adding a pod, and the
+    # `while` form span forever the first time it did) -- the intent held, the
+    # string did not, and a count cannot tell those apart.
+    def _body(start: str, end: str) -> str:
+        return src.split(start)[1].split(end)[0]
+
+    paths = {
+        "ensure_ready": _body("def ensure_ready", "\n    def "),
+        "acquire": _body("def acquire", "\n    def "),
+        "growth": _body("def _grow_in_background", "\n    def "),
+        "warm floor": _body("# Keep min_pods warm.", "def _warm_provision_one"),
+    }
+    for name, body in paths.items():
+        assert "_adopt_shared_pod()" in body, f"{name} does not try adoption"
+        if "_provision_one" in body:
+            assert body.index("_adopt_shared_pod()") < body.index("_provision_one"), (
+                f"{name} rents before it tries adoption")

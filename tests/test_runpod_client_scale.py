@@ -337,9 +337,15 @@ def test_ensure_ready_marks_the_pool_as_provisioning():
 
 
 def test_the_warm_top_up_does_not_stack_on_a_booting_pod():
+    """A floor of 1 must not become 2 by topping up against a pod already
+    booting. 0.3.69 fills a floor in waves rather than one pod per pass, so
+    the old `not self._booting` guard is gone and the intent is arithmetic:
+    `_booting` is counted in `in_hand`, so the deficit a wave may request is
+    already reduced by whatever is on the way."""
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def maintain")[1].split("def close")[0]
-    assert "not self._booting" in blk
+    assert "in_hand = len([p for p in self.pods if p.healthy]) + self._booting" in blk
+    assert "want = min(keep_min - in_hand," in blk
     assert "sibling_is_provisioning" in blk
 
 

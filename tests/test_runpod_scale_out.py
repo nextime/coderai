@@ -169,14 +169,23 @@ def test_the_counters_exist_without___init__():
 
 
 def test_the_single_flight_paths_ask_how_many_not_whether():
-    """ensure_ready (the FIRST pod) and the warm-floor top-up must still be
-    single-flight — they are not allowed to grow a fleet — so they check the
-    count directly rather than a boolean that scale-up also writes."""
+    """ensure_ready (the FIRST pod) must still be single-flight: one request may
+    not rent a fleet, so it checks the count directly rather than a boolean that
+    scale-up also writes.
+
+    The warm-floor top-up deliberately is NOT single-flight any more (0.3.69). A
+    floor is a DECLARATION — min_pods, keep_warm, or a client lease already said
+    how many pods should be warm — so filling it is not speculative. One pod per
+    pass, each taking ~5 minutes, made a declared floor of 8 take ~40 minutes to
+    exist. It is bounded instead by the model's own scale_up_max_parallel_boots,
+    and `_booting` is counted so a wave cannot overshoot the floor."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
     ready = src.split("def ensure_ready")[1].split("\n    def ")[0]
     assert "if self._booting:" in ready and "self._booting += 1" in ready
     maint = src.split("def maintain")[1].split("\n    def ")[0]
-    assert "not self._booting" in maint
+    assert "scale_up_max_parallel_boots" in maint
+    assert "parallel - self._booting" in maint
+    assert "+ self._booting" in maint, "a wave must count what is already booting"
 
 
 def test_the_counter_returns_to_zero_after_a_scale_up():

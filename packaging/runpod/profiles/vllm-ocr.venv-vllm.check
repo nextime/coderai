@@ -1,18 +1,35 @@
-# Deep check for the pinned-0.20.1 vllm venv: the OpenAI server module must
-# import, and the version must be the one this image exists to pin — a silent
-# resolve to something newer would defeat the whole point of the image.
+# Deep check for the vllm venv: the OpenAI server module must import, and the
+# version must MATCH the plain `vllm` profile rather than being pinned away from
+# it. Two images serving the same weights on two different vLLMs is an invisible
+# difference, and this image used to be exactly that.
+import pathlib
 import vllm.entrypoints.openai.api_server                 # noqa
 import torch, vllm
 print("vllm", vllm.__version__, "torch", torch.__version__, "cuda", torch.version.cuda)
-assert vllm.__version__.startswith("0.20."), (
-    "this image exists to pin vLLM 0.20.x (what surya-ocr validates against); "
-    "got %s" % vllm.__version__)
+
+# The pin lives in profiles/vllm.venv-vllm.txt; read it rather than restate it,
+# so bumping the fleet cannot silently leave this image behind.
+_want = ""
+for _p in ("/tmp/venv-profiles/vllm.venv-vllm.txt",
+           "packaging/runpod/profiles/vllm.venv-vllm.txt"):
+    _f = pathlib.Path(_p)
+    if _f.is_file():
+        for _line in _f.read_text().splitlines():
+            if _line.strip().startswith("vllm=="):
+                _want = _line.strip().split("==", 1)[1].split("+")[0]
+        break
+if _want:
+    assert vllm.__version__.startswith(_want), (
+        "this image must serve the same vLLM as profiles/vllm (%s); got %s"
+        % (_want, vllm.__version__))
+    print("vllm matches the fleet profile:", _want)
+else:
+    print("could not read the fleet's vllm pin; version match not enforced here")
 
 # Surya-2 is Qwen3.5-VL, so the architecture has to be in this vLLM's registry or
-# the pod cannot serve the model at all. Checked through the registry's own
-# lookup where one is exposed and reported-not-enforced otherwise: the private
-# table has been renamed before, and failing a BUILD on the name of a private
-# symbol would be failing for the wrong reason.
+# the pod cannot serve the model at all. Reported-not-enforced where the registry
+# cannot be enumerated: the private table has been renamed before, and failing a
+# BUILD on the name of a private symbol would be failing for the wrong reason.
 _ARCH = "Qwen3_5ForConditionalGeneration"
 try:
     from vllm.model_executor.models import registry as _reg

@@ -250,19 +250,26 @@ def test_it_defaults_on():
 
 
 # ------------------------------------------- option 2: the pinned-vLLM image #
-def test_the_vllm_ocr_profile_exists_and_pins_the_version_surya_validates():
-    """Surya spawns `vllm/vllm-openai:v0.20.1` (surya/settings.py:96). Serving the
-    same weights on 0.27.1 is what loses the accents, so the second half of the
-    answer is an image on the version its authors test."""
+def test_the_vllm_ocr_profile_runs_the_SAME_vllm_as_the_fleet():
+    """This image was built to pin vLLM 0.20.1 — the version surya spawns
+    (surya/settings.py:96) — because a page of crisp synthetic Italian came back
+    from 0.27.1 with one U+FFFD per accented letter.
+
+    The pin was the wrong conclusion from a real measurement: surya-ocr-2's
+    tokenizer is BYTE-level, so a U+FFFD per accent does not show the model
+    choosing it, and the Digesta fleet has since been reading accented Italian on
+    0.27.1 (`coderai-vllm`). Two images serving the same weights on two vLLMs is
+    an invisible difference, and that difference cost three rounds of blaming the
+    pod image. So the pins must be IDENTICAL, and 0.3.69 repurposed this image
+    for what actually distinguishes it: the OCR pipeline on the pod."""
     import pathlib
     prof = pathlib.Path(__file__).resolve().parents[1] / "packaging/runpod/profiles"
-    reqs = (prof / "vllm-ocr.venv-vllm.txt").read_text()
-    assert "vllm==0.20.1+cu129" in reqs
-    # The torch triple is vLLM 0.20.1's own metadata, not a guess.
-    assert "torch==2.11.0+cu129" in reqs
-    assert "torchvision==0.26.0+cu129" in reqs
-    assert "torchaudio==2.11.0+cu129" in reqs
-    # uv, because pip cannot resolve this pin set (as for the 0.27.1 profile).
+    fleet = [l.strip() for l in (prof / "vllm.venv-vllm.txt").read_text().splitlines()
+             if l.strip() and not l.strip().startswith("#")]
+    ours = [l.strip() for l in (prof / "vllm-ocr.venv-vllm.txt").read_text().splitlines()
+            if l.strip() and not l.strip().startswith("#")]
+    assert ours == fleet, "the OCR image drifted from the fleet's vLLM again"
+    # uv, because pip cannot resolve this pin set.
     assert (prof / "vllm-ocr.venv-vllm.uv").exists()
     # The light core, like the profile it is derived from.
     assert (prof / "vllm-ocr.light").exists()
@@ -270,15 +277,29 @@ def test_the_vllm_ocr_profile_exists_and_pins_the_version_surya_validates():
     assert "gcc" in (prof / "vllm-ocr.apt").read_text()
 
 
-def test_the_build_check_refuses_a_silent_version_drift():
-    """The whole point of the image is the pin. If uv resolved something newer the
-    build has to fail rather than produce an image that looks right."""
+def test_the_build_check_refuses_a_silent_drift_from_the_fleet():
+    """The check no longer asserts a hardcoded version — it READS the fleet's pin
+    from disk and requires a match, so bumping profiles/vllm cannot silently
+    leave the OCR image behind on an older vLLM."""
     import pathlib
     prof = pathlib.Path(__file__).resolve().parents[1] / "packaging/runpod/profiles"
     check = (prof / "vllm-ocr.venv-vllm.check").read_text()
-    assert 'startswith("0.20.")' in check
+    assert "vllm.venv-vllm.txt" in check, "the check does not read the fleet pin"
+    assert "vllm.__version__.startswith(_want)" in check
     # ...but it must not fail the build on the NAME of a private vLLM symbol.
     assert "except ImportError" in check
+
+
+def test_the_pipeline_is_what_distinguishes_the_ocr_image():
+    """Since the vLLM versions match, the surya client venv IS the difference."""
+    import pathlib
+    prof = pathlib.Path(__file__).resolve().parents[1] / "packaging/runpod/profiles"
+    assert (prof / "vllm-ocr.venv-surya.txt").exists()
+    surya = (prof / "vllm-ocr.venv-surya.txt").read_text()
+    assert "surya-ocr==" in surya
+    assert "pillow<11" in surya
+    # and the rasteriser, in the main venv, because the pod renders its own page
+    assert "pypdfium2" in (prof / "vllm-ocr.txt").read_text()
 
 
 def test_the_profile_is_discoverable_by_the_builder():

@@ -35,3 +35,38 @@
 # NOT a drop-in replacement for `vllm`: 0.20.1 is seven minor releases behind,
 # and anything else that image serves would be pinned back with it. Rent this
 # one for the OCR model only.
+
+# ---------------------------------------------------------------------------
+# WHAT THIS IMAGE IS NOW (0.3.69)
+#
+# Not "a different vLLM" — that difference is gone, this profile's venv-vllm.txt
+# is byte-identical to profiles/vllm.venv-vllm.txt and its check enforces that.
+# It is "the OCR PIPELINE on the pod": the surya client venv sits beside the
+# model, so the orchestrator sends a ONE-PAGE PDF and the card rasterises and
+# reads it, instead of shipping a ~1 MB base64 PNG per page across the internet
+# and resuming cut-off pages over four more round trips of the same.
+#
+# The main venv therefore needs the rasteriser. It must NOT grow a torch: this
+# is a light-core image and Dockerfile.capability fails the build if torch
+# reaches the main venv.
+#
+# STAMP/SIGNATURE DETECTION STAYS ON THE ORCHESTRATOR, deliberately, and this
+# image is not missing anything by not carrying it:
+#
+#   * `detect.py` imports ultralytics IN-PROCESS, and ultralytics brings torch.
+#     Putting it here means either a third torch in the image (main + vllm venv
+#     + surya venv, ~+2.5 GB compressed, slower pulls, and a slower warm floor)
+#     or a fourth venv plus a detect worker to reach it.
+#   * There is no model to carry anyway: `ocr.detect_model_path` defaults to ""
+#     and the weights are operator-supplied. Baking them would also break the
+#     rule that a released image contains no models, configs, keys or secrets.
+#   * And the orchestrator does not need the pod's help: it SPLIT the page, so
+#     it still holds that one-page PDF and can render it locally when — and only
+#     when — detection is enabled. `detect_mode` is off by default, so most
+#     installs pay nothing, and a detector hunting stamps does not need OCR
+#     resolution: at 100 DPI an A4 page is 0.97 Mpixels against 6.04 at 250.
+#
+# So `detect_mode` works the same in both modes. What differs is only WHERE the
+# pixels come from, and in neither case do they cross the network twice.
+pypdfium2>=4.20.0             # rasterise the page ON the card; no system poppler
+jsonschema>=4.0.0             # structured-extraction schemas are validated here

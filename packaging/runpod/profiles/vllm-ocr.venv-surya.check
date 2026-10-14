@@ -1,0 +1,28 @@
+# Deep check for the surya+detector venv on the POD.
+import PIL
+from PIL import Image                                       # noqa
+
+assert int(PIL.__version__.split(".")[0]) < 11, f"pillow {PIL.__version__} — surya caps <11"
+
+# The predictors ocr_worker.load() actually constructs.
+from surya.detection import DetectionPredictor              # noqa
+from surya.recognition import RecognitionPredictor          # noqa
+
+import surya
+import torch
+print("surya", getattr(surya, "__version__", "ok"), "pillow", PIL.__version__)
+print("torch", torch.__version__)
+
+# CPU on purpose, and asserted: a CUDA torch resolving in here silently adds
+# ~5.3 GB (nvidia 3196 MB + triton 896 MB + torch 1175 MB measured) AND puts
+# surya's local line detector on the card vLLM is serving the model from.
+assert torch.version.cuda is None, (
+    "this venv must hold a CPU torch (got cuda %s): the GPU belongs to vLLM, "
+    "and a CUDA build costs ~5.3 GB of image for a workload that does not want "
+    "the card" % torch.version.cuda)
+
+# The detector runs here too, sharing that torch — which is the whole reason it
+# costs ~30 MB instead of a third torch.
+from ultralytics import YOLO                                # noqa
+import ultralytics
+print("ultralytics", getattr(ultralytics, "__version__", "ok"), "on cpu torch")
