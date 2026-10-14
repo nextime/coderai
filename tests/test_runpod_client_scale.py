@@ -390,7 +390,13 @@ def test_the_warm_path_adopts_before_it_rents():
     assert "_adopt_shared_pod()" in ready
     assert ready.index("_adopt_shared_pod()") < ready.index("self._provision_one()")
     warm = src.split("def maintain")[1].split("def close")[0]
-    assert "if not self._adopt_shared_pod():" in warm
+    # Spelling changed in 0.3.68: adoption moved ABOVE the sibling-boot check
+    # and now returns early, because a restart's own orphans were sitting behind
+    # the stale boot marker that the restart created. The intent this test
+    # guards -- adopt before renting -- is stronger than before, so assert the
+    # intent rather than the old line. See tests/test_runpod_restart_orphans.py.
+    assert "_adopt_shared_pod()" in warm
+    assert warm.index("_adopt_shared_pod()") < warm.index("self._provision_one()")
 
 
 def test_adoption_is_one_implementation_for_both_callers():

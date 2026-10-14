@@ -3021,6 +3021,12 @@ class RunpodPodPool:
             # …and from every SIBLING engine's reaper, which cannot see the set
             # above: each engine has its own pools and its own reaper.
             register_pod(pod_id, str(self.model_key), api_key=self.api_key,
+                         # The rate is known HERE, not only once the pod is
+                         # ready. A boot interrupted by a restart or a crash
+                         # leaves an entry that bills at a real $/hr, and
+                         # without this the reaper could only say "the registry
+                         # records no rate for it" and drop the money.
+                         hourly_usd=float(sel.get("price") or 0.0),
                          image=str(self._image or ""),
                          gpu=str(sel["display_name"]))   # url once ready
             _warn = weight_transfer_warning(_model_entry(self.served or self.model_key),
@@ -3798,6 +3804,18 @@ class RunpodPodPool:
             if self._release_pending and healthy_n <= keep_min:
                 self._release_pending = False          # satisfied
         if healthy_n < keep_min and not self._closed and not self._booting:
+            # A pod that is ALREADY RUNNING for this pool beats waiting for one
+            # that is booting, and beats renting a second. Tried before the
+            # sibling check on purpose: after a restart the pods this deployment
+            # rented a minute ago are running, registered and billing, and
+            # deferring to a sibling's boot marker left them unowned -- the pool
+            # empty, the account full. Adoption is the recovery path, so it must
+            # not sit behind the thing it recovers from.
+            try:
+                if self._adopt_shared_pod():
+                    return
+            except Exception as exc:
+                print(f"[runpod] maintain: adoption failed: {exc}", flush=True)
             # One already on the way (from here, from ensure_ready, or from a
             # sibling engine sharing this pool) is one pod, not none: topping up
             # against a booting pod is how a warm floor of 1 became two.
@@ -3814,8 +3832,7 @@ class RunpodPodPool:
             print(f"[runpod] {self.model_key!r}: warm floor {keep_min}, "
                   f"{healthy_n} pod(s) healthy — renting one", flush=True)
             try:
-                if not self._adopt_shared_pod():
-                    self._provision_one()
+                self._provision_one()
             except Exception as exc:
                 print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
             finally:
@@ -4486,8 +4503,13 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
                           "image": str(image or (was or {}).get("image") or ""),
                           "gpu": str(gpu or (was or {}).get("gpu") or ""),
                           # So a pod adopted after a restart is still attributed
-                          # its real $/hr instead of looking free.
-                          "hourly_usd": float(hourly_usd or 0.0)}
+                          # its real $/hr instead of looking free. Carried over
+                          # like image/gpu: a re-registration that does not know
+                          # the rate must not overwrite one that did, or an
+                          # adoption turns a billing pod free.
+                          "hourly_usd": float(hourly_usd
+                                              or (was or {}).get("hourly_usd")
+                                              or 0.0)}
         return True
 
     _registry_update(_write)
@@ -4523,8 +4545,22 @@ def touch_registered_pods() -> int:
     return touched[0]
 
 
+#: How long a URL-less registry entry may go un-heartbeated before it stops
+#: meaning "a sibling is booting this". The heartbeat runs every 60s, so three
+#: missed beats is a dead owner -- not a slow one.
+#:
+#: This used to be REAP_GRACE_SECONDS (1200s), which conflated two unrelated
+#: questions: "is a sibling still booting?" (answered by the heartbeat) and "how
+#: long before the reaper may kill an unowned pod?" (deliberately generous). The
+#: cost was paid live on 2026-10-14: a deploy restarted coderai mid-boot, the
+#: previous incarnation's URL-less entry looked like a live sibling for twenty
+#: minutes, and because this check runs BEFORE adoption the pool could neither
+#: rent nor adopt -- six pods billing on the account and none in the interface.
+PROVISION_STALE_SECONDS = 180.0
+
+
 def sibling_is_provisioning(pool_key: str) -> bool:
-    """True when another process has a pod for this pool that is still booting.
+    """True when another LIVE process has a pod for this pool that is booting.
 
     Registered at creation with no URL yet. Without this the sibling rents its
     own during the ~2.5 minutes a pod takes to boot — which is exactly what
@@ -4539,9 +4575,10 @@ def sibling_is_provisioning(pool_key: str) -> bool:
             continue
         if _is_this_process(info) or info.get("url"):
             continue
-        # Only while it could plausibly still be booting; a stale entry from a
-        # dead process must not block provisioning forever.
-        if now - float(info.get("at") or 0) < REAP_GRACE_SECONDS:
+        # Only while its owner is still TALKING. A heartbeat that stopped means
+        # the process that was booting this pod is gone, and waiting on it is
+        # waiting forever -- while the pod it rented bills.
+        if now - float(info.get("at") or 0) < PROVISION_STALE_SECONDS:
             return True
     return False
 

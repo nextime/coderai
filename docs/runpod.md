@@ -25,6 +25,37 @@ deployment — see [RunPod-only deployments](#runpod-only-deployments).
 
 ---
 
+## A restart mid-boot used to freeze the pool
+
+Observed live 2026-10-14: six pods billing on the account, none in coderai's
+interface, and this every fifteen seconds for seven minutes —
+
+```
+[runpod] another engine is booting a pod for 'datalab-to/surya-ocr-2' — waiting for it
+```
+
+Nothing was booting. A deploy had restarted coderai while a pod was mid-boot,
+leaving that pod's URL-less registry entry behind with no owner. Two separate
+decisions turned a dead marker into a frozen pool:
+
+* `sibling_is_provisioning()` judged the entry's liveness against
+  `REAP_GRACE_SECONDS` (1200s). That constant answers a different question — how
+  long the reaper waits before killing an unowned pod — and the registry has a
+  **60-second heartbeat**, so a dead owner is detectable in seconds. Now
+  `PROVISION_STALE_SECONDS` (180s, three missed beats).
+* the sibling check ran **before** `_adopt_shared_pod()`. So the recovery path
+  for orphaned pods sat behind the marker that orphaning creates, and five
+  running, registered, billing pods were never adopted. Adoption now runs first:
+  a pod already serving this pool beats both waiting for a boot and renting.
+
+Money, same incident: a pod registered at *creation* recorded no `$/hr` (the rate
+was passed only at the ready-registration), so a boot interrupted before ready
+could only ever be reaped with `the registry records no rate for it`. The price
+is known at creation and is recorded there. And `hourly_usd` is now carried over
+on re-registration like `image` and `gpu` were — an adoption that did not know
+the rate used to turn a billing pod free.
+
+
 ## 1. Account setup
 
 **Settings → RunPod** (the Settings page is split into category tabs; RunPod is
