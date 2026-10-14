@@ -6,8 +6,8 @@
 # U+FFFD per accented letter. The pin was the wrong conclusion from a real
 # measurement: surya-ocr-2's tokenizer is BYTE-level, so a U+FFFD per accent
 # does not show the model chose it — it shows bytes being split and decoded
-# separately somewhere downstream. The Digesta fleet has since been serving
-# surya-ocr-2 on 0.27.1 (`coderai-vllm`) and reading accented Italian.
+# separately somewhere downstream. A production fleet has since been serving
+# surya-ocr-2 on 0.27.1 (`coderai-vllm`) and reading accented text correctly.
 #
 # So the version difference is gone and the reason for this image changed: it is
 # no longer "a different vLLM" but "the OCR PIPELINE on the pod" — the surya
@@ -15,7 +15,7 @@
 # rasterised and read on the card instead of crossing the network as a bitmap.
 # Keep this list identical to profiles/vllm.venv-vllm.txt: two images serving
 # the same weights on two vLLMs is exactly the invisible difference that cost
-# the Digesta dev three rounds of blaming the pod image.
+# three rounds of blaming a pod image for an orchestrator bug.
 --extra-index-url https://wheels.vllm.ai/0.27.1/cu129
 --extra-index-url https://download.pytorch.org/whl/cu129
 vllm==0.27.1+cu129

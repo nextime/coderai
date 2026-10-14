@@ -11,3 +11,27 @@ geographiclib>=2.0
 # recognition works without one.
 pytorch_lightning>=2.0.0
 pytorch_metric_learning>=2.0.0
+
+# ---------------------------------------------------------------------------
+# bge-m3 MULTI-VECTOR (dense + sparse + colbert) runs HERE, and only here.
+#
+# Hybrid retrieval wants dense AND sparse from one pass. Those extra vectors
+# come from linear heads (sparse_linear.pt / colbert_linear.pt) applied to the
+# last hidden state -- a transformers forward pass, not an embedding server's
+# output.
+# So:
+#
+#   * THIS image serves them. It is FULL core, so torch and transformers are in
+#     the main venv, and codai/api/embeddings._is_bge_m3() picks the native
+#     multi-vector backend automatically from the presence of sparse_linear.pt
+#     in the repo. Nothing to configure.
+#
+#   * `coderai-vllm` CANNOT, and not for want of a setting: it is a LIGHT-core
+#     image with no torch in its main venv by design, so _load_bge_m3 cannot
+#     even import. vLLM serves embeddings dense only. Asking that pod for
+#     sparse now returns a 400 naming this, rather than a normal-looking
+#     dense-only response that quietly halves a hybrid search.
+#
+# transformers is already pinned above for exactly this (and the heads are plain
+# Linear layers, so FlagEmbedding -- which pins older transformers/peft -- is
+# deliberately NOT a dependency).

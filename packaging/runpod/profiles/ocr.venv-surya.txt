@@ -14,8 +14,8 @@
 # ~250 MB for a CPU build. The `ocr` profile's own card runs docTR and (when
 # baked) surya's local line detector; a CUDA resolve here is ~5 GB of image for
 # a venv that, on a GPU-less orchestrator, can never execute any of it --
-# `torch.cuda.is_available()` is False on the Digesta orchestrator today while
-# its surya venv carries cu130.
+# `torch.cuda.is_available()` is False on a GPU-less orchestrator while its
+# surya venv carries a cu130 build -- measured, and not a hypothetical.
 #
 # Set an explicit CUDA pin here if you WANT surya's line detection on the card.
 --extra-index-url https://download.pytorch.org/whl/cpu

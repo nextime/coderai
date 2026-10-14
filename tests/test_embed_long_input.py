@@ -251,3 +251,109 @@ def test_the_clip_family_is_left_truncating_on_purpose():
     blk = src.split("def _embed_texts(")[1].split("def _embed_images(")[0]
     clip = blk.split("elif backend == 'clip':")[1].split("elif backend ==")[0]
     assert "_embed_long(" not in clip
+
+
+# ------------------------------------------- multi-vector, merged per type #
+#
+# A long input on the bge-m3 multi-vector path needs all three outputs merged,
+# and none of the three is a free choice: each is what the encoder ALREADY does
+# within one window, extended across windows. Getting these wrong degrades
+# retrieval in a way that reads as a model problem, so they are pinned here.
+def test_one_window_passes_through_untouched():
+    part = {"dense": [1.0, 0.0], "sparse": {5: 0.5}, "colbert": [[1.0, 0.0]]}
+    assert em._bge_m3_merge([part], ("dense", "sparse", "colbert")) is part
+
+
+def test_dense_is_mean_pooled_and_renormalized():
+    """Dense is an L2-normalized CLS vector; a mean of unit vectors is not one,
+    and cosine similarity on a non-unit vector is quietly wrong."""
+    out = em._bge_m3_merge([{"dense": [1.0, 0.0]}, {"dense": [0.0, 1.0]}],
+                           ("dense",))
+    v = out["dense"]
+    assert math.isclose(math.sqrt(sum(x * x for x in v)), 1.0, rel_tol=1e-9)
+    assert math.isclose(v[0], v[1], rel_tol=1e-9)
+
+
+def test_sparse_takes_the_MAX_per_token_id():
+    """The encoder max-pools per token id inside a window already
+    (scatter_reduce amax), and max is what retrieval wants: a term's weight is
+    its strongest occurrence, not an average diluted by the pages that never
+    mention it."""
+    out = em._bge_m3_merge([{"sparse": {5: 0.2, 9: 0.9}},
+                            {"sparse": {5: 0.7, 11: 0.1}}], ("sparse",))
+    assert out["sparse"] == {5: 0.7, 9: 0.9, 11: 0.1}
+
+
+def test_sparse_averaging_would_be_wrong():
+    """Guard against someone 'tidying' max into mean: a term appearing strongly
+    on one page of forty must not be diluted to a fortieth of its weight."""
+    parts = [{"sparse": {7: 1.0}}] + [{"sparse": {}} for _ in range(39)]
+    out = em._bge_m3_merge(parts, ("sparse",))
+    assert out["sparse"][7] == 1.0
+
+
+def test_colbert_token_vectors_are_concatenated():
+    """Colbert scores max-sim of each query token against ALL document token
+    vectors, so every content token of every window belongs in the list."""
+    out = em._bge_m3_merge([{"colbert": [[1.0], [2.0]]},
+                            {"colbert": [[3.0]]}], ("colbert",))
+    assert out["colbert"] == [[1.0], [2.0], [3.0]]
+
+
+def test_only_the_requested_types_are_merged():
+    out = em._bge_m3_merge([{"dense": [1.0, 0.0], "sparse": {1: 1.0}},
+                            {"dense": [0.0, 1.0], "sparse": {2: 1.0}}],
+                           ("dense",))
+    assert "dense" in out and "sparse" not in out
+
+
+def test_first_pooling_keeps_the_opening_window_only():
+    """For an operator who would rather have the old truncating behaviour, said
+    explicitly rather than by accident."""
+    a = {"dense": [1.0, 0.0], "sparse": {1: 1.0}}
+    b = {"dense": [0.0, 1.0], "sparse": {2: 1.0}}
+    assert em._bge_m3_merge([a, b], ("dense", "sparse"), "first") is a
+
+
+def test_merging_nothing_is_empty_not_a_crash():
+    assert em._bge_m3_merge([], ("dense",)) == {}
+
+
+def test_a_missing_type_in_a_window_does_not_break_the_merge():
+    out = em._bge_m3_merge([{"dense": [1.0, 0.0]}, {}], ("dense", "sparse"))
+    assert out["dense"]
+    assert out["sparse"] == {}
+
+
+def test_the_multi_vector_path_windows_long_inputs():
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    # Split on the next TOP-LEVEL def (column 0): the body contains a nested
+    # `def _run()`, and splitting on "def " cut the slice before the windowing.
+    fn = src.split("async def _bge_m3_response")[1].split("\ndef ")[0]
+    assert "_token_windows(" in fn
+    assert "_bge_m3_merge(" in fn
+
+
+# ------------------------------------- dense-only backends say so out loud #
+def test_sparse_on_a_dense_only_backend_is_refused_with_the_reason():
+    """It used to be ignored: a caller asking for sparse got a normal-looking
+    dense response, and its hybrid retrieval then ran on half the signal and
+    merely scored worse -- which reads as a model problem."""
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    assert "DENSE vectors only" in src
+    assert "coderai-embeddings" in src, "the message must name where it DOES work"
+    assert "no torch in its main venv" in src, (
+        "the message must say why the vllm image cannot, not just that it cannot")
+
+
+def test_the_refusal_is_a_400_not_a_500():
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    blk = src.split("_extra = [t for t in _want_types")[1].split("# Text vectors first")[0]
+    assert "status_code=400" in blk
+
+
+def test_dense_only_requests_are_untouched():
+    """Asking for nothing, or for dense, must not start failing."""
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    blk = src.split("_want_types = [")[1].split("raise HTTPException")[0]
+    assert "t != 'dense'" in blk

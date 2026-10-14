@@ -1323,6 +1323,59 @@ def _bge_m3_encode(model_obj, texts: List[str], types, max_length: int = 8192):
     return results
 
 
+def _bge_m3_merge(parts: List[dict], types, pool: str = "mean") -> dict:
+    """Merge one text's per-window bge-m3 results into one.
+
+    None of these three is a free choice: each is what the encoder ALREADY does
+    within a single window, extended across windows.
+
+      dense    mean of the window vectors, RE-NORMALIZED. Dense is an
+               L2-normalized CLS vector, and a mean of unit vectors is not one;
+               a caller doing cosine similarity on it would get quietly wrong
+               numbers.
+      sparse   MAX per token id. The encoder max-pools per token id inside a
+               window already (`scatter_reduce_(..., reduce='amax')`), and max
+               is also what retrieval wants: a term's weight is its strongest
+               occurrence in the document, not an average diluted by the pages
+               that do not mention it.
+      colbert  CONCATENATED. Colbert scores max-sim of each query token against
+               ALL document token vectors, so every content token of every
+               window belongs in the list. Note this grows with the document --
+               a 40-page input yields 40 windows' worth of token vectors.
+
+    `pool="first"` keeps only the opening window, for an operator who would
+    rather have the old truncating behaviour explicitly.
+    """
+    if not parts:
+        return {}
+    if len(parts) == 1:
+        return parts[0]
+    if pool == "first":
+        return parts[0]
+    out: dict = {}
+    if 'dense' in types:
+        import math
+        vecs = [p['dense'] for p in parts if p.get('dense')]
+        if vecs:
+            n = len(vecs)
+            mean = [sum(col) / n for col in zip(*vecs)]
+            norm = math.sqrt(sum(x * x for x in mean)) or 1.0
+            out['dense'] = [x / norm for x in mean]
+    if 'sparse' in types:
+        merged: dict = {}
+        for p in parts:
+            for tid, w in (p.get('sparse') or {}).items():
+                if w > merged.get(tid, 0.0):
+                    merged[tid] = w
+        out['sparse'] = merged
+    if 'colbert' in types:
+        toks = []
+        for p in parts:
+            toks.extend(p.get('colbert') or [])
+        out['colbert'] = toks
+    return out
+
+
 async def _bge_m3_response(request, model_obj, texts, _emb_cfg):
     """Build the extended /v1/embeddings response for a bge-m3 model: dense in the usual
     `embedding` field, plus `sparse_embedding` / `colbert_embedding` per requested type.
@@ -1347,9 +1400,41 @@ async def _bge_m3_response(request, model_obj, texts, _emb_cfg):
             raise HTTPException(status_code=400,
                                 detail=f"This model has no {t} head.")
     max_len = int(_emb_cfg.get('n_ctx') or _raw.get('n_ctx') or 8192)
+    # Long inputs: window them rather than letting the tokenizer's
+    # `truncation=True` keep the opening and say nothing. bge-m3's window is
+    # 8192 tokens -- roughly 6000 words, 15-20 pages -- so this bites on whole
+    # documents rather than passages, and when it bites it was invisible.
+    _mode, _pool = _embed_chunk_cfg(getattr(model_obj, 'name', None)
+                                    or getattr(request, 'model', None))
+    _tokzr = model_obj.model[0]
+    _chunks: List[int] = []
 
     def _run():
-        return _bge_m3_encode(model_obj, texts, types, max_len)
+        if _mode == "truncate":
+            return _bge_m3_encode(model_obj, texts, types, max_len)
+
+        def _enc(t):
+            return _tokzr.encode(t, add_special_tokens=True)
+
+        def _dec(ids):
+            return _tokzr.decode(ids, skip_special_tokens=True)
+
+        windows, owner = [], []
+        for idx, t in enumerate(texts):
+            ws = _token_windows(t, max(64, max_len - 16), _enc, _dec)
+            if len(ws) > 1 and _mode == "error":
+                raise ValueError(
+                    f"input {idx} needs {len(ws)} windows of {max_len} tokens; "
+                    f"embed_long_input=error refuses to merge it.")
+            _chunks.append(len(ws))
+            for w in ws:
+                windows.append(w)
+                owner.append(idx)
+        flat = _bge_m3_encode(model_obj, windows, types, max_len)
+        grouped = [[] for _ in texts]
+        for part, idx in zip(flat, owner):
+            grouped[idx].append(part)
+        return [_bge_m3_merge(g, types, _pool) for g in grouped]
 
     try:
         results = await asyncio.get_event_loop().run_in_executor(None, _run)
@@ -1996,6 +2081,40 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     # bypassing the dense-only vector pipeline below.
     if getattr(model_obj, 'backend', None) == 'bge-m3':
         return await _bge_m3_response(request, model_obj, texts, _emb_cfg)
+
+    # SPARSE/COLBERT ASKED OF A DENSE-ONLY BACKEND. Until 0.3.73 the
+    # `embedding_types` field was simply ignored here: a caller asking for
+    # sparse got a normal-looking response with only `embedding` in it and no
+    # indication that half of what it asked for does not exist on this path.
+    # Silence is the worst answer -- the caller's hybrid retrieval then runs on
+    # dense alone and merely scores worse, which reads as a model problem.
+    #
+    # vLLM is the case that matters in practice: it serves embeddings DENSE
+    # ONLY. bge-m3's sparse and colbert come from extra linear heads
+    # (sparse_linear.pt / colbert_linear.pt) applied to the last hidden state,
+    # which is a transformers forward pass this backend does not do. And a
+    # `coderai-vllm` pod cannot fall back to the native path either: it is a
+    # LIGHT-core image with no torch in its main venv by design, so
+    # _load_bge_m3 could not even import. The image that serves multi-vector is
+    # `coderai-embeddings` (full core, torch + transformers), where
+    # _is_bge_m3() detects the head and picks the path automatically.
+    _want_types = [str(t).strip().lower()
+                   for t in (getattr(request, 'embedding_types', None) or [])
+                   if str(t).strip()]
+    _extra = [t for t in _want_types if t and t != 'dense']
+    if _extra:
+        _b = getattr(model_obj, 'backend', None) or 'this backend'
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Model '{model_name}' is being served by {_b}, which produces "
+                    f"DENSE vectors only — {', '.join(sorted(set(_extra)))} is not "
+                    f"available on this path. bge-m3's sparse/colbert come from "
+                    f"extra linear heads over the last hidden state, which needs "
+                    f"the native transformers backend. Serve the model on the "
+                    f"coderai-embeddings image (full core: torch + transformers), "
+                    f"where the multi-vector backend is selected automatically "
+                    f"from the repo's sparse_linear.pt. A coderai-vllm pod cannot "
+                    f"do it: no torch in its main venv, by design."))
 
     # Text vectors first, then image vectors — indices follow that order.
     vectors: List[List[float]] = []
