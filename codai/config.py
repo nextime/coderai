@@ -992,6 +992,15 @@ class OcrConfig:
     # at 32), so a window is never smaller than the work the engines can take nor
     # large enough to reintroduce the problem.
     page_window: int = 0
+    # How many PROCESSES may rasterise PDFs at once. pdfium permits one caller at
+    # a time, so in-process rasterisation is single-threaded however many cores
+    # the box has -- which 0.3.66 made explicit with a lock after concurrent
+    # access corrupted pdfium and reported "Data format error" on valid files.
+    # pdfium IS safe one-document-per-process, so the throughput comes back from
+    # workers (codai/ocr/workers/raster_worker.py), one document each.
+    # 0 = auto (half the cores, at most 4). 1 = rasterise in-process under the
+    # lock: no IPC and no extra processes, which a small host may prefer.
+    raster_workers: int = 0
     # Default document language when a request names none. "auto" (the shipped
     # default) means let the engine recognise what it finds: surya-2, olmOCR and
     # docTR are multilingual and have no language input at all, and PaddleOCR --
@@ -1917,6 +1926,7 @@ class ConfigManager:
                 "max_concurrency": self.config.ocr.max_concurrency,
                 "max_resident_mb": self.config.ocr.max_resident_mb,
                 "page_window": self.config.ocr.page_window,
+                "raster_workers": self.config.ocr.raster_workers,
                 "lang": self.config.ocr.lang,
                 "paddle_enabled": self.config.ocr.paddle_enabled,
                 "paddle_use_gpu": self.config.ocr.paddle_use_gpu,

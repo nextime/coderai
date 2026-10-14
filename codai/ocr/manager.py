@@ -1145,6 +1145,13 @@ class OcrManager:
             out["unreadable"] = report
         return out
 
+    def _raster_workers(self, cfg) -> int:
+        """How many processes may rasterise at once. 0 = auto, 1 = in-process."""
+        try:
+            return max(0, int(getattr(cfg, "raster_workers", 0) or 0))
+        except Exception:
+            return 0
+
     def _page_window(self, cfg) -> int:
         """How many pages of one document to hold rasterised at a time.
 
@@ -1180,8 +1187,12 @@ class OcrManager:
         when a later window has to fall back -- the whole-document path re-read
         them from page one.
         """
+        # `chunk` is the page window: a pooled read borrows a worker per chunk,
+        # so matching the two means the document is re-opened once per window
+        # rather than once per few pages.
         stream = render_pages(data, filename=filename, content_type=content_type,
-                              dpi=dpi)
+                              dpi=dpi, raster_workers=self._raster_workers(cfg),
+                              chunk=window)
         pages_all: List[OcrPage] = []
         blank_all: list = []
         stamps_all: list = []

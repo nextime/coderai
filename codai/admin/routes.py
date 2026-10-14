@@ -4134,6 +4134,7 @@ def build_settings_dict(c, gpu_cards):
             "max_concurrency": c.ocr.max_concurrency,
             "max_resident_mb": c.ocr.max_resident_mb,
             "page_window": c.ocr.page_window,
+            "raster_workers": c.ocr.raster_workers,
             "lang": c.ocr.lang,
             "paddle_auto_lang": c.ocr.paddle_auto_lang,
             "paddle_enabled": c.ocr.paddle_enabled,
@@ -4979,6 +4980,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         # 0 = derive from the cgroup limit or host RAM; see codai/ocr/budget.py
         if "max_resident_mb" in d: o.max_resident_mb = _i("max_resident_mb", o.max_resident_mb, 0)
         if "page_window" in d: o.page_window = _i("page_window", o.page_window, 0)
+        if "raster_workers" in d: o.raster_workers = _i("raster_workers", o.raster_workers, 0)
         if "lang" in d: o.lang = (d.get("lang") or "auto").strip()
         if "paddle_auto_lang" in d: o.paddle_auto_lang = (d.get("paddle_auto_lang") or "latin").strip()
         # PaddleOCR

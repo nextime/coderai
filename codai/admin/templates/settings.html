@@ -1132,6 +1132,14 @@
         A document larger than the whole budget still runs, alone. This is the setting
         that prevents an out-of-memory kill; max concurrency never did.</span>
       </div>
+      <div class="form-group" style="flex:1;min-width:130px">
+        <label class="form-label">Rasteriser processes</label>
+        <input type="number" id="s-ocr-raster-workers" class="form-input" min="0" placeholder="0">
+        <span class="form-hint">pdfium allows one caller at a time, so rasterising
+        in-process is single-threaded however many cores you have. Workers restore the
+        parallelism, one document each. <b>0 = auto</b> (half the cores, at most 4).
+        <b>1 = in-process</b>: no extra processes and no IPC, for a small host.</span>
+      </div>
       <div class="form-group" style="flex:1;min-width:120px">
         <label class="form-label">Page window</label>
         <input type="number" id="s-ocr-page-window" class="form-input" min="0" placeholder="0">
@@ -2218,6 +2226,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 64;
     document.getElementById('s-ocr-max-resident-mb').value = ocr.max_resident_mb ?? 0;
     document.getElementById('s-ocr-page-window').value = ocr.page_window ?? 0;
+    document.getElementById('s-ocr-raster-workers').value = ocr.raster_workers ?? 0;
     document.getElementById('s-ocr-lang').value = ocr.lang ?? 'auto';
     document.getElementById('s-ocr-paddle-auto-lang').value = ocr.paddle_auto_lang ?? 'latin';
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
@@ -2518,6 +2527,7 @@ async function saveSettings(silent){
       max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 64,
       max_resident_mb: parseInt(document.getElementById('s-ocr-max-resident-mb').value) || 0,
       page_window: parseInt(document.getElementById('s-ocr-page-window').value) || 0,
+      raster_workers: parseInt(document.getElementById('s-ocr-raster-workers').value) || 0,
       lang: document.getElementById('s-ocr-lang').value.trim() || 'auto',
       paddle_auto_lang: document.getElementById('s-ocr-paddle-auto-lang').value.trim() || 'latin',
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,

@@ -380,11 +380,17 @@ def page_estimate(data: bytes, filename: str = "", content_type: str = "",
             with _PDFIUM_LOCK:
                 pdf = pdfium.PdfDocument(data)
                 scale = max(0.5, dpi / 72.0)
-                total = 0
                 n = len(pdf)
-                for i in range(n):
-                    w, h = pdf[i].get_size()      # points, no render
-                    total += int(w * scale) * int(h * scale)
+                # get_page_size() reads the size from the page tree by index.
+                # `pdf[i].get_size()` LOADS the page object to ask it the same
+                # question: 593 ms for a 47-page document against 1.9 ms, for
+                # identical numbers -- and it was being paid under the lock, so
+                # every document in the install queued behind it.
+                try:
+                    sizes = [pdf.get_page_size(i) for i in range(n)]
+                except Exception:
+                    sizes = [pdf[i].get_size() for i in range(n)]
+                total = sum(int(w * scale) * int(h * scale) for w, h in sizes)
             return n, int(total * _BYTES_PER_PIXEL * PAGE_OVERHEAD)
         except Exception:
             # Unreadable page tree, or no pypdfium2. A PDF page is ~A4 far more often
@@ -405,7 +411,7 @@ def page_estimate(data: bytes, filename: str = "", content_type: str = "",
 
 
 def render_pages(data: bytes, filename: str = "", content_type: str = "",
-                 dpi: int = 200):
+                 dpi: int = 200, raster_workers: int = 0, chunk: int = 8):
     """Yield RGB ``PIL.Image`` pages ONE AT A TIME instead of returning them all.
 
     Same decoding rules as :func:`load_pages` — this is that function with the list
@@ -428,6 +434,19 @@ def render_pages(data: bytes, filename: str = "", content_type: str = "",
               or name.endswith(".pdf") or data[:5] == b"%PDF-")
 
     if is_pdf:
+        # A worker process when there is one (pdfium is safe one document per
+        # process); otherwise here, under the lock. The fallback is a correct
+        # render, so a pool that cannot start costs throughput, never an outage.
+        if raster_workers != 1:
+            try:
+                from codai.ocr.rasterize import iter_pdf_pages
+                pooled = iter_pdf_pages(data, dpi, chunk=chunk,
+                                        raster_workers=raster_workers)
+            except Exception:
+                pooled = None
+            if pooled is not None:
+                yield from pooled
+                return
         yield from _render_pdf_pages(data, dpi)
         return
 
@@ -444,6 +463,39 @@ def render_pages(data: bytes, filename: str = "", content_type: str = "",
         except Exception:
             pass
         yield img.convert("RGB")
+
+
+def render_pdf_range(data: bytes, dpi: int, start: int, stop: int):
+    """Yield in-process RGB pages for ``[start, stop)`` of a PDF, under the lock.
+
+    The fallback for a pooled read whose pool stopped serving midway: re-rendering
+    from page zero would redo work the caller already has, and failing a document
+    that is half read is the worst of the three options.
+    """
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        pdfium = None
+    if pdfium is None:
+        # No pypdfium2 at all: the whole-document fallback owns this case.
+        for i, img in enumerate(_rasterize_pdf(data, dpi)):
+            if start <= i < stop:
+                yield img
+        return
+    try:
+        with _PDFIUM_LOCK:
+            pdf = pdfium.PdfDocument(data)
+            scale = max(0.5, dpi / 72.0)
+            n = len(pdf)
+    except Exception as e:
+        raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
+    for i in range(max(0, start), min(n, stop)):
+        try:
+            with _PDFIUM_LOCK:
+                img = pdf[i].render(scale=scale).to_pil().convert("RGB")
+        except Exception as e:
+            raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
+        yield img
 
 
 def _render_pdf_pages(data: bytes, dpi: int):

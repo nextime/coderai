@@ -1541,6 +1541,60 @@ Two rules keep the gate from being worse than the problem:
 * **Reservations are returned on cancellation**, not just on success. A client that
   disconnects mid-document would otherwise shrink the budget permanently.
 
+### pdfium allows one caller at a time
+
+0.3.65 moved rendering off the event loop so a long PDF would stop stalling every
+other request. Until then `load_pages` ran ON the loop, which serialised every
+rasterisation **by accident**. Removing the accident let documents into pdfium
+concurrently, and pdfium permits exactly one caller. Concurrent use corrupts its
+state and reports
+
+```
+failed to rasterise PDF (pypdfium2): PDFium: Data format error
+```
+
+on documents that are perfectly valid — so the failure accuses the input, and the
+operator goes looking at their files. Measured: 1 document fine, 8 concurrent = 8
+failures, 24 = 24. Three valid PDFs that poppler parsed cleanly were rejected this
+way in production, within an hour of the deploy.
+
+0.3.66 serialised every pdfium call behind one lock. Correct, and it made
+rasterisation single-threaded for the whole install — a ceiling of about one core.
+
+0.3.67 gets the parallelism back the only way pdfium permits: **one document per
+process** (`ocr.raster_workers`, 0 = auto at half the cores capped at 4, 1 =
+in-process under the lock). Measured on 12 concurrent 47-page PDFs at 150 DPI:
+
+| rasterising | wall clock |
+|---|---|
+| in-process, under the lock | 21.9 s |
+| 4 worker processes | **10.3 s** |
+
+2.1x rather than 4x: the parent is single-threaded for receiving the pixels and
+rebuilding the images, and ~4.5 GB crosses the pipes. The ceiling is the parent,
+not the workers.
+
+Three things that design has to get right, each of which cost a bug first:
+
+* **A worker is borrowed per CHUNK, not per document.** The caller OCRs each
+  window between pulls, which takes far longer than rasterising it, so holding a
+  worker across that would idle it for most of its tenure and cap the install at
+  `raster_workers` concurrent documents — worse than the lock it replaces.
+* **A pool that cannot start must cost nothing.** The first version waited 300 s
+  for a worker that could never arrive (missing script), stalling every document
+  for five minutes. Failure to create a worker is now remembered, not retried per
+  document, and a busy pool falls back in-process after 30 s rather than queueing.
+* **Workers are executed, never imported.** `import codai.ocr` costs 377 MB and
+  1.5 s (it reaches `codai.models.manager` and litellm). Paying that per worker,
+  in a subsystem whose other half exists to bound memory, would be self-defeating;
+  the worker script imports pypdfium2 and PIL only, about 25 MB.
+
+A related cost found while measuring this: pricing a document used to call
+`pdf[i].get_size()` per page, which **loads each page object** — 593 ms for a
+47-page document, paid under the lock. `pdf.get_page_size(i)` reads the same
+numbers from the page tree by index in 1.9 ms. `page_estimate` went from ~600 ms
+to 9.6 ms per document.
+
 ### What this does not bound
 
 `/v1/ocr/batch` still reads every uploaded file fully into memory before any gating.

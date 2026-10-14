@@ -402,7 +402,10 @@ def _manager(monkeypatch, n_pages, cfg=None, engine_for=None):
     cfg = cfg or _Cfg()
     trace = {"pulled": 0, "windows": [], "reserved": []}
 
-    def _fake_render(data, filename="", content_type="", dpi=200):
+    def _fake_render(data, filename="", content_type="", dpi=200,
+                     raster_workers=0, chunk=8):
+        trace["chunk"] = chunk
+        trace["raster_workers"] = raster_workers
         for i in range(n_pages):
             trace["pulled"] += 1
             yield f"page-{i}"                     # a stand-in for a PIL image
@@ -728,3 +731,19 @@ def test_the_lock_is_held_around_every_pdfium_call():
     for chunk in src.split("pdfium.PdfDocument(data)")[:-1]:
         assert "_PDFIUM_LOCK" in chunk.rsplit("try:", 1)[-1], (
             "a PdfDocument is built without holding _PDFIUM_LOCK")
+
+
+def test_the_pool_chunk_matches_the_page_window(monkeypatch):
+    """A pooled read borrows a worker per chunk and re-opens the document each
+    time, so a chunk smaller than the window pays that cost for nothing."""
+    m, trace = _manager(monkeypatch, n_pages=40)
+    asyncio.run(m.ocr_document(b"%PDF-x", filename="x.pdf"))
+    assert trace["chunk"] == 4, trace.get("chunk")      # _Cfg.page_window
+
+
+def test_the_raster_worker_setting_reaches_the_renderer(monkeypatch):
+    class _C(_Cfg):
+        raster_workers = 3
+    m, trace = _manager(monkeypatch, n_pages=8, cfg=_C())
+    asyncio.run(m.ocr_document(b"%PDF-x", filename="x.pdf"))
+    assert trace["raster_workers"] == 3
