@@ -412,6 +412,34 @@ MODEL_TYPE_CAPABILITY = {
 _LLM_MODEL_TYPES = ("text_models", "gguf_models", "vision_models")
 
 
+def _in_embedding_section(entry: dict) -> bool:
+    """Whether this entry lives in models.json's `embedding_models`.
+
+    By IDENTITY first (the same dict object the loader holds), falling back to
+    the id -- so an entry copied or rebuilt still resolves. Returns False on any
+    failure: a capability guess is never worth an exception in a placement path.
+    """
+    try:
+        from codai.admin.routes import config_manager as _cm
+        md = getattr(_cm, "models_data", None) if _cm else None
+        lst = (md or {}).get("embedding_models")
+        if not isinstance(lst, list):
+            return False
+        for m in lst:
+            if m is entry:
+                return True
+        want = str(entry.get("id") or entry.get("path") or "").strip().lower()
+        if not want:
+            return False
+        for m in lst:
+            if isinstance(m, dict) and str(
+                    m.get("id") or m.get("path") or "").strip().lower() == want:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def model_capability(entry: dict, include_text: bool = False) -> str:
     """The capability a model entry belongs to.
 
@@ -429,6 +457,22 @@ def model_capability(entry: dict, include_text: bool = False) -> str:
     explicit = str(entry.get("capability") or "").strip().lower()
     if explicit:
         return explicit
+    # An entry in `embedding_models` IS an embeddings model. Nothing told
+    # model_capability that: it receives a bare dict, and _model_entry_for()
+    # iterates md.values() and discards the section key it matched in.
+    #
+    # Before this, the capability came from `runpod.engine` being one of the
+    # coderai-* server engines -- so an embedding model with `engine: coderai`
+    # (the correct setting for a capability pod) resolved to NO capability, the
+    # front could not classify it, and it was loaded LOCALLY on a GPU-less
+    # orchestrator. It failed as "tries to load on the wrong machine" rather
+    # than as "this needs a capability", which is a long way from the cause.
+    #
+    # Deliberately only this one section. The others work today, and remapping
+    # them all would change placement for every model kind to fix one -- a
+    # blast radius this does not need.
+    if _in_embedding_section(entry):
+        return "embeddings"
     # A LongCat-Video model is a video model, but the 'video' image cannot serve it: its
     # pipeline is not in diffusers and it needs its own Python 3.10 venv. Without this
     # it would be placed on an image that boots, passes its health check, accepts the
