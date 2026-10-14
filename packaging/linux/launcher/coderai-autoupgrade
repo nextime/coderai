@@ -13,9 +13,18 @@
 #      image was already current, so an exit-code-driven loop would restart the
 #      service on every tick;
 #   5. restart only if the service is idle, else defer to the next tick (the new
-#      code sits in the image until then, which is safe);
+#      code sits in the image until then, which is safe). A host that is busy at
+#      EVERY tick would otherwise never upgrade at all, so after MAX_DEFERRALS
+#      busy ticks the script books a FORCED upgrade for the next midnight and
+#      takes it, work in flight or not. Observed before that existed: 24 skips in
+#      one day and two versions behind, because the busy path exited before the
+#      counter the force depended on was ever incremented;
 #   6. verify health after the restart, and ROLL BACK to the remembered image if
 #      it does not come up.
+#
+# MAX_DEFERRALS=0 keeps the old meaning: wait for an idle moment, however long,
+# and never book a forced restart. Anything above 0 is a promise that the upgrade
+# WILL land, at midnight at the latest.
 #
 # Exit 0: nothing to do, upgraded and healthy, or deliberately deferred.
 # Exit 1: the upgrade or the restart failed -- and then the message says whether
@@ -91,6 +100,11 @@ mkdir -p "$STATE_DIR" || { echo "autoupgrade: cannot create $STATE_DIR" >&2; exi
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 PENDING="$STATE_DIR/restart-pending"
 DEFERRALS="$STATE_DIR/deferrals"
+# When a host is NEVER idle, the upgrade is armed for the next midnight and
+# this file holds that deadline (epoch seconds). The hourly timer ticks at
+# 00:00, so the arming run and the firing run are the ordinary schedule --
+# no second timer to install, nothing to clean up if the host reboots.
+FORCE_AT="$STATE_DIR/force-upgrade-at"
 
 say(){ printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG"; }
 
@@ -120,6 +134,10 @@ say "config: restart=[$RESTART_CMD] health=$HEALTH_URL idle-check=$IDLE_CHECK"
 # conf overriding the environment, an operator could be looking at the opposite of
 # what they typed.
 say "config: require-idle=$REQUIRE_IDLE_CHECK max-deferrals=$MAX_DEFERRALS"
+if [ -f "$FORCE_AT" ]; then
+    _at="$(cat "$FORCE_AT" 2>/dev/null || echo 0)"
+    say "config: a FORCED upgrade is booked for $(date -d "@$_at" '+%F %T' 2>/dev/null || echo "$_at")"
+fi
 
 # ---------------------------------------------------------------------- the lock
 # flock on a dedicated fd, non-blocking: a run that overlaps the previous one is
@@ -225,6 +243,37 @@ inflight(){
     echo "$best $detail"
 }
 
+# After MAX_DEFERRALS busy ticks, stop waiting for a window that is not coming
+# and book one. Midnight local, because that is the cheapest hour to interrupt
+# on a business-hours workload and it is a time an operator can predict without
+# reading this file.
+arm_midnight_force(){
+    local n="$1" at
+    # Tomorrow 00:00 local. `date -d` is GNU; fall back to "now + the seconds
+    # left in the day" so this still works on a busybox host.
+    at="$(date -d 'tomorrow 00:00' +%s 2>/dev/null || true)"
+    if [ -z "$at" ]; then
+        at=$(( $(date +%s) + (86400 - ($(date +%H) * 3600 + $(date +%M) * 60 + $(date +%S))) ))
+    fi
+    echo "$at" > "$FORCE_AT"
+    say "NEVER IDLE for $n run(s) — booking a FORCED upgrade for $(date -d "@$at" '+%F %T' 2>/dev/null || echo "$at")."
+    say "      It will restart the service even with work in flight, because an"
+    say "      install that is busy every hour otherwise never upgrades at all."
+    say "      Cancel it by deleting $FORCE_AT."
+}
+
+# Is a booked forced upgrade due? Clears the booking either way it is used, so a
+# deadline that has passed fires ONCE and not on every tick afterwards.
+force_due(){
+    [ -f "$FORCE_AT" ] || return 1
+    local at now
+    at="$(cat "$FORCE_AT" 2>/dev/null || echo 0)"
+    case "$at" in ''|*[!0-9]*) rm -f "$FORCE_AT"; return 1 ;; esac
+    now="$(date +%s)"
+    [ "$now" -ge "$at" ] || return 1
+    return 0
+}
+
 # Any work in progress -- a request OR a detached job like training -- or we
 # cannot tell? Then this run does nothing. Calling it "serving" was wrong:
 # the case this exists for has no request in flight at all.
@@ -243,6 +292,24 @@ guard_idle(){
     fi
     if [ "$count" -gt 0 ]; then
         say "SKIP: $count piece(s) of work in progress [$detail] — leaving the image alone"
+        # COUNT IT. This used to return without touching the counter, and the
+        # counter is only otherwise incremented in the restart step -- which is
+        # never reached when we exit here. So `max-deferrals` could not fire and
+        # a host busy on every hourly tick never upgraded AT ALL, which is not
+        # what the timer's own comment promises ("or after MAX_DEFERRALS hours of
+        # never being idle"). Observed: 24 skips in one day, two versions behind,
+        # deferrals file still 0.
+        local n
+        n=$(cat "$DEFERRALS" 2>/dev/null || echo 0)
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        n=$((n + 1))
+        echo "$n" > "$DEFERRALS"
+        if [ "$MAX_DEFERRALS" -gt 0 ] && [ "$n" -ge "$MAX_DEFERRALS" ] \
+                && [ ! -f "$FORCE_AT" ]; then
+            arm_midnight_force "$n"
+        else
+            say "      busy run $n$( [ "$MAX_DEFERRALS" -gt 0 ] && printf '/%s' "$MAX_DEFERRALS" )"
+        fi
         return 1
     fi
     say "idle ($detail)"
@@ -281,7 +348,15 @@ else
     # Nothing is touched while CoderAI is serving. Checked BEFORE the upgrade and
     # not only before the restart, so a busy host never even reaches the state
     # where new code sits in the image waiting for a window.
-    guard_idle || exit 0
+    if force_due; then
+        FORCED=1
+        say "FORCED UPGRADE (booked because this host was never idle) — proceeding"
+        say "      with work possibly in flight. Requests being served WILL be"
+        say "      interrupted by the restart; that is the trade this booking made."
+    else
+        FORCED=0
+        guard_idle || exit 0
+    fi
     say "image $IMAGE_TAG carries $BEFORE; checking '$UPGRADE_REF'"
     # The rollback point is a TAG on the current image, so it costs nothing and
     # survives the commit the upgrade makes onto $IMAGE_TAG.
@@ -312,7 +387,12 @@ fi
 # while it ran, and the restart is the part that would kill it.
 N=$(cat "$DEFERRALS" 2>/dev/null || echo 0)
 OUT="$(inflight)"; BUSY="${OUT%% *}"; WHAT="${OUT#* }"
-if [ "$BUSY" = unknown ] || { [ "$BUSY" -gt 0 ] 2>/dev/null; }; then
+if [ "${FORCED:-0}" = 1 ]; then
+    # The whole point of the booking. Deferring here would put us back where the
+    # booking was made: waiting for a window this host does not have.
+    [ "$BUSY" = unknown ] || [ "$BUSY" -eq 0 ] 2>/dev/null \
+        || say "forced: restarting with work in flight [$WHAT]"
+elif [ "$BUSY" = unknown ] || { [ "$BUSY" -gt 0 ] 2>/dev/null; }; then
     if [ "$N" -lt "$MAX_DEFERRALS" ]; then
         echo $((N + 1)) > "$DEFERRALS"
         say "work in progress [$WHAT] — deferring the restart ($((N + 1))/$MAX_DEFERRALS)"
@@ -329,7 +409,10 @@ fi
 
 if restart_and_verify; then
     say "OK: running $(cat "$PENDING" 2>/dev/null | sed 's/.*-> //') and healthy"
-    rm -f "$PENDING" "$DEFERRALS"
+    # The booking and the busy-run count both end here: the upgrade landed, so
+    # the next busy stretch starts counting from zero rather than inheriting a
+    # deadline from the last one.
+    rm -f "$PENDING" "$DEFERRALS" "$FORCE_AT"
     exit 0
 fi
 

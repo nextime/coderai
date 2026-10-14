@@ -6,7 +6,10 @@
 # clone of one branch and a version compare, and the script exits without
 # touching the service unless the baked version actually changed. A restart only
 # happens on a real upgrade, and only when the fleet is idle (or after
-# MAX_DEFERRALS hours of never being idle).
+# MAX_DEFERRALS hours of never being idle -- which then books a FORCED upgrade
+# for the next midnight and takes it regardless, because an install busy on
+# every tick otherwise never upgrades at all. The 00:00 tick of this very timer
+# is what fires it, so there is no second unit to install).
 #
 # RandomizedDelaySec spreads a fleet of orchestrators so they do not all clone
 # and restart on the same minute. Persistent=true runs a missed check once after
