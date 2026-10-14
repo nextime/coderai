@@ -35,6 +35,7 @@ from typing import Dict, List, Optional
 
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
                             PAGE_OPTIONS, page_estimate, render_pages,
+                            iter_pdf_page_pdfs, pdf_page_count,
                             unreadable_report)
 from codai.ocr.budget import get_budget
 
@@ -345,6 +346,104 @@ def _warn_if_oversubscribed(name: str, pages: int) -> None:
     elif need > 1:
         print(f"[ocr] engine {name!r}: {pages} pages at once spreads over {need} "
               f"pods ({per} in flight each); {tail}.", flush=True)
+
+
+def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
+                      dpi: int, opts: dict, detect) -> dict:
+    """POST one page to a pod's own /v1/ocr and return its response dict.
+
+    Through `pod_http`, not `requests`: a pod on the direct path serves HTTPS
+    with a certificate signed by THIS install's CA, addressed by an IP that was
+    not known when it was issued. Plain requests fails that twice over, which is
+    the same trap olmOCR fell into (see tests/test_olmocr_pod_tls.py).
+    """
+    from codai.api import pod_http
+    url = str(base or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url + "/ocr"
+    else:
+        url = url + "/v1/ocr"
+    fields = {"engine": "surya"}
+    if dpi:
+        fields["dpi"] = str(int(dpi))
+    if detect:
+        fields["detect"] = str(detect)
+    for k_src, k_dst in (("max_tokens", "max_tokens"),
+                         ("max_continuations", "max_continuations")):
+        v = (opts or {}).get(k_src)
+        if v:
+            fields[k_dst] = str(int(v))
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        r = pod_http.post(url, files={"file": (name, blob, "application/pdf")},
+                          data=fields, headers=headers, timeout=600)
+    except Exception as e:
+        raise OcrError(f"pod OCR at {url} is unreachable: {e}", status=503)
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = (r.text or "")[:200]
+        except Exception:
+            pass
+        raise OcrError(f"pod OCR at {url} answered {r.status_code}: {body}",
+                       status=int(r.status_code))
+    try:
+        return r.json()
+    except Exception as e:
+        raise OcrError(f"pod OCR at {url} returned no JSON: {e}", status=502)
+
+
+def _page_from_pod(d: dict, index: int) -> OcrPage:
+    """One page of a pod's /v1/ocr response as an OcrPage.
+
+    Carries the DIAGNOSTICS across, not just the text: `repeat_detected` and the
+    rest are the whole reason a caller can tell a looping page from a blank one,
+    and dropping them at this boundary would make a pod-read page less
+    explicable than a locally-read one for no reason.
+    """
+    page = OcrPage(index=index, text=str(d.get("text") or ""),
+                   width=int(d.get("width") or 0),
+                   height=int(d.get("height") or 0))
+    meta = dict(d.get("meta") or {})
+    for k in ("repeat_detected", "repeat_chars", "model_attempts", "confidence",
+              "confidence_measured", "unreadable", "blank", "ink",
+              "finish_reason", "continuations"):
+        if k in d:
+            meta[k] = d[k]
+    if meta:
+        page.meta = meta
+    return page
+
+
+def pod_pipeline_model(cfg, engine: str = "") -> str:
+    """The model id whose pods run the OCR pipeline themselves, or "".
+
+    THE IMAGE IS THE SWITCH. A model served by `coderai-vllm-ocr` carries surya
+    and the rasteriser, so the page goes to it as a one-page PDF; one served by
+    `coderai-vllm` serves only the model and the pipeline stays here. There is
+    no second setting, because two switches that can disagree is the kind of
+    invisible mismatch that gets blamed on a pod image.
+
+    Returns "" for every other case -- no model mode, no entry, a different
+    image -- so the caller simply does what it has always done.
+    """
+    name = (engine or "").strip().lower()
+    if name and name != "surya":
+        return ""
+    if str(getattr(cfg, "surya_serve", "") or "").strip().lower() != "model":
+        return ""
+    mid = str(getattr(cfg, "surya_model_id", "") or "").strip()
+    if not mid:
+        return ""
+    try:
+        from codai.api.runpod_worker import _model_entry, image_runs_ocr_pipeline
+        entry = _model_entry(mid) or {}
+        image = str((entry.get("runpod") or {}).get("image") or "")
+        return mid if image_runs_ocr_pipeline(image) else ""
+    except Exception:
+        return ""
 
 
 def _drain(stream, n: int) -> list:
@@ -1106,10 +1205,33 @@ class OcrManager:
         # temps are safe (wait_until_safe blocks, so run it off the event loop).
         await asyncio.to_thread(_wait_thermal_safe)
 
-        async with budget.reserve(reserve):
-            name, pages, blank, stamps, signatures = await self._read_windowed(
-                data, filename, content_type, use_dpi, window,
-                engine=engine, lang=lang, detect=detect, page_opts=page_opts, cfg=cfg)
+        # THE POD-SIDE PIPELINE. When the model's pods run it themselves (the
+        # image is the switch -- see pod_pipeline_model), the page goes to them
+        # as a one-page PDF and this box never rasterises: no window to hold, no
+        # resident budget to charge, no bitmap crossing the network. Falls
+        # through to the local path whenever a pod cannot serve, because an
+        # optimisation that cannot run must cost latency and not an error.
+        _remote_model = pod_pipeline_model(cfg, engine)
+        _out = None
+        if _remote_model:
+            try:
+                _out = await self._read_on_pods(
+                    data, filename, content_type, _remote_model,
+                    dpi=use_dpi, page_opts=page_opts, detect=detect, cfg=cfg)
+            except OcrError:
+                raise
+            except Exception as exc:
+                print(f"[ocr] the pod-side pipeline for {_remote_model!r} could "
+                      f"not run ({exc}); reading locally instead", flush=True)
+                _out = None
+        if _out is not None:
+            name, pages, blank, stamps, signatures = _out
+        else:
+            async with budget.reserve(reserve):
+                name, pages, blank, stamps, signatures = await self._read_windowed(
+                    data, filename, content_type, use_dpi, window,
+                    engine=engine, lang=lang, detect=detect,
+                    page_opts=page_opts, cfg=cfg)
         full_text = "\n\n".join(p.text for p in pages)
 
         structured_out = None
@@ -1151,6 +1273,84 @@ class OcrManager:
             return max(0, int(getattr(cfg, "raster_workers", 0) or 0))
         except Exception:
             return 0
+
+    async def _read_on_pods(self, data: bytes, filename: str, content_type: str,
+                            model_id: str, *, dpi: int, page_opts, detect, cfg):
+        """Send ONE PAGE PER REQUEST to pods that run the pipeline themselves.
+
+        The page travels as a small PDF and the pod renders and reads it on the
+        card, with its own vLLM over loopback instead of four internet round
+        trips for a page resumed four times. This box never rasterises.
+
+        Page-level fan-out is unchanged: each page is an independent request and
+        `placement.choose` picks an upstream for it, so every pod in the pool
+        shares the work and none of them owns a document.
+
+        Returns (engine_name, pages, blank, stamps, signatures) like
+        `_read_windowed`, or None when no pod could serve -- in which case the
+        caller does what it always did. A pod-side pipeline is an optimisation,
+        and an optimisation that cannot run must cost latency, never an error.
+        """
+        from codai.models import placement
+
+        is_pdf = ((content_type or "").lower() == "application/pdf"
+                  or (filename or "").lower().endswith(".pdf")
+                  or data[:5] == b"%PDF-")
+        # A single image has nothing to split; it goes as it arrived.
+        parts = (list(iter_pdf_page_pdfs(data)) if is_pdf else [data])
+        if not parts:
+            return None
+        sem = self._sem or asyncio.Semaphore(4)
+        opts = dict(page_opts or {})
+
+        async def _one(idx: int, blob: bytes):
+            async with sem:
+                try:
+                    lease = placement.choose(
+                        model_id, spill_after=placement.spill_threshold(model_id))
+                except Exception as exc:
+                    raise OcrError(f"no upstream for {model_id}: {exc}", status=503)
+                try:
+                    if lease.kind == "local":
+                        # Nothing rented: the local pipeline is the right answer
+                        # and the caller already has it.
+                        return None
+                    return await asyncio.to_thread(
+                        _post_page_to_pod, lease.base, lease.api_key, blob,
+                        f"{idx}.pdf" if is_pdf else (filename or "page"),
+                        dpi, opts, detect)
+                finally:
+                    lease.release()
+
+        got = await asyncio.gather(*[_one(i, b) for i, b in enumerate(parts)],
+                                   return_exceptions=True)
+        if any(r is None for r in got):
+            # At least one page had no pod. Do the WHOLE document locally rather
+            # than stitch two pipelines together: a document read half one way
+            # and half the other is the hardest kind of result to explain.
+            return None
+        bad = [r for r in got if isinstance(r, BaseException)]
+        if bad:
+            raise bad[0]
+
+        pages, blank, stamps, sigs = [], [], [], []
+        served = ""
+        for idx, res in enumerate(got):
+            served = served or str(res.get("engine") or "")
+            for p in (res.get("pages") or []):
+                page = _page_from_pod(p, idx)
+                pages.append(page)
+            for i in (res.get("blank_pages") or []):
+                blank.append(idx)
+            for d in (res.get("stamps") or []):
+                d = dict(d)
+                d["page"] = idx
+                stamps.append(d)
+            for d in (res.get("signatures") or []):
+                d = dict(d)
+                d["page"] = idx
+                sigs.append(d)
+        return (served or "surya", pages, sorted(set(blank)), stamps, sigs)
 
     def _page_window(self, cfg) -> int:
         """How many pages of one document to hold rasterised at a time.

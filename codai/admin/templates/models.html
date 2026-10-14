@@ -1065,7 +1065,20 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <span class="form-hint" style="font-size:11px">Models naming the same pool share one set of pods and one budget until it saturates. Needs a <b>coderai</b> or custom multi-model image — a vLLM or llama.cpp pod is launched for ONE model and sharing is refused.</span>
           </div>
           <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
-            <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = engine default)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = engine default)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest">
+              <span class="form-hint" style="font-size:11px">
+                For an OCR VLM the image also chooses <b>where the OCR pipeline runs</b>,
+                and it is the only switch:
+                <b>coderai-vllm</b> — the pod serves the model and this box rasterises every
+                page and sends it as a base64 PNG (~1&nbsp;MB per A4 page at 250&nbsp;DPI,
+                and again for each resumption round of a long page).
+                <b>coderai-vllm-ocr</b> — the pod carries surya and the rasteriser, so it is
+                sent a one-page PDF (~474&nbsp;KB, 1.2&nbsp;ms of CPU here instead of
+                ~105&nbsp;ms to render) and reads it on the card, talking to its own vLLM
+                over loopback. Either way one page is one request, so every pod in the pool
+                still shares the work. Page budgets, DPI, continuation and repeat-detector
+                settings travel to the pod, so it reads a page the same way.
+              </span></div>
             <div class="form-row" style="margin:0"><label class="form-label">Disk (GB)</label><input type="number" id="cfg-rp-disk" class="form-input" min="1" placeholder="40"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Port</label><input type="number" id="cfg-rp-port" class="form-input" min="1" placeholder="8000"></div>
           </div>

@@ -1488,6 +1488,67 @@ more than one page.
 
 ---
 
+## Where the pipeline runs: the image chooses
+
+An OCR VLM needs two things — a model server and the surya pipeline that drives
+it. Which machine runs the second one is chosen by the pod **image**, and by
+nothing else:
+
+| image | the pod | this box |
+|---|---|---|
+| `coderai-vllm` | serves the model | rasterises every page, runs surya, sends a ~1.06 MB base64 PNG per A4 page at 250 DPI — and again for every resumption round |
+| `coderai-vllm-ocr` | carries surya + `pypdfium2`: renders and reads the page on the card, its vLLM over loopback | splits out a one-page PDF (~474 KB, **1.7 ms** against ~105 ms to rasterise) and never materialises a bitmap |
+
+A separate "run it on the pod" setting was built first and then removed. Two
+switches that can disagree is the invisible mismatch that cost three rounds of
+blaming a pod image for orchestrator bugs; choosing the image *is* choosing the
+mode, it already lives in `models.json` and on the model page, and an image that
+cannot run a pipeline can no longer be asked to.
+
+### Page-level fan-out is unchanged
+
+One page is one request in both modes. `placement.choose` picks an upstream per
+page, so every pod in the pool shares the work and none of them owns a document.
+That is the reason the split is per page rather than per document: sending a
+whole PDF to one pod would turn an 8-way parallel read into a serial one.
+
+### What travels to the pod
+
+Not just the wiring — the **tuning**. `surya_dpi`, the page budget, the
+continuation count, the repeat-detector thresholds, `surya_langs`, the page
+window, the resident cap. Every one of those was set in response to a measured
+failure, and a pod reading pages at surya's own defaults would be
+indistinguishable from the "pre-fix pod image" that was wrongly blamed three
+times. A test cross-checks every `CODERAI_OCR_*` the plan sends against what
+`config.py` actually reads, because a variable sent and never read is a setting
+that silently does not apply.
+
+### What it falls back to, and what it refuses to hide
+
+* **No pod rented** (`placement` answers "local") — the whole document is read
+  locally. Not half one way and half the other: a document read by two pipelines
+  is the hardest kind of result to explain.
+* **A pod answers 500** — raised, not quietly re-read here. A broken fleet must
+  stay visible.
+* **The image lacks the pipeline** — the orchestrator simply does what it always
+  did. Nothing is downgraded.
+
+### What the image costs
+
+14.3 GB built, against ~12 GB for `coderai-vllm` — the whole pipeline and the
+stamp/signature detector for ~2 GB, because the surya venv holds a **CPU** torch:
+
+```
+/opt/coderai/venvs/surya   1.6 GB    (torch 2.14.1+cpu, cuda=None, + ultralytics)
+/opt/coderai/venvs/vllm     11 GB
+main venv: pypdfium2, and no torch at all (light core)
+```
+
+A CUDA torch in there would add ~4.2 GB (nvidia 3196 MB + triton 896 MB, plus the
+larger torch) **and** put surya's small local line detector on the card that is
+serving the model. The venv's build check asserts `torch.version.cuda is None` so
+a future resolve cannot quietly undo that.
+
 ## What a document costs while it is being read
 
 `ocr.max_concurrency` bounds how many pages are **being read**. Until 0.3.65 nothing

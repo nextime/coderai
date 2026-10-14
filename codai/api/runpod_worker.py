@@ -1092,6 +1092,41 @@ def _ocr_cfg():
         return None
 
 
+#: The image that carries the OCR pipeline: surya's client venv plus pypdfium2.
+#: Selecting it IS selecting the mode -- see pod_runs_ocr_pipeline().
+OCR_PIPELINE_IMAGE_HINT = "coderai-vllm-ocr"
+
+
+def image_runs_ocr_pipeline(image: str) -> bool:
+    """Whether `image` carries the OCR pipeline (the surya venv + rasteriser).
+
+    Matched on the image NAME rather than probed, because the decision is made
+    before any pod exists. A private mirror or a pinned tag still matches, since
+    the hint is a substring of the repository.
+    """
+    return OCR_PIPELINE_IMAGE_HINT in str(image or "").strip().lower()
+
+
+def pod_runs_ocr_pipeline(mcfg, image: str = "") -> bool:
+    """Whether THIS model's pods run the OCR pipeline themselves.
+
+    THE IMAGE IS THE SWITCH, and deliberately the only one:
+
+      * `coderai-vllm`      — the pod serves the model; the ORCHESTRATOR
+                              rasterises and runs surya, as it always has.
+      * `coderai-vllm-ocr`  — the pod carries the surya client venv and
+                              pypdfium2, so it is sent a one-page PDF and does
+                              the whole page itself.
+
+    A separate "run it on the pod" flag was built first and then removed: two
+    switches that can disagree is precisely the invisible mismatch that cost
+    three rounds of blaming a pod image this morning. Choosing the image IS
+    choosing the mode, it is already in models.json and on the model page, and
+    an image that cannot run a pipeline can no longer be asked to.
+    """
+    return image_runs_ocr_pipeline(str(image or getattr(mcfg, "image", "") or ""))
+
+
 def _ocr_external_server(engine: str):
     """The off-box OpenAI-compatible endpoint configured for a VLM OCR engine, or "".
 
@@ -1211,6 +1246,84 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         # configuring the model at all, exactly as surya's licence is; the pod
         # inherits it and coqui skips the prompt.
         env.setdefault("COQUI_TOS_AGREED", "1")
+
+    # A pod on an image that CARRIES the pipeline runs it, whatever capability
+    # the model is filed under. The image is the switch (pod_runs_ocr_pipeline),
+    # so this does not sit inside the `cap == "ocr"` branch: the model that
+    # serves surya-ocr-2 is a VLM like any other, and filing it as an OCR
+    # capability pod is not what makes its pod able to read a page.
+    if pod_runs_ocr_pipeline(mcfg, image):
+        _o = _ocr_cfg()
+        env["CODERAI_OCR_ENABLED"] = "1"
+        env["CODERAI_OCR_SURYA_ENABLED"] = "1"
+        env["CODERAI_OCR_DEFAULT_ENGINE"] = "surya"
+        # The baked venv, so the pod does not try to BUILD one on a rented
+        # machine (minutes, and it would land on the container disk).
+        env["CODERAI_OCR_SURYA_VENV"] = "/opt/coderai/venvs/surya"
+        # Surya drives the model through the pod's OWN coderai, in the same
+        # "model" mode the orchestrator uses -- which is what makes the gateway
+        # mint it an attach token instead of needing a bearer hand-wired here.
+        # Over loopback, so a page resumed four times costs four local round
+        # trips rather than four across the internet.
+        env["CODERAI_OCR_SURYA_SERVE"] = "model"
+        env["CODERAI_OCR_SURYA_MODEL_ID"] = str(served or "").strip()
+        # Surya is GPL and gated on an explicit acceptance. The pod inherits the
+        # decision made here; it cannot make it for itself.
+        env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] = "1"
+        # This image carries NO docTR -- `auto` would route a failed page to an
+        # engine that is not there. Surya or nothing, said out loud.
+        env["CODERAI_OCR_FALLBACK_ENGINES"] = "off"
+        # And the TUNING. Every one of these was set in response to a measured
+        # failure, and a pod reading pages at surya's defaults instead would be
+        # indistinguishable from the "pre-fix pod image" that got blamed three
+        # times for orchestrator bugs.
+        for _var, _attr in (("CODERAI_OCR_DPI", "dpi"),
+                            ("CODERAI_OCR_SURYA_DPI", "surya_dpi"),
+                            ("CODERAI_OCR_SURYA_MAX_TOKENS", "surya_max_tokens"),
+                            ("CODERAI_OCR_SURYA_MAX_CONTINUATIONS",
+                             "surya_max_continuations"),
+                            ("CODERAI_OCR_SURYA_CONTEXT_TOKENS",
+                             "surya_context_tokens"),
+                            ("CODERAI_OCR_SURYA_MAX_RETRIES", "surya_max_retries"),
+                            ("CODERAI_OCR_SURYA_REPEAT_MAX_REPEATS",
+                             "surya_repeat_max_repeats"),
+                            ("CODERAI_OCR_SURYA_REPEAT_WINDOW",
+                             "surya_repeat_window"),
+                            ("CODERAI_OCR_SURYA_REPEAT_SCALING",
+                             "surya_repeat_scaling"),
+                            ("CODERAI_OCR_SURYA_LANES", "surya_lanes"),
+                            ("CODERAI_OCR_SURYA_INSTANCES", "surya_instances"),
+                            ("CODERAI_OCR_SURYA_LANGS", "surya_langs"),
+                            ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency"),
+                            ("CODERAI_OCR_PAGE_WINDOW", "page_window"),
+                            ("CODERAI_OCR_RASTER_WORKERS", "raster_workers"),
+                            ("CODERAI_OCR_BLANK_PAGE_MAX_CHARS",
+                             "blank_page_max_chars"),
+                            ("CODERAI_OCR_DETECT_MODE", "detect_mode"),
+                            ("CODERAI_OCR_DETECT_MODEL_PATH", "detect_model_path"),
+                            ("CODERAI_OCR_DETECT_CONF", "detect_conf")):
+            _val = getattr(_o, _attr, None) if _o is not None else None
+            if _val not in (None, "", 0, 0.0):
+                env[_var] = str(_val)
+        for _var, _attr in (("CODERAI_OCR_SURYA_REPAIR_ACCENTS",
+                             "surya_repair_accents"),
+                            ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace")):
+            if _o is not None and getattr(_o, _attr, None) is not None:
+                env[_var] = "1" if getattr(_o, _attr) else "0"
+        # The detector's weights are operator-supplied and a released image
+        # carries none, so say plainly when a mode is asked for that the pod
+        # cannot honour rather than letting it report a page with no stamps.
+        if str(getattr(_o, "detect_mode", "off") or "off").lower() in (
+                "detector", "both") and not str(
+                    getattr(_o, "detect_model_path", "") or "").strip():
+            print("[runpod] ocr.detect_mode wants the YOLO detector but "
+                  "ocr.detect_model_path is empty — a pod cannot acquire weights "
+                  "it was never given, and will report no stamps rather than "
+                  "fail. Set the path (staged on the pod) or use detect_mode="
+                  "layout.", flush=True)
+        print(f"[runpod] the OCR PIPELINE runs on this pod ({image}): it is sent "
+              f"one page as a PDF and reads it on the card, with its own vLLM "
+              f"over loopback", flush=True)
 
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"

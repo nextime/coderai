@@ -2119,6 +2119,56 @@ class ConfigManager:
                 _val = (_os.environ.get(_env) or "").strip()
                 if _val:
                     setattr(self.config.ocr, _attr, _val)
+            # The TUNING, not just the wiring. A pod that runs the OCR pipeline
+            # itself (runpod `pod_ocr_pipeline`) must read a page the same way
+            # the orchestrator would, and every one of these was set in response
+            # to a measured failure: the 3072-token page budget that surya's own
+            # per-item 12288 used to beat, the continuation count, the repeat
+            # detector's thresholds, the DPI that saturates surya's pixel cap.
+            # Seeding the serve URL but not the budgets would give a pod running
+            # surya's defaults -- which is indistinguishable, from the outside,
+            # from the "pre-fix pod image" that cost three rounds of blame.
+            for _env, _attr, _cast in (
+                    ("CODERAI_OCR_DPI", "dpi", int),
+                    ("CODERAI_OCR_SURYA_DPI", "surya_dpi", int),
+                    ("CODERAI_OCR_SURYA_MAX_TOKENS", "surya_max_tokens", int),
+                    ("CODERAI_OCR_SURYA_MAX_CONTINUATIONS",
+                     "surya_max_continuations", int),
+                    ("CODERAI_OCR_SURYA_CONTEXT_TOKENS",
+                     "surya_context_tokens", int),
+                    ("CODERAI_OCR_SURYA_MAX_RETRIES", "surya_max_retries", int),
+                    ("CODERAI_OCR_SURYA_REPEAT_MAX_REPEATS",
+                     "surya_repeat_max_repeats", int),
+                    ("CODERAI_OCR_SURYA_REPEAT_WINDOW",
+                     "surya_repeat_window", int),
+                    ("CODERAI_OCR_SURYA_REPEAT_SCALING",
+                     "surya_repeat_scaling", float),
+                    ("CODERAI_OCR_SURYA_INSTANCES", "surya_instances", int),
+                    ("CODERAI_OCR_SURYA_LANES", "surya_lanes", int),
+                    ("CODERAI_OCR_SURYA_LANGS", "surya_langs", str),
+                    ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency", int),
+                    ("CODERAI_OCR_MAX_RESIDENT_MB", "max_resident_mb", int),
+                    ("CODERAI_OCR_PAGE_WINDOW", "page_window", int),
+                    ("CODERAI_OCR_RASTER_WORKERS", "raster_workers", int),
+                    ("CODERAI_OCR_BLANK_PAGE_MAX_CHARS",
+                     "blank_page_max_chars", int),
+                    ("CODERAI_OCR_DETECT_MODE", "detect_mode", str),
+                    ("CODERAI_OCR_DETECT_MODEL_PATH", "detect_model_path", str),
+                    ("CODERAI_OCR_DETECT_CONF", "detect_conf", float)):
+                _val = (_os.environ.get(_env) or "").strip()
+                if not _val:
+                    continue
+                try:
+                    setattr(self.config.ocr, _attr, _cast(_val))
+                except (TypeError, ValueError):
+                    print(f"[config] {_env}={_val!r} is not a {_cast.__name__}; "
+                          f"leaving ocr.{_attr} alone", flush=True)
+            for _env, _attr in (
+                    ("CODERAI_OCR_SURYA_REPAIR_ACCENTS", "surya_repair_accents"),
+                    ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace"),
+                    ("CODERAI_OCR_SURYA_USE_GPU", "surya_use_gpu")):
+                if _os.environ.get(_env) is not None:
+                    setattr(self.config.ocr, _attr, _flag(_env))
             if _flag("CODERAI_OCR_SURYA_ACCEPT_LICENSE"):
                 # Surya is GPL and gated on an explicit acceptance. The pod
                 # inherits the decision made here; it cannot make it itself.
