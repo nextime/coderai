@@ -1036,6 +1036,13 @@ def _truncate_dims(results, dimensions):
     return out
 
 
+#: Token ceiling for ONE built GME prompt. The chat template adds ~40 tokens
+#: around the body, so a window of text must leave room for it -- which is why
+#: the windowing happens before the prompt is built, not by truncating after.
+_QWENVL_PROMPT_TOKENS = 1800
+_QWENVL_TEXT_TOKENS = 1700
+
+
 def _qwenvl_embed(model_tuple, items, dimensions=None):
     """GME-style embedding on a native Qwen2-VL: last-token hidden state under the
     GME chat prompt (mirrors the repo's custom_st tokenize/forward, which we can't
@@ -1061,8 +1068,14 @@ def _qwenvl_embed(model_tuple, items, dimensions=None):
             f'<|im_start|>user\n{body}<|im_end|>\n'
             f'<|im_start|>assistant\n<|endoftext|>')
 
+    # 1800 was a silent ceiling: a long text was cut here and the caller got a
+    # confident vector of its opening. The windowing is done by the CALLER
+    # (_embed_texts), which knows the mode and can report it; by the time a
+    # prompt is built the text is already wrapped in the chat template and
+    # cutting it here would also cut the template's closing tokens.
     inputs = processor(text=prompts, images=images or None, padding='longest',
-                       truncation=True, max_length=1800, return_tensors='pt')
+                       truncation=True, max_length=_QWENVL_PROMPT_TOKENS,
+                       return_tensors='pt')
     inputs = {k: v.to(device) for k, v in inputs.items()}
     if 'pixel_values' in inputs:
         inputs['pixel_values'] = inputs['pixel_values'].to(hf_model.dtype)
@@ -1379,11 +1392,191 @@ async def _bge_m3_response(request, model_obj, texts, _emb_cfg):
         usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens})
 
 
-def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[float]]:
+# ---------------------------------------------------------------------------
+# Long inputs: chunk and pool, rather than silently keep the opening
+# ---------------------------------------------------------------------------
+#
+# Only the GGUF path ever did this. Every other backend passed `truncation=True`
+# and returned a confident unit vector of roughly the first page of a long
+# document, with nothing in the response to say so -- a wrong answer that looks
+# right, which is the failure mode this codebase keeps paying for.
+#
+# Tunable PER-MODEL (models.json) -> env -> default, like the admission gate
+# above:
+#   embed_long_input  CODERAI_EMBED_LONG_INPUT  chunk | truncate | error
+#                     (default "chunk")
+#   embed_chunk_pool  CODERAI_EMBED_CHUNK_POOL  mean | first  (default "mean")
+#
+# `truncate` is kept reachable on purpose: for a short-text encoder a 40-page
+# input is usually a caller bug, and an operator may prefer the old behaviour
+# over a vector pooled from forty windows. `error` says so out loud instead.
+_EMBED_LONG_DEFAULT = "chunk"
+_EMBED_POOL_DEFAULT = "mean"
+
+
+def _embed_chunk_cfg(model=None):
+    """(mode, pool) for a model: models.json overrides env overrides default."""
+    mc = {}
+    if model:
+        try:
+            c = multi_model_manager._config_for_model(model)
+            if isinstance(c, dict):
+                raw = c.get('_raw_cfg') if isinstance(c.get('_raw_cfg'), dict) else {}
+                mc = {**raw, **c}
+        except Exception:
+            mc = {}
+
+    def _resolve(keys, env, default, allowed):
+        for k in keys:
+            v = mc.get(k)
+            if isinstance(v, str) and v.strip().lower() in allowed:
+                return v.strip().lower()
+        v = (os.environ.get(env) or "").strip().lower()
+        return v if v in allowed else default
+
+    mode = _resolve(('embed_long_input', 'embed_overflow'),
+                    'CODERAI_EMBED_LONG_INPUT', _EMBED_LONG_DEFAULT,
+                    ("chunk", "truncate", "error"))
+    pool = _resolve(('embed_chunk_pool',), 'CODERAI_EMBED_CHUNK_POOL',
+                    _EMBED_POOL_DEFAULT, ("mean", "first"))
+    return mode, pool
+
+
+def _token_windows(text: str, tok_limit: int, encode, decode) -> List[str]:
+    """`text` as windows that each verifiably fit `tok_limit` AFTER re-encoding.
+
+    The re-encode is not paranoia. A detokenize->retokenize round trip is NOT
+    token-count-stable -- specials and BOS are re-added, and a window cut at
+    exactly the limit can re-inflate past it. The GGUF path learned that by
+    tripping llama.cpp's GGML_ASSERT (SIGABRT); every backend gets the guard.
+    """
+    toks = encode(text)
+    if len(toks) <= tok_limit:
+        return [text]
+    out, i = [], 0
+    while i < len(toks):
+        end = min(len(toks), i + tok_limit)
+        # Shrink until the DECODED text re-encodes within the limit.
+        while end > i:
+            piece = decode(toks[i:end])
+            n = len(encode(piece))
+            if n <= tok_limit:
+                break
+            end -= max(8, n - tok_limit)
+        if end <= i:
+            # One token that will not fit on its own: give up on this text
+            # rather than loop. Pathological, and silence would be worse.
+            break
+        out.append(piece)
+        i = end
+    return out or [text]
+
+
+def _pool_vectors(vecs: List[List[float]], pool: str) -> List[float]:
+    """Combine a text's chunk vectors into one, re-normalized.
+
+    Mean-pooling unit vectors does NOT give a unit vector, and a caller doing
+    cosine similarity on a non-unit vector gets quietly wrong numbers -- so the
+    re-normalization is part of the contract, not a tidy-up.
+    """
+    if not vecs:
+        return []
+    if len(vecs) == 1:
+        return list(vecs[0])
+    if pool == "first":
+        return list(vecs[0])
+    import math
+    n = len(vecs)
+    mean = [sum(col) / n for col in zip(*vecs)]
+    norm = math.sqrt(sum(x * x for x in mean)) or 1.0
+    return [x / norm for x in mean]
+
+
+def _embed_long(texts: List[str], tok_limit: int, encode, decode, embed_batch,
+                mode: str = _EMBED_LONG_DEFAULT, pool: str = _EMBED_POOL_DEFAULT):
+    """Embed `texts`, chunking any that exceed `tok_limit`.
+
+    Returns (vectors, chunk_counts) -- one count per input, so the caller can
+    REPORT that an input was chunked. Replacing a silent truncation with a
+    silent pooling would be the same bug with a better answer.
+
+    Every window of every text goes to `embed_batch` in ONE call: the backends
+    batch internally, and a per-window call would turn a 40-page document into
+    40 round trips.
+    """
+    if not texts:
+        return [], []
+    windows, owner = [], []
+    counts = []
+    for idx, t in enumerate(texts):
+        if mode == "truncate":
+            # The pre-0.3.72 behaviour, kept reachable and now DELIBERATE.
+            w = _token_windows(t, tok_limit, encode, decode)[:1]
+        else:
+            w = _token_windows(t, tok_limit, encode, decode)
+            if len(w) > 1 and mode == "error":
+                raise ValueError(
+                    f"input {idx} needs {len(w)} windows of {tok_limit} tokens; "
+                    f"embed_long_input=error refuses to pool it. Shorten the "
+                    f"input, or set embed_long_input=chunk.")
+        counts.append(len(w))
+        for piece in w:
+            windows.append(piece)
+            owner.append(idx)
+    flat = embed_batch(windows)
+    out = [[] for _ in texts]
+    grouped = [[] for _ in texts]
+    for vec, idx in zip(flat, owner):
+        grouped[idx].append(vec)
+    for idx, vecs in enumerate(grouped):
+        out[idx] = _pool_vectors(vecs, pool)
+    return out, counts
+
+
+def _st_token_limit(model) -> int:
+    """A sentence-transformers model's usable token window.
+
+    `max_seq_length` is the model's own number; the margin is for the specials
+    `encode` re-adds, the same reason the GGUF path keeps 64 back from n_ctx.
+    """
+    try:
+        n = int(getattr(model, "max_seq_length", 0) or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return max(64, (n or 512) - 16)
+
+
+def _embed_texts(model_obj, texts: List[str], dimensions=None,
+                 chunk_counts=None, model_key=None) -> List[List[float]]:
     backend, model = model_obj
+    _mode, _pool = _embed_chunk_cfg(model_key)
     if backend == 'sentence_transformers':
-        vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-        results = [v.tolist() for v in vecs]
+        # Long inputs used to be truncated by the tokenizer, silently: a 40-page
+        # document came back as a confident unit vector of its first ~512
+        # tokens. Chunk and pool instead (or truncate, deliberately, if the
+        # operator asked for that).
+        tok = getattr(model, "tokenizer", None)
+        if tok is not None:
+            def _enc(t):
+                return tok.encode(t, add_special_tokens=True)
+
+            def _dec(ids):
+                return tok.decode(ids, skip_special_tokens=True)
+
+            def _batch(ws):
+                v = model.encode(ws, convert_to_numpy=True,
+                                 normalize_embeddings=True)
+                return [x.tolist() for x in v]
+            results, _counts = _embed_long(texts, _st_token_limit(model),
+                                           _enc, _dec, _batch, _mode, _pool)
+            if chunk_counts is not None:
+                chunk_counts.extend(_counts)
+        else:
+            # No tokenizer to window with: the old path, and say so rather than
+            # pretend the input was handled.
+            vecs = model.encode(texts, convert_to_numpy=True,
+                                normalize_embeddings=True)
+            results = [v.tolist() for v in vecs]
     elif backend == 'clip':
         import torch
         import torch.nn.functional as F
@@ -1396,6 +1589,26 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         feats = F.normalize(feats, dim=-1)
         results = [row.cpu().tolist() for row in feats]
     elif backend == 'qwenvl':
+        # GME: window the TEXT before the chat prompt is built around it. The
+        # processor's own truncation would cut the template's closing tokens as
+        # readily as the body, and 1800 was a silent ceiling -- a long text came
+        # back as a confident vector of its opening.
+        _proc = model[0] if isinstance(model, (tuple, list)) else None
+        _tok = getattr(_proc, 'tokenizer', None) if _proc is not None else None
+        if _tok is not None and texts:
+            def _enc(t):
+                return _tok.encode(t, add_special_tokens=False)
+
+            def _dec(ids):
+                return _tok.decode(ids, skip_special_tokens=True)
+
+            def _batch(ws):
+                return _qwenvl_embed(model, [{'text': w} for w in ws], dimensions)
+            results, _counts = _embed_long(texts, _QWENVL_TEXT_TOKENS,
+                                           _enc, _dec, _batch, _mode, _pool)
+            if chunk_counts is not None:
+                chunk_counts.extend(_counts)
+            return results
         return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'text': t} for t in texts], dimensions)
@@ -1786,10 +1999,15 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
 
     # Text vectors first, then image vectors — indices follow that order.
     vectors: List[List[float]] = []
+    # How many windows each input needed. Reported when any was more than one:
+    # replacing a SILENT truncation with a silent pooling would be the same bug
+    # with a better answer.
+    _chunks: List[int] = []
     try:
         if texts:
             vectors += await asyncio.get_event_loop().run_in_executor(
-                None, _embed_texts, model_obj, texts, request.dimensions)
+                None, _embed_texts, model_obj, texts, request.dimensions,
+                _chunks, model_key)
         if images:
             vectors += await asyncio.get_event_loop().run_in_executor(
                 None, _embed_images, model_obj, images, request.dimensions)
@@ -1817,9 +2035,11 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
             await asyncio.get_event_loop().run_in_executor(
                 None, multi_model_manager._evict_models_for_vram, 2.0)
             vectors = []
+            _chunks = []
             if texts:
                 vectors += await asyncio.get_event_loop().run_in_executor(
-                    None, _embed_texts, model_obj, texts, request.dimensions)
+                    None, _embed_texts, model_obj, texts, request.dimensions,
+                    _chunks, model_key)
             if images:
                 vectors += await asyncio.get_event_loop().run_in_executor(
                     None, _embed_images, model_obj, images, request.dimensions)
@@ -1897,4 +2117,15 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     )
     if quant_meta is not None:
         resp.quantization = quant_meta
+    # SAY SO when an input did not fit. Before 0.3.72 a long document was
+    # truncated and the response looked identical to one that fit -- a caller
+    # had no way to tell an embedding of a document from an embedding of its
+    # first page. Chunking without reporting would keep that blindness.
+    if any(c > 1 for c in (_chunks or [])):
+        _m, _p = _embed_chunk_cfg(model_key)
+        resp.chunked = {"windows": list(_chunks), "pool": _p}
+        _n = sum(1 for c in _chunks if c > 1)
+        print(f"[embeddings] {_n} of {len(_chunks)} input(s) exceeded the model's "
+              f"window and were embedded in {max(_chunks)} window(s) at most, "
+              f"pooled by {_p}", flush=True)
     return resp
