@@ -760,6 +760,10 @@ app.include_router(loras_router, tags=["LoRAs"])
 app.include_router(environments_router, tags=["Environments"])
 app.include_router(spatial_router, tags=["Spatial / 3D"])
 app.include_router(ocr_router, tags=["OCR"])
+# Retrieval chunking. A pure CPU text operation (no tokenizer, no model,
+# no GPU), so every image serves it -- including the light-core ones.
+from codai.api.chunking import router as chunking_router   # noqa: E402
+app.include_router(chunking_router, tags=["Chunking"])
 # The address an attached OCR engine drives: one stable URL of ours, forwarded
 # per request to the least-busy server that holds the model. Not in the schema —
 # it is machine-to-machine, authenticated by a lease rather than an API token.

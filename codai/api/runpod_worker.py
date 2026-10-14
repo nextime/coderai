@@ -1254,46 +1254,72 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     # capability pod is not what makes its pod able to read a page.
     if pod_runs_ocr_pipeline(mcfg, image):
         _o = _ocr_cfg()
+        # WHICH engine this pod's pipeline is for. A pod serves one model, and
+        # that model is what decides -- surya-ocr-2, chandra-ocr-2 or olmOCR.
+        # Hardcoding surya told a chandra pod to run surya against chandra's
+        # model id, which would have produced plausible-looking text from the
+        # wrong engine.
+        _served_l = str(served or "").lower()
+        _eng = "surya"
+        for _cand in ("chandra", "olmocr", "surya"):
+            if _cand in _served_l:
+                _eng = _cand
+                break
         env["CODERAI_OCR_ENABLED"] = "1"
-        env["CODERAI_OCR_SURYA_ENABLED"] = "1"
-        env["CODERAI_OCR_DEFAULT_ENGINE"] = "surya"
+        env[f"CODERAI_OCR_{_eng.upper()}_ENABLED"] = "1"
+        env["CODERAI_OCR_DEFAULT_ENGINE"] = _eng
         # The baked venv, so the pod does not try to BUILD one on a rented
-        # machine (minutes, and it would land on the container disk).
-        env["CODERAI_OCR_SURYA_VENV"] = "/opt/coderai/venvs/surya"
+        # machine (minutes, and it would land on the container disk). Only
+        # surya has one: chandra and olmOCR in served mode speak HTTP from the
+        # main venv (PIL + requests), which is why the pod side is nearly free
+        # for them and needed a 1.6 GB venv for surya.
+        if _eng == "surya":
+            env["CODERAI_OCR_SURYA_VENV"] = "/opt/coderai/venvs/surya"
         # Surya drives the model through the pod's OWN coderai, in the same
         # "model" mode the orchestrator uses -- which is what makes the gateway
         # mint it an attach token instead of needing a bearer hand-wired here.
         # Over loopback, so a page resumed four times costs four local round
         # trips rather than four across the internet.
-        env["CODERAI_OCR_SURYA_SERVE"] = "model"
-        env["CODERAI_OCR_SURYA_MODEL_ID"] = str(served or "").strip()
-        # Surya is GPL and gated on an explicit acceptance. The pod inherits the
-        # decision made here; it cannot make it for itself.
-        env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] = "1"
+        env[f"CODERAI_OCR_{_eng.upper()}_SERVE"] = "model"
+        env[f"CODERAI_OCR_{_eng.upper()}_MODEL_ID"] = str(served or "").strip()
+        # Licences are inherited, never decided by the pod: surya is GPL and
+        # chandra's weights are a modified OpenRAIL-M. Asking for the engine by
+        # name HERE is the decision.
+        if _eng == "surya":
+            env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] = "1"
+        elif _eng == "chandra":
+            env["CODERAI_OCR_CHANDRA_ACCEPT_LICENSE"] = "1"
         # This image carries NO docTR -- `auto` would route a failed page to an
-        # engine that is not there. Surya or nothing, said out loud.
+        # engine that is not there. This engine or nothing, said out loud.
         env["CODERAI_OCR_FALLBACK_ENGINES"] = "off"
         # And the TUNING. Every one of these was set in response to a measured
         # failure, and a pod reading pages at surya's defaults instead would be
         # indistinguishable from the "pre-fix pod image" that got blamed three
         # times for orchestrator bugs.
-        for _var, _attr in (("CODERAI_OCR_DPI", "dpi"),
-                            ("CODERAI_OCR_SURYA_DPI", "surya_dpi"),
-                            ("CODERAI_OCR_SURYA_MAX_TOKENS", "surya_max_tokens"),
-                            ("CODERAI_OCR_SURYA_MAX_CONTINUATIONS",
-                             "surya_max_continuations"),
-                            ("CODERAI_OCR_SURYA_CONTEXT_TOKENS",
-                             "surya_context_tokens"),
-                            ("CODERAI_OCR_SURYA_MAX_RETRIES", "surya_max_retries"),
-                            ("CODERAI_OCR_SURYA_REPEAT_MAX_REPEATS",
-                             "surya_repeat_max_repeats"),
-                            ("CODERAI_OCR_SURYA_REPEAT_WINDOW",
-                             "surya_repeat_window"),
-                            ("CODERAI_OCR_SURYA_REPEAT_SCALING",
-                             "surya_repeat_scaling"),
-                            ("CODERAI_OCR_SURYA_LANES", "surya_lanes"),
-                            ("CODERAI_OCR_SURYA_INSTANCES", "surya_instances"),
-                            ("CODERAI_OCR_SURYA_LANGS", "surya_langs"),
+        # Per-engine tuning, by name, so a chandra pod gets chandra's budgets
+        # rather than surya's. Every one of these was set in response to a
+        # measured failure, and a pod running the engine's own defaults instead
+        # is indistinguishable from the "pre-fix pod image" that got blamed
+        # three times for orchestrator bugs.
+        _E = _eng.upper()
+        _per_engine = [(f"CODERAI_OCR_{_E}_DPI", f"{_eng}_dpi"),
+                       (f"CODERAI_OCR_{_E}_MAX_TOKENS", f"{_eng}_max_tokens"),
+                       (f"CODERAI_OCR_{_E}_MAX_CONTINUATIONS",
+                        f"{_eng}_max_continuations"),
+                       (f"CODERAI_OCR_{_E}_CONTEXT_TOKENS",
+                        f"{_eng}_context_tokens"),
+                       (f"CODERAI_OCR_{_E}_MAX_RETRIES", f"{_eng}_max_retries"),
+                       (f"CODERAI_OCR_{_E}_INSTANCES", f"{_eng}_instances"),
+                       (f"CODERAI_OCR_{_E}_LANES", f"{_eng}_lanes"),
+                       (f"CODERAI_OCR_{_E}_LANGS", f"{_eng}_langs")]
+        if _eng == "surya":
+            _per_engine += [
+                ("CODERAI_OCR_SURYA_REPEAT_MAX_REPEATS",
+                 "surya_repeat_max_repeats"),
+                ("CODERAI_OCR_SURYA_REPEAT_WINDOW", "surya_repeat_window"),
+                ("CODERAI_OCR_SURYA_REPEAT_SCALING", "surya_repeat_scaling")]
+        for _var, _attr in _per_engine + [
+                            ("CODERAI_OCR_DPI", "dpi"),
                             ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency"),
                             ("CODERAI_OCR_PAGE_WINDOW", "page_window"),
                             ("CODERAI_OCR_RASTER_WORKERS", "raster_workers"),
@@ -1301,7 +1327,7 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                              "blank_page_max_chars"),
                             ("CODERAI_OCR_DETECT_MODE", "detect_mode"),
                             ("CODERAI_OCR_DETECT_MODEL_PATH", "detect_model_path"),
-                            ("CODERAI_OCR_DETECT_CONF", "detect_conf")):
+                            ("CODERAI_OCR_DETECT_CONF", "detect_conf")]:
             _val = getattr(_o, _attr, None) if _o is not None else None
             if _val not in (None, "", 0, 0.0):
                 env[_var] = str(_val)
@@ -1321,9 +1347,9 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                   "it was never given, and will report no stamps rather than "
                   "fail. Set the path (staged on the pod) or use detect_mode="
                   "layout.", flush=True)
-        print(f"[runpod] the OCR PIPELINE runs on this pod ({image}): it is sent "
-              f"one page as a PDF and reads it on the card, with its own vLLM "
-              f"over loopback", flush=True)
+        print(f"[runpod] the {_eng} OCR PIPELINE runs on this pod ({image}): it "
+              f"is sent one page as a PDF and reads it on the card, with its own "
+              f"vLLM over loopback", flush=True)
 
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
@@ -2719,7 +2745,15 @@ class RunpodPodPool:
                 print(f"[runpod] {_dc or '(no region)'}: attaching volume "
                       f"{_v or '(none — this region has no volume configured)'}",
                       flush=True)
-            print(f"[runpod] provisioning pod for {self.model_key!r}: {sel['display_name']} "
+            # ONE pod request walks this whole list until a (card, region) pair
+            # has capacity, so this line is printed PER CANDIDATE -- and it used
+            # to say "provisioning pod", which reads as a pod being launched.
+            # 312 attempts for 10 pods in one afternoon therefore looked like
+            # runaway provisioning to an operator reading the log, and was
+            # reported as such. Say which attempt this is, out of how many, so
+            # the shape of the list is visible instead of inferred.
+            print(f"[runpod] {self.model_key!r}: trying candidate "
+                  f"{i + 1}/{len(ranked)} for ONE pod — {sel['display_name']} "
                   f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr"
                   + (f" in {_dc}" if _dc else " (region: RunPod's choice)") + _alt,
                   flush=True)

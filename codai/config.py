@@ -381,6 +381,41 @@ class EnhanceConfig:
 
 
 @dataclass
+class ChunkingConfig:
+    """Retrieval chunking (`POST /v1/chunk`).
+
+    NOT embedding windowing. `ocr`/`embeddings` settings make one input fit a
+    model window and pool it into ONE vector; this splits a document into MANY
+    separately-indexable chunks, each with its section, parent and references.
+
+    Token counts are approximated as characters / `chars_per_token`, so the
+    endpoint loads no tokenizer and needs no model, no GPU and no pod -- which
+    is what lets every image serve it, light-core ones included.
+    """
+    # The defaults are the ones a production index was built with: changing them
+    # changes every chunk boundary, which makes a re-chunked index incomparable
+    # with the one it replaces and retrieval quality unmeasurable across the
+    # change. Treat them as a format, not a preference.
+    chunk_tokens: int = 800              # target size, approximated tokens
+    overlap: int = 120                   # carried tail, approximated tokens
+    chars_per_token: int = 4             # the approximation divisor
+    structural: bool = True              # False = flat length chunking
+    structure: str = "it-legal"          # default template name
+    require_text: bool = True            # refuse container bytes (see below)
+    # A chunker that accepts a PDF or an OOXML container embeds garbage that the
+    # index cannot afterwards distinguish from content. Measured on a production
+    # corpus: 0.59% of chunks held control characters, 0.04% raw OOXML --
+    # documents whose container was chunked instead of its extracted text.
+    # `require_text: false` opts out deliberately.
+    max_chars: int = 8_000_000           # above this -> 413 too_large
+    # Operator-supplied structure templates, same JSON shape as the built-in
+    # `it-legal`, selected by name. An unknown name is an ERROR, never a silent
+    # fallback: a caller who asked for their own template and silently got
+    # Italian legal sectioning would index the wrong boundaries and never know.
+    templates: dict = field(default_factory=dict)
+
+
+@dataclass
 class CompactionConfig:
     """Global defaults for auto-compaction of an over-long chat history.
 
@@ -1379,6 +1414,7 @@ class Config:
     runpod: RunpodConfig = field(default_factory=RunpodConfig)
     ocr: OcrConfig = field(default_factory=OcrConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
@@ -1576,6 +1612,7 @@ class ConfigManager:
                 runpod=_dc(RunpodConfig, config_data.get("runpod", {})),
                 ocr=_dc(OcrConfig, config_data.get("ocr", {})),
                 compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
+                chunking=_dc(ChunkingConfig, config_data.get("chunking", {})),
                 broker=_dc(BrokerConfig, config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
@@ -2016,6 +2053,16 @@ class ConfigManager:
                 "extract_max_tokens": self.config.ocr.extract_max_tokens,
                 "extract_schema": self.config.ocr.extract_schema,
                 "extract_validate": self.config.ocr.extract_validate,
+            },
+            "chunking": {
+                "chunk_tokens": self.config.chunking.chunk_tokens,
+                "overlap": self.config.chunking.overlap,
+                "chars_per_token": self.config.chunking.chars_per_token,
+                "structural": self.config.chunking.structural,
+                "structure": self.config.chunking.structure,
+                "require_text": self.config.chunking.require_text,
+                "max_chars": self.config.chunking.max_chars,
+                "templates": self.config.chunking.templates,
             },
             "compaction": {
                 "enabled": self.config.compaction.enabled,

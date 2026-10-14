@@ -72,6 +72,17 @@ _CAPABILITY_PREFIXES = (
     ("/v1/video", "video"),
     ("/v1/3d", "spatial"),
     ("/v1/embeddings", "embeddings"),
+    # Retrieval chunking rides the EMBEDDINGS capability rather than inventing
+    # one of its own. Two reasons: chunks are on their way to be embedded, so
+    # the machine that will embed them is the natural place to cut them; and the
+    # embeddings image is full-core, so it carries the chunker. Inventing a
+    # `chunk` capability would mean a capability nothing advertises, and renting
+    # a GPU pod to run a regex split.
+    #
+    # It is pure CPU either way -- token counts are characters /
+    # chars_per_token, no tokenizer, no model -- so forwarding it is about WHERE
+    # the CPU is, which matters when the orchestrator is the busy box.
+    ("/v1/chunk", "embeddings"),
     ("/v1/rerank", "rerank"),
     ("/v1/ocr", "ocr"),
     ("/v1/loras", "loras"),
@@ -142,6 +153,51 @@ _ORCHESTRATION_PREFIXES = ("/v1/pipelines", "/v1/characters", "/v1/environments"
 #: `model` field in a multipart body, without paying for a full form parse.
 _MULTIPART_MODEL = re.compile(
     rb'name="model"\r?\n(?:[^\r\n]*\r?\n)*?\r?\n([^\r\n]*)', re.IGNORECASE)
+
+
+def _inline_chunk_template(path: str, headers: dict, body: bytes) -> bytes:
+    """Resolve a NAMED /v1/chunk structure template into its object before the
+    request leaves this machine.
+
+    A template registered in THIS install's config does not exist on the
+    remote. Forwarded by name it would come back 404 `unknown_template` -- or,
+    far worse, match a DIFFERENT template that happens to share the name and
+    return different chunk boundaries with no indication that anything
+    happened. Chunk boundaries that silently differ by which machine answered
+    make a retrieval index unmeasurable, which is the whole thing
+    docs/chunking.md warns about.
+
+    Built-in names are left alone: every coderai has those, and sending the
+    object would only make the request bigger.
+
+    Never raises: a body it cannot parse is forwarded untouched, and the remote
+    then answers for itself.
+    """
+    if (path or "").rstrip("/") != "/v1/chunk":
+        return body
+    if "json" not in (headers.get("content-type") or "").lower():
+        return body            # multipart goes to /v1/chunk/file; same rule there
+    try:
+        import json as _json
+        obj = _json.loads(body or b"{}")
+        if not isinstance(obj, dict):
+            return body
+        name = obj.get("structure")
+        if not isinstance(name, str) or not name.strip():
+            return body        # already inline, or defaulted
+        from codai.api.chunking import BUILTIN_TEMPLATES, resolve_template
+        if name.strip() in BUILTIN_TEMPLATES:
+            return body
+        from codai.api.chunking import _registered_templates
+        tpl = resolve_template(name, _registered_templates())
+        if not isinstance(tpl, dict):
+            return body
+        obj["structure"] = tpl
+        print(f"[remote] /v1/chunk: inlining the {name!r} template so the remote "
+              f"cuts on the same boundaries this install would", flush=True)
+        return _json.dumps(obj).encode("utf-8")
+    except Exception:
+        return body
 
 
 def capability_for(path: str) -> str:
@@ -673,6 +729,7 @@ class RemoteGatewayMiddleware:
             return await _error(send, 502, f"remote routing failed: {exc}")
         if not target:
             return await self._app(scope, replay, send)
+        body = _inline_chunk_template(scope.get("path") or "", headers, body)
         await self._forward(scope, headers, body, target, send)
 
     async def _forward(self, scope, headers, body, target, send):

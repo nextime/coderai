@@ -344,9 +344,9 @@ def test_pages_come_back_in_document_order(monkeypatch):
 
     seen = []
 
-    def _post(base, key, blob, name, dpi, opts, detect):
+    def _post(base, key, blob, name, dpi, opts, detect, engine="surya"):
         seen.append(name)
-        return {"engine": "surya", "pages": [{"text": name, "width": 1, "height": 2}]}
+        return {"engine": engine, "pages": [{"text": name, "width": 1, "height": 2}]}
     monkeypatch.setattr(om, "_post_page_to_pod", _post)
     name, pages, blank, stamps, sigs = asyncio.run(mgr._read_on_pods(
         _pdf(5), "d.pdf", "application/pdf", "m",
@@ -468,3 +468,109 @@ def test_the_fallback_message_names_the_cause_not_just_the_effect():
     fn = src.split("async def _read_on_pods")[1].split("\n    def ")[0]
     assert "placement answered 'local'" in fn
     assert "nothing rented" in fn
+
+
+# ------------------------------- all three VLM engines, not just surya #
+#
+# surya needed a 1.6 GB client venv baked into the image. chandra and olmOCR in
+# served mode speak only HTTP (PIL + requests, already in the main venv), so for
+# them the pod side costs nothing beyond the rasteriser. Leaving them on the
+# orchestrator while surya moved was an asymmetry, not a design.
+class _MultiCfg:
+    surya_serve = "model"
+    surya_model_id = "datalab-to/surya-ocr-2"
+    chandra_serve = "model"
+    chandra_model_id = "datalab-to/chandra-ocr-2"
+    olmocr_serve = "model"
+    olmocr_model_id = "allenai/olmOCR-2-7B-1025-FP8"
+    default_engine = "surya"
+    max_concurrency = 8
+    page_window = 4
+    blank_page_max_chars = 0
+    fallback_engines = "off"
+
+
+@pytest.mark.parametrize("engine,expect", [
+    ("surya", "datalab-to/surya-ocr-2"),
+    ("chandra", "datalab-to/chandra-ocr-2"),
+    ("olmocr", "allenai/olmOCR-2-7B-1025-FP8"),
+])
+def test_every_vlm_engine_can_take_the_pod_path(monkeypatch, engine, expect):
+    monkeypatch.setattr(rw, "_model_entry", lambda mid: {
+        "runpod": {"image": "ghcr.io/nextime/coderai-vllm-ocr:latest"}})
+    assert om.pod_pipeline_model(_MultiCfg(), engine) == expect
+
+
+@pytest.mark.parametrize("engine", ["surya", "chandra", "olmocr"])
+def test_a_plain_vllm_image_keeps_every_engine_local(monkeypatch, engine):
+    monkeypatch.setattr(rw, "_model_entry", lambda mid: {
+        "runpod": {"image": "ghcr.io/nextime/coderai-vllm:latest"}})
+    assert om.pod_pipeline_model(_MultiCfg(), engine) == ""
+
+
+def test_a_non_vlm_engine_never_takes_the_pod_path(monkeypatch):
+    """paddle and docTR run in-process; there is no model server to drive."""
+    monkeypatch.setattr(rw, "_model_entry", lambda mid: {
+        "runpod": {"image": "ghcr.io/nextime/coderai-vllm-ocr:latest"}})
+    for eng in ("paddle", "doctr", "nonsense"):
+        assert om.pod_pipeline_model(_MultiCfg(), eng) == ""
+
+
+def test_each_engine_reads_its_own_serve_mode(monkeypatch):
+    """chandra on `server` mode must not be dragged onto the pod path by
+    surya's `model` mode."""
+    class _C(_MultiCfg):
+        chandra_serve = "server"
+    monkeypatch.setattr(rw, "_model_entry", lambda mid: {
+        "runpod": {"image": "ghcr.io/nextime/coderai-vllm-ocr:latest"}})
+    assert om.pod_pipeline_model(_C(), "chandra") == ""
+    assert om.pod_pipeline_model(_C(), "surya") == "datalab-to/surya-ocr-2"
+
+
+def test_the_dispatch_tells_the_pod_WHICH_engine(monkeypatch):
+    """Hardcoded "surya" sent a chandra page to surya, which the pod would have
+    served with the wrong model -- and the text would have come back looking
+    plausible."""
+    from codai.api import pod_http
+    seen = {}
+
+    class _R:
+        status_code = 200
+
+        def json(self):
+            return {"engine": "chandra", "pages": []}
+    monkeypatch.setattr(pod_http, "post",
+                        lambda url, **kw: seen.update(kw) or _R())
+    om._post_page_to_pod("https://1.2.3.4:8000/v1", "t", b"%PDF-x", "0.pdf",
+                         250, {}, None, "chandra")
+    assert seen["data"]["engine"] == "chandra"
+
+
+def test_the_pod_env_is_shaped_by_the_served_model_not_hardcoded():
+    src = (ROOT / "codai/api/runpod_worker.py").read_text()
+    blk = src.split("if pod_runs_ocr_pipeline(mcfg, image):")[1] \
+             .split('if cap == "ocr":')[0]
+    assert 'env[f"CODERAI_OCR_{_eng.upper()}_ENABLED"]' in blk
+    assert 'env[f"CODERAI_OCR_{_eng.upper()}_SERVE"]' in blk
+    assert '"CODERAI_OCR_SURYA_ENABLED"' not in blk, "still hardcoded to surya"
+
+
+def test_only_surya_is_pointed_at_a_baked_venv():
+    """chandra and olmOCR have none -- they speak HTTP from the main venv, which
+    is why the pod side is nearly free for them."""
+    src = (ROOT / "codai/api/runpod_worker.py").read_text()
+    blk = src.split("if pod_runs_ocr_pipeline(mcfg, image):")[1] \
+             .split('if cap == "ocr":')[0]
+    assert 'if _eng == "surya":' in blk
+    venv = blk.split('CODERAI_OCR_SURYA_VENV')[0]
+    assert venv.rstrip().endswith('if _eng == "surya":') or 'if _eng == "surya"' in venv
+
+
+def test_each_engine_inherits_its_own_licence_decision():
+    """surya is GPL, chandra's weights are a modified OpenRAIL-M. A pod cannot
+    accept either for itself."""
+    src = (ROOT / "codai/api/runpod_worker.py").read_text()
+    blk = src.split("if pod_runs_ocr_pipeline(mcfg, image):")[1] \
+             .split('if cap == "ocr":')[0]
+    assert "CODERAI_OCR_SURYA_ACCEPT_LICENSE" in blk
+    assert "CODERAI_OCR_CHANDRA_ACCEPT_LICENSE" in blk

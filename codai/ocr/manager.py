@@ -349,7 +349,7 @@ def _warn_if_oversubscribed(name: str, pages: int) -> None:
 
 
 def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
-                      dpi: int, opts: dict, detect) -> dict:
+                      dpi: int, opts: dict, detect, engine: str = "surya") -> dict:
     """POST one page to a pod's own /v1/ocr and return its response dict.
 
     Through `pod_http`, not `requests`: a pod on the direct path serves HTTPS
@@ -363,7 +363,10 @@ def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
         url = url + "/ocr"
     else:
         url = url + "/v1/ocr"
-    fields = {"engine": "surya"}
+    # The engine the POD must use. Hardcoded "surya" sent a chandra page to
+    # surya, which the pod would have served with the wrong model -- and the
+    # text would have come back looking plausible.
+    fields = {"engine": str(engine or "surya")}
     if dpi:
         fields["dpi"] = str(int(dpi))
     if detect:
@@ -420,6 +423,9 @@ def _page_from_pod(d: dict, index: int) -> OcrPage:
 def pod_pipeline_model(cfg, engine: str = "") -> str:
     """The model id whose pods run the OCR pipeline themselves, or "".
 
+    Answers for whichever VLM engine is being used -- surya, chandra or
+    olmOCR -- each read from its own `<engine>_serve` / `<engine>_model_id`.
+
     THE IMAGE IS THE SWITCH. A model served by `coderai-vllm-ocr` carries surya
     and the rasteriser, so the page goes to it as a one-page PDF; one served by
     `coderai-vllm` serves only the model and the pipeline stays here. There is
@@ -429,12 +435,19 @@ def pod_pipeline_model(cfg, engine: str = "") -> str:
     Returns "" for every other case -- no model mode, no entry, a different
     image -- so the caller simply does what it has always done.
     """
-    name = (engine or "").strip().lower()
-    if name and name != "surya":
+    name = (engine or "").strip().lower() or str(
+        getattr(cfg, "default_engine", "") or "").strip().lower()
+    # All three VLM engines can run on the pod, not just surya. The image is
+    # what differs: surya needs its client venv baked in, while chandra and
+    # olmOCR in served mode speak only HTTP (PIL + requests, already present),
+    # so for them the pod side costs nothing beyond the rasteriser. Leaving
+    # them on the orchestrator while surya moved was an asymmetry, not a
+    # design.
+    if name not in ("surya", "chandra", "olmocr"):
         return ""
-    if str(getattr(cfg, "surya_serve", "") or "").strip().lower() != "model":
+    if str(getattr(cfg, f"{name}_serve", "") or "").strip().lower() != "model":
         return ""
-    mid = str(getattr(cfg, "surya_model_id", "") or "").strip()
+    mid = str(getattr(cfg, f"{name}_model_id", "") or "").strip()
     if not mid:
         return ""
     try:
@@ -1217,7 +1230,9 @@ class OcrManager:
             try:
                 _out = await self._read_on_pods(
                     data, filename, content_type, _remote_model,
-                    dpi=use_dpi, page_opts=page_opts, detect=detect, cfg=cfg)
+                    dpi=use_dpi, page_opts=page_opts, detect=detect, cfg=cfg,
+                    engine_name=(engine or "").strip().lower()
+                    or str(getattr(cfg, "default_engine", "") or "").lower())
             except OcrError:
                 raise
             except Exception as exc:
@@ -1275,7 +1290,8 @@ class OcrManager:
             return 0
 
     async def _read_on_pods(self, data: bytes, filename: str, content_type: str,
-                            model_id: str, *, dpi: int, page_opts, detect, cfg):
+                            model_id: str, *, dpi: int, page_opts, detect, cfg,
+                            engine_name: str = "surya"):
         """Send ONE PAGE PER REQUEST to pods that run the pipeline themselves.
 
         The page travels as a small PDF and the pod renders and reads it on the
@@ -1318,7 +1334,7 @@ class OcrManager:
                     return await asyncio.to_thread(
                         _post_page_to_pod, lease.base, lease.api_key, blob,
                         f"{idx}.pdf" if is_pdf else (filename or "page"),
-                        dpi, opts, detect)
+                        dpi, opts, detect, engine_name)
                 finally:
                     lease.release()
 
