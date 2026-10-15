@@ -614,3 +614,44 @@ def test_a_model_without_adapters_is_not_nudged(monkeypatch):
     monkeypatch.setattr(vw, "_load_lora_runtime",
                         lambda *a: pytest.fail("nothing to load"))
     _nudge_engine_for_adapters({"path": BASE_REPO, "alias": "base"}, "text_models")
+
+
+def test_a_pool_sibling_is_seeded_with_an_engine_too(monkeypatch):
+    """Only the pool's OWN entry carried one, so a sibling arrived on the pod
+    with no backend and fell through to the pod's default:
+
+        503 Model 'diogene-alpha' failed to load: Unknown backend: cpu
+
+    It did not bite while an adapter collapsed into its base on the pod — it
+    was never a model of its own to load. Making it one exposed this."""
+    import json
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [dict(BASE), dict(ADAPTER)]}),
+                        raising=False)
+    mcfg = rw.parse_model_runpod(BASE["runpod"])
+    plan = rw._plan("coderai", "img", "", mcfg, "key", dict(BASE), "base-awq",
+                    seed_entries=rw.shared_pool_seed_entries("shared", "base-awq"))
+    seeds = {s.get("alias"): s for s in
+             json.loads(plan["env"]["CODERAI_SEED_MODELS"])}
+    assert seeds["base-awq"]["backend"] == "vllm"
+    assert seeds["tuned-alpha"]["backend"] == "vllm"      # the one that was missing
+
+
+def test_every_sibling_gets_the_POOLS_engine(monkeypatch):
+    """A pool is one pod running one image, so siblings cannot each have their
+    own engine. Seeding a sibling's different one would describe something the
+    pod cannot satisfy, and the failure would land minutes later inside a
+    rented machine."""
+    import json
+    import codai.admin.routes as routes
+    other = dict(ADAPTER)
+    other["runpod"] = dict(ADAPTER["runpod"], engine="coderai-llama")
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [dict(BASE), other]}), raising=False)
+    mcfg = rw.parse_model_runpod(BASE["runpod"])
+    plan = rw._plan("coderai", "img", "", mcfg, "key", dict(BASE), "base-awq",
+                    seed_entries=rw.shared_pool_seed_entries("shared", "base-awq"))
+    seeds = {s.get("alias"): s for s in
+             json.loads(plan["env"]["CODERAI_SEED_MODELS"])}
+    assert seeds["tuned-alpha"]["backend"] == "vllm"   # the pool's, not its own

@@ -1272,7 +1272,19 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         if one:
             seeds.extend(_json.loads(one))
     for extra in (seed_entries or []):
-        one = seed_model_env(extra, seed_served_name(extra), "")
+        # …with the ENGINE too. Only the pool's own entry carried one, so a
+        # sibling arrived on the pod with no backend and fell through to the
+        # pod's default:
+        #     503 Model 'diogene-alpha' failed to load: Unknown backend: cpu
+        # It did not bite while an adapter collapsed into its base on the pod —
+        # it was never a model of its own to load. Making it one exposed this.
+        #
+        # The POOL's engine, always. A pool is one pod running one image, so
+        # siblings cannot each have their own: seeding a sibling's different
+        # engine would describe something the pod cannot satisfy, and the
+        # failure would land minutes later inside a rented machine.
+        one = seed_model_env(extra, seed_served_name(extra), "",
+                             engine=engine_pod_backend(entry or {}, mcfg))
         if one:
             seeds.extend(_json.loads(one))
     if seeds:
