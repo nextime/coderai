@@ -3166,7 +3166,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                           if isinstance(sv, str) else bool(sv))
         # ints
         for k in ("container_disk_gb", "volume_gb", "port", "ctx", "min_pods",
-                  "max_pods", "scale_up_inflight_per_pod", "scale_down_after_s",
+                  "max_pods", "scale_up_inflight_per_pod",
+                  # How many GPUs may start billing together when the pool
+                  # grows. Settable in the form, so it must survive the save.
+                  "scale_up_max_parallel_boots", "scale_down_after_s",
                   "scale_down_costliest_first",
                   "max_inflight_per_pod",
                   "idle_timeout_s",

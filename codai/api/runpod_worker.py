@@ -5374,7 +5374,20 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
             continue                       # our own; the local pool handles it
         url = str(info.get("url") or "")
         if not url:
-            continue
+            # A pod that was still BOOTING when its owner died. register_pod
+            # writes the url only once the pod is ready, so a restart landing
+            # inside a boot — and these images take 6-14 minutes to boot — left
+            # an entry nothing could ever adopt: skipped here in silence, then
+            # billed until the reaper's grace expired. The pod id is enough to
+            # ask RunPod where it is.
+            url = _recover_pod_url(pod_id, info)
+            if not url:
+                print(f"[runpod] not adopting pod {pod_id}: it has no address "
+                      f"recorded and RunPod does not give one yet (it was "
+                      f"still booting when its owner stopped)", flush=True)
+                continue
+            print(f"[runpod] pod {pod_id} was mid-boot when its owner stopped; "
+                  f"recovered its address from RunPod: {url}", flush=True)
         if image:
             theirs = str(info.get("image") or "")
             if theirs != str(image):
@@ -5392,7 +5405,46 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
         key = str(info.get("key") or "") or api_key
         if _pod_health_ok(url, path=health_path, api_key=key):
             return pod_id, url, key, float(info.get("hourly_usd") or 0.0)
+        # The last silent refusal. A pod that does not answer may be dead, may
+        # be mid-warm-up, or may want a token we do not have — and renting
+        # beside it looks identical from the log either way.
+        print(f"[runpod] not adopting pod {pod_id}: it did not answer "
+              f"{health_path} at {url} (dead, still loading, or it wants a "
+              f"token this pool does not have)", flush=True)
     return None, "", "", 0.0
+
+
+def _recover_pod_url(pod_id: str, info: dict) -> str:
+    """Where a registered pod is now, asked of RunPod rather than remembered.
+
+    Only for an entry with no url: the owner died between creating the pod and
+    it becoming ready. Best effort — a pod that still has no port gives nothing
+    and the caller says so.
+    """
+    try:
+        from codai.models.manager import get_active_runpod_config
+        from codai.api.runpod_client import RunpodClient, direct_tcp_url, pod_proxy_url
+        acct = get_active_runpod_config()
+        if acct is None or not getattr(acct, "api_key", ""):
+            return ""
+        live = RunpodClient(acct).get_pod(str(pod_id))
+    except Exception as exc:
+        print(f"[runpod] could not ask RunPod where pod {pod_id} is: {exc}",
+              flush=True)
+        return ""
+    if str(live.get("status") or "").upper() in ("TERMINATED", "EXITED", "FAILED"):
+        return ""
+    ports = live.get("ports") or []
+    if not ports:
+        return ""
+    # The same two shapes _provision_one chooses between, decided the same way:
+    # a recorded direct-TCP address is https to a bare IP.
+    try:
+        port = int(info.get("port") or 0) or 8000
+    except Exception:
+        port = 8000
+    direct = direct_tcp_url(ports, port, tls=True)
+    return direct or pod_proxy_url(str(pod_id), port)
 
 
 def unregister_pod(pod_id: str) -> None:
@@ -5764,8 +5816,89 @@ def reap_orphans() -> int:
     return reaped
 
 
+def reclaim_registered_pods() -> int:
+    """Take this deployment's surviving pods back into their pools, at startup.
+
+    Adoption existed, but only ON DEMAND: it runs inside ``acquire`` when a
+    request needs a pod. Nothing reconciled the registry at boot, so after a
+    restart the pods this deployment was already paying for sat unowned until
+    either a request happened to want that pool or the reaper's 20-minute grace
+    expired. "Every restart leaves orphaned pods" was an accurate description
+    of the design rather than a bug in one branch: an hourly unattended upgrade
+    could pay for a fleet twice over, once for the pods it abandoned and again
+    for the ones it rented beside them.
+
+    Reclaiming here costs one registry read and one health probe per pod, and
+    saves both the double billing and a cold boot the fleet had already paid
+    for. Returns how many were taken back.
+
+    Only pods whose pool key names a model this install configures: a shared
+    pool key (``pool:…``) has no single entry to rebuild its shape from, and
+    guessing would be worse than the on-demand path those already have.
+    """
+    try:
+        from codai.models.manager import get_active_runpod_config
+        acct = get_active_runpod_config()
+    except Exception:
+        acct = None
+    if acct is None or not getattr(acct, "enabled", False):
+        return 0
+    try:
+        data = _registry_update(lambda d: False) or {}
+    except Exception as exc:
+        print(f"[runpod] reclaim: cannot read the registry ({exc})", flush=True)
+        return 0
+    keys = {}
+    for pod_id, info in data.items():
+        if not isinstance(info, dict) or _is_this_process(info):
+            continue
+        key = str(info.get("pool") or "")
+        if key:
+            keys[key] = keys.get(key, 0) + 1
+    if not keys:
+        return 0
+    taken = 0
+    for key in keys:
+        if key.startswith("pool:"):
+            print(f"[runpod] reclaim: leaving shared pool {key!r} to the "
+                  f"on-demand path — its shape comes from whichever model "
+                  f"loads first, not from the registry", flush=True)
+            continue
+        entry = _model_entry(key)
+        if not entry:
+            print(f"[runpod] reclaim: {key!r} has pods registered but this "
+                  f"install no longer configures it — leaving them to the "
+                  f"reaper", flush=True)
+            continue
+        try:
+            mcfg = parse_model_runpod(entry.get("runpod") or {})
+            served = str((entry.get("runpod") or {}).get("served_model")
+                         or entry.get("id") or key)
+            pool = get_pod_pool(key, acct, mcfg, served, entry=entry)
+            # EVERY pod of this pool, not one. A fleet of sixteen reclaimed one
+            # pod and left fifteen billing, which is the bug with extra steps.
+            # Bounded by how many the registry actually holds for this key, so
+            # a pool that keeps answering "yes" cannot spin: adoption removes
+            # nothing by itself, and the loop must end whatever it returns.
+            for _ in range(keys[key]):
+                if not pool._adopt_shared_pod():
+                    break
+                taken += 1
+                print(f"[runpod] reclaim: took back a pod for {key!r} that "
+                      f"outlived the process that rented it", flush=True)
+        except Exception as exc:
+            print(f"[runpod] reclaim: {key!r}: {exc}", flush=True)
+    return taken
+
+
 def _scaler_loop():
     tick = 0
+    # Take our own pods back BEFORE reaping: a pod this deployment is already
+    # paying for should rejoin its pool, not be killed and rented again.
+    try:
+        reclaim_registered_pods()
+    except Exception as exc:
+        print(f"[runpod] reclaim: startup: {exc}", flush=True)
     # Reap once promptly on start to catch orphans left by a crash/restart.
     try:
         reap_orphans()
