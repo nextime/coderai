@@ -1264,7 +1264,7 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         if one:
             seeds.extend(_json.loads(one))
     for extra in (seed_entries or []):
-        one = seed_model_env(extra, "", "")
+        one = seed_model_env(extra, seed_served_name(extra), "")
         if one:
             seeds.extend(_json.loads(one))
     if seeds:
@@ -1600,6 +1600,23 @@ def _account_hint():
         return get_active_runpod_config()
     except Exception:
         return None
+
+
+def seed_served_name(entry: dict) -> str:
+    """The name a pod must answer to for a seed entry that is not the pool's own.
+
+    The pool's OWN model is seeded with the name the pool serves it under; the
+    others were seeded with nothing, so `seed_model_env` set no alias and the pod
+    registered them under their `path`. For a LoRA that is fatal rather than
+    cosmetic: an adapter's path IS its base, so the second name over one set of
+    weights collapsed into the first and the pod answered 404 under it for the
+    rest of its paid life. Which of the two broke depended on which model
+    happened to rent the pod.
+    """
+    block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+    return (str(block.get("served_model") or "").strip()
+            or str(entry.get("id") or "").strip()
+            or str(entry.get("alias") or "").strip())
 
 
 def seed_model_env(entry: dict, served: str = "", source: str = "",

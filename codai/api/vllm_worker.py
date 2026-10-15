@@ -127,17 +127,36 @@ def resolve_service_key(cfg, model_path: Optional[str] = None):
     return mp, key
 
 
+def service_key_for(cfg, model_path=None, served_name=None):
+    """The key for the vLLM instance that serves ``served_name``.
+
+    ONE engine per set of weights, not one per name. vLLM registers adapters at
+    launch and serves each under its own name, so a base and its LoRAs are one
+    instance — keying on the name as well meant a second request for the same
+    weights under a different name started a SECOND copy of the model on the
+    same card. On a 48 GB card holding a 27B that is not a slowdown, it is an
+    out-of-memory crash, and the first engine is the one that dies.
+
+    ``served_name`` is still what the instance must ANSWER to; see
+    :func:`_ensure_service_once`, which relaunches an engine that does not.
+    """
+    _resolved, key = resolve_service_key(cfg, model_path)
+    return key
+
+
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
                 served_name: Optional[str] = None, model_config: dict = None,
                 gpu_memory_utilization: Optional[float] = None,
                 max_model_len: Optional[int] = None,
                 max_num_batched_tokens: Optional[int] = None,
                 max_num_seqs: Optional[int] = None) -> list:
-    mid = served_name or (getattr(cfg, "model_id", "vllm") or "vllm")
+    mids = _served_names(model_config,
+                         served_name or (getattr(cfg, "model_id", "") or ""),
+                         model_path)
     cmd = [py, "-m", "vllm.entrypoints.openai.api_server",
            "--host", host, "--port", str(port),
            "--model", model_path,
-           "--served-model-name", mid]
+           "--served-model-name"] + mids
     # A side job serving a small model (the OCR VLM engines) overrides the context the
     # LLM backend is configured with: it inherited ctx=18432, and the activation peak
     # that size profiles for was 9.4 GiB of the 11.1 GiB that made surya-ocr-2 unable to
@@ -238,6 +257,36 @@ def _sibling_lora_specs(model_config: dict) -> list:
     return unique
 
 
+def _served_names(model_config: dict, served_name: str, fallback: str) -> list:
+    """Every name this ONE engine must answer to.
+
+    One engine serves a base and each adapter of it, so the launch cannot name
+    only the model whose request happened to start it: whichever of the two
+    arrived second would be unreachable, which is the failure this whole path
+    exists to stop. Adapter names come from ``--lora-modules`` and must NOT be
+    repeated here — vLLM would then have a model and an adapter under one name.
+    """
+    adapters = {str(s.get("name") or "") for s in _sibling_lora_specs(model_config or {})}
+    names = [str(served_name or "")]
+    base = _base_of(model_config or {})
+    if base:
+        try:
+            from codai.admin.routes import config_manager
+            md = getattr(config_manager, "models_data", None) or {}
+        except Exception:
+            md = {}
+        for entry in (md.get("text_models") or []):
+            if not isinstance(entry, dict) or _base_of(entry) != base:
+                continue
+            names.append(str(entry.get("alias") or entry.get("id") or "").strip())
+    out, seen = [], set()
+    for n in names:
+        if n and n not in seen and n not in adapters:
+            seen.add(n)
+            out.append(n)
+    return out or [fallback]
+
+
 def _lora_args(model_config: dict) -> list:
     """`--enable-lora --lora-modules …` for the adapters this engine must serve."""
     try:
@@ -291,6 +340,27 @@ def _model_config_for(model_name: str) -> dict:
         return _model_entry_for(model_name) or {}
     except Exception:
         return {}
+
+
+def _serves_name(url: str, name: str):
+    """True / False / None — the last meaning "could not tell".
+
+    The difference matters: not serving a name costs a relaunch, and failing to
+    ASK looks identical from here. Restarting a loaded 27B because one probe
+    timed out would be far worse than leaving the doubt, so an unanswered probe
+    is never a verdict.
+    """
+    import requests
+    try:
+        r = requests.get(url + "/v1/models", timeout=5)
+        data = r.json().get("data")
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    ids = [str(m.get("id", "")) for m in data if isinstance(m, dict)]
+    tail = name.rstrip("/").split("/")[-1]
+    return any(i == name or i.rstrip("/").split("/")[-1] == tail for i in ids)
 
 
 def _remote_serves(url: str, name: str) -> bool:
@@ -384,13 +454,28 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
         return _remote
 
     resolved, svc_key = resolve_service_key(cfg, model_path)
-    if served_name:
-        svc_key = f"{svc_key}|{served_name}"
     with _lock:
         svc = _services.get(svc_key)
         if svc and svc["proc"].poll() is None and _health_ok(svc["url"]):
-            return svc["url"]
-        if svc:
+            # Alive is not the same as useful. An engine serves the names it was
+            # LAUNCHED with, and this instance may have started before the name
+            # now being asked for existed here at all — a pod is taught models
+            # after it boots, and an adapter registered afterwards is not in any
+            # running engine's --lora-modules. Reusing it then answers 404 for
+            # as long as the engine lives.
+            #
+            # Only an answered probe that omits the name forces a relaunch: a
+            # probe that fails says nothing, and restarting a loaded 27B on a
+            # timeout would be far worse than the doubt.
+            if not served_name or _serves_name(svc["url"], served_name) is not False:
+                return svc["url"]
+            print(f"[vllm] the engine on {svc['url']} does not serve "
+                  f"{served_name!r} — it started before this model was known "
+                  f"here; restarting it so one engine serves the base and every "
+                  f"adapter of it", flush=True)
+            _services.pop(svc_key, None)
+            _stop_proc(svc, svc_key)
+        elif svc:
             _services.pop(svc_key, None)
 
         py = ensure_built(cfg)
@@ -628,8 +713,6 @@ def _shrink_candidate(gmu: float, kv_gib: float, target_kv_gb: float,
 
 def _service_meta(cfg, model_path=None, served_name=None) -> dict:
     _resolved, svc_key = resolve_service_key(cfg, model_path)
-    if served_name:
-        svc_key = f"{svc_key}|{served_name}"
     with _lock:
         svc = _services.get(svc_key) or {}
     return svc.get("meta") or {}
@@ -719,9 +802,13 @@ def ensure_service(cfg, model_path: Optional[str] = None,
     raise last if last is not None else RuntimeError("vLLM did not start")
 
 
-def stop_service(svc_key: str) -> None:
-    with _lock:
-        svc = _services.pop(svc_key, None)
+def _stop_proc(svc: dict, svc_key: str = "") -> None:
+    """Tear a service's process (and its ray cluster) down.
+
+    Separate from :func:`stop_service` because it takes no lock: a caller that
+    already holds ``_lock`` — replacing an engine in place — would deadlock on
+    it.
+    """
     if not svc:
         return
     proc = svc["proc"]
@@ -741,7 +828,13 @@ def stop_service(svc_key: str) -> None:
             ray.stop()
         except Exception as exc:
             print(f"[vllm] ray teardown for {svc_key} failed: {exc}", flush=True)
-    print(f"[vllm] service for {svc_key} stopped", flush=True)
+    print(f"[vllm] service for {svc_key or svc.get('url')} stopped", flush=True)
+
+
+def stop_service(svc_key: str) -> None:
+    with _lock:
+        svc = _services.pop(svc_key, None)
+    _stop_proc(svc, svc_key)
 
 
 def stop_all() -> None:
@@ -752,8 +845,6 @@ def stop_all() -> None:
 def is_running(cfg, model_path: Optional[str] = None, served_name: Optional[str] = None) -> bool:
     """True if a vLLM service for this (model_path, served_name) is currently up."""
     _resolved, svc_key = resolve_service_key(cfg, model_path)
-    if served_name:
-        svc_key = f"{svc_key}|{served_name}"
     with _lock:
         svc = _services.get(svc_key)
         return bool(svc and svc["proc"].poll() is None)
@@ -880,8 +971,6 @@ def stop_service_for(cfg, model_path: Optional[str] = None,
     VRAM. Returns an estimate of the GB it was holding (gpu_memory_utilization × total
     VRAM), 0.0 if nothing was running."""
     _resolved, svc_key = resolve_service_key(cfg, model_path)
-    if served_name:
-        svc_key = f"{svc_key}|{served_name}"
     with _lock:
         svc = _services.get(svc_key)
         running = bool(svc and svc["proc"].poll() is None)

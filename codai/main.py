@@ -882,9 +882,11 @@ def main():
         for _e in _seeded:
             _sec = _e.get("model_type") or "text_models"
             _lst = models_config.setdefault(_sec, [])
+            # (path, name), not path: a LoRA and its base share one path, so
+            # matching on the path alone dropped the adapter here too.
+            from codai.config import _same_model
             if isinstance(_lst, list) and not any(
-                    isinstance(x, dict) and x.get("path") == _e.get("path")
-                    for x in _lst):
+                    isinstance(x, dict) and _same_model(x, _e) for x in _lst):
                 _lst.append(_e)
             _keys.add(_e.get("alias") or _e.get("path"))
         try:

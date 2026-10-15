@@ -1271,6 +1271,7 @@ def test_a_pod_that_refuses_connections_is_dropped_and_the_request_retried(monke
     calls = []
     class _R:
         status_code = 200
+        ok = True
         def raise_for_status(self): pass
         def json(self): return {"choices": [{"message": {"content": "hi"}}], "usage": {}}
     def _post(url, **kw):

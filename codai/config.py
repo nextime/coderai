@@ -1462,6 +1462,33 @@ class Config:
     parser: str = "auto"
 
 
+def seed_entry_name(entry: dict) -> str:
+    """The name a seeded entry is asked for by — not necessarily its path."""
+    if not isinstance(entry, dict):
+        return ""
+    return (str(entry.get("alias") or "").strip()
+            or str(entry.get("id") or "").strip())
+
+
+def _same_model(known: dict, seed: dict) -> bool:
+    """Is ``seed`` the model ``known`` already is?
+
+    Not "same path". A LoRA and the base it adapts share one path BY DEFINITION
+    — the adapter is a few MB of deltas over the base weights — so keying
+    identity on the path alone made the second of the two vanish into the first.
+    A pod seeded with both was told about one, and answered 404 under the other
+    name for the rest of its paid life. Which one survived depended on the order
+    they arrived in, so it looked intermittent rather than wrong.
+
+    Identity is (weights, name): the same path under a DIFFERENT name is another
+    model that happens to load from the same place.
+    """
+    if str(known.get("path") or "") != str(seed.get("path") or ""):
+        return False
+    a, b = seed_entry_name(known), seed_entry_name(seed)
+    return not a or not b or a == b
+
+
 class ConfigManager:
     """Manages configuration loading, saving, and validation."""
     
@@ -2318,10 +2345,11 @@ class ConfigManager:
             if not isinstance(lst, list):
                 continue
             path = str(e["path"])
-            if any(isinstance(m, dict) and m.get("path") == path for m in lst):
+            if any(isinstance(m, dict) and _same_model(m, e) for m in lst):
                 continue            # a real entry already covers it — leave it alone
             lst.append(dict(e))
-            print(f"[seed] registered {path} in {section}", flush=True)
+            print(f"[seed] registered {seed_entry_name(e) or path} in {section}",
+                  flush=True)
         # The catalogue alone is not enough: request validation asks the MODEL
         # MANAGER for its allowed identifiers, and a seeded pod whose manager was
         # never told still answers "not available" with an empty list. The

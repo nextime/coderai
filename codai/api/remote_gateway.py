@@ -1228,6 +1228,38 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
         return False
 
 
+def teach_pod(base: str, api_key: str, model: str) -> bool:
+    """Make a pod able to serve ``model``: its adapters first, then its entry.
+
+    A pool hands back whichever pod it has, and a pod rented for one name of a
+    SHARED pool has never heard of the others — adoption checks the image, the
+    GPU class and the bearer token, none of which say anything about the
+    catalogue. So the pod that a request lands on may simply not know the model,
+    and says so with a 404 that is permanent: the pod is kept warm, so nothing
+    ever replaces it.
+
+    Renting a second card for a name the running one could serve is the
+    expensive answer. This is the other one: send the adapter bytes, register
+    the entry, and let the caller try again on the same pod.
+
+    ``teach_model`` alone is not enough for an adapter — it registers a content
+    id the pod does not hold yet.
+    """
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(model) or {}
+    except Exception:
+        entry = {}
+    if entry:
+        try:
+            ensure_text_loras(base, api_key, entry)
+        except Exception as exc:
+            print(f"[remote-gateway] could not send {model!r}'s adapters to {base}: "
+                  f"{exc}", flush=True)
+            return False
+    return teach_model(base, api_key, model)
+
+
 def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
     """Push a model's weights to a remote that cannot fetch them itself.
 

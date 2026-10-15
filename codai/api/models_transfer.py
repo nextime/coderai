@@ -168,17 +168,29 @@ def register_model_runtime(entry: dict, section: str) -> str:
     and the admin pages see it) and the model manager is told about it (so
     request validation accepts it).
     """
+    from codai.config import seed_entry_name, _same_model
+
     path = entry.get("path")
+    name = seed_entry_name(entry)
     already = False
+    # A LoRA and its base share one path, so the model this instance must be
+    # keyed by is the NAME when the path is already taken by a different one.
+    # Registering the adapter as the base silently returned "already known" and
+    # the pod went on refusing the adapter's name — teaching it was a no-op.
+    key = path
     try:
         from codai.admin.routes import config_manager
         md = getattr(config_manager, "models_data", None)
         if isinstance(md, dict):
             lst = md.setdefault(section, [])
             if isinstance(lst, list):
-                already = any(isinstance(m, dict) and m.get("path") == path
+                already = any(isinstance(m, dict) and _same_model(m, entry)
                               for m in lst)
                 if not already:
+                    if name and any(isinstance(m, dict)
+                                    and str(m.get("path") or "") == str(path or "")
+                                    for m in lst):
+                        key = name
                     lst.append(dict(entry))
     except Exception as exc:
         print(f"[register] catalogue update failed: {exc}", flush=True)
@@ -189,11 +201,15 @@ def register_model_runtime(entry: dict, section: str) -> str:
             from codai.models.manager import multi_model_manager
             cfg = {k: v for k, v in entry.items() if k not in ("path",)}
             cfg.setdefault("load_mode", "on-request")
-            getattr(multi_model_manager, setter)(path, config=cfg)
+            if key != path:
+                # The manager keys on the name it is given; the weights still
+                # have to be findable, so the path travels in the config.
+                cfg["path"] = path
+            getattr(multi_model_manager, setter)(key, config=cfg)
             if entry.get("alias"):
                 # An alias is how a request usually names it (bge-m3 vs BAAI/bge-m3).
                 try:
-                    multi_model_manager.model_aliases[str(entry["alias"])] = path
+                    multi_model_manager.model_aliases[str(entry["alias"])] = key
                 except Exception:
                     pass
             # An engine only lists models the front assigned it, and a model
@@ -203,14 +219,15 @@ def register_model_runtime(entry: dict, section: str) -> str:
                 cur = getattr(multi_model_manager, "_assigned_model_keys", None)
                 if cur is not None:
                     multi_model_manager.set_assigned_models(
-                        set(cur) | {path, entry.get("alias") or path})
+                        set(cur) | {key, entry.get("alias") or key})
             except Exception:
                 pass
         except Exception as exc:
-            print(f"[register] {path} could not be made usable: {exc}", flush=True)
+            print(f"[register] {key} could not be made usable: {exc}", flush=True)
             return "known" if already else "added"
     if not already:
-        print(f"[register] {path} registered in {section}", flush=True)
+        print(f"[register] {key} registered in {section}"
+              + (f" (adapter over {path})" if key != path else ""), flush=True)
     return "known" if already else "added"
 
 

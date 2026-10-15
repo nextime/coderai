@@ -167,13 +167,16 @@ def test_stopping_reports_what_was_reserved_not_the_engines_share(monkeypatch):
     stopped = []
     monkeypatch.setattr(vllm_worker, "stop_service", lambda k: stopped.append(k))
     launched = vllm_worker.effective_gmu(0.60)          # 0.60 -> a 14.4 GB reservation
-    monkeypatch.setitem(vllm_worker._services, "m|m",
+    # Keyed by the WEIGHTS, not by the name they are served under: one engine
+    # serves a base and every adapter of it, so a second name over the same
+    # path must find the same instance rather than start another copy.
+    monkeypatch.setitem(vllm_worker._services, "m",
                         {"proc": _Proc(), "port": 1, "url": "u", "ray": None,
                          "gmu": launched})
     cfg = type("C", (), {"model_path": "m", "gpu_memory_utilization": 0.0})()
     freed = vllm_worker.stop_service_for(cfg, model_path="m", served_name="m",
                                          gpu_memory_utilization=0.10)
-    assert stopped == ["m|m"]
+    assert stopped == ["m"]
     assert freed == pytest.approx(launched * 24.0, abs=0.05)     # ~14.4 GB, what it took
     assert freed > 0.10 * 24.0                      # not the (stale) share the caller passed
 

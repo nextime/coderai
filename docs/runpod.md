@@ -390,6 +390,33 @@ an entry recording neither image nor card — written before this check existed 
 is refused rather than trusted: one extra pod once, against a silent answer from
 the wrong code. Every refusal says which pod and why.
 
+None of those three says anything about the pod's **catalogue**, and a *shared*
+pool promises several names over one copy of the weights. A pod rented for one
+of them has never heard of the others, so the first request naming a sibling
+got a 404 — and because the pool keeps the pod warm, that 404 was permanent.
+The pod is now taught instead: the adapter bytes are pushed to it, the entry is
+registered, and the SAME request is retried on the SAME pod. Renting a second
+card to serve a name the running one can hold is the answer this avoids.
+
+```
+[runpod] pod did not know 'tuned-alpha' (Model 'tuned-alpha' is not available.
+         Use one of: base-awq) — taught it, retrying
+```
+
+Teaching is tried once per pod per model. A pod that still refuses afterwards
+fails with its OWN message rather than with `404 Client Error: Not Found for
+url: …`, which said nothing about the catalogue and read like a network fault.
+
+#### A name is not a path
+
+A LoRA and the base it adapts load from the same weights, so a model entry's
+`path` cannot identify it — the adapter and its base have the same one. Identity
+is **(weights, name)** everywhere a model is seeded, registered or served, and
+every engine serves one set of weights under every name configured for it: the
+base under its own, each adapter through vLLM's `--lora-modules`. Keying on the
+path alone made the second name vanish into the first; keying the ENGINE on the
+name as well would have started a second copy of the model on the same card.
+
 Every pod's hours reach the ledger, whichever way it ends: a pool retires one
 (`_terminate`), RunPod takes one away (`forget`), the reaper kills a stale one,
 or it disappears entirely — terminated from the console, or straight through the

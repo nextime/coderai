@@ -28,6 +28,32 @@ from typing import AsyncGenerator, Dict, List, Optional
 from codai.backends.base import ModelBackend
 
 
+class RemoteModelUnknown(RuntimeError):
+    """The pod answered that it does not know the model we asked for."""
+
+
+def _pod_detail(r) -> str:
+    """What the pod SAID, not what requests says about the status line.
+
+    ``raise_for_status()`` produces "404 Client Error: Not Found for url: …" and
+    throws the body away — and the body is the whole message: it names the models
+    the pod actually has. A pod that had never been told about a model therefore
+    reached the caller as something indistinguishable from a routing fault.
+    """
+    try:
+        body = r.json()
+    except Exception:
+        return (getattr(r, "text", "") or "").strip()[:400]
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])[:400]
+        for key in ("detail", "message", "error"):
+            if body.get(key):
+                return str(body[key])[:400]
+    return str(body)[:400]
+
+
 class RunpodBackend(ModelBackend):
     """Thin OpenAI proxy to a model hosted on RunPod."""
 
@@ -203,6 +229,32 @@ class RunpodBackend(ModelBackend):
         key = getattr(pool, "api_key", "") or ""
         return {"Authorization": f"Bearer {key}"} if key else {}
 
+    def _check(self, r) -> None:
+        """raise_for_status(), keeping what the pod said and naming the one case
+        we can do something about."""
+        if r.ok:
+            return
+        from codai.api.remote_gateway import _is_unknown_model
+        import requests
+        detail = _pod_detail(r)
+        if _is_unknown_model(r.status_code, (detail or "").encode("utf-8", "replace")):
+            raise RemoteModelUnknown(detail)
+        raise requests.HTTPError(
+            f"the pod answered {r.status_code}: {detail}", response=r)
+
+    def _teach(self, base: str) -> bool:
+        """Tell this pod about our model after it said it has never heard of it."""
+        try:
+            from codai.api.remote_gateway import teach_pod
+        except Exception:
+            return False
+        name = self._model_id or self._served_name
+        pool = getattr(self, "_pool", None)
+        key = getattr(pool, "api_key", "") if pool is not None else ""
+        # The pool's base ends in /v1; teach_pod posts to <root>/v1/models/register.
+        root = base[:-3].rstrip("/") if base.endswith("/v1") else base
+        return bool(teach_pod(root, key, name))
+
     def openai_endpoint(self):
         """``(base_url ending /v1, api_key)`` for a client that will speak to this
         model over HTTP ITSELF, instead of going through us.
@@ -318,7 +370,19 @@ class RunpodBackend(ModelBackend):
                         raise
                     continue
                 try:
-                    r.raise_for_status()
+                    try:
+                        self._check(r)
+                    except RemoteModelUnknown as unknown:
+                        # The pod does not know this model. That is recoverable
+                        # exactly once: teach it and ask the SAME pod again,
+                        # rather than pay for a second card to serve a name the
+                        # running one can hold.
+                        if attempt == 2 or not self._teach(base):
+                            raise
+                        print(f"[runpod] pod did not know "
+                              f"{self._served_name!r} ({unknown}) — taught it, "
+                              f"retrying", flush=True)
+                        continue
                     data = r.json()
                     self._store_usage(data.get("usage", {}))
                     choice = (data.get("choices") or [{}])[0]
@@ -350,9 +414,11 @@ class RunpodBackend(ModelBackend):
                     payload["response_format"] = response_format
                 if tools:
                     payload["tools"] = tools
+                sent = False
                 try:
                     async for chunk in self._stream(base + "/chat/completions", payload,
                                                     delta_key="delta"):
+                        sent = True
                         yield chunk
                 except requests.exceptions.ConnectionError:
                     # Refused before a byte arrived: the pod is gone. Drop it
@@ -360,6 +426,16 @@ class RunpodBackend(ModelBackend):
                     self._unreachable()
                     if attempt == 2:
                         raise
+                    continue
+                except RemoteModelUnknown as unknown:
+                    # The refusal happens before the first byte, so going again
+                    # replays nothing — but check rather than assume, because a
+                    # retry after output has started would duplicate it.
+                    if sent or attempt == 2 or not await asyncio.to_thread(
+                            self._teach, base):
+                        raise
+                    print(f"[runpod] pod did not know {self._served_name!r} "
+                          f"({unknown}) — taught it, retrying", flush=True)
                     continue
                 finally:
                     release()
@@ -419,7 +495,9 @@ class RunpodBackend(ModelBackend):
             try:
                 with pod_http.post(url, json=payload, headers=headers,
                                    stream=True, timeout=3600) as r:
-                    r.raise_for_status()
+                    # Not raise_for_status(): it discards the body, which on a
+                    # 404 is the pod telling us which models it actually has.
+                    self._check(r)
                     buf = b""
                     done = False
                     for bchunk in r.iter_content(chunk_size=8192):

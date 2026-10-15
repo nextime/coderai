@@ -36,6 +36,7 @@ class _Reply:
     #: A real response reports its code, and the backend reads it so that a
     #: server's own explanation of a 4xx survives the trip up.
     status_code = 200
+    ok = True
     reason = "OK"
     url = "http://stub/v1/chat/completions"
 
