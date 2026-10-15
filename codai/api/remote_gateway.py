@@ -155,8 +155,21 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
 #: would resolve nowhere. It carries no `model` field today, so it happens to
 #: stay local by accident; that is luck, not design, and the same shape of
 #: accident as /v1/runpod, which did not stay local.
+#: ``/v1/ocr/attach`` is an OCR engine's attachment to THIS install's gateway.
+#: The lease in the path was minted here and lives in this process's memory, so
+#: forwarding the request hands a pod a token it never issued — which it
+#: correctly refuses:
+#:
+#:     404 {"error": {"message": "unknown OCR engine lease"}}
+#:
+#: surya's client swallows that and returns an empty generation, so every page
+#: came back unread with the GPU never asked to read one. Measured: the pod's
+#: vLLM logged a single 6-token warm-up for a whole document, and $88 of surya
+#: time in a day produced nothing. The gateway behind this prefix does its own
+#: forwarding, with its own pool and its own lease — that is the hop, and it
+#: must start here.
 _LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob", "/v1/runpod",
-                   "/v1/loras")
+                   "/v1/loras", "/v1/ocr/attach")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes

@@ -1,6 +1,13 @@
 # /v1/audio/generate, /v1/audio/stems, /v1/audio/cleanup
 torchaudio
 transformers>=4.35.0
+# transformers refuses a `device_map`/`torch.device` load without accelerate, so
+# a pod boots healthy, answers /v1/models, and then fails EVERY request with
+#   Model '<name>' failed to load: Using a `device_map` ... requires `accelerate`
+# which reads as a model problem rather than an image problem. Measured on a
+# real A40 for the embeddings image: 303s of boot paid before anyone could find
+# out. Every profile that carries transformers carries this with it.
+accelerate>=0.26.0
 diffusers>=0.25.0
 demucs>=4.0.1
 deepfilternet>=0.5.6

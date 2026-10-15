@@ -1234,6 +1234,11 @@ def _ocr_external_server(engine: str):
     return ""
 
 
+#: Seed lists already announced, so a plan recomputed every scaler pass does
+#: not repeat itself. Bounded: this must never become a place memory grows.
+_PLAN_SAID: dict = {}
+
+
 def _plan(engine, image, args, mcfg, api_key, entry, served,
           seed_entries: list = None, capability: str = "") -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the models it must serve."""
@@ -1302,7 +1307,17 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             seen.add(key)
             unique.append(s)
         env["CODERAI_SEED_MODELS"] = _json.dumps(unique)
-        print(f"[runpod] pod will be told about {len(unique)} model(s)", flush=True)
+        # Once per distinct seed list. A plan is recomputed on every scaler
+        # pass — roughly every fifteen seconds while a pod boots — and saying
+        # the same sentence each time buries the lines that matter in a boot
+        # log somebody is reading precisely because something went wrong.
+        _sig = (str(image), env["CODERAI_SEED_MODELS"])
+        if _PLAN_SAID.get(_sig) is None:
+            while len(_PLAN_SAID) > 64:
+                _PLAN_SAID.pop(next(iter(_PLAN_SAID)))
+            _PLAN_SAID[_sig] = True
+            print(f"[runpod] pod will be told about {len(unique)} model(s)",
+                  flush=True)
     # A pod rented for a subsystem that ships disabled has to arrive with it on.
     # An OCR pod booted, accepted the request and answered "OCR subsystem is
     # disabled (enable it in Settings → OCR)" — a settings screen nobody will
@@ -2899,8 +2914,14 @@ class RunpodPodPool:
             block = self._budget_blocks(sel["price"])
             if block:
                 raise RunpodError(f"RunPod budget cap hit — not provisioning ({block}).")
+            # `pool:` is dropped from the NAME only — it is legal on RunPod
+            # but makes a console listing hard to read, and ownership is
+            # decided by the `coderai-<deployment>-` prefix, never by the rest.
+            _key = str(self.model_key)
+            if _key.startswith("pool:"):
+                _key = _key[len("pool:"):]
             name = (f"coderai-{_deploy_tag(self.account)}-"
-                    + str(self.model_key)[:20].replace("/", "_").replace(" ", "_")
+                    + _key[:20].replace("/", "_").replace(" ", "_")
                     + "-" + uuid.uuid4().hex[:6])
             _dc = sel.get("_dc") or self._data_center()
             # Say so when this is not the card that was asked for. Renting a
@@ -3213,14 +3234,30 @@ class RunpodPodPool:
         if budget <= 0:
             return False
         t0 = time.time()
-        payload = {"model": self.served or str(self.model_key),
-                   "messages": [{"role": "user", "content": "ok"}],
-                   "max_tokens": 1, "temperature": 0.0}
+        name = self.served or str(self.model_key)
+        # The RIGHT endpoint for what this pod serves. Asking an embeddings pod
+        # for a chat completion is a 404 by design —
+        #   "Model 'BAAI/bge-m3' is a embedding model and cannot be used for
+        #    text generation. Use the embedding endpoint instead."
+        # — printed at WARNING volume on every boot of a pod that is perfectly
+        # healthy. It reads as a broken pod, and it cost a wrong diagnosis.
+        cap = ""
+        try:
+            cap = model_capability(self.entry or {})
+        except Exception:
+            cap = ""
+        if cap == "embeddings":
+            path, payload = "/v1/embeddings", {"model": name, "input": "ok"}
+        else:
+            path = "/v1/chat/completions"
+            payload = {"model": name,
+                       "messages": [{"role": "user", "content": "ok"}],
+                       "max_tokens": 1, "temperature": 0.0}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         try:
-            reply = pod_http.post(url.rstrip("/") + "/v1/chat/completions",
+            reply = pod_http.post(url.rstrip("/") + path,
                                   json=payload, headers=headers, timeout=budget)
         except Exception as exc:
             print(f"[runpod] pod {pod_id}: warm-up did not complete "
@@ -5523,6 +5560,17 @@ def reap_orphans() -> int:
         return 0
     from codai.api.runpod_client import RunpodClient, RunpodError
     prefix = f"coderai-{_deploy_tag(acct)}-"
+    # Pods this deployment recorded, whatever they are CALLED. Ownership was
+    # decided by the name alone, so renaming `deployment_id` instantly orphaned
+    # every pod already running under the old prefix: still billing, and no
+    # longer anything's to reap. The registry is the better authority — it is
+    # written when we create a pod — and the prefix stays as the fallback for a
+    # pod this process never recorded.
+    _ours = set()
+    try:
+        _ours = {str(k) for k in (_registry_update(lambda d: False) or {})}
+    except Exception:
+        _ours = set()
     try:
         client = RunpodClient(acct)
         pods = client.list_pods()
@@ -5564,7 +5612,7 @@ def reap_orphans() -> int:
     for p in pods:
         pid, name = p.get("id"), (p.get("name") or "")
         status = str(p.get("status") or "").upper()
-        if not pid or not name.startswith(prefix):
+        if not pid or not (name.startswith(prefix) or str(pid) in _ours):
             continue                      # not ours (or another deployment's)
         if pid in known:
             continue                      # tracked by a live pool / provisioning

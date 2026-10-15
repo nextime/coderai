@@ -3,6 +3,13 @@
 torch==2.5.1+cu124
 torchaudio==2.5.1+cu124
 transformers==4.46.3
+# transformers refuses a `device_map`/`torch.device` load without accelerate, so
+# a pod boots healthy, answers /v1/models, and then fails EVERY request with
+#   Model '<name>' failed to load: Using a `device_map` ... requires `accelerate`
+# which reads as a model problem rather than an image problem. Measured on a
+# real A40 for the embeddings image: 303s of boot paid before anyone could find
+# out. Every profile that carries transformers carries this with it.
+accelerate>=0.26.0
 coqui-tts>=0.24.0
 # coqui-tts imports click at module load but does not declare it, so the venv
 # installs cleanly and then fails its import check. Found by iterating the venv
