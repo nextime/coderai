@@ -1200,6 +1200,28 @@
         <div class="form-hint">Tried when the chosen engine can't serve, so a document
           is never refused: <code>auto</code>, <code>off</code>, or an explicit order.</div>
       </div>
+      <div class="form-group" style="flex:1;min-width:170px">
+        <label class="form-label">Re-read degraded pages on</label>
+        <input type="text" id="s-ocr-retry-degraded" class="form-input" placeholder="auto">
+        <div class="form-hint">A page can come back looping or cut off at the token cap
+          with the engine answering <code>200</code>, so <em>Fallback engines</em> never
+          fires. These re-read only those pages elsewhere and keep whichever answer
+          isn't degraded: <code>auto</code>, <code>off</code>, or an explicit order.</div>
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Re-read cap (pages/doc)</label>
+        <input type="number" id="s-ocr-retry-degraded-max" class="form-input" min="0" placeholder="0">
+        <div class="form-hint">0 = no limit. A scan the whole fleet reads badly would
+          otherwise pay twice for every page to arrive in the same place.</div>
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Re-read pages under × median</label>
+        <input type="number" id="s-ocr-retry-short" class="form-input" min="0" max="1" step="0.05" placeholder="0">
+        <div class="form-hint">0 = off. Catches an engine that stops early without
+          flagging anything, by comparing a page with the document's own median.
+          <strong>Inferred, not attested</strong> — a real title or signature page looks
+          the same, so leave it off unless your documents have none.</div>
+      </div>
     </div>
 
     <div class="card-title" style="font-size:13px;margin-top:.4rem">PaddleOCR</div>
@@ -2232,6 +2254,9 @@ async function loadSettings(){
     document.getElementById('s-ocr-retry-cooldown').value = ocr.build_retry_cooldown_s ?? 60;
     document.getElementById('s-ocr-vlm-gmu').value = ocr.vlm_gpu_memory_utilization ?? 0;
     document.getElementById('s-ocr-fallback').value = ocr.fallback_engines ?? 'auto';
+    document.getElementById('s-ocr-retry-degraded').value = ocr.retry_degraded ?? 'auto';
+    document.getElementById('s-ocr-retry-degraded-max').value = ocr.retry_degraded_max_pages ?? 0;
+    document.getElementById('s-ocr-retry-short').value = ocr.retry_short_pages_below ?? 0;
     document.getElementById('s-ocr-vlm-mnbt').value = ocr.vlm_max_num_batched_tokens ?? 4096;
     document.getElementById('s-ocr-vlm-mns').value = ocr.vlm_max_num_seqs ?? 16;
     document.getElementById('s-ocr-vlm-mml').value = ocr.vlm_max_model_len ?? 0;
@@ -2533,6 +2558,9 @@ async function saveSettings(silent){
       build_retry_cooldown_s: parseFloat(document.getElementById('s-ocr-retry-cooldown').value) || 0,
       vlm_gpu_memory_utilization: parseFloat(document.getElementById('s-ocr-vlm-gmu').value) || 0,
       fallback_engines: document.getElementById('s-ocr-fallback').value.trim() || 'auto',
+      retry_degraded: document.getElementById('s-ocr-retry-degraded').value.trim() || 'auto',
+      retry_degraded_max_pages: parseInt(document.getElementById('s-ocr-retry-degraded-max').value) || 0,
+      retry_short_pages_below: parseFloat(document.getElementById('s-ocr-retry-short').value) || 0,
       vlm_max_num_batched_tokens: parseInt(document.getElementById('s-ocr-vlm-mnbt').value) || 0,
       vlm_max_num_seqs: parseInt(document.getElementById('s-ocr-vlm-mns').value) || 0,
       vlm_max_model_len: parseInt(document.getElementById('s-ocr-vlm-mml').value) || 0,

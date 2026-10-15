@@ -35,7 +35,7 @@ from typing import Dict, List, Optional
 
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
                             PAGE_OPTIONS, page_estimate, render_pages,
-                            iter_pdf_page_pdfs, pdf_page_count,
+                            iter_pdf_page_pdfs, pdf_page_count, split_pdf_page,
                             unreadable_report)
 from codai.ocr.budget import get_budget
 
@@ -1247,6 +1247,14 @@ class OcrManager:
                     data, filename, content_type, use_dpi, window,
                     engine=engine, lang=lang, detect=detect,
                     page_opts=page_opts, cfg=cfg)
+        # A page can be ruined without anything failing -- see `_retry_degraded`.
+        # Done here rather than inside either pipeline, because the two produce
+        # the same degraded pages for the same reasons and a reader of the
+        # result cannot tell which path it came from.
+        recovered = await self._retry_degraded(
+            data, filename, content_type, name, pages, dpi=use_dpi,
+            page_opts=page_opts, detect=detect, lang=lang, cfg=cfg,
+            window=window)
         full_text = "\n\n".join(p.text for p in pages)
 
         structured_out = None
@@ -1280,6 +1288,11 @@ class OcrManager:
         report = unreadable_report(pages)
         if report:
             out["unreadable"] = report
+        if recovered:
+            # Top level, because a caller deciding whether to trust this
+            # document should not have to walk the pages to find out that part
+            # of it was read by a different engine than the one it asked for.
+            out["recovered_pages"] = recovered
         return out
 
     def _raster_workers(self, cfg) -> int:
@@ -1288,6 +1301,238 @@ class OcrManager:
             return max(0, int(getattr(cfg, "raster_workers", 0) or 0))
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------
+    # Degraded pages
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _page_degraded(page) -> str:
+        """Why this page is not usable, or "" when it is.
+
+        A degraded page is NOT an error. The engine answered 200 with
+        plausible-looking text, and the only evidence is in the diagnostics it
+        attached. Two causes, both of which make the page incomplete:
+
+        * ``repeat_detected`` -- the decode fell into a loop and ran to the cap
+          emitting the same fragment. Retrying the SAME engine at a higher
+          temperature is what produced this flag; it does not clear it.
+        * ``truncated`` -- it stopped at the cap and could not be continued.
+
+        Deliberately NOT degraded: a short page, a blank page, or a page the
+        engine reported it could not read. Those have their own handling and
+        their own meaning, and re-reading them on a second engine would spend a
+        card to learn what the first engine already said correctly.
+        """
+        meta = getattr(page, "meta", None) or {}
+        if meta.get("repeat_detected"):
+            return "looping"
+        info = meta.get("model_attempts") or {}
+        if isinstance(info, dict) and info.get("truncated"):
+            return "truncated"
+        return ""
+
+    @staticmethod
+    def _short_pages(pages: List, cfg) -> dict:
+        """Pages far shorter than the document around them → {index: reason}.
+
+        Reported from the same run: olmOCR returned 4,046 characters where
+        chandra read 30,983 on the SAME page, and its fastest calls returned
+        the least text. Nothing was flagged -- the reply ended cleanly, well
+        short of the cap, so there is no `truncated` and no loop. The only
+        evidence an early stop leaves is the company it keeps.
+
+        So the measure is the document's OWN median, not a character count:
+        a threshold in characters would have to be re-tuned for every language,
+        DPI, layout and font, and would be wrong for all of them. A page at an
+        eighth of its neighbours is an early stop whatever the corpus.
+
+        OFF by default (`retry_short_pages_below = 0`) and deliberately so.
+        This signal is INFERRED, where looping and truncation are attested by
+        the engine itself -- and a genuine title page, index or signature page
+        looks exactly the same from here. Only the operator knows whether their
+        documents have those.
+        """
+        try:
+            frac = float(getattr(cfg, "retry_short_pages_below", 0.0) or 0.0)
+            min_doc = int(getattr(cfg, "retry_short_pages_min_doc", 4) or 4)
+        except Exception:
+            return {}
+        if frac <= 0 or len(pages) < max(3, min_doc):
+            return {}
+        lens = sorted(len((getattr(p, "text", "") or "").strip()) for p in pages)
+        mid = len(lens) // 2
+        median = lens[mid] if len(lens) % 2 else (lens[mid - 1] + lens[mid]) / 2
+        if median <= 0:
+            return {}
+        floor = median * frac
+        out = {}
+        for i, page in enumerate(pages):
+            n = len((getattr(page, "text", "") or "").strip())
+            # A page the blank check already explained is not an early stop:
+            # there was nothing on it. Re-reading it buys the same answer from
+            # a second card.
+            if (getattr(page, "meta", None) or {}).get("blank"):
+                continue
+            if n < floor:
+                out[i] = (f"short ({n} chars against a document median of "
+                          f"{int(median)})")
+        return out
+
+    def _retry_degraded_order(self, failed: str) -> List[str]:
+        """Engines to re-read a degraded page with, in order."""
+        cfg = self._require_cfg()
+        raw = str(getattr(cfg, "retry_degraded", "auto") or "auto").strip().lower()
+        if raw in ("off", "none", "no", "false", "0"):
+            return []
+        if raw in ("auto", "", "on", "true", "1"):
+            return self._fallback_order(failed)
+        names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
+        return [n for n in names
+                if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
+
+    async def _read_page_blobs(self, blobs, engine: str, *, filename: str,
+                               content_type: str, dpi: int, page_opts, detect,
+                               lang, cfg, window: int):
+        """Read a handful of one-page documents with ONE named engine.
+
+        Takes whichever of the two pipelines that engine's configuration
+        selects, exactly as a whole document would -- a retry that quietly used
+        the other path would be measuring the path, not the engine.
+        """
+        out = []
+        remote = pod_pipeline_model(cfg, engine)
+        for blob in blobs:
+            got = None
+            if remote:
+                try:
+                    got = await self._read_on_pods(
+                        blob, filename, content_type, remote, dpi=dpi,
+                        page_opts=page_opts, detect=detect, cfg=cfg,
+                        engine_name=engine)
+                except Exception as exc:
+                    print(f"[ocr] re-reading on '{engine}' pods failed: {exc}",
+                          flush=True)
+                    got = None
+            if got is not None:
+                pages = got[1]
+            else:
+                _n, pages, _b, _s, _g = await self._read_windowed(
+                    blob, filename, content_type, dpi, window, engine=engine,
+                    lang=lang, detect=detect, page_opts=page_opts, cfg=cfg)
+            out.append(pages[0] if pages else None)
+        return out
+
+    async def _retry_degraded(self, data: bytes, filename: str, content_type: str,
+                              name: str, pages: List, *, dpi: int, page_opts,
+                              detect, lang, cfg, window: int) -> str:
+        """Re-read every degraded page on another engine. Returns a note, or "".
+
+        Mutates `pages` in place, replacing only those pages that come back
+        clean. This exists because an OCR run can fail almost completely with
+        no error anywhere: a repeating decode answers 200, `fallback_engines`
+        never fires, and a thousand documents land in the index truncated.
+
+        Bounded by construction -- only pages already known to be unusable are
+        re-read, so a clean document costs nothing and a ruined one costs at
+        most a second pass over its ruined pages.
+        """
+        why = {}
+        for i, page in enumerate(pages):
+            reason = self._page_degraded(page)
+            if reason:
+                why[i] = reason
+        for i, reason in self._short_pages(pages, cfg).items():
+            why.setdefault(i, reason)
+        bad = sorted(why)
+        if not bad:
+            return ""
+        chain = self._retry_degraded_order(name)
+        if not chain:
+            return ""
+        try:
+            cap = max(0, int(getattr(cfg, "retry_degraded_max_pages", 0) or 0))
+        except Exception:
+            cap = 0
+        dropped = 0
+        if cap and len(bad) > cap:
+            dropped = len(bad) - cap
+            bad = bad[:cap]
+        is_pdf = ((content_type or "").lower() == "application/pdf"
+                  or (filename or "").lower().endswith(".pdf")
+                  or data[:5] == b"%PDF-")
+        if not is_pdf:
+            if len(pages) != 1:
+                return ""
+            blobs = {0: data}
+        else:
+            blobs = {}
+            for i in bad:
+                try:
+                    blobs[i] = split_pdf_page(data, i)
+                except Exception as exc:
+                    print(f"[ocr] cannot isolate page {i} to re-read it: {exc}",
+                          flush=True)
+        bad = [i for i in bad if i in blobs]
+        if not bad:
+            return ""
+        print(f"[ocr] {len(bad)} of {len(pages)} page(s) came back DEGRADED from "
+              f"'{name}' ("
+              + ", ".join(f"p{i}:{why[i]}" for i in bad[:8])
+              + (" ..." if len(bad) > 8 else "")
+              + f") — the engine answered 200, so this is not a fallback: "
+              f"re-reading those pages on {' -> '.join(chain)}", flush=True)
+        if dropped:
+            print(f"[ocr] and leaving {dropped} more as they are "
+                  f"(ocr.retry_degraded_max_pages)", flush=True)
+        fixed: dict = {}
+        for alt in chain:
+            todo = [i for i in bad if i not in fixed]
+            if not todo:
+                break
+            try:
+                got = await self._read_page_blobs(
+                    [blobs[i] for i in todo], alt, filename=filename,
+                    content_type=content_type, dpi=dpi, page_opts=page_opts,
+                    detect=detect, lang=lang, cfg=cfg, window=window)
+            except Exception as exc:
+                print(f"[ocr] re-read on '{alt}' failed outright: {exc}", flush=True)
+                continue
+            for i, page in zip(todo, got):
+                if page is None or self._page_degraded(page):
+                    continue
+                if why[i].startswith("short"):
+                    # The complaint was length, so the answer has to be longer.
+                    # A second engine that stops just as early has told us the
+                    # page really is short, and taking its text would hide that
+                    # behind a different engine's name.
+                    if len((page.text or "").strip()) <= \
+                            len((pages[i].text or "").strip()):
+                        continue
+                # Keep the ORIGINAL page index: the caller indexes by it, and a
+                # page re-read on its own always comes back as page 0.
+                page.index = pages[i].index
+                meta = dict(getattr(page, "meta", None) or {})
+                meta["degraded_retry"] = {
+                    "from": name, "to": alt, "reason": why[i],
+                    "why": (f"'{name}' returned this page {why[i]}, which is a "
+                            f"200 and not a failure, so it was re-read on "
+                            f"'{alt}' and that answer is the one here"),
+                }
+                page.meta = meta
+                pages[i] = page
+                fixed[i] = alt
+        if not fixed:
+            print(f"[ocr] no engine in {' -> '.join(chain)} read those pages any "
+                  f"better — keeping what '{name}' produced, still flagged",
+                  flush=True)
+            return ""
+        by_engine: dict = {}
+        for alt in fixed.values():
+            by_engine[alt] = by_engine.get(alt, 0) + 1
+        note = ", ".join(f"{n} page(s) by {e}" for e, n in sorted(by_engine.items()))
+        print(f"[ocr] recovered {len(fixed)} of {len(bad)} degraded page(s): "
+              f"{note}", flush=True)
+        return note
 
     async def _read_on_pods(self, data: bytes, filename: str, content_type: str,
                             model_id: str, *, dpi: int, page_opts, detect, cfg,

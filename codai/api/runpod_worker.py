@@ -1336,6 +1336,11 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         # This image carries NO docTR -- `auto` would route a failed page to an
         # engine that is not there. This engine or nothing, said out loud.
         env["CODERAI_OCR_FALLBACK_ENGINES"] = "off"
+        # Same reasoning for the degraded-page re-read, and one more: only the
+        # ORCHESTRATOR can reach another engine's pods. A pod re-reading its own
+        # degraded page would re-read it on the one engine that just produced
+        # it, which is the retry that already failed.
+        env["CODERAI_OCR_RETRY_DEGRADED"] = "off"
         # And the TUNING. Every one of these was set in response to a measured
         # failure, and a pod reading pages at surya's defaults instead would be
         # indistinguishable from the "pre-fix pod image" that got blamed three

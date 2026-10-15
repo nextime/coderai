@@ -4180,6 +4180,10 @@ def build_settings_dict(c, gpu_cards):
             "vlm_max_num_seqs": c.ocr.vlm_max_num_seqs,
             "vlm_max_model_len": c.ocr.vlm_max_model_len,
             "fallback_engines": c.ocr.fallback_engines,
+            "retry_degraded": c.ocr.retry_degraded,
+            "retry_degraded_max_pages": c.ocr.retry_degraded_max_pages,
+            "retry_short_pages_below": c.ocr.retry_short_pages_below,
+            "retry_short_pages_min_doc": c.ocr.retry_short_pages_min_doc,
             "olmocr_enabled": c.ocr.olmocr_enabled,
             "olmocr_instances": c.ocr.olmocr_instances,
             "olmocr_serve": c.ocr.olmocr_serve,
@@ -5043,6 +5047,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "build_retry_cooldown_s" in d: o.build_retry_cooldown_s = _f("build_retry_cooldown_s", o.build_retry_cooldown_s, 0.0)
         if "vlm_gpu_memory_utilization" in d: o.vlm_gpu_memory_utilization = _f("vlm_gpu_memory_utilization", o.vlm_gpu_memory_utilization, 0.0)
         if "fallback_engines" in d: o.fallback_engines = (d.get("fallback_engines") or "auto").strip()
+        if "retry_degraded" in d: o.retry_degraded = (d.get("retry_degraded") or "auto").strip()
+        if "retry_degraded_max_pages" in d: o.retry_degraded_max_pages = max(0, int(d.get("retry_degraded_max_pages") or 0))
+        if "retry_short_pages_below" in d: o.retry_short_pages_below = max(0.0, min(1.0, float(d.get("retry_short_pages_below") or 0.0)))
+        if "retry_short_pages_min_doc" in d: o.retry_short_pages_min_doc = max(3, int(d.get("retry_short_pages_min_doc") or 4))
         if "vlm_max_num_batched_tokens" in d: o.vlm_max_num_batched_tokens = _i("vlm_max_num_batched_tokens", o.vlm_max_num_batched_tokens, 0)
         if "vlm_max_num_seqs" in d: o.vlm_max_num_seqs = _i("vlm_max_num_seqs", o.vlm_max_num_seqs, 0)
         if "vlm_max_model_len" in d: o.vlm_max_model_len = _i("vlm_max_model_len", o.vlm_max_model_len, 0)

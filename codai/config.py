@@ -1084,6 +1084,30 @@ class OcrConfig:
     # "off"/"none" = no fallback (fail with the original error); or an explicit
     # comma/space separated order.
     fallback_engines: str = "auto"
+    # A page can come back DEGRADED without the engine ever failing: the reply
+    # looped until it hit the token cap, or it stopped at the cap and could not
+    # be resumed. `fallback_engines` never fires for those -- the call returned
+    # 200 -- so a run can come out almost entirely truncated with no error
+    # anywhere. These re-read ONLY the degraded pages on another engine and keep
+    # whichever answer is not degraded. "auto" = the fallback order; "off" = keep
+    # what the first engine produced; or an explicit comma/space separated order.
+    retry_degraded: str = "auto"
+    # Stop re-reading after this many pages of one document, 0 = no limit. A
+    # scan the whole fleet reads badly would otherwise pay twice for every page
+    # to arrive at the same place.
+    retry_degraded_max_pages: int = 0
+    # Re-read a page whose text is below this FRACTION of the document's median
+    # page, even though the engine flagged nothing. 0 = off, which is the
+    # default, because unlike a looping or truncated page this one is INFERRED:
+    # the engine says the page is fine and we are disagreeing with it from the
+    # shape of the document around it. A real early stop looks exactly like a
+    # title page or a signature page, and only the operator knows which their
+    # corpus has. 0.25 catches an engine that returned an eighth of what its
+    # neighbours did without touching a document of genuinely uneven pages.
+    retry_short_pages_below: float = 0.0
+    # ...and only in a document with at least this many pages, since a median
+    # taken over two pages is not a median.
+    retry_short_pages_min_doc: int = 4
 
     # --- PaddleOCR / PP-Structure ---
     paddle_enabled: bool = True
@@ -2011,6 +2035,10 @@ class ConfigManager:
                 "vlm_max_num_seqs": self.config.ocr.vlm_max_num_seqs,
                 "vlm_max_model_len": self.config.ocr.vlm_max_model_len,
                 "fallback_engines": self.config.ocr.fallback_engines,
+                "retry_degraded": self.config.ocr.retry_degraded,
+                "retry_degraded_max_pages": self.config.ocr.retry_degraded_max_pages,
+                "retry_short_pages_below": self.config.ocr.retry_short_pages_below,
+                "retry_short_pages_min_doc": self.config.ocr.retry_short_pages_min_doc,
                 "olmocr_enabled": self.config.ocr.olmocr_enabled,
                 "olmocr_instances": self.config.ocr.olmocr_instances,
                 "olmocr_serve": self.config.ocr.olmocr_serve,
@@ -2162,7 +2190,8 @@ class ConfigManager:
                                 ("CODERAI_OCR_CHANDRA_MODEL", "chandra_model"),
                                 ("CODERAI_OCR_CHANDRA_MODEL_ID", "chandra_model_id"),
                                 ("CODERAI_OCR_CHANDRA_SERVER_URL", "chandra_server_url"),
-                                ("CODERAI_OCR_FALLBACK_ENGINES", "fallback_engines")):
+                                ("CODERAI_OCR_FALLBACK_ENGINES", "fallback_engines"),
+                                ("CODERAI_OCR_RETRY_DEGRADED", "retry_degraded")):
                 _val = (_os.environ.get(_env) or "").strip()
                 if _val:
                     setattr(self.config.ocr, _attr, _val)
