@@ -468,3 +468,83 @@ def test_an_unknown_name_is_not_sent_anywhere(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen",
                         lambda *a, **k: pytest.fail("nothing to register"))
     assert vw._load_lora_runtime("http://e", SEEDED_BASE, "not-an-adapter") is False
+
+
+# --------------------------------------------------------------------------- #
+# a retrain keeps the name and changes the bytes
+# --------------------------------------------------------------------------- #
+V1 = {"path": BASE_REPO, "alias": "tuned-alpha",
+      "loras": [{"path": "sha256:v1", "name": "tuned-alpha", "weight": 1.0}]}
+V2 = {"path": BASE_REPO, "alias": "tuned-alpha",
+      "loras": [{"path": "sha256:v2", "name": "tuned-alpha", "weight": 1.0}]}
+
+
+def test_the_same_name_with_new_bytes_is_a_different_adapter(monkeypatch):
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, V2]}), raising=False)
+    vw._LORA_LOADED[("http://e", "tuned-alpha")] = "sha256:v1"
+    assert vw._adapter_is_stale("http://e", SEEDED_BASE, "tuned-alpha") is True
+
+
+def test_the_same_bytes_are_not_stale(monkeypatch):
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, V1]}), raising=False)
+    vw._LORA_LOADED[("http://e", "tuned-alpha")] = "sha256:v1"
+    assert vw._adapter_is_stale("http://e", SEEDED_BASE, "tuned-alpha") is False
+
+
+def test_an_adapter_we_did_not_load_is_never_guessed_at(monkeypatch):
+    """Unloading on a guess is worse than serving what is there."""
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, V2]}), raising=False)
+    vw._LORA_LOADED.pop(("http://unknown", "tuned-alpha"), None)
+    assert vw._adapter_is_stale("http://unknown", SEEDED_BASE, "tuned-alpha") is False
+
+
+def test_a_retrain_is_swapped_in_place_not_restarted(monkeypatch):
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, V2]}), raising=False)
+    monkeypatch.setattr("codai.models.text_loras.local_path", lambda src: "/blobs/" + src)
+    calls = []
+
+    def _urlopen(req, timeout=0):
+        calls.append(req.full_url.rsplit("/", 1)[-1])
+        return type("R", (), {"read": lambda self: b"{}"})()
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    vw._LORA_LOADED[("http://e", "tuned-alpha")] = "sha256:v1"
+    assert vw._unload_lora_runtime("http://e", "tuned-alpha") is True
+    assert vw._load_lora_runtime("http://e", SEEDED_BASE, "tuned-alpha") is True
+    assert calls == ["unload_lora_adapter", "load_lora_adapter"]
+    # and the engine is now recorded as holding the NEW one
+    assert vw._LORA_LOADED[("http://e", "tuned-alpha")] == "sha256:v2"
+
+
+def test_new_bytes_under_an_old_name_are_still_sent_to_the_pod(monkeypatch):
+    """Caching 'already sent' by NAME meant a retrain never reached the pod."""
+    from codai.backends import runpod as rb
+    import codai.models.manager as mgr
+    import codai.api.remote_gateway as gw
+
+    sent = []
+    version = {"src": "/local/v1"}
+    monkeypatch.setattr(mgr, "_model_entry_for",
+                        lambda n: {"id": n, "loras": [{"path": version["src"],
+                                                       "name": n}]},
+                        raising=False)
+    monkeypatch.setattr(gw, "ensure_text_loras",
+                        lambda base, key, entry: sent.append(version["src"]))
+
+    b = rb.RunpodBackend.__new__(rb.RunpodBackend)
+    b._model_id = b._served_name = "tuned-alpha"
+    b._pool = type("P", (), {"api_key": "k"})()
+    rb.RunpodBackend._ADAPTERS_SENT.clear()
+    b._ensure_adapters("https://pod")
+    b._ensure_adapters("https://pod")           # same version: once
+    version["src"] = "/local/v2"
+    b._ensure_adapters("https://pod")           # retrained: sent again
+    assert sent == ["/local/v1", "/local/v2"]

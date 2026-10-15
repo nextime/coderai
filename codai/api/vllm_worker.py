@@ -408,6 +408,65 @@ def _model_config_for(model_name: str) -> dict:
         return {}
 
 
+#: (engine url, adapter name) -> the source that engine was given. A retrain
+#: keeps the name and changes the bytes, so "does it serve this name?" is not
+#: the same question as "does it serve THIS adapter?".
+_LORA_LOADED: dict = {}
+
+
+def _adapter_source(model_config: dict, served_name: str) -> str:
+    """The source configured for ``served_name`` right now, or ''."""
+    want = (served_name or "").strip()
+    if not want:
+        return ""
+    for spec in _sibling_lora_specs(model_config or {}):
+        if str(spec.get("name") or "") == want:
+            return str(spec.get("source") or "")
+    return ""
+
+
+def _note_loaded(url: str, model_config: dict, served_name: str) -> None:
+    src = _adapter_source(model_config, served_name)
+    if src:
+        _LORA_LOADED[(url, served_name)] = src
+
+
+def _adapter_is_stale(url: str, model_config: dict, served_name: str) -> bool:
+    """Does this engine hold an OLDER version of the adapter it answers to?
+
+    Retraining ships under the same name. Without this the engine kept the
+    adapter it was launched with and answered confidently from stale weights —
+    the update looked applied, because the catalogue had it and the name worked.
+
+    Unknown counts as NOT stale: an engine we have no record for is one we did
+    not load, and unloading an adapter on a guess is worse than serving it.
+    """
+    want = _adapter_source(model_config, served_name)
+    if not want:
+        return False
+    had = _LORA_LOADED.get((url, served_name))
+    return bool(had) and had != want
+
+
+def _unload_lora_runtime(url: str, served_name: str) -> bool:
+    """Drop an adapter from a running engine, so a new version can take its name."""
+    import json as _json
+    import urllib.request
+
+    body = _json.dumps({"lora_name": served_name}).encode()
+    req = urllib.request.Request(url.rstrip("/") + "/v1/unload_lora_adapter",
+                                 data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=120)
+    except Exception as exc:
+        print(f"[lora] could not unload {served_name!r} from {url} ({exc})",
+              flush=True)
+        return False
+    _LORA_LOADED.pop((url, served_name), None)
+    return True
+
+
 def _load_lora_runtime(url: str, model_config: dict, served_name: str) -> bool:
     """Register an adapter into a RUNNING engine. True when it will now serve.
 
@@ -463,6 +522,7 @@ def _load_lora_runtime(url: str, model_config: dict, served_name: str) -> bool:
         return False
     print(f"[lora] added {want!r} to the running engine on {url} — no reload",
           flush=True)
+    _LORA_LOADED[(url, want)] = str(spec.get("source") or "")
     return True
 
 
@@ -591,13 +651,24 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
             # Only an answered probe that omits the name forces a relaunch: a
             # probe that fails says nothing, and restarting a loaded 27B on a
             # timeout would be far worse than the doubt.
+            mcfg_entry = _model_config_for(resolved or model_path or "")
             if not served_name or _serves_name(svc["url"], served_name) is not False:
-                return svc["url"]
+                # It answers to the name. Does it answer with the adapter that
+                # is configured NOW? A retrain keeps the name.
+                if not _adapter_is_stale(svc["url"], mcfg_entry, served_name):
+                    return svc["url"]
+                print(f"[lora] {served_name!r} on {svc['url']} is an older "
+                      f"version of the adapter — swapping it in the running "
+                      f"engine", flush=True)
+                if _unload_lora_runtime(svc["url"], served_name) \
+                        and _load_lora_runtime(svc["url"], mcfg_entry, served_name):
+                    return svc["url"]
+                print(f"[lora] could not swap {served_name!r} in place — "
+                      f"restarting the engine so it picks up the new adapter",
+                      flush=True)
             # An ADAPTER can usually just be handed to the running engine. Try
             # that before throwing away a loaded base model.
-            if _load_lora_runtime(svc["url"],
-                                  _model_config_for(resolved or model_path or ""),
-                                  served_name):
+            elif _load_lora_runtime(svc["url"], mcfg_entry, served_name):
                 return svc["url"]
             print(f"[vllm] the engine on {svc['url']} does not serve "
                   f"{served_name!r} — it started before this model was known "
@@ -674,6 +745,14 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
         threading.Thread(target=_pump_logs, args=(proc, tail, meta), daemon=True).start()
         _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray,
                               "gmu": gmu, "meta": meta}
+        # Which VERSION of each adapter this engine was launched with, so a
+        # retrain under the same name is recognised as a different adapter
+        # rather than a name the engine already answers to.
+        _LORA_LOADED.pop((url, served_name or ""), None)
+        for _spec in _sibling_lora_specs(_model_config_for(resolved or model) or {}):
+            _nm = str(_spec.get("name") or "")
+            if _nm:
+                _LORA_LOADED[(url, _nm)] = str(_spec.get("source") or "")
 
     def _tail_msg():
         # The last six lines of a vLLM crash are the wrapper's own traceback

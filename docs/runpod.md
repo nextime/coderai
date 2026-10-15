@@ -385,6 +385,32 @@ restarting the engine with the adapter included, and says so in the log.
 > install would launch today, so the runtime path is always tried and never
 > assumed.
 
+### Updating an adapter after a retrain
+
+Register the same name again with the new blob. The reply says `"state":
+"updated"` rather than `"registered"`, which is the confirmation that it
+replaced an adapter instead of adding a second one.
+
+Versioning is by CONTENT, which is what makes this safe to run on every
+retrain: an adapter whose bytes have not changed is recognised as the same one
+and nothing reloads. When they HAVE changed, the new bytes are sent to the pod,
+the old adapter is dropped from the running engine and the new one takes its
+name — the base model is not reloaded and nothing else on that pod is
+interrupted.
+
+Both halves of that needed a version in the key, and neither had one at first:
+
+* the orchestrator cached "this pod already has this adapter" by NAME, so a
+  retrain never sent the new bytes;
+* and the engine was asked "do you serve this name?", which a stale adapter
+  answers yes to. It kept the weights it was launched with and answered
+  confidently from them. The update looked applied — the catalogue had it and
+  the name worked — and the only visible symptom was output identical to the
+  previous version.
+
+An engine coderai has no record of is never guessed at: unloading an adapter on
+a guess is worse than serving the one that is there.
+
 ## 3. Request flow
 
 ```

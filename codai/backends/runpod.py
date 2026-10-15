@@ -229,19 +229,27 @@ class RunpodBackend(ModelBackend):
         # getattr: sending adapters must never be the thing that breaks a
         # request. Anything missing here means there is nothing to send.
         name = getattr(self, "_model_id", "") or getattr(self, "_served_name", "")
-        key = (root, name)
-        if not name or key in self._ADAPTERS_SENT:
+        if not name:
             return
-        self._ADAPTERS_SENT.add(key)            # once, even if it fails
         try:
             from codai.models.manager import _model_entry_for
             from codai.models.text_loras import configured_specs, portable_specs
             entry = _model_entry_for(name) or {}
             if not entry:
                 return
-            _, needs_sending = portable_specs(configured_specs(entry))
+            specs = configured_specs(entry)
+            _, needs_sending = portable_specs(specs)
             if not needs_sending:
                 return
+            # Keyed on WHICH adapter, not just its name. A retrain keeps the
+            # name and changes the bytes, so a cache that remembered only the
+            # name never sent the new ones and the pod went on serving the old
+            # adapter — with nothing in the answer to say which one replied.
+            key = (root, name, tuple(sorted(str(s.get("source") or "")
+                                            for s in specs)))
+            if key in self._ADAPTERS_SENT:
+                return
+            self._ADAPTERS_SENT.add(key)        # once per version, even if it fails
             from codai.api.remote_gateway import ensure_text_loras
             pool = getattr(self, "_pool", None)
             ensure_text_loras(root, getattr(pool, "api_key", "") if pool else "",
