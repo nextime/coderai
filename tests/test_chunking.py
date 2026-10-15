@@ -565,15 +565,38 @@ def test_a_named_registered_template_is_inlined_before_it_leaves():
         chk._registered_templates = orig
 
 
-def test_a_builtin_name_is_left_alone():
-    """Every coderai has the built-ins; sending the object would only make the
-    request bigger."""
+def test_a_builtin_name_is_inlined_too():
+    """It used to be left alone, on the reasoning that every coderai has the
+    built-ins. That is true of the NAME and not of what it means: `it-legal`
+    was widened to accept markdown headings in 0.3.87 and `it-legal-strict` did
+    not exist before it, so a pod on an older image resolves the same name to
+    different anchors — or 404s on one it has never heard of. A pod fleet is
+    mixed-version by nature.
+
+    A few hundred bytes on the request buys boundaries that depend on THIS
+    install's version rather than on which machine answered, which is the only
+    way an index stays comparable."""
     import json
     from codai.api import remote_gateway as rg
+    from codai.api.chunking import IT_LEGAL
     body = json.dumps({"text": "t", "structure": "it-legal"}).encode()
     out = rg._inline_chunk_template("/v1/chunk",
                                     {"content-type": "application/json"}, body)
-    assert json.loads(out)["structure"] == "it-legal"
+    sent = json.loads(out)["structure"]
+    assert isinstance(sent, dict)
+    assert [s["label"] for s in sent["sections"]] == \
+        [s["label"] for s in IT_LEGAL["sections"]]
+
+
+def test_an_unknown_template_name_is_forwarded_untouched():
+    """Resolution failing here must not swallow the request: the remote answers
+    for itself, and `unknown_template` is a clear error either way."""
+    import json
+    from codai.api import remote_gateway as rg
+    body = json.dumps({"text": "t", "structure": "no-such-template"}).encode()
+    out = rg._inline_chunk_template("/v1/chunk",
+                                    {"content-type": "application/json"}, body)
+    assert json.loads(out)["structure"] == "no-such-template"
 
 
 def test_an_inline_template_is_passed_through_untouched():

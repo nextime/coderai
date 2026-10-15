@@ -330,6 +330,7 @@ def gateway_app():
     gw.capability_endpoints = lambda: {}
     gw._model_remote = lambda m: ""
     try:
+        gw._EchoRemote_hits = lambda: _EchoRemote.hits
         yield TestClient(app), gw, url
     finally:
         for name, fn in saved.items():
@@ -1979,3 +1980,71 @@ def test_a_fresh_pods_first_not_found_is_retried_not_believed(gateway_app, monke
 
 async def _fast_sleep(_s):
     return None
+
+
+# --------------------------------------------------------------------------- #
+# /v1/chunk must run where the operator says: here, on a node, or on a pod.
+#
+# It rides the EMBEDDINGS capability rather than inventing one of its own —
+# chunks are on their way to be embedded, and the embeddings image is full-core
+# so it already carries the chunker. A `chunk` capability of its own would be
+# one nothing advertises, or would rent a GPU to run a regex split.
+# --------------------------------------------------------------------------- #
+def test_chunking_runs_here_when_nothing_is_remote():
+    """A regex split over text must not rent a GPU by default."""
+    import json as _json
+    from codai.api.remote_gateway import resolve_target
+    body = _json.dumps({"text": "MOTIVI DELLA DECISIONE\n\nx."}).encode()
+    assert resolve_target("/v1/chunk", "POST", "", body, "application/json") is None
+
+
+def test_a_capability_image_serves_the_chunk_route_at_all():
+    """Forwarding to a pod without /v1/chunk would be a 404 per document."""
+    from codai.api.app import app
+    paths = {getattr(r, "path", "") for r in app.routes}
+    assert "/v1/chunk" in paths and "/v1/chunk/file" in paths
+
+
+def test_the_embeddings_capability_has_a_published_image():
+    """So a capability pod needs no image name typed in."""
+    from codai.api.runpod_worker import PUBLISHED_CAPABILITY_IMAGES
+    assert "embeddings" in PUBLISHED_CAPABILITY_IMAGES
+
+
+def test_chunking_is_forwarded_to_a_node(gateway_app):
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {"embeddings": url}
+    _EchoRemote.hits = []
+    r = client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx."})
+    assert r.status_code == 200 and r.json()["served_by"] == "remote"
+    assert _EchoRemote.hits[-1]["path"] == "/v1/chunk"
+
+
+def test_chunking_stays_here_when_another_capability_is_remote(gateway_app):
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {"images": url}
+    _EchoRemote.hits = []
+    client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx."})
+    assert _EchoRemote.hits == []          # never left this machine
+
+
+def test_a_named_chunk_template_is_inlined_before_it_leaves(gateway_app):
+    """A name resolved on the far side is a DIFFERENT template that happens to
+    share it — different boundaries, with nothing to say so."""
+    import json as _json
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {"embeddings": url}
+    _EchoRemote.hits = []
+    client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx.",
+                                   "structure": "it-legal"})
+    sent = _json.loads(_EchoRemote.hits[-1]["body"])
+    assert isinstance(sent["structure"], dict) and sent["structure"]["sections"]
+
+
+def test_a_chunk_request_can_pin_itself_local(gateway_app):
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {"embeddings": url}
+    _EchoRemote.hits = []
+    client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx."},
+                headers={"X-Coderai-Placement": "local"})
+    assert _EchoRemote.hits == []

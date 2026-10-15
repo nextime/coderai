@@ -188,8 +188,17 @@ def _inline_chunk_template(path: str, headers: dict, body: bytes) -> bytes:
     make a retrieval index unmeasurable, which is the whole thing
     docs/chunking.md warns about.
 
-    Built-in names are left alone: every coderai has those, and sending the
-    object would only make the request bigger.
+    Built-in names are inlined too, which they did not used to be. "Every
+    coderai has those" is true of the NAME and not of what it means: `it-legal`
+    was widened to accept markdown headings in 0.3.87 and `it-legal-strict` did
+    not exist before it, so a pod on an older image resolves the same name to
+    different anchors — or 404s on one it has never heard of. A pod fleet is
+    mixed-version by nature; one rented an hour ago is running whatever
+    `:latest` meant then.
+
+    Sending the object makes the request a few hundred bytes larger and makes
+    the boundaries a property of THIS install's version, which is the only way
+    an index stays comparable across a fleet.
 
     Never raises: a body it cannot parse is forwarded untouched, and the remote
     then answers for itself.
@@ -206,10 +215,7 @@ def _inline_chunk_template(path: str, headers: dict, body: bytes) -> bytes:
         name = obj.get("structure")
         if not isinstance(name, str) or not name.strip():
             return body        # already inline, or defaulted
-        from codai.api.chunking import BUILTIN_TEMPLATES, resolve_template
-        if name.strip() in BUILTIN_TEMPLATES:
-            return body
-        from codai.api.chunking import _registered_templates
+        from codai.api.chunking import resolve_template, _registered_templates
         tpl = resolve_template(name, _registered_templates())
         if not isinstance(tpl, dict):
             return body

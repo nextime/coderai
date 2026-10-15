@@ -200,6 +200,37 @@ lawyer's demand surface as if it were a holding — the most damaging mistake th
 index can make. A template that wants them merged must say so explicitly by
 giving both patterns the same label.
 
+## Where it runs
+
+`/v1/chunk` rides the **embeddings** capability rather than having one of its
+own: chunks are on their way to be embedded, and the embeddings image is
+full-core so it already carries the chunker. A `chunk` capability would be one
+nothing advertises — or would rent a GPU to run a regex split.
+
+| placement | configuration |
+|---|---|
+| this orchestrator (default) | nothing; `remotes.endpoints`/`remotes.pods` empty |
+| a RunPod pod | `remotes.pods.embeddings`, or `remotes.endpoints.embeddings: "runpod"` — uses `ghcr.io/nextime/coderai-embeddings` |
+| a cluster node, or any coderai | `remotes.endpoints.embeddings: "https://node:8777"` (a list becomes a pool with failover) |
+| one request, pinned | `X-Coderai-Placement: local` or `remote` |
+
+Local is the default on purpose: a regex split over text needs no GPU, and a
+remote adds a round trip in each direction.
+
+**A named template is resolved before the request leaves.** `structure:
+"it-legal"` is replaced by the template OBJECT, built-ins included. The name is
+the same everywhere; what it means is not — `it-legal` was widened to accept
+markdown headings in 0.3.87 and `it-legal-strict` did not exist before it, so a
+pod on an older image would resolve the same name to different anchors, or 404
+on one it has never heard of. A pod fleet is mixed-version by nature: one
+rented an hour ago runs whatever `:latest` meant then. Inlining costs a few
+hundred bytes and makes the boundaries a property of THIS install's version,
+which is the only way an index stays comparable across a fleet.
+
+A per-MODEL remote does not move chunking. A chunk request carries no `model`,
+so only the capability map places it — having `bge-m3` on its own pod leaves
+`/v1/chunk` here.
+
 ## Algorithm
 
 Implement exactly this order; the overlap and packing rules are where a port
