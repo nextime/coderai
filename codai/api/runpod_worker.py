@@ -4297,6 +4297,32 @@ _scaler_started = False
 _SINGLE_MODEL_ENGINES = ("vllm", "llamacpp")
 
 
+def canonical_model_key(model_key: str, entry: dict = None) -> str:
+    """ONE pool key per set of weights, whatever name the caller used.
+
+    A model answers to several names — its id, its HuggingFace path, any alias —
+    and the pool key was simply whichever one the request happened to carry. So
+    `bge-m3` and `BAAI/bge-m3` built two pools over the same weights and rented
+    two A40s, one of them pure waste at $0.59/hr, with /v1/models listing both
+    names and nothing anywhere saying they are the same thing.
+
+    Keyed on the ENTRY, so every name for one model lands on one pool. A model
+    with no entry keeps its name: there is nothing else to key on, and refusing
+    to pool it would be worse than pooling it under the name given.
+    """
+    try:
+        if entry is None:
+            from codai.models.manager import _model_entry_for
+            entry = _model_entry_for(model_key) or {}
+    except Exception:
+        entry = {}
+    if not isinstance(entry, dict):
+        entry = {}
+    return (str(entry.get("id") or "").strip()
+            or str(entry.get("path") or "").strip()
+            or str(model_key))
+
+
 def shared_pool_key(mcfg: "RunpodModelConfig", model_key: str,
                     model_path: str = "") -> str:
     """The pool key for this model: its own, or a shared one it opted into.
@@ -4307,7 +4333,7 @@ def shared_pool_key(mcfg: "RunpodModelConfig", model_key: str,
     """
     shared = (getattr(mcfg, "pool", "") or "").strip().lower()
     if not shared:
-        return str(model_key)
+        return canonical_model_key(model_key)
     engine = resolve_pod_engine(mcfg, model_key, model_path)
     if engine in _SINGLE_MODEL_ENGINES:
         raise RuntimeError(
@@ -4726,7 +4752,15 @@ def get_live_pool(key: str):
     if not k:
         return None
     with _pools_lock:
-        return _pools.get(k)
+        got = _pools.get(k)
+        if got is not None:
+            return got
+        # An ALIAS of a pooled model. `status` reports the canonical key, but a
+        # client holds whichever name it has been using all along, and being
+        # told a running pool does not exist is how a pod ends up with no way
+        # to turn it off.
+        alt = canonical_model_key(k)
+        return _pools.get(alt) if alt != k else None
 
 
 def _scale_live_pool(pool, key: str, pods: int, teardown: bool = False,

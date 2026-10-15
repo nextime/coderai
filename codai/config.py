@@ -1108,6 +1108,18 @@ class OcrConfig:
     # ...and only in a document with at least this many pages, since a median
     # taken over two pages is not a median.
     retry_short_pages_min_doc: int = 4
+    # The status a document gets when EVERY page with ink on it came back
+    # empty. 200 with no text is indistinguishable from a blank document, and a
+    # client that treats an empty read as an unreadable scan then writes the
+    # document off; this says plainly that the read did not happen. 0 keeps the
+    # old 200. A partially read document is always 200, with `unread_pages`.
+    unread_status: int = 502
+    # Wall-clock ceiling for ONE /v1/ocr request, 0 = no limit. A read that
+    # dribbles bytes never trips a client's READ timeout -- that timeout is
+    # per-read, so a response trickling for nineteen minutes looks healthy to
+    # httpx the whole way. A client cannot bound the call without a stopwatch
+    # of its own, so the bound belongs here as well.
+    request_timeout_s: float = 0.0
 
     # --- PaddleOCR / PP-Structure ---
     paddle_enabled: bool = True
@@ -2064,6 +2076,8 @@ class ConfigManager:
                 "fallback_engines": self.config.ocr.fallback_engines,
                 "retry_degraded": self.config.ocr.retry_degraded,
                 "retry_degraded_max_pages": self.config.ocr.retry_degraded_max_pages,
+                "unread_status": self.config.ocr.unread_status,
+                "request_timeout_s": self.config.ocr.request_timeout_s,
                 "retry_short_pages_below": self.config.ocr.retry_short_pages_below,
                 "retry_short_pages_min_doc": self.config.ocr.retry_short_pages_min_doc,
                 "olmocr_enabled": self.config.ocr.olmocr_enabled,

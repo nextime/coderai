@@ -467,12 +467,73 @@ def extract_refs(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # The whole operation
 # ---------------------------------------------------------------------------
+def _absorb_runts(chunks, minimum: int, want_refs: bool) -> list:
+    """Fold a chunk shorter than ``minimum`` into the one before it.
+
+    A `P.Q.M.` is often two lines. As its own chunk it is a 162-character entry
+    in a retrieval index — too short to carry meaning on its own and long enough
+    to match, which is the worst combination. Asked for by an operator whose
+    index was filling with them.
+
+    OFF by default, and it must stay off by default: merging moves a boundary,
+    and a re-chunked corpus whose boundaries moved cannot be compared with the
+    index it replaces. Neither this implementation nor the one it ports does
+    this unless asked.
+
+    What it does NOT do is hide the join. The absorbed chunk's label is recorded
+    on the survivor (`absorbed_sections`) and in the response, because section
+    labels carry meaning that must not be quietly rewritten: `conclusioni` is
+    what a party ASKED FOR and `dispositivo` is what the court DECIDED, and an
+    index that confuses them surfaces a lawyer's demand as a holding. A reader
+    of a merged chunk can always see which labels went into it.
+
+    The FIRST chunk is never absorbed — there is nothing before it.
+    """
+    try:
+        minimum = int(minimum or 0)
+    except (TypeError, ValueError):
+        minimum = 0
+    if minimum <= 0 or len(chunks) < 2:
+        return []
+    out = []
+    absorbed = []
+    for obj in chunks:
+        if out and len(obj["text"]) < minimum:
+            prev = out[-1]
+            absorbed.append({"into": prev["ord"],
+                             "section": obj.get("section"),
+                             "n_chars": obj["n_chars"]})
+            prev["text"] = prev["text"] + "\n\n" + obj["text"]
+            prev["n_chars"] = len(prev["text"])
+            if obj.get("section") and obj.get("section") != prev.get("section"):
+                labels = prev.setdefault("absorbed_sections", [])
+                if obj["section"] not in labels:
+                    labels.append(obj["section"])
+            if want_refs:
+                merged = list(prev.get("norm_refs") or [])
+                for ref in obj.get("norm_refs") or []:
+                    if ref not in merged:
+                        merged.append(ref)
+                prev["norm_refs"] = merged
+            if "end" in obj and "start" in prev:
+                prev["end"] = obj["end"]
+            continue
+        out.append(obj)
+    if not absorbed:
+        return []
+    for i, obj in enumerate(out):
+        obj["ord"] = i
+    chunks[:] = out
+    return absorbed
+
+
 def chunk_document(text: str, *, chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
                    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
                    chars_per_token: int = DEFAULT_CHARS_PER_TOKEN,
                    structural: bool = True, structure: Any = "it-legal",
                    refs: Any = "it-legal", include_offsets: bool = False,
                    require_text: bool = True,
+                   min_chunk_chars: int = 0,
                    registered: Optional[dict] = None) -> dict:
     """Chunk `text` and return the response document (see docs/chunking.md)."""
     if not isinstance(text, str):
@@ -523,6 +584,8 @@ def chunk_document(text: str, *, chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
                     cursor = at
             chunks.append(obj)
 
+    absorbed = _absorb_runts(chunks, min_chunk_chars, want_refs)
+
     return {
         "chunks": chunks,
         "n_chunks": len(chunks),
@@ -531,7 +594,9 @@ def chunk_document(text: str, *, chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         "structural_applied": bool(applied),
         "params": {"chunk_tokens": int(chunk_tokens),
                    "overlap_tokens": int(overlap_tokens),
-                   "chars_per_token": int(chars_per_token)},
+                   "chars_per_token": int(chars_per_token),
+                   "min_chunk_chars": int(min_chunk_chars or 0)},
+        **({"absorbed": absorbed} if absorbed else {}),
     }
 
 
@@ -608,6 +673,14 @@ class ChunkRequest(BaseModel):
     extract_refs: Optional[Any] = Field(None, description="Reference extractor: a name, an inline object, or false to skip.")
     require_text: Optional[bool] = Field(None, description="Reject binary input instead of chunking container bytes.")
     include_offsets: Optional[bool] = Field(None, description="Add char offsets into the normalised source text.")
+    min_chunk_chars: Optional[int] = Field(
+        None, ge=0,
+        description="Fold a chunk shorter than this into the one before it. 0 "
+                    "(the default) keeps every chunk, which is what the "
+                    "reference implementation does: merging MOVES a boundary, "
+                    "and a corpus re-chunked with moved boundaries cannot be "
+                    "compared with the index it replaces. The labels that were "
+                    "absorbed are reported, never silently dropped.")
     model_config = ConfigDict(extra="allow")
 
 
@@ -631,6 +704,8 @@ def _resolve_params(text: str, body) -> dict:
         include_offsets=bool(body.include_offsets),
         require_text=(body.require_text if body.require_text is not None
                       else _bool_setting("require_text", "CODERAI_CHUNK_REQUIRE_TEXT", True)),
+        min_chunk_chars=(body.min_chunk_chars if body.min_chunk_chars is not None
+                         else g("min_chunk_chars", "CODERAI_CHUNK_MIN_CHARS", 0)),
         registered=_registered_templates(),
     )
 
@@ -687,6 +762,7 @@ async def create_chunks_from_file(
     extract_refs: Optional[str] = Form(None),
     require_text: Optional[bool] = Form(None),
     include_offsets: Optional[bool] = Form(None),
+    min_chunk_chars: Optional[int] = Form(None),
 ):
     """The multipart form of `/v1/chunk`, with the same field names as values --
     matching how `/v1/ocr` takes its options.
@@ -704,7 +780,7 @@ async def create_chunks_from_file(
         chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens,
         chars_per_token=chars_per_token, structural=structural,
         structure=structure, require_text=require_text,
-        include_offsets=include_offsets,
+        include_offsets=include_offsets, min_chunk_chars=min_chunk_chars,
         extract_refs=(False if (extract_refs or "").strip().lower()
                       in ("0", "false", "no", "off") else (extract_refs or None)))
     return _run(_resolve_params(raw.decode("utf-8", "ignore"), body))

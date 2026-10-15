@@ -269,7 +269,15 @@ def _served_names(model_config: dict, served_name: str, fallback: str) -> list:
     adapters = {str(s.get("name") or "") for s in _sibling_lora_specs(model_config or {})}
     names = [str(served_name or "")]
     base = _base_of(model_config or {})
-    if base:
+    if adapters and base:
+        # Several names over ONE engine. Which of them asked for it must not
+        # decide what the engine answers to — order-dependence is the bug this
+        # is being changed for — so the full set is collected every time: the
+        # weights' own name, and every name the catalogue gives this base.
+        #
+        # Only when there ARE adapters. A model served alone is named exactly as
+        # it was before, because nothing about it is ambiguous.
+        names.append(str(fallback or ""))
         try:
             from codai.admin.routes import config_manager
             md = getattr(config_manager, "models_data", None) or {}
@@ -278,7 +286,8 @@ def _served_names(model_config: dict, served_name: str, fallback: str) -> list:
         for entry in (md.get("text_models") or []):
             if not isinstance(entry, dict) or _base_of(entry) != base:
                 continue
-            names.append(str(entry.get("alias") or entry.get("id") or "").strip())
+            names.append(str(entry.get("alias") or "").strip())
+            names.append(str(entry.get("id") or "").strip())
     out, seen = [], set()
     for n in names:
         if n and n not in seen and n not in adapters:

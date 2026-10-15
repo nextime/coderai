@@ -281,3 +281,11 @@ def test_an_unanswered_probe_never_costs_a_relaunch(monkeypatch):
     monkeypatch.setattr(vw, "_serves_name", lambda url, name: None)
     assert vw._ensure_service_once(_Cfg(), BASE_REPO, "tuned-alpha") == "http://127.0.0.1:9"
     assert stopped == []
+
+
+def test_the_engine_answers_the_same_set_whichever_name_started_it(catalogue):
+    """Order-dependence is the bug; the launch must not inherit it."""
+    by_base = vw._served_names(dict(BASE), "base-awq", BASE_REPO)
+    by_adapter = vw._served_names(dict(BASE), "tuned-alpha", BASE_REPO)
+    assert set(by_base) == set(by_adapter)
+    assert BASE_REPO in by_base

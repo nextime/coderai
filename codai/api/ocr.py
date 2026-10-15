@@ -29,6 +29,7 @@ import asyncio
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from codai.ocr.base import OcrError
@@ -76,6 +77,64 @@ def _page_opts(max_tokens, max_continuations) -> dict:
     return out
 
 
+async def _bounded(cfg, coro):
+    """Run an OCR read under the install's wall-clock ceiling, if it set one.
+
+    A client's read timeout cannot bound this. httpx (and requests) time each
+    READ, so a response that dribbles a byte at a time never trips one: a
+    chandra read stayed open for nineteen minutes against a `timeout=420`.
+    Bounding it needs a stopwatch over the whole call, and the server is the
+    side that knows what it is doing.
+    """
+    try:
+        limit = float(getattr(cfg.ocr, "request_timeout_s", 0) or 0)
+    except Exception:
+        limit = 0.0
+    if limit <= 0:
+        return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout=limit)
+    except asyncio.TimeoutError:
+        raise OcrError(f"the read passed the {limit:g}s ceiling for one request "
+                       f"(ocr.request_timeout_s) and was stopped", status=504)
+
+
+def _answer(result: dict, cfg):
+    """The OCR response, with a status code that matches what we found.
+
+    A document whose every readable page came back empty must NOT be a 200. The
+    orchestrator has already measured ink on those pages and said there is
+    something on them, so "no text" is this run failing, not the document being
+    blank — but the two are identical in a 200 whose `text` is empty, and a
+    client that treats an empty read as an unreadable scan then consumes the
+    document from its queue and writes it off. That happened to roughly a
+    thousand documents in one night behind a lost engine lease.
+
+    Only the all-or-nothing case changes status: a document that produced SOME
+    text is still a 200, with `unread_pages` naming the ones it did not. Set
+    `ocr.unread_status` to 0 to keep the old behaviour.
+    """
+    try:
+        status = int(getattr(cfg.ocr, "unread_status", 502) or 0)
+    except Exception:
+        status = 502
+    unread = result.get("unread_pages") or []
+    if not status or not unread:
+        return result
+    if (result.get("text") or "").strip():
+        return result                   # partially read: 200 and a named list
+    return JSONResponse(status_code=status, content={
+        "error": {
+            "message": (f"every page with ink on it came back empty "
+                        f"({len(unread)} of {result.get('num_pages', 0)}): the "
+                        f"document was not read. This is not a blank document "
+                        f"— see unread_pages."),
+            "type": "ocr_unread",
+        },
+        **result,
+    })
+
+
 @router.post("/v1/ocr", summary="OCR an image or PDF with a dedicated OCR engine")
 async def create_ocr(
     file: UploadFile = File(...),
@@ -100,7 +159,7 @@ async def create_ocr(
         raise HTTPException(status_code=413, detail="file too large (max 100 MB)")
 
     try:
-        return await ocr_manager.ocr_document(
+        result = await _bounded(cfg, ocr_manager.ocr_document(
             data,
             filename=file.filename or "",
             content_type=file.content_type or "",
@@ -111,7 +170,8 @@ async def create_ocr(
             schema=schema_,
             lang=lang,
             page_opts=_page_opts(max_tokens, max_continuations),
-        )
+        ))
+        return _answer(result, cfg)
     except OcrError as e:
         raise HTTPException(status_code=e.status, detail=str(e))
     except Exception as e:

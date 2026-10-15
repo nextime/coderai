@@ -167,14 +167,30 @@ beats registered; an unknown name is an error, never a silent fallback.
 ### Built-in `it-legal`
 
 Carries both families, because party filings outnumber rulings in the merito
-corpus. Patterns, verbatim from the production implementation:
+corpus.
+
+**`it-legal` is deliberately NOT byte-identical to the original.** Its
+single-word anchors accept a DECORATED heading — `**P.Q.M.**`, `_DISPOSITIVO_`,
+`## FATTO` — because OCR engines that emit markdown (chandra, olmOCR) produce
+exactly those, and the original's `^\s*dispositivo\s*$` does not match one. The
+difference is `[\s*#>_]*` where the original has `\s*`, on the three anchored
+patterns (`premess[ae]`, `fatto`, `dispositivo`).
+
+That difference is VISIBLE in the output: a decorated `**P.Q.M.**` becomes its
+own `dispositivo` section here and stays inside `motivazione` there — one extra
+chunk, usually a short one, and the preceding chunk shorter by the same text.
+If you are re-chunking a corpus indexed with the original, use
+[`it-legal-strict`](#built-in-it-legal-strict), which IS byte-identical; a
+boundary that moves makes the new index incomparable with the old.
+
+Patterns:
 
 | Label | Pattern |
 |---|---|
-| `premessa` | `tanto\s+premesso\|ci[oò]\s+premesso\|^\s*[*#>_ ]*premesso\s+che\b\|^\s*premess[ae]\s*$` |
-| `fatto` | `svolgimento\s+del\s+processo\|ragioni\s+di\s+fatto\|in\s+fatto\b\|fatto\s+e\s+diritto\|^\s*fatto\s*$\|esposizione\s+del\s+fatto` |
+| `premessa` | `tanto\s+premesso\|ci[oò]\s+premesso\|^\s*[*#>_ ]*premesso\s+che\b\|^[\s*#>_]*premess[ae][\s*#>_]*$` |
+| `fatto` | `svolgimento\s+del\s+processo\|ragioni\s+di\s+fatto\|in\s+fatto\b\|fatto\s+e\s+diritto\|^[\s*#>_]*fatto[\s*#>_]*$\|esposizione\s+del\s+fatto` |
 | `motivazione` | `motivi\s+della\s+decisione\|ragioni\s+della\s+decisione\|motivazione\|considerato\s+in\s+diritto\|in\s+diritto\b\|motivi\s+in\s+diritto\|ragioni\s+in\s+diritto` |
-| `dispositivo` | `p\.?\s*q\.?\s*m\.?\|p\.?\s*t\.?\s*m\.?\|per\s+questi\s+motivi\|^\s*dispositivo\s*$\|così\s+deciso\|così\s+provvede` |
+| `dispositivo` | `p\.?\s*q\.?\s*m\.?\|p\.?\s*t\.?\s*m\.?\|per\s+questi\s+motivi\|^[\s*#>_]*dispositivo[\s*#>_]*$\|così\s+deciso\|così\s+provvede` |
 | `conclusioni` | `^\s*[*#>_ ]*conclusion[ei]\b\|\bconclusioni\s*:\|voglia\s+(?:l['’]ill\.?mo\s+)?(?:il\s+)?(?:tribunale\|giudice\|giudicante)\|^\s*[*#>_ ]*chiede\b\|salvis\s+iuribus` |
 
 **`conclusioni` is a label of its own and must never be folded into
@@ -266,7 +282,7 @@ extracts article and act citations, normalises them, and de-duplicates while
   split across two keys depending on how the source wrote it. `del` separates
   as well as `/` (`legge 241 del 1990`), and the bare `l` needs its dot.
 
-### `it-legal-strict`
+### Built-in `it-legal-strict`
 
 `it-legal` widens the line-anchored headers to tolerate markdown emphasis, so
 `**FATTO**` opens a section. The implementation this ports does not: its

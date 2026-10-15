@@ -347,6 +347,19 @@ def _note_loop(raw: str) -> None:
     st["loop_chars"] = len(raw or "")
 
 
+def _note_empty() -> None:
+    """Record that a call to the model came back with nothing at all.
+
+    Not the same as a page the model could not read: NOTHING came back, so the
+    model was never asked successfully. Seen live when a front restart voided an
+    OCR lease — every call answered 404 "unknown OCR engine lease", surya's
+    client swallowed it and returned an empty generation, and the page was
+    reported as read.
+    """
+    st = _state()
+    st["empty_replies"] = int(st.get("empty_replies") or 0) + 1
+
+
 def _page_override(name: str, default):
     """A per-request value for the page this THREAD is reading, else the default.
 
@@ -1400,6 +1413,21 @@ class SuryaWorker:
                 budget = _RETRY_BUDGET[0]
                 if budget is not None:
                     max_retries = min(int(max_retries or 0), int(budget))
+                # A reply with NO tokens did not repeat itself — it never
+                # happened. The detector is handed an empty string, finds no
+                # progress in it and asks for another go at a higher
+                # temperature; the temperature cannot help a call that failed.
+                # Live, with a dead lease behind it, that was four full paid
+                # generations per page, `tokens: [0,0,0,0]`, and a document
+                # returned as successfully read with no text in it.
+                if not int(getattr(result, "token_count", 0) or 0) \
+                        and not (getattr(result, "raw", "") or "").strip():
+                    _note_empty()
+                    print("[surya] the model returned nothing for this page — "
+                          "not a repetition, so it is NOT re-run at a higher "
+                          "temperature; the page is reported unread",
+                          file=sys.stderr, flush=True)
+                    return False
                 again = inner_retry(result, retries, max_retries, *a, **kw)
                 if again:
                     print(f"[surya] page repeated itself — retry "
@@ -1551,6 +1579,18 @@ class SuryaWorker:
         if _state().get("looping"):
             page["repeat_detected"] = True
             page["repeat_chars"] = int(_state().get("loop_chars") or 0)
+        # Every call for this page came back empty. The page was never read, and
+        # that is a different thing from a page that was read and found blank —
+        # one is ours to fix, the other is the document's.
+        _empty = int(_state().get("empty_replies") or 0)
+        if _empty:
+            page["engine_empty"] = {
+                "calls": _empty,
+                "why": ("the model returned no tokens at all; the page was not "
+                        "read. A transport failure answers like this — a lost "
+                        "engine lease, a pod taken away mid-batch — and so does "
+                        "a refused request."),
+            }
         tries = _attempts()
         toks = _attempt_token_counts()
         cap = int(_page_override("max_tokens", _MAX_TOKENS[0])

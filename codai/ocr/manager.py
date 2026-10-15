@@ -474,6 +474,30 @@ def _drain(stream, n: int) -> list:
     return out
 
 
+def _unread_pages(pages) -> list:
+    """Pages with ink on them and no text: read attempts that did not happen.
+
+    Deliberately NOT the same list as `blank_pages`. A blank page is a fact
+    about the document; an unread page is a fact about this run, and only one
+    of the two is worth retrying.
+    """
+    out = []
+    for page in pages or []:
+        meta = getattr(page, "meta", None) or {}
+        if (getattr(page, "text", "") or "").strip():
+            continue
+        why = ""
+        if meta.get("engine_empty"):
+            why = "the engine returned no tokens for this page"
+        else:
+            ink = meta.get("page_ink")
+            if isinstance(ink, dict) and ink.get("blank") is False:
+                why = str(ink.get("why") or "there is ink on this page")
+        if why:
+            out.append({"page": getattr(page, "index", len(out)), "why": why})
+    return out
+
+
 def _mark_blank_pages(cfg, images, pages) -> list:
     """Attach an ink measurement to any page that came back with little text.
 
@@ -1288,6 +1312,16 @@ class OcrManager:
         report = unreadable_report(pages)
         if report:
             out["unreadable"] = report
+        # Pages this install itself judged readable and then produced no text
+        # for. A caller cannot tell that from a blank page by looking at the
+        # text, and the two lead to opposite places: one is a document to skip,
+        # the other is a read to repeat. We already computed the judgement --
+        # `page_ink` says there is ink on the page -- it simply never reached
+        # the response, so ~1,000 documents were consumed from a work queue and
+        # written off as unreadable scans after a lost engine lease.
+        unread = _unread_pages(pages)
+        if unread:
+            out["unread_pages"] = unread
         if recovered:
             # Top level, because a caller deciding whether to trust this
             # document should not have to walk the pages to find out that part
@@ -1326,6 +1360,19 @@ class OcrManager:
         meta = getattr(page, "meta", None) or {}
         if meta.get("repeat_detected"):
             return "looping"
+        # Nothing came back from the model at all. Not the same as a page the
+        # model read and found empty: this page was never read, so another
+        # engine is exactly the right thing to try. A lost engine lease answers
+        # like this, and so does a pod taken away mid-batch.
+        if meta.get("engine_empty"):
+            return "unread"
+        ink = meta.get("page_ink")
+        if (isinstance(ink, dict) and ink.get("blank") is False
+                and not (getattr(page, "text", "") or "").strip()):
+            # The orchestrator already measured ink on this page and said there
+            # IS something on it. Answering 200 with no text for a page we
+            # ourselves judged readable is the silent-wrong-answer case.
+            return "unread"
         info = meta.get("model_attempts") or {}
         if isinstance(info, dict) and info.get("truncated"):
             return "truncated"

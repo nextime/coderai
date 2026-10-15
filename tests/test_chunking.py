@@ -529,7 +529,7 @@ def test_the_params_are_echoed_so_a_caller_can_tell_what_applied():
     r = ch.chunk_document(RULING, chunk_tokens=100, overlap_tokens=10,
                           chars_per_token=5)
     assert r["params"] == {"chunk_tokens": 100, "overlap_tokens": 10,
-                           "chars_per_token": 5}
+                           "chars_per_token": 5, "min_chunk_chars": 0}
 
 
 # ------------------------------------------- forwarding it to a remote #

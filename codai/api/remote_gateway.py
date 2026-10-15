@@ -135,7 +135,20 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
 
 #: Paths that are this install's own, matched by prefix at run time (the literal
 #: route templates above are what the coverage test reads).
-_LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob")
+#:
+#: ``/v1/runpod`` is THIS install's control plane: it rents, reports and
+#: releases the pods. It carries a ``model`` field like an inference request, so
+#: the gateway read it as one, resolved the model to its pod — and FORWARDED the
+#: scale request to a pod, renting one in order to deliver it. The pod has no
+#: runpod configuration of its own, so it answered
+#:
+#:     404 {"detail": "'datalab-to/surya-ocr-2' has no runpod block"}
+#:
+#: which reads exactly like the orchestrator refusing a name it should know.
+#: Teardown was the worst case: asking to give six pods back rented a seventh to
+#: ask it on, blocked for minutes hunting capacity, and then reported that the
+#: model does not exist. An operator could not turn off $3.54/hr from the API.
+_LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob", "/v1/runpod")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes

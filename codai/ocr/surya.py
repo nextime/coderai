@@ -317,22 +317,40 @@ class SuryaEngine(SubprocessOcrEngine):
         a URL nothing answers, and would fail every page from then on. So a failure is
         checked against the endpoint itself: if it is still healthy the error is real
         and is reported, and if it is gone the worker is restarted against a freshly
-        provisioned one. Exactly once — a second failure is an outage, not a lease."""
+        provisioned one. Exactly once — a second failure is an outage, not a lease.
+
+        A failure is not always an exception. surya's client catches the HTTP
+        error itself ("Inference error: Error code: 404 …") and returns a
+        generation with no tokens, so a page can come back EMPTY with nothing
+        raised — and the check below, which used to run only in `except`, never
+        ran. Observed live: a front restart voided the lease, every page
+        answered 404, and the document came back 200 with no text and no error
+        anywhere in it. An empty page is therefore checked the same way a raised
+        one is; the probe only costs anything on a page that already produced
+        nothing.
+        """
+        page = None
         try:
-            return super().recognize_image(image)
+            page = super().recognize_image(image)
         except OcrError as first:
             if self._serve_mode() != "model" or self._endpoint_alive():
                 raise
-            print(f"[ocr] surya endpoint {self._server_url} is gone "
-                  f"({first}) — re-resolving", flush=True)
-            from codai.models import placement
-            from codai.ocr import served_model
-            served_model.forget()
-            # The candidate set is discovered, so a vanished pod or node must be
-            # re-discovered too; otherwise the re-resolve hands back the same
-            # dead address it just rejected.
-            placement.forget()
-            self.cleanup()
-            self.load()
-            self._loaded = True
-            return super().recognize_image(image)
+            why = str(first)
+        else:
+            if self._serve_mode() != "model" or (page.text or "").strip() \
+                    or self._endpoint_alive():
+                return page
+            why = "the engine returned no text and its lease is gone"
+        print(f"[ocr] surya endpoint {self._server_url} is gone "
+              f"({why}) — re-resolving", flush=True)
+        from codai.models import placement
+        from codai.ocr import served_model
+        served_model.forget()
+        # The candidate set is discovered, so a vanished pod or node must be
+        # re-discovered too; otherwise the re-resolve hands back the same
+        # dead address it just rejected.
+        placement.forget()
+        self.cleanup()
+        self.load()
+        self._loaded = True
+        return super().recognize_image(image)
