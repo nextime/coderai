@@ -412,6 +412,41 @@ MODEL_TYPE_CAPABILITY = {
 _LLM_MODEL_TYPES = ("text_models", "gguf_models", "vision_models")
 
 
+def entry_model_type(entry: dict) -> str:
+    """The models.json SECTION this entry lives in ("embedding_models", ...), or "".
+
+    In models.json a model's kind is the dict KEY it sits under, not a field on
+    the entry -- and the entry is all that travels to a pod. Matched by IDENTITY
+    first (the same dict object the loader holds), falling back to id/path so a
+    copied or rebuilt entry still resolves. Returns "" on any failure: this
+    feeds a seeding path, and a guess is never worth an exception there.
+    """
+    try:
+        from codai.admin.routes import config_manager as _cm
+        md = getattr(_cm, "models_data", None) if _cm else None
+        if not isinstance(md, dict):
+            return ""
+        for section, lst in md.items():
+            if not isinstance(lst, list):
+                continue
+            for m in lst:
+                if m is entry:
+                    return str(section)
+        want = str(entry.get("id") or entry.get("path") or "").strip().lower()
+        if not want:
+            return ""
+        for section, lst in md.items():
+            if not isinstance(lst, list):
+                continue
+            for m in lst:
+                if isinstance(m, dict) and str(
+                        m.get("id") or m.get("path") or "").strip().lower() == want:
+                    return str(section)
+    except Exception:
+        pass
+    return ""
+
+
 def _in_embedding_section(entry: dict) -> bool:
     """Whether this entry lives in models.json's `embedding_models`.
 
@@ -1620,6 +1655,19 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
             )
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
     out["path"] = path
+    if not out.get("model_type"):
+        # WITHOUT THIS the pod registers it as a text model. `model_type` is in
+        # `keep` above, but a models.json entry does not carry one -- the kind
+        # is the section it sits under, and only the entry travels. The pod's
+        # seeder (ConfigManager._seed_models) reads `model_type` and falls back
+        # to "text_models", so an embeddings pod answered
+        #   "Model 'BAAI/bge-m3' is a text model and cannot be used for
+        #    embedding generation. Use the text endpoint instead."
+        # after a clean boot and a correct /v1/models -- which reads as the
+        # caller's mistake rather than a seeding bug.
+        _mt = entry_model_type(entry)
+        if _mt:
+            out["model_type"] = _mt
     if engine:
         # The pod runs this native engine for the model, whichever way it was
         # said here (the runpod block's engine, or the model's own pin).
@@ -4382,7 +4430,18 @@ def capability_seed_entries(capability: str, limit: int = 40) -> list:
             path = str(entry.get("path") or "")
             if not (_looks_like_repo_id(path) or path.startswith(("http://", "https://"))):
                 continue                      # the pod could never fetch it
-            out.append(entry)
+            # CARRY THE SECTION. In models.json the kind of a model is the dict
+            # KEY it sits under, not a field on the entry -- and the entry is
+            # all that travels. The pod's seeder reads `model_type` and falls
+            # back to "text_models", so without this every seeded model was
+            # registered on the pod as a TEXT model whatever it actually was.
+            #
+            # The symptom is not a routing error, which is what makes it
+            # expensive: the pod boots, serves /v1/models, lists the model --
+            # and then answers "Model 'BAAI/bge-m3' is a text model and cannot
+            # be used for embedding generation. Use the text endpoint instead."
+            # That reads as a configuration mistake on the caller's side.
+            out.append(dict(entry, model_type=section))
             if len(out) >= limit:
                 return out
     return out
