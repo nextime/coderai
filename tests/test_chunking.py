@@ -370,6 +370,40 @@ def test_acts_normalise_to_kind_number_year():
     assert ch.extract_refs("legge 24/2017") == ["l.24/2017"]
 
 
+# Cases taken one by one from a diff against the implementation this ports,
+# run side by side on the same documents. Each was a real divergence.
+def test_an_article_enumeration_resolves_to_its_first_article():
+    """`artt. 163, 164 e 167 c.p.c.` must reach the code at the end and emit
+    the FIRST article only. Requiring the code to sit immediately after the
+    number dropped the whole citation instead."""
+    assert ch.extract_refs("artt. 115 e 116 c.p.c.") == ["art.115 c.p.c."]
+    assert ch.extract_refs("artt. 163, 164 e 167 c.p.c.") == ["art.163 c.p.c."]
+
+
+def test_an_article_suffix_may_be_hyphenated():
+    """`art. 2055-bis c.c.` keeps its hyphen; `art. 2055 bis c.c.` loses its
+    space. Only whitespace is squeezed out of the number."""
+    assert ch.extract_refs("art. 2055-bis c.c.") == ["art.2055-bis c.c."]
+    assert ch.extract_refs("art. 2055 bis c.c.") == ["art.2055bis c.c."]
+
+
+def test_the_code_may_be_spelled_out():
+    assert ch.extract_refs("art. 2043 cod. civ.") == ["art.2043 c.c."]
+
+
+def test_articolo_spelled_out_is_not_an_article_citation():
+    """`art`/`artt` only. Accepting `articolo` adds references the corpus this
+    was measured against does not have, which is a divergence even though it
+    looks like an improvement."""
+    assert ch.extract_refs("articolo 2043 c.c.") == []
+    assert ch.extract_refs("visto l'art. 2043 della c.c.") == []
+
+
+def test_an_act_may_be_written_with_del_instead_of_a_slash():
+    assert ch.extract_refs("legge 241 del 1990") == ["l.241/1990"]
+    assert ch.extract_refs("l 241/1990") == []        # the dot is required
+
+
 def test_a_bare_article_number_is_not_a_reference():
     """Reported from production: `art. 380` and `art. 360` came back as
     `['art.380']` -- an unqualified number is ambiguous (every code has an
@@ -377,18 +411,68 @@ def test_a_bare_article_number_is_not_a_reference():
     key. The code suffix is required, and a citation without one is dropped."""
     assert ch.extract_refs("si veda l'art. 360 n. 3") == []
     assert ch.extract_refs("art.380, art.360, art.115, art.395") == []
-    # ...but the same numbers WITH a code are still references.
     assert ch.extract_refs("violazione dell'art. 380 c.p.c.") == ["art.380 c.p.c."]
 
 
 def test_an_act_year_may_be_two_digits_and_is_kept_verbatim():
-    """`d.p.r. 115/02` was extracted as nothing at all, because the year was
-    pinned to four digits. It is kept as written: expanding `02` to `2002`
-    would file the same act under two keys depending on the source's style."""
+    """`d.p.r. 115/02` was extracted as nothing, because the year was pinned to
+    four digits. It is kept as written: expanding `02` to `2002` would file the
+    same act under two keys depending on the source's style."""
     assert ch.extract_refs("ai sensi del d.p.r. 115/02") == ["d.p.r.115/02"]
     assert ch.extract_refs(
         "del d.p.r. 115/02 e del d.lgs. 446/1998") == ["d.p.r.115/02",
                                                        "d.lgs.446/1998"]
+
+
+# ------------------------------------------------- section bodies are strip #
+def test_two_adjacent_sections_merge_into_one_paragraph_not_two():
+    """THE off-by-one. An unstripped section body ends with the blank line
+    before the next header, so merging two of them inserted a PARAGRAPH break
+    where the original puts a line break -- and a paragraph break is packed as
+    `\n\n` while a line break rides along inside one piece. One character per
+    merged section, which is enough to make a re-chunked index incomparable."""
+    txt = ("CONCLUSIONI\n\nchiede il rigetto.\n\n"
+           "Voglia il Tribunale\n\naccogliere le domande.\n")
+    secs, applied, _ = ch.split_sections(txt, ch.IT_LEGAL)
+    assert applied
+    merged = [s for s in secs if s["label"] == "conclusioni"]
+    assert len(merged) == 1, [s["label"] for s in secs]
+    body = merged[0]["text"]
+    assert not body.startswith(("\n", " ")) and not body.endswith(("\n", " "))
+    assert "chiede il rigetto.\nVoglia il Tribunale" in body
+
+
+def test_an_empty_section_does_not_spend_a_parent_id():
+    """Two headers back to back leave an empty body between them. Kept, it
+    would take a `parent` and shift every id after it."""
+    txt = "testa.\n\nSVOLGIMENTO DEL PROCESSO\nP.Q.M.\n\ncondanna."
+    secs, _, _ = ch.split_sections(txt, ch.IT_LEGAL)
+    assert all(s["text"].strip() for s in secs)
+
+
+# -------------------------------------------------------- strict template #
+def test_strict_template_keeps_the_original_anchors():
+    """`it-legal` matches a markdown-emphasised header; the implementation this
+    ports does not, so a corpus indexed with it must be re-chunked the old way
+    or not at all. `it-legal-strict` is that old way, and it is the ONLY
+    deliberate behavioural difference between the two."""
+    txt = "testa.\n\n**FATTO**\n\ncorpo.\n\n**IN DIRITTO**\n\nmotivi."
+    wide = ch.chunk_document(txt, structure="it-legal", **DEFAULTS)
+    strict = ch.chunk_document(txt, structure="it-legal-strict", **DEFAULTS)
+    assert [c["section"] for c in wide["chunks"]] == ["intestazione", "fatto",
+                                                      "motivazione"]
+    assert [c["section"] for c in strict["chunks"]] == ["intestazione",
+                                                        "motivazione"]
+    assert strict["structure"] == "it-legal-strict"
+
+
+def test_strict_and_wide_agree_on_an_undecorated_document():
+    """The widening is purely additive: a document whose headers carry no
+    markdown is sectioned identically by both."""
+    wide = ch.chunk_document(RULING, structure="it-legal", **DEFAULTS)
+    strict = ch.chunk_document(RULING, structure="it-legal-strict", **DEFAULTS)
+    assert [(c["text"], c["section"], c["parent"]) for c in wide["chunks"]] == \
+           [(c["text"], c["section"], c["parent"]) for c in strict["chunks"]]
 
 
 def test_references_are_deduplicated_in_first_seen_order():

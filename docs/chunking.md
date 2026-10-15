@@ -254,11 +254,31 @@ extracts article and act citations, normalises them, and de-duplicates while
   The code is **required**: a bare `art. 360` is not emitted, because every
   procedural code has one and the field exists to be exact-matched — an
   unqualified number files three different articles under a single key.
+  Only `art`/`artt` open a citation (not `articolo`), only `del` links it to
+  its code (not `della`), the code may be spelled `cod. civ.`, and a suffix may
+  be hyphenated (`art.2055-bis c.c.`) — the hyphen is kept, a space is not.
+  An **enumeration** (`artt. 163, 164 e 167 c.p.c.`) resolves to its first
+  article only: `art.163 c.p.c.`
 - Acts → `<kind><num>/<year>`, e.g. `d.lgs.209/2005`, with
   `dlgs → d.lgs.`, `dl → d.l.`, `dpr → d.p.r.`, `legge|l → l.`
   The year is two to four digits and is kept **verbatim**: `d.p.r. 115/02`
   normalises to `d.p.r.115/02`, never to `/2002`, so the same act does not
-  split across two keys depending on how the source wrote it.
+  split across two keys depending on how the source wrote it. `del` separates
+  as well as `/` (`legge 241 del 1990`), and the bare `l` needs its dot.
+
+### `it-legal-strict`
+
+`it-legal` widens the line-anchored headers to tolerate markdown emphasis, so
+`**FATTO**` opens a section. The implementation this ports does not: its
+`^\s*fatto\s*$` cannot match once the `**` is consumed, and such a document is
+not sectioned at all. That is the **only** deliberate behavioural difference
+between the two, and it is purely additive — no line that matched before stops
+matching, and on an undecorated document the two templates agree byte for byte,
+including sections, parents and refs.
+
+`it-legal-strict` keeps the original anchors. Use it to re-chunk a corpus that
+was indexed with the original, where a boundary that moves makes the new index
+incomparable with the old. Anyone starting fresh wants `it-legal`.
 
 These are a filter field and an exact-match signal for hybrid search — the thing
 dense embeddings blur, since `art. 2043` and `art. 2054` sit close in vector

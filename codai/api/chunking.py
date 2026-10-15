@@ -115,26 +115,57 @@ IT_LEGAL: Dict[str, Any] = {
     ],
 }
 
-#: DEVIATION FROM docs/chunking.md, deliberate and recorded here because it
-#: affects byte-identity with the implementation this ports.
+#: Byte-identical to the implementation this ports: the anchors are the plain
+#: `^\s*fatto\s*$` of the original, so `**FATTO**` falls through and the
+#: document is not sectioned at all.
 #:
-#: The doc gives the patterns verbatim and asks for a fidelity case with a
-#: markdown-decorated header (`**FATTO**`). Those two requirements contradict
-#: each other: the verbatim `^\s*fatto\s*$` cannot match `**FATTO**`. The
-#: anchors here are widened to `^[\s*#>_]*fatto[\s*#>_]*$` so the documented
-#: case works.
+#: It exists for ONE job: re-chunking a corpus that was indexed with the
+#: original, where a boundary that moves makes the new index incomparable with
+#: the old. Anyone starting fresh wants `it-legal`.
+IT_LEGAL_STRICT: Dict[str, Any] = dict(
+    IT_LEGAL, name="it-legal-strict",
+    sections=[
+        {"label": "premessa",
+         "pattern": r"tanto\s+premesso|ci[oò]\s+premesso|^\s*[*#>_ ]*premesso\s+che\b|"
+                    r"^\s*premess[ae]\s*$"},
+        {"label": "fatto",
+         "pattern": r"svolgimento\s+del\s+processo|ragioni\s+di\s+fatto|in\s+fatto\b|"
+                    r"fatto\s+e\s+diritto|^\s*fatto\s*$|esposizione\s+del\s+fatto"},
+        {"label": "motivazione",
+         "pattern": r"motivi\s+della\s+decisione|ragioni\s+della\s+decisione|"
+                    r"motivazione|considerato\s+in\s+diritto|in\s+diritto\b|"
+                    r"motivi\s+in\s+diritto|ragioni\s+in\s+diritto"},
+        {"label": "dispositivo",
+         "pattern": r"p\.?\s*q\.?\s*m\.?|p\.?\s*t\.?\s*m\.?|per\s+questi\s+motivi|"
+                    r"^\s*dispositivo\s*$|così\s+deciso|così\s+provvede"},
+        {"label": "conclusioni",
+         "pattern": r"^\s*[*#>_ ]*conclusion[ei]\b|\bconclusioni\s*:|"
+                    r"voglia\s+(?:l[\'’]ill\.?mo\s+)?(?:il\s+)?(?:tribunale|giudice|giudicante)|"
+                    r"^\s*[*#>_ ]*chiede\b|salvis\s+iuribus"},
+    ])
+
+#: THE ONE DELIBERATE DIVERGENCE from the implementation this ports, and it is
+#: here rather than in a commit message because it is the only thing that can
+#: move a chunk boundary.
+#:
+#: Verified by running both against the same documents: the original does NOT
+#: match `**FATTO**` -- its `^\s*fatto\s*$` cannot, since the `**` is consumed
+#: before the line anchor is tested. A document with emphasised headers is
+#: therefore not sectioned at all by the original; `it-legal` widens the
+#: anchors to `^[\s*#>_]*fatto[\s*#>_]*$` so it is.
 #:
 #: The widening is purely additive -- no line that matched before stops
 #: matching, so no existing match position moves. What changes is which
 #: documents are sectioned AT ALL: one whose headers were emphasised used to
-#: fall back to flat chunking and now gets labels. Those documents' chunks
-#: differ from an index built before this and must be re-chunked; documents
-#: already sectioned are identical.
+#: fall back to flat chunking and now gets labels. On everything else the two
+#: templates agree byte for byte.
 #:
-#: Worth confirming against the production implementation: if it DOES match
-#: `**FATTO**`, its patterns differ from the table in the doc, and that
-#: difference is what matters for identity rather than this note.
-BUILTIN_TEMPLATES: Dict[str, Dict[str, Any]] = {"it-legal": IT_LEGAL}
+#: `it-legal-strict` keeps the original behaviour for re-chunking an index that
+#: was built with it.
+BUILTIN_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "it-legal": IT_LEGAL,
+    "it-legal-strict": IT_LEGAL_STRICT,
+}
 
 
 def _flags_from(spec: str) -> int:
@@ -267,25 +298,35 @@ def split_sections(text: str, tpl: Optional[dict]) -> Tuple[List[dict], bool, Op
     ``keep_header_line`` is set, so the header stays inside its own section.
     """
     if tpl is None:
-        return [{"label": "", "text": text}], False, None
+        return [{"label": "", "text": text.strip()}], False, None
     rx, labels, opts = compile_template(tpl)
     marks = [(m.start(), labels[int(m.lastgroup[1:])])
              for m in rx.finditer(text) if m.lastgroup]
     if not marks:
         # No header anywhere: flat, and SAID so, rather than inventing one
         # section per paragraph or pretending the template applied.
-        return [{"label": "", "text": text}], False, opts["name"]
+        return [{"label": "", "text": text.strip()}], False, opts["name"]
     out: List[dict] = []
-    head = text[:marks[0][0]]
-    if head.strip() and opts["head_label"] is not None:
+    # Every section body is STRIPPED, and an empty one is dropped entirely.
+    # Both matter beyond tidiness: an unstripped body ends with the blank line
+    # before the next header, so merging two of them would insert a PARAGRAPH
+    # break where there should be a line break -- one character, on every
+    # merged section, which is enough to make a re-chunked index incomparable
+    # with the one it replaces. An empty section would spend a `parent` id and
+    # shift every id after it.
+    head = text[:marks[0][0]].strip()
+    if head and opts["head_label"] is not None:
         out.append({"label": str(opts["head_label"] or ""), "text": head})
     for i, (pos, label) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
-        body = text[pos:end] if opts["keep_header_line"] else text[pos:end]
+        body = (text[pos:end] if opts["keep_header_line"] else text[pos:end]).strip()
+        if not body:
+            continue
         if opts["merge_adjacent"] and out and out[-1]["label"] == label:
             # Filings routinely open the conclusions twice (CONCLUSIONI, then
             # "Voglia il Tribunale..."). Left separate, one block becomes two
             # and the parent ids multiply, defeating the point of `parent`.
+            # Joined with ONE newline, so the two halves stay one paragraph.
             out[-1]["text"] = out[-1]["text"] + "\n" + body
         else:
             out.append({"label": label, "text": body})
@@ -363,21 +404,37 @@ def pack(pieces: List[str], target: int, overlap: int) -> List[str]:
 # ---------------------------------------------------------------------------
 # Reference extraction
 # ---------------------------------------------------------------------------
-_ART_SUFFIX = r"(?:\s*(?:bis|ter|quater|quinquies|sexies))?"
-#: The code suffix is MANDATORY, not optional. A bare `art. 360` is ambiguous
-#: -- every procedural code has one -- so it is deliberately NOT a reference:
-#: this field exists to be exact-matched, and an unqualified number would put
-#: three different articles under one key.
+#: Ported VERBATIM from the implementation these fixtures were cut against.
+#: Every liberty taken with these patterns -- `articolo` as well as `art.`,
+#: `della` as well as `del`, a dotless `l` -- moves a reference into or out of
+#: a chunk's filter field, and an index built with one cannot be compared with
+#: an index built with the other.
+_ART_SUFFIX = r"(?:[- ]?(?:bis|ter|quater|quinquies|sexies))?"
+#: `cod. civ.` spelled out, as well as every dotted abbreviation. Order matters:
+#: `c.p.c.` must be offered before `c.p.`, or the longer code loses its tail.
+_CODE = (r"(?:c\.?c\.?|cod\.?\s*civ\.?|c\.?p\.?c\.?|c\.?p\.?p\.?"
+         r"|c\.?p\.?|cost\.?)")
+#: The code suffix is MANDATORY. A bare `art. 360` is ambiguous -- every
+#: procedural code has one -- so it is deliberately NOT a reference: this field
+#: exists to be exact-matched, and an unqualified number would put three
+#: different articles under a single key.
+#:
+#: The middle group swallows an ENUMERATION (`artt. 163, 164 e 167 c.p.c.`)
+#: without capturing it, so the citation resolves to its FIRST article and the
+#: code at the end is still reached. Only the first is emitted -- that is the
+#: behaviour the existing indexes were built with.
 _ART_RX = re.compile(
-    r"\bart(?:t|icol[oi])?\.?\s*(\d+" + _ART_SUFFIX + r")"
-    r"\s*(?:del\s+|della\s+)?(codciv|c\.?c\.?|c\.?p\.?c\.?|c\.?p\.?p\.?|c\.?p\.?|cost\.?)",
-    re.IGNORECASE)
-#: The year is kept VERBATIM, two digits included: `d.p.r. 115/02` normalises
-#: to `d.p.r.115/02`, never to `/2002`. Expanding it would silently split the
-#: same act across two keys depending on how the source wrote it.
+    r"artt?\.?\s*(\d{1,4}" + _ART_SUFFIX + r")"
+    r"(?:\s*,?\s*(?:e|ed|,)\s*\d{1,4})*"
+    r"\s*(?:del\s+)?(" + _CODE + r")", re.IGNORECASE)
+#: The year is two to four digits and is kept VERBATIM: `d.p.r. 115/02`
+#: normalises to `d.p.r.115/02`, never to `/2002`. Expanding it would file the
+#: same act under two keys depending on how the source wrote it. `del` is a
+#: separator as well as `/`, because `legge 241 del 1990` is how it is written
+#: in running prose.
 _ACT_RX = re.compile(
-    r"\b(d\.?\s*lgs\.?|d\.?\s*l\.?|d\.?\s*p\.?\s*r\.?|legge|l\.?)\s*"
-    r"(?:n\.?\s*)?(\d+)\s*/\s*(\d{2,4})", re.IGNORECASE)
+    r"(d\.?\s*lgs\.?|d\.?\s*l\.?|d\.?\s*p\.?\s*r\.?|legge|l\.)\s*"
+    r"(?:n\.?\s*)?(\d{1,4})\s*(?:/|\s+del\s+)\s*(\d{2,4})", re.IGNORECASE)
 _CODE_MAP = {"codciv": "c.c.", "cc": "c.c.", "cpc": "c.p.c.", "cpp": "c.p.p.",
              "cp": "c.p.", "cost": "cost."}
 _KIND_MAP = {"dlgs": "d.lgs.", "dl": "d.l.", "dpr": "d.p.r.", "legge": "l.",
@@ -393,9 +450,12 @@ def extract_refs(text: str) -> List[str]:
     """
     seen: Dict[str, None] = {}
     for m in _ART_RX.finditer(text):
-        num = re.sub(r"\s+", "", m.group(1) or "").lower()
+        # Spaces only: `2055-bis` keeps its hyphen, `2055 bis` loses its space.
+        num = re.sub(r"\s", "", m.group(1) or "").lower()
         code_raw = re.sub(r"[.\s]", "", (m.group(2) or "")).lower()
-        code = _CODE_MAP.get(code_raw, "")
+        # An unmapped code is kept as written rather than dropped -- the suffix
+        # was matched, so it IS a code, just not one the table knows.
+        code = _CODE_MAP.get(code_raw, code_raw)
         seen.setdefault(f"art.{num} {code}".strip(), None)
     for m in _ACT_RX.finditer(text):
         kind_raw = re.sub(r"[.\s]", "", (m.group(1) or "")).lower()
