@@ -101,6 +101,18 @@ IT_LEGAL: Dict[str, Any] = {
     "line_prefix": r"[ \t>*_#]*",
     "merge_adjacent": True,
     "keep_header_line": True,
+    # A trailing section shorter than this is folded into the chunk before it.
+    # On by default HERE and not in `it-legal-strict`, because this is the
+    # OCR-aware template: it detects more headings (markdown ones), so it meets
+    # short trailing sections more often, and a 56-character chunk is too small
+    # to carry meaning and long enough to match — the worst combination in a
+    # retrieval index.
+    "min_chunk_chars": 300,
+    # …but NEVER across these pairs, whatever the size. `conclusioni` is what a
+    # party ASKED FOR and `dispositivo` is what the court DECIDED. An index that
+    # merges them can surface a lawyer's demand as a holding, and recording the
+    # absorbed label is a weaker guarantee than refusing the merge.
+    "never_absorb": [["conclusioni", "dispositivo"]],
     "sections": [
         {"label": "premessa",
          "pattern": r"tanto\s+premesso|ci[oò]\s+premesso|^\s*[*#>_ ]*premesso\s+che\b|^" + _LEAD + r"premess[ae]" + _TRAIL + "$"},
@@ -124,6 +136,12 @@ IT_LEGAL: Dict[str, Any] = {
 #: the old. Anyone starting fresh wants `it-legal`.
 IT_LEGAL_STRICT: Dict[str, Any] = dict(
     IT_LEGAL, name="it-legal-strict",
+    # No absorption at all. "Strict" here means THIS TEMPLATE DOES NOT PACK —
+    # every section the splitter finds becomes its own chunk, however short.
+    # It deliberately does NOT claim to be byte-identical to any particular
+    # outside implementation: matching one would mean matching its threshold,
+    # and that is a number only its owner knows.
+    min_chunk_chars=0,
     sections=[
         {"label": "premessa",
          "pattern": r"tanto\s+premesso|ci[oò]\s+premesso|^\s*[*#>_ ]*premesso\s+che\b|"
@@ -467,7 +485,42 @@ def extract_refs(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # The whole operation
 # ---------------------------------------------------------------------------
-def _absorb_runts(chunks, minimum: int, want_refs: bool) -> list:
+def _merge_forbidden(prev: dict, obj: dict, forbidden: set) -> bool:
+    """Is folding ``obj`` into ``prev`` a merge the template forbids?
+
+    Size does not get a vote here. `conclusioni` is what a party ASKED FOR and
+    `dispositivo` is what the court DECIDED; an index that runs them together
+    can surface a demand as a holding, which is the most damaging mistake this
+    whole template exists to prevent. Recording the absorbed label afterwards
+    is a weaker guarantee than never making the merge, so for these pairs the
+    chunk stays short.
+    """
+    if not forbidden:
+        return False
+    here = _labels_of(obj)
+    there = _labels_of(prev)
+    return any(frozenset((a, b)) in forbidden
+               for a in there for b in here if a != b)
+
+
+def _never_absorb_pairs(spec) -> set:
+    """Label pairs that must not be merged, as an unordered set of frozensets."""
+    out = set()
+    for pair in (spec or []):
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            out.add(frozenset(str(x) for x in pair))
+    return out
+
+
+def _labels_of(chunk: dict) -> set:
+    """Every section label a chunk carries, including ones it absorbed."""
+    out = {str(chunk.get("section") or "")}
+    out.update(str(x) for x in (chunk.get("absorbed_sections") or []))
+    return {x for x in out if x}
+
+
+def _absorb_runts(chunks, minimum: int, want_refs: bool,
+                  never_absorb=None) -> list:
     """Fold a chunk shorter than ``minimum`` into the one before it.
 
     A `P.Q.M.` is often two lines. As its own chunk it is a 162-character entry
@@ -495,10 +548,19 @@ def _absorb_runts(chunks, minimum: int, want_refs: bool) -> list:
         minimum = 0
     if minimum <= 0 or len(chunks) < 2:
         return []
+    forbidden = _never_absorb_pairs(never_absorb)
     out = []
     absorbed = []
     for obj in chunks:
-        if out and len(obj["text"]) < minimum:
+        # …and only into a chunk that can CARRY it. Without this, a document
+        # whose sections are all short collapses into one chunk: each runt
+        # folds into the runt before it, and a decree or an order comes out of
+        # the index as a single undifferentiated blob with its section labels
+        # reduced to a list. The case this exists for is a long section
+        # followed by a two-line P.Q.M., not a short document.
+        if out and len(obj["text"]) < minimum \
+                and len(out[-1]["text"]) >= minimum \
+                and not _merge_forbidden(out[-1], obj, forbidden):
             prev = out[-1]
             absorbed.append({"into": prev["ord"],
                              "section": obj.get("section"),
@@ -533,7 +595,7 @@ def chunk_document(text: str, *, chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
                    structural: bool = True, structure: Any = "it-legal",
                    refs: Any = "it-legal", include_offsets: bool = False,
                    require_text: bool = True,
-                   min_chunk_chars: int = 0,
+                   min_chunk_chars: Optional[int] = None,
                    registered: Optional[dict] = None) -> dict:
     """Chunk `text` and return the response document (see docs/chunking.md)."""
     if not isinstance(text, str):
@@ -584,7 +646,12 @@ def chunk_document(text: str, *, chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
                     cursor = at
             chunks.append(obj)
 
-    absorbed = _absorb_runts(chunks, min_chunk_chars, want_refs)
+    # The request wins; otherwise the TEMPLATE decides, because how finely a
+    # document is cut belongs with the rules that cut it.
+    if min_chunk_chars is None:
+        min_chunk_chars = int((tpl or {}).get("min_chunk_chars") or 0)
+    absorbed = _absorb_runts(chunks, min_chunk_chars, want_refs,
+                             (tpl or {}).get("never_absorb"))
 
     return {
         "chunks": chunks,
@@ -704,8 +771,11 @@ def _resolve_params(text: str, body) -> dict:
         include_offsets=bool(body.include_offsets),
         require_text=(body.require_text if body.require_text is not None
                       else _bool_setting("require_text", "CODERAI_CHUNK_REQUIRE_TEXT", True)),
+        # None = "the template decides". An explicit 0 from a request or the
+        # config still means "never absorb".
         min_chunk_chars=(body.min_chunk_chars if body.min_chunk_chars is not None
-                         else g("min_chunk_chars", "CODERAI_CHUNK_MIN_CHARS", 0)),
+                         else _setting("min_chunk_chars", "CODERAI_CHUNK_MIN_CHARS",
+                                       None, int)),
         registered=_registered_templates(),
     )
 

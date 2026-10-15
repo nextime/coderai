@@ -2048,3 +2048,86 @@ def test_a_chunk_request_can_pin_itself_local(gateway_app):
     client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx."},
                 headers={"X-Coderai-Placement": "local"})
     assert _EchoRemote.hits == []
+
+
+def test_chunking_borrows_the_pod_of_a_model_of_its_capability(gateway_app):
+    """A capability-only request names no model, so per-model placement — the
+    thing that moved everything else remote — cannot place it. An install with
+    bge-m3 on a pod was told "nothing configures 'embeddings' to run remotely"
+    while a coderai-embeddings pod, which HAS the chunker in it, sat idle.
+
+    Only on an explicit `remote`: nothing should rent a GPU to run a regex
+    split because nobody said otherwise."""
+    import codai.admin.routes as routes
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {}
+    gw.capability_pods = lambda: {}
+
+    class _CM:
+        models_data = {"embedding_models": [{"id": "bge-m3",
+                                             "path": "BAAI/bge-m3"}]}
+
+    saved_cm = getattr(routes, "config_manager", None)
+    saved_pl = gw.model_placement
+    routes.config_manager = _CM()
+    # The real one answers ('', None) for no model at all; ('local', …) means
+    # PINNED here and short-circuits before the capability path ever runs.
+    gw.model_placement = lambda m: (("url", url) if m in ("bge-m3", "BAAI/bge-m3")
+                                    else ("", None))
+    try:
+        _EchoRemote.hits = []
+        r = client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx."},
+                        headers={"X-Coderai-Placement": "remote"})
+        assert r.status_code == 200 and r.json()["served_by"] == "remote"
+        assert _EchoRemote.hits[-1]["path"] == "/v1/chunk"
+    finally:
+        routes.config_manager = saved_cm
+        gw.model_placement = saved_pl
+
+
+def test_it_does_not_borrow_across_capabilities(gateway_app):
+    """An embeddings pod has no OCR dependencies; borrowing across would be a
+    pod that boots and then cannot do the work."""
+    import codai.admin.routes as routes
+    client, gw, url = gateway_app
+
+    class _CM:
+        models_data = {"embedding_models": [{"id": "bge-m3",
+                                             "path": "BAAI/bge-m3"}]}
+
+    saved_cm = getattr(routes, "config_manager", None)
+    saved_pl = gw.model_placement
+    routes.config_manager = _CM()
+    gw.model_placement = lambda m: (("url", url) if m else ("", None))
+    try:
+        assert gw._capability_sibling_target("ocr") is None
+        assert gw._capability_sibling_target("embeddings") is not None
+    finally:
+        routes.config_manager = saved_cm
+        gw.model_placement = saved_pl
+
+
+def test_without_the_header_a_capability_only_request_stays_here(gateway_app):
+    import codai.admin.routes as routes
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {}
+    gw.capability_pods = lambda: {}
+
+    class _CM:
+        models_data = {"embedding_models": [{"id": "bge-m3",
+                                             "path": "BAAI/bge-m3"}]}
+
+    saved_cm = getattr(routes, "config_manager", None)
+    saved_pl = gw.model_placement
+    routes.config_manager = _CM()
+    # The real one answers ('', None) for no model at all; ('local', …) means
+    # PINNED here and short-circuits before the capability path ever runs.
+    gw.model_placement = lambda m: (("url", url) if m in ("bge-m3", "BAAI/bge-m3")
+                                    else ("", None))
+    try:
+        _EchoRemote.hits = []
+        client.post("/v1/chunk", json={"text": "MOTIVI DELLA DECISIONE\n\nx."})
+        assert _EchoRemote.hits == []
+    finally:
+        routes.config_manager = saved_cm
+        gw.model_placement = saved_pl

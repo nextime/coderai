@@ -191,6 +191,37 @@ def is_bundle(data: bytes) -> bool:
     return len(data) > 262 and data[257:262] == b"ustar"
 
 
+def canonical_id(source: str) -> str:
+    """The id ``source`` SHOULD have, recomputed from the content it names.
+
+    A blob store can hold a directory under a non-canonical name: before
+    v0.3.94 an uploaded bundle was stored under the hash of the tar bytes that
+    arrived, and a tar of one adapter made by GNU tar hashes differently from
+    this bundler's. Every side that later re-bundles the content computes the
+    canonical id, looks for THAT, and finds nothing — so the adapter is
+    silently dropped and the base model answers under its name.
+
+    Fixing the upload path only helps new uploads; a catalogue already holding
+    a stale id stays broken with no symptom. So anything about to SEND or SEED
+    an adapter resolves the id against the content first, and a stale entry
+    repairs itself on the next request.
+
+    Returns ``source`` unchanged when it is not a local content id, or when it
+    cannot be resolved — the caller then reports an id it cannot find, which is
+    the honest outcome.
+    """
+    src = str(source or "").strip()
+    if not src.startswith("sha256:"):
+        return src
+    try:
+        local = local_path(src)
+    except Exception:
+        return src
+    if not local or not os.path.exists(local):
+        return src
+    return blob_id(local) or src
+
+
 def blob_id(path: str) -> str:
     """The ``sha256:<hex>`` id an adapter will have in any blob store.
 

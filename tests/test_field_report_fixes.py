@@ -152,7 +152,10 @@ def test_a_short_trailing_chunk_can_be_folded_in():
     from codai.api import chunking as ch
     body = ("La corte ritiene il ricorso fondato ai sensi dell'art. 360 c.p.c. " * 9)
     text = f"MOTIVI DELLA DECISIONE\n\n{body}\n\nP.Q.M.\n\nRigetta."
-    plain = ch.chunk_document(text, chunk_tokens=800, overlap_tokens=120)
+    # min_chunk_chars=0 is how you ask for every section as its own chunk;
+    # `it-legal` now packs by default (see test_it_legal_absorbs_a_runt).
+    plain = ch.chunk_document(text, chunk_tokens=800, overlap_tokens=120,
+                              min_chunk_chars=0)
     assert [c["section"] for c in plain["chunks"]] == ["motivazione", "dispositivo"]
     merged = ch.chunk_document(text, chunk_tokens=800, overlap_tokens=120,
                                min_chunk_chars=200)
@@ -171,13 +174,20 @@ def test_an_absorbed_section_label_is_reported_never_dropped():
     assert "dispositivo" in merged["chunks"][0]["absorbed_sections"]
 
 
-def test_merging_is_off_unless_asked():
-    """It MOVES a boundary, and a re-chunked corpus whose boundaries moved
-    cannot be compared with the index it replaces."""
+def test_merging_is_the_templates_choice_not_a_global_default():
+    """`it-legal` packs (it is the OCR-aware template and meets more short
+    sections); `it-legal-strict` does not. Either way the number is echoed, so
+    a caller can tell which boundaries it is looking at — moved boundaries make
+    a re-chunked corpus incomparable with the index it replaces."""
     from codai.api import chunking as ch
-    r = ch.chunk_document("MOTIVI DELLA DECISIONE\n\nx.\n\nP.Q.M.\n\ny.")
-    assert r["params"]["min_chunk_chars"] == 0
-    assert "absorbed" not in r
+    doc = "MOTIVI DELLA DECISIONE\n\nx.\n\nP.Q.M.\n\ny."
+    assert ch.chunk_document(doc)["params"]["min_chunk_chars"] == 300
+    strict = ch.chunk_document(doc, structure="it-legal-strict")
+    assert strict["params"]["min_chunk_chars"] == 0
+    assert "absorbed" not in strict
+    # A document of only short sections is NOT collapsed: a runt folds only
+    # into a chunk that can carry it.
+    assert ch.chunk_document(doc)["n_chunks"] == 2
 
 
 def test_a_decorated_heading_sections_under_it_legal_but_not_strict():
@@ -475,3 +485,30 @@ def test_a_plain_file_adapter_still_hashes_as_itself(tmp_path, monkeypatch):
     data = b"not a tar, just safetensors bytes"
     h, existed = loras.save_lora_blob(data)
     assert h == hashlib.sha256(data).hexdigest() and not existed
+
+
+def test_a_stale_id_in_the_catalogue_repairs_itself(tmp_path, monkeypatch):
+    """Fixing the UPLOAD path only helps new uploads. An adapter already
+    registered under a non-canonical id stays broken with no symptom but
+    base-model answers, so anything about to send or seed one resolves the id
+    against the content first."""
+    from codai.models import text_loras
+
+    blob = tmp_path / "deadbeef"          # stored under a hash nobody recomputes
+    blob.mkdir()
+    (blob / "adapter_config.json").write_text('{"r": 8}')
+    monkeypatch.setattr(text_loras, "local_path",
+                        lambda src: str(blob) if src == "sha256:deadbeef" else "")
+    fixed = text_loras.canonical_id("sha256:deadbeef")
+    assert fixed == text_loras.blob_id(str(blob)) != "sha256:deadbeef"
+
+
+def test_an_id_that_cannot_be_resolved_is_left_alone():
+    """Reporting an id we cannot find is the honest outcome."""
+    from codai.models import text_loras
+    assert text_loras.canonical_id("sha256:nothinghere") == "sha256:nothinghere"
+
+
+def test_a_huggingface_source_is_not_touched():
+    from codai.models import text_loras
+    assert text_loras.canonical_id("vendor/adapter") == "vendor/adapter"

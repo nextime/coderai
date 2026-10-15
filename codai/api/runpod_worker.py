@@ -1724,7 +1724,13 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
             for spec in specs:
                 src = str(spec.get("source") or "")
                 if is_portable(src) or src.startswith("sha256:"):
-                    rewritten.append({"path": src, "weight": spec.get("weight", 1.0),
+                    # Resolved against the CONTENT: a catalogue can hold an id
+                    # that nothing else computes (see text_loras.canonical_id),
+                    # and a pod told that id looks it up, misses, and serves
+                    # the base under the adapter's name.
+                    from codai.models.text_loras import canonical_id
+                    rewritten.append({"path": canonical_id(src),
+                                      "weight": spec.get("weight", 1.0),
                                       "name": spec.get("name")})
                     continue
                 local = local_path(src)

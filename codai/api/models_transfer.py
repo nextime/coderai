@@ -228,7 +228,50 @@ def register_model_runtime(entry: dict, section: str) -> str:
     if not already:
         print(f"[register] {key} registered in {section}"
               + (f" (adapter over {path})" if key != path else ""), flush=True)
+    _nudge_engine_for_adapters(entry, section)
     return "known" if already else "added"
+
+
+def _nudge_engine_for_adapters(entry: dict, section: str) -> None:
+    """Hand a just-registered adapter to an engine that is ALREADY running.
+
+    Registering teaches the catalogue. The engine is a separate thing: vLLM
+    takes its adapters when it starts, and the code that adds one to a live
+    engine sits on the model-LOAD path — which does not run again for a model
+    this instance already loaded. So a pod could be sent an adapter, register
+    it, report it in /v1/loras, and go on answering from the base model,
+    because nothing connected the two. Measured: the orchestrator pushed the
+    bytes and taught the entry, and the pod's log did not change.
+
+    Best effort by design. Failing here must not fail the registration: the
+    entry is correct either way, and the next load picks it up.
+    """
+    if section != "text_models" or not (entry or {}).get("loras"):
+        return
+    name = (str(entry.get("alias") or "").strip()
+            or str(entry.get("id") or "").strip())
+    if not name:
+        return
+    try:
+        from codai.api import vllm_worker as vw
+        from codai.models.manager import get_active_vllm_config
+        cfg = get_active_vllm_config()
+        if cfg is None:
+            return
+        _resolved, key = vw.resolve_service_key(cfg, str(entry.get("path") or ""))
+        svc = (vw._services or {}).get(key)
+        url = (svc or {}).get("url")
+        if not url:
+            return                      # no engine up: the next load will do it
+        if vw._serves_name(url, name) is True \
+                and not vw._adapter_is_stale(url, entry, name):
+            return                      # already serving this very adapter
+        if vw._adapter_is_stale(url, entry, name):
+            vw._unload_lora_runtime(url, name)
+        vw._load_lora_runtime(url, entry, name)
+    except Exception as exc:
+        print(f"[register] {name}: could not hand it to the running engine "
+              f"({exc}) — it will be picked up on the next load", flush=True)
 
 
 def _register_entry(entry: dict, section: str) -> str:

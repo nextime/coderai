@@ -1702,6 +1702,40 @@ class ApexBig50Parser(BaseParser):
 
 
 # Model Parser Dispatcher
+#: Family detection reads the model NAME, which is wrong for an adapter: a
+#: LoRA is named by what it was trained to do, not by what it is. `qwen38-awq`
+#: matched QwenParser and `diogene-alpha` — the same weights with an adapter —
+#: matched nothing, so its `<think>…</think>` block was never separated and
+#: came back inside `content`. With a modest max_tokens the whole budget went
+#: into reasoning that never closed, and the caller saw an EMPTY reply from a
+#: 200. Reported from a chat client against a shared pool.
+#:
+#: An adapter is the same family as the weights it adapts, so a name that
+#: matches nothing is resolved to the base's instead.
+_FAMILY_HINTS = ("qwen", "deepseek", "glm", "colibri", "llama", "mistral",
+                 "gemma", "phi", "kimi", "granite", "command", "yi", "hermes")
+
+
+def _family_name(model_name: str) -> str:
+    """``model_name``, or the base it adapts when the name says nothing."""
+    name = str(model_name or "")
+    low = name.lower()
+    if any(h in low for h in _FAMILY_HINTS):
+        return name
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(name) or {}
+        if not entry.get("loras"):
+            return name
+        block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+        base = (str(entry.get("path") or "").strip()
+                or str(block.get("hf_repo") or "").strip()
+                or str(block.get("served_model") or "").strip())
+        return base or name
+    except Exception:
+        return name
+
+
 class ModelParserDispatcher:
     """Dispatcher to select the appropriate parser based on model name."""
     
@@ -1722,7 +1756,7 @@ class ModelParserDispatcher:
             # (self._log_selection is False during __init__ when model_name=None)
             return parser
         
-        model_lower = self.model_name.lower()
+        model_lower = _family_name(self.model_name).lower()
         
         # Qwen models
         if 'qwen' in model_lower:

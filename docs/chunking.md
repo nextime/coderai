@@ -200,6 +200,18 @@ lawyer's demand surface as if it were a holding — the most damaging mistake th
 index can make. A template that wants them merged must say so explicitly by
 giving both patterns the same label.
 
+**And packing may not merge them either.** A size threshold is not allowed to
+override that rule, so a template declares the pairs it refuses to combine:
+
+```json
+"never_absorb": [["conclusioni", "dispositivo"]]
+```
+
+`it-legal` ships with that one. For these pairs the chunk stays short however
+small it is — recording the absorbed label afterwards is a weaker guarantee
+than never making the merge. The guard applies to what a chunk CONTAINS, so one
+that has already absorbed `conclusioni` will not then take a `dispositivo`.
+
 ## Where it runs
 
 `/v1/chunk` rides the **embeddings** capability rather than having one of its
@@ -315,13 +327,23 @@ extracts article and act citations, normalises them, and de-duplicates while
 
 ### Built-in `it-legal-strict`
 
-`it-legal` widens the line-anchored headers to tolerate markdown emphasis, so
-`**FATTO**` opens a section. The implementation this ports does not: its
-`^\s*fatto\s*$` cannot match once the `**` is consumed, and such a document is
-not sectioned at all. That is the **only** deliberate behavioural difference
-between the two, and it is purely additive — no line that matched before stops
-matching, and on an undecorated document the two templates agree byte for byte,
-including sections, parents and refs.
+The two templates differ in exactly two ways, both deliberate.
+
+**Headings.** `it-legal` widens the line-anchored headers to tolerate markdown
+emphasis, so `**FATTO**` opens a section; the stricter anchors cannot match
+once the `**` is consumed, and such a document is not sectioned at all. This is
+purely additive — no line that matched before stops matching.
+
+**Packing.** `it-legal` sets `min_chunk_chars: 300`; `it-legal-strict` sets 0.
+Detecting more headings means meeting more short trailing sections, and a
+56-character chunk is too small to carry meaning and long enough to match,
+which is the worst combination in a retrieval index.
+
+`it-legal-strict` therefore means **this template does not pack** — every
+section becomes its own chunk, however short. It does NOT claim byte-identity
+with any particular outside implementation: matching one means matching its
+packing threshold too, and that is a number only its owner knows. Compare
+against yours and set `min_chunk_chars` to whatever agrees with it.
 
 `it-legal-strict` keeps the original anchors. Use it to re-chunk a corpus that
 was indexed with the original, where a boundary that moves makes the new index

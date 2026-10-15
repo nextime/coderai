@@ -621,6 +621,64 @@ class Target:
 PLACEMENT_HEADER = "x-coderai-placement"
 
 
+def _capability_sibling_target(cap: str) -> Optional["Target"]:
+    """A remote already configured for SOME model of ``cap``, or None.
+
+    Capability-only requests (`/v1/chunk`) name no model, so the per-model
+    placement that moved everything else cannot place them. Rather than make an
+    operator configure the same destination twice — once for bge-m3, once for
+    the embeddings capability — this finds a model of the capability that is
+    already remote and borrows its destination.
+
+    Safe because the sibling is of the SAME capability: whatever image serves
+    that model has this capability's dependencies in it. It would not be safe
+    to borrow across capabilities, and this never does.
+    """
+    if not cap:
+        return None
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+    except Exception:
+        return None
+    from codai.api.runpod_worker import model_capability
+    for section, lst in md.items():
+        if not isinstance(lst, list):
+            continue
+        for entry in lst:
+            if not isinstance(entry, dict) or entry.get("enabled") is False:
+                continue
+            name = (str(entry.get("id") or "").strip()
+                    or str(entry.get("path") or "").strip())
+            # The SECTION is the kind — a bare entry does not carry it, which is
+            # the same trap that filed every seeded model under text_models.
+            if not name or model_capability(dict(entry, model_type=section),
+                                            include_text=True) != cap:
+                continue
+            try:
+                where, detail = model_placement(name)
+            except Exception:
+                continue
+            if where == "pod":
+                _entry, block = detail
+                from codai.api.runpod_worker import get_model_pod_pool
+                t = Target(pool=get_model_pod_pool(name, _entry, block),
+                           reason=f"capability {cap!r} on {name}'s pod")
+            elif where == "url":
+                t = Target(url=detail, reason=f"capability {cap!r} on {name}'s host")
+            elif where == "host":
+                _entry, hblock = detail
+                from codai.api.host_worker import get_host_pool
+                t = Target(pool=get_host_pool(name, hblock),
+                           reason=f"capability {cap!r} on {name}'s host")
+            else:
+                continue
+            print(f"[remote-gateway] {cap!r} has no remote of its own — using "
+                  f"{name}'s, which already serves this capability", flush=True)
+            return t
+    return None
+
+
 def resolve_target(path: str, method: str, query: str, body: bytes,
                    content_type: str, force: str = "") -> Optional["Target"]:
     """Decide where this request should go, or None to serve it locally.
@@ -719,7 +777,19 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         from codai.api.runpod_worker import get_capability_pool
         return Target(pool=get_capability_pool(cap, pods.get(cap) or {}),
                       reason=f"capability {cap!r} on a RunPod pod")
+    # Nothing binds the CAPABILITY — but a model of it may already be running
+    # remotely, and its pod can serve this. /v1/chunk is the case: it carries no
+    # model, so only the capability map places it, and an install with bge-m3 on
+    # a pod was told "nothing configures 'embeddings' to run remotely" while a
+    # coderai-embeddings pod — which has the chunker in it — sat there idle.
+    #
+    # Only on an explicit `remote`: a capability-only request has no model to
+    # pay for a cold start, and renting a GPU to run a regex split is not
+    # something to do because nobody said otherwise.
     if force == "remote":
+        sibling = _capability_sibling_target(cap)
+        if sibling is not None:
+            return sibling
         raise RuntimeError(
             f"nothing configures {model or cap!r} to run remotely — set a "
             "service_url or a RunPod pod on the model, or a remote for its "
@@ -1160,6 +1230,8 @@ def ensure_text_loras(base: str, api_key: str, entry: dict) -> dict:
         if is_portable(source):
             rewritten.append({**spec, "source": source})
             continue
+        from codai.models.text_loras import canonical_id
+        source = canonical_id(source)
         path = local_path(source)
         if not path:
             dropped.append(source)

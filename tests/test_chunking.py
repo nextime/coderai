@@ -528,8 +528,10 @@ def test_the_endpoint_needs_no_model_or_tokenizer():
 def test_the_params_are_echoed_so_a_caller_can_tell_what_applied():
     r = ch.chunk_document(RULING, chunk_tokens=100, overlap_tokens=10,
                           chars_per_token=5)
+    # 300 is `it-legal`'s own default: how finely a document is cut belongs
+    # with the rules that cut it.
     assert r["params"] == {"chunk_tokens": 100, "overlap_tokens": 10,
-                           "chars_per_token": 5, "min_chunk_chars": 0}
+                           "chars_per_token": 5, "min_chunk_chars": 300}
 
 
 # ------------------------------------------- forwarding it to a remote #
@@ -622,3 +624,75 @@ def test_inlining_never_raises_and_leaves_what_it_cannot_handle(path, ctype, bod
     request, not just a chunk one."""
     from codai.api import remote_gateway as rg
     assert rg._inline_chunk_template(path, {"content-type": ctype}, body) == body
+
+
+# --------------------------------------------------------------------------- #
+# Packing defaults belong to the TEMPLATE
+#
+# `it-legal` is the OCR-aware one: it detects markdown headings, so it meets
+# short trailing sections more often, and a 56-character chunk is too small to
+# carry meaning and long enough to match — the worst combination in an index.
+# `it-legal-strict` does not pack at all.
+#
+# Note what strict does NOT claim: byte-identity with any particular outside
+# implementation. Matching one means matching its threshold, and that is a
+# number only its owner knows.
+# --------------------------------------------------------------------------- #
+LONG = ("La corte ritiene il ricorso fondato ai sensi dell'art. 360 c.p.c. " * 55).strip()
+MARKDOWN_RULING = f"## FATTO\n\n{LONG}\n\n**DISPOSITIVO**\n\nRigetta il ricorso e compensa le spese."
+
+
+def test_it_legal_absorbs_a_runt_by_default():
+    r = ch.chunk_document(MARKDOWN_RULING, chunk_tokens=800, overlap_tokens=120,
+                          structure="it-legal")
+    assert r["params"]["min_chunk_chars"] == 300
+    assert [c["n_chars"] for c in r["chunks"]] == [3177, 1001]
+    assert r["absorbed"][0]["section"] == "dispositivo"
+    assert r["chunks"][-1]["absorbed_sections"] == ["dispositivo"]
+
+
+def test_strict_does_not_pack():
+    r = ch.chunk_document(MARKDOWN_RULING, chunk_tokens=800, overlap_tokens=120,
+                          structure="it-legal-strict")
+    assert r["params"]["min_chunk_chars"] == 0
+    assert "absorbed" not in r
+
+
+def test_a_request_overrides_the_template_default():
+    r = ch.chunk_document(MARKDOWN_RULING, chunk_tokens=800, overlap_tokens=120,
+                          structure="it-legal", min_chunk_chars=0)
+    assert r["params"]["min_chunk_chars"] == 0
+    assert [c["section"] for c in r["chunks"]][-1] == "dispositivo"
+
+
+def test_conclusioni_is_never_absorbed_into_dispositivo():
+    """The one merge the whole template exists to prevent. `conclusioni` is
+    what a party ASKED FOR, `dispositivo` is what the court DECIDED, and an
+    index that runs them together can surface a demand as a holding.
+
+    Size gets no vote: both chunks here are far below the threshold and the
+    split still stands. A recorded label is a weaker guarantee than never
+    making the merge."""
+    text = "CONCLUSIONI\n\nVoglia il Tribunale accogliere.\n\nP.Q.M.\n\nRigetta."
+    r = ch.chunk_document(text, chunk_tokens=800, overlap_tokens=120,
+                          structure="it-legal", min_chunk_chars=5000)
+    assert [c["section"] for c in r["chunks"]] == ["conclusioni", "dispositivo"]
+    assert all(len(c["text"]) < 5000 for c in r["chunks"])
+
+
+def test_the_guard_survives_an_earlier_absorption():
+    """A chunk that has already absorbed `conclusioni` must not then absorb a
+    `dispositivo` — the forbidden pair is about what a chunk CONTAINS."""
+    prev = {"section": "motivazione", "absorbed_sections": ["conclusioni"]}
+    obj = {"section": "dispositivo"}
+    assert ch._merge_forbidden(prev, obj,
+                               ch._never_absorb_pairs([["conclusioni",
+                                                        "dispositivo"]]))
+
+
+def test_an_ordinary_short_section_is_still_absorbed():
+    prev = {"section": "motivazione"}
+    obj = {"section": "dispositivo"}
+    assert not ch._merge_forbidden(prev, obj,
+                                   ch._never_absorb_pairs([["conclusioni",
+                                                            "dispositivo"]]))

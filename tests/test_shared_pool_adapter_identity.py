@@ -548,3 +548,69 @@ def test_new_bytes_under_an_old_name_are_still_sent_to_the_pod(monkeypatch):
     version["src"] = "/local/v2"
     b._ensure_adapters("https://pod")           # retrained: sent again
     assert sent == ["/local/v1", "/local/v2"]
+
+
+# --------------------------------------------------------------------------- #
+# registering is not serving
+# --------------------------------------------------------------------------- #
+REGISTERED = {"path": BASE_REPO, "alias": "tuned-alpha",
+              "loras": [{"path": "sha256:v1", "name": "tuned-alpha", "weight": 1.0}]}
+
+
+def _vllm_up(monkeypatch, url="http://engine", serves=False, stale=False):
+    import codai.models.manager as mgr
+    from codai.api import vllm_worker as vw
+    calls = []
+    monkeypatch.setattr(mgr, "get_active_vllm_config",
+                        lambda: type("C", (), {"model_path": BASE_REPO})(),
+                        raising=False)
+    monkeypatch.setattr(vw, "_services", {BASE_REPO: {"url": url}}, raising=False)
+    monkeypatch.setattr(vw, "_serves_name", lambda u, n: serves)
+    monkeypatch.setattr(vw, "_adapter_is_stale", lambda u, c, n: stale)
+    monkeypatch.setattr(vw, "_unload_lora_runtime",
+                        lambda u, n: calls.append(("unload", n)) or True)
+    monkeypatch.setattr(vw, "_load_lora_runtime",
+                        lambda u, c, n: calls.append(("load", n)) or True)
+    return calls
+
+
+def test_registering_hands_the_adapter_to_a_running_engine(monkeypatch):
+    """The pod registered it, reported it in /v1/loras, and went on answering
+    from the base model — nothing connected the catalogue to the engine."""
+    from codai.api.models_transfer import _nudge_engine_for_adapters
+    calls = _vllm_up(monkeypatch, serves=False)
+    _nudge_engine_for_adapters(REGISTERED, "text_models")
+    assert calls == [("load", "tuned-alpha")]
+
+
+def test_a_retrain_is_swapped_on_registration(monkeypatch):
+    from codai.api.models_transfer import _nudge_engine_for_adapters
+    calls = _vllm_up(monkeypatch, serves=True, stale=True)
+    _nudge_engine_for_adapters(REGISTERED, "text_models")
+    assert calls == [("unload", "tuned-alpha"), ("load", "tuned-alpha")]
+
+
+def test_the_same_adapter_already_live_is_left_alone(monkeypatch):
+    calls = _vllm_up(monkeypatch, serves=True, stale=False)
+    from codai.api.models_transfer import _nudge_engine_for_adapters
+    _nudge_engine_for_adapters(REGISTERED, "text_models")
+    assert calls == []
+
+
+def test_no_engine_running_is_not_an_error(monkeypatch):
+    import codai.models.manager as mgr
+    from codai.api import vllm_worker as vw
+    from codai.api.models_transfer import _nudge_engine_for_adapters
+    monkeypatch.setattr(mgr, "get_active_vllm_config",
+                        lambda: type("C", (), {"model_path": BASE_REPO})(),
+                        raising=False)
+    monkeypatch.setattr(vw, "_services", {}, raising=False)
+    _nudge_engine_for_adapters(REGISTERED, "text_models")   # must not raise
+
+
+def test_a_model_without_adapters_is_not_nudged(monkeypatch):
+    from codai.api import vllm_worker as vw
+    from codai.api.models_transfer import _nudge_engine_for_adapters
+    monkeypatch.setattr(vw, "_load_lora_runtime",
+                        lambda *a: pytest.fail("nothing to load"))
+    _nudge_engine_for_adapters({"path": BASE_REPO, "alias": "base"}, "text_models")
