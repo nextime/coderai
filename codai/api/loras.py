@@ -41,7 +41,7 @@ import time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from codai.platform_paths import default_loras_dir
 from codai.queue.manager import queue_manager
@@ -2912,6 +2912,127 @@ async def lora_blob_info(hash: str, _auth=Depends(_require_api_auth)):
                 "exists": True, "unpacked": True}
     return {"id": f"sha256:{os.path.basename(p)[:-len('.safetensors')]}",
             "bytes": os.path.getsize(p), "exists": True}
+
+
+class LoraRegisterRequest(BaseModel):
+    name: str = Field(..., description="The name requests will ask for.")
+    base: str = Field(..., description="An existing model this adapter is trained on.")
+    adapter: str = Field(..., description="A 'sha256:…' id from /v1/loras/upload, a "
+                                          "HuggingFace repo id, or a path on the server.")
+    weight: float = Field(1.0, gt=0, description="Scaling applied to the adapter.")
+    pool: Optional[str] = Field(None, description="Pod pool to join. Defaults to the "
+                                                  "base's, which is what puts the "
+                                                  "adapter on the card already holding "
+                                                  "the base weights.")
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
+@router.post("/v1/loras/register", summary="Serve an uploaded adapter under its own name")
+async def register_lora(body: LoraRegisterRequest, _auth=Depends(_require_api_auth)):
+    """Turn an uploaded adapter into a model name this install will serve.
+
+    `/v1/loras/upload` puts the bytes somewhere; this is what makes them
+    answerable. Without it the last step was editing models.json by hand, which
+    is not a step a team retraining adapters can automate.
+
+    The adapter JOINS THE BASE'S POOL by default, which is the whole economy of
+    it: the base weights are already loaded on a rented card, an adapter is tens
+    of megabytes of deltas, and vLLM applies them per request. One GPU serves the
+    base and every adapter of it, each under its own name, with no reload —
+    see docs/runpod.md.
+
+    Identity is (weights, name). An adapter and its base share a `path` by
+    definition, so nothing here may key on the path alone; that mistake is why a
+    pod once answered under an adapter's name with base weights.
+    """
+    name = (body.name or "").strip()
+    base = (body.base or "").strip()
+    adapter = (body.adapter or "").strip()
+    if not name or not base or not adapter:
+        raise HTTPException(status_code=400,
+                            detail="name, base and adapter are all required")
+
+    from codai.admin.routes import config_manager
+    md = getattr(config_manager, "models_data", None)
+    if not isinstance(md, dict):
+        raise HTTPException(status_code=503, detail="no model catalogue is loaded")
+
+    # The base, by any name it answers to.
+    base_entry, section = None, "text_models"
+    for sec, lst in md.items():
+        if not isinstance(lst, list):
+            continue
+        for m in lst:
+            if not isinstance(m, dict):
+                continue
+            if base in (str(m.get("id") or ""), str(m.get("alias") or ""),
+                        str(m.get("path") or "")):
+                base_entry, section = m, sec
+                break
+        if base_entry is not None:
+            break
+    if base_entry is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no model named {base!r} — register the base first")
+
+    # The bytes have to be HERE before a pod can be told the id: the id is all
+    # that travels, and a pod sent an id nobody holds serves the base instead.
+    if adapter.startswith("sha256:") and not lora_blob_exists(adapter):
+        raise HTTPException(
+            status_code=404,
+            detail=f"{adapter} is not in the blob store — POST it to "
+                   f"/v1/loras/upload first (a PEFT adapter directory travels "
+                   f"as a tar; it is unpacked here)")
+
+    block = base_entry.get("runpod")
+    pool = (body.pool or "").strip()
+    if not pool and isinstance(block, dict):
+        pool = str(block.get("pool") or "").strip()
+
+    entry = {"id": name, "enabled": True,
+             "loras": [{"name": name, "path": adapter, "weight": float(body.weight)}]}
+    if isinstance(block, dict):
+        # The base's own placement, budgets and card choice: an adapter is
+        # served by the same engine on the same pod, so inheriting is the only
+        # answer that does not quietly rent a second card.
+        rp = {k: v for k, v in block.items()
+              if k not in ("served_model", "pool", "min_pods", "keep_warm")}
+        rp["served_model"] = name
+        if pool:
+            rp["pool"] = pool
+        entry["runpod"] = rp
+        if str(base_entry.get("backend") or "").strip():
+            entry["backend"] = base_entry["backend"]
+
+    lst = md.setdefault(section, [])
+    existing = next((m for m in lst if isinstance(m, dict)
+                     and name in (str(m.get("id") or ""), str(m.get("alias") or ""))),
+                    None)
+    if existing is not None:
+        if not existing.get("loras"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{name!r} is already a model here and is not an adapter — "
+                       f"pick another name rather than replace it")
+        existing.clear()
+        existing.update(entry)
+        state = "updated"
+    else:
+        lst.append(entry)
+        state = "registered"
+    config_manager.save_models()
+
+    # Usable now, not after a restart. A pod already holding the base is handed
+    # the adapter by the engine that serves it (vllm_worker), so this does not
+    # rent anything and does not reload the base model.
+    try:
+        from codai.api.models_transfer import register_model_runtime
+        register_model_runtime(entry, section)
+    except Exception as exc:
+        print(f"[lora] {name} saved but not live until restart: {exc}", flush=True)
+
+    return {"ok": True, "state": state, "name": name, "base": base,
+            "adapter": adapter, "pool": pool or None, "section": section}
 
 
 @router.get("/v1/loras", summary="List registered LoRAs")

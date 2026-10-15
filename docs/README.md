@@ -26,6 +26,7 @@ reference; these are the deep dives.
 |---|---|
 | [video-compose.md](video-compose.md) | `POST /v1/video/compose`: scenes → a finished, uploadable reel (narration timing, Ken Burns, ducked music, burned captions, thumbnail) and `/v1/files/upload` |
 | [ocr.md](ocr.md) | The `/v1/ocr` document-transcription subsystem |
+| [chunking.md](chunking.md) | `POST /v1/chunk`: splitting a document for a retrieval index, with the structure decided per request by a template |
 | [expressive-tts.md](expressive-tts.md) | Expressive text-to-speech |
 | [zimage-lora-training.md](zimage-lora-training.md) | LoRA training for image models |
 | [dtype-auto-selection.md](dtype-auto-selection.md) | How model dtype is chosen automatically |
@@ -37,3 +38,9 @@ reference; these are the deep dives.
 | [orchestrator-runpod-guide.md](orchestrator-runpod-guide.md) | Install CoderAI as a **GPU-less RunPod orchestrator**: register models, scale pods, watch the cost. The operator's path for a host with no GPU |
 | [install-from-packages.md](install-from-packages.md) | `docker pull ghcr.io/nextime/coderai` — the full image and the nineteen capability images, Linux, Windows, offline |
 | [reverse-proxy-nginx.md](reverse-proxy-nginx.md) | nginx at root, on a subdomain, or under a sub-path |
+
+## Field reports
+
+| Doc | Subject |
+|---|---|
+| [digesta-field-report-2026-10-15.md](digesta-field-report-2026-10-15.md) | What Digesta hit in production on 15 Oct 2026: a surya lease returning empty pages as `200`, `scale` 404ing for every model, a duplicated `bge-m3`, chunk divergence; plus a measured three-engine comparison |

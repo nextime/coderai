@@ -8,6 +8,7 @@ import pathlib
 import sys
 
 import pytest
+from fastapi import HTTPException
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -237,3 +238,127 @@ def test_an_abbreviated_heading_sections_under_both_templates():
     for tpl in ("it-legal", "it-legal-strict"):
         r = ch.chunk_document(text, structure=tpl)
         assert [c["section"] for c in r["chunks"]] == ["motivazione", "dispositivo"], tpl
+
+
+# ===================================================================== store
+# Getting an adapter from a client into a served name had no API: the last step
+# was editing models.json by hand.
+def _catalogue(monkeypatch, models=None, saved=None):
+    import codai.admin.routes as routes
+
+    class _CM:
+        def __init__(self):
+            self.models_data = {"text_models": list(models or [])}
+
+        def save_models(self):
+            (saved if saved is not None else []).append(True)
+
+    cm = _CM()
+    monkeypatch.setattr(routes, "config_manager", cm, raising=False)
+    return cm
+
+
+BASE_MODEL = {"id": "base-awq", "alias": "base", "path": "vendor/Some-27B",
+              "backend": "runpod",
+              "runpod": {"pool": "shared", "served_model": "base-awq",
+                         "hf_repo": "vendor/Some-27B", "engine": "coderai-vllm",
+                         "max_hourly_usd": 1.2, "min_pods": 1, "keep_warm": True}}
+
+
+@pytest.mark.anyio
+async def test_an_uploaded_adapter_becomes_a_servable_name(monkeypatch):
+    from codai.api import loras
+    saved = []
+    cm = _catalogue(monkeypatch, [dict(BASE_MODEL)], saved)
+    monkeypatch.setattr(loras, "lora_blob_exists", lambda h: True)
+    monkeypatch.setattr("codai.api.models_transfer.register_model_runtime",
+                        lambda e, s: "added")
+
+    out = await loras.register_lora(loras.LoraRegisterRequest(
+        name="tuned-alpha", base="base-awq", adapter="sha256:abc"))
+    assert out["state"] == "registered" and saved
+    entry = cm.models_data["text_models"][-1]
+    assert entry["id"] == "tuned-alpha"
+    assert entry["loras"] == [{"name": "tuned-alpha", "path": "sha256:abc",
+                               "weight": 1.0}]
+
+
+@pytest.mark.anyio
+async def test_it_joins_the_base_pool_so_no_second_card_is_rented(monkeypatch):
+    """The whole economy: the base weights are already on a card."""
+    from codai.api import loras
+    cm = _catalogue(monkeypatch, [dict(BASE_MODEL)])
+    monkeypatch.setattr(loras, "lora_blob_exists", lambda h: True)
+    monkeypatch.setattr("codai.api.models_transfer.register_model_runtime",
+                        lambda e, s: "added")
+    out = await loras.register_lora(loras.LoraRegisterRequest(
+        name="tuned-alpha", base="base", adapter="sha256:abc"))
+    rp = cm.models_data["text_models"][-1]["runpod"]
+    assert out["pool"] == "shared" and rp["pool"] == "shared"
+    assert rp["served_model"] == "tuned-alpha"
+    assert rp["max_hourly_usd"] == 1.2          # the base's budget, inherited
+    # NOT the base's warm floor: an adapter rides the base's pod, it does not
+    # ask for one of its own.
+    assert "min_pods" not in rp and "keep_warm" not in rp
+
+
+@pytest.mark.anyio
+async def test_bytes_we_do_not_hold_are_refused_before_anything_is_saved(monkeypatch):
+    """A pod sent an id nobody holds serves the BASE instead, silently."""
+    from codai.api import loras
+    saved = []
+    _catalogue(monkeypatch, [dict(BASE_MODEL)], saved)
+    monkeypatch.setattr(loras, "lora_blob_exists", lambda h: False)
+    with pytest.raises(HTTPException) as err:
+        await loras.register_lora(loras.LoraRegisterRequest(
+            name="tuned-alpha", base="base-awq", adapter="sha256:missing"))
+    assert err.value.status_code == 404
+    assert "/v1/loras/upload" in str(err.value.detail)
+    assert not saved
+
+
+@pytest.mark.anyio
+async def test_an_unknown_base_is_refused(monkeypatch):
+    from codai.api import loras
+    _catalogue(monkeypatch, [dict(BASE_MODEL)])
+    monkeypatch.setattr(loras, "lora_blob_exists", lambda h: True)
+    with pytest.raises(HTTPException) as err:
+        await loras.register_lora(loras.LoraRegisterRequest(
+            name="x", base="nope", adapter="sha256:abc"))
+    assert err.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_retraining_replaces_the_adapter_rather_than_duplicating_it(monkeypatch):
+    from codai.api import loras
+    cm = _catalogue(monkeypatch, [dict(BASE_MODEL)])
+    monkeypatch.setattr(loras, "lora_blob_exists", lambda h: True)
+    monkeypatch.setattr("codai.api.models_transfer.register_model_runtime",
+                        lambda e, s: "added")
+    for blob in ("sha256:v1", "sha256:v2"):
+        out = await loras.register_lora(loras.LoraRegisterRequest(
+            name="tuned-alpha", base="base-awq", adapter=blob))
+    assert out["state"] == "updated"
+    assert len(cm.models_data["text_models"]) == 2
+    assert cm.models_data["text_models"][-1]["loras"][0]["path"] == "sha256:v2"
+
+
+@pytest.mark.anyio
+async def test_a_real_model_is_never_overwritten_by_an_adapter(monkeypatch):
+    from codai.api import loras
+    _catalogue(monkeypatch, [dict(BASE_MODEL)])
+    monkeypatch.setattr(loras, "lora_blob_exists", lambda h: True)
+    with pytest.raises(HTTPException) as err:
+        await loras.register_lora(loras.LoraRegisterRequest(
+            name="base-awq", base="base-awq", adapter="sha256:abc"))
+    assert err.value.status_code == 409
+
+
+def test_the_adapter_store_is_never_forwarded():
+    """An upload must land in THIS blob store: it is where a pod is sent its
+    adapters from, and the id we hand out has to resolve here."""
+    from codai.api.remote_gateway import resolve_target
+    for path in ("/v1/loras/upload", "/v1/loras/register",
+                 "/v1/loras/blob/abc", "/v1/loras"):
+        assert resolve_target(path, "POST", "", b'{"name":"x","base":"y"}',
+                              "application/json") is None, path

@@ -311,6 +311,80 @@ the RAM they need, not just the VRAM — `min_vram_gb` says nothing about RAM.
 
 ---
 
+## 2b. Several LoRAs on one rented card
+
+A LoRA is tens of megabytes of low-rank deltas over a base that may be tens of
+gigabytes. Renting a card per adapter pays for the base weights again every
+time; the point of a **pool** is that you do not.
+
+Give the base and each adapter the same `runpod.pool`. One pod loads the base
+once, vLLM registers every adapter at launch, and a request picks one by name:
+
+```json
+{"id": "my-base",    "runpod": {"pool": "team-a", "served_model": "my-base",
+                                "hf_repo": "vendor/Some-27B"}}
+{"id": "tuned-alpha", "loras": [{"name": "tuned-alpha", "path": "sha256:…"}],
+                      "runpod": {"pool": "team-a", "served_model": "tuned-alpha",
+                                 "hf_repo": "vendor/Some-27B"}}
+```
+
+```
+POST /v1/chat/completions {"model": "tuned-alpha", …}
+POST /v1/chat/completions {"model": "my-base",     …}
+```
+
+Both land on the same pod and the same loaded base. Requests naming *different*
+adapters batch together in one forward pass — that is `--max-loras`, which the
+launch sets explicitly because its default of 1 makes them serialise instead,
+costing latency rather than raising an error.
+
+### Sending an adapter from a client
+
+An adapter trained elsewhere gets in with two calls. A PEFT adapter is a
+DIRECTORY (`adapter_config.json` plus weights), so it travels as a tar — the
+tar magic is detected, no flag to pass:
+
+```bash
+tar -cf adapter.tar -C /path/to/tuned-alpha .
+curl -X POST $BASE/v1/loras/upload -H "Authorization: Bearer $TOKEN" \
+     -F file=@adapter.tar
+# -> {"id": "sha256:2e820c…", "bytes": 166821376, "existed": false}
+
+curl -X POST $BASE/v1/loras/register -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' -d '{
+       "name": "tuned-alpha", "base": "my-base", "adapter": "sha256:2e820c…"}'
+# -> {"ok": true, "state": "registered", "pool": "team-a"}
+```
+
+The store is content-addressed, so re-uploading an unchanged adapter costs one
+existence check (`GET /v1/loras/blob/<hex>`, 200 or 404) instead of the bytes.
+Registering inherits the base's pool, placement and budgets, and sets
+`served_model` to the new name; it deliberately does NOT inherit `min_pods` or
+`keep_warm`, because an adapter rides the base's pod rather than asking for one
+of its own. Re-registering the same name with a new blob is how a retrain ships.
+
+An adapter that lives in a HuggingFace repo needs no upload at all — give
+`adapter` the repo id and the pod fetches it itself, at datacenter speed.
+
+### Adding one to a pod that is already running
+
+`--enable-lora` cannot be switched on after vLLM has started, so an engine that
+launched without it must RELOAD the base model to accept its first adapter —
+minutes, on a card billed by the hour. A pod told it serves a pool therefore
+launches with LoRA enabled **even when no adapter is known yet**
+(`CODERAI_VLLM_ENABLE_LORA`): the capacity flags are what must be decided at
+launch, not the list of adapters.
+
+With the door open, a new adapter is handed to the running engine
+(`/v1/load_lora_adapter`) and is servable immediately, with no reload. Where
+that is not possible — an engine started without `--enable-lora`, an older
+vLLM, an adapter whose rank exceeds `--max-lora-rank` — coderai falls back to
+restarting the engine with the adapter included, and says so in the log.
+
+> A pod rented an hour ago may be running an older image than the one this
+> install would launch today, so the runtime path is always tried and never
+> assumed.
+
 ## 3. Request flow
 
 ```

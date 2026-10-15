@@ -148,7 +148,15 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
 #: Teardown was the worst case: asking to give six pods back rented a seventh to
 #: ask it on, blocked for minutes hunting capacity, and then reported that the
 #: model does not exist. An operator could not turn off $3.54/hr from the API.
-_LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob", "/v1/runpod")
+#: ``/v1/loras`` is this install's adapter store and registry. An upload must
+#: land in THIS blob store — it is where a pod is sent its adapters from, and
+#: the content id this install hands out has to resolve here. Forwarded to a
+#: pod, the bytes would go to a machine that is gone an hour later and the id
+#: would resolve nowhere. It carries no `model` field today, so it happens to
+#: stay local by accident; that is luck, not design, and the same shape of
+#: accident as /v1/runpod, which did not stay local.
+_LOCAL_PREFIXES = ("/v1/files/upload", "/v1/files/blob", "/v1/runpod",
+                   "/v1/loras")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes
