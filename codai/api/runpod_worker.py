@@ -3372,17 +3372,26 @@ class RunpodPodPool:
                   f"while it was still booting ({why}) — terminating it now "
                   f"rather than paying out the boot for a pod nobody wants",
                   flush=True)
+            gone = True
             try:
                 client.terminate_pod(pod_id)
             except Exception as exc:
-                print(f"[runpod] could not terminate {pod_id}: {exc}", flush=True)
+                gone = False
+                print(f"[runpod] !! could not terminate {pod_id}: {exc} — it is "
+                      f"STILL BILLING; the reaper will take it, or stop it now "
+                      f"with POST /v1/runpod/release", flush=True)
             with _pools_lock:
                 _provisioning_ids.discard(pod_id)
                 _provisioning_info.pop(pod_id, None)
-            try:
-                unregister_pod(pod_id)
-            except Exception:
-                pass
+            # Only forget a pod that is actually gone. Dropping the entry after
+            # a FAILED terminate throws away the registry's record of a pod
+            # that is still running, leaving the name prefix as the only thing
+            # that can still identify it as ours.
+            if gone:
+                try:
+                    unregister_pod(pod_id)
+                except Exception:
+                    pass
 
         # The caller's narrowing, if a lease is in force. Read per provision so
         # a lapsed lease stops constraining the very next pod.
@@ -3481,8 +3490,31 @@ class RunpodPodPool:
                 self._dump_pod_logs(client, pod_id, "boot failed", url)
                 try:
                     client.terminate_pod(pod_id)
-                except Exception:
-                    pass
+                except Exception as term_exc:
+                    # NOT `pass`. This is the moment a pod becomes a leak: the
+                    # teardown runs through the same API that just failed, so
+                    # the attempt most likely to fail is the one that matters,
+                    # and a silent drop left a GPU billing with nothing in any
+                    # log naming it. Say it in the words of the thing that went
+                    # wrong, and leave the registry entry alone — the reaper
+                    # owns a pod it can still see, and that entry is now the
+                    # only record that this pod exists.
+                    print(f"[runpod] !! pod {pod_id} COULD NOT BE TERMINATED "
+                          f"after its boot failed: {term_exc}", flush=True)
+                    print(f"[runpod] !! it is still billing at "
+                          f"${sel['price']:.2f}/hr. The stale-pod reaper will "
+                          f"take it once it is past the grace period; to stop "
+                          f"it now: POST /v1/runpod/release {{\"pod_id\": "
+                          f"\"{pod_id}\"}} or {console}", flush=True)
+                else:
+                    # A boot that failed still ran a GPU for the minutes it
+                    # took to fail, and no pool ever held this pod, so nothing
+                    # else would ever ledger those minutes.
+                    try:
+                        close_bill_from_registry(pod_id, "boot failed")
+                    except Exception:
+                        pass
+                    unregister_pod(pod_id)
                 with _pools_lock:
                     _provisioning_ids.discard(pod_id)
                     _provisioning_info.pop(pod_id, None)
@@ -5527,23 +5559,68 @@ _POD_LOG_MAX_BYTES = int(os.environ.get("CODERAI_POD_LOG_MAX_BYTES", 8 * 1024 * 
 _POD_LOG_KEEP_LINES = int(os.environ.get("CODERAI_POD_LOG_KEEP_LINES", 20000))
 
 
-def _pod_age_seconds(pod: dict):
-    """Seconds since the pod was created, or None when RunPod does not say."""
-    for key in ("uptime_s", "uptimeSeconds", "runtimeSeconds"):
-        val = pod.get(key)
-        if isinstance(val, (int, float)) and val >= 0:
-            return float(val)
+def _rental_age_seconds(pod: dict):
+    """Seconds since the pod was RENTED, from RunPod's own timestamps, or None.
+
+    ``lastStatusChange`` is a sentence, not a field: "Rented by User: Thu Oct 15
+    2026 19:36:58 GMT+0000 (Coordinated Universal Time)". The date after the
+    colon is what we want, and only when the sentence is about the rental —
+    a later status change would date the change, not the pod.
+    """
+    from datetime import datetime, timezone
     for key in ("createdAt", "created_at"):
         val = pod.get(key)
         if not val:
             continue
         try:
-            from datetime import datetime, timezone
             return (datetime.now(timezone.utc) - datetime.fromisoformat(
                 str(val).replace("Z", "+00:00"))).total_seconds()
         except Exception:
             continue
+    text = str(pod.get("last_change") or pod.get("lastStatusChange") or "")
+    if "rented" not in text.lower() or ":" not in text:
+        return None
+    stamp = text.split(":", 1)[1].split("(")[0].strip()
+    for fmt in ("%a %b %d %Y %H:%M:%S GMT%z", "%a %b %d %Y %H:%M:%S %Z",
+                "%a %b %d %Y %H:%M:%S"):
+        try:
+            when = datetime.strptime(stamp, fmt)
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - when).total_seconds()
+        # A clock that disagrees would otherwise reap on arrival.
+        return age if age >= 0 else None
     return None
+
+
+def _pod_age_seconds(pod: dict):
+    """Seconds since the pod was created, or None when RunPod does not say.
+
+    The RENTAL time first, uptime only as a floor. uptime is how long the
+    CURRENT run has lasted, and it resets whenever the container restarts: a
+    pod that fails and restarts every few minutes reported 234s while it was 11
+    minutes old, so it could never reach REAP_GRACE_SECONDS and the reaper
+    skipped it on every sweep, forever. Observed live — a pod abandoned
+    mid-boot billed at $1.09/hr with nothing tracking it and no sweep that
+    would ever have caught it.
+
+    They are combined rather than swapped: uptime cannot exceed the age, so the
+    larger of the two is still a true lower bound on how long this pod has
+    existed, and keeping it means a pod whose rental stamp is unparsable is no
+    worse off than before.
+    """
+    ages = []
+    rental = _rental_age_seconds(pod)
+    if rental is not None:
+        ages.append(rental)
+    for key in ("uptime_s", "uptimeSeconds", "runtimeSeconds"):
+        val = pod.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            ages.append(float(val))
+            break
+    return max(ages) if ages else None
 
 
 def reap_orphans() -> int:

@@ -38,6 +38,23 @@ class RunpodError(RuntimeError):
     """A RunPod API call failed (network, auth, or GraphQL error)."""
 
 
+class RunpodTransient(RunpodError):
+    """The API could not be ASKED — it says nothing about the pod.
+
+    A 503 from RunPod's control plane, a timeout, a dropped connection: the
+    question never got an answer. That is a different fact from "the pod is
+    bad", and conflating the two cost a live pod once already. A boot wait got
+    HTTP 503 while a 9.6 GB image was still being pulled, read it as a boot
+    failure, tore the pod down through the SAME unavailable API — which also
+    failed — and left an untracked GPU billing until someone looked at the
+    account. The request that started it answered 502 while the machine it had
+    paid for was still coming up.
+
+    A subclass, so every existing ``except RunpodError`` keeps working; callers
+    that can afford to wait catch this one first and retry.
+    """
+
+
 #: Said once per process, not once per pod: the scaler would otherwise repeat it
 #: every boot.
 _GLOBAL_VOLUME_WARNED = False
@@ -137,11 +154,19 @@ class RunpodClient:
                               timeout=timeout,
                               headers={"Content-Type": "application/json"})
         except requests.RequestException as exc:
-            raise RunpodError(f"RunPod API unreachable ({_mask(self._api_key)}): {exc}")
+            # No answer at all — transient by definition.
+            raise RunpodTransient(f"RunPod API unreachable ({_mask(self._api_key)}): {exc}")
         if r.status_code == 401:
             raise RunpodError(f"RunPod rejected the API key ({_mask(self._api_key)}) — 401.")
         if r.status_code >= 400:
-            raise RunpodError(f"RunPod API HTTP {r.status_code}: {r.text[:300]}")
+            # 5xx is RunPod's own trouble and 408/429 is "ask again"; neither is
+            # a statement about what we asked for. A 4xx otherwise IS: a bad id,
+            # a malformed query, a refused request — retrying that only wastes
+            # the deadline.
+            cls = (RunpodTransient
+                   if r.status_code >= 500 or r.status_code in (408, 425, 429)
+                   else RunpodError)
+            raise cls(f"RunPod API HTTP {r.status_code}: {r.text[:300]}")
         try:
             body = r.json()
         except ValueError:
@@ -463,19 +488,49 @@ class RunpodClient:
         except RunpodError:
             raise
 
-    def terminate_pod(self, pod_id: str) -> None:
+    def terminate_pod(self, pod_id: str, attempts: int = 4) -> None:
+        """Stop a pod, retrying while the API is merely unreachable.
+
+        The one call that must not give up quietly. Every other failed call
+        costs a retry; this one costs a GPU that bills until a human notices.
+        The case that matters is precisely the one where a single try fails:
+        the control plane is having trouble, which is also what made the caller
+        decide to tear the pod down in the first place — so the teardown meets
+        the same 503 that caused it.
+
+        Raises after the last attempt. A caller that swallows that exception is
+        choosing to leak a pod, and should say so in the log instead.
+        """
         q = "mutation($input: PodTerminateInput!) { podTerminate(input: $input) }"
-        self._gql(q, {"input": {"podId": pod_id}}, timeout=30.0)
+        delay = 2.0
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                self._gql(q, {"input": {"podId": pod_id}}, timeout=30.0)
+                return
+            except RunpodTransient as exc:
+                if attempt >= attempts:
+                    raise
+                print(f"[runpod] terminate {pod_id}: {exc} — retrying in "
+                      f"{delay:.0f}s ({attempt}/{attempts})", flush=True)
+                time.sleep(delay)
+                delay = min(delay * 2, 15.0)
 
     def list_pods(self) -> list:
         """List the account's pods: [{id, name, status, cost_per_hr, image}]."""
         # runtime.uptimeInSeconds is what makes the reaper's grace period real:
         # without an age every pod looked undatable, and the "never reap a pod
         # younger than GRACE" backstop abstained on all of them.
+        # lastStatusChange carries the RENTAL time ("Rented by User: Thu Oct 15
+        # 2026 19:36:58 GMT+0000"), which is the pod's real age. uptime alone is
+        # the current RUN's age and resets on every container restart, so a pod
+        # stuck in a restart loop reported 234s when it was 11 minutes old and
+        # could never cross the reaper's 20-minute grace. The one pod that most
+        # needs reaping — one nothing is tracking, failing over and over — was
+        # the one pod the reaper could never see.
         q = """
         query Pods {
           myself {
-            pods { id name desiredStatus costPerHr imageName
+            pods { id name desiredStatus costPerHr imageName lastStatusChange
                    runtime { uptimeInSeconds } }
           }
         }"""
@@ -487,6 +542,7 @@ class RunpodClient:
                 "id": p.get("id"), "name": p.get("name"),
                 "status": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
                 "image": p.get("imageName"),
+                "last_change": p.get("lastStatusChange") or "",
             }
             # Absent while a pod is still being scheduled, which is exactly when
             # it must not be mistaken for a leftover — the reaper now treats a
@@ -558,8 +614,29 @@ class RunpodClient:
         started = time.time()
         next_report = started + 60.0
         last = {}
+        # A boot wait is MINUTES long — a cold machine pulling a 10 GB image is
+        # the normal case after every image release — so it is the call most
+        # likely to be in flight when the control plane hiccups. Asking and not
+        # being answered is not the pod failing; keep asking until the deadline
+        # the caller set, and only then say the API was the thing that broke.
+        api_down_since = 0.0
+        last_transient = None
         while time.time() < deadline:
-            info = self.get_pod(pod_id)
+            try:
+                info = self.get_pod(pod_id)
+            except RunpodTransient as exc:
+                last_transient = exc
+                if not api_down_since:
+                    api_down_since = time.time()
+                    print(f"[runpod] pod {pod_id}: RunPod API not answering "
+                          f"({exc}) — still waiting; this says nothing about "
+                          f"the pod", flush=True)
+                time.sleep(poll_every)
+                continue
+            if api_down_since:
+                print(f"[runpod] pod {pod_id}: RunPod API answering again after "
+                      f"{time.time() - api_down_since:.0f}s", flush=True)
+                api_down_since = 0.0
             last = info
             if info.get("status") in ("TERMINATED", "FAILED"):
                 raise RunpodError(f"Pod {pod_id} entered status {info.get('status')} before ready.")
@@ -593,6 +670,13 @@ class RunpodClient:
                       f"(status={info.get('status')} uptime={info.get('uptime_s')}s) "
                       f"— {why}", flush=True)
             time.sleep(poll_every)
+        if api_down_since and not last:
+            # The whole wait went by without one answer. Blaming the pod here
+            # would be a guess, and the caller tears down on a boot failure.
+            raise RunpodTransient(
+                f"Pod {pod_id}: RunPod's API did not answer once in "
+                f"{ready_timeout:.0f}s ({last_transient}) — the pod's state is "
+                f"unknown, not known-bad.")
         raise RunpodError(
             f"Pod {pod_id} did not expose port {port} within {ready_timeout}s "
             f"(last status={last.get('status')} uptime={last.get('uptime_s')}s). "
