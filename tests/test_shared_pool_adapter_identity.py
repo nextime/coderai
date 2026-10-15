@@ -373,3 +373,98 @@ def test_a_model_with_no_local_adapters_sends_nothing(monkeypatch):
     b._pool = type("P", (), {"api_key": "k"})()
     rb.RunpodBackend._ADAPTERS_SENT.clear()
     b._ensure_adapters("https://pod")
+
+
+# --------------------------------------------------------------------------- #
+# a pool keeps the LoRA door open, and an adapter walks through it
+# --------------------------------------------------------------------------- #
+def test_a_pool_engine_enables_lora_before_it_has_any_adapter(monkeypatch):
+    """--enable-lora cannot be turned on later, so an engine without it has to
+    RELOAD the base model the first time an adapter arrives."""
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager", _CM({"text_models": [SEEDED_BASE]}),
+                        raising=False)
+    monkeypatch.setenv("CODERAI_VLLM_ENABLE_LORA", "1")
+    args = vw._lora_args(SEEDED_BASE)
+    assert "--enable-lora" in args
+    assert "--lora-modules" not in args
+    assert "--max-lora-rank" in args and "--max-loras" in args
+
+
+def test_a_model_that_serves_no_pool_pays_nothing(monkeypatch):
+    import codai.admin.routes as routes
+    monkeypatch.delenv("CODERAI_VLLM_ENABLE_LORA", raising=False)
+    monkeypatch.setattr(routes, "config_manager", _CM({"text_models": [SEEDED_BASE]}),
+                        raising=False)
+    assert vw._lora_args(SEEDED_BASE) == []
+
+
+def test_the_models_own_pool_also_opens_the_door(monkeypatch):
+    """An install driving vLLM directly has no pod env to read."""
+    import codai.admin.routes as routes
+    monkeypatch.delenv("CODERAI_VLLM_ENABLE_LORA", raising=False)
+    entry = dict(BASE)
+    monkeypatch.setattr(routes, "config_manager", _CM({"text_models": [entry]}),
+                        raising=False)
+    assert "--enable-lora" in vw._lora_args(entry)
+
+
+def test_the_pod_is_told_it_serves_a_pool():
+    import json
+    mcfg = rw.parse_model_runpod({"pool": "shared", "engine": "coderai-vllm",
+                                  "hf_repo": BASE_REPO})
+    plan = rw._plan("coderai", "img", "", mcfg, "key", dict(BASE), "base-awq")
+    assert plan["env"]["CODERAI_VLLM_ENABLE_LORA"] == "1"
+
+
+def test_a_model_with_no_pool_is_not():
+    mcfg = rw.parse_model_runpod({"engine": "coderai-vllm", "hf_repo": BASE_REPO})
+    plan = rw._plan("coderai", "img", "", mcfg, "key", dict(BASE), "base-awq")
+    assert "CODERAI_VLLM_ENABLE_LORA" not in plan["env"]
+
+
+def test_a_new_adapter_is_handed_to_the_running_engine_not_a_restart(monkeypatch):
+    """The whole point: one A40, the base loaded once, adapters added live."""
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, SEEDED_ADAPTER]}),
+                        raising=False)
+    monkeypatch.setattr("codai.models.text_loras.local_path",
+                        lambda src: "/blobs/tuned-alpha")
+    posted = {}
+
+    def _urlopen(req, timeout=0):
+        posted["url"] = req.full_url
+        posted["body"] = req.data
+        return type("R", (), {"read": lambda self: b"{}"})()
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    assert vw._load_lora_runtime("http://e", SEEDED_BASE, "tuned-alpha") is True
+    assert posted["url"].endswith("/v1/load_lora_adapter")
+    assert b'"lora_name": "tuned-alpha"' in posted["body"]
+
+
+def test_an_engine_that_refuses_at_runtime_still_gets_restarted(monkeypatch):
+    """A pod rented an hour ago may run an older image than we would launch."""
+    import urllib.error
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, SEEDED_ADAPTER]}),
+                        raising=False)
+    monkeypatch.setattr("codai.models.text_loras.local_path", lambda src: "/blobs/a")
+
+    def _boom(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    assert vw._load_lora_runtime("http://e", SEEDED_BASE, "tuned-alpha") is False
+
+
+def test_an_unknown_name_is_not_sent_anywhere(monkeypatch):
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, SEEDED_ADAPTER]}),
+                        raising=False)
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda *a, **k: pytest.fail("nothing to register"))
+    assert vw._load_lora_runtime("http://e", SEEDED_BASE, "not-an-adapter") is False

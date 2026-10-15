@@ -1255,6 +1255,14 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     # look like they fell over at 32 concurrent pages when they were simply out
     # of window. Admission here is the pod's parallel-request and queue limits.
     env["CODERAI_SERVER_RATE_LIMIT_ENABLED"] = "0"
+    # This pod serves a shared POOL: several names over one copy of the weights,
+    # which for text models means a base and its adapters. vLLM cannot turn
+    # `--enable-lora` on after it has started, so an engine launched without it
+    # has to RELOAD the base model the first time an adapter arrives — minutes,
+    # on a card billed by the hour. Telling the pod now costs a buffer
+    # allocation and lets an adapter be added to the running engine instead.
+    if str(getattr(mcfg, "pool", "") or "").strip():
+        env["CODERAI_VLLM_ENABLE_LORA"] = "1"
     seeds = []
     if entry:
         kind, value = resolve_model_source(entry, mcfg)

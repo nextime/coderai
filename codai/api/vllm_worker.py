@@ -316,15 +316,50 @@ def _served_names(model_config: dict, served_name: str, fallback: str) -> list:
     return out or [fallback]
 
 
+#: This engine serves a shared POOL — several names over one copy of the
+#: weights — so the LoRA machinery is allocated whether or not an adapter is
+#: known yet. Set by the orchestrator when the model's runpod block names a
+#: pool (see runpod_worker._plan); a model entry's own `runpod.pool` works too,
+#: for an install driving vLLM directly.
+_ENABLE_LORA_ENV = "CODERAI_VLLM_ENABLE_LORA"
+
+
+def _serves_a_pool(model_config: dict) -> bool:
+    raw = (os.environ.get(_ENABLE_LORA_ENV) or "").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    block = (model_config or {}).get("runpod")
+    return bool(isinstance(block, dict) and str(block.get("pool") or "").strip())
+
+
+def _lora_capacity_args(n_mods: int) -> list:
+    """The flags that must be decided at LAUNCH, separate from the adapter list.
+
+    vLLM takes `--lora-modules` as a convenience; what it cannot change later is
+    the CAPACITY. `--enable-lora` allocates the machinery, `--max-lora-rank`
+    sizes the slots, `--max-loras` decides how many distinct adapters may be
+    live in one batch. Get those right and the list itself can grow at runtime.
+    """
+    # vLLM rejects an adapter whose rank exceeds --max-lora-rank (default 16),
+    # and the message points at the flag rather than the adapter, so raise the
+    # ceiling to what vLLM supports rather than have a trained LoRA refused.
+    #
+    # --max-loras default is 1, so with several registered, requests naming
+    # different ones cannot batch together and serialise instead — the cost
+    # lands on latency, not on an error, which is why it goes unnoticed. The
+    # floor of 4 is for a pool that has no adapters YET: the engine must be able
+    # to batch across the ones it is about to be given.
+    return ["--max-lora-rank", "64",
+            "--max-loras", str(max(4, min(n_mods, 8)) if n_mods else 4)]
+
+
 def _lora_args(model_config: dict) -> list:
     """`--enable-lora --lora-modules …` for the adapters this engine must serve."""
     try:
         from codai.models.text_loras import describe, is_portable, local_path
         specs = _sibling_lora_specs(model_config or {})
     except Exception:
-        return []
-    if not specs:
-        return []
+        specs = []
     mods, usable = [], []
     for spec in specs:
         src = str(spec.get("source") or "")
@@ -346,17 +381,19 @@ def _lora_args(model_config: dict) -> list:
         mods.append(f"{spec['name']}={resolved}")
         usable.append(spec)
     if not mods:
-        return []
+        if not _serves_a_pool(model_config):
+            return []
+        # A pool pod with no adapter yet. `--enable-lora` cannot be turned on
+        # afterwards, so an engine launched without it has to RELOAD the base
+        # model — minutes, on a card being paid for by the hour — the first
+        # time an adapter arrives. Opening the door costs a buffer allocation
+        # and nothing else, and only a model that declares a pool pays it.
+        print("[lora] no adapters yet, but this engine serves a pool — "
+              "starting with LoRA enabled so one can be added without a "
+              "reload", flush=True)
+        return ["--enable-lora"] + _lora_capacity_args(0)
     args = ["--enable-lora", "--lora-modules"] + mods
-    # vLLM rejects an adapter whose rank exceeds --max-lora-rank (default 16),
-    # and the message points at the flag rather than the adapter, so raise the
-    # ceiling to what vLLM supports rather than have a trained LoRA refused.
-    args += ["--max-lora-rank", "64"]
-    # How many DISTINCT adapters may be active in one batch. The default is 1,
-    # so with several registered, requests naming different ones cannot batch
-    # together and serialise instead — the cost lands on latency, not on an
-    # error, which is why it goes unnoticed.
-    args += ["--max-loras", str(max(1, min(len(mods), 8)))]
+    args += _lora_capacity_args(len(mods))
     print(f"[lora] vLLM will serve adapters: {describe(usable)}", flush=True)
     return args
 
@@ -369,6 +406,64 @@ def _model_config_for(model_name: str) -> dict:
         return _model_entry_for(model_name) or {}
     except Exception:
         return {}
+
+
+def _load_lora_runtime(url: str, model_config: dict, served_name: str) -> bool:
+    """Register an adapter into a RUNNING engine. True when it will now serve.
+
+    vLLM takes `--lora-modules` at launch, so for a long time the only way to
+    add one was to restart — a full reload of the base model, minutes, on a card
+    billed by the hour, and every request in flight lost. `/v1/load_lora_adapter`
+    does it in place (vLLM >= 0.9, behind VLLM_ALLOW_RUNTIME_LORA_UPDATING,
+    which the launch sets whenever it enabled LoRA).
+
+    Returns False for every reason it might not work — an engine started without
+    `--enable-lora`, an older vLLM, the flag unset, an adapter whose rank exceeds
+    the slot size — and the caller falls back to the restart. A pod rented an
+    hour ago may be running an older image than the one we would launch today,
+    so "it should be supported" is not something this can assume.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    want = (served_name or "").strip()
+    if not want:
+        return False
+    spec = next((s for s in _sibling_lora_specs(model_config or {})
+                 if str(s.get("name") or "") == want), None)
+    if spec is None:
+        return False
+    try:
+        from codai.models.text_loras import local_path
+        src = str(spec.get("source") or "")
+        path = local_path(src) if src.startswith(("sha256:", "name:")) else src
+    except Exception:
+        path = ""
+    if not path:
+        return False
+    body = _json.dumps({"lora_name": want, "lora_path": path}).encode()
+    req = urllib.request.Request(url.rstrip("/") + "/v1/load_lora_adapter",
+                                 data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        print(f"[lora] {url} refused {want!r} at runtime ({exc.code} {detail}) "
+              f"— falling back to a restart", flush=True)
+        return False
+    except Exception as exc:
+        print(f"[lora] could not reach {url} to add {want!r} ({exc}) — falling "
+              f"back to a restart", flush=True)
+        return False
+    print(f"[lora] added {want!r} to the running engine on {url} — no reload",
+          flush=True)
+    return True
 
 
 def _serves_name(url: str, name: str):
@@ -498,6 +593,12 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
             # timeout would be far worse than the doubt.
             if not served_name or _serves_name(svc["url"], served_name) is not False:
                 return svc["url"]
+            # An ADAPTER can usually just be handed to the running engine. Try
+            # that before throwing away a loaded base model.
+            if _load_lora_runtime(svc["url"],
+                                  _model_config_for(resolved or model_path or ""),
+                                  served_name):
+                return svc["url"]
             print(f"[vllm] the engine on {svc['url']} does not serve "
                   f"{served_name!r} — it started before this model was known "
                   f"here; restarting it so one engine serves the base and every "
@@ -536,6 +637,13 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
         # via extra_env. (Set before extra_env so an explicit override wins.)
         env.setdefault("VLLM_USE_FLASHINFER", "0")
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+        # An adapter can then be registered into the RUNNING engine
+        # (/v1/load_lora_adapter) instead of costing a reload of the base
+        # model. Only where the launch actually enabled LoRA: the flag is
+        # meaningless otherwise, and setting it everywhere would be a claim we
+        # cannot honour.
+        if "--enable-lora" in cmd:
+            env.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
         # Pin this vLLM instance to specific NVIDIA GPU(s) if configured (CUDA-only).
         gpu = (getattr(cfg, "gpu", "") or "").strip()
         if gpu:
