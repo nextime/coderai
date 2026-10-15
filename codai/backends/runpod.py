@@ -206,7 +206,49 @@ class RunpodBackend(ModelBackend):
         # The pod runs a vLLM OpenAI server at /v1; its proxy URL has no path, so
         # add /v1 to match the serverless base (which already ends in /openai/v1).
         self._last_pod = pod
+        self._ensure_adapters(url.rstrip("/"))
         return url.rstrip("/") + "/v1", (lambda: self._pool.release(pod))
+
+    #: Pods already sent this model's adapters, by (pod url, model). A pod keeps
+    #: what it is given and a new pod has a new URL, so this never goes stale.
+    _ADAPTERS_SENT: set = set()
+
+    def _ensure_adapters(self, root: str) -> None:
+        """Put this model's LOCAL adapters on the pod before anything loads.
+
+        A pod is seeded with the adapter's CONTENT ID, not its bytes — the id is
+        computed here so that the pod can be told about it before it exists. It
+        still has to receive the bytes, and until it does, the engine launches
+        without the adapter and answers under its name with BASE weights.
+
+        Before the first request, not after a failure: vLLM registers adapters
+        when it STARTS, so bytes that arrive late cost a full reload of the base
+        model to take effect. This is the difference between a pod that is right
+        on boot and one that reloads a 27B to become right.
+        """
+        # getattr: sending adapters must never be the thing that breaks a
+        # request. Anything missing here means there is nothing to send.
+        name = getattr(self, "_model_id", "") or getattr(self, "_served_name", "")
+        key = (root, name)
+        if not name or key in self._ADAPTERS_SENT:
+            return
+        self._ADAPTERS_SENT.add(key)            # once, even if it fails
+        try:
+            from codai.models.manager import _model_entry_for
+            from codai.models.text_loras import configured_specs, portable_specs
+            entry = _model_entry_for(name) or {}
+            if not entry:
+                return
+            _, needs_sending = portable_specs(configured_specs(entry))
+            if not needs_sending:
+                return
+            from codai.api.remote_gateway import ensure_text_loras
+            pool = getattr(self, "_pool", None)
+            ensure_text_loras(root, getattr(pool, "api_key", "") if pool else "",
+                              entry)
+        except Exception as exc:
+            print(f"[runpod] could not send {name!r}'s adapters to {root}: {exc}",
+                  flush=True)
 
     def _auth(self) -> dict:
         """The bearer header for THIS send, read from the pool now.

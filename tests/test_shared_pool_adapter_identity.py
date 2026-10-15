@@ -289,3 +289,87 @@ def test_the_engine_answers_the_same_set_whichever_name_started_it(catalogue):
     by_adapter = vw._served_names(dict(BASE), "tuned-alpha", BASE_REPO)
     assert set(by_base) == set(by_adapter)
     assert BASE_REPO in by_base
+
+
+# --------------------------------------------------------------------------- #
+# the adapter has to be FOUND, and then it has to be THERE
+# --------------------------------------------------------------------------- #
+SEEDED_BASE = {"path": BASE_REPO, "alias": "base-awq"}
+SEEDED_ADAPTER = {"path": BASE_REPO, "alias": "tuned-alpha",
+                  "loras": [{"path": "sha256:abc", "name": "tuned-alpha",
+                             "weight": 1.0}]}
+
+
+def test_a_seeded_sibling_is_not_mistaken_for_the_model_itself(monkeypatch):
+    """A seeded entry has `alias` and no `id`. Comparing ids compared "" with
+    "", matched every sibling, and excluded all of them — so the pod launched
+    with no --enable-lora and answered under the adapter's name with BASE
+    weights. Measured on a live pod: `--served-model-name <base>` and nothing
+    else on the command line."""
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, SEEDED_ADAPTER]}),
+                        raising=False)
+    specs = vw._sibling_lora_specs(SEEDED_BASE)
+    assert [s["name"] for s in specs] == ["tuned-alpha"]
+
+
+def test_a_model_does_not_collect_its_own_adapter_twice(monkeypatch):
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, SEEDED_ADAPTER]}),
+                        raising=False)
+    specs = vw._sibling_lora_specs(SEEDED_ADAPTER)
+    assert [s["name"] for s in specs] == ["tuned-alpha"]
+
+
+def test_an_adapter_that_cannot_be_resolved_is_not_served_under_its_name(monkeypatch):
+    """Refusing the NAME is the point. Serving the base under an adapter's name
+    is a fluent, confident, wrong answer that nothing downstream can detect."""
+    import codai.admin.routes as routes
+    monkeypatch.setattr(routes, "config_manager",
+                        _CM({"text_models": [SEEDED_BASE, SEEDED_ADAPTER]}),
+                        raising=False)
+    monkeypatch.setattr("codai.models.text_loras.local_path", lambda src: None)
+    assert vw._lora_args(SEEDED_BASE) == []
+    assert "tuned-alpha" not in vw._served_names(SEEDED_BASE, "base-awq", BASE_REPO)
+
+
+def test_the_adapter_bytes_go_to_the_pod_before_anything_loads(monkeypatch):
+    """vLLM registers adapters when it STARTS; bytes that arrive later cost a
+    full reload of the base model to take effect."""
+    from codai.backends import runpod as rb
+    import codai.models.manager as mgr
+    import codai.api.remote_gateway as gw
+
+    sent = []
+    monkeypatch.setattr(mgr, "_model_entry_for",
+                        lambda n: {"id": n, "loras": [{"path": "/local/a", "name": n}]},
+                        raising=False)
+    monkeypatch.setattr(gw, "ensure_text_loras",
+                        lambda base, key, entry: sent.append(base))
+
+    b = rb.RunpodBackend.__new__(rb.RunpodBackend)
+    b._model_id = "tuned-alpha"
+    b._served_name = "tuned-alpha"
+    b._pool = type("P", (), {"api_key": "k"})()
+    rb.RunpodBackend._ADAPTERS_SENT.clear()
+    b._ensure_adapters("https://pod")
+    b._ensure_adapters("https://pod")           # once per pod, not per request
+    assert sent == ["https://pod"]
+
+
+def test_a_model_with_no_local_adapters_sends_nothing(monkeypatch):
+    from codai.backends import runpod as rb
+    import codai.models.manager as mgr
+    import codai.api.remote_gateway as gw
+
+    monkeypatch.setattr(mgr, "_model_entry_for", lambda n: {"id": n}, raising=False)
+    monkeypatch.setattr(gw, "ensure_text_loras",
+                        lambda *a, **k: pytest.fail("nothing to send"))
+    b = rb.RunpodBackend.__new__(rb.RunpodBackend)
+    b._model_id = "plain"
+    b._served_name = "plain"
+    b._pool = type("P", (), {"api_key": "k"})()
+    rb.RunpodBackend._ADAPTERS_SENT.clear()
+    b._ensure_adapters("https://pod")

@@ -212,6 +212,18 @@ def _base_of(entry: dict) -> str:
     return str(entry.get("path") or block.get("hf_repo") or entry.get("id") or "").strip().lower()
 
 
+def _entry_name(entry: dict) -> str:
+    """What a model entry is ASKED FOR by.
+
+    `alias` first: a seeded entry (the only kind a pod has) carries one and no
+    `id`, while a models.json entry carries both.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    return (str(entry.get("alias") or "").strip()
+            or str(entry.get("id") or "").strip())
+
+
 def _sibling_lora_specs(model_config: dict) -> list:
     """Adapters of this model AND of every other model loading the same base.
 
@@ -236,9 +248,17 @@ def _sibling_lora_specs(model_config: dict) -> list:
         md = getattr(config_manager, "models_data", None) or {}
     except Exception:
         return specs
-    mine = str((model_config or {}).get("id") or "")
+    # Not `id`: a SEEDED entry has none. The kind of entry a pod holds is the
+    # kind that arrives in CODERAI_SEED_MODELS, and that carries `alias`, not
+    # `id` — so "is this me?" compared "" with "" and matched every sibling,
+    # excluding all of them. The pod then launched vLLM with no --enable-lora
+    # and answered under the adapter's name with BASE weights. Nothing failed.
+    mine = _entry_name(model_config)
     for entry in (md.get("text_models") or []):
-        if not isinstance(entry, dict) or str(entry.get("id") or "") == mine:
+        if not isinstance(entry, dict) or entry is model_config:
+            continue
+        name = _entry_name(entry)
+        if name and mine and name == mine:
             continue
         if _base_of(entry) != base:
             continue
@@ -246,7 +266,7 @@ def _sibling_lora_specs(model_config: dict) -> list:
             # A sibling's adapter is served under the sibling's OWN name: that is
             # the name the request will ask for.
             spec = dict(spec)
-            spec["name"] = str(entry.get("id") or spec.get("name"))
+            spec["name"] = name or str(spec.get("name") or "")
             specs.append(spec)
     seen, unique = set(), []
     for spec in specs:
