@@ -352,6 +352,55 @@ def _resolve_repo_file(model_name: str, filename: str):
 _BGE_M3_TYPES = ('dense', 'sparse', 'colbert')
 
 
+#: `(model_name, filename) -> bool`, so the Hub is asked once per process.
+#: A repo's file list does not change under a running server.
+_REPO_FILE_CACHE: dict = {}
+
+
+def _repo_has_file(model_name: str, filename: str) -> bool:
+    """Does this repo contain ``filename``? Cache first, then the Hub's INDEX.
+
+    `_resolve_repo_file` answers from the local disk only, which is right for
+    "give me the path" and wrong for "does this exist" -- and the difference is
+    invisible until the model has never been downloaded.
+
+    On a RENTED POD it is never downloaded. The pod is disposable and its cache
+    starts empty, so a feature detected by the presence of a file was
+    permanently undetectable there: bge-m3 loaded through the DENSE
+    sentence-transformers path on every pod, every time, and the request for
+    sparse vectors was then refused with a message telling the caller to use
+    the image they were already using.
+
+    So when the file is not on disk, ask the Hub for the repo's file LIST --
+    metadata, no download, one call per process. Offline installs are
+    unaffected: HF_HUB_OFFLINE short-circuits it, and any failure answers False
+    exactly as before.
+    """
+    if _resolve_repo_file(model_name, filename) is not None:
+        return True
+    import os
+    if os.path.isdir(model_name):
+        return False                 # a local dir IS the whole answer
+    if str(os.environ.get("HF_HUB_OFFLINE") or "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return False
+    key = (str(model_name), str(filename))
+    hit = _REPO_FILE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    found = False
+    try:
+        from huggingface_hub import list_repo_files
+        found = filename in set(list_repo_files(model_name))
+    except Exception as exc:
+        # Not reachable, gated, or not a Hub repo. Answer the way the local-only
+        # check always did rather than failing a load over a metadata lookup.
+        print(f"[embeddings] could not list files for {model_name!r} "
+              f"({type(exc).__name__}) — assuming no {filename}", flush=True)
+    _REPO_FILE_CACHE[key] = found
+    return found
+
+
 def _is_bge_m3(model_name: str, trust: bool) -> bool:
     """True if the repo is a bge-m3-style multi-vector embedder.
 
@@ -360,7 +409,10 @@ def _is_bge_m3(model_name: str, trust: bool) -> bool:
     (AutoConfig can fail to resolve in an offline/engine context, which would wrongly
     demote bge-m3 to the dense path); we only exclude vision/dual encoders, which never
     carry this head anyway."""
-    if _resolve_repo_file(model_name, 'sparse_linear.pt') is None:
+    # `_repo_has_file`, NOT `_resolve_repo_file`: on a rented pod nothing is
+    # cached when this runs, and a local-only check made multi-vector bge-m3
+    # undetectable on exactly the machines built to serve it.
+    if not _repo_has_file(model_name, 'sparse_linear.pt'):
         return False
     try:
         if _is_vision_only(model_name, trust) or _is_dual_encoder(model_name, trust):
