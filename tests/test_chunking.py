@@ -370,6 +370,27 @@ def test_acts_normalise_to_kind_number_year():
     assert ch.extract_refs("legge 24/2017") == ["l.24/2017"]
 
 
+def test_a_bare_article_number_is_not_a_reference():
+    """Reported from production: `art. 380` and `art. 360` came back as
+    `['art.380']` -- an unqualified number is ambiguous (every code has an
+    art. 360), so it would put three different articles under one exact-match
+    key. The code suffix is required, and a citation without one is dropped."""
+    assert ch.extract_refs("si veda l'art. 360 n. 3") == []
+    assert ch.extract_refs("art.380, art.360, art.115, art.395") == []
+    # ...but the same numbers WITH a code are still references.
+    assert ch.extract_refs("violazione dell'art. 380 c.p.c.") == ["art.380 c.p.c."]
+
+
+def test_an_act_year_may_be_two_digits_and_is_kept_verbatim():
+    """`d.p.r. 115/02` was extracted as nothing at all, because the year was
+    pinned to four digits. It is kept as written: expanding `02` to `2002`
+    would file the same act under two keys depending on the source's style."""
+    assert ch.extract_refs("ai sensi del d.p.r. 115/02") == ["d.p.r.115/02"]
+    assert ch.extract_refs(
+        "del d.p.r. 115/02 e del d.lgs. 446/1998") == ["d.p.r.115/02",
+                                                       "d.lgs.446/1998"]
+
+
 def test_references_are_deduplicated_in_first_seen_order():
     txt = "art. 2054 c.c., poi art. 2043 c.c., di nuovo art. 2054 c.c."
     assert ch.extract_refs(txt) == ["art.2054 c.c.", "art.2043 c.c."]

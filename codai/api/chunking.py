@@ -364,13 +364,20 @@ def pack(pieces: List[str], target: int, overlap: int) -> List[str]:
 # Reference extraction
 # ---------------------------------------------------------------------------
 _ART_SUFFIX = r"(?:\s*(?:bis|ter|quater|quinquies|sexies))?"
+#: The code suffix is MANDATORY, not optional. A bare `art. 360` is ambiguous
+#: -- every procedural code has one -- so it is deliberately NOT a reference:
+#: this field exists to be exact-matched, and an unqualified number would put
+#: three different articles under one key.
 _ART_RX = re.compile(
     r"\bart(?:t|icol[oi])?\.?\s*(\d+" + _ART_SUFFIX + r")"
-    r"(?:\s*(?:del\s+|della\s+)?(codciv|c\.?c\.?|c\.?p\.?c\.?|c\.?p\.?p\.?|c\.?p\.?|cost\.?))?",
+    r"\s*(?:del\s+|della\s+)?(codciv|c\.?c\.?|c\.?p\.?c\.?|c\.?p\.?p\.?|c\.?p\.?|cost\.?)",
     re.IGNORECASE)
+#: The year is kept VERBATIM, two digits included: `d.p.r. 115/02` normalises
+#: to `d.p.r.115/02`, never to `/2002`. Expanding it would silently split the
+#: same act across two keys depending on how the source wrote it.
 _ACT_RX = re.compile(
     r"\b(d\.?\s*lgs\.?|d\.?\s*l\.?|d\.?\s*p\.?\s*r\.?|legge|l\.?)\s*"
-    r"(?:n\.?\s*)?(\d+)\s*/\s*(\d{4})", re.IGNORECASE)
+    r"(?:n\.?\s*)?(\d+)\s*/\s*(\d{2,4})", re.IGNORECASE)
 _CODE_MAP = {"codciv": "c.c.", "cc": "c.c.", "cpc": "c.p.c.", "cpp": "c.p.p.",
              "cp": "c.p.", "cost": "cost."}
 _KIND_MAP = {"dlgs": "d.lgs.", "dl": "d.l.", "dpr": "d.p.r.", "legge": "l.",

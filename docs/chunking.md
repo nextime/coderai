@@ -251,8 +251,14 @@ extracts article and act citations, normalises them, and de-duplicates while
   `bis`/`ter`/`quater`/`quinquies`/`sexies` suffix with spaces removed, and the
   code normalises through `codciv|cc → c.c.`, `cpc → c.p.c.`, `cpp → c.p.p.`,
   `cp → c.p.`, `cost → cost.`
+  The code is **required**: a bare `art. 360` is not emitted, because every
+  procedural code has one and the field exists to be exact-matched — an
+  unqualified number files three different articles under a single key.
 - Acts → `<kind><num>/<year>`, e.g. `d.lgs.209/2005`, with
   `dlgs → d.lgs.`, `dl → d.l.`, `dpr → d.p.r.`, `legge|l → l.`
+  The year is two to four digits and is kept **verbatim**: `d.p.r. 115/02`
+  normalises to `d.p.r.115/02`, never to `/2002`, so the same act does not
+  split across two keys depending on how the source wrote it.
 
 These are a filter field and an exact-match signal for hybrid search — the thing
 dense embeddings blur, since `art. 2043` and `art. 2054` sit close in vector
