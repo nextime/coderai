@@ -328,12 +328,19 @@ def test_ensure_ready_marks_the_pool_as_provisioning():
     """A pod is not in self.pods until it answers its health probe, minutes
     later. Without this flag the 15 s scaler reads "0 healthy, floor 1" and
     rents a second one — which is exactly what happened on the first live
-    boot: two A40s where the configuration asked for one."""
+    boot: two A40s where the configuration asked for one.
+
+    And it counts ONE PER POD. This said `+= 1` while booting `want` of them,
+    so with min_pods 3 three cards were on the way and every other reader of
+    `_booting` believed there was one — each then topping up against a deficit
+    already being filled. Asking for N and getting more than N started here."""
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def ensure_ready")[1].split("def _pick")[0]
-    assert "self._booting += 1" in blk
-    assert "finally:" in blk and "self._booting = max(0, self._booting - 1)" in blk
-    assert blk.index("if self._booting:") < blk.index("self._booting += 1")
+    assert "self._booting += want" in blk
+    assert "self._booting - want" in blk, "what goes up must all come down"
+    assert "self._booting += 1" not in blk
+    assert "finally:" in blk and "self._booting = max(0, self._booting - want)" in blk
+    assert blk.index("if self._booting:") < blk.index("self._booting += want")
 
 
 def test_the_warm_top_up_does_not_stack_on_a_booting_pod():
@@ -394,7 +401,7 @@ def test_the_warm_path_adopts_before_it_rents():
     src = __import__("pathlib").Path(rw.__file__).read_text()
     ready = src.split("def ensure_ready")[1].split("def _pick")[0]
     assert "_adopt_shared_pod()" in ready
-    assert ready.index("_adopt_shared_pod()") < ready.index("self._provision_one()")
+    assert ready.index("_adopt_shared_pod()") < ready.index("self._provision_one(")
     warm = src.split("def maintain")[1].split("def close")[0]
     # Spelling changed in 0.3.68: adoption moved ABOVE the sibling-boot check
     # and now returns early, because a restart's own orphans were sitting behind
@@ -402,7 +409,7 @@ def test_the_warm_path_adopts_before_it_rents():
     # guards -- adopt before renting -- is stronger than before, so assert the
     # intent rather than the old line. See tests/test_runpod_restart_orphans.py.
     assert "_adopt_shared_pod()" in warm
-    assert warm.index("_adopt_shared_pod()") < warm.index("self._provision_one()")
+    assert warm.index("_adopt_shared_pod()") < warm.index("self._provision_one(")
 
 
 def test_adoption_is_one_implementation_for_both_callers():
@@ -454,7 +461,7 @@ def test_the_warm_path_waits_for_a_pod_that_is_still_booting():
     src = __import__("pathlib").Path(rw.__file__).read_text()
     ready = src.split("def ensure_ready")[1].split("def _pick")[0]
     assert "sibling_is_provisioning" in ready
-    assert ready.index("sibling_is_provisioning") < ready.index("self._provision_one()")
+    assert ready.index("sibling_is_provisioning") < ready.index("self._provision_one(")
 
 
 def test_a_booting_pod_from_a_previous_process_counts():

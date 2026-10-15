@@ -19,8 +19,10 @@ FastAPI application module for codai API.
 Contains the FastAPI app initialization, lifespan, and core endpoints.
 """
 
+import asyncio
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional, Union
@@ -921,7 +923,29 @@ class RunpodScaleRequest(BaseModel):
                     "OFF by a request: asking for true where the operator set "
                     "false is ignored and reported. Omit to use the model's own "
                     "setting.")
+    wait_s: Optional[float] = Field(
+        None, ge=0, le=600,
+        description="How long to wait for the pool to answer before returning "
+                    "`pending`. The work CONTINUES either way -- this bounds "
+                    "the reply, not the scaling. 0 returns immediately with a "
+                    "request id. Default 20s.")
     model_config = ConfigDict(extra="allow")
+
+
+#: Background scale requests, by id, so a caller that stopped waiting can find
+#: out how it ended. Bounded: a scale is a handful of fields and old ones are
+#: dropped, because this must never become a place memory accumulates.
+_scale_jobs: "dict" = {}
+_scale_jobs_lock = threading.Lock()
+SCALE_JOBS_MAX = 64
+SCALE_WAIT_DEFAULT_S = 20.0
+
+
+def _scale_job_put(job_id: str, payload: dict) -> None:
+    with _scale_jobs_lock:
+        _scale_jobs[job_id] = payload
+        while len(_scale_jobs) > SCALE_JOBS_MAX:
+            _scale_jobs.pop(next(iter(_scale_jobs)))
 
 
 @app.post("/v1/runpod/scale", summary="Ask for warm pods on a model", tags=["Core"])
@@ -956,10 +980,45 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     spend caps still refuse to provision regardless of what is asked here.
     """
     from codai.api import runpod_worker
+    import uuid
+
+    # OFF THE EVENT LOOP, and this is the important half. This endpoint used to
+    # call straight into the pool from the coroutine, so while it hunted for
+    # capacity -- dozens of (card, region) candidates, one network round trip
+    # each -- the whole server was blocked. /v1/runpod/status stopped answering
+    # during exactly the operation someone would poll it about, which makes a
+    # slow rental look identical to an outage.
+    job_id = uuid.uuid4().hex[:12]
+    task = asyncio.create_task(asyncio.to_thread(
+        runpod_worker.set_client_pods,
+        body.model, body.pods, teardown=bool(body.teardown),
+        gpu_types=body.gpu_types, allow_other_gpus=body.allow_other_gpus))
+
+    def _done(t):
+        try:
+            _scale_job_put(job_id, {"id": job_id, "state": "done",
+                                    "result": t.result()})
+        except BaseException as exc:            # noqa: BLE001 - recorded, not raised
+            _scale_job_put(job_id, {"id": job_id, "state": "failed",
+                                    "error": str(exc)})
+    task.add_done_callback(_done)
+
+    wait_s = (SCALE_WAIT_DEFAULT_S if body.wait_s is None
+              else max(0.0, float(body.wait_s)))
     try:
-        return runpod_worker.set_client_pods(
-            body.model, body.pods, teardown=bool(body.teardown),
-            gpu_types=body.gpu_types, allow_other_gpus=body.allow_other_gpus)
+        if wait_s <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
+    except asyncio.TimeoutError:
+        # The scaling CONTINUES. Answering is what stopped, so a caller with a
+        # 60s client timeout gets an answer instead of a dead socket, and a
+        # rental that is merely slow stops looking like an outage.
+        _scale_job_put(job_id, {"id": job_id, "state": "running"})
+        return {"accepted": True, "pending": True, "request_id": job_id,
+                "model": body.model, "requested": body.pods,
+                "detail": (f"still finding capacity after {wait_s:.0f}s — the "
+                           f"request is running; poll /v1/runpod/scale/"
+                           f"{job_id}, or /v1/runpod/status for the fleet")}
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
@@ -970,6 +1029,58 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
         raise HTTPException(status_code=403, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"scale failed: {exc}")
+
+
+@app.get("/v1/runpod/scale/{request_id}", summary="How a scale request ended",
+         tags=["Core"])
+async def runpod_scale_result(request_id: str):
+    """The result of a scale that was still running when its caller gave up."""
+    with _scale_jobs_lock:
+        got = _scale_jobs.get(str(request_id or "").strip())
+    if got is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no scale request {request_id!r} — it finished long enough "
+                   f"ago to have been dropped, or it was never made. "
+                   f"/v1/runpod/status has the fleet either way.")
+    return got
+
+
+class RunpodReleaseRequest(BaseModel):
+    pod_id: str = Field(..., description="The pod to terminate, as reported by "
+                                         "/v1/runpod/status.")
+    reason: str = Field("released by client",
+                        description="Recorded in the log and the spend ledger.")
+    model_config = ConfigDict(extra="allow")
+
+
+@app.post("/v1/runpod/release", summary="Terminate one pod by id", tags=["Core"])
+async def runpod_release(body: RunpodReleaseRequest, request: Request):
+    """Stop ONE pod, whatever pool it is in and whether or not it is in one.
+
+    Every other path scales a POOL, which means a pod with no floor to lower
+    could not be stopped from here at all: one adopted from another process,
+    one left behind by a crash, one whose pool was reconfigured underneath it.
+    The only remaining way to stop those billing was the RunPod console, and a
+    pod this process cannot see is precisely the one that needs a button.
+
+    ADMIN-SCOPED, unlike /v1/runpod/scale. Leasing warm pods is bounded by the
+    model's own max_pods and expires by itself; terminating a named pod is
+    neither bounded nor reversible, and the pod may be serving someone else's
+    request. The reply says how many were in flight when it went.
+    """
+    if not _admin_scoped_token(request):
+        raise HTTPException(status_code=403,
+                            detail="terminating a named pod needs an "
+                                   "admin-scoped API key")
+    from codai.api import runpod_worker
+    try:
+        return await asyncio.to_thread(runpod_worker.release_pod,
+                                       body.pod_id, body.reason)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"release failed: {exc}")
 
 
 @app.get("/coderai/capabilities", summary="Server capability document", tags=["Core"])

@@ -2305,6 +2305,16 @@ def _select_gpu(client, mcfg: "RunpodModelConfig", account_cfg) -> dict:
     return _rank_gpus(client, mcfg, account_cfg)[0]
 
 
+class BootCancelled(Exception):
+    """An anticipatory boot was released before it finished.
+
+    Not a failure: the pod was wanted when the boot started and is not wanted
+    now, so it is terminated and the caller carries on. Distinct from a boot
+    that FAILED, because the two want opposite handling -- a failure retries on
+    another machine, a cancellation must not.
+    """
+
+
 @_dc_pod
 class PodHandle:
     pod_id: str
@@ -2555,6 +2565,11 @@ class RunpodPodPool:
     busy pod for a dead one.
     """
 
+    #: Class-level default so a pool built in a test without __init__ -- and
+    #: any pickled or partially constructed one -- still has a cancel epoch to
+    #: compare against. See `_boot_cancelled`.
+    _cancel_epoch = 0
+
     #: Class-level so an instance built without __init__ (several tests, and
     #: any future path that skips it) reads 0 rather than raising. `_booting` is
     #: pods THIS process is provisioning right now; `_waiting` is acquire()
@@ -2611,6 +2626,14 @@ class RunpodPodPool:
         #: queued. Measured on 2026-10-13: 64 pages wanting 4 pods got 2, ready
         #: ten minutes apart, and the client reported "no real scale-out".
         self._booting = 0
+        #: Bumped every time a client gives the fleet back. A boot that was
+        #: started BEFORE the shed and lands after it is a pod nobody asked for
+        #: any more -- and until this existed there was no way to say so: a
+        #: booting pod is an integer here, not an object, so `shed_now` could
+        #: not see it, could not count it and could not cancel it. A client that
+        #: asked for one pod, got four on the way, and released them paid all
+        #: four boots in full.
+        self._cancel_epoch = 0
         #: acquire() callers blocked waiting for a slot. Without this the grower
         #: can see THAT the fleet is full (every pod at its ceiling) but not BY
         #: HOW MUCH, so it could only ever ask for one more pod.
@@ -3190,12 +3213,45 @@ class RunpodPodPool:
         """
         return self._data_centers()[0]
 
-    def _provision_one(self):
+    def _provision_one(self, cancellable: bool = False):
         """Create + boot one pod; append it healthy. Blocking (minutes).
 
-        Retries on a different machine when a pod is accepted but never boots."""
+        Retries on a different machine when a pod is accepted but never boots.
+
+        ``cancellable`` marks an ANTICIPATORY boot -- the warm floor, or growth
+        for demand that may be gone by the time the card is ready. Those are
+        abandoned, and the pod terminated, if the fleet is released while they
+        are on the way: a boot takes minutes, and paying one out to the end for
+        a pod that will be shed on arrival is the whole of the complaint. A
+        boot a waiting request is blocked on is never cancellable, whatever
+        arrives meanwhile -- the request is what the pod is for.
+        """
         from codai.api.runpod_client import RunpodClient, RunpodError, pod_console_url
         client = RunpodClient(self.account)
+        # Read BEFORE anything is created, so a shed that arrives at any point
+        # from here on is seen. Captured even when not cancellable, so the one
+        # branch that reads it needs no second condition.
+        with self._cv:
+            _epoch = self._cancel_epoch
+
+        def _give_back(pod_id, why):
+            """Terminate a pod this pool no longer wants and stop tracking it."""
+            print(f"[runpod] pod {pod_id} for {self.model_key!r} was released "
+                  f"while it was still booting ({why}) — terminating it now "
+                  f"rather than paying out the boot for a pod nobody wants",
+                  flush=True)
+            try:
+                client.terminate_pod(pod_id)
+            except Exception as exc:
+                print(f"[runpod] could not terminate {pod_id}: {exc}", flush=True)
+            with _pools_lock:
+                _provisioning_ids.discard(pod_id)
+                _provisioning_info.pop(pod_id, None)
+            try:
+                unregister_pod(pod_id)
+            except Exception:
+                pass
+
         # The caller's narrowing, if a lease is in force. Read per provision so
         # a lapsed lease stops constraining the very next pod.
         ranked = _rank_gpus(client, self.mcfg, self.account,
@@ -3261,6 +3317,9 @@ class RunpodPodPool:
                 # Wait for the OpenAI server inside the pod (image pull + model load).
                 deadline = time.time() + load_to
                 while time.time() < deadline:
+                    if cancellable and self._boot_cancelled(_epoch):
+                        _give_back(pod_id, "during the model load")
+                        raise BootCancelled(pod_id)
                     if _pod_health_ok(url, path=self.health_path,
                                       api_key=self.api_key):
                         print(f"[runpod] pod {pod_id}: serving after "
@@ -3276,6 +3335,11 @@ class RunpodPodPool:
                 else:
                     raise RunpodError(f"pod {pod_id} OpenAI server did not answer "
                                       f"/v1/models within {int(load_to)}s")
+            except BootCancelled:
+                # Already terminated and untracked by `_give_back`. NOT a boot
+                # failure: retrying on the next machine would rent exactly the
+                # card that was just given back.
+                raise
             except Exception as exc:
                 # Self-diagnose: pull the vLLM/container log before tearing down, so
                 # the cause (OOM / bad args / model gate / stuck machine) is in the log.
@@ -3302,6 +3366,13 @@ class RunpodPodPool:
                           data_center=(sel.get("_dc") or self._data_center()),
                           cloud_type=str(sel.get("cloud_type") or ""),
                           gpu_count=int(sel.get("gpu_count") or 1))
+            # The last chance, and the one that matters most: a shed that
+            # lands in the seconds between "serving" and "appended" would
+            # otherwise put the pod in the fleet a moment after the fleet was
+            # released, where only the idle timer would ever find it.
+            if cancellable and self._boot_cancelled(_epoch):
+                _give_back(pod_id, "just as it came up")
+                raise BootCancelled(pod_id)
             with self._cv:
                 self.pods.append(h)
                 self._cv.notify_all()
@@ -3334,13 +3405,20 @@ class RunpodPodPool:
             # configuration asked for one.
             if self._booting:
                 return
-            self._booting += 1
+            # ONE PER POD, not one per call. This said `+= 1` and then booted
+            # `want` of them, so a model with min_pods 3 had three cards on the
+            # way while every other reader of `_booting` -- the 15s scaler's
+            # `in_hand`, `_should_grow`, the parallel-boot cap -- believed there
+            # was one. Each of those then topped up against a deficit that was
+            # already being filled. Asking for N and getting more than N starts
+            # here.
+            self._booting += want
         try:
             # A pod for this pool may already be up — a sibling engine's, or our
             # own from before the last restart. Renting beside it is how a warm
             # floor of one became two A40s at every boot.
             if self._adopt_shared_pod():
-                return
+                return          # `finally` gives back all `want`
             # Nothing ready to adopt — but a pod may be mid-boot, registered
             # with no URL yet. That is one pod on the way, not none. It matters
             # most right here: the warm floor is rebuilt at every boot, so an
@@ -3359,7 +3437,8 @@ class RunpodPodPool:
                     raise
         finally:
             with self._cv:
-                self._booting = max(0, self._booting - 1)
+                self._booting = max(0, self._booting - want)
+                self._cv.notify_all()
 
     def _pick(self, healthy: list, affinity: str):
         """Which pod serves this request: the one that already holds the
@@ -3396,6 +3475,16 @@ class RunpodPodPool:
         load = sum(p.inflight for p in serving) + max(0, self._waiting)
         want = (load + threshold - 1) // threshold
         return max(1, min(int(self.mcfg.max_pods), want))
+
+    def _boot_cancelled(self, epoch: int) -> bool:
+        """Was this boot released while it was still booting?
+
+        Only ANTICIPATORY boots ask -- the warm floor and background growth.
+        A boot that a waiting request is blocked on is never cancelled however
+        many sheds arrive: the request is the thing the pod is for.
+        """
+        with self._cv:
+            return self._cancel_epoch != epoch
 
     def _should_grow(self, healthy: list) -> bool:
         """True when real concurrency justifies another pod.
@@ -3467,7 +3556,9 @@ class RunpodPodPool:
                 # would mix two tokens in one pool, so this cannot make that
                 # worse.
                 if not self._adopt_shared_pod():
-                    self._provision_one()
+                    self._provision_one(cancellable=True)
+            except BootCancelled:
+                pass          # said its piece already, and it is not a failure
             except Exception as exc:
                 print(f"[runpod] scale-up for {self.model_key!r} failed: {exc}", flush=True)
             finally:
@@ -3850,9 +3941,20 @@ class RunpodPodPool:
         """
         terminated, draining = [], []
         with self._cv:
+            # Cancel first, and unconditionally. A boot that is on the way is a
+            # pod this client asked for and has now given back; whether the
+            # arithmetic below also finds surplus among the READY pods is a
+            # separate question. Anticipatory boots see this and hand their pod
+            # straight back instead of joining a fleet nobody wants.
+            booting = int(self._booting)
+            self._cancel_epoch += 1
             serving = [p for p in self.pods if p.healthy and not p.draining]
+            # Booting pods count as capacity on the way, so the surplus is
+            # measured against what the fleet will BE, not only what it is.
+            # Without this a client holding four boots and no ready pod was
+            # told "kept 0, needed 1" and kept paying for all four.
             need = self._pods_needed(serving)
-            surplus = max(0, len(serving) - need)
+            surplus = max(0, len(serving) + booting - need)
             order = sorted(serving, key=lambda p: (p.inflight, p.last_used))
             if getattr(self.mcfg, "scale_down_costliest_first", False):
                 order = sorted(serving, key=lambda p: (-float(p.hourly_usd or 0.0),
@@ -3868,6 +3970,10 @@ class RunpodPodPool:
                 else:
                     victim.draining = True
                     draining.append(victim.pod_id)
+            # A boot cancelled here is capacity that will never arrive, so it
+            # must not count against the ready pods we then decide to keep --
+            # otherwise a client with one ready pod and three cancelled boots
+            # would see its last serving pod shed too.
             self._surplus_since = 0.0
             kept = len([p for p in self.pods if p.healthy and not p.draining])
             # Anything still here above the operator's own floor is here because
@@ -3878,11 +3984,17 @@ class RunpodPodPool:
             self._release_pending = bool(kept > floor or draining)
         print(f"[runpod] {self.model_key!r}: client released the fleet — "
               f"{len(terminated)} terminated, {len(draining)} draining, "
+              f"{booting} boot(s) cancelled, "
               f"{kept} kept ({need} still needed by work in flight, warm floor "
               f"{floor})"
               + (" — will retire as soon as they fall idle"
                  if self._release_pending else ""), flush=True)
         return {"terminated": terminated, "draining": draining, "kept": kept,
+                # Boots in flight when the release arrived. They cannot be
+                # named -- a pod that is still being created has no id here --
+                # but they CAN be counted, and a count is the difference
+                # between "nothing happened" and "four cards stopped".
+                "cancelled_boots": booting,
                 # `needed` is demand; `floor` is configuration. Reporting demand
                 # AS "floor" read as though the operator had asked for the pod,
                 # which is the opposite of what it meant.
@@ -4089,7 +4201,9 @@ class RunpodPodPool:
         """One warm-floor boot, on its own thread. Always gives `_booting` back:
         a leaked increment is a pool that can never grow again."""
         try:
-            self._provision_one()
+            self._provision_one(cancellable=True)
+        except BootCancelled:
+            pass          # said its piece already, and it is not a failure
         except Exception as exc:
             print(f"[runpod] maintain: warm provision failed: {exc}", flush=True)
         finally:
@@ -4526,6 +4640,119 @@ def seed_region_volumes(model: str, regions=None) -> dict:
     return out
 
 
+def get_live_pool(key: str):
+    """A pool that is running under exactly this key, or None.
+
+    Matched on the registry key, which is what `pods_status` reports and
+    therefore the only name a client can have seen.
+    """
+    k = str(key or "").strip()
+    if not k:
+        return None
+    with _pools_lock:
+        return _pools.get(k)
+
+
+def _scale_live_pool(pool, key: str, pods: int, teardown: bool = False,
+                     gpu_types=None, allow_other_gpus=None) -> dict:
+    """`set_client_pods` for a pool addressed directly rather than by model."""
+    mcfg = getattr(pool, "mcfg", None)
+    if mcfg is not None and not getattr(mcfg, "allow_client_scale", False):
+        raise PermissionError(
+            f"the pool {key!r} does not allow client scaling — set "
+            '"allow_client_scale": true on the runpod block of a model that '
+            "uses it")
+    out = pool.set_client_floor(pods, gpu_types=gpu_types,
+                                allow_other_gpus=allow_other_gpus)
+    if teardown:
+        out["teardown"] = pool.shed_now()
+    out["pool"] = out.get("model") or key
+    out["model"] = key
+    return out
+
+
+def release_pod(pod_id: str, reason: str = "released by client") -> dict:
+    """Terminate ONE pod by id, wherever it is, and stop tracking it.
+
+    The gap this fills: every other path here scales a POOL. A pod adopted from
+    another process, a pod left behind by a crash, a pod whose pool was
+    reconfigured underneath it -- none of those belong to a floor anyone can
+    lower, and the only way to stop them billing was the RunPod console.
+
+    Terminates whatever the account is actually running under that id, even
+    when no pool here knows it: a pod this process cannot see is precisely the
+    one that needs the button. Refuses a pod with requests on it unless
+    ``force``-ed by the caller draining it first -- see `shed_now` for the
+    graceful path.
+    """
+    pid = str(pod_id or "").strip()
+    if not pid:
+        raise LookupError("no pod id given")
+    from codai.models.manager import get_active_runpod_config
+    acct = get_active_runpod_config()
+    if acct is None or not getattr(acct, "enabled", False):
+        raise RuntimeError("RunPod is not enabled")
+    out = {"pod_id": pid, "found_in_pool": None, "inflight": 0,
+           "terminated": False}
+    cost, gpu, spot = 0.0, "", False
+    # Drop it from its pool FIRST, so nothing routes a new request onto a pod
+    # that is about to go away.
+    with _pools_lock:
+        pools = list(_pools.items())
+    for key, pool in pools:
+        with pool._cv:
+            victim = next((p for p in pool.pods if p.pod_id == pid), None)
+            if victim is None:
+                continue
+            out["found_in_pool"] = key
+            out["inflight"] = int(victim.inflight)
+            # Attributed before it is dropped, or the money lands nowhere --
+            # which is exactly how an untracked pod becomes an unexplained bill.
+            cost = ((time.time() - victim.started_at) / 3600.0
+                    * float(victim.hourly_usd or 0.0))
+            gpu, spot = str(victim.gpu or ""), bool(victim.is_spot)
+            victim.healthy = False
+            pool.pods.remove(victim)
+            pool._cv.notify_all()
+        break
+    from codai.api.runpod_client import RunpodClient
+    try:
+        RunpodClient(acct).terminate_pod(pid)
+        out["terminated"] = True
+    except Exception as exc:
+        # Say which half happened. A pod dropped from the pool but still
+        # billing is a worse state than either end, and the caller can only
+        # act on it if it is told.
+        out["error"] = str(exc)
+        if out["found_in_pool"]:
+            out["warning"] = (
+                f"pod {pid} was removed from pool {out['found_in_pool']!r} but "
+                f"RunPod did not confirm the termination — it may still be "
+                f"billing. Check the console.")
+        raise RuntimeError(out.get("warning") or f"could not terminate {pid}: {exc}")
+    finally:
+        with _pools_lock:
+            _provisioning_ids.discard(pid)
+            _provisioning_info.pop(pid, None)
+        try:
+            unregister_pod(pid)
+        except Exception:
+            pass
+    if out["found_in_pool"]:
+        try:
+            from codai.api import runpod_ledger
+            runpod_ledger.record_spend(out["found_in_pool"], cost,
+                                       {"pod_id": pid, "gpu": gpu,
+                                        "is_spot": spot, "reason": reason})
+            out["billed_usd"] = round(cost, 4)
+        except Exception:
+            pass
+    print(f"[runpod] pod {pid} terminated on request ({reason})"
+          + (f" — it was serving {out['inflight']} request(s) in "
+             f"{out['found_in_pool']!r}" if out["inflight"] else ""), flush=True)
+    return out
+
+
 def set_client_pods(model: str, pods: int, teardown: bool = False,
                     gpu_types=None, allow_other_gpus=None) -> dict:
     """Lease a warm floor for one model on a client's behalf.
@@ -4551,9 +4778,23 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
     key = str(model or "").strip()
     if not key:
         raise LookupError("no model named")
+    # A LIVE POOL, addressed by the key this very function reports back as
+    # `pool`. Several models share one pool, so `pool:digesta-qwen38` is not a
+    # model and has no runpod block of its own -- and until now the only answer
+    # to it was "has no runpod block", from code that already knew the caller
+    # could not look the key up. A pool that exists can be addressed; its
+    # permission and its clamp come from the config it was built with.
+    existing = get_live_pool(key)
+    if existing is not None:
+        return _scale_live_pool(existing, key, pods, teardown=teardown,
+                                gpu_types=gpu_types,
+                                allow_other_gpus=allow_other_gpus)
     block = model_runpod_block(key)
     if not block:
-        raise LookupError(f"{key!r} has no runpod block")
+        raise LookupError(
+            f"{key!r} has no runpod block, and no pod pool is running under "
+            f"that name either. Pass a model id, or a pool key that "
+            f"/v1/runpod/status is currently reporting.")
     mcfg = parse_model_runpod(block)
     if not mcfg.allow_client_scale:
         raise PermissionError(

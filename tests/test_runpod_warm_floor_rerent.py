@@ -272,7 +272,7 @@ def test_the_floor_is_re_established_once_the_ghost_is_gone(monkeypatch):
 
     rented = []
     pool._adopt_shared_pod = lambda: False
-    pool._provision_one = lambda: rented.append("rented")
+    pool._provision_one = lambda cancellable=False: rented.append("rented")
     pool._drain_pod_log = lambda p: None
     pool._scale_down = lambda now: None
     monkeypatch.setattr(rw, "sibling_is_provisioning", lambda key: False)
@@ -300,7 +300,7 @@ def test_a_sibling_already_renting_is_one_pod_not_none(monkeypatch):
     _install(monkeypatch, pool)
     rented = []
     pool._adopt_shared_pod = lambda: False
-    pool._provision_one = lambda: rented.append("rented")
+    pool._provision_one = lambda cancellable=False: rented.append("rented")
     pool._drain_pod_log = lambda p: None
     pool._scale_down = lambda now: None
     monkeypatch.setattr(rw, "sibling_is_provisioning", lambda key: True)
@@ -314,7 +314,7 @@ def test_an_existing_pod_elsewhere_is_adopted_before_renting(monkeypatch):
     _install(monkeypatch, pool)
     rented = []
     pool._adopt_shared_pod = lambda: True
-    pool._provision_one = lambda: rented.append("rented")
+    pool._provision_one = lambda cancellable=False: rented.append("rented")
     pool._drain_pod_log = lambda p: None
     pool._scale_down = lambda now: None
     monkeypatch.setattr(rw, "sibling_is_provisioning", lambda key: False)
@@ -330,7 +330,7 @@ def test_no_floor_means_no_re_rent(monkeypatch):
     rw.reconcile_pools({"ghost": "TERMINATED"})
     rented = []
     pool._adopt_shared_pod = lambda: False
-    pool._provision_one = lambda: rented.append("rented")
+    pool._provision_one = lambda cancellable=False: rented.append("rented")
     pool._drain_pod_log = lambda p: None
     pool._scale_down = lambda now: None
     monkeypatch.setattr(rw, "sibling_is_provisioning", lambda key: False)

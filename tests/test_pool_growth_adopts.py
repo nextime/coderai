@@ -40,7 +40,7 @@ class _Pool:
         self.calls.append("adopt")
         return self._adopts
 
-    def _provision_one(self):
+    def _provision_one(self, cancellable=False):
         self.calls.append("rent")
 
 
@@ -81,7 +81,12 @@ def test_every_provisioning_path_tries_adoption_first():
     """
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
     # 5 call sites: ensure_ready, acquire, growth, warm floor, seed_region.
-    assert src.count("self._provision_one()") == 5
+    # Two of the five now pass `cancellable=True` -- the anticipatory
+    # boots, which hand their pod back if the fleet is released while
+    # they are on the way. The inline one a request is waiting on never
+    # is. Counted together: every call site still adopts first.
+    assert src.count("self._provision_one(") == 5
+    assert src.count("self._provision_one(cancellable=True)") == 2
 
     # Per PATH rather than a global count of one spelling. The warm floor stopped
     # matching `if not self._adopt_shared_pod():` in 0.3.69 when it became a

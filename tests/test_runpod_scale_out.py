@@ -181,7 +181,7 @@ def test_the_single_flight_paths_ask_how_many_not_whether():
     and `_booting` is counted so a wave cannot overshoot the floor."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
     ready = src.split("def ensure_ready")[1].split("\n    def ")[0]
-    assert "if self._booting:" in ready and "self._booting += 1" in ready
+    assert "if self._booting:" in ready and "self._booting += want" in ready
     maint = src.split("def maintain")[1].split("\n    def ")[0]
     assert "scale_up_max_parallel_boots" in maint
     assert "parallel - self._booting" in maint
@@ -195,7 +195,7 @@ def test_the_counter_returns_to_zero_after_a_scale_up():
     exits, each of which must decrement."""
     pool = _pool(pods=[_pod("a", inflight=16)], waiting=48)
     provisioned = []
-    pool._provision_one = lambda: provisioned.append(1)
+    pool._provision_one = lambda cancellable=False: provisioned.append(1)
     pool._pick = lambda healthy, affinity: healthy[0]
     pool._remember_affinity = lambda a, p: None
     got, url = pool.acquire(timeout=5)
@@ -274,7 +274,7 @@ def test_growth_prefers_a_pod_already_running_over_renting():
     nothing until the reaper's grace expired. Only the cold paths adopted."""
     pool = _pool(pods=[_pod("a", inflight=16)], waiting=48)
     provisioned, adopted = [], []
-    pool._provision_one = lambda: provisioned.append(1)
+    pool._provision_one = lambda cancellable=False: provisioned.append(1)
     pool._adopt_shared_pod = lambda: (adopted.append(1), True)[1]
     pool._pick = lambda healthy, affinity: healthy[0]
     pool._remember_affinity = lambda a, p: None
