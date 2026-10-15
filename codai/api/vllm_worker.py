@@ -144,6 +144,64 @@ def service_key_for(cfg, model_path=None, served_name=None):
     return key
 
 
+#: Model family -> the vLLM parser that reads its tool-call syntax. A tool call
+#: is TEXT the model emits in its own trained format, so the parser belongs to
+#: the family, not to the deployment. Longest match wins, so `qwen3-coder`
+#: beats `qwen`.
+_TOOL_PARSERS = (
+    ("qwen3-coder", "qwen3_coder"), ("qwen3_coder", "qwen3_coder"),
+    ("deepseek-v3", "deepseek_v3"), ("deepseek_v3", "deepseek_v3"),
+    ("llama-3", "llama3_json"), ("llama3", "llama3_json"),
+    ("mistral", "mistral"), ("ministral", "mistral"),
+    ("granite", "granite"), ("internlm", "internlm"), ("jamba", "jamba"),
+    ("glm-4.5", "glm45"), ("glm-4.6", "glm45"), ("glm45", "glm45"),
+    # Qwen 2.5/3 and the many Hermes-style finetunes emit <tool_call> JSON.
+    ("qwen", "hermes"), ("hermes", "hermes"),
+)
+
+
+def _tool_parser_for(cfg, model_config: dict, model_path: str) -> str:
+    """Which vLLM tool-call parser to launch with, or '' for none.
+
+    An explicit setting always wins — including "off", because a model whose
+    family is guessed wrongly parses tool calls into nonsense, and silently
+    producing wrong tool arguments is worse than refusing the request.
+    """
+    want = str(getattr(cfg, "tool_call_parser", "") or "").strip()
+    if want and want.lower() not in ("auto", "detect"):
+        return "" if want.lower() in ("off", "none", "false", "0") else want
+    hay = " ".join(str(x or "").lower() for x in (
+        model_path, (model_config or {}).get("path"),
+        (model_config or {}).get("id"), (model_config or {}).get("alias")))
+    best = ""
+    for needle, parser in _TOOL_PARSERS:
+        if needle in hay and len(needle) > len(best):
+            best, found = needle, parser
+    return dict(_TOOL_PARSERS).get(best, "") if best else ""
+
+
+def _tool_args(cfg, model_config: dict, model_path: str) -> list:
+    """`--enable-auto-tool-choice --tool-call-parser X`, when we know X.
+
+    Both or neither: vLLM refuses to START with --enable-auto-tool-choice and
+    no parser, and a pod that will not boot is worse than one that cannot do
+    tool calls. When the family is unrecognised this says so, because the
+    symptom otherwise lands on the CLIENT as a 400 at request time.
+    """
+    parser = _tool_parser_for(cfg, model_config, model_path)
+    if not parser:
+        want = str(getattr(cfg, "tool_call_parser", "") or "").strip().lower()
+        if want not in ("off", "none", "false", "0"):
+            print(f"[vllm] no tool-call parser known for {model_path!r} — "
+                  f"requests carrying `tools` will be refused by vLLM. Set "
+                  f"vllm.tool_call_parser (or the model's vllm block) to one "
+                  f"of: {', '.join(sorted(set(p for _, p in _TOOL_PARSERS)))}",
+                  flush=True)
+        return []
+    print(f"[vllm] tool calls parsed as {parser!r}", flush=True)
+    return ["--enable-auto-tool-choice", "--tool-call-parser", parser]
+
+
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
                 served_name: Optional[str] = None, model_config: dict = None,
                 gpu_memory_utilization: Optional[float] = None,
@@ -199,6 +257,9 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     # a HuggingFace repo id. A QLoRA adapter is an ordinary LoRA here — the
     # quantisation is how the base model loads, which --quantization covers.
     cmd += _lora_args(model_config)
+    # Tool calling. vLLM answers 400 to any request carrying `tools` unless it
+    # was launched for it, and the message names flags the caller cannot set.
+    cmd += _tool_args(cfg, model_config, model_path)
 
     extra = (getattr(cfg, "extra_args", "") or "").strip()
     if extra:

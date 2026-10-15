@@ -21,6 +21,10 @@ VLLM_FIELDS = ("ctx", "gpu", "gpu_memory_utilization", "tensor_parallel_size",
                "pipeline_parallel_size", "distributed_executor_backend", "ray_address",
                "ray_port", "nodes", "nodes_ready_timeout_s", "max_num_seqs", "dtype",
                "quantization", "extra_args", "extra_env",
+               # Which parser reads this model's tool-call syntax. Per model,
+               # because the syntax belongs to the model family and one install
+               # serves several.
+               "tool_call_parser",
                # Per model, so the one checkpoint with a byte-level vocabulary can
                # ask for token ids without changing what every other vLLM model
                # reports (see VllmConfig.return_token_ids).

@@ -775,6 +775,15 @@ class VllmConfig:
     max_num_seqs: int = 0                # --max-num-seqs (0 = vLLM default)
     dtype: str = ""                      # --dtype (blank = auto; e.g. bfloat16/float16)
     quantization: str = ""               # --quantization (blank = none; e.g. awq/gptq/fp8)
+    # Tool calling. vLLM parses a model's tool-call syntax with a named parser
+    # and REFUSES a request carrying `tools` unless it was launched with one:
+    #     "auto" tool choice requires --enable-auto-tool-choice and
+    #      --tool-call-parser to be set
+    # -- a 400 at request time, from a server that started cleanly, for a
+    # feature the catalogue says the model has. The syntax belongs to the model
+    # family, so "auto" picks it from the model name and an explicit value
+    # (here, or per model in its `vllm` block) wins. "off" disables it.
+    tool_call_parser: str = "auto"
     extra_args: str = ""                 # extra flags for the api_server
     extra_env: str = ""                  # free-form KEY=VALUE env for the subprocess
     auto_build: bool = False             # create the isolated venv + pip install vllm if missing

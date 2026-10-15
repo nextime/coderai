@@ -1665,6 +1665,10 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
             # to load a 154 GB GGUF with transformers. Other backend pins are
             # stripped below: vulkan/opencl say something about THIS machine.
             "backend", "ds4", "colibri", "k3",
+            # …and the vLLM block, for the same reason: tool-call syntax,
+            # context and memory shape describe the MODEL, and a pod that does
+            # not get them serves it differently from this install.
+            "vllm",
             "flash_attention", "model_template", "acceleration", "component_quantization",
             "languages", "supports_translation", "parser", "max_instances",
             # LoRA settings travel too: a coderai pod applies them itself, and

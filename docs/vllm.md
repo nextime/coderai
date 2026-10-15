@@ -73,3 +73,54 @@ large corpus, batch classification/extraction, high-QPS chat.
   not a VLM — see the OCR docs.)
 - Selection stays pin/alias-only to avoid collisions with ds4/colibri/k3/kt, exactly
   like ktransformers.
+
+## Tool calling
+
+vLLM parses a model's tool calls with a named parser, and **refuses any request
+carrying `tools` unless it was launched with one**:
+
+```
+400 "auto" tool choice requires --enable-auto-tool-choice and
+    --tool-call-parser to be set
+```
+
+That is a request-time error from a server that started cleanly, for a
+capability the catalogue says the model has, naming flags the caller cannot
+set. So coderai sets them.
+
+A tool call is TEXT the model emits in its own trained format, so the parser
+belongs to the model FAMILY rather than to the deployment. `tool_call_parser`
+defaults to `auto`, which picks from the model name:
+
+| family | parser |
+|---|---|
+| Qwen 2.5 / 3, Hermes finetunes | `hermes` |
+| Qwen3-Coder | `qwen3_coder` |
+| Llama 3.x | `llama3_json` |
+| Mistral / Ministral | `mistral` |
+| DeepSeek-V3 | `deepseek_v3` |
+| GLM-4.5 / 4.6 | `glm45` |
+| Granite, InternLM, Jamba | `granite`, `internlm`, `jamba` |
+
+Longest match wins, so `qwen3-coder` is not swallowed by `qwen`.
+
+Set it explicitly — globally, or per model in its `vllm` block — for anything
+not on that list:
+
+```json
+{"id": "my-model", "backend": "vllm",
+ "vllm": {"tool_call_parser": "llama3_json"}}
+```
+
+`off` disables tool calling for that model. Use it rather than letting a wrong
+guess stand: a mismatched parser does not fail, it parses tool calls into
+nonsense, and silently producing wrong tool ARGUMENTS is worse than refusing
+the request.
+
+Both flags are passed together or not at all — vLLM refuses to **start** with
+`--enable-auto-tool-choice` and no parser, and an engine that will not boot is
+worse than one that cannot do tool calls. When the family is unrecognised the
+log says what to set, because otherwise the symptom lands on the client.
+
+The `vllm` block travels to a RunPod pod with the model, so a pod serves it the
+same way this install does.
