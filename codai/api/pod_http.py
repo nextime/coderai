@@ -37,11 +37,48 @@ _lock = threading.Lock()
 _session = None
 
 
+#: Connections kept alive PER POD. requests' own default is 10, and one shared
+#: session serves every pod, so the pool is per host either way — but 10 is a
+#: number for a browser talking to a website, not for an OCR run fanning
+#: `ocr.max_concurrency` pages at ONE pod.
+#:
+#: Past the tenth concurrent request urllib3 opens a connection anyway, uses it,
+#: finds the pool full on release and discards it. Every page after the tenth
+#: therefore pays a fresh TLS handshake to a machine in another country: several
+#: round trips of latency each, and handshake CPU on the orchestrator at exactly
+#: the moment it is busiest. Measured on a live run: 74 "Connection pool is
+#: full, discarding connection" warnings in five minutes, ~14 a minute, against
+#: a single pod IP.
+#:
+#: Idle connections cost a socket and nothing else, so sizing this to the
+#: concurrency the install is configured for is the cheap side of the trade.
+_DEFAULT_POOL = 64
+_MAX_POOL = 256
+
+
+def _pool_size() -> int:
+    """How many connections to keep per pod — from the configured concurrency.
+
+    Read at session creation, not import: the config is not loaded yet when
+    this module is imported, and an install that raises `ocr.max_concurrency`
+    should not have to know that a connection pool exists.
+    """
+    try:
+        from codai.config import config_manager
+        cfg = config_manager.config.ocr if config_manager and config_manager.config else None
+        want = int(getattr(cfg, "max_concurrency", 0) or 0)
+    except Exception:
+        want = 0
+    return max(_DEFAULT_POOL, min(_MAX_POOL, want))
+
+
 class _PinnedAdapter(HTTPAdapter):
     """An adapter whose pool trusts our CA and skips hostname matching."""
 
     def __init__(self, ca_file: str, **kw):
         self._ca_file = ca_file
+        kw.setdefault("pool_connections", _DEFAULT_POOL)
+        kw.setdefault("pool_maxsize", _DEFAULT_POOL)
         super().__init__(**kw)
 
     def init_poolmanager(self, *args, **kwargs):
@@ -80,7 +117,9 @@ def _pinned_session() -> requests.Session:
         if _session is None:
             from codai.api.pod_tls import ensure_ca
             s = requests.Session()
-            s.mount("https://", _PinnedAdapter(ensure_ca()))
+            size = _pool_size()
+            s.mount("https://", _PinnedAdapter(ensure_ca(), pool_connections=size,
+                                               pool_maxsize=size))
             _session = s
         return _session
 
