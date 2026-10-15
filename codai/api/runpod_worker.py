@@ -3651,7 +3651,20 @@ class RunpodPodPool:
             return self._cancel_epoch != epoch
 
     def _should_grow(self, healthy: list) -> bool:
-        """True when real concurrency justifies another pod.
+        """True when real concurrency justifies another pod."""
+        return bool(self._grow_reason(healthy))
+
+    def _grow_reason(self, healthy: list) -> str:
+        """WHY another pod is justified, in the words of the trigger that fired,
+        or '' for no.
+
+        Two independent triggers, and saying which one fired is the whole point
+        of this returning a sentence. The caller used to print the DEMAND
+        number whichever trigger fired, so a pool growing because its one pod
+        was saturated announced "growing to meet 1 pod(s) of demand — 1 up" —
+        which reads as a pool renting a second card to meet demand it has
+        already met, i.e. as a bug. Observed on a live orchestrator and it cost
+        a real investigation to find that the fleet was behaving correctly.
 
         The pool used to grow only when it had NO healthy pod, so every request
         beyond the first piled onto pod #1 and max_pods never came into play.
@@ -3670,10 +3683,10 @@ class RunpodPodPool:
         """
         in_hand = len(self.pods) + self._booting
         if in_hand >= self.mcfg.max_pods:
-            return False
+            return ""
         parallel = max(1, int(getattr(self.mcfg, "scale_up_max_parallel_boots", 1) or 1))
         if self._booting >= parallel:
-            return False
+            return ""
         # A draining pod is on its way out and takes no new work, so counting it
         # as capacity would answer "no need to grow" with the one pod that cannot
         # help — and counting its emptying in-flight as the minimum would say the
@@ -3683,12 +3696,18 @@ class RunpodPodPool:
             # Nothing can serve a request. One on the way is enough to wait for;
             # a second here would be two cards for the same first request, which
             # is how a warm floor of one became two.
-            return self._booting == 0
+            if self._booting:
+                return ""
+            return "nothing can serve a request yet — renting the first pod"
         # Demand we can measure: what the pods carry plus what is blocked. This
         # is the part that may grow SEVERAL pods at once, because the number is
         # real rather than a guess about the future.
-        if in_hand < self._pods_for_demand(serving):
-            return True
+        want = self._pods_for_demand(serving)
+        if in_hand < want:
+            threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
+            load = sum(p.inflight for p in serving) + max(0, self._waiting)
+            return (f"{load} page(s) in flight or waiting at {threshold} per pod "
+                    f"needs {want} pod(s), and {in_hand} are in hand")
         # And the original, anticipatory trigger: every pod is at its in-flight
         # threshold, so the next request has nowhere good to go. Kept because
         # `max_inflight_per_pod` defaults to unlimited, so requests are often
@@ -3697,8 +3716,17 @@ class RunpodPodPool:
         # unlike the demand above this is a prediction, and a prediction should
         # not rent four cards.
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-        return (self._booting == 0
-                and min(p.inflight for p in serving) >= threshold)
+        if self._booting:
+            return ""
+        least = min(p.inflight for p in serving)
+        if least >= threshold:
+            # NOT a demand figure. Demand is already met — one pod is exactly
+            # right for `threshold` in flight — and this rents ahead of the
+            # next request rather than for one that exists.
+            return (f"every pod is at its {threshold}-in-flight threshold "
+                    f"(least loaded carries {least}) — renting one more for "
+                    f"the next burst, not for work already queued")
+        return ""
 
     def _grow_in_background(self):
         """Provision another pod without making the triggering request wait for it.
@@ -3750,10 +3778,13 @@ class RunpodPodPool:
             with self._cv:
                 healthy = [p for p in self.pods if p.healthy]
                 chosen = self._pick(healthy, affinity) if healthy else None
-                if self._should_grow(healthy):
+                # Asked ONCE, and the answer carries its own reason. Deciding
+                # here and describing it separately below is what let the
+                # message name a trigger that had not fired.
+                why = self._grow_reason(healthy)
+                if why:
                     self._booting += 1
                     grow_now = True
-                    want = self._pods_for_demand([p for p in healthy if not p.draining])
                 if chosen is not None:
                     chosen.inflight += 1
                     chosen.last_used = time.time()
@@ -3761,9 +3792,9 @@ class RunpodPodPool:
                     url = chosen.url
             if chosen is not None:
                 if grow_now:
-                    print(f"[runpod] {self.model_key!r}: growing to meet "
-                          f"{want} pod(s) of demand — {len(self.pods)} up, "
-                          f"{self._booting} booting", flush=True)
+                    print(f"[runpod] {self.model_key!r}: growing — {why} "
+                          f"[{len(self.pods)} up, {self._booting} booting]",
+                          flush=True)
                     self._grow_in_background()      # absorbs the NEXT request
                 return chosen, url
 
