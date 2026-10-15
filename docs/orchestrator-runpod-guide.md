@@ -1255,6 +1255,24 @@ restart, the tag is put back, the service is restarted again, and the run exits
 non-zero with one line saying whether it recovered. A service left down says
 "Needs a human".
 
+**Taking an upgrade now, on purpose.** The policy above is for the unattended
+run. An operator who wants the upgrade this minute says so on the command line,
+and nothing has to be edited by hand:
+
+```bash
+coderai-autoupgrade --force                  # upgrade + restart on this run,
+                                             # busy or not; no booking left behind
+coderai-autoupgrade --force-at 'tomorrow 02:00'   # book one; the hourly timer fires it
+coderai-autoupgrade --cancel-force           # drop a booking, whoever made it
+```
+
+`--force` interrupts whatever is in flight — that is what it is for. It also
+reaches the *restart* step, so it lands an upgrade that has been sitting in the
+image behind deferrals. `--force-at` takes anything `date -d` understands
+(`'+2 hours'`, `'now'`, an absolute time) and needs no second timer: the ordinary
+hourly tick at or after that moment takes it. `--cancel-force` clears the booking
+whether an operator made it or the script armed it after a run of busy ticks.
+
 Two traps worth knowing before they cost you an evening:
 
 - **The config file is sourced as shell, so quote anything with a space.**
@@ -1268,8 +1286,9 @@ Two traps worth knowing before they cost you an evening:
   failure mode here that leaves no trace anywhere.
 
 `HEALTH_URL` is the only address to get right; `/metrics` and
-`/v1/runpod/status` are derived from it. On the Digesta host the container's
-8776 is published on 8777, so it is `http://127.0.0.1:8777/healthz`.
+`/v1/runpod/status` are derived from it. When the container's 8776 is published on another
+port, that is the one to name — `http://127.0.0.1:8777/healthz` for a host
+publishing it on 8777.
 
 State and history live in `${XDG_STATE_HOME:-~/.local/state}/coderai`:
 `autoupgrade.log` (trimmed, since this runs 24 times a day), `restart-pending`

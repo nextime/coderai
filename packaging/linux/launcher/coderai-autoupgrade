@@ -26,11 +26,58 @@
 # and never book a forced restart. Anything above 0 is a promise that the upgrade
 # WILL land, at midnight at the latest.
 #
+# An operator overrides all of that with `--force` (take the upgrade on this run,
+# busy or not), `--force-at WHEN` (book one) or `--cancel-force`. See --help.
+#
 # Exit 0: nothing to do, upgraded and healthy, or deliberately deferred.
 # Exit 1: the upgrade or the restart failed -- and then the message says whether
 #         a rollback happened, because that is the only thing an operator who
 #         reads one line needs to know.
 set -uo pipefail
+
+# ------------------------------------------------------------------ the operator
+# Everything above describes the UNATTENDED policy: wait for an idle moment, and
+# book a forced upgrade only when the host never has one. An operator who wants
+# the upgrade NOW is not covered by that policy, and the only way to say so used
+# to be to write an epoch into the booking file by hand -- undocumented, easy to
+# get wrong, and it leaves a booking behind that forces every later run too.
+FORCE_NOW=0
+FORCE_AT_SPEC=""
+CANCEL_FORCE=0
+usage(){
+    cat <<'EOF'
+coderai-autoupgrade [options]
+
+Unattended in-place upgrade for a CoderAI orchestrator. With no options it
+follows the configured policy: upgrade when the host is idle, defer when it is
+busy. See the comments at the top of this script, and the conf file it sources.
+
+  -f, --force         upgrade and restart on THIS run, idle or not. Work in
+                      flight WILL be interrupted. Leaves no booking behind.
+      --force-at WHEN book a forced upgrade for WHEN (anything `date -d` takes,
+                      e.g. 'tomorrow 02:00', '+2 hours', 'now'). The ordinary
+                      timer fires it; nothing else has to be installed.
+      --cancel-force  cancel a booked forced upgrade, whether this script booked
+                      it after a run of busy ticks or an operator did.
+  -h, --help          this text.
+
+Exit 0: nothing to do, upgraded and healthy, or deliberately deferred.
+Exit 1: the upgrade or the restart failed (the message says whether it rolled
+        back).
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f|--force)     FORCE_NOW=1 ;;
+        --force-at)     [ $# -ge 2 ] || { echo "autoupgrade: --force-at needs a time" >&2; exit 2; }
+                        FORCE_AT_SPEC="$2"; shift ;;
+        --force-at=*)   FORCE_AT_SPEC="${1#*=}" ;;
+        --cancel-force) CANCEL_FORCE=1 ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "autoupgrade: unknown option '$1' (try --help)" >&2; exit 2 ;;
+    esac
+    shift
+done
 
 CONF="${CODERAI_AUTOUPGRADE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/coderai/autoupgrade.conf}"
 
@@ -117,6 +164,32 @@ if [ -f "$LOG" ] && [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX_LI
         && mv "$LOG.trim" "$LOG"
 fi
 
+# --cancel-force and --force-at only touch the booking and leave: they are how an
+# operator edits the schedule, not a run of it. Done here, where $FORCE_AT and the
+# log exist, so the change is recorded in the same log as the runs it affects.
+if [ "$CANCEL_FORCE" = 1 ]; then
+    if [ -f "$FORCE_AT" ]; then
+        rm -f "$FORCE_AT"; say "booked forced upgrade CANCELLED by --cancel-force"
+    else
+        say "no forced upgrade was booked; nothing to cancel"
+    fi
+    exit 0
+fi
+if [ -n "$FORCE_AT_SPEC" ]; then
+    _at="$(date -d "$FORCE_AT_SPEC" +%s 2>/dev/null || true)"
+    case "${_at:-}" in
+        ''|*[!0-9]*) say "FAIL: --force-at '$FORCE_AT_SPEC' is not a time this host's date(1) understands"; exit 1 ;;
+    esac
+    echo "$_at" > "$FORCE_AT"
+    say "FORCED upgrade booked for $(date -d "@$_at" '+%F %T' 2>/dev/null || echo "$_at") by --force-at"
+    say "      The next timer tick at or after that moment upgrades and restarts"
+    say "      with work in flight. Cancel it with --cancel-force."
+    exit 0
+fi
+if [ "$FORCE_NOW" = 1 ]; then
+    say "--force: this run ignores the idle check and the deferral policy"
+fi
+
 [ -n "$RUNNER" ] || { say "FAIL: no coderai-docker on PATH (set RUNNER= in $CONF)"; exit 1; }
 [ -x "$RUNNER" ] || { say "FAIL: RUNNER '$RUNNER' is not executable"; exit 1; }
 
@@ -138,6 +211,7 @@ if [ -f "$FORCE_AT" ]; then
     _at="$(cat "$FORCE_AT" 2>/dev/null || echo 0)"
     say "config: a FORCED upgrade is booked for $(date -d "@$_at" '+%F %T' 2>/dev/null || echo "$_at")"
 fi
+
 
 # ---------------------------------------------------------------------- the lock
 # flock on a dedicated fd, non-blocking: a run that overlaps the previous one is
@@ -259,7 +333,7 @@ arm_midnight_force(){
     say "NEVER IDLE for $n run(s) — booking a FORCED upgrade for $(date -d "@$at" '+%F %T' 2>/dev/null || echo "$at")."
     say "      It will restart the service even with work in flight, because an"
     say "      install that is busy every hour otherwise never upgrades at all."
-    say "      Cancel it by deleting $FORCE_AT."
+    say "      Cancel it with: coderai-autoupgrade --cancel-force"
 }
 
 # Is a booked forced upgrade due? Clears the booking either way it is used, so a
@@ -340,6 +414,11 @@ restart_and_verify(){
 BEFORE="$(baked_version)"
 [ -n "$BEFORE" ] || { say "FAIL: cannot read the version from $IMAGE_TAG (wrong tag? engine '$ENGINE'?)"; exit 1; }
 
+# --force reaches the restart step too. A host whose upgrade has been sitting in
+# the image for days behind a deferral is exactly the case an operator types
+# --force for, and that path skips the block below entirely.
+FORCED="$FORCE_NOW"
+
 if [ -f "$PENDING" ]; then
     # A previous run upgraded the image but could not restart. Do not upgrade
     # again on top of that; land what is already there first.
@@ -348,7 +427,13 @@ else
     # Nothing is touched while CoderAI is serving. Checked BEFORE the upgrade and
     # not only before the restart, so a busy host never even reaches the state
     # where new code sits in the image waiting for a window.
-    if force_due; then
+    if [ "$FORCE_NOW" = 1 ]; then
+        # Asked for on the command line. Still clear any booking: the operator
+        # is taking the upgrade now, so a deadline made for the same upgrade has
+        # nothing left to fire for.
+        rm -f "$FORCE_AT"
+        say "FORCED UPGRADE (--force) — proceeding with work possibly in flight."
+    elif force_due; then
         FORCED=1
         say "FORCED UPGRADE (booked because this host was never idle) — proceeding"
         say "      with work possibly in flight. Requests being served WILL be"

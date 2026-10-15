@@ -83,8 +83,7 @@ def test_arming_says_when_and_how_to_cancel(tmp_path):
     r = _harness(tmp_path, 'arm_midnight_force 3')
     out = r.stdout
     assert "FORCED upgrade" in out
-    assert "Cancel it by deleting" in out
-    assert "force-upgrade-at" in out
+    assert "--cancel-force" in out
     assert "restart the service even with work in flight" in out
 
 
