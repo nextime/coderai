@@ -140,3 +140,64 @@ def test_the_detector_uses_the_existence_check_not_the_path_one():
     blk = src.split("def _is_bge_m3")[1].split("\ndef ")[0]
     assert "_repo_has_file(" in blk
     assert "_resolve_repo_file(" not in blk
+
+
+# ------------------------------------------- and then the heads must ARRIVE #
+def test_the_head_is_downloaded_when_it_is_not_cached(monkeypatch, no_local):
+    """Detecting the head is not having it. `from_pretrained` fetches the
+    config and the weights the config NAMES — `sparse_linear.pt` is neither,
+    so after the base model loads it is still absent on a fresh machine, and a
+    cache-only lookup reports "This model has no sparse head." That reads as a
+    property of the model rather than of the disk."""
+    import huggingface_hub
+    calls = []
+
+    def _dl(repo, fname, *a, **k):
+        calls.append((repo, fname, k.get("local_files_only")))
+        return "/tmp/fetched.pt"
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _dl, raising=False)
+    monkeypatch.setattr(emb.os.path, "isfile", lambda p: p == "/tmp/fetched.pt")
+    got = emb._fetch_repo_file("BAAI/bge-m3", "sparse_linear.pt")
+    assert got == "/tmp/fetched.pt"
+    # Downloaded for real: local_files_only must NOT be set on this call.
+    assert calls and not calls[0][2]
+
+
+def test_a_cached_head_is_not_downloaded_again(monkeypatch):
+    monkeypatch.setattr(emb, "_resolve_repo_file", lambda *a, **k: "/cache/h.pt")
+    import huggingface_hub
+
+    def _boom(*a, **k):
+        raise AssertionError("downloaded a file that was already here")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _boom, raising=False)
+    assert emb._fetch_repo_file("BAAI/bge-m3", "sparse_linear.pt") == "/cache/h.pt"
+
+
+def test_a_head_that_cannot_be_fetched_means_the_dense_path(monkeypatch, no_local):
+    """None, not an exception: the caller already handles a model with no
+    head, and a network blip must not turn into a failed load."""
+    import huggingface_hub
+
+    def _boom(*a, **k):
+        raise OSError("gated repo")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _boom, raising=False)
+    assert emb._fetch_repo_file("BAAI/bge-m3", "sparse_linear.pt") is None
+
+
+def test_offline_does_not_fetch_heads(monkeypatch, no_local):
+    import huggingface_hub
+
+    def _boom(*a, **k):
+        raise AssertionError("reached the network while offline")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _boom, raising=False)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert emb._fetch_repo_file("BAAI/bge-m3", "sparse_linear.pt") is None
+
+
+def test_the_head_loader_fetches_rather_than_resolves():
+    """The two read almost identically at the call site and only one of them
+    works on a machine that has never seen the repo."""
+    src = (ROOT / "codai/api/embeddings.py").read_text()
+    blk = src.split("def _load_bge_m3")[1].split("\ndef ")[0]
+    assert "_fetch_repo_file(" in blk
+    assert "_resolve_repo_file(" not in blk

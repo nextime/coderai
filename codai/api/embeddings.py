@@ -401,6 +401,40 @@ def _repo_has_file(model_name: str, filename: str) -> bool:
     return found
 
 
+def _fetch_repo_file(model_name: str, filename: str):
+    """Local path to ``filename``, DOWNLOADING it if it is not already here.
+
+    The companion to `_resolve_repo_file`, for files that must actually be
+    read rather than merely detected. Needed because a repo's extra files are
+    not part of what `from_pretrained` fetches: it pulls the config and the
+    weights the config names, and nothing else. bge-m3's `sparse_linear.pt`
+    and `colbert_linear.pt` are plain tensors sitting beside the model, so on
+    a machine that has never seen the repo they are simply absent after the
+    base model has loaded -- and a cache-only lookup then reports a model with
+    no sparse head, which is indistinguishable from a model that has none.
+
+    Returns None rather than raising: a head that cannot be fetched means the
+    dense path, which is what the caller already handles.
+    """
+    got = _resolve_repo_file(model_name, filename)
+    if got is not None:
+        return got
+    import os
+    if os.path.isdir(model_name):
+        return None                  # a local dir IS the whole answer
+    if str(os.environ.get("HF_HUB_OFFLINE") or "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(model_name, filename)
+        return path if path and os.path.isfile(path) else None
+    except Exception as exc:
+        print(f"[embeddings] could not fetch {filename} for {model_name!r}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
 def _is_bge_m3(model_name: str, trust: bool) -> bool:
     """True if the repo is a bge-m3-style multi-vector embedder.
 
@@ -440,7 +474,12 @@ def _load_bge_m3(model_name: str, device, model_config):
     model.eval()
 
     def _load_head(fname):
-        path = _resolve_repo_file(model_name, fname)
+        # FETCH, not resolve. `from_pretrained` above downloaded the config and
+        # the weights the config names -- these heads are neither, so on a
+        # machine that has never seen this repo they are still absent here.
+        # Resolving from cache therefore reported "no sparse head" on every
+        # freshly rented pod, which reads as a property of the MODEL.
+        path = _fetch_repo_file(model_name, fname)
         if not path:
             return None
         sd = torch.load(path, map_location='cpu', weights_only=True)
