@@ -553,14 +553,24 @@ def _load_lora_runtime(url: str, model_config: dict, served_name: str) -> bool:
     spec = next((s for s in _sibling_lora_specs(model_config or {})
                  if str(s.get("name") or "") == want), None)
     if spec is None:
+        print(f"[lora] {want!r} is not an adapter of this model here — nothing "
+              f"to add to the running engine", flush=True)
         return False
+    src = str(spec.get("source") or "")
     try:
         from codai.models.text_loras import local_path
-        src = str(spec.get("source") or "")
         path = local_path(src) if src.startswith(("sha256:", "name:")) else src
-    except Exception:
+    except Exception as exc:
+        print(f"[lora] could not resolve {src} ({exc})", flush=True)
         path = ""
     if not path:
+        # Said out loud because the alternative is this function returning
+        # False with no explanation, and the engine then serving the BASE
+        # under the adapter's name. That is exactly how an id mismatch between
+        # the catalogue and the blob store stayed invisible for three releases.
+        print(f"[lora] {want!r}: {src} is not in this machine's blob store — "
+              f"cannot add it to the running engine. The catalogue and the "
+              f"store disagree about this adapter's id.", flush=True)
         return False
     body = _json.dumps({"lora_name": want, "lora_path": path}).encode()
     req = urllib.request.Request(url.rstrip("/") + "/v1/load_lora_adapter",

@@ -333,18 +333,36 @@ def save_lora_blob(data: bytes) -> tuple:
     from a flag, so the sender does not have to declare the shape.
     """
     import hashlib
-    from codai.models.text_loras import is_bundle
+    import shutil
+    from codai.models.text_loras import blob_id, is_bundle
     h = hashlib.sha256(data).hexdigest()
     if is_bundle(data):
-        dest = os.path.join(_lora_blob_dir(), h)
-        if os.path.isdir(dest):
-            return h, True
-        tmp = dest + ".tmp"
-        import shutil
+        # The id must name the CONTENT, not the container it arrived in. A tar
+        # of the same adapter made by GNU tar, by this bundler, or by anything
+        # else hashes differently -- mtimes, ownership, member order -- so an
+        # id taken from the uploaded bytes is one that nobody else can
+        # reproduce. Measured live: a client uploaded a tar hashing to
+        # b8eac366…, the catalogue recorded that, every subsequent push
+        # re-bundled the unpacked directory and stored 2e820c…, and the pod
+        # looked up b8eac366… and got a 404. It HAD the bytes, under another
+        # name, and so served the base model under the adapter's name.
+        #
+        # So an uploaded bundle is unpacked first and stored under the id of
+        # THIS bundler's packing of it, which is what every side computes.
+        tmp = os.path.join(_lora_blob_dir(), f"incoming-{h}.tmp")
         shutil.rmtree(tmp, ignore_errors=True)
         _unpack_lora_bundle(data, tmp)
+        canonical = (blob_id(tmp) or f"sha256:{h}").split(":", 1)[-1]
+        dest = os.path.join(_lora_blob_dir(), canonical)
+        if os.path.isdir(dest):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return canonical, True
         os.replace(tmp, dest)
-        return h, False
+        if canonical != h:
+            print(f"[lora] stored an uploaded bundle as {canonical[:12]}… "
+                  f"(its own bytes hashed to {h[:12]}…): the id names the "
+                  f"content, so any sender computes the same one", flush=True)
+        return canonical, False
     p = os.path.join(_lora_blob_dir(), f"{h}.safetensors")
     if os.path.isfile(p):
         return h, True

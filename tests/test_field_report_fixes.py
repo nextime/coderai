@@ -387,3 +387,91 @@ async def test_the_base_model_is_not_listed_as_an_adapter(monkeypatch):
     _catalogue(monkeypatch, [dict(BASE_MODEL)])
     monkeypatch.setattr(loras, "_loras_dir", lambda: "/nonexistent")
     assert (await loras.list_loras())["loras"] == []
+
+
+# ============================================================ adapter ids
+# An uploaded bundle was stored under the hash of THE BYTES THAT ARRIVED. A tar
+# of the same adapter made by GNU tar, by coderai's bundler, or by anything
+# else hashes differently — mtimes, ownership, member order — so the id in the
+# catalogue was one nobody else could reproduce. Measured live: the client
+# uploaded a tar hashing to b8eac366…, every later push re-bundled the unpacked
+# directory and stored 2e820c…, and the pod looked up b8eac366… and 404'd. It
+# had the bytes under another name, so it served the BASE under the adapter's
+# name — fluently, with nothing in the response to say so.
+def test_an_uploaded_bundle_is_stored_under_its_canonical_content_id(tmp_path,
+                                                                     monkeypatch):
+    import hashlib
+    import io
+    import tarfile
+
+    from codai.api import loras
+    from codai.models import text_loras
+
+    src = tmp_path / "adapter"
+    src.mkdir()
+    (src / "adapter_config.json").write_text('{"r": 8}')
+    (src / "adapter_model.safetensors").write_bytes(b"\x00" * 2048)
+
+    # A tar made by someone ELSE: different mtimes, so different bytes.
+    foreign = io.BytesIO()
+    with tarfile.open(fileobj=foreign, mode="w") as tf:
+        for f in sorted(src.iterdir()):
+            info = tarfile.TarInfo(f.name)
+            info.size = f.stat().st_size
+            info.mtime = 1700000000          # not what bundle_dir writes
+            with open(f, "rb") as fh:
+                tf.addfile(info, fh)
+    uploaded = foreign.getvalue()
+
+    store = tmp_path / "blobs"
+    store.mkdir()
+    monkeypatch.setattr(loras, "_lora_blob_dir", lambda: str(store))
+
+    h, existed = loras.save_lora_blob(uploaded)
+    assert not existed
+    # NOT the hash of the bytes that arrived…
+    assert h != hashlib.sha256(uploaded).hexdigest()
+    # …but the id any side computes from the content it now holds.
+    assert f"sha256:{h}" == text_loras.blob_id(str(store / h))
+
+
+def test_re_uploading_the_same_adapter_is_recognised(tmp_path, monkeypatch):
+    """Two different tars of one adapter must not become two blobs."""
+    import io
+    import tarfile
+
+    from codai.api import loras
+
+    src = tmp_path / "a"
+    src.mkdir()
+    (src / "adapter_config.json").write_text('{"r": 4}')
+
+    def _tar(mtime):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            info = tarfile.TarInfo("adapter_config.json")
+            data = (src / "adapter_config.json").read_bytes()
+            info.size = len(data)
+            info.mtime = mtime
+            tf.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    store = tmp_path / "blobs"
+    store.mkdir()
+    monkeypatch.setattr(loras, "_lora_blob_dir", lambda: str(store))
+
+    first, e1 = loras.save_lora_blob(_tar(1700000000))
+    second, e2 = loras.save_lora_blob(_tar(1800000000))
+    assert first == second and not e1 and e2
+    assert len([p for p in store.iterdir() if p.is_dir()]) == 1
+
+
+def test_a_plain_file_adapter_still_hashes_as_itself(tmp_path, monkeypatch):
+    from codai.api import loras
+    import hashlib
+    store = tmp_path / "blobs"
+    store.mkdir()
+    monkeypatch.setattr(loras, "_lora_blob_dir", lambda: str(store))
+    data = b"not a tar, just safetensors bytes"
+    h, existed = loras.save_lora_blob(data)
+    assert h == hashlib.sha256(data).hexdigest() and not existed
