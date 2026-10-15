@@ -84,7 +84,7 @@ async def test_broker_client_waits_for_registered_before_register():
             json.dumps(
                 {
                     "event": "registered",
-                    "accepted": True,
+                    "status": "ok",
                     "session_id": "session-123",
                 }
             ),
@@ -137,7 +137,7 @@ async def test_broker_client_waits_for_registered_before_register():
 @pytest.mark.anyio("asyncio")
 async def test_broker_client_rejects_registered_ack_without_session_id():
     websocket = FakeWebSocket(
-        [json.dumps({"event": "registered", "accepted": True, "session_id": ""})]
+        [json.dumps({"event": "registered", "status": "ok", "session_id": ""})]
     )
     runtime = BrokerRuntimeConfig(
         enabled=True,
@@ -157,7 +157,7 @@ async def test_broker_client_rejects_registered_ack_without_session_id():
 async def test_broker_client_passes_connect_timeout_to_websocket_connection():
     websocket = FakeWebSocket(
         [
-            json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"}),
+            json.dumps({"event": "registered", "status": "ok", "session_id": "session-123"}),
             json.dumps({"request_id": "session-123", "status": "ok"}),
         ]
     )
@@ -183,7 +183,7 @@ async def test_broker_client_passes_connect_timeout_to_websocket_connection():
 async def test_broker_client_applies_request_timeout_to_socket_reads():
     websocket = FakeWebSocket(
         [
-            json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"}),
+            json.dumps({"event": "registered", "status": "ok", "session_id": "session-123"}),
             json.dumps({"request_id": "session-123", "status": "ok"}),
         ]
     )
@@ -207,7 +207,7 @@ async def test_broker_client_applies_request_timeout_to_socket_reads():
 async def test_broker_client_rejects_failed_register_ack():
     websocket = FakeWebSocket(
         [
-            json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"}),
+            json.dumps({"event": "registered", "status": "ok", "session_id": "session-123"}),
             json.dumps({"request_id": "session-123", "status": "error"}),
         ]
     )
@@ -226,7 +226,7 @@ async def test_broker_client_stores_registered_session_metadata():
             json.dumps(
                 {
                     "event": "registered",
-                    "accepted": True,
+                    "status": "ok",
                     "session_id": "session-123",
                     "provider_id": "provider-1",
                     "client_id": "client-1",

@@ -96,7 +96,7 @@ def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_pa
     app.dependency_overrides.clear()
 
 
-def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, tmp_path):
+def test_model_configure_edits_an_existing_whisper_server_model_in_place(monkeypatch, tmp_path):
     from codai.admin import routes
 
     cfg = _build_config(tmp_path)
@@ -127,8 +127,18 @@ def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, 
         },
     )
 
-    assert response.status_code in {400, 409}
-    assert "duplicate" in response.text.lower() or "already" in response.text.lower()
+    # Posting an id that already exists is an EDIT, not a duplicate. The
+    # handler says so where it does it: "Update in place when the id already
+    # exists … Otherwise editing an existing whisper-server model would either
+    # 409 or silently create a duplicate config." This test asked for the 409
+    # that was deliberately removed.
+    assert response.status_code == 200
+    audio = cfg.models_data["audio_models"]
+    assert len([m for m in audio if m.get("id") == "whisper-vulkan-base"]) == 1
+    edited = next(m for m in audio if m.get("id") == "whisper-vulkan-base")
+    assert edited["model_path"] == "/models/ggml-small.bin"
+    assert edited["port"] == 8745
+    assert edited["gpu_device"] == 1
 
     app.dependency_overrides.clear()
 
@@ -464,15 +474,23 @@ def test_model_load_and_unload_manage_whisper_server_runtime(monkeypatch):
     from codai.api.app import app
     from codai.models.manager import multi_model_manager
 
+    # `is_running` has to answer honestly, not always True: loading a server
+    # that is ALREADY running is correctly a no-op, so a fake that claims to be
+    # up and then expects start() to be called is asking for a double start.
     runtime = SimpleNamespace(
         started=[],
         stopped=False,
-        is_running=lambda: True,
         start=lambda model_path=None, gpu_device=0: runtime.started.append((model_path, gpu_device)) or model_path,
-        cleanup=lambda: setattr(runtime, "stopped", True),
         _model_path="/models/ggml-base.bin",
         _gpu_device=0,
     )
+    # `stop` is the primitive and `cleanup` an alias for it on the real class;
+    # the unload path calls stop(). The fake defined only cleanup, so stop()
+    # raised AttributeError into an `except Exception: pass` and the test saw
+    # a server that was never stopped — with nothing anywhere saying why.
+    runtime.stop = lambda: setattr(runtime, "stopped", True)
+    runtime.cleanup = runtime.stop
+    runtime.is_running = lambda: bool(runtime.started) and not runtime.stopped
 
     monkeypatch.setattr(
         routes,
@@ -515,36 +533,37 @@ def test_model_load_and_unload_manage_whisper_server_runtime(monkeypatch):
 
 
 def test_transcription_requires_configured_whisper_server_model_id():
-    import asyncio
+    """Asking for whisper-server with none configured is a clear refusal.
 
-    from codai.api import transcriptions
+    This used to call the endpoint FUNCTION directly. A FastAPI handler's
+    unpassed parameters are then `Form(...)` sentinels rather than values, and
+    the first arithmetic on one fails with
+
+        TypeError: unsupported operand type(s) for +: 'Form' and 'Form'
+
+    which says nothing about transcription and breaks whenever the signature
+    grows a field. Driving the real route exercises the same refusal and is
+    immune to that.
+    """
+    from fastapi.testclient import TestClient
+
+    from codai.api.app import app
     from codai.models.manager import multi_model_manager
 
     multi_model_manager.whisper_servers.clear()
     multi_model_manager.models.clear()
     multi_model_manager.audio_models[:] = []
 
-    class DummyUpload:
-        filename = "sample.wav"
+    client = TestClient(app)
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("sample.wav", b"audio", "audio/wav")},
+        data={"model": "whisper-server", "response_format": "json"},
+    )
 
-        async def read(self):
-            return b"audio"
-
-    async def run_call():
-        return await transcriptions.create_transcription(
-            model="whisper-server",
-            file=DummyUpload(),
-            language=None,
-            prompt=None,
-            response_format="json",
-            temperature=0.0,
-        )
-
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(run_call())
-
-    assert exc.value.status_code in {400, 404}
-    assert "not configured" in str(exc.value.detail).lower() or "not available" in str(exc.value.detail).lower()
+    assert response.status_code in {400, 404}
+    body = response.text.lower()
+    assert "not configured" in body or "not available" in body
 
 
 def test_whisper_alias_prefers_idle_instance(monkeypatch):
@@ -672,10 +691,19 @@ def test_settings_api_does_not_return_whisper_fields(monkeypatch):
     app.dependency_overrides[routes.require_admin] = lambda: "admin"
 
     client = TestClient(app)
-    response = client.get("/admin/api/settings")
+    # There is no GET for settings any more — the API only UPDATES them — so
+    # "what the settings response contains" is no longer a thing that exists.
+    # The contract this test protected survives: whisper is configured per
+    # MODEL (an audio_models entry), never as a global settings field.
+    assert client.get("/admin/api/settings").status_code == 405
 
-    assert response.status_code == 200
-    assert "whisper" not in response.json()
+    # …and the settings endpoint does not touch whisper at all: a
+    # whisper-server is configured as an audio_models ENTRY, with its own
+    # server_path, port and gpu_device, never as a global setting.
+    import inspect
+
+    src = inspect.getsource(routes.api_save_settings).lower()
+    assert "whisper" not in src
 
     app.dependency_overrides.clear()
 
@@ -774,7 +802,10 @@ def test_models_template_submits_whisper_server_source_and_resolved_gguf_path():
     assert "? document.getElementById('ws-gguf-select').value" in template
     assert ": document.getElementById('ws-model-path').value.trim()) || null;" in template
     assert "model_source: modelSource," in template
-    assert "model_path: getWhisperServerModelPath()," in template
+    # The call was hoisted into a local so the three reads happen together;
+    # what matters is that the payload's model_path still comes FROM it.
+    assert "const modelPath = getWhisperServerModelPath();" in template
+    assert "model_path: modelPath," in template
 
 
 def test_models_template_uses_fixed_cached_gguf_default_without_route_context():

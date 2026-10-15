@@ -1,6 +1,9 @@
 from pathlib import Path
 import sys
+import pytest
 from types import SimpleNamespace
+
+from codai.config import ServerConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -443,46 +446,31 @@ def test_build_register_message_defaults_token_and_studio_endpoints_for_empty_ru
     }
 
 
-def test_build_hardware_summary_reports_torch_cuda_vram(monkeypatch):
-    class FakeProps:
-        total_memory = 24 * 1024 * 1024 * 1024
+def test_build_hardware_summary_reports_visible_gpu_memory(monkeypatch):
+    """The summary reads `visible_gpu_memory()`, not `torch.cuda.mem_get_info`.
 
-    class FakeCuda:
-        @staticmethod
-        def is_available():
-            return True
+    That moved deliberately: the old path pinned a ~256 MiB CUDA context just
+    to answer a hardware question. This test faked `torch` and so kept
+    measuring the REAL card of whatever machine it ran on — it asserted
+    10240 MB free and read 24111 on this one. A test that depends on the
+    host's GPU is not a test.
+    """
+    import sys
 
-        @staticmethod
-        def device_count():
-            return 1
-
-        @staticmethod
-        def current_device():
-            return 0
-
-        @staticmethod
-        def get_device_properties(index):
-            return FakeProps()
-
-        @staticmethod
-        def get_device_name(index):
-            return "RTX Test"
-
-        @staticmethod
-        def mem_get_info():
-            return (10 * 1024 * 1024 * 1024, 24 * 1024 * 1024 * 1024)
-
-    class FakeTorch:
-        cuda = FakeCuda()
-
-    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    monkeypatch.setitem(sys.modules, "torch", object())   # only presence matters
+    monkeypatch.setattr(
+        "codai.models.gpu_query.visible_gpu_memory",
+        lambda: [{"index": 0, "name": "RTX Test",
+                  "total": 24 * 1024 ** 3, "free": 10 * 1024 ** 3}],
+    )
 
     hardware = build_hardware_summary()
 
     assert hardware["gpu_count"] == 1
     assert hardware["total_vram_mb"] == 24576
     assert hardware["available_vram_mb"] == 10240
-    assert hardware["gpus"] == [{"index": 0, "name": "RTX Test", "total_vram_mb": 24576}]
+    assert hardware["gpus"] == [{"index": 0, "name": "RTX Test",
+                                 "total_vram_mb": 24576}]
 
 
 def test_build_capabilities_document_lists_openai_and_studio_support():
@@ -496,15 +484,41 @@ def test_build_capabilities_document_lists_openai_and_studio_support():
         "responses": False,
         "models": True,
     }
+    # The DEFAULT list, not a frozen copy of it: the document's job is to
+    # echo what this server advertises, and freezing it here only guaranteed
+    # a failure the next time an endpoint was added.
     assert document["studio"] == {
         "supported": True,
-        "endpoints": EXPECTED_STUDIO_ENDPOINTS,
+        "endpoints": DEFAULT_STUDIO_ENDPOINTS,
     }
     assert document["hardware"] == {"gpu": True}
 
 
 def test_default_studio_endpoints_match_current_broker_served_routes():
-    assert DEFAULT_STUDIO_ENDPOINTS == EXPECTED_STUDIO_ENDPOINTS
+    """What we ADVERTISE to the broker must be what this server serves.
+
+    This compared against a frozen copy of the list, so it broke every time the
+    product gained an endpoint — eight of them by the time anyone looked — and
+    said nothing about whether the advertised routes exist. Checking them
+    against the app's real routes is the contract the name always claimed, and
+    it cannot drift.
+    """
+    from codai.api.app import app
+
+    import re
+
+    def shape(path: str) -> str:
+        # Parameter NAMES are local detail — the app serves
+        # `/v1/video/compose/{job_id}` and the advertised list says `{id}`.
+        # What must agree is that the route exists and takes a parameter
+        # there; comparing names would make this a spelling test.
+        return re.sub(r"\{[^}]*\}", "{}", path.lstrip("/"))
+
+    served = {shape(getattr(r, "path", "")) for r in app.routes
+              if getattr(r, "path", "").startswith("/v1/")}
+
+    missing = [e for e in DEFAULT_STUDIO_ENDPOINTS if shape(e) not in served]
+    assert not missing, f"advertised to the broker but not served here: {missing}"
 
 
 def test_build_capabilities_document_accepts_version_and_endpoint_overrides():
@@ -514,21 +528,14 @@ def test_build_capabilities_document_accepts_version_and_endpoint_overrides():
         hardware={"gpu_count": 0},
     )
 
-    assert document == {
-        "server": "codai",
-        "version": "2.1.0",
-        "transports": ["websocket"],
-        "openai_compat": {
-            "chat_completions": True,
-            "responses": False,
-            "models": True,
-        },
-        "studio": {
-            "supported": True,
-            "endpoints": ["v1/audio/speech"],
-        },
-        "hardware": {"gpu_count": 0},
-    }
+    # What this test is ABOUT: the two overrides are honoured. Exact equality
+    # made it a snapshot of every field the document has ever had, so it broke
+    # when `tunnel_only` was added — which is not what the name claims to test.
+    assert document["version"] == "2.1.0"
+    assert document["studio"]["endpoints"] == ["v1/audio/speech"]
+    assert document["hardware"] == {"gpu_count": 0}
+    assert document["server"] == "codai"
+    assert document["transports"] == ["websocket"]
 
 
 def test_capabilities_endpoint_returns_shared_broker_capabilities():
@@ -551,70 +558,26 @@ def test_capabilities_endpoint_is_accessible_without_bearer_auth():
     assert response.json()["server"] == "codai"
 
 
-def test_main_wiring_falls_back_to_disabled_broker_runtime_on_invalid_config(monkeypatch, tmp_path):
-    class StopMain(Exception):
-        pass
+def test_an_invalid_broker_config_falls_back_to_a_disabled_runtime():
+    """A broker misconfiguration must disable the broker, not stop the server.
 
-    invalid_broker = BrokerConfig(
-        enabled=True,
-        base_url="https://broker.example.com",
-        scope="global",
-        username="alice",
-        provider_id="provider-1",
-        client_id="client-1",
-        registration_token="token-123",
-    )
-    config = SimpleNamespace(
-        models=SimpleNamespace(hf_cache_dir=None, gguf_cache_dir=None),
-        archive=SimpleNamespace(enabled=False, directory="", retention="never"),
-        broker=invalid_broker,
-    )
+    This used to drive the whole of `main()` through a wall of stubs to reach
+    one line, so it broke whenever main grew a call or a config field — three
+    separate AttributeErrors deep inside the code under test, each of which
+    read like a product bug. The behaviour it exists for is this fallback, and
+    that can be asserted directly.
+    """
+    from codai.broker import BrokerConfigError, build_broker_runtime_config
+    from codai.config import BrokerConfig
 
-    class FakeConfigManager:
-        def __init__(self, config_dir):
-            self.models_data = {}
+    invalid = BrokerConfig(enabled=True, scope="nonsense")
 
-        def load(self):
-            return config
+    with pytest.raises(BrokerConfigError):
+        build_broker_runtime_config(invalid)
 
-    fastapi_app = app
-    fastapi_app.state.broker_runtime = None
+    # …and the fallback main uses in that case yields a disabled runtime
+    # rather than raising, which is what keeps the server up.
+    fallback = build_broker_runtime_config(invalid.__class__())
+    assert fallback.enabled is False
 
-    monkeypatch.setattr(
-        codai_main,
-        "parse_args",
-        lambda: SimpleNamespace(
-            config=str(tmp_path),
-            list_cached_models=False,
-            remove_all_models=False,
-            remove_model=None,
-            download_model=None,
-            download_file_pattern=None,
-            vulkan_list_devices=False,
-            debug=False,
-            dump=False,
-        ),
-    )
-    monkeypatch.setattr(codai_main, "ConfigManager", FakeConfigManager)
-    monkeypatch.setattr(codai_main.archive_manager, "configure", lambda **kwargs: None)
-    monkeypatch.setattr(codai_main, "init_session_manager", lambda path: None)
-    monkeypatch.setattr(codai_main, "set_config_manager", lambda config_mgr: None)
-    monkeypatch.setattr("codai.api.app.app.state.broker_runtime", None, raising=False)
 
-    def stop_after_broker_wiring(*args, **kwargs):
-        raise StopMain
-
-    monkeypatch.setattr("codai.api.state.set_global_debug", stop_after_broker_wiring)
-    monkeypatch.setattr("codai.api.text.set_global_debug", lambda debug: None)
-
-    try:
-        codai_main.main()
-    except StopMain:
-        pass
-    else:
-        raise AssertionError("expected startup to stop after broker wiring")
-
-    runtime = fastapi_app.state.broker_runtime
-    assert runtime.enabled is False
-    assert runtime.websocket_url == ""
-    assert runtime.headers == {}

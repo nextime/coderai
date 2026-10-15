@@ -148,9 +148,16 @@ def test_the_profile_uses_the_custom_dockerfile_escape_hatch():
 
 
 def test_the_image_builds_the_310_venv_from_the_same_requirements_file():
-    """One source of truth: the pod and a local install must not drift."""
+    """One source of truth: the pod and a local install must not drift.
+
+    The literal `python3.10 -m venv` is gone: the venv is now built in a
+    `python:3.10-slim` STAGE, where that interpreter's own pip and headers
+    live, and copied across. What matters to this test is unchanged — the venv
+    is 3.10 and it comes from the same requirements file.
+    """
     assert "requirements-longcat.txt" in PODFILE
-    assert "python3.10 -m venv" in PODFILE
+    assert "PY310_IMAGE=python:3.10-slim" in PODFILE
+    assert "-m venv /opt/coderai/longcat_venv" in PODFILE
 
 
 def test_the_image_verifies_the_venv_rather_than_hoping():
