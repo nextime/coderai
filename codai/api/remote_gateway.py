@@ -429,6 +429,25 @@ def any_remote_configured() -> bool:
 
 
 def _any_remote_configured_uncached() -> bool:
+    """Is ANYTHING on this install placed somewhere other than here?
+
+    This gate decides whether the middleware looks at a request at all, so
+    anything it cannot see is served locally no matter what `model_placement`
+    would have said. It has to agree with `model_placement` on every way a
+    model can be placed away from this box, or the two disagree silently and
+    the symptom is a model loading HERE while the admin page, the test page
+    and /v1/models/test/state all report it as remote.
+
+    That is exactly what happened: it knew about capability endpoints,
+    capability pods and `service_url`, and NOT about a per-model `backend`.
+    An install whose remote models are all per-model RunPod pods -- no
+    capability pods, no service_url anywhere -- answered False, so the gateway
+    short-circuited EVERY request and the GPU-less orchestrator tried to load
+    bge-m3 itself. Five minutes of downloading from HuggingFace, then a 500.
+
+    OCR was unaffected and that is why this survived: the OCR manager asks
+    `placement.choose` itself rather than going through this middleware.
+    """
     if capability_endpoints() or capability_pods():
         return True
     try:
@@ -436,9 +455,22 @@ def _any_remote_configured_uncached() -> bool:
         md = getattr(config_manager, "models_data", None)
         if isinstance(md, dict):
             for lst in md.values():
-                if isinstance(lst, list):
-                    for m in lst:
-                        if isinstance(m, dict) and str(m.get("service_url") or "").strip():
+                if not isinstance(lst, list):
+                    continue
+                for m in lst:
+                    if not isinstance(m, dict):
+                        continue
+                    if str(m.get("service_url") or "").strip():
+                        return True
+                    # The same two tests `model_placement` makes, and for the
+                    # same reason: a block without its backend is a leftover,
+                    # and a backend without its block is nothing to route to.
+                    backend = str(m.get("backend") or "").strip().lower()
+                    if backend == "runpod" and isinstance(m.get("runpod"), dict):
+                        return True
+                    if backend == "host" and isinstance(m.get("host"), dict):
+                        hb = m["host"]
+                        if str(hb.get("url") or "").strip() or hb.get("hosts"):
                             return True
     except Exception:
         pass
