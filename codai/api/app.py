@@ -102,6 +102,16 @@ async def lifespan(app: FastAPI):
     import asyncio as _asyncio
     boot_phase("lifespan start")
 
+    # Before anything schedules work: every `asyncio.to_thread` in this process
+    # uses the loop's default executor, and an untold loop sizes it for
+    # incidental background work rather than for a fan-out of blocking pod
+    # calls. See codai/api/thread_pool.py.
+    try:
+        from codai.api.thread_pool import install_default_executor
+        install_default_executor()
+    except Exception as exc:
+        print(f"[threads] could not size the default pool: {exc}", flush=True)
+
     async def _archive_cleanup_loop():
         from codai.api.archive import archive_manager
         while True:
@@ -853,18 +863,26 @@ async def runpod_spend(request: Request):
         raise HTTPException(status_code=403,
                             detail="this endpoint needs an admin-scoped API key")
     from codai.api import runpod_worker, runpod_ledger
-    try:
-        pods = runpod_worker.pods_status()
-    except Exception:
-        pods = []
-    try:
-        ledger = runpod_ledger.totals()
-    except Exception:
-        ledger = {"per_model": {}, "global": {}}
-    try:
-        schedules = runpod_worker.pools_schedule_status()
-    except Exception:
-        schedules = []
+
+    def _snapshot():
+        # Off the event loop. Each of these takes the pool locks and reads a
+        # file; none is slow by itself, but a lock held by a provisioning
+        # thread would otherwise stall the whole loop rather than one request.
+        try:
+            pods = runpod_worker.pods_status()
+        except Exception:
+            pods = []
+        try:
+            ledger = runpod_ledger.totals()
+        except Exception:
+            ledger = {"per_model": {}, "global": {}}
+        try:
+            schedules = runpod_worker.pools_schedule_status()
+        except Exception:
+            schedules = []
+        return pods, ledger, schedules
+
+    pods, ledger, schedules = await asyncio.to_thread(_snapshot)
     live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods if p.get("healthy"))
     live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
     caps = {}

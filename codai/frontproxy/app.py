@@ -977,8 +977,13 @@ class FrontProxy:
             if shared:
                 _rw.shared_pool_key(mcfg, model or "", "")   # raises if not shareable
             pool = _rw.get_pod_pool(key, rp, mcfg, served, shared=bool(shared))
-            # Provisioning blocks for minutes on a cold pod; keep the loop free.
-            handle, url = await _asyncio.to_thread(pool.acquire)
+            # Provisioning blocks for MINUTES on a cold pod. Keeping it off the
+            # loop was never enough: on the shared default executor, N of these
+            # waits occupy every thread the process has, and an unrelated
+            # request that merely needs one — the admin page asking what the
+            # fleet is doing — queues behind a pod boot. Its own pool.
+            from codai.api.thread_pool import run_on_pod_pool
+            handle, url = await run_on_pod_pool(pool.acquire)
         except Exception as exc:
             print("[runpod-spill] pod acquire failed, falling back to local: %s" % exc,
                   flush=True)
@@ -2904,6 +2909,13 @@ def build_app(config, config_dir=None) -> FastAPI:
 
     @app.on_event("startup")
     async def _startup():
+        # The front blocks on pool.acquire() for whole pod boots, so it needs
+        # the sized pools at least as much as the engine does.
+        try:
+            from codai.api.thread_pool import install_default_executor
+            install_default_executor()
+        except Exception as exc:
+            print(f"[threads] could not size the default pool: {exc}", flush=True)
         front.supervisor = EngineSupervisor(config, None, front.registry,
                                             models_path=front._models_path,
                                             internal_token=front.internal_token,

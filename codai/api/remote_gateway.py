@@ -956,7 +956,11 @@ class RemoteGatewayMiddleware:
             return pod_http.request(scope.get("method", "POST"), dest, data=body or None,
                                     headers=fwd, stream=True, timeout=(30, 3600))
         try:
-            resp = await asyncio.to_thread(_call)
+            # On the pod pool: one forwarded page can hold this thread for
+            # minutes, and `ocr.max_concurrency` of them must not be able to
+            # exhaust the executor every other endpoint shares.
+            from codai.api.thread_pool import run_on_pod_pool
+            resp = await run_on_pod_pool(_call)
             # The first request into a pod that came up seconds ago can land
             # before the far side is really serving — RunPod's proxy answers
             # 404 until its route settles, a catalogue may lag its /v1/models

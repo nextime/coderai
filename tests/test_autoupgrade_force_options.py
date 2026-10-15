@@ -60,7 +60,12 @@ def test_force_at_books_the_time_it_was_given(tmp_path):
     assert at is not None
     lt = time.localtime(at)
     assert (lt.tm_hour, lt.tm_min) == (2, 0), time.ctime(at)
-    assert time.time() < at <= time.time() + 86400 + 60
+    # "tomorrow 02:00" is between 2 and 26 hours away depending on the hour the
+    # suite runs. The first version of this asserted "within 24h" and went red
+    # at 00:22 — the test was wrong about the clock, not the code about the
+    # booking. What matters is that it is in the future and is tomorrow.
+    assert time.time() < at <= time.time() + 2 * 86400
+    assert lt.tm_mday == time.localtime(time.time() + 86400).tm_mday
 
 
 def test_force_at_takes_a_relative_time(tmp_path):
