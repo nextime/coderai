@@ -3058,7 +3058,38 @@ async def list_loras(_auth=Depends(_require_api_auth)):
                         meta = json.load(f)
                 except Exception:
                     pass
-            out.append({"name": name, "path": wf, **meta})
+            out.append({"name": name, "path": wf, "source": "trained", **meta})
+    # …and the adapters REGISTERED as servable names (/v1/loras/register).
+    # Those live in the model catalogue, not in the training registry, so this
+    # listed nothing after a successful registration — which reads exactly like
+    # the registration having failed.
+    seen = {e["name"] for e in out}
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+    except Exception:
+        md = {}
+    for lst in md.values():
+        if not isinstance(lst, list):
+            continue
+        for entry in lst:
+            if not isinstance(entry, dict) or not entry.get("loras"):
+                continue
+            nm = (str(entry.get("id") or "").strip()
+                  or str(entry.get("alias") or "").strip())
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            specs = entry["loras"] if isinstance(entry["loras"], list) else []
+            first = specs[0] if specs and isinstance(specs[0], dict) else {}
+            out.append({
+                "name": nm, "source": "registered",
+                "adapter": str(first.get("path") or first.get("source") or ""),
+                "weight": float(first.get("weight", 1.0) or 1.0),
+                "base": str(entry.get("path") or ""),
+                "pool": str((entry.get("runpod") or {}).get("pool") or "") or None,
+                "served": True,
+            })
     return {"loras": out}
 
 

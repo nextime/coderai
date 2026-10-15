@@ -250,10 +250,15 @@ class RunpodBackend(ModelBackend):
             if key in self._ADAPTERS_SENT:
                 return
             self._ADAPTERS_SENT.add(key)        # once per version, even if it fails
-            from codai.api.remote_gateway import ensure_text_loras
+            # Bytes AND entry. Pushing the bytes alone leaves the pod's
+            # catalogue naming the adapter it was SEEDED with, which after a
+            # re-register is a content id nobody holds — so the engine drops
+            # the adapter and serves the base under its name. Measured live:
+            # seeded sha256:2e820c…, pushed sha256:b8eac366…, and the pod went
+            # on looking for the first.
+            from codai.api.remote_gateway import teach_pod
             pool = getattr(self, "_pool", None)
-            ensure_text_loras(root, getattr(pool, "api_key", "") if pool else "",
-                              entry)
+            teach_pod(root, getattr(pool, "api_key", "") if pool else "", name)
         except Exception as exc:
             print(f"[runpod] could not send {name!r}'s adapters to {root}: {exc}",
                   flush=True)

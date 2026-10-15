@@ -362,3 +362,28 @@ def test_the_adapter_store_is_never_forwarded():
                  "/v1/loras/blob/abc", "/v1/loras"):
         assert resolve_target(path, "POST", "", b'{"name":"x","base":"y"}',
                               "application/json") is None, path
+
+
+@pytest.mark.anyio
+async def test_a_registered_adapter_is_visible_in_the_listing(monkeypatch):
+    """It listed only the TRAINING registry, so a blob-uploaded adapter was
+    invisible right after a successful register — which reads exactly like the
+    registration having failed."""
+    from codai.api import loras
+    _catalogue(monkeypatch, [dict(BASE_MODEL), {
+        "id": "tuned-alpha", "path": "vendor/Some-27B",
+        "loras": [{"name": "tuned-alpha", "path": "sha256:abc", "weight": 1.0}],
+        "runpod": {"pool": "shared"}}])
+    monkeypatch.setattr(loras, "_loras_dir", lambda: "/nonexistent")
+    got = (await loras.list_loras())["loras"]
+    mine = [e for e in got if e["name"] == "tuned-alpha"]
+    assert mine and mine[0]["adapter"] == "sha256:abc"
+    assert mine[0]["pool"] == "shared" and mine[0]["source"] == "registered"
+
+
+@pytest.mark.anyio
+async def test_the_base_model_is_not_listed_as_an_adapter(monkeypatch):
+    from codai.api import loras
+    _catalogue(monkeypatch, [dict(BASE_MODEL)])
+    monkeypatch.setattr(loras, "_loras_dir", lambda: "/nonexistent")
+    assert (await loras.list_loras())["loras"] == []

@@ -1195,7 +1195,7 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
     """
     import requests
 
-    if not model or (base, model) in _REGISTERED:
+    if not model:
         return False
     try:
         from codai.models.manager import _model_entry_for
@@ -1203,6 +1203,17 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
     except Exception:
         entry = {}
     if not entry:
+        return False
+    # Keyed on WHICH adapter, not just the name. A retrain keeps the name and
+    # changes the content id, and a remote still holding the old one answers
+    # from the old weights — or, when it holds neither, from the base.
+    try:
+        from codai.models.text_loras import configured_specs
+        stamp = tuple(sorted(str(s.get("source") or "")
+                             for s in configured_specs(entry)))
+    except Exception:
+        stamp = ()
+    if (base, model, stamp) in _REGISTERED:
         return False
 
     from codai.api.runpod_worker import (parse_model_runpod, resolve_model_source,
@@ -1212,7 +1223,7 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
     kind, value = resolve_model_source(entry, mcfg)
     if kind == "upload":
         ensure_model_uploaded(base, api_key, entry)
-        _REGISTERED.add((base, model))
+        _REGISTERED.add((base, model, stamp))
         return True
     if kind not in ("hf", "url") or not value:
         print(f"[remote-gateway] cannot teach {model!r} to {base}: no HuggingFace id "
@@ -1242,7 +1253,7 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
                   f"{r.status_code} {(r.text or '')[:160]}", flush=True)
             return False
         print(f"[remote-gateway] taught {base} about {model!r} ({value})", flush=True)
-        _REGISTERED.add((base, model))
+        _REGISTERED.add((base, model, stamp))
         return True
     except Exception as exc:
         print(f"[remote-gateway] could not teach {model!r} to {base}: {exc}", flush=True)
