@@ -172,21 +172,71 @@ def forget(model_id: str = "") -> None:
 
 
 # ------------------------------------------------------------------ discovery #
+#: model id -> {kind: why that kind of candidate was not built}. Kept so the
+#: ERROR can carry it, not just a log: a rented pod's log is not reachable from
+#: the machine that gets the 503, and "is not served over HTTP by this install"
+#: describes configuration for what may be a lookup, a failed launch or a
+#: missing catalogue entry. One night was spent on the difference.
+_declines: dict = {}
+
+
+def _decline(model_id: str, kind: str, reason: str) -> None:
+    """Record (and say once) why a kind of candidate could not be built."""
+    with _lock:
+        per = _declines.setdefault(model_id, {})
+        said = per.get(kind)
+        per[kind] = reason
+    if said != reason:
+        print(f"[placement] {model_id!r}: no {kind} candidate — {reason}",
+              flush=True)
+
+
+def why_no_candidates(model_id: str) -> str:
+    """The recorded reasons, as one sentence, or ''."""
+    with _lock:
+        per = dict(_declines.get(model_id) or {})
+    if not per:
+        return ""
+    return "; ".join(f"{k}: {v}" for k, v in sorted(per.items()))
+
+
 def _local_candidate(model_id: str) -> Optional[Candidate]:
     """This install's own vLLM, when it is what serves the model."""
     try:
         from codai.models import manager as mm
-        if mm.resolve_engine_backend(model_id) != "vllm":
+        engine = mm.resolve_engine_backend(model_id)
+        if engine != "vllm":
+            # The three things that decide this, named separately: a missing
+            # catalogue entry, a pin to something else, and a disabled vLLM all
+            # arrive here as the same None, and they need different fixes. On a
+            # pod the entry is seeded into memory rather than read from
+            # models.json, so "NOT in this process's catalogue" is a real and
+            # non-obvious answer.
+            try:
+                found = ("found" if mm._model_entry_for(model_id) is not None
+                         else "NOT FOUND in this process")
+                pin = mm._pinned_backend(model_id) or "none"
+                on = mm._engine_enabled("vllm")
+            except Exception as exc:
+                found, pin, on = f"could not be looked up ({exc})", "?", "?"
+            _decline(model_id, "local",
+                     "resolved to %s, not vllm (catalogue entry %s, backend "
+                     "pin %r, vllm enabled=%s)"
+                     % (engine or "no managed engine", found, pin, on))
             return None
         from codai.api import runpod_worker, vllm_worker
         from codai.models.manager import get_active_vllm_config
         vcfg = get_active_vllm_config()
         path = (runpod_worker._model_path_for(model_id) or "").strip() or model_id
         base = vllm_worker.ensure_service(vcfg, model_path=path, served_name=model_id)
-    except Exception:
+    except Exception as exc:
+        _decline(model_id, "local", f"{type(exc).__name__}: {exc}")
         return None
     if not base:
+        _decline(model_id, "local", "the vLLM service returned no base URL")
         return None
+    with _lock:
+        _declines.pop(model_id, None)
     return Candidate(key=f"local:{model_id}", kind="local",
                      base=base.rstrip("/") + "/v1", priority=0, primary=True)
 
@@ -287,11 +337,15 @@ def _pod_candidate(model_id: str) -> Optional[Candidate]:
     try:
         from codai.models import manager as mm
         if not mm.runpod_should_handle(model_id):
+            _decline(model_id, "pod",
+                     "this install does not route it to RunPod (no "
+                     "`backend: runpod` on its entry, or no entry here)")
             return None
         from codai.backends.runpod import RunpodBackend
         backend = RunpodBackend(mm.get_active_runpod_config())
         backend.load_model(model_id)
-    except Exception:
+    except Exception as exc:
+        _decline(model_id, "pod", f"{type(exc).__name__}: {exc}")
         return None
 
     def _acquire():
@@ -429,11 +483,18 @@ def choose(model_id: str, spill_after: int = 0) -> Lease:
     """
     cands = candidates(model_id)
     if not cands:
+        # Carry WHY in the error, not only in a log. The machine that reads
+        # this message is often not the machine that produced it — a rented
+        # pod's log is not reachable from the orchestrator that gets its 503 —
+        # and without the reasons this sentence blames configuration for what
+        # may be a failed launch or a catalogue the process cannot see.
+        why = why_no_candidates(model_id)
         raise OcrError(
             f"model {model_id!r} is not served over HTTP by this install, so an OCR "
             f"engine cannot attach to it. Pin the model to a backend that has an "
             f"endpoint (backend: \"runpod\", a cluster node that holds it, or a "
-            f"service_url), or pick a serve mode that fits this box.",
+            f"service_url), or pick a serve mode that fits this box."
+            + (f" [why: {why}]" if why else ""),
             status=503)
 
     last_exc = None

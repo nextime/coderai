@@ -260,6 +260,49 @@ def _engine_model_id(engine: str) -> str:
     return (getattr(cfg, "model_id", "") or "").lower() if cfg else ""
 
 
+def _names_of_entry(m: dict) -> set:
+    """Everything a model entry answers to, lowercased."""
+    path = str(m.get("path") or m.get("id") or "")
+    return {path.lower(), os.path.basename(path.rstrip("/")).lower(),
+            str(m.get("alias") or "").lower(), str(m.get("id") or "").lower()}
+
+
+def _env_seed_entries() -> list:
+    """The entries this process was SEEDED with, read from the environment.
+
+    A rented pod has no models.json: its catalogue arrives in
+    CODERAI_SEED_MODELS and is registered in memory, on the ConfigManager the
+    admin module happens to hold. Any process (or import order) where that
+    global is not that object sees an EMPTY catalogue — and then a seeded
+    model has no `backend` pin, resolves to no engine, produces no placement
+    candidate, and the pod answers "not served over HTTP by this install"
+    about a model it is serving perfectly well over loopback.
+
+    Reading the environment needs no global and no import order. It is the
+    same list the seeder used, so the two cannot disagree.
+    """
+    raw = os.environ.get("CODERAI_SEED_MODELS", "").strip()
+    if not raw:
+        return []
+    global _SEED_CACHE
+    cached = globals().get("_SEED_CACHE")
+    if cached is not None and cached[0] == raw:
+        return cached[1]
+    try:
+        import json as _json
+        parsed = _json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        out = [e for e in parsed if isinstance(e, dict) and e.get("path")]
+    except Exception:
+        out = []
+    _SEED_CACHE = (raw, out)
+    return out
+
+
+_SEED_CACHE = None
+
+
 def _model_entry_for(model_name: str):
     """The models.json entry (dict) matching ``model_name`` by path / basename /
     alias / id, or None."""
@@ -276,14 +319,16 @@ def _model_entry_for(model_name: str):
                 for m in lst:
                     if not isinstance(m, dict):
                         continue
-                    path = str(m.get("path") or m.get("id") or "")
-                    base = os.path.basename(path.rstrip("/")).lower()
-                    cands = {path.lower(), base, str(m.get("alias") or "").lower(),
-                             str(m.get("id") or "").lower()}
-                    if name in cands:
+                    if name in _names_of_entry(m):
                         return m
     except Exception:
         pass
+    # Last resort, and only ever non-empty on a seeded pod: see
+    # _env_seed_entries(). Deliberately AFTER the catalogue, so a real entry
+    # (which an operator may have edited) always wins.
+    for m in _env_seed_entries():
+        if name in _names_of_entry(m):
+            return m
     return None
 
 
