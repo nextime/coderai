@@ -255,6 +255,23 @@ def download_model(model_path: str, cache_dir: Optional[str] = None, file_patter
     Returns:
         Path to downloaded model, or None on failure
     """
+    # NEITHER a URL NOR a repo id: say so, rather than handing a bare name to
+    # requests.get and letting it raise MissingSchema from four frames deep.
+    #
+    # That is not a cosmetic difference. A `vision_models` entry named
+    # `qwen38-vision` (no slash, so not a repo id; no scheme, so not a URL)
+    # reached here at engine startup, requests raised, and the engine
+    # crash-looped five times in 120 s and was QUARANTINED -- taking /v1/ocr
+    # and every RunPod pool with it for ninety minutes. A name nobody can
+    # resolve is a configuration mistake, and it must read like one.
+    if not is_huggingface_model_id(model_path) and not str(model_path).startswith(
+            ("http://", "https://")):
+        print(f"[cache] cannot fetch {model_path!r}: it is not a local path, not "
+              f"a URL (no http:// or https://), and not a HuggingFace repo id "
+              f"(no 'owner/name'). Nothing says where these weights are. If this "
+              f"model is served remotely, pin it with `backend` so nothing tries "
+              f"to load it here.", flush=True)
+        return None
     # Check if it's a HuggingFace model ID
     if is_huggingface_model_id(model_path):
         # Use HF cache if no specific cache_dir provided

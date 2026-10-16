@@ -247,6 +247,42 @@ class RunpodModelConfig:
     # engine's own batch width. 0 = leave the pod's defaults alone.
     pod_max_parallel_requests: int = 0
     pod_queue_max_size: int = 0
+    #: What the two numbers above, and `scale_up_inflight_per_pod`, are stated
+    #: FOR: the first card in `gpu_types`. Every other card in a mixed fleet is
+    #: scaled against it, by VRAM, because VRAM is what bounds how many
+    #: requests fit at once (KV cache) and it is knowable without measuring
+    #: anything.
+    #:
+    #: VRAM is NOT a throughput ratio, and the difference is worth stating: an
+    #: A100 SXM 80GB holds 1.67x an A40's memory but has 2.93x its bandwidth,
+    #: while an L40S holds exactly as much as an A40 and is ~1.24x faster. So
+    #: VRAM under-credits a faster card and gives a same-size one nothing. When
+    #: that matters, name the card here and the number wins:
+    #:     {"NVIDIA A100-SXM4-80GB": 2.9, "NVIDIA L40S": 1.25}
+    #: A card not named falls back to the VRAM ratio.
+    gpu_weights: dict = field(default_factory=dict)
+    #: PER-CARD limits, which say outright what `gpu_weights` can only imply:
+    #:
+    #:   "gpu_limits": {
+    #:     "NVIDIA A100-SXM4-80GB": {"parallel": 186, "queue": 744, "scale_up": 93},
+    #:     "NVIDIA A40":            {"parallel": 64,  "queue": 256, "scale_up": 32}
+    #:   }
+    #:
+    #: `parallel`/`queue` are what the POD's own admission gate is launched
+    #: with (it is env, so it is per pod and therefore per card); `scale_up` is
+    #: the in-flight depth at which that card justifies another pod;
+    #: `inflight` caps what this process will send one.
+    #:
+    #: This exists because a scaled single number cannot be right for long. The
+    #: model-level numbers describe ONE card, and which card that is was the
+    #: first entry of `gpu_types` -- so changing the rental preference silently
+    #: re-scaled the concurrency, and a figure measured on an A40 came to
+    #: describe an A100 by a factor nobody had measured. A table states what was
+    #: measured, per card, and nothing is multiplied.
+    #:
+    #: A card absent from the table falls back to `gpu_weights`, then to the
+    #: VRAM ratio, then to the model-level numbers unscaled.
+    gpu_limits: dict = field(default_factory=dict)
     # --- warm-pod schedule ---
     # When set, the warm floor (min_pods/keep_warm) only applies inside the
     # window; outside it the floor is 0 and warm pods are terminated, so a model
@@ -2194,6 +2230,34 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.data_center = (b.get("data_center") or "").strip().upper()
     cfg.pod_max_parallel_requests = max(0, _as_int(b.get("pod_max_parallel_requests"),
                                                    cfg.pod_max_parallel_requests))
+    _gl = b.get("gpu_limits")
+    if isinstance(_gl, dict):
+        out = {}
+        for card, lim in _gl.items():
+            if not str(card).strip() or not isinstance(lim, dict):
+                continue
+            row = {}
+            for key in ("parallel", "queue", "scale_up", "inflight"):
+                try:
+                    v = int(lim.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if v >= 0:
+                    row[key] = v
+            if row:
+                out[str(card).strip()] = row
+        cfg.gpu_limits = out
+    _gw = b.get("gpu_weights")
+    if isinstance(_gw, dict):
+        out = {}
+        for k, v in _gw.items():
+            try:
+                w = float(v)
+            except (TypeError, ValueError):
+                continue
+            if w > 0 and str(k).strip():
+                out[str(k).strip()] = w
+        cfg.gpu_weights = out
     cfg.pod_queue_max_size = max(0, _as_int(b.get("pod_queue_max_size"),
                                             cfg.pod_queue_max_size))
     cfg.schedule_enabled = _as_bool(b.get("schedule_enabled"), cfg.schedule_enabled)
@@ -2458,6 +2522,89 @@ class BootCancelled(Exception):
     """
 
 
+def card_limits(mcfg, card: str) -> dict:
+    """``{parallel, queue, scale_up, inflight}`` for this card.
+
+    The per-card table first, then the model-level numbers for anything it does
+    not state. Matched the same loose way weights are, because RunPod spells a
+    card two ways (catalogue id vs the display name a pod reports).
+    """
+    base = {"parallel": int(getattr(mcfg, "pod_max_parallel_requests", 0) or 0),
+            "queue": int(getattr(mcfg, "pod_queue_max_size", 0) or 0),
+            "scale_up": max(1, int(getattr(mcfg, "scale_up_inflight_per_pod", 1) or 1)),
+            "inflight": int(getattr(mcfg, "max_inflight_per_pod", 0) or 0)}
+    table = getattr(mcfg, "gpu_limits", None) or {}
+    name = str(card or "").strip().lower()
+    if not name or not table:
+        return base
+    for key, row in table.items():
+        k = str(key).strip().lower()
+        if k and (k == name or k in name or name in k) and isinstance(row, dict):
+            out = dict(base)
+            out.update({kk: int(vv) for kk, vv in row.items()
+                        if kk in base and vv is not None})
+            out["scale_up"] = max(1, int(out["scale_up"]))
+            return out
+    return base
+
+
+def _weight_for(weights: dict, card: str):
+    """The configured weight for this card name, or None.
+
+    Matched loosely in both directions because the two sources spell cards
+    differently: RunPod's catalogue ids ("NVIDIA A100-SXM4-80GB") and the
+    display names a pod reports ("A100 SXM") are not the same string.
+    """
+    name = str(card or "").strip().lower()
+    if not name or not weights:
+        return None
+    for key, w in weights.items():
+        k = str(key).strip().lower()
+        if not k:
+            continue
+        if k == name or k in name or name in k:
+            try:
+                return float(w)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _adopted_card(account_cfg, pod_id: str) -> dict:
+    """``{gpu, gpu_count, vram_gb}`` for a pod we are taking over.
+
+    Two sources, cheapest first: the registry, which recorded the card when
+    THIS deployment rented the pod, and the account, which knows regardless.
+    Blanks when neither answers -- an unidentified card costs a weight of 1.0
+    (see `pod_weight`), never a pod.
+    """
+    out = {}
+    try:
+        ent = registry_entry(pod_id) or {}
+        gpu = str(ent.get("gpu") or "").strip()
+        if gpu:
+            out = {"gpu": gpu,
+                   "gpu_count": int(ent.get("gpu_count") or 1),
+                   "vram_gb": float(ent.get("vram_gb") or 0.0)}
+    except Exception:
+        out = {}
+    if out.get("gpu") and out.get("vram_gb"):
+        return out
+    try:
+        from codai.api.runpod_client import RunpodClient
+        live = RunpodClient(account_cfg).get_pod(pod_id) or {}
+        gpu = str(live.get("gpu") or "").strip()
+        if gpu:
+            return {"gpu": gpu,
+                    "gpu_count": int(live.get("gpu_count") or 1),
+                    "vram_gb": float(live.get("vram_gb") or 0.0)}
+    except Exception as exc:
+        print(f"[runpod] adopting {pod_id}: could not read its card ({exc}); "
+              f"it will carry the preferred card's share of the load",
+              flush=True)
+    return out or {"gpu": ""}
+
+
 @_dc_pod
 class PodHandle:
     pod_id: str
@@ -2482,6 +2629,13 @@ class PodHandle:
     data_center: str = ""
     cloud_type: str = ""
     gpu_count: int = 1
+    #: Total VRAM of this pod (per-card x gpu_count), 0 when unknown. This is
+    #: what makes a MIXED fleet work: the operator's concurrency and scale-up
+    #: numbers describe the PREFERRED card, and a pod holding more or less
+    #: memory than that one gets its share scaled in proportion. 0 means "treat
+    #: it as the preferred card" -- never 0 capacity, which would take a
+    #: perfectly good pod out of service for want of a number.
+    vram_gb: float = 0.0
 
 
 def _deploy_tag(account_cfg) -> str:
@@ -2944,6 +3098,16 @@ class RunpodPodPool:
         last = None
         for i in range(start, len(ranked)):
             sel = ranked[i]
+            # THE POD'S OWN GATE, for the card it is about to run on. The plan
+            # above was built before a candidate was chosen, so its env carried
+            # the model-level numbers whatever card won -- and the gate is env,
+            # set once at launch, so a pod rented on a 3x card spent its whole
+            # life admitting a 1x card's worth of work.
+            _lim = card_limits(self.mcfg, str(sel.get("display_name") or ""))
+            if _lim.get("parallel"):
+                env["CODERAI_SERVER_MAX_PARALLEL_REQUESTS"] = str(int(_lim["parallel"]))
+            if _lim.get("queue"):
+                env["CODERAI_SERVER_QUEUE_MAX_SIZE"] = str(int(_lim["queue"]))
             block = self._budget_blocks(sel["price"])
             if block:
                 raise RunpodError(f"RunPod budget cap hit — not provisioning ({block}).")
@@ -3239,7 +3403,15 @@ class RunpodPodPool:
                            started_at=float(
                                registry_entry(shared_id).get("created")
                                or time.time()),
-                           gpu="(adopted)",
+                           # WHICH CARD, not "(adopted)". A pod whose card is
+                           # unknown cannot be given a share of the load that
+                           # matches it, cannot have its concurrency sized, and
+                           # shows up in the fleet report as one anonymous
+                           # kind -- which is how a whole day's status output
+                           # read `by_gpu: {"(adopted)": 32}`. The registry
+                           # knows when we rented it ourselves; the account
+                           # knows otherwise.
+                           **_adopted_card(self.account, shared_id),
                            healthy=True, last_used=time.time())
         with self._cv:
             self.pods.append(handle)
@@ -3461,7 +3633,9 @@ class RunpodPodPool:
                          # records no rate for it" and drop the money.
                          hourly_usd=float(sel.get("price") or 0.0),
                          image=str(self._image or ""),
-                         gpu=str(sel["display_name"]))   # url once ready
+                         gpu=str(sel["display_name"]),
+                         vram_gb=float(sel.get("memory_gb") or 0.0),
+                         gpu_count=int(sel.get("gpu_count") or 1))  # url once ready
             _warn = weight_transfer_warning(_model_entry(self.served or self.model_key),
                                             self.mcfg, self.account)
             if _warn:
@@ -3562,7 +3736,10 @@ class RunpodPodPool:
                           console_url=console,
                           data_center=(sel.get("_dc") or self._data_center()),
                           cloud_type=str(sel.get("cloud_type") or ""),
-                          gpu_count=int(sel.get("gpu_count") or 1))
+                          gpu_count=int(sel.get("gpu_count") or 1),
+                          # The candidate's own figure, already multiplied by
+                          # gpu_count where the pool offered several cards.
+                          vram_gb=float(sel.get("memory_gb") or 0.0))
             # The last chance, and the one that matters most: a shed that
             # lands in the seconds between "serving" and "appended" would
             # otherwise put the pod in the fleet a moment after the fleet was
@@ -3584,7 +3761,11 @@ class RunpodPodPool:
                          # whether this pod is even adoptable: same image, and a
                          # card the pool prefers rather than someone's fallback.
                          image=str(self._image or ""),
-                         gpu=str(sel["display_name"]))
+                         gpu=str(sel["display_name"]),
+                         # ...and how big that card is, for the share of the
+                         # load it should carry once adopted.
+                         vram_gb=float(sel.get("memory_gb") or 0.0),
+                         gpu_count=int(sel.get("gpu_count") or 1))
             print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
             return h
         raise last_exc or RunpodError("RunPod: could not provision a pod.")
@@ -3640,9 +3821,13 @@ class RunpodPodPool:
     def _pick(self, healthy: list, affinity: str):
         """Which pod serves this request: the one that already holds the
         conversation's cache, else the least loaded."""
-        cap = int(getattr(self.mcfg, "max_inflight_per_pod", 0) or 0)
-        free = [p for p in healthy
-                if not p.draining and (cap <= 0 or p.inflight < cap)]
+        free = []
+        for p in healthy:
+            if p.draining:
+                continue
+            cap = self.pod_capacity(p)          # scaled to THIS pod's card
+            if cap <= 0 or p.inflight < cap:
+                free.append(p)
         if not free:
             return None
         if affinity and getattr(self.mcfg, "sticky_sessions", True):
@@ -3650,7 +3835,12 @@ class RunpodPodPool:
             for p in free:
                 if p.pod_id == pid:
                     return p
-        return min(free, key=lambda x: x.inflight)
+        # Weighted least-connections. Plain least-inflight is card-blind: in a
+        # mixed fleet it hands an A100 and an A40 the same number of pages, so
+        # the fast card drains its share and idles while the slow one straggles
+        # -- and a document finishes only when its LAST page lands, so the
+        # slowest pod sets the latency the client sees.
+        return min(free, key=lambda x: x.inflight / max(0.01, self.pod_weight(x)))
 
     def _remember_affinity(self, affinity: str, pod: "PodHandle") -> None:
         if not affinity or not getattr(self.mcfg, "sticky_sessions", True):
@@ -3659,6 +3849,111 @@ class RunpodPodPool:
         self._affinity.move_to_end(affinity)
         while len(self._affinity) > 4096:
             self._affinity.popitem(last=False)
+
+    def _preferred_vram_gb(self) -> float:
+        """VRAM of the card the operator's numbers were written for.
+
+        The FIRST entry of `gpu_types` -- naming a card is how an operator says
+        "this is what I am sizing for". Read from a pod actually running that
+        card when one is, because that figure came from RunPod rather than from
+        a table in here that would rot. 0 when nothing says, which makes every
+        weight 1.0 and the whole mechanism inert: a mixed-fleet optimisation
+        must never be able to misroute a single-card fleet.
+        """
+        prefer = [str(g).strip() for g in (getattr(self.mcfg, "gpu_types", None) or [])
+                  if str(g).strip()]
+        if not prefer:
+            return 0.0
+        head = prefer[0].lower()
+        with self._cv:
+            pods = list(self.pods)
+        for p in pods:
+            vram = float(getattr(p, "vram_gb", 0.0) or 0.0)
+            name = str(getattr(p, "gpu", "") or "").lower()
+            if vram > 0 and name and (head in name or name in head):
+                return vram
+        return 0.0
+
+    def pod_weight(self, pod: "PodHandle") -> float:
+        """This pod's share of the load, relative to the preferred card.
+
+        An explicit `gpu_weights` entry wins: VRAM bounds how many requests FIT
+        but says nothing about how fast they finish, and the two diverge badly
+        (A100 SXM: 1.67x an A40's memory, 2.93x its bandwidth; L40S: same
+        memory, ~1.24x faster). Absent an entry, the VRAM ratio is the honest
+        zero-measurement proxy -- it is right about capacity and conservative
+        about speed.
+
+        Clamped to [0.25, 8] and never 0: a pod whose card we cannot identify
+        is treated as the preferred one and keeps serving. Taking it out of
+        rotation for want of a number would turn a reporting gap into an
+        outage.
+        """
+        # getattr throughout: this is a duck-typed pod, and a caller holding a
+        # lighter object must get the neutral weight rather than an exception.
+        # A missing attribute is the same situation as an unknown card, and the
+        # docstring above promises that keeps the pod serving.
+        name = str(getattr(pod, "gpu", "") or "").strip()
+        prefer_name = ""
+        prefer = [str(g).strip() for g
+                  in (getattr(self.mcfg, "gpu_types", None) or []) if str(g).strip()]
+        if prefer:
+            prefer_name = prefer[0]
+        # THE TABLE FIRST, and derived rather than configured twice: if the
+        # operator stated a scale-up depth for both cards, their ratio IS the
+        # share of the load each should carry. One source of truth beats a
+        # weights table that can disagree with the limits table.
+        table = getattr(self.mcfg, "gpu_limits", None) or {}
+        if table and name and prefer_name:
+            mine_t = _weight_for({k: 1 for k in table}, name)
+            base_t = _weight_for({k: 1 for k in table}, prefer_name)
+            if mine_t is not None and base_t is not None:
+                a = card_limits(self.mcfg, name)["scale_up"]
+                b = card_limits(self.mcfg, prefer_name)["scale_up"]
+                if b > 0:
+                    return max(0.25, min(8.0, a / float(b)))
+        weights = getattr(self.mcfg, "gpu_weights", None) or {}
+        mine = _weight_for(weights, name)
+        if mine is not None:
+            # NORMALISED by the preferred card's own weight, so the configured
+            # concurrency and threshold mean what they say: "per preferred
+            # card". The operator's table is anchored wherever is convenient
+            # (ours is at the A40, because that is what was measured), and
+            # multiplying the threshold by an absolute 2.9 for the very card it
+            # was written for would size the fleet three times too large.
+            base = _weight_for(weights, prefer_name) if prefer_name else None
+            return max(0.25, min(8.0, mine / (base or 1.0)))
+        base = self._preferred_vram_gb()
+        vram = float(getattr(pod, "vram_gb", 0.0) or 0.0)
+        if base > 0 and vram > 0:
+            return max(0.25, min(8.0, vram / base))
+        return 1.0
+
+    def pod_capacity(self, pod: "PodHandle") -> int:
+        """How many requests THIS pod may hold.
+
+        A per-card `inflight` is taken as written; otherwise the model-level
+        number is scaled by this pod's weight. Unlimited stays unlimited.
+        """
+        name = str(getattr(pod, "gpu", "") or "").strip()
+        lim = card_limits(self.mcfg, name)
+        stated = int(lim.get("inflight") or 0)
+        base = int(getattr(self.mcfg, "max_inflight_per_pod", 0) or 0)
+        if stated != base and stated > 0:
+            return stated                 # the table said so, for this card
+        if base <= 0:
+            return 0
+        return max(1, int(round(base * self.pod_weight(pod))))
+
+    def pod_threshold(self, pod: "PodHandle") -> float:
+        """The in-flight depth at which THIS pod justifies another one."""
+        name = str(getattr(pod, "gpu", "") or "").strip()
+        lim = card_limits(self.mcfg, name)
+        stated = int(lim.get("scale_up") or 0)
+        base = max(1, int(getattr(self.mcfg, "scale_up_inflight_per_pod", 1) or 1))
+        if stated and stated != base:
+            return float(stated)          # written for this card
+        return base * self.pod_weight(pod)
 
     def _pods_for_demand(self, serving: list) -> int:
         """How many pods the work we can SEE justifies, capped at max_pods.
@@ -3670,7 +3965,15 @@ class RunpodPodPool:
         """
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
         load = sum(p.inflight for p in serving) + max(0, self._waiting)
-        want = (load + threshold - 1) // threshold
+        # Per POD, weighted: the threshold describes the preferred card, so a
+        # fleet of bigger cards carries the same load in fewer pods. Dividing
+        # by a flat threshold would rent ~3x more A100s than the work needs,
+        # which is the same arithmetic that reached 94 pods at 10 % utilisation.
+        per_pod = sum(self.pod_threshold(p) for p in serving)
+        mean = (per_pod / len(serving)) if serving else float(threshold)
+        if mean <= 0:
+            mean = float(threshold)
+        want = int(-(-load // mean))          # ceil, in weighted pod-equivalents
         return max(1, min(int(self.mcfg.max_pods), want))
 
     def _boot_cancelled(self, epoch: int) -> bool:
@@ -5233,7 +5536,8 @@ def _is_this_process(info: dict) -> bool:
 
 def register_pod(pod_id: str, pool_key: str = "", url: str = "",
                  api_key: str = "", hourly_usd: float = 0.0,
-                 image: str = "", gpu: str = "") -> None:
+                 image: str = "", gpu: str = "",
+                 vram_gb: float = 0.0, gpu_count: int = 0) -> None:
     """Record a pod as owned by this deployment.
 
     Two reasons, both about processes that cannot see each other: no sibling's
@@ -5274,6 +5578,12 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "",
                           # so an adoption does not erase them.
                           "image": str(image or (was or {}).get("image") or ""),
                           "gpu": str(gpu or (was or {}).get("gpu") or ""),
+                          # ...and HOW BIG that card is, so a pod adopted after
+                          # a restart can be given a share of the load matching
+                          # its card without asking the account again. Carried
+                          # over for the same reason the two above are.
+                          "vram_gb": float(vram_gb or (was or {}).get("vram_gb") or 0.0),
+                          "gpu_count": int(gpu_count or (was or {}).get("gpu_count") or 1),
                           # So a pod adopted after a restart is still attributed
                           # its real $/hr instead of looking free. Carried over
                           # like image/gpu: a re-registration that does not know

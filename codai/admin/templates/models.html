@@ -963,7 +963,24 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </div>
           </div>
           <div class="form-row" style="margin:.25rem 0 0">
-            <span class="form-hint" style="font-size:11px">How many requests the pod's own server admits at once. The defaults are sized for a shared workstation and will throttle a dedicated card long before its GPU is busy — everything over the limit gets a 429. Set these to roughly the remote engine's batch width (e.g. vLLM's <code>max_num_seqs</code>).</span>
+            <span class="form-hint" style="font-size:11px">How many requests the pod's own server admits at once. The defaults are sized for a shared workstation and will throttle a dedicated card long before its GPU is busy — everything over the limit gets a 429. Set these to roughly the remote engine's batch width (e.g. vLLM's <code>max_num_seqs</code>). The numbers above apply to any card without a row in the table below.</span>
+          </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label class="form-label">Per-card limits <span style="font-weight:400;opacity:.7">(one row per GPU)</span></label>
+            <table style="width:100%;font-size:12px;border-collapse:collapse" id="cfg-rp-gpu-limits-table">
+              <thead><tr style="text-align:left;opacity:.75">
+                <th style="padding:.15rem .25rem">GPU</th>
+                <th style="padding:.15rem .25rem">parallel</th>
+                <th style="padding:.15rem .25rem">queue</th>
+                <th style="padding:.15rem .25rem">scale&nbsp;up at</th>
+                <th style="padding:.15rem .25rem">in&#8209;flight cap</th>
+                <th></th>
+              </tr></thead>
+              <tbody id="cfg-rp-gpu-limits-rows"></tbody>
+            </table>
+            <button type="button" class="btn btn-secondary" style="margin-top:.35rem;font-size:12px"
+                    onclick="rpGpuLimitAddRow()">+ add a card</button>
+            <span class="form-hint" style="font-size:11px">A mixed fleet needs a number per card, not one number scaled: a figure measured on one GPU does not describe another, and leaving it to be multiplied means changing the rental preference silently re-scales it. <b>Leave a card out until you have measured it</b> — it then falls back to the numbers above (or to its VRAM ratio). <code>scale up at</code> is the in-flight depth at which that card justifies renting another pod, and it also decides that card&rsquo;s share of the load: two cards with depths 32 and 93 are given work in that ratio.</span>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label class="form-label">Region (data centre)</label>
@@ -4937,6 +4954,7 @@ function _populateRunpod(s){
   set('cfg-rp-schedule-tz', rp.schedule_tz || '');
   set('cfg-rp-data-center', rp.data_center || '');
   set('cfg-rp-pod-parallel', rp.pod_max_parallel_requests != null ? rp.pod_max_parallel_requests : '');
+  rpGpuLimitsLoad(rp.gpu_limits || {});
   set('cfg-rp-pod-queue', rp.pod_queue_max_size != null ? rp.pod_queue_max_size : '');
   (function(){
     // Days come back normalised to 0=Mon…6=Sun; an empty list means every day,
@@ -5156,6 +5174,7 @@ function _collectRunpod(){
                           .map(function(cb){ return cb.value; }),
     data_center:        (val('cfg-rp-data-center') || '').trim(),
     pod_max_parallel_requests: intOrU('cfg-rp-pod-parallel'),
+    gpu_limits: rpGpuLimitsCollect(),
     pod_queue_max_size:        intOrU('cfg-rp-pod-queue'),
   };
   return o;
@@ -5522,5 +5541,50 @@ async function testRunModel(){
   }
 }
 
+
+function rpGpuLimitAddRow(card, lim) {
+  const body = document.getElementById('cfg-rp-gpu-limits-rows');
+  if (!body) return;
+  lim = lim || {};
+  const tr = document.createElement('tr');
+  const cell = (html) => { const td = document.createElement('td');
+                           td.style.padding = '.1rem .25rem'; td.innerHTML = html; return td; };
+  tr.appendChild(cell('<input type="text" class="form-input rp-gl-card" style="width:100%;font-size:12px"'
+    + ' placeholder="NVIDIA A40" value="' + (card || '').replace(/"/g, '&quot;') + '">'));
+  for (const k of ['parallel', 'queue', 'scale_up', 'inflight']) {
+    tr.appendChild(cell('<input type="number" min="0" class="form-input rp-gl-' + k
+      + '" style="width:100%;font-size:12px" value="'
+      + (lim[k] != null ? lim[k] : '') + '">'));
+  }
+  tr.appendChild(cell('<button type="button" class="btn btn-secondary" style="font-size:11px"'
+    + ' onclick="this.closest(\'tr\').remove()">remove</button>'));
+  body.appendChild(tr);
+}
+
+function rpGpuLimitsLoad(limits) {
+  const body = document.getElementById('cfg-rp-gpu-limits-rows');
+  if (!body) return;
+  body.innerHTML = '';
+  Object.keys(limits || {}).sort().forEach(card => rpGpuLimitAddRow(card, limits[card]));
+}
+
+function rpGpuLimitsCollect() {
+  // A row with a card name but no numbers is DROPPED rather than saved as a
+  // row of zeros: an empty row means "not measured yet", and a zero would be
+  // read as a real limit.
+  const out = {};
+  document.querySelectorAll('#cfg-rp-gpu-limits-rows tr').forEach(tr => {
+    const card = (tr.querySelector('.rp-gl-card') || {}).value || '';
+    if (!card.trim()) return;
+    const row = {};
+    for (const k of ['parallel', 'queue', 'scale_up', 'inflight']) {
+      const el = tr.querySelector('.rp-gl-' + k);
+      const v = el && el.value !== '' ? parseInt(el.value, 10) : null;
+      if (v != null && !isNaN(v) && v >= 0) row[k] = v;
+    }
+    if (Object.keys(row).length) out[card.trim()] = row;
+  });
+  return out;
+}
 </script>
 {% endblock %}

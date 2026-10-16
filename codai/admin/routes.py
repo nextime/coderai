@@ -3202,6 +3202,31 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         env = src.get("env")
         if isinstance(env, dict) and env:
             rpo["env"] = {str(k): str(v) for k, v in env.items()}
+        # PER-CARD limits. A mixed fleet needs a number per card rather than one
+        # number scaled: a figure measured on one GPU does not describe another.
+        # A row carrying a card name but no numbers is DROPPED -- "not measured
+        # yet" must not be saved as a limit of zero.
+        gl = src.get("gpu_limits")
+        if isinstance(gl, dict):
+            out = {}
+            for card, lim in gl.items():
+                name = str(card or "").strip()
+                if not name or not isinstance(lim, dict):
+                    continue
+                row = {}
+                for key in ("parallel", "queue", "scale_up", "inflight"):
+                    if lim.get(key) in (None, ""):
+                        continue
+                    try:
+                        v = int(lim.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if v >= 0:
+                        row[key] = v
+                if row:
+                    out[name] = row
+            if out:
+                rpo["gpu_limits"] = out
         if rpo:
             entry["runpod"] = rpo
         else:

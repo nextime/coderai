@@ -303,6 +303,12 @@ def _env_seed_entries() -> list:
 _SEED_CACHE = None
 
 
+#: Backends that serve a model somewhere else. A model pinned to one of these
+#: has no local weights to resolve, so nothing here should download, cache or
+#: path-resolve it -- on ANY install, whichever section lists it.
+_REMOTE_BACKENDS = ("runpod", "remote", "node", "cluster")
+
+
 def _model_entry_for(model_name: str):
     """The models.json entry (dict) matching ``model_name`` by path / basename /
     alias / id, or None."""
@@ -2990,6 +2996,29 @@ class MultiModelManager:
         Returns the resolved model path or identifier.
         """
         from codai.models.cache import is_huggingface_model_id
+
+        # 0. A model pinned to a REMOTE backend has no local weights, by
+        # definition. Resolving one here downloads something this install will
+        # never run, and for a name that is not a repo id it used to reach
+        # requests.get and raise -- which crash-looped an engine into
+        # quarantine over a catalogue entry (see codai/models/cache for the
+        # incident).
+        #
+        # This is also what lets ONE catalogue entry serve both kinds of
+        # install: the same `vision_models` row runs on rented pods where it is
+        # pinned `backend: runpod`, and loads locally on a box with a GPU where
+        # it is not. The pin is the whole difference, and the section a model
+        # is listed in must not override it.
+        pin = ""
+        try:
+            entry = _model_entry_for(model_path) or {}
+            pin = str(entry.get("backend") or "").strip().lower()
+        except Exception:
+            pin = ""
+        if pin in _REMOTE_BACKENDS:
+            print(f"[models] {model_path!r} is pinned to {pin!r}, which serves it "
+                  f"elsewhere — not resolving local weights for it", flush=True)
+            return model_path
 
         # 1. Check if it's a local file
         if os.path.isfile(model_path):

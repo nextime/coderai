@@ -133,6 +133,45 @@ def pod_console_url(pod_id: str) -> str:
     return f"https://www.runpod.io/console/pods/{pod_id}"
 
 
+def _machine_fields(p: dict) -> dict:
+    """``{gpu, gpu_id, gpu_count, vram_gb}`` from a pod's machine, defensively.
+
+    RunPod reports the card on the MACHINE, and a pod whose machine record is
+    missing (one still provisioning, one being torn down) must not break a
+    listing the reaper depends on -- so every field degrades to a blank rather
+    than raising.
+    """
+    m = (p.get("machine") or {}) if isinstance(p, dict) else {}
+    gt = (m.get("gpuType") or {}) if isinstance(m, dict) else {}
+    try:
+        n = max(1, int(p.get("gpuCount") or 1))
+    except (TypeError, ValueError):
+        n = 1
+    try:
+        per_card = float(gt.get("memoryInGb") or 0.0)
+    except (TypeError, ValueError):
+        per_card = 0.0
+    return {"gpu": str(m.get("gpuDisplayName") or ""),
+            "gpu_id": str(m.get("gpuTypeId") or ""),
+            "gpu_count": n,
+            # The pod's TOTAL VRAM: a 2-card pod holds twice the KV cache.
+            "vram_gb": per_card * n}
+
+
+def get_pod_machine(client, pod_id: str) -> dict:
+    """``{gpu, gpu_id, gpu_count, vram_gb}`` for one pod, or blanks.
+
+    Used when ADOPTING a pod this process did not rent: the registry may know
+    the card (we recorded it when we rented it), and when it does not, the only
+    other source is the account.
+    """
+    try:
+        return {k: v for k, v in (client.get_pod(pod_id) or {}).items()
+                if k in ("gpu", "gpu_id", "gpu_count", "vram_gb")}
+    except Exception:
+        return {}
+
+
 class RunpodClient:
     def __init__(self, cfg):
         self._cfg = cfg
@@ -456,6 +495,8 @@ class RunpodClient:
             desiredStatus
             lastStatusChange
             costPerHr
+            gpuCount
+            machine { gpuDisplayName gpuTypeId gpuType { memoryInGb } }
             runtime {
               uptimeInSeconds
               ports { ip isIpPublic privatePort publicPort type }
@@ -467,6 +508,7 @@ class RunpodClient:
         rt = p.get("runtime") or {}
         ports = rt.get("ports") or []
         return {
+            **_machine_fields(p),
             "id": p.get("id") or pod_id,
             "status": p.get("desiredStatus"),
             # The one field that says WHY a pod is EXITED. It reads like
@@ -531,6 +573,8 @@ class RunpodClient:
         query Pods {
           myself {
             pods { id name desiredStatus costPerHr imageName lastStatusChange
+                   gpuCount
+                   machine { gpuDisplayName gpuTypeId gpuType { memoryInGb } }
                    runtime { uptimeInSeconds } }
           }
         }"""
@@ -542,6 +586,11 @@ class RunpodClient:
                 "id": p.get("id"), "name": p.get("name"),
                 "status": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
                 "image": p.get("imageName"),
+                # WHICH CARD. A pool that cannot name a pod's card cannot size
+                # its concurrency, weight its share of the load, or report the
+                # fleet honestly -- adopted pods were listed as "(adopted)" and
+                # counted as one anonymous kind.
+                **_machine_fields(p),
                 "last_change": p.get("lastStatusChange") or "",
             }
             # Absent while a pod is still being scheduled, which is exactly when
