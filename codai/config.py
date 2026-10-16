@@ -1071,6 +1071,34 @@ class OcrConfig:
     # wait times out the next pages go straight through for a cooldown rather
     # than paying the ceiling one page at a time.
     pod_pipeline_wait_s: float = 60.0
+    # --- how a page is handed to the model ---
+    # Measured on A4 at 200 DPI (3.4-3.9 Mpix): rendering a page costs 21-46 ms
+    # and ENCODING it 86-353 ms, so three quarters of what is called
+    # rasterisation is zlib, and on the surya path it was paid twice per page.
+    #
+    #   auto   (default) a page that already IS an image -- a scan held as one
+    #          full-page JPEG -- is sent to the model exactly as the PDF holds
+    #          it: no render, no encode, no resample (0.1 ms and 147 KB against
+    #          46 + 352 ms and 1846 KB). Everything else is encoded as PNG at
+    #          zlib level 1, which is lossless and 2.6x faster than PIL's
+    #          default level 6.
+    #   png    always re-encode. The one setting under which two runs of the
+    #          same document produce byte-identical requests whatever the PDF
+    #          held, which is what a controlled comparison needs.
+    #   jpeg   lossy, 8 ms and a third of the bytes. Whether it costs accuracy
+    #          is a question about a corpus rather than about a codec, so it is
+    #          opt-in and not a default.
+    page_image_format: str = "auto"
+    page_image_jpeg_quality: int = 95
+    # The bounds within which a scan may be passed through. Below the floor the
+    # embedded image is genuinely coarser than the configured DPI and rendering
+    # it up at least gives the model the pixel density the rest of the pipeline
+    # was tuned for; far above the target, rendering DOWN is cheaper than
+    # shipping the whole thing for the engine to scale. Expressed in real DPI
+    # rather than as a ratio because "is 150 DPI enough to read" is a question
+    # about documents, which an operator can answer.
+    page_image_min_dpi: float = 150.0
+    page_image_max_dpi_factor: float = 3.0
     # How many pages of one document are rasterised at a time. The document is read
     # in windows, so residency is O(window) instead of O(document): a 400-page
     # filing costs the same as an 8-page one. 0 = follow `max_concurrency` (capped
@@ -2078,6 +2106,10 @@ class ConfigManager:
                 "max_pages": self.config.ocr.max_pages,
                 "pod_pipeline": self.config.ocr.pod_pipeline,
                 "pod_pipeline_wait_s": self.config.ocr.pod_pipeline_wait_s,
+                "page_image_format": self.config.ocr.page_image_format,
+                "page_image_jpeg_quality": self.config.ocr.page_image_jpeg_quality,
+                "page_image_min_dpi": self.config.ocr.page_image_min_dpi,
+                "page_image_max_dpi_factor": self.config.ocr.page_image_max_dpi_factor,
                 "page_window": self.config.ocr.page_window,
                 "raster_workers": self.config.ocr.raster_workers,
                 "lang": self.config.ocr.lang,

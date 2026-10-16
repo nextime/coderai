@@ -41,6 +41,7 @@ import threading
 from typing import Optional
 
 from codai.ocr.base import OcrError, render_pdf_range
+from codai.ocr.workers import page_image
 
 _WORKER = os.path.join(os.path.dirname(__file__), "workers", "raster_worker.py")
 
@@ -97,8 +98,9 @@ class _Worker:
         self.proc.stdin.flush()
 
     # -- commands --------------------------------------------------------- #
-    def open(self, data: bytes, dpi: int) -> "tuple[int, int]":
-        self._send({"cmd": "open", "dpi": int(dpi), "nbytes": len(data)}, data)
+    def open(self, data: bytes, dpi: int, policy=None) -> "tuple[int, int]":
+        self._send({"cmd": "open", "dpi": int(dpi), "nbytes": len(data),
+                    "page_image": (policy or page_image.DEFAULT).as_dict()}, data)
         r = self._reply()
         if not r.get("ok"):
             # A bad document is the document's problem, not the worker's: raise
@@ -118,6 +120,18 @@ class _Worker:
         out = []
         for m in metas:
             raw = self._read_exactly(int(m["nbytes"]))
+            mime = m.get("mime")
+            if mime:
+                # The worker never rendered this page: these are the bytes the
+                # PDF itself holds. Image.open is lazy, so the pixels are only
+                # decoded if something downstream actually looks at them -- and
+                # the bytes ride along so the engine can send them onwards
+                # without an encode. Carried, not trusted: any transform drops
+                # them (see page_image.attach).
+                import io as _io
+                img = Image.open(_io.BytesIO(raw))
+                out.append(page_image.attach(img, mime, raw))
+                continue
             out.append(Image.frombytes("RGB", (int(m["w"]), int(m["h"])), raw))
         return out
 
@@ -269,7 +283,7 @@ def reset_pool() -> None:
         _pool_size = 0
 
 
-def probe_pdf(data: bytes, dpi: int, raster_workers: int = 0):
+def probe_pdf(data: bytes, dpi: int, raster_workers: int = 0, policy=None):
     """``(pages, retained_bytes)`` for a PDF, in a worker when there is one.
 
     Returns None when the pool could not serve, so the caller uses its own
@@ -282,7 +296,7 @@ def probe_pdf(data: bytes, dpi: int, raster_workers: int = 0):
         with pool.borrow() as w:
             if w is None:
                 return None
-            return w.open(data, dpi)
+            return w.open(data, dpi, policy)
     except OcrError:
         raise                       # a bad document, not a pool problem
     except Exception as exc:
@@ -292,7 +306,7 @@ def probe_pdf(data: bytes, dpi: int, raster_workers: int = 0):
 
 
 def iter_pdf_pages(data: bytes, dpi: int, chunk: int = 8,
-                   raster_workers: int = 0):
+                   raster_workers: int = 0, policy=None):
     """Yield RGB pages from worker processes, or None if the pool cannot serve.
 
     A generator that yields nothing and returns is indistinguishable from an empty
@@ -317,7 +331,7 @@ def iter_pdf_pages(data: bytes, dpi: int, chunk: int = 8,
     if w is None:
         return None
     try:
-        n, _est = w.open(data, dpi)
+        n, _est = w.open(data, dpi, policy)
     finally:
         pool.release(w)
 
@@ -329,11 +343,11 @@ def iter_pdf_pages(data: bytes, dpi: int, chunk: int = 8,
             if worker is None:
                 # The pool stopped serving mid-document. Rasterise the rest here
                 # rather than fail a document that is already half read.
-                for img in render_pdf_range(data, dpi, start, n):
+                for img in render_pdf_range(data, dpi, start, n, policy):
                     yield img
                 return
             try:
-                worker.open(data, dpi)
+                worker.open(data, dpi, policy)
                 pages = worker.render(start, count)
             finally:
                 pool.release(worker)

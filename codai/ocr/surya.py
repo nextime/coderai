@@ -92,7 +92,14 @@ class SuryaEngine(SubprocessOcrEngine):
                 "repeat_window": max(0, int(getattr(
                     self.cfg, "surya_repeat_window", 0) or 0)),
                 "repeat_scaling": max(0.0, float(getattr(
-                    self.cfg, "surya_repeat_scaling", 0.0) or 0.0))}
+                    self.cfg, "surya_repeat_scaling", 0.0) or 0.0)),
+                # How the WORKER encodes a page for the model, when it has to
+                # encode one at all. Sent at load because the surya function it
+                # replaces is module-level and must be in place before page one.
+                "page_image_format": str(getattr(
+                    self.cfg, "page_image_format", "auto") or "auto"),
+                "page_image_jpeg_quality": max(1, min(100, int(getattr(
+                    self.cfg, "page_image_jpeg_quality", 95) or 95)))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")

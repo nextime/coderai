@@ -283,7 +283,8 @@ def ink_coverage(image, threshold: int = 200) -> float:
         return -1.0
 
 
-def load_pages(data: bytes, filename: str = "", content_type: str = "", dpi: int = 200) -> List["Any"]:
+def load_pages(data: bytes, filename: str = "", content_type: str = "",
+               dpi: int = 200, policy=None) -> List["Any"]:
     """Decode ``data`` (an image or a PDF) into a list of RGB ``PIL.Image`` pages.
 
     PDFs are rasterised at ``dpi`` via pypdfium2 (preferred) or pdf2image/poppler.
@@ -302,7 +303,7 @@ def load_pages(data: bytes, filename: str = "", content_type: str = "", dpi: int
         or data[:5] == b"%PDF-"
 
     if is_pdf:
-        return _rasterize_pdf(data, dpi)
+        return _rasterize_pdf(data, dpi, policy)
 
     try:
         img = Image.open(io.BytesIO(data))
@@ -484,7 +485,8 @@ def iter_pdf_page_pdfs(data: bytes):
 
 
 def render_pages(data: bytes, filename: str = "", content_type: str = "",
-                 dpi: int = 200, raster_workers: int = 0, chunk: int = 8):
+                 dpi: int = 200, raster_workers: int = 0, chunk: int = 8,
+                 policy=None):
     """Yield RGB ``PIL.Image`` pages ONE AT A TIME instead of returning them all.
 
     Same decoding rules as :func:`load_pages` — this is that function with the list
@@ -514,13 +516,14 @@ def render_pages(data: bytes, filename: str = "", content_type: str = "",
             try:
                 from codai.ocr.rasterize import iter_pdf_pages
                 pooled = iter_pdf_pages(data, dpi, chunk=chunk,
-                                        raster_workers=raster_workers)
+                                        raster_workers=raster_workers,
+                                        policy=policy)
             except Exception:
                 pooled = None
             if pooled is not None:
                 yield from pooled
                 return
-        yield from _render_pdf_pages(data, dpi)
+        yield from _render_pdf_pages(data, dpi, policy)
         return
 
     try:
@@ -538,7 +541,30 @@ def render_pages(data: bytes, filename: str = "", content_type: str = "",
         yield img.convert("RGB")
 
 
-def render_pdf_range(data: bytes, dpi: int, start: int, stop: int):
+def _page_or_render(page, dpi: float, scale: float, policy):
+    """One page as a PIL image: its own bytes when it may be, else rendered.
+
+    The in-process twin of the rasteriser worker's fast path. Both call the same
+    guards (``page_image.extract_embedded``) so the two never drift -- a page
+    passed through in one and rendered in the other would make a pool outage
+    change what the model is shown, not just how fast it arrives.
+    """
+    from codai.ocr.workers import page_image
+    got = None
+    if policy is not None:
+        got = policy.extract(page, dpi)
+    elif page_image.DEFAULT.passthrough:
+        got = page_image.DEFAULT.extract(page, dpi)
+    if got is not None:
+        import io as _io
+        from PIL import Image as _Image
+        mime, raw, _size = got
+        return page_image.attach(_Image.open(_io.BytesIO(raw)), mime, raw)
+    return page.render(scale=scale).to_pil().convert("RGB")
+
+
+def render_pdf_range(data: bytes, dpi: int, start: int, stop: int,
+                     policy=None):
     """Yield in-process RGB pages for ``[start, stop)`` of a PDF, under the lock.
 
     The fallback for a pooled read whose pool stopped serving midway: re-rendering
@@ -551,7 +577,7 @@ def render_pdf_range(data: bytes, dpi: int, start: int, stop: int):
         pdfium = None
     if pdfium is None:
         # No pypdfium2 at all: the whole-document fallback owns this case.
-        for i, img in enumerate(_rasterize_pdf(data, dpi)):
+        for i, img in enumerate(_rasterize_pdf(data, dpi, policy)):
             if start <= i < stop:
                 yield img
         return
@@ -565,13 +591,13 @@ def render_pdf_range(data: bytes, dpi: int, start: int, stop: int):
     for i in range(max(0, start), min(n, stop)):
         try:
             with _PDFIUM_LOCK:
-                img = pdf[i].render(scale=scale).to_pil().convert("RGB")
+                img = _page_or_render(pdf[i], dpi, scale, policy)
         except Exception as e:
             raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
         yield img
 
 
-def _render_pdf_pages(data: bytes, dpi: int):
+def _render_pdf_pages(data: bytes, dpi: int, policy=None):
     """Yield one rasterised RGB page at a time (pypdfium2, else pdf2image)."""
     try:
         import pypdfium2 as pdfium
@@ -592,9 +618,7 @@ def _render_pdf_pages(data: bytes, dpi: int):
                 # and holding pdfium while an engine reads a page would serialise
                 # the whole subsystem behind one document.
                 with _PDFIUM_LOCK:
-                    page = pdf[i]
-                    bitmap = page.render(scale=scale)
-                    img = bitmap.to_pil().convert("RGB")
+                    img = _page_or_render(pdf[i], dpi, scale, policy)
             except Exception as e:
                 raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)
             yield img
@@ -602,11 +626,11 @@ def _render_pdf_pages(data: bytes, dpi: int):
 
     # pdf2image has no per-page API that avoids the whole document, so this path
     # keeps the old behaviour: correctness first, and pypdfium2 is the shipped dep.
-    for im in _rasterize_pdf(data, dpi):
+    for im in _rasterize_pdf(data, dpi, policy):
         yield im
 
 
-def _rasterize_pdf(data: bytes, dpi: int) -> List["Any"]:
+def _rasterize_pdf(data: bytes, dpi: int, policy=None) -> List["Any"]:
     """Rasterise a PDF to a list of RGB PIL pages (pypdfium2 first, then pdf2image)."""
     from PIL import Image  # noqa: F401  (imported for type parity / already validated)
 
@@ -623,9 +647,7 @@ def _rasterize_pdf(data: bytes, dpi: int) -> List["Any"]:
                 scale = max(0.5, dpi / 72.0)
                 pages = []
                 for i in range(len(pdf)):
-                    page = pdf[i]
-                    bitmap = page.render(scale=scale)
-                    pages.append(bitmap.to_pil().convert("RGB"))
+                    pages.append(_page_or_render(pdf[i], dpi, scale, policy))
             return pages
         except Exception as e:
             raise OcrError(f"failed to rasterise PDF (pypdfium2): {e}", status=400)

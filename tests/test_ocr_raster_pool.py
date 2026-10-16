@@ -235,7 +235,35 @@ def test_the_worker_does_not_import_the_ocr_package():
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module.split(".")[0])
     assert "codai" not in names, f"worker imports the package: {sorted(names)}"
-    assert names <= {"json", "sys", "pypdfium2", "PIL"}, sorted(names)
+    # `page_image` is the one local module it loads, by path, because the guards
+    # deciding when a page may be passed through unrendered must be the SAME
+    # ones the parent applies -- two copies of those would drift, and a drifted
+    # guard changes what the model is shown. It is held to the same rule as the
+    # worker itself, below.
+    assert names <= {"json", "os", "sys", "pypdfium2", "PIL", "page_image"}, \
+        sorted(names)
+
+
+def test_the_policy_module_is_as_light_as_the_worker():
+    """The worker may import it, so it carries the worker's constraint too:
+    stdlib and PIL, nothing of coderai, and no top-level pypdfium2 (which the
+    engine venvs do not have)."""
+    import ast
+    src = (ROOT / "codai/ocr/workers/page_image.py").read_text()
+    names = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module.split(".")[0])
+    assert "codai" not in names, sorted(names)
+    top = set()
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Import):
+            top.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top.add(node.module.split(".")[0])
+    assert top == {"io"}, sorted(top)
 
 
 def test_the_worker_is_run_with_isolated_mode():

@@ -153,15 +153,22 @@ def parse_front_matter(content: str) -> (dict, str):
 # image prep
 # ---------------------------------------------------------------------------
 
-def prepare_image(image, longest_side: int = DEFAULT_LONGEST_SIDE) -> str:
-    """Return a ``data:image/png;base64,…`` URI of ``image`` scaled to ``longest_side``.
+def prepare_image(image, longest_side: int = DEFAULT_LONGEST_SIDE,
+                  policy=None) -> str:
+    """Return a ``data:<mime>;base64,…`` URI of ``image`` scaled to ``longest_side``.
 
     Only ever scales DOWN past the target: upsampling a small crop buys nothing and costs
     vision tokens.
+
+    A page that needs no scaling and arrived already encoded is sent exactly as
+    it arrived -- hence the resize BEFORE any ``convert``, so the carried bytes
+    are dropped by the one operation that invalidates them rather than by a
+    mode conversion that was a no-op anyway.
     """
     from PIL import Image
+    from codai.ocr.workers import page_image
 
-    img = image.convert("RGB")
+    img = image
     target = max(64, int(longest_side or DEFAULT_LONGEST_SIDE))
     w, h = img.size
     longest = max(w, h)
@@ -169,9 +176,10 @@ def prepare_image(image, longest_side: int = DEFAULT_LONGEST_SIDE) -> str:
         scale = target / float(longest)
         img = img.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
                          Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    mime, raw = (policy or page_image.DEFAULT).encode(img)
+    return page_image.data_uri(mime, raw)
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +360,11 @@ class OlmOcrEngine(OcrEngine):
         and olmOCR's front matter made that worse: a reply cut off before the
         body closes parses to metadata and no text at all.
         """
+        from codai.ocr.workers import page_image
         data_uri = prepare_image(
             image, int(getattr(self.cfg, "olmocr_longest_side", DEFAULT_LONGEST_SIDE) or
-                       DEFAULT_LONGEST_SIDE))
+                       DEFAULT_LONGEST_SIDE),
+            page_image.Policy.from_cfg(self.cfg))
         messages = [{
             "role": "user",
             "content": [

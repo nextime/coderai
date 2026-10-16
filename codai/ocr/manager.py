@@ -2186,9 +2186,11 @@ class OcrManager:
         # `chunk` is the page window: a pooled read borrows a worker per chunk,
         # so matching the two means the document is re-opened once per window
         # rather than once per few pages.
+        from codai.ocr.workers import page_image
         stream = render_pages(data, filename=filename, content_type=content_type,
                               dpi=dpi, raster_workers=self._raster_workers(cfg),
-                              chunk=window)
+                              chunk=window,
+                              policy=page_image.Policy.from_cfg(cfg))
         pages_all: List[OcrPage] = []
         blank_all: list = []
         stamps_all: list = []

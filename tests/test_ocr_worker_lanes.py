@@ -45,12 +45,20 @@ def _png_bytes():
 
 
 class _Img:
-    """The minimum of a PIL image the engine touches before sending it."""
+    """The minimum of a PIL image the engine touches before sending it.
+
+    ``save`` takes ``format`` as a keyword because that is how the encoder
+    writes it now -- it also passes ``compress_level``, which PIL accepts and
+    this stand-in ignores.
+    """
+
+    mode = "RGB"
+    size = (1, 1)
 
     def convert(self, mode):
         return self
 
-    def save(self, buf, fmt):
+    def save(self, buf, format=None, **kw):
         buf.write(_png_bytes())
 
 

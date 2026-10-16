@@ -403,9 +403,10 @@ def _manager(monkeypatch, n_pages, cfg=None, engine_for=None):
     trace = {"pulled": 0, "windows": [], "reserved": []}
 
     def _fake_render(data, filename="", content_type="", dpi=200,
-                     raster_workers=0, chunk=8):
+                     raster_workers=0, chunk=8, policy=None):
         trace["chunk"] = chunk
         trace["raster_workers"] = raster_workers
+        trace["policy"] = policy
         for i in range(n_pages):
             trace["pulled"] += 1
             yield f"page-{i}"                     # a stand-in for a PIL image
@@ -739,6 +740,19 @@ def test_the_pool_chunk_matches_the_page_window(monkeypatch):
     m, trace = _manager(monkeypatch, n_pages=40)
     asyncio.run(m.ocr_document(b"%PDF-x", filename="x.pdf"))
     assert trace["chunk"] == 4, trace.get("chunk")      # _Cfg.page_window
+
+
+def test_the_page_image_policy_reaches_the_renderer(monkeypatch):
+    """It decides whether a scanned page is rendered at all, so a read that
+    does not carry it would silently render every scan."""
+    class _C(_Cfg):
+        page_image_format = "jpeg"
+        page_image_jpeg_quality = 70
+    m, trace = _manager(monkeypatch, n_pages=2, cfg=_C())
+    asyncio.run(m.ocr_document(b"%PDF-x", filename="x.pdf"))
+    assert trace["policy"] is not None
+    assert trace["policy"].fmt == "jpeg"
+    assert trace["policy"].jpeg_quality == 70
 
 
 def test_the_raster_worker_setting_reaches_the_renderer(monkeypatch):

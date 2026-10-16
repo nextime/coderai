@@ -288,14 +288,19 @@ class SubprocessOcrEngine(OcrEngine):
 
     def recognize_image(self, image) -> OcrPage:
         import base64
-        import io
-        buf = io.BytesIO()
-        image.convert("RGB").save(buf, "PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        from codai.ocr.workers import page_image
+        # The page goes down the pipe as it already is whenever it can: a
+        # scanned page arrives as the JPEG the PDF held, and re-encoding it here
+        # cost 323 ms of zlib and 1.8 MB of pipe per page -- then surya's own
+        # client did it a SECOND time to build the request. `image.convert`
+        # used to be unconditional, which also quietly dropped the carried
+        # bytes on every page, since convert returns a copy.
+        mime, raw = page_image.Policy.from_cfg(self.cfg).encode(image)
+        b64 = base64.b64encode(raw).decode("ascii")
         # Per-request overrides travel WITH the page, not with the load: a pool
         # is built once and then serves every caller, so anything set at load
         # time is the same for all of them.
-        msg = {"cmd": "ocr", "image": b64}
+        msg = {"cmd": "ocr", "image": b64, "mime": mime}
         opts = page_options()
         if opts:
             msg["opts"] = opts

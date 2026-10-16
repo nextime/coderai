@@ -21,22 +21,45 @@ Protocol, newline-delimited JSON with raw binary payloads, on stdin/stdout:
     <- {"ok": true, "pages": [{"w": 2066, "h": 2924, "nbytes": 18122952}, ...]}
        + <concatenated raw RGB bytes, in that order>
 
+A page may instead come back ALREADY ENCODED, with a "mime" on its meta:
+
+    <- {"ok": true, "pages": [{"w": 1268, "h": 1752, "nbytes": 150740,
+                               "mime": "image/jpeg"}]}
+       + <the JPEG the PDF itself holds, untouched>
+
+which is what a scanned page is: one full-page DCTDecode image that needs no
+render and no encode (0.1 ms and 147 KB against 46 ms, 352 ms and 1846 KB). The
+guards live in page_image.extract_embedded; `open` carries the policy.
+
     -> {"cmd": "close"}                     release the document, keep the process
     <- {"ok": true}
 
     -> {"cmd": "shutdown"}
     <- {"ok": true}                         then exit
 
-Raw RGB rather than PNG: the parent rebuilds the page with Image.frombytes, and
-a page that is about to be read by an OCR engine must not pass through a lossy
-codec, while PNG would cost more CPU than the pipe it saves.
+Raw RGB rather than PNG for a RENDERED page: the parent rebuilds it with
+Image.frombytes, and a page about to be read by an OCR engine must not pass
+through a lossy codec, while PNG would cost more CPU than the pipe it saves. A
+page that was never rendered is a different matter -- its bytes are already a
+JPEG, and re-rendering them to ship them raw would be work in both directions.
 
 Errors answer {"ok": false, "error": str, "status": int} and leave the process
 usable -- one undecodable document must not cost the pool a worker.
 """
 
 import json
+import os
 import sys
+
+# This script runs with -I, so its own directory is NOT on sys.path. The policy
+# that decides when a page may be passed through has to be shared with the
+# parent -- duplicating those guards is how the two sides drift -- and it is the
+# one import allowed here beyond pypdfium2 and PIL: stdlib + PIL only, no codai.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import page_image
+except Exception:                      # pragma: no cover - keep rendering
+    page_image = None
 
 
 class _Doc:
@@ -46,6 +69,8 @@ class _Doc:
         self.pdf = None
         self.scale = 1.0
         self.n = 0
+        self.dpi = 200
+        self.policy = None
 
     def close(self):
         pdf, self.pdf = self.pdf, None
@@ -112,6 +137,13 @@ def main() -> int:
                 _reply({"ok": False, "error": str(e), "status": 500})
                 return 1          # the frame is lost; the parent must replace us
             dpi = int(msg.get("dpi") or 200)
+            doc.dpi = dpi
+            doc.policy = None
+            if page_image is not None and msg.get("page_image") is not None:
+                try:
+                    doc.policy = page_image.Policy.from_dict(msg.get("page_image"))
+                except Exception:
+                    doc.policy = None
             try:
                 doc.pdf = pdfium.PdfDocument(data)
                 doc.scale = max(0.5, dpi / 72.0)
@@ -140,6 +172,19 @@ def main() -> int:
             try:
                 for i in range(start, min(doc.n, start + count)):
                     page = doc.pdf[i]
+                    # A page that already IS an image is sent as it is: no
+                    # render, no encode, and a pipe carrying 147 KB instead of
+                    # 11.6 MB. None from here means "render it", always.
+                    got = None
+                    if doc.policy is not None:
+                        got = doc.policy.extract(page, doc.dpi)
+                    if got is not None:
+                        mime, raw, (w, h) = got
+                        metas.append({"w": w, "h": h, "nbytes": len(raw),
+                                      "mime": mime})
+                        blobs.append(raw)
+                        del page
+                        continue
                     bitmap = page.render(scale=doc.scale)
                     img = bitmap.to_pil().convert("RGB")
                     raw = img.tobytes()

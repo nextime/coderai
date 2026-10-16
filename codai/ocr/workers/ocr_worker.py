@@ -11,7 +11,13 @@
 # Protocol: newline-delimited JSON on stdin/stdout.
 #   startup            → worker prints {"ready": true}
 #   {"cmd":"load","opts":{...}}   → {"ok":true} | {"ok":false,"error":..,"status":..}
-#   {"cmd":"ocr","image":"<b64 png>","opts":{...}} → {"ok":true,"page":{...}} | {...}
+#   {"cmd":"ocr","image":"<b64>","mime":"image/png","opts":{...}}
+#                      → {"ok":true,"page":{...}} | {...}
+#       `mime` is what `image` actually is ("image/png" when absent). It matters
+#       because a page that arrived already encoded can be sent ONWARDS to the
+#       model without being encoded again: surya's own client PNGs every page
+#       (86-353 ms on A4 at 200 DPI), and with the pipe doing the same the
+#       surya path paid zlib twice per page against ~5 s on the GPU.
 #       `opts` are PER-REQUEST overrides for this page only (max_tokens,
 #       max_continuations). Applied thread-locally, so lanes cannot overwrite
 #       each other's budgets. Absent = the values sent at load.
@@ -325,6 +331,131 @@ def _no_resume(reason: str) -> None:
         _state()["no_resume"] = str(reason)
     except Exception:
         pass
+
+
+#: What a page's bytes were when they arrived, attached to the PIL image.
+#:
+#: Deliberately the same shape as ``codai/ocr/workers/page_image.py`` writes,
+#: and deliberately NOT imported from it: this file runs inside the engine's own
+#: virtualenv, where coderai is not importable at all. The convention is the
+#: protocol, so it is repeated here rather than shared.
+_PAGE_BYTES = "_coderai_page_bytes"
+
+#: ``(format, quality)`` for pages this process must encode itself. Module-level
+#: because the surya function it feeds is.
+_IMAGE_FORMAT = ["auto", 95]
+
+
+def _carry(img, mime, raw):
+    """Remember that ``raw`` already encodes ``img`` (see page_image.attach)."""
+    try:
+        setattr(img, _PAGE_BYTES, (mime, raw, tuple(img.size)))
+    except Exception:
+        pass
+    return img
+
+
+def _carried(img):
+    """``(mime, raw)`` when this image IS those bytes, else None.
+
+    The size check is what makes this safe: surya scales a page to fit the
+    model, and a scaled page is a new object -- but an in-place transform would
+    leave the attribute pointing at bytes of the wrong size, which the model
+    would read as a perfectly plausible wrong page.
+    """
+    got = getattr(img, _PAGE_BYTES, None)
+    if not got:
+        return None
+    try:
+        mime, raw, size = got
+    except Exception:
+        return None
+    if not raw or tuple(img.size) != tuple(size):
+        return None
+    return mime, raw
+
+
+def _encode_page(img):
+    """``(mime, bytes)`` for one page: its own bytes, else the cheap encoding.
+
+    PIL's PNG default is ``compress_level=6`` (323 ms on a 3.45 Mpix page);
+    level 1 is lossless too and takes 123 ms. JPEG is 8 ms but lossy, so it is
+    only used when the operator asked for it.
+    """
+    fmt, quality = _IMAGE_FORMAT[0], _IMAGE_FORMAT[1]
+    if fmt != "png":
+        got = _carried(img)
+        if got is not None:
+            return got
+    buf = io.BytesIO()
+    if fmt == "jpeg":
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=int(quality))
+        return "image/jpeg", buf.getvalue()
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.save(buf, format="PNG", compress_level=1)
+    return "image/png", buf.getvalue()
+
+
+def _install_image_encoder():
+    """Make surya's client stop re-encoding pages it was handed encoded.
+
+    ``surya/inference/backends/openai_client.py`` builds every request with
+
+        buf = io.BytesIO(); image.save(buf, format="PNG")        # 86-353 ms
+        ... f"data:image/png;base64,{image_b64}"                 # hard-coded
+
+    so both functions are replaced: the encoder, to reuse the page's own bytes
+    (or at least a cheaper encoding), and the message builder, because the mime
+    type in that URI is a literal and a JPEG announced as a PNG is the kind of
+    thing that works until the day a server believes it.
+
+    Patched once per process, failure is silent BY DESIGN: a surya release that
+    renames either function must cost throughput, never pages. Verified by
+    reading the installed module, not assumed -- if ``_build_messages`` no
+    longer calls the encoder by name, the encoder patch alone still works.
+    """
+    try:
+        from surya.inference.backends import openai_client as _oc
+    except Exception as e:
+        print(f"[surya] page encoder unavailable: {e}", file=sys.stderr)
+        return
+    if getattr(_oc, "_coderai_image_patched", False):
+        return
+    if getattr(_oc, "encode_image_b64", None) is None:
+        print("[surya] page encoder: no encode_image_b64 to replace",
+              file=sys.stderr)
+        return
+
+    def _encode_b64(image):
+        mime, raw = _encode_page(image)
+        _LAST_MIME.value = mime
+        return base64.b64encode(raw).decode("ascii")
+
+    def _build_messages(image, prompt):
+        b64 = _encode_b64(image)
+        mime = getattr(_LAST_MIME, "value", "image/png")
+        return [{"role": "user",
+                 "content": [{"type": "image_url",
+                              "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                             {"type": "text", "text": prompt}]}]
+
+    _oc.encode_image_b64 = _encode_b64
+    if getattr(_oc, "_build_messages", None) is not None:
+        _oc._build_messages = _build_messages
+    _oc._coderai_image_patched = True
+
+
+#: The mime of the last page this THREAD encoded, so the message builder can
+#: declare what it is actually sending. Per-thread for the same reason the token
+#: trace is: lanes put several pages in one process.
+class _LastMime(threading.local):
+    value = "image/png"
+
+
+_LAST_MIME = _LastMime()
 
 
 def _note_loop(raw: str) -> None:
@@ -1199,6 +1330,16 @@ class SuryaWorker:
         _RETRY_BUDGET[0] = None if budget is None else max(0, int(budget))
         #: 0 leaves surya's own 2048 in place.
         _MAX_TOKENS[0] = max(0, int(opts.get("max_tokens", 0) or 0))
+        #: How a page is encoded for the model, when this process must encode
+        #: it at all. Module cell, like the rest: the surya function it feeds is
+        #: module-level.
+        fmt = str(opts.get("page_image_format", "auto") or "auto").strip().lower()
+        _IMAGE_FORMAT[0] = fmt if fmt in ("auto", "png", "jpeg") else "auto"
+        try:
+            _IMAGE_FORMAT[1] = max(1, min(100, int(
+                opts.get("page_image_jpeg_quality", 95) or 95)))
+        except (TypeError, ValueError):
+            _IMAGE_FORMAT[1] = 95
         #: Resumptions allowed for one page. 0 = return a cut-off page partial.
         _CONTINUE_BUDGET[0] = max(0, int(opts.get("max_continuations", 2) or 0))
         #: 0 asks the server for its own `max_model_len`. Set it when the server
@@ -1249,6 +1390,7 @@ class SuryaWorker:
         self._det = DetectionPredictor()
         self._mode = "predictor"
         self._install_trace_hook()
+        _install_image_encoder()
         return
 
     def _install_trace_hook(self):
@@ -1730,6 +1872,7 @@ def _serve_page(lanes: "_Lanes", msg: dict, engine: str) -> None:
         from PIL import Image
         data = base64.b64decode(msg["image"])
         img = Image.open(io.BytesIO(data)); img.load()
+        _carry(img, msg.get("mime") or "image/png", data)
         # On THIS thread, before the page is read. _trace_begin() inside ocr()
         # resets the page's trace but not the options, so they survive it -- and
         # being thread-local they cannot leak into another lane's page.
@@ -1784,6 +1927,7 @@ def main():
                     from PIL import Image
                     data = base64.b64decode(msg["image"])
                     img = Image.open(io.BytesIO(data)); img.load()
+                    _carry(img, msg.get("mime") or "image/png", data)
                     _trace_opts(msg.get("opts"))
                     _emit({"ok": True, "page": worker.ocr(img)})
                 except Exception as e:

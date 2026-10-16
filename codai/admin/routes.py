@@ -4138,6 +4138,10 @@ def build_settings_dict(c, gpu_cards):
             "max_pages": c.ocr.max_pages,
             "pod_pipeline": c.ocr.pod_pipeline,
             "pod_pipeline_wait_s": c.ocr.pod_pipeline_wait_s,
+            "page_image_format": c.ocr.page_image_format,
+            "page_image_jpeg_quality": c.ocr.page_image_jpeg_quality,
+            "page_image_min_dpi": c.ocr.page_image_min_dpi,
+            "page_image_max_dpi_factor": c.ocr.page_image_max_dpi_factor,
             "max_resident_mb": c.ocr.max_resident_mb,
             "page_window": c.ocr.page_window,
             "raster_workers": c.ocr.raster_workers,
@@ -4997,6 +5001,21 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 o.pod_pipeline_wait_s = max(0.0, float(d.get("pod_pipeline_wait_s") or 0))
             except (TypeError, ValueError):
                 pass
+        if "page_image_format" in d:
+            _pf = str(d.get("page_image_format") or "").strip().lower()
+            # An unknown value leaves the setting alone rather than silently
+            # becoming the default: a typo in a scripted PUT must not quietly
+            # change how every page is encoded.
+            o.page_image_format = _pf if _pf in ("auto", "png", "jpeg") else o.page_image_format
+        if "page_image_jpeg_quality" in d:
+            o.page_image_jpeg_quality = max(1, min(100, _i(
+                "page_image_jpeg_quality", o.page_image_jpeg_quality, 1)))
+        for _k, _lo in (("page_image_min_dpi", 0.0), ("page_image_max_dpi_factor", 1.0)):
+            if _k in d:
+                try:
+                    setattr(o, _k, max(_lo, float(d.get(_k) or 0)))
+                except (TypeError, ValueError):
+                    pass
         if "max_resident_mb" in d: o.max_resident_mb = _i("max_resident_mb", o.max_resident_mb, 0)
         if "page_window" in d: o.page_window = _i("page_window", o.page_window, 0)
         if "raster_workers" in d: o.raster_workers = _i("raster_workers", o.raster_workers, 0)

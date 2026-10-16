@@ -1150,6 +1150,41 @@
         that is momentarily full, not a cold one: after a timeout the next pages go
         straight through for five minutes rather than paying this per page.</span>
       </div>
+      <div class="form-group" style="flex:1;min-width:190px">
+        <label class="form-label">Page image sent to the model</label>
+        <select id="s-ocr-page-image-format" class="form-input">
+          <option value="auto">Auto &mdash; pass scans through, else lossless PNG</option>
+          <option value="png">Always re-encode as PNG</option>
+          <option value="jpeg">JPEG (lossy, fastest)</option>
+        </select>
+        <span class="form-hint">Measured on A4 at 200&nbsp;DPI: rendering a page costs
+        21&ndash;46&nbsp;ms and <b>encoding it 86&ndash;353&nbsp;ms</b>, so most of what
+        looks like rasterisation is zlib. <b>Auto</b> sends a scanned page as the JPEG the
+        PDF already holds &mdash; no render, no encode, no resample (0.1&nbsp;ms, 147&nbsp;KB)
+        &mdash; and encodes everything else losslessly at zlib level&nbsp;1. <b>PNG</b>
+        always re-encodes, which is what a controlled comparison needs. <b>JPEG</b> is
+        eight times faster again but lossy.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">JPEG quality</label>
+        <input type="number" id="s-ocr-page-image-quality" class="form-input" min="1" max="100" placeholder="95">
+        <span class="form-hint">Only used when the format above is JPEG.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Pass a scan through above (DPI)</label>
+        <input type="number" id="s-ocr-page-image-min-dpi" class="form-input" min="0" placeholder="150">
+        <span class="form-hint">A scan coarser than this is rendered at the configured DPI
+        instead, so the model still gets the pixel density the rest of the pipeline was
+        tuned for. A scan is also rendered when it is more than
+        <span id="s-ocr-page-image-factor-label">3</span>&times; the target, where
+        rendering down is cheaper than shipping it whole.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:130px">
+        <label class="form-label">&hellip;and below this &times; DPI</label>
+        <input type="number" id="s-ocr-page-image-max-factor" class="form-input" min="1" step="0.5" placeholder="3">
+        <span class="form-hint">Upper bound for passing a scan through, as a multiple of
+        the configured DPI.</span>
+      </div>
       <div class="form-group" style="flex:1;min-width:140px">
         <label class="form-label">Max resident pages (MB)</label>
         <input type="number" id="s-ocr-max-resident-mb" class="form-input" min="0" placeholder="0">
@@ -2276,6 +2311,12 @@ async function loadSettings(){
     document.getElementById('s-ocr-max-pages').value = ocr.max_pages ?? 0;
     document.getElementById('s-ocr-pod-pipeline').value = ocr.pod_pipeline ?? 'prefer';
     document.getElementById('s-ocr-pod-pipeline-wait').value = ocr.pod_pipeline_wait_s ?? 60;
+    document.getElementById('s-ocr-page-image-format').value = ocr.page_image_format ?? 'auto';
+    document.getElementById('s-ocr-page-image-quality').value = ocr.page_image_jpeg_quality ?? 95;
+    document.getElementById('s-ocr-page-image-min-dpi').value = ocr.page_image_min_dpi ?? 150;
+    document.getElementById('s-ocr-page-image-max-factor').value = ocr.page_image_max_dpi_factor ?? 3;
+    document.getElementById('s-ocr-page-image-factor-label').textContent =
+      String(ocr.page_image_max_dpi_factor ?? 3);
     document.getElementById('s-ocr-max-resident-mb').value = ocr.max_resident_mb ?? 0;
     document.getElementById('s-ocr-page-window').value = ocr.page_window ?? 0;
     document.getElementById('s-ocr-raster-workers').value = ocr.raster_workers ?? 0;
@@ -2583,6 +2624,10 @@ async function saveSettings(silent){
       max_pages: parseInt(document.getElementById('s-ocr-max-pages').value) || 0,
       pod_pipeline: document.getElementById('s-ocr-pod-pipeline').value || 'prefer',
       pod_pipeline_wait_s: parseFloat(document.getElementById('s-ocr-pod-pipeline-wait').value) || 0,
+      page_image_format: document.getElementById('s-ocr-page-image-format').value || 'auto',
+      page_image_jpeg_quality: parseInt(document.getElementById('s-ocr-page-image-quality').value) || 95,
+      page_image_min_dpi: parseFloat(document.getElementById('s-ocr-page-image-min-dpi').value) || 0,
+      page_image_max_dpi_factor: parseFloat(document.getElementById('s-ocr-page-image-max-factor').value) || 3,
       max_resident_mb: parseInt(document.getElementById('s-ocr-max-resident-mb').value) || 0,
       page_window: parseInt(document.getElementById('s-ocr-page-window').value) || 0,
       raster_workers: parseInt(document.getElementById('s-ocr-raster-workers').value) || 0,

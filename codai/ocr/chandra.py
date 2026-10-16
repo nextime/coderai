@@ -204,18 +204,24 @@ def scale_to_fit(img, max_size=(3072, 2048), min_size=(1792, 28), grid_size: int
     return img.resize((new_width, new_height), resample=Image.Resampling.LANCZOS)
 
 
-def prepare_image(image) -> (str, tuple):
+def prepare_image(image, policy=None) -> (str, tuple):
     """``(data URI, (w, h))`` for the image as the MODEL will see it.
 
     The size is returned because the boxes come back normalised against it, and
     de-normalising them against the pre-scaling size would put every box in the wrong
     place on any page that was scaled.
+
+    ``scale_to_fit`` FIRST, and ``convert`` only if the mode needs it: both
+    return a new object, which is what drops a scanned page's own JPEG bytes --
+    exactly when they stop being the image the model will see. A page that needs
+    neither keeps them and is sent without being encoded at all.
     """
-    img = scale_to_fit(image.convert("RGB"))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-    return uri, img.size
+    from codai.ocr.workers import page_image
+    img = scale_to_fit(image)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    mime, raw = (policy or page_image.DEFAULT).encode(img)
+    return page_image.data_uri(mime, raw), img.size
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +585,9 @@ class ChandraEngine(OcrEngine):
 
     def recognize_image(self, image) -> OcrPage:
         src_w, src_h = image.size
-        data_uri, (w, h) = prepare_image(image)
+        from codai.ocr.workers import page_image
+        data_uri, (w, h) = prepare_image(
+            image, page_image.Policy.from_cfg(self.cfg))
         content, meta, conf = self._ask_with_retries(data_uri)
         page = parse_page(
             content, w, h,
