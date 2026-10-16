@@ -364,11 +364,22 @@ def _served_names(model_config: dict, served_name: str, fallback: str) -> list:
             md = getattr(config_manager, "models_data", None) or {}
         except Exception:
             md = {}
-        for entry in (md.get("text_models") or []):
-            if not isinstance(entry, dict) or _base_of(entry) != base:
+        # EVERY category, not just text_models. A model's TYPE is its section
+        # (see main.py's _CATEGORY_TYPE_PREFIX), so the same weights listed
+        # under `vision_models` to serve images are a different entry in a
+        # different list -- and scanning only text_models left that name out of
+        # the launch. The engine then did not answer to it: either a 404, or a
+        # relaunch per alternating request, which on a 27B is an OOM rather
+        # than a slowdown. The weights are what one engine serves; which list
+        # the operator wrote the name in says nothing about that.
+        for _lst in md.values():
+            if not isinstance(_lst, list):
                 continue
-            names.append(str(entry.get("alias") or "").strip())
-            names.append(str(entry.get("id") or "").strip())
+            for entry in _lst:
+                if not isinstance(entry, dict) or _base_of(entry) != base:
+                    continue
+                names.append(str(entry.get("alias") or "").strip())
+                names.append(str(entry.get("id") or "").strip())
     out, seen = [], set()
     for n in names:
         if n and n not in seen and n not in adapters:
