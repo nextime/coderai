@@ -348,6 +348,73 @@ def _warn_if_oversubscribed(name: str, pages: int) -> None:
               f"pods ({per} in flight each); {tail}.", flush=True)
 
 
+class PodUnreachable(OcrError):
+    """Nothing came back over the socket — which is NOT an answer.
+
+    The distinction decides what may be concluded. A pod that ANSWERS 404 or
+    503 has told us about the image it runs: it cannot run the pipeline, it
+    will say the same for every page, and the pool belongs on the shelf. A
+    socket that dies has told us about one TCP connection.
+
+    Conflating the two cost a production run its afternoon. A pooled keep-alive
+    connection that a pod closed while idle fails on its next use with
+    RemoteDisconnected; that became `OcrError(503)`, 503 meant "these pods
+    cannot run the pipeline", and one dead socket moved every document onto the
+    orchestrator for five minutes. It happened twelve times in four hours, the
+    log said it once, and a GPU-less box climbed to 38 GB rasterising work that
+    sixteen rented A40s were idle and willing to do.
+    """
+
+
+#: Attempts per page, counting the first. Covers a dead pooled socket (nothing
+#: was sent, so a retry has no side effect) and a pod that has genuinely gone,
+#: which the next attempt's placement routes around.
+POD_PAGE_ATTEMPTS = 3
+
+#: Text that means "the connection failed", as opposed to a reply we dislike.
+#: Matched on the message because requests wraps urllib3 which wraps the
+#: socket, and the useful name is rarely the outermost one.
+_DEAD_SOCKET_HINTS = ("remotedisconnected", "connection aborted",
+                      "connection reset", "connection refused",
+                      "protocolerror", "badstatusline", "broken pipe",
+                      "closed connection", "connectionerror",
+                      "connection error", "ssleoferror", "eof occurred")
+
+
+def _looks_like_a_dead_socket(exc: BaseException) -> bool:
+    """A failed CONNECTION, not a timeout and not a reply.
+
+    Timeouts are deliberately excluded: a pod may be ninety seconds into a
+    130-second read, and sending the page again would double the work on a card
+    that is already doing it.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "timeout" in text or "timed out" in text:
+        return False
+    return any(hint in text for hint in _DEAD_SOCKET_HINTS)
+
+
+def _pod_still_alive(base: str, api_key: str) -> bool:
+    """Does this pod answer /healthz at all? Asked BEFORE calling it dead.
+
+    A pod reclaimed out of band and a pod whose idle socket we reused fail
+    identically on one request. Treating the second as the first terminated
+    seven healthy A40s in an earlier incident, so the address gets a question of
+    its own before anyone writes it off.
+    """
+    from codai.api import pod_http
+    url = str(base or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    url = url.rstrip("/") + "/healthz"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        r = pod_http.get(url, headers=headers, timeout=15)
+    except Exception:
+        return False
+    return int(getattr(r, "status_code", 0) or 0) < 500
+
+
 def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
                       dpi: int, opts: dict, detect, engine: str = "surya") -> dict:
     """POST one page to a pod's own /v1/ocr and return its response dict.
@@ -379,11 +446,20 @@ def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    try:
-        r = pod_http.post(url, files={"file": (name, blob, "application/pdf")},
-                          data=fields, headers=headers, timeout=600)
-    except Exception as e:
-        raise OcrError(f"pod OCR at {url} is unreachable: {e}", status=503)
+    r = None
+    for attempt in range(1, POD_PAGE_ATTEMPTS + 1):
+        try:
+            r = pod_http.post(url, files={"file": (name, blob, "application/pdf")},
+                              data=fields, headers=headers, timeout=600)
+            break
+        except Exception as e:
+            # A pooled connection the pod closed while idle fails on its next
+            # use with nothing having been sent, so one more attempt costs a
+            # connect and gets a new socket.
+            if attempt < POD_PAGE_ATTEMPTS and _looks_like_a_dead_socket(e):
+                continue
+            raise PodUnreachable(f"pod OCR at {url} is unreachable: {e}",
+                                 status=503)
     if r.status_code >= 400:
         body = ""
         try:
@@ -454,7 +530,14 @@ def _set_aside_pod_pipeline(mid: str, reason: str) -> bool:
     with _POD_PIPELINE_LOCK:
         hit = _POD_PIPELINE_UNUSABLE.get(mid)
         fresh = not hit or hit[0] <= now
-        _POD_PIPELINE_UNUSABLE[mid] = (now + POD_PIPELINE_COOLDOWN_S, reason)
+        if fresh:
+            _POD_PIPELINE_UNUSABLE[mid] = (now + POD_PIPELINE_COOLDOWN_S, reason)
+        # An ACTIVE cooldown is not extended. It used to be, silently: every
+        # further refusal pushed the expiry out while only the first one
+        # printed, so a pool set aside for five minutes could stay aside for
+        # twenty with nothing in the log between. The window is the window;
+        # when it ends the pods are asked again, and _read_on_pods says, at
+        # most once per window, that this box is rasterising until then.
     return fresh
 
 
@@ -495,6 +578,166 @@ def _say_pipeline_gate(name: str, mid: str, image: str, runs: bool) -> None:
               f"model's runpod block has an `engine` or an `image`", flush=True)
 
 
+#: (reason key) -> when it was last said. A reason that recurs per document
+#: would bury the log at a hundred documents a minute, and one said once per
+#: process goes stale in a run that lasts hours -- so every "why this went
+#: local" line is rate limited rather than deduplicated outright.
+_SAID_AT: dict = {}
+_SAID_LOCK = threading.Lock()
+
+
+def _say_rate_limited(key, message: str, every: float = 60.0) -> None:
+    """Print ``message`` at most once per ``every`` seconds for this ``key``."""
+    now = time.time()
+    with _SAID_LOCK:
+        last = _SAID_AT.get(key, 0.0)
+        if now - last < max(0.0, every):
+            return
+        _SAID_AT[key] = now
+    print(message, flush=True)
+
+
+def _vlm_engine_for(cfg, name: str) -> str:
+    """Which VLM engine a request means, resolving a MODEL ID like a read does.
+
+    `/v1/ocr` accepts the model a caller knows about in place of the engine
+    name driving it -- `resolve_engine` has mapped the Surya-2 checkpoint to
+    'surya' since the endpoint existed, and the catalogue advertises those ids
+    as aliases. The pod-side gate did NOT: it compared the raw string against
+    the three engine names, so a caller naming the model got "" -- no pod-side
+    pipeline, no message, and this box rasterising every page of every
+    document. The switch has to be read the way a READ reads it, for the same
+    reason it has to be read the way a LAUNCH reads it.
+    """
+    want = (name or "").strip().lower()
+    if want in ("surya", "chandra", "olmocr"):
+        return want
+    if not want:
+        return ""
+    for eng in ("surya", "chandra", "olmocr"):
+        for field in (f"{eng}_model_id", f"{eng}_model"):
+            got = str(getattr(cfg, field, "") or "").strip().lower()
+            if got and got == want:
+                return eng
+    return ""
+
+
+def _pod_pipeline_policy(cfg) -> tuple:
+    """(policy, wait_seconds) for what to do when no pod can take a page.
+
+    * ``auto``    -- read it on this box at once (what 0.4.1-0.4.5 did).
+    * ``prefer``  -- wait up to the ceiling for a pod, then read it here. The
+      default: a pool that cannot serve this second is usually a pool whose
+      pods are booting, and the alternative is this box rasterising, which is
+      what every OCR memory incident on record has been.
+    * ``require`` -- never rasterise here; answer 503 saying why.
+    """
+    raw = str(getattr(cfg, "pod_pipeline", "") or "prefer").strip().lower()
+    if raw in ("off", "never", "local"):
+        raw = "auto"
+    if raw not in ("auto", "prefer", "require"):
+        raw = "prefer"
+    try:
+        wait = float(getattr(cfg, "pod_pipeline_wait_s", 60.0) or 0.0)
+    except Exception:
+        wait = 60.0
+    return raw, max(0.0, wait)
+
+
+#: model id -> when waiting for a pod may be tried again. A pool that is out of
+#: budget, or at its ceiling, stays that way for minutes: without this every
+#: page of every document would pay the full wait before going local, turning a
+#: 60s ceiling into a 60s tax per page.
+_POD_WAIT_COOLDOWN: dict = {}
+POD_WAIT_COOLDOWN_S = 300.0
+
+
+def _pod_wait_cooling(mid: str) -> bool:
+    """True when a wait for this model's pods just timed out."""
+    with _POD_PIPELINE_LOCK:
+        until = _POD_WAIT_COOLDOWN.get(mid, 0.0)
+        if until <= time.time():
+            _POD_WAIT_COOLDOWN.pop(mid, None)
+            return False
+        return True
+
+
+def _set_pod_wait_cooldown(mid: str) -> None:
+    with _POD_PIPELINE_LOCK:
+        _POD_WAIT_COOLDOWN[mid] = time.time() + POD_WAIT_COOLDOWN_S
+
+
+async def _lease_a_pod(model_id: str, policy: str, wait_s: float):
+    """A lease on a pod that runs the pipeline, or None to read on this box.
+
+    Raises OcrError(503) under ``require``, which is the whole point of that
+    setting: an install that has decided this box must never rasterise would
+    rather have a page refused, and retried, than have the orchestrator quietly
+    take on the work it has no memory for.
+    """
+    from codai.models import placement
+    waiting = policy in ("prefer", "require") and not (
+        policy == "prefer" and _pod_wait_cooling(model_id))
+    deadline = time.time() + wait_s if waiting else 0.0
+    waited = 0.0
+    while True:
+        try:
+            lease = placement.choose(
+                model_id, spill_after=placement.spill_threshold(model_id))
+        except OcrError:
+            raise
+        except Exception as exc:
+            raise OcrError(f"no upstream for {model_id}: {exc}", status=503)
+        if lease.kind != "local":
+            if waited:
+                print(f"[ocr] a pod for {model_id!r} became free after "
+                      f"{waited:.0f}s — the page goes there and this box does "
+                      f"not rasterise it", flush=True)
+            return lease
+        # Placement would have this box serve the page, which means rasterising
+        # here: the condition that every OCR memory incident on record began
+        # with. Say which it is, then act on the policy.
+        lease.release()
+        why = ""
+        try:
+            why = placement.why_no_candidates(model_id)
+        except Exception:
+            why = ""
+        why = why or "the pool had no pod to hand out"
+        now = time.time()
+        if now < deadline:
+            await asyncio.sleep(min(2.0, max(0.1, deadline - now)))
+            waited = time.time() + wait_s - deadline
+            continue
+        if policy == "require":
+            raise OcrError(
+                f"the pods for {model_id!r} run the OCR pipeline and this "
+                f"install sets ocr.pod_pipeline=require, so this box will not "
+                f"rasterise the page: no pod could take it"
+                + (f" after {wait_s:.0f}s" if wait_s else "")
+                + f" — {why}. Retry, raise the pool's ceiling or its budget, "
+                f"or set ocr.pod_pipeline=prefer to let this box read it.",
+                status=503)
+        if waiting:
+            _set_pod_wait_cooldown(model_id)
+            _say_rate_limited(
+                ("wait-timeout", model_id),
+                f"[ocr] waited {wait_s:.0f}s for a pod that runs the pipeline "
+                f"for {model_id!r} and none came ({why}) — reading on THIS BOX, "
+                f"which means rasterising here, and not waiting again for "
+                f"{POD_WAIT_COOLDOWN_S:.0f}s. Watch this process's memory.",
+                every=POD_WAIT_COOLDOWN_S)
+        else:
+            _say_rate_limited(
+                ("placement-local", model_id),
+                f"[ocr] placement answered 'local' for {model_id!r}, so no "
+                f"pod is available to run the pipeline ({why}) — THIS BOX "
+                f"rasterises and reads the "
+                f"page. Set ocr.pod_pipeline=prefer to wait for a pod first, "
+                f"or require to refuse the page instead.")
+        return None
+
+
 def pod_pipeline_model(cfg, engine: str = "") -> str:
     """The model id whose pods run the OCR pipeline themselves, or "".
 
@@ -514,20 +757,56 @@ def pod_pipeline_model(cfg, engine: str = "") -> str:
     Returns "" for every other case -- no model mode, no entry, a different
     image -- so the caller simply does what it has always done.
     """
-    name = (engine or "").strip().lower() or str(
+    raw = (engine or "").strip().lower() or str(
         getattr(cfg, "default_engine", "") or "").strip().lower()
+    # A caller may name the MODEL instead of the engine -- documented, accepted
+    # everywhere else, and silently fatal here until 0.4.6. See _vlm_engine_for.
+    name = _vlm_engine_for(cfg, raw)
+    if name and name != raw:
+        _say_rate_limited(
+            ("alias", raw, name),
+            f"[ocr] {raw!r} names the {name!r} engine on this install, so the "
+            f"pod-side pipeline applies to it", every=600.0)
     # All three VLM engines can run on the pod, not just surya. The image is
     # what differs: surya needs its client venv baked in, while chandra and
     # olmOCR in served mode speak only HTTP (PIL + requests, already present),
     # so for them the pod side costs nothing beyond the rasteriser. Leaving
     # them on the orchestrator while surya moved was an asymmetry, not a
     # design.
-    if name not in ("surya", "chandra", "olmocr"):
+    if not name:
+        # SAY SO. Returning "" in silence here is what let a whole production
+        # run rasterise on the orchestrator with 8,278 successful pod reads in
+        # the same log: nothing distinguishes "the pods are doing it" from "the
+        # gate did not recognise the engine" when neither prints anything.
+        if raw in _ENGINE_FACTORIES:
+            _say_rate_limited(
+                ("no-pod-pipeline", raw),
+                f"[ocr] {raw!r} has no pod-side pipeline (only surya, chandra "
+                f"and olmOCR run on the pods), so THIS BOX rasterises and "
+                f"reads every page it is given", every=600.0)
+        else:
+            _say_rate_limited(
+                ("unknown-engine", raw),
+                f"[ocr] {raw!r} is not an OCR engine or a model id this "
+                f"install serves, so the pod-side pipeline cannot be chosen "
+                f"for it and THIS BOX rasterises", every=600.0)
         return ""
-    if str(getattr(cfg, f"{name}_serve", "") or "").strip().lower() != "model":
+    serve = str(getattr(cfg, f"{name}_serve", "") or "").strip().lower()
+    if serve != "model":
+        _say_rate_limited(
+            ("serve-mode", name, serve),
+            f"[ocr] {name!r}: serve mode is {serve or 'unset'!r}, not 'model', "
+            f"so there is no served model for a pod to run the pipeline "
+            f"against — THIS BOX rasterises. Set {name}_serve to 'model' to "
+            f"move it to the pods", every=600.0)
         return ""
     mid = str(getattr(cfg, f"{name}_model_id", "") or "").strip()
     if not mid:
+        _say_rate_limited(
+            ("no-model-id", name),
+            f"[ocr] {name!r}: serve mode is 'model' but {name}_model_id is "
+            f"empty, so there is nothing for the pods to serve — THIS BOX "
+            f"rasterises", every=600.0)
         return ""
     try:
         from codai.api.runpod_worker import (_model_entry,
@@ -1719,6 +1998,15 @@ class OcrManager:
         # aside; repeating it per document would bury it.
         standing = _pod_pipeline_refusal(model_id)
         if standing:
+            # Said when it was set aside, but a cooldown is minutes long and a
+            # run is hours: without a word here the documents in between look
+            # exactly like documents the pods read.
+            _say_rate_limited(
+                ("standing-refusal", model_id),
+                f"[ocr] still not asking the pods for {model_id!r} to run the "
+                f"pipeline ({standing}) — THIS BOX rasterises until the "
+                f"{POD_PIPELINE_COOLDOWN_S:.0f}s cooldown expires",
+                every=POD_PIPELINE_COOLDOWN_S)
             return None
         parts = (list(iter_pdf_page_pdfs(data)) if is_pdf else [data])
         if not parts:
@@ -1726,6 +2014,8 @@ class OcrManager:
         sem = self._sem or asyncio.Semaphore(4)
         opts = dict(page_opts or {})
         refused: list = []
+        unreachable: list = []
+        policy, wait_s = _pod_pipeline_policy(cfg)
 
         async def _one(idx: int, blob: bytes):
             async with sem:
@@ -1733,34 +2023,61 @@ class OcrManager:
                     # Another page already found the pods cannot run it. Do not
                     # send the rest of the document one failure at a time.
                     return None
-                try:
-                    lease = placement.choose(
-                        model_id, spill_after=placement.spill_threshold(model_id))
-                except Exception as exc:
-                    raise OcrError(f"no upstream for {model_id}: {exc}", status=503)
-                try:
-                    if lease.kind == "local":
-                        # Nothing rented: the local pipeline is the right answer
-                        # and the caller already has it.
+                # TRY NOT TO GO LOCAL. A pool with no free pod right now is
+                # usually a pool whose pods are booting; this box rasterising
+                # instead is how a GPU-less orchestrator reached 38 GB and
+                # climbing while sixteen A40s it was paying for sat idle.
+                for attempt in range(1, POD_PAGE_ATTEMPTS + 1):
+                    if refused:
                         return None
-                    return await asyncio.to_thread(
-                        _post_page_to_pod, lease.base, lease.api_key, blob,
-                        f"{idx}.pdf" if is_pdf else (filename or "page"),
-                        dpi, opts, detect, engine_name)
-                except OcrError as exc:
-                    # A POD THAT CANNOT RUN THE PIPELINE IS NOT A FAILED PAGE.
-                    # It answers the same way for every page of every document,
-                    # so raising turned "this optimisation is unavailable" into
-                    # "this document cannot be read" -- while the local pipeline
-                    # sat there able to read it. The comment on this method
-                    # already said an optimisation that cannot run must cost
-                    # latency and never an error; this is that, implemented.
-                    if int(getattr(exc, "status", 0) or 0) not in _POD_CANNOT_RUN_PIPELINE:
-                        raise
-                    refused.append(str(exc))
-                    return None
-                finally:
-                    lease.release()
+                    lease = await _lease_a_pod(model_id, policy, wait_s)
+                    if lease is None:
+                        return None
+                    try:
+                        return await asyncio.to_thread(
+                            _post_page_to_pod, lease.base, lease.api_key, blob,
+                            f"{idx}.pdf" if is_pdf else (filename or "page"),
+                            dpi, opts, detect, engine_name)
+                    except PodUnreachable as exc:
+                        # A DEAD SOCKET IS NOT A VERDICT ON THE IMAGE. Ask the
+                        # address whether anything is still there: a pod that
+                        # answers /healthz keeps its place in the pool (killing
+                        # it on a reused idle connection has cost seven healthy
+                        # cards before), and one that does not is reported so
+                        # the next attempt is routed elsewhere.
+                        alive = await asyncio.to_thread(
+                            _pod_still_alive, lease.base, lease.api_key)
+                        if not alive:
+                            lease.dead()
+                        _say_rate_limited(
+                            ("unreachable", model_id),
+                            f"[ocr] a pod for {model_id!r} did not answer this "
+                            f"page ({exc}); it is "
+                            + ("GONE and has been dropped from the pool"
+                               if not alive else
+                               "still answering /healthz, so this was the "
+                               "connection and not the pod")
+                            + f" — attempt {attempt} of {POD_PAGE_ATTEMPTS}. "
+                            f"This does NOT set the pool aside: only a pod that "
+                            f"ANSWERS can say it cannot run the pipeline.",
+                            every=30.0)
+                        if attempt >= POD_PAGE_ATTEMPTS:
+                            unreachable.append(str(exc))
+                            return None
+                        continue
+                    except OcrError as exc:
+                        # A POD THAT CANNOT RUN THE PIPELINE IS NOT A FAILED
+                        # PAGE. It answers the same way for every page of every
+                        # document, so raising turned "this optimisation is
+                        # unavailable" into "this document cannot be read" --
+                        # while the local pipeline sat there able to read it.
+                        if int(getattr(exc, "status", 0) or 0) not in _POD_CANNOT_RUN_PIPELINE:
+                            raise
+                        refused.append(str(exc))
+                        return None
+                    finally:
+                        lease.release()
+                return None
 
         got = await asyncio.gather(*[_one(i, b) for i, b in enumerate(parts)],
                                    return_exceptions=True)
@@ -1776,7 +2093,16 @@ class OcrManager:
             # had never run. One line is the difference between a test that
             # proves something and a test that proves nothing.
             _n = sum(1 for r in got if r is None)
-            if refused:
+            if unreachable and not refused:
+                _say_rate_limited(
+                    ("unreachable-fallback", model_id),
+                    f"[ocr] {_n} of {len(parts)} page(s) could not be sent to "
+                    f"any pod for {model_id!r} after {POD_PAGE_ATTEMPTS} "
+                    f"attempts each ({unreachable[0]}) — reading the WHOLE "
+                    f"document on THIS BOX, which rasterises here. The pool is "
+                    f"NOT set aside: the next document asks the pods again.",
+                    every=30.0)
+            elif refused:
                 # The pods answered, and what they said was "not me". That is a
                 # different fault from "nothing is rented", needs a different
                 # fix, and must carry the pod's OWN words: this is the only

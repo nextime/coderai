@@ -1048,6 +1048,29 @@ class OcrConfig:
     # It must never look like an empty or failed read -- see the "a degraded
     # page still answers 200" trap this subsystem already carries.
     max_pages: int = 0
+    # What to do when the model's pods are the ones that run the OCR pipeline
+    # (their image carries the rasteriser) but no pod can take a page.
+    #
+    #   auto    -- read it here at once. What 0.4.1-0.4.5 did, kept because an
+    #              install with a GPU of its own may genuinely prefer it.
+    #   prefer  -- wait up to `pod_pipeline_wait_s` for a pod, then read it
+    #              here. The default, because a pool with nothing free this
+    #              second is usually a pool whose pods are still booting.
+    #   require -- never rasterise on this box: answer 503 and say why.
+    #
+    # The default is not a performance setting, it is a memory one. A GPU-less
+    # orchestrator that quietly takes the pipeline back holds every page it
+    # renders: measured at ~0.8 GB/min and 36 GB on a 125 GB box, with sixteen
+    # rented cards idle, because a caller named the model instead of the engine
+    # and the gate said nothing. Waiting a minute is cheaper than that in every
+    # install where the pods exist at all.
+    pod_pipeline: str = "prefer"
+    # How long `prefer` (and `require`) wait for a pod before giving up on one.
+    # A pod takes minutes to boot, so this is deliberately NOT long enough to
+    # cover a cold pool: it covers a pool that is momentarily full. After a
+    # wait times out the next pages go straight through for a cooldown rather
+    # than paying the ceiling one page at a time.
+    pod_pipeline_wait_s: float = 60.0
     # How many pages of one document are rasterised at a time. The document is read
     # in windows, so residency is O(window) instead of O(document): a 400-page
     # filing costs the same as an 8-page one. 0 = follow `max_concurrency` (capped
@@ -2053,6 +2076,8 @@ class ConfigManager:
                 "max_concurrency": self.config.ocr.max_concurrency,
                 "max_resident_mb": self.config.ocr.max_resident_mb,
                 "max_pages": self.config.ocr.max_pages,
+                "pod_pipeline": self.config.ocr.pod_pipeline,
+                "pod_pipeline_wait_s": self.config.ocr.pod_pipeline_wait_s,
                 "page_window": self.config.ocr.page_window,
                 "raster_workers": self.config.ocr.raster_workers,
                 "lang": self.config.ocr.lang,

@@ -305,16 +305,24 @@ def _fake_placement(monkeypatch, kind="pod", on_choose=None):
 def test_no_pod_means_the_local_pipeline(monkeypatch):
     """`placement.choose` answering "local" means nothing is rented. The whole
     document is then read locally -- not half one way and half the other, which
-    is the hardest kind of result to explain."""
+    is the hardest kind of result to explain.
+
+    With `ocr.pod_pipeline = auto`, which is this immediate fallback: the
+    shipped default waits for a pod first (see
+    tests/test_ocr_pod_pipeline_policy.py), because reading here means
+    rasterising here."""
+    class _Auto(_Cfg):
+        pod_pipeline = "auto"
+
     mgr = om.OcrManager()
-    mgr._require_cfg = lambda: _Cfg()
+    mgr._require_cfg = lambda: _Auto()
     mgr._sem = asyncio.Semaphore(4)
 
     _fake_placement(monkeypatch, kind="local")
 
     out = asyncio.run(mgr._read_on_pods(
         _pdf(3), "d.pdf", "application/pdf", "m",
-        dpi=250, page_opts=None, detect=None, cfg=_Cfg()))
+        dpi=250, page_opts=None, detect=None, cfg=_Auto()))
     assert out is None
 
 
