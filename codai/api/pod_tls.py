@@ -35,6 +35,17 @@ _lock = threading.Lock()
 #: Environment variables the pod reads (boot.sh). PEM text, not paths.
 ENV_CERT = "CODERAI_TLS_CERT"
 ENV_KEY = "CODERAI_TLS_KEY"
+#: The CA's PUBLIC certificate, sent so the pod can verify ITSELF.
+#:
+#: A pod that terminates TLS has to talk to its own API over loopback -- an OCR
+#: engine runs as a subprocess and attaches to the gateway by URL, so it goes
+#: through the socket like any other client. Without the CA it cannot verify the
+#: certificate the pod is serving, and surya reported the pod's own address as
+#: "not reachable at /health" while the pod was answering perfectly well.
+#:
+#: Public by definition: this is the certificate every user verifies releases
+#: against. The private key never leaves this machine.
+ENV_CA = "CODERAI_TLS_CA"
 
 
 def tls_dir() -> str:
@@ -92,7 +103,13 @@ def issue_pod_cert(pod_name: str, days: int = 30) -> dict:
         key, csr, crt = (os.path.join(tmp, n) for n in ("pod.key", "pod.csr", "pod.pem"))
         ext = os.path.join(tmp, "ext.cnf")
         with open(ext, "w") as f:
-            f.write("subjectAltName=DNS:coderai-pod\n"
+            # `coderai-pod` resolves to loopback inside the pod (boot.sh adds
+            # it to /etc/hosts), so the pod verifies ITS OWN certificate by a
+            # name the certificate actually carries -- no disabled hostname
+            # check anywhere on that path. The IP SANs are belt and braces for
+            # anything that reaches loopback numerically.
+            f.write("subjectAltName=DNS:coderai-pod,DNS:localhost,"
+                    "IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n"
                     "extendedKeyUsage=serverAuth\n"
                     "basicConstraints=CA:FALSE\n")
         _run(["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
@@ -109,4 +126,15 @@ def issue_pod_cert(pod_name: str, days: int = 30) -> dict:
 def pod_env(pod_name: str) -> dict:
     """The environment that turns TLS on in a coderai pod."""
     leaf = issue_pod_cert(pod_name)
-    return {ENV_CERT: leaf["cert"], ENV_KEY: leaf["key"]}
+    env = {ENV_CERT: leaf["cert"], ENV_KEY: leaf["key"]}
+    try:
+        with open(ensure_ca()) as f:
+            env[ENV_CA] = f.read()
+    except Exception as exc:
+        # Not fatal: without it the pod still serves TLS outward, it just
+        # cannot verify itself on loopback. Say so rather than let an OCR
+        # engine discover it as "/health is not reachable".
+        print(f"[runpod] could not read the pod TLS CA to send it ({exc}); "
+              f"an OCR pipeline ON this pod will not be able to verify the "
+              f"pod's own address", flush=True)
+    return env

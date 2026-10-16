@@ -80,6 +80,49 @@ if [ -n "$CODERAI_TLS_CERT" ] && [ -n "$CODERAI_TLS_KEY" ]; then
     unset CODERAI_TLS_KEY
     TLS_ARGS="--ssl-certfile /run/coderai-tls/cert.pem --ssl-keyfile /run/coderai-tls/key.pem"
     phase "tls: serving https with the certificate the renting coderai sent"
+
+    # This pod now speaks TLS on its ONLY port, so anything here that talks to
+    # the pod's own API goes through TLS too -- an OCR engine runs as a
+    # subprocess and attaches to the gateway by URL, over the socket like any
+    # other client. Handing it http://127.0.0.1:8000 made it probe a plain
+    # request at a TLS listener and report the pod's own address as "not
+    # reachable at /health" while the pod was answering fine.
+    #
+    # So: a name the certificate carries, resolving to loopback, and a trust
+    # store that holds BOTH the public roots and our CA. Verification stays on
+    # end to end -- no skipped hostname check, no disabled verify.
+    grep -q ' coderai-pod$' /etc/hosts 2>/dev/null \
+        || echo "127.0.0.1 coderai-pod" >> /etc/hosts 2>/dev/null \
+        || phase "tls: could not add coderai-pod to /etc/hosts"
+    if [ -n "${CODERAI_TLS_CA:-}" ]; then
+        printf '%s\n' "$CODERAI_TLS_CA" > /run/coderai-tls/ca.pem
+        # certifi FIRST, ours appended: a bundle that lost the public roots
+        # would break every HuggingFace download on this pod, which is a far
+        # worse failure than the one being fixed. Only export it once it is
+        # built and non-empty.
+        BASE_CA="$(python -c 'import certifi;print(certifi.where())' 2>/dev/null || true)"
+        if [ -n "$BASE_CA" ] && [ -s "$BASE_CA" ]; then
+            cat "$BASE_CA" /run/coderai-tls/ca.pem > /run/coderai-tls/bundle.pem 2>/dev/null
+        else
+            cat /etc/ssl/certs/ca-certificates.crt /run/coderai-tls/ca.pem \
+                > /run/coderai-tls/bundle.pem 2>/dev/null || true
+        fi
+        if [ -s /run/coderai-tls/bundle.pem ] \
+           && grep -qc "BEGIN CERTIFICATE" /run/coderai-tls/bundle.pem >/dev/null 2>&1; then
+            export SSL_CERT_FILE=/run/coderai-tls/bundle.pem
+            export REQUESTS_CA_BUNDLE=/run/coderai-tls/bundle.pem
+            export CURL_CA_BUNDLE=/run/coderai-tls/bundle.pem
+            export CODERAI_SELF_BASE="https://coderai-pod:8000"
+            phase "tls: loopback verified via coderai-pod with the public roots plus our CA"
+        else
+            phase "tls: trust bundle could not be built — an OCR pipeline on this pod cannot verify loopback"
+        fi
+    else
+        phase "tls: no CA was sent — an OCR pipeline on this pod cannot verify loopback"
+    fi
+else
+    # Plain HTTP (the RunPod proxy is in front): loopback is loopback.
+    export CODERAI_SELF_BASE="http://127.0.0.1:8000"
 fi
 
 # A ray WORKER instead of a server: the vllm image joins a multi-node vLLM
