@@ -64,9 +64,12 @@ def _pool_size() -> int:
     should not have to know that a connection pool exists.
     """
     try:
-        from codai.config import config_manager
-        cfg = config_manager.config.ocr if config_manager and config_manager.config else None
-        want = int(getattr(cfg, "max_concurrency", 0) or 0)
+        # The SHARED manager is in codai.admin.routes; codai.config has no
+        # `config_manager` at all, so the old read raised ImportError on every
+        # call and this silently returned the floor. See
+        # codai/api/thread_pool.py for what that cost.
+        from codai.api.thread_pool import _configured_concurrency
+        want = _configured_concurrency()
     except Exception:
         want = 0
     return max(_DEFAULT_POOL, min(_MAX_POOL, want))

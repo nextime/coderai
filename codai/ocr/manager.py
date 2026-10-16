@@ -33,6 +33,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from codai.api.thread_pool import run_on_pod_pool
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
                             PAGE_OPTIONS, page_estimate, render_pages,
                             iter_pdf_page_pdfs, pdf_page_count, split_pdf_page,
@@ -1160,6 +1161,15 @@ class OcrManager:
                     pass
             self._pools = {}
             self._sem = asyncio.Semaphore(max(1, int(getattr(cfg, "max_concurrency", 4))))
+            # The semaphore is only half of the width: every page in flight on
+            # the pod path also holds a thread, so a raised max_concurrency that
+            # does not reach the pod pool just queues on it instead. Grows only,
+            # and only when the pool already exists.
+            try:
+                from codai.api.thread_pool import resize_pod_pool
+                resize_pod_pool()
+            except Exception:
+                pass
         self._register_releaser()
 
     def _register_releaser(self) -> None:
@@ -2034,7 +2044,16 @@ class OcrManager:
                     if lease is None:
                         return None
                     try:
-                        return await asyncio.to_thread(
+                        # THE POD POOL, not the default executor. A page forward
+                        # blocks for 8-35 s, and `asyncio.to_thread` hands it to
+                        # the loop's default pool -- 32 threads, shared with
+                        # every other blocking call in the process. That was the
+                        # real ceiling on this path: 32 forwards in flight
+                        # against a 512-page semaphore and 31 idle pods, which
+                        # is 1.65 pages/s however wide the semaphore or the
+                        # pods' own gate is set. codai/api/thread_pool.py was
+                        # written for exactly this call and nothing used it.
+                        return await run_on_pod_pool(
                             _post_page_to_pod, lease.base, lease.api_key, blob,
                             f"{idx}.pdf" if is_pdf else (filename or "page"),
                             dpi, opts, detect, engine_name)
@@ -2045,7 +2064,7 @@ class OcrManager:
                         # it on a reused idle connection has cost seven healthy
                         # cards before), and one that does not is reported so
                         # the next attempt is routed elsewhere.
-                        alive = await asyncio.to_thread(
+                        alive = await run_on_pod_pool(
                             _pod_still_alive, lease.base, lease.api_key)
                         if not alive:
                             lease.dead()
