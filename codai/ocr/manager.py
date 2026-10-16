@@ -420,6 +420,52 @@ def _page_from_pod(d: dict, index: int) -> OcrPage:
     return page
 
 
+#: How long a pool stays marked as unable to run the pipeline on its own pods
+#: before it is tried again. Long enough that a document does not pay a failed
+#: round trip per page, short enough that fixing the pods (a rebuilt image, a
+#: corrected seed) takes effect without restarting the orchestrator.
+POD_PIPELINE_COOLDOWN_S = 300.0
+
+#: model id -> (until, reason). See _read_on_pods().
+_POD_PIPELINE_UNUSABLE: dict = {}
+_POD_PIPELINE_LOCK = threading.Lock()
+
+
+def _pod_pipeline_refusal(mid: str) -> str:
+    """Why this pool's pods were set aside, or "" if they are to be tried."""
+    with _POD_PIPELINE_LOCK:
+        hit = _POD_PIPELINE_UNUSABLE.get(mid)
+        if not hit:
+            return ""
+        until, reason = hit
+        if until <= time.time():
+            _POD_PIPELINE_UNUSABLE.pop(mid, None)
+            return ""
+        return reason
+
+
+def _set_aside_pod_pipeline(mid: str, reason: str) -> bool:
+    """Stop sending pages to this pool's own pipeline for a while.
+
+    Returns True the first time, so the caller says it once per cooldown
+    instead of once per page.
+    """
+    now = time.time()
+    with _POD_PIPELINE_LOCK:
+        hit = _POD_PIPELINE_UNUSABLE.get(mid)
+        fresh = not hit or hit[0] <= now
+        _POD_PIPELINE_UNUSABLE[mid] = (now + POD_PIPELINE_COOLDOWN_S, reason)
+    return fresh
+
+
+#: Answers that mean "this pod cannot run the pipeline", as opposed to "this
+#: page went wrong". A pod that does not serve /v1/ocr, cannot attach its OCR
+#: engine to the model it is serving, or has no model to attach to will say the
+#: same thing for every page of every document -- so the pages belong on the
+#: local pipeline, not in a retry loop.
+_POD_CANNOT_RUN_PIPELINE = (404, 501, 503)
+
+
 #: (engine, model, image) combinations already explained. The gate is asked
 #: once per document, and the answer only changes when the configuration does,
 #: so saying it every time would bury it; saying it never is what let a whole
@@ -1649,14 +1695,25 @@ class OcrManager:
                   or (filename or "").lower().endswith(".pdf")
                   or data[:5] == b"%PDF-")
         # A single image has nothing to split; it goes as it arrived.
+        # Set aside recently? Then this document does not pay a round trip per
+        # page to be told the same thing again. Said once, when it was set
+        # aside; repeating it per document would bury it.
+        standing = _pod_pipeline_refusal(model_id)
+        if standing:
+            return None
         parts = (list(iter_pdf_page_pdfs(data)) if is_pdf else [data])
         if not parts:
             return None
         sem = self._sem or asyncio.Semaphore(4)
         opts = dict(page_opts or {})
+        refused: list = []
 
         async def _one(idx: int, blob: bytes):
             async with sem:
+                if refused:
+                    # Another page already found the pods cannot run it. Do not
+                    # send the rest of the document one failure at a time.
+                    return None
                 try:
                     lease = placement.choose(
                         model_id, spill_after=placement.spill_threshold(model_id))
@@ -1671,6 +1728,18 @@ class OcrManager:
                         _post_page_to_pod, lease.base, lease.api_key, blob,
                         f"{idx}.pdf" if is_pdf else (filename or "page"),
                         dpi, opts, detect, engine_name)
+                except OcrError as exc:
+                    # A POD THAT CANNOT RUN THE PIPELINE IS NOT A FAILED PAGE.
+                    # It answers the same way for every page of every document,
+                    # so raising turned "this optimisation is unavailable" into
+                    # "this document cannot be read" -- while the local pipeline
+                    # sat there able to read it. The comment on this method
+                    # already said an optimisation that cannot run must cost
+                    # latency and never an error; this is that, implemented.
+                    if int(getattr(exc, "status", 0) or 0) not in _POD_CANNOT_RUN_PIPELINE:
+                        raise
+                    refused.append(str(exc))
+                    return None
                 finally:
                     lease.release()
 
@@ -1688,11 +1757,25 @@ class OcrManager:
             # had never run. One line is the difference between a test that
             # proves something and a test that proves nothing.
             _n = sum(1 for r in got if r is None)
-            print(f"[ocr] the pod-side pipeline was configured for {model_id!r} "
-                  f"but {_n} of {len(parts)} page(s) had no pod to run it "
-                  f"(placement answered 'local' — nothing rented, or the pool "
-                  f"could not serve) — reading the WHOLE document here instead",
-                  flush=True)
+            if refused:
+                # The pods answered, and what they said was "not me". That is a
+                # different fault from "nothing is rented", needs a different
+                # fix, and must carry the pod's OWN words: this is the only
+                # place they are visible.
+                if _set_aside_pod_pipeline(model_id, refused[0]):
+                    print(f"[ocr] the pods for {model_id!r} run an image that "
+                          f"carries the OCR pipeline, but they REFUSE to run "
+                          f"it: {refused[0]} — falling back to the pipeline on "
+                          f"this box and not asking them again for "
+                          f"{POD_PIPELINE_COOLDOWN_S:.0f}s. This box will "
+                          f"rasterise in the meantime, so watch its memory.",
+                          flush=True)
+            else:
+                print(f"[ocr] the pod-side pipeline was configured for "
+                      f"{model_id!r} but {_n} of {len(parts)} page(s) had no "
+                      f"pod to run it (placement answered 'local' — nothing "
+                      f"rented, or the pool could not serve) — reading the "
+                      f"WHOLE document here instead", flush=True)
             return None
         bad = [r for r in got if isinstance(r, BaseException)]
         if bad:

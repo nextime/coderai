@@ -459,15 +459,20 @@ def test_a_silent_fallback_would_make_a_test_prove_nothing():
     fallback and the success say which one happened."""
     src = (ROOT / "codai/ocr/manager.py").read_text()
     fn = src.split("async def _read_on_pods")[1].split("\n    def ")[0]
-    assert "but {_n} of {len(parts)} page(s) had no pod" in fn
+    # Matched on fragments rather than a whole sentence: the wording is
+    # allowed to be rewrapped, but a path that reports NOTHING is not.
+    assert "page(s) had no " in fn
     assert "ON THE PODS" in fn
+    # …and the third outcome, added after pods that carried the pipeline
+    # refused to run it and the document failed instead of falling back.
+    assert "REFUSE to run" in fn
 
 
 def test_the_fallback_message_names_the_cause_not_just_the_effect():
     src = (ROOT / "codai/ocr/manager.py").read_text()
     fn = src.split("async def _read_on_pods")[1].split("\n    def ")[0]
     assert "placement answered 'local'" in fn
-    assert "nothing rented" in fn
+    assert "nothing " in fn and "rented" in fn
 
 
 # ------------------------------- all three VLM engines, not just surya #

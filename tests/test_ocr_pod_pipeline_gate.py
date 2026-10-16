@@ -28,6 +28,11 @@ from codai.api.runpod_worker import (image_runs_ocr_pipeline,
 import codai.ocr.manager as om
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 OCR_IMAGE = "ghcr.io/nextime/coderai-vllm-ocr:latest"
 PLAIN_IMAGE = "ghcr.io/nextime/coderai-vllm:latest"
 
@@ -192,3 +197,140 @@ def test_a_non_vlm_engine_never_goes_to_a_pod(monkeypatch):
 def test_local_serve_mode_never_goes_to_a_pod(monkeypatch):
     _with_entry(monkeypatch, _entry(engine="coderai-vllm-ocr"))
     assert om.pod_pipeline_model(_cfg(surya_serve="local"), "surya") == ""
+
+
+# --------------------------------------------------------------------------
+# A pod that cannot run the pipeline must cost latency, not the document
+# --------------------------------------------------------------------------
+
+class _Lease:
+    kind = "pod"
+    base = "https://10.0.0.1:1234/v1"
+    api_key = "k"
+
+    def release(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _forget_set_aside_pools():
+    om._POD_PIPELINE_UNUSABLE.clear()
+    yield
+    om._POD_PIPELINE_UNUSABLE.clear()
+
+
+def _two_page_pdf_split(monkeypatch, pages=2):
+    monkeypatch.setattr(om, "iter_pdf_page_pdfs",
+                        lambda _d: [b"%%PDF-page" + str(i).encode() for i in range(pages)])
+
+
+def _pods_answer(monkeypatch, fn):
+    from codai.models import placement
+    monkeypatch.setattr(placement, "choose", lambda *_a, **_k: _Lease())
+    monkeypatch.setattr(placement, "spill_threshold", lambda *_a, **_k: 0)
+    monkeypatch.setattr(om, "_post_page_to_pod", fn)
+
+
+async def _read(mgr, cfg):
+    return await mgr._read_on_pods(b"%PDF-1.4 x", "f.pdf", "application/pdf",
+                                   "datalab-to/surya-ocr-2", dpi=200,
+                                   page_opts=None, detect=None, cfg=cfg,
+                                   engine_name="surya")
+
+
+@pytest.mark.anyio
+async def test_a_pod_that_refuses_the_pipeline_falls_back_instead_of_failing(
+        monkeypatch, capsys):
+    """THE outage: a 503 from the pod turned an optimisation into a failure."""
+    _two_page_pdf_split(monkeypatch)
+
+    def _refuse(*_a, **_k):
+        raise om.OcrError("pod OCR at https://10.0.0.1:1234/v1/ocr answered "
+                          "503: model is not served over HTTP by this install",
+                          status=503)
+
+    _pods_answer(monkeypatch, _refuse)
+    mgr = om.OcrManager()
+    assert await _read(mgr, types.SimpleNamespace()) is None
+    out = capsys.readouterr().out
+    assert "REFUSE to run it" in out
+    assert "not served over HTTP" in out          # the POD's own words
+
+
+@pytest.mark.anyio
+async def test_a_refusal_stops_the_rest_of_the_document(monkeypatch):
+    """One failed round trip, not one per page of an 1800-page filing."""
+    _two_page_pdf_split(monkeypatch, pages=40)
+    calls = []
+
+    def _refuse(*_a, **_k):
+        calls.append(1)
+        raise om.OcrError("pod OCR answered 503: nope", status=503)
+
+    _pods_answer(monkeypatch, _refuse)
+    mgr = om.OcrManager()
+    assert await _read(mgr, types.SimpleNamespace()) is None
+    assert len(calls) < 40
+
+
+@pytest.mark.anyio
+async def test_the_pool_is_set_aside_so_the_next_document_does_not_retry(
+        monkeypatch):
+    _two_page_pdf_split(monkeypatch)
+    calls = []
+
+    def _refuse(*_a, **_k):
+        calls.append(1)
+        raise om.OcrError("pod OCR answered 503: nope", status=503)
+
+    _pods_answer(monkeypatch, _refuse)
+    mgr = om.OcrManager()
+    await _read(mgr, types.SimpleNamespace())
+    before = len(calls)
+    await _read(mgr, types.SimpleNamespace())
+    assert len(calls) == before, "second document re-asked a pool already set aside"
+
+
+@pytest.mark.anyio
+async def test_the_pool_is_tried_again_once_the_cooldown_passes(monkeypatch):
+    """A rebuilt image must take effect without restarting the orchestrator."""
+    _two_page_pdf_split(monkeypatch)
+    calls = []
+
+    def _refuse(*_a, **_k):
+        calls.append(1)
+        raise om.OcrError("pod OCR answered 503: nope", status=503)
+
+    _pods_answer(monkeypatch, _refuse)
+    mgr = om.OcrManager()
+    await _read(mgr, types.SimpleNamespace())
+    om._POD_PIPELINE_UNUSABLE["datalab-to/surya-ocr-2"] = (0.0, "stale")
+    before = len(calls)
+    await _read(mgr, types.SimpleNamespace())
+    assert len(calls) > before
+
+
+@pytest.mark.anyio
+async def test_a_real_page_failure_still_fails(monkeypatch):
+    """Falling back on ANY error would hide a broken page behind a slow one."""
+    _two_page_pdf_split(monkeypatch)
+
+    def _boom(*_a, **_k):
+        raise om.OcrError("pod OCR answered 400: that is not a PDF", status=400)
+
+    _pods_answer(monkeypatch, _boom)
+    mgr = om.OcrManager()
+    with pytest.raises(om.OcrError):
+        await _read(mgr, types.SimpleNamespace())
+
+
+@pytest.mark.anyio
+async def test_a_working_pod_is_untouched(monkeypatch):
+    _two_page_pdf_split(monkeypatch)
+    _pods_answer(monkeypatch,
+                 lambda *_a, **_k: {"engine": "surya",
+                                    "pages": [{"text": "ok", "index": 0}]})
+    mgr = om.OcrManager()
+    got = await _read(mgr, types.SimpleNamespace())
+    assert got is not None
+    assert got[0] == "surya"
