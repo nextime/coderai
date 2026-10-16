@@ -4135,6 +4135,7 @@ def build_settings_dict(c, gpu_cards):
             "dpi": c.ocr.dpi,
             "surya_dpi": c.ocr.surya_dpi,
             "max_concurrency": c.ocr.max_concurrency,
+            "max_pages": c.ocr.max_pages,
             "max_resident_mb": c.ocr.max_resident_mb,
             "page_window": c.ocr.page_window,
             "raster_workers": c.ocr.raster_workers,
@@ -4985,6 +4986,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_dpi" in d: o.surya_dpi = _i("surya_dpi", o.surya_dpi, 0)
         if "max_concurrency" in d: o.max_concurrency = _i("max_concurrency", o.max_concurrency, 1)
         # 0 = derive from the cgroup limit or host RAM; see codai/ocr/budget.py
+        if "max_pages" in d: o.max_pages = _i("max_pages", o.max_pages, 0)
         if "max_resident_mb" in d: o.max_resident_mb = _i("max_resident_mb", o.max_resident_mb, 0)
         if "page_window" in d: o.page_window = _i("page_window", o.page_window, 0)
         if "raster_workers" in d: o.raster_workers = _i("raster_workers", o.raster_workers, 0)

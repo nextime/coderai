@@ -1123,6 +1123,14 @@
         <span class="form-hint">A ceiling on concurrent page WORK, not on memory. It does
         not bound how much a document holds &mdash; use the two settings below for that.</span>
       </div>
+      <div class="form-group" style="flex:1;min-width:130px">
+        <label class="form-label">Max pages per document</label>
+        <input type="number" id="s-ocr-max-pages" class="form-input" min="0" placeholder="0">
+        <span class="form-hint">Refuse a document longer than this instead of reading it.
+        <b>0 = no ceiling.</b> Checked off the page tree before any work, so an
+        over-long document is refused in milliseconds with a 413 naming its page
+        count &mdash; never a silent or empty read.</span>
+      </div>
       <div class="form-group" style="flex:1;min-width:140px">
         <label class="form-label">Max resident pages (MB)</label>
         <input type="number" id="s-ocr-max-resident-mb" class="form-input" min="0" placeholder="0">
@@ -2246,6 +2254,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-dpi').value = ocr.dpi ?? 200;
     document.getElementById('s-ocr-surya-dpi').value = ocr.surya_dpi ?? 250;
     document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 64;
+    document.getElementById('s-ocr-max-pages').value = ocr.max_pages ?? 0;
     document.getElementById('s-ocr-max-resident-mb').value = ocr.max_resident_mb ?? 0;
     document.getElementById('s-ocr-page-window').value = ocr.page_window ?? 0;
     document.getElementById('s-ocr-raster-workers').value = ocr.raster_workers ?? 0;
@@ -2550,6 +2559,7 @@ async function saveSettings(silent){
       dpi: parseInt(document.getElementById('s-ocr-dpi').value) || 200,
       surya_dpi: parseInt(document.getElementById('s-ocr-surya-dpi').value) || 0,
       max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 64,
+      max_pages: parseInt(document.getElementById('s-ocr-max-pages').value) || 0,
       max_resident_mb: parseInt(document.getElementById('s-ocr-max-resident-mb').value) || 0,
       page_window: parseInt(document.getElementById('s-ocr-page-window').value) || 0,
       raster_workers: parseInt(document.getElementById('s-ocr-raster-workers').value) || 0,

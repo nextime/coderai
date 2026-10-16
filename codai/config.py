@@ -1030,6 +1030,24 @@ class OcrConfig:
     # that will never set one. A document bigger than the whole budget still runs,
     # alone -- a gate that can refuse forever is just a deadlock.
     max_resident_mb: int = 0
+    # Refuse a document longer than this many pages instead of reading it.
+    # 0 = no ceiling, which is the shipped default: page count is not a fault,
+    # and an install that batch-reads book scans is as legitimate as one that
+    # reads two-page letters.
+    #
+    # It exists because length is the one property that is knowable BEFORE any
+    # work is done (page_estimate reads the page tree) and the one that scales
+    # every cost at once -- time, memory, tokens and, where pages are read on
+    # rented cards, money. An operator who knows their corpus has a tail of
+    # 1800-page outliers that will never finish inside a client's timeout is
+    # better served refusing them in milliseconds, with a reason, than having
+    # them time out expensively an hour later.
+    #
+    # Refusing LOUDLY is the whole point: a skipped document answers 413 with
+    # its page count and this limit, so a caller can route it somewhere else.
+    # It must never look like an empty or failed read -- see the "a degraded
+    # page still answers 200" trap this subsystem already carries.
+    max_pages: int = 0
     # How many pages of one document are rasterised at a time. The document is read
     # in windows, so residency is O(window) instead of O(document): a 400-page
     # filing costs the same as an 8-page one. 0 = follow `max_concurrency` (capped
@@ -2034,6 +2052,7 @@ class ConfigManager:
                 "dpi": self.config.ocr.dpi,
                 "max_concurrency": self.config.ocr.max_concurrency,
                 "max_resident_mb": self.config.ocr.max_resident_mb,
+                "max_pages": self.config.ocr.max_pages,
                 "page_window": self.config.ocr.page_window,
                 "raster_workers": self.config.ocr.raster_workers,
                 "lang": self.config.ocr.lang,

@@ -1318,6 +1318,25 @@ class OcrManager:
         # already spent, so admission control has to work from the page tree.
         n_pages, est_bytes = page_estimate(data, filename=filename,
                                            content_type=content_type, dpi=use_dpi)
+        # Length is the one cost knowable before any work, and it scales every
+        # other one at once. An install that sets a ceiling gets it enforced
+        # HERE -- in milliseconds, off the page tree -- rather than an hour
+        # later as a timeout that already cost the time, the memory and, on
+        # rented cards, the money. Refused out loud, with both numbers, so a
+        # caller can route the document somewhere else; a skip that looked
+        # like an empty read would be the worst of both.
+        limit = 0
+        try:
+            limit = int(getattr(cfg, "max_pages", 0) or 0)
+        except Exception:
+            limit = 0
+        if limit > 0 and n_pages > limit:
+            raise OcrError(
+                f"{filename or 'this document'} has {n_pages} pages, over the "
+                f"{limit}-page ceiling this install sets for one document "
+                f"(ocr.max_pages) — it was NOT read. Raise the ceiling, or "
+                f"split the document and send the parts.",
+                status=413)
         window = self._page_window(cfg)
         # Charge for the WINDOW, not the document -- windowing is what makes that
         # honest, and charging whole documents would queue work that never coexists.
