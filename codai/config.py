@@ -1099,14 +1099,18 @@ class OcrConfig:
     pod_http_async: bool = True
     page_image_format: str = "auto"
     page_image_jpeg_quality: int = 95
-    # The bounds within which a scan may be passed through. Below the floor the
-    # embedded image is genuinely coarser than the configured DPI and rendering
-    # it up at least gives the model the pixel density the rest of the pipeline
-    # was tuned for; far above the target, rendering DOWN is cheaper than
-    # shipping the whole thing for the engine to scale. Expressed in real DPI
-    # rather than as a ratio because "is 150 DPI enough to read" is a question
-    # about documents, which an operator can answer.
-    page_image_min_dpi: float = 150.0
+    # An ADDITIONAL floor on passing a scan through, in real DPI. 0 means the
+    # floor is the engine's own target DPI, which is the only setting under
+    # which a passed-through scan cannot change what the model sees.
+    #
+    # It shipped as an absolute 150 and that was wrong: a 150-DPI scan then
+    # reached a 250-DPI engine at native size -- 40 % less linear resolution
+    # than the render it replaced -- and surya-ocr-2 lost Italian accents on
+    # those pages. Reported from production the same afternoon. The point of
+    # the passthrough was "the same pixels without the work"; fewer pixels is
+    # not a saving, it is a different page. Raise this only to demand MORE than
+    # the target.
+    page_image_min_dpi: float = 0.0
     page_image_max_dpi_factor: float = 3.0
     # How many pages of one document are rasterised at a time. The document is read
     # in windows, so residency is O(window) instead of O(document): a 400-page

@@ -37,11 +37,28 @@ guards live in page_image.extract_embedded; `open` carries the policy.
     -> {"cmd": "shutdown"}
     <- {"ok": true}                         then exit
 
-Raw RGB rather than PNG for a RENDERED page: the parent rebuilds it with
-Image.frombytes, and a page about to be read by an OCR engine must not pass
-through a lossy codec, while PNG would cost more CPU than the pipe it saves. A
-page that was never rendered is a different matter -- its bytes are already a
-JPEG, and re-rendering them to ship them raw would be work in both directions.
+A rendered page is encoded HERE, losslessly, rather than shipped as raw RGB.
+Measured on an A4 page at 250 DPI (6.04 Mpix), which is surya's own default:
+
+    raw RGB over the pipe            18.1 MB   and the parent then spent
+                                               109.7 ms encoding it anyway
+    PNG level 1 encoded here          0.72 MB  104.7 ms, in THIS process
+    the parent's lazy Image.open                 0.12 ms
+
+So the encode does not get added, it MOVES: off the single parent process and
+onto this pool, which is parallel, while the pipe carries 25x less and the
+parent holds 0.72 MB per page in flight instead of 18.1 MB. That last number is
+the one that matters -- a GPU-less orchestrator rasterising at 48 pages in
+flight is the difference between 35 MB and 870 MB of page bitmaps.
+
+The parent opens it lazily and passes the bytes onward, so the page is decoded
+only if something actually wants pixels (ink measurement, a detector) and the
+engine hop reuses these exact bytes instead of encoding a second time.
+
+PNG, not JPEG, unless the operator asked for JPEG: a page about to be read by
+an OCR engine must not pass through a lossy codec by default. Raw RGB remains
+the fallback when no policy was sent, which keeps the protocol readable by an
+older parent.
 
 Errors answer {"ok": false, "error": str, "status": int} and leave the process
 usable -- one undecodable document must not cost the pool a worker.
@@ -187,9 +204,22 @@ def main() -> int:
                         continue
                     bitmap = page.render(scale=doc.scale)
                     img = bitmap.to_pil().convert("RGB")
-                    raw = img.tobytes()
-                    metas.append({"w": img.width, "h": img.height,
-                                  "nbytes": len(raw)})
+                    # Encode here, under the policy, so the parent reuses these
+                    # bytes rather than encoding its own copy of the same page.
+                    enc = None
+                    if doc.policy is not None:
+                        try:
+                            enc = doc.policy.encode(img)
+                        except Exception:
+                            enc = None          # a render is worth more than a codec
+                    if enc is not None:
+                        mime, raw = enc
+                        metas.append({"w": img.width, "h": img.height,
+                                      "nbytes": len(raw), "mime": mime})
+                    else:
+                        raw = img.tobytes()
+                        metas.append({"w": img.width, "h": img.height,
+                                      "nbytes": len(raw)})
                     blobs.append(raw)
                     # Drop each page before rendering the next: this process is
                     # as bound by residency as its parent.

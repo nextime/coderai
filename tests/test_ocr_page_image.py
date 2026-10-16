@@ -150,7 +150,7 @@ def test_policy_from_a_config_that_predates_these_knobs():
     class _Old:
         dpi = 200
     p = pi.Policy.from_cfg(_Old())
-    assert (p.fmt, p.jpeg_quality, p.min_dpi, p.max_dpi_factor) == ("auto", 95, 150.0, 3.0)
+    assert (p.fmt, p.jpeg_quality, p.min_dpi, p.max_dpi_factor) == ("auto", 95, 0.0, 3.0)
 
 
 def test_policy_from_the_real_config():
@@ -173,7 +173,7 @@ def test_policy_clamps_nonsense():
     p = pi.Policy("auto", 9999, -5, 0.1)
     assert p.jpeg_quality == 100 and p.min_dpi == 0.0 and p.max_dpi_factor == 1.0
     p = pi.Policy("auto", "x", "y", "z")
-    assert (p.jpeg_quality, p.min_dpi, p.max_dpi_factor) == (95, 150.0, 3.0)
+    assert (p.jpeg_quality, p.min_dpi, p.max_dpi_factor) == (95, 0.0, 3.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -183,13 +183,53 @@ def test_policy_clamps_nonsense():
 def test_a_full_page_scan_is_passed_through():
     pdfium = pytest.importorskip("pypdfium2")
     pdf = pdfium.PdfDocument(_scan_pdf())
-    got = pi.extract_embedded(pdf[0], 200)
+    got = pi.extract_embedded(pdf[0], 150)        # the fixture's own density
     assert got is not None
     mime, raw, size = got
     assert mime == pi.MIME_JPEG
     assert raw[:3] == b"\xff\xd8\xff"
     assert size == (1268, 1752)
     assert Image.open(io.BytesIO(raw)).size == (1268, 1752)
+
+
+def test_a_scan_coarser_than_the_TARGET_is_rendered_not_passed_through():
+    """THE REGRESSION. This shipped with an absolute 150-DPI floor, so a
+    150-DPI scan reached a 250-DPI engine at native size -- 40 % less linear
+    resolution than the render it replaced -- and surya-ocr-2 lost Italian
+    accents on exactly those pages. Reported from production the same
+    afternoon.
+
+    Passing a scan through was always meant to be "the same pixels without the
+    work". Fewer pixels is not a saving, it is a different page.
+    """
+    pdfium = pytest.importorskip("pypdfium2")
+    pdf = pdfium.PdfDocument(_scan_pdf())          # a 150-DPI scan
+    assert pi.extract_embedded(pdf[0], 250) is None, "a 150-DPI scan must NOT " \
+        "be sent to a 250-DPI engine instead of being rendered up"
+    assert pi.extract_embedded(pdf[0], 200) is None
+    # ...and it IS passed through to an engine that asked for no more.
+    assert pi.extract_embedded(pdf[0], 150) is not None
+
+
+def test_min_dpi_only_raises_the_floor_never_lowers_it():
+    pdfium = pytest.importorskip("pypdfium2")
+    pdf = pdfium.PdfDocument(_scan_pdf())
+    # Asking for less than the target cannot re-open the hole.
+    assert pi.extract_embedded(pdf[0], 250, min_dpi=100.0) is None
+    # Demanding MORE than the target works.
+    assert pi.extract_embedded(pdf[0], 150, min_dpi=200.0) is None
+    assert pi.extract_embedded(pdf[0], 150, min_dpi=100.0) is not None
+
+
+def test_surya_at_its_own_default_dpi_never_sees_a_coarser_scan():
+    """surya_dpi defaults to 250 and surya is measured to read badly below it,
+    so the engine's own target is what the guard must compare against."""
+    from codai.config import OcrConfig
+    assert OcrConfig().surya_dpi == 250
+    assert OcrConfig().page_image_min_dpi == 0.0      # 0 = follow the target
+    pdfium = pytest.importorskip("pypdfium2")
+    pdf = pdfium.PdfDocument(_scan_pdf())
+    assert pi.Policy.from_cfg(OcrConfig()).extract(pdf[0], 250) is None
 
 
 def test_a_scan_coarser_than_the_floor_is_rendered_instead():
@@ -218,7 +258,7 @@ def test_the_floor_tolerates_pdfiums_own_arithmetic():
     pdf = pdfium.PdfDocument(_scan_pdf())
     md = next(iter(pdf[0].get_objects())).get_metadata()
     assert md.vertical_dpi < 150.0
-    assert pi.extract_embedded(pdf[0], 200, min_dpi=150.0) is not None
+    assert pi.extract_embedded(pdf[0], 150) is not None
 
 
 def test_a_page_with_anything_else_on_it_is_rendered():
@@ -276,8 +316,8 @@ def test_extraction_never_raises():
 def test_the_png_policy_never_extracts():
     pdfium = pytest.importorskip("pypdfium2")
     pdf = pdfium.PdfDocument(_scan_pdf())
-    assert pi.Policy("png").extract(pdf[0], 200) is None
-    assert pi.Policy("auto").extract(pdf[0], 200) is not None
+    assert pi.Policy("png").extract(pdf[0], 150) is None
+    assert pi.Policy("auto").extract(pdf[0], 150) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +326,7 @@ def test_the_png_policy_never_extracts():
 
 def test_render_pages_passes_a_scan_through_in_process():
     from codai.ocr.base import render_pages
-    pages = list(render_pages(_scan_pdf(), filename="s.pdf", dpi=200,
+    pages = list(render_pages(_scan_pdf(), filename="s.pdf", dpi=150,
                               raster_workers=1))
     assert len(pages) == 1
     got = pi.carried(pages[0])
@@ -308,7 +348,7 @@ def test_the_rasteriser_pool_carries_the_bytes_across_the_pipe():
     from codai.ocr import rasterize
     rasterize.reset_pool()
     try:
-        gen = rasterize.iter_pdf_pages(_scan_pdf(), 200, chunk=4, raster_workers=2)
+        gen = rasterize.iter_pdf_pages(_scan_pdf(), 150, chunk=4, raster_workers=2)
         if gen is None:
             pytest.skip("no rasteriser pool in this environment")
         pages = list(gen)
@@ -581,3 +621,157 @@ def test_the_worker_and_the_module_agree_on_the_attribute():
     assert w._carried(img) == (pi.MIME_JPEG, raw)
     w._carry(img, pi.MIME_JPEG, raw)
     assert pi.carried(img) == (pi.MIME_JPEG, raw)
+
+
+def test_the_floor_follows_THE_REQUEST_not_the_engine_default():
+    """A client that asks for a DPI gets that DPI honoured, here too.
+
+    `ocr_document` resolves `use_dpi = int(dpi) if dpi else engine_dpi(engine)`
+    and passes it to the pod forward, to the local render AND (on the pod) to
+    this guard -- so "is this scan detailed enough" is asked about what THIS
+    request wanted, never about a default the caller overrode. A guard reading
+    the engine default instead would silently pass a 200-DPI scan to a request
+    that asked for 300.
+    """
+    pdfium = pytest.importorskip("pypdfium2")
+
+    # A 250-DPI scan, as three different requests see it. Pixels derived from
+    # the fixture's own page size rather than hardcoded: 609 pt is not A4, and
+    # a number that assumes it measures 244 DPI while claiming 250.
+    def page250():
+        px_w = round(609.0 / 72 * 250)
+        px_h = round(842.0 / 72 * 250)
+        return pdfium.PdfDocument(_scan_pdf(px_w=px_w, px_h=px_h))[0]
+
+    assert pi.extract_embedded(page250(), 250) is not None   # asked for 250: as good
+    assert pi.extract_embedded(page250(), 200) is not None   # asked for less: better
+    assert pi.extract_embedded(page250(), 300) is None       # asked for MORE: render it
+
+
+def test_the_request_dpi_reaches_the_renderer_and_the_guard():
+    """The plumbing the test above relies on, asserted rather than assumed."""
+    import inspect
+
+    from codai.ocr.manager import OcrManager
+    src = inspect.getsource(OcrManager.ocr_document)
+    assert "use_dpi = int(dpi) if dpi else self.engine_dpi(engine)" in src
+    # ...and that one value is what every read path is given.
+    assert src.count("use_dpi") >= 4
+
+
+# --------------------------------------------------------------------------- #
+# the rasterisation hop: encoded in the worker, not in the parent
+# --------------------------------------------------------------------------- #
+
+def _text_pdf(pages=1):
+    """A rendered (not scanned) page, so the passthrough cannot apply."""
+    pdfium = pytest.importorskip("pypdfium2")
+    pdf = pdfium.PdfDocument.new()
+    for _ in range(pages):
+        page = pdf.new_page(595.28, 841.89)
+        path = pdfium.raw.FPDFPageObj_CreateNewRect(40, 40, 400, 600)
+        pdfium.raw.FPDFPage_InsertObject(page, path)
+        pdfium.raw.FPDFPage_GenerateContent(page)
+    out = io.BytesIO()
+    pdf.save(out)
+    return out.getvalue()
+
+
+def test_a_rendered_page_arrives_from_the_pool_already_encoded():
+    """The page a POOL rendered carries its own bytes, so the engine hop does
+    not encode a second copy of the same pixels."""
+    from codai.ocr import rasterize
+    rasterize.reset_pool()
+    try:
+        gen = rasterize.iter_pdf_pages(_text_pdf(), 250, chunk=4, raster_workers=2)
+        if gen is None:
+            pytest.skip("no rasteriser pool in this environment")
+        pages = list(gen)
+    finally:
+        rasterize.reset_pool()
+    assert len(pages) == 1
+    got = pi.carried(pages[0])
+    assert got is not None, "a rendered page must arrive encoded"
+    assert got[0] == pi.MIME_PNG            # lossless by default
+    assert got[1][:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_the_pool_hop_is_lossless():
+    """PNG, so the pixels the model sees are the pixels pdfium drew. A lossy
+    codec on this hop would change what is read for a saving on a local pipe."""
+    from codai.ocr import rasterize
+    from codai.ocr.base import render_pages
+    data = _text_pdf()
+    rasterize.reset_pool()
+    try:
+        gen = rasterize.iter_pdf_pages(data, 250, chunk=4, raster_workers=2)
+        if gen is None:
+            pytest.skip("no rasteriser pool in this environment")
+        pooled = list(gen)[0]
+    finally:
+        rasterize.reset_pool()
+    inproc = list(render_pages(data, filename="x.pdf", dpi=250, raster_workers=1))[0]
+    pooled.load()
+    assert pooled.convert("RGB").tobytes() == inproc.convert("RGB").tobytes()
+
+
+def test_the_engine_hop_sends_the_pool_bytes_unchanged(monkeypatch):
+    """What the move is FOR: one encode per page, not two."""
+    from codai.ocr import rasterize, subprocess_engine
+    rasterize.reset_pool()
+    try:
+        gen = rasterize.iter_pdf_pages(_text_pdf(), 250, chunk=4, raster_workers=2)
+        if gen is None:
+            pytest.skip("no rasteriser pool in this environment")
+        page = list(gen)[0]
+    finally:
+        rasterize.reset_pool()
+
+    sent = {}
+
+    class _Engine(subprocess_engine.SubprocessOcrEngine):
+        def __init__(self):
+            self.cfg = type("C", (), {})()
+            self._mux = False
+            self.name = "fake"
+
+        def _rpc(self, msg):
+            sent.update(msg)
+            return {"ok": True, "page": {}}
+
+        def _page_from_dict(self, d):
+            return d
+
+        class _Lock:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        _lock = _Lock()
+
+    _Engine().recognize_image(page)
+    assert sent["mime"] == pi.MIME_PNG
+    assert base64.b64decode(sent["image"]) == pi.carried(page)[1]
+
+
+def test_the_operators_jpeg_choice_reaches_the_pool_hop():
+    from codai.ocr import rasterize
+    rasterize.reset_pool()
+    try:
+        gen = rasterize.iter_pdf_pages(_text_pdf(), 250, chunk=4, raster_workers=2,
+                                       policy=pi.Policy("jpeg", 90))
+        if gen is None:
+            pytest.skip("no rasteriser pool in this environment")
+        page = list(gen)[0]
+    finally:
+        rasterize.reset_pool()
+    got = pi.carried(page)
+    assert got is not None and got[0] == pi.MIME_JPEG
+
+
+def test_a_worker_sent_no_policy_still_ships_a_page():
+    """Raw RGB stays the fallback, so an older parent can still read this."""
+    import inspect
+
+    from codai.ocr.workers import raster_worker
+    src = inspect.getsource(raster_worker)
+    assert "img.tobytes()" in src
+    assert "if doc.policy is not None" in src

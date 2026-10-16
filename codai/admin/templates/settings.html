@@ -1183,13 +1183,14 @@
         <span class="form-hint">Only used when the format above is JPEG.</span>
       </div>
       <div class="form-group" style="flex:1;min-width:150px">
-        <label class="form-label">Pass a scan through above (DPI)</label>
-        <input type="number" id="s-ocr-page-image-min-dpi" class="form-input" min="0" placeholder="150">
-        <span class="form-hint">A scan coarser than this is rendered at the configured DPI
-        instead, so the model still gets the pixel density the rest of the pipeline was
-        tuned for. A scan is also rendered when it is more than
-        <span id="s-ocr-page-image-factor-label">3</span>&times; the target, where
-        rendering down is cheaper than shipping it whole.</span>
+        <label class="form-label">Extra floor for passing a scan through (DPI)</label>
+        <input type="number" id="s-ocr-page-image-min-dpi" class="form-input" min="0" placeholder="0">
+        <span class="form-hint"><b>0 = the engine&rsquo;s own DPI</b>, which is the only
+        setting under which a passed-through scan cannot change what the model sees: a
+        coarser scan is rendered up instead, exactly as before. Raise this only to demand
+        <i>more</i> than the target. A scan is also rendered when it exceeds
+        <span id="s-ocr-page-image-factor-label">3</span>&times; the target, where rendering
+        down is cheaper than shipping it whole.</span>
       </div>
       <div class="form-group" style="flex:1;min-width:130px">
         <label class="form-label">&hellip;and below this &times; DPI</label>
@@ -2326,7 +2327,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-pod-http-async').value = (ocr.pod_http_async ?? true) ? '1' : '0';
     document.getElementById('s-ocr-page-image-format').value = ocr.page_image_format ?? 'auto';
     document.getElementById('s-ocr-page-image-quality').value = ocr.page_image_jpeg_quality ?? 95;
-    document.getElementById('s-ocr-page-image-min-dpi').value = ocr.page_image_min_dpi ?? 150;
+    document.getElementById('s-ocr-page-image-min-dpi').value = ocr.page_image_min_dpi ?? 0;
     document.getElementById('s-ocr-page-image-max-factor').value = ocr.page_image_max_dpi_factor ?? 3;
     document.getElementById('s-ocr-page-image-factor-label').textContent =
       String(ocr.page_image_max_dpi_factor ?? 3);

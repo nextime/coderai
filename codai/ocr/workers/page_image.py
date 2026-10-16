@@ -144,7 +144,7 @@ def data_uri(mime: str, raw: bytes) -> str:
 _OBJ_IMAGE = 3
 
 
-def extract_embedded(page, dpi: int, min_dpi: float = 150.0,
+def extract_embedded(page, dpi: int, min_dpi: float = 0.0,
                      max_dpi_factor: float = 3.0):
     """``(mime, raw, (w, h))`` if this page IS one embedded JPEG, else ``None``.
 
@@ -169,11 +169,20 @@ def extract_embedded(page, dpi: int, min_dpi: float = 150.0,
       error.
     * **It covers the page.** 98 % in both axes, anchored at the origin, or the
       model is being shown a crop.
-    * **Between ``min_dpi`` and ``max_dpi_factor`` x the target.** Below the
-      floor the scan is genuinely coarser than the configured DPI and rendering
-      it up at least hands the model the pixel density the rest of the pipeline
-      was tuned for; far above it, rendering DOWN to the target is cheaper than
-      shipping the whole thing and letting the engine scale it.
+    * **At least the TARGET DPI, and at most ``max_dpi_factor`` x it.** This
+      guard was wrong when it shipped and the error is worth recording: it used
+      an absolute floor (150 DPI) instead of the DPI the page would have been
+      rendered at. A 150-DPI scan then went to a 250-DPI engine at its native
+      size -- a 40 % linear resolution drop in what the model sees -- and
+      surya-ocr-2 lost Italian accents on exactly those pages, which is a
+      regression reported from production within hours of the change.
+
+      The justification for passing a scan through was never "fewer pixels", it
+      was "the same pixels, without the work". A coarser image is not a saving,
+      it is a different page. So the floor is the target itself, and
+      ``min_dpi`` only RAISES it; above ``max_dpi_factor`` x the target,
+      rendering down is cheaper than shipping the whole thing for the engine to
+      scale.
     """
     try:
         if int(page.get_rotation() or 0) % 360 != 0:
@@ -200,11 +209,18 @@ def extract_embedded(page, dpi: int, min_dpi: float = 150.0,
             return None
         if abs(left) / pw > 0.02 or abs(bottom) / ph > 0.02:
             return None
-        # 2 % of slack on the floor, because pdfium derives the effective DPI
-        # from the image's own bounding box rather than the page: a plain
-        # 150-DPI scan of an A4 page reports 150.0 across and 149.957 down, and
-        # an exact floor would reject it over four hundredths of a dot.
-        lo = float(min_dpi) * 0.98
+        # The floor is what we WOULD have rendered; min_dpi only raises it.
+        # 0 (the default) therefore means "as detailed as the target", which is
+        # the only setting under which passing a scan through cannot change what
+        # the model sees.
+        floor = float(dpi)
+        if min_dpi and float(min_dpi) > floor:
+            floor = float(min_dpi)
+        # 2 % of slack, because pdfium derives the effective DPI from the
+        # image's own bounding box rather than the page: a plain 150-DPI scan of
+        # an A4 page reports 150.0 across and 149.957 down, and an exact floor
+        # would reject it over four hundredths of a dot.
+        lo = floor * 0.98
         hi = float(dpi) * float(max_dpi_factor)
         for eff in (float(md.horizontal_dpi), float(md.vertical_dpi)):
             if not (lo <= eff <= hi):
@@ -233,7 +249,7 @@ class Policy:
     __slots__ = ("fmt", "jpeg_quality", "min_dpi", "max_dpi_factor")
 
     def __init__(self, fmt: str = "auto", jpeg_quality: int = 95,
-                 min_dpi: float = 150.0, max_dpi_factor: float = 3.0):
+                 min_dpi: float = 0.0, max_dpi_factor: float = 3.0):
         fmt = (fmt or "auto").strip().lower()
         self.fmt = fmt if fmt in FORMATS else "auto"
         try:
@@ -243,7 +259,7 @@ class Policy:
         try:
             self.min_dpi = max(0.0, float(min_dpi))
         except Exception:
-            self.min_dpi = 150.0
+            self.min_dpi = 0.0
         try:
             self.max_dpi_factor = max(1.0, float(max_dpi_factor))
         except Exception:
@@ -262,7 +278,7 @@ class Policy:
         g = lambda k, d: getattr(cfg, k, d) if cfg is not None else d  # noqa: E731
         return cls(g("page_image_format", "auto"),
                    g("page_image_jpeg_quality", 95),
-                   g("page_image_min_dpi", 150.0),
+                   g("page_image_min_dpi", 0.0),
                    g("page_image_max_dpi_factor", 3.0))
 
     def as_dict(self) -> dict:
@@ -274,7 +290,7 @@ class Policy:
     def from_dict(cls, d):
         d = d or {}
         return cls(d.get("fmt", "auto"), d.get("jpeg_quality", 95),
-                   d.get("min_dpi", 150.0), d.get("max_dpi_factor", 3.0))
+                   d.get("min_dpi", 0.0), d.get("max_dpi_factor", 3.0))
 
     def encode(self, img):
         """``(mime, bytes)`` under this policy."""
