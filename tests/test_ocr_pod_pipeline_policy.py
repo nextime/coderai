@@ -65,7 +65,15 @@ def _cfg(**kw):
             "olmocr_serve": "model",
             "olmocr_model_id": "allenai/olmOCR-2-7B-1025-FP8",
             "max_concurrency": 8, "page_window": 4,
-            "pod_pipeline": "prefer", "pod_pipeline_wait_s": 60.0}
+            "pod_pipeline": "prefer", "pod_pipeline_wait_s": 60.0,
+            # EXPLICIT, not incidental: these tests stub the SYNC transport
+            # (`_post_page_to_pod`, `pod_http.post`), so they must say which
+            # path they are exercising. When the async default was introduced
+            # they silently stopped testing their own stubs and started dialling
+            # 10.0.0.1 for real -- 300 s of nothing instead of a failure. A test
+            # that quietly measures a different thing is worse than one that
+            # breaks.
+            "pod_http_async": False}
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -222,9 +230,12 @@ def _one_page(monkeypatch):
 
 
 def _page_read(monkeypatch):
-    monkeypatch.setattr(om, "_post_page_to_pod",
-                        lambda *_a, **_k: {"engine": "surya",
-                                           "pages": [{"text": "ok"}]})
+    reply = {"engine": "surya", "pages": [{"text": "ok"}]}
+
+    async def _aok(*_a, **_k):
+        return reply
+    monkeypatch.setattr(om, "_post_page_to_pod", lambda *_a, **_k: reply)
+    monkeypatch.setattr(om, "_apost_page_to_pod", _aok)
 
 
 async def _read(cfg):

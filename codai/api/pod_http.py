@@ -152,3 +152,114 @@ def head(url: str, **kw):
     if is_pinned_url(url):
         return request("HEAD", url, **kw)
     return requests.head(url, **kw)
+
+
+# --------------------------------------------------------------------------- #
+# the async path
+# --------------------------------------------------------------------------- #
+#
+# A page forward blocks for ~60 s against a real corpus, and the sync path above
+# costs one THREAD for every one of them. That is survivable at tens of pages in
+# flight and not at thousands: 15 documents/second at ~3.5 pages each and ~60 s
+# per page is ~3,200 forwards outstanding, which is not a number of threads any
+# install should be asked to carry (see codai/api/thread_pool.py, where the pod
+# pool is capped at 2048 for exactly that reason).
+#
+# So the hot path gets a coroutine instead. Everything the sync path learned the
+# hard way is kept:
+#
+# * the pod serves HTTPS with a certificate signed by THIS install's CA, at an
+#   ip that was not known when it was issued -- so the CA is trusted and the
+#   hostname check is off, and NOT verify=False, which would accept anyone;
+# * one client per event loop, with connection limits from the same
+#   `_pool_size()` the sync session uses;
+# * a proxied pod (http://, or https:// to a name) is an ordinary request.
+#
+# httpx rather than aiohttp: it is already in the stack (codai/cluster/nodes.py,
+# codai/main.py) and takes an ssl.SSLContext directly, so the pinned context is
+# the same object the sync path builds.
+
+_aclients: dict = {}
+_alock = threading.Lock()
+
+
+def _pinned_ssl_context():
+    """The context the sync adapter installs, built once per call site.
+
+    CA from this install, hostname matching off. The two together are the whole
+    trust decision for a direct-TCP pod: the certificate must be one we signed,
+    and the name on it cannot be the ip we reach it at.
+    """
+    from codai.api.pod_tls import ensure_ca
+    ctx = ssl.create_default_context(cafile=ensure_ca())
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def async_available() -> bool:
+    """Whether the async transport can be used at all."""
+    try:
+        import httpx            # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def aclient(pinned: bool):
+    """The AsyncClient for this event loop, created on first use.
+
+    Keyed by loop AND by pinned-ness: the two need different trust settings, and
+    a client built for one must never serve the other. Keyed by loop because an
+    httpx client belongs to the loop whose transport it opened its sockets on --
+    sharing one across loops is how a test suite ends up with sockets attached
+    to a closed loop.
+    """
+    import asyncio
+
+    import httpx
+
+    try:
+        loop_key = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_key = 0
+    key = (loop_key, bool(pinned))
+    with _alock:
+        c = _aclients.get(key)
+        if c is not None and not c.is_closed:
+            return c
+        size = _pool_size()
+        limits = httpx.Limits(max_connections=size,
+                              max_keepalive_connections=size)
+        kw = {"limits": limits, "timeout": httpx.Timeout(600.0, connect=30.0)}
+        if pinned:
+            kw["verify"] = _pinned_ssl_context()
+        c = httpx.AsyncClient(**kw)
+        _aclients[key] = c
+        return c
+
+
+async def apost(url: str, files=None, data=None, headers=None, timeout=600):
+    """POST on the event loop. Answers like the sync path: an object with
+    ``status_code``, ``text`` and ``json()``, so callers need not care which
+    transport ran."""
+    c = aclient(is_pinned_url(url))
+    return await c.post(url, files=files, data=data, headers=headers,
+                        timeout=timeout)
+
+
+async def aget(url: str, headers=None, timeout=15):
+    c = aclient(is_pinned_url(url))
+    return await c.get(url, headers=headers, timeout=timeout)
+
+
+async def aclose_all() -> None:
+    """Close every client (shutdown, tests). Never raises."""
+    with _alock:
+        clients = list(_aclients.values())
+        _aclients.clear()
+    for c in clients:
+        try:
+            await c.aclose()
+        except Exception:
+            pass

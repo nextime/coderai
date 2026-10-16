@@ -1088,6 +1088,15 @@ class OcrConfig:
     #   jpeg   lossy, 8 ms and a third of the bytes. Whether it costs accuracy
     #          is a question about a corpus rather than about a codec, so it is
     #          opt-in and not a default.
+    # Forward a page to a pod on the EVENT LOOP rather than on a thread.
+    #
+    # The sync path costs one thread per page in flight, and a thread is the
+    # wrong unit for a ~60 s wait on a socket: 15 documents a second at ~3.5
+    # pages each needs ~3,200 outstanding, against a thread-pool ceiling of
+    # 2048. On by default; off puts the forward back on the pod thread pool,
+    # which is kept working so an operator who hits something odd on a new
+    # transport can change one setting instead of waiting for a release.
+    pod_http_async: bool = True
     page_image_format: str = "auto"
     page_image_jpeg_quality: int = 95
     # The bounds within which a scan may be passed through. Below the floor the
@@ -2106,6 +2115,7 @@ class ConfigManager:
                 "max_pages": self.config.ocr.max_pages,
                 "pod_pipeline": self.config.ocr.pod_pipeline,
                 "pod_pipeline_wait_s": self.config.ocr.pod_pipeline_wait_s,
+                "pod_http_async": self.config.ocr.pod_http_async,
                 "page_image_format": self.config.ocr.page_image_format,
                 "page_image_jpeg_quality": self.config.ocr.page_image_jpeg_quality,
                 "page_image_min_dpi": self.config.ocr.page_image_min_dpi,

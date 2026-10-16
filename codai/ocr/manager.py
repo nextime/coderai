@@ -416,24 +416,21 @@ def _pod_still_alive(base: str, api_key: str) -> bool:
     return int(getattr(r, "status_code", 0) or 0) < 500
 
 
-def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
-                      dpi: int, opts: dict, detect, engine: str = "surya") -> dict:
-    """POST one page to a pod's own /v1/ocr and return its response dict.
-
-    Through `pod_http`, not `requests`: a pod on the direct path serves HTTPS
-    with a certificate signed by THIS install's CA, addressed by an IP that was
-    not known when it was issued. Plain requests fails that twice over, which is
-    the same trap olmOCR fell into (see tests/test_olmocr_pod_tls.py).
-    """
-    from codai.api import pod_http
+def _page_post_url(base: str) -> str:
+    """The pod's own /v1/ocr for this base."""
     url = str(base or "").rstrip("/")
-    if url.endswith("/v1"):
-        url = url + "/ocr"
-    else:
-        url = url + "/v1/ocr"
-    # The engine the POD must use. Hardcoded "surya" sent a chandra page to
-    # surya, which the pod would have served with the wrong model -- and the
-    # text would have come back looking plausible.
+    return url + "/ocr" if url.endswith("/v1") else url + "/v1/ocr"
+
+
+def _page_post_fields(api_key: str, dpi: int, opts: dict, detect,
+                      engine: str = "surya"):
+    """``(fields, headers)`` for one page forward.
+
+    Shared by the sync and async paths on purpose. The engine name is the field
+    that matters most here: hardcoding "surya" once sent a chandra page to
+    surya, which the pod served with the wrong model and the text came back
+    looking perfectly plausible.
+    """
     fields = {"engine": str(engine or "surya")}
     if dpi:
         fields["dpi"] = str(int(dpi))
@@ -444,23 +441,18 @@ def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
         v = (opts or {}).get(k_src)
         if v:
             fields[k_dst] = str(int(v))
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    r = None
-    for attempt in range(1, POD_PAGE_ATTEMPTS + 1):
-        try:
-            r = pod_http.post(url, files={"file": (name, blob, "application/pdf")},
-                              data=fields, headers=headers, timeout=600)
-            break
-        except Exception as e:
-            # A pooled connection the pod closed while idle fails on its next
-            # use with nothing having been sent, so one more attempt costs a
-            # connect and gets a new socket.
-            if attempt < POD_PAGE_ATTEMPTS and _looks_like_a_dead_socket(e):
-                continue
-            raise PodUnreachable(f"pod OCR at {url} is unreachable: {e}",
-                                 status=503)
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    return fields, headers
+
+
+def _page_response(r, url: str) -> dict:
+    """A pod's reply as a dict, or the OcrError it deserves.
+
+    Whatever transport produced it: an ANSWER, even 503, is a verdict about the
+    pod and belongs on the refusal path, while nothing-came-back is
+    PodUnreachable and must not be. That distinction is the whole of 0.4.6 and
+    it is transport-independent, so it lives here.
+    """
     if r.status_code >= 400:
         body = ""
         try:
@@ -473,6 +465,109 @@ def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
         return r.json()
     except Exception as e:
         raise OcrError(f"pod OCR at {url} returned no JSON: {e}", status=502)
+
+
+async def _apost_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
+                             dpi: int, opts: dict, detect,
+                             engine: str = "surya") -> dict:
+    """One page to a pod, ON THE EVENT LOOP — no thread per page in flight.
+
+    The sync twin below costs one thread for every outstanding page, and a
+    thread is the wrong unit for a 60-second wait on a socket: 15 documents a
+    second at ~3.5 pages each needs ~3,200 of them. This path needs none.
+
+    Identical semantics to the sync one, deliberately: the same retry on a dead
+    pooled socket (nothing was sent, so a retry has no side effect), the same
+    refusal to retry a timeout, and the same PodUnreachable for a transport
+    failure so a closed socket is never mistaken for a pod refusing the
+    pipeline.
+    """
+    from codai.api import pod_http
+    url = _page_post_url(base)
+    fields, headers = _page_post_fields(api_key, dpi, opts, detect, engine)
+    for attempt in range(1, POD_PAGE_ATTEMPTS + 1):
+        try:
+            r = await pod_http.apost(
+                url, files={"file": (name, blob, "application/pdf")},
+                data=fields, headers=headers, timeout=600)
+            return _page_response(r, url)
+        except OcrError:
+            raise                      # an ANSWER; not a transport failure
+        except Exception as e:
+            if attempt < POD_PAGE_ATTEMPTS and _looks_like_a_dead_socket(e):
+                continue
+            raise PodUnreachable(f"pod OCR at {url} is unreachable: {e}",
+                                 status=503)
+
+
+async def _apod_still_alive(base: str, api_key: str) -> bool:
+    """`_pod_still_alive` on the event loop. False on anything at all."""
+    from codai.api import pod_http
+    url = str(base or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    url = url.rstrip("/") + "/healthz"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        r = await pod_http.aget(url, headers=headers, timeout=15)
+    except Exception:
+        return False
+    return int(getattr(r, "status_code", 0) or 0) < 500
+
+
+def _use_async_pod_http(cfg) -> bool:
+    """Whether page forwards go on the loop rather than on a thread.
+
+    On by default, with a switch: this is a new transport on the hottest path
+    in the subsystem, and an operator who hits something odd should be able to
+    put it back on the thread pool from the settings page rather than wait for
+    a release. The thread path is kept working for exactly that reason, not as
+    dead code.
+    """
+    try:
+        if not bool(getattr(cfg, "pod_http_async", True)):
+            return False
+    except Exception:
+        pass
+    try:
+        from codai.api import pod_http
+        return pod_http.async_available()
+    except Exception:
+        return False
+
+
+def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
+                      dpi: int, opts: dict, detect, engine: str = "surya") -> dict:
+    """POST one page to a pod's own /v1/ocr and return its response dict.
+
+    The THREAD path: the caller is on the pod thread pool, one thread per page
+    in flight. `_apost_page_to_pod` is the same request on the event loop and
+    is the default; this stays reachable through `ocr.pod_http_async` so a new
+    transport can be ruled out without waiting for a release.
+
+    Through `pod_http`, not `requests`: a pod on the direct path serves HTTPS
+    with a certificate signed by THIS install's CA, addressed by an IP that was
+    not known when it was issued. Plain requests fails that twice over, which is
+    the same trap olmOCR fell into (see tests/test_olmocr_pod_tls.py).
+    """
+    from codai.api import pod_http
+    url = _page_post_url(base)
+    fields, headers = _page_post_fields(api_key, dpi, opts, detect, engine)
+    for attempt in range(1, POD_PAGE_ATTEMPTS + 1):
+        try:
+            r = pod_http.post(url, files={"file": (name, blob, "application/pdf")},
+                              data=fields, headers=headers, timeout=600)
+            return _page_response(r, url)
+        except OcrError:
+            raise                      # an ANSWER; not a transport failure
+        except Exception as e:
+            # A pooled connection the pod closed while idle fails on its next
+            # use with nothing having been sent, so one more attempt costs a
+            # connect and gets a new socket.
+            if attempt < POD_PAGE_ATTEMPTS and _looks_like_a_dead_socket(e):
+                continue
+            raise PodUnreachable(f"pod OCR at {url} is unreachable: {e}",
+                                 status=503)
 
 
 def _page_from_pod(d: dict, index: int) -> OcrPage:
@@ -2026,6 +2121,17 @@ class OcrManager:
         refused: list = []
         unreachable: list = []
         policy, wait_s = _pod_pipeline_policy(cfg)
+        # Decided once per document, not per page: a document whose pages
+        # changed transport halfway would be unexplainable in the log.
+        use_async = _use_async_pod_http(cfg)
+        _say_rate_limited(
+            ("pod-transport", model_id),
+            f"[ocr] forwarding pages for {model_id!r} "
+            + ("on the event loop (no thread per page in flight)"
+               if use_async else
+               "on the pod THREAD pool — one thread per page in flight, so "
+               "the width of this path is that pool's size"),
+            every=300.0)
 
         async def _one(idx: int, blob: bytes):
             async with sem:
@@ -2044,19 +2150,25 @@ class OcrManager:
                     if lease is None:
                         return None
                     try:
-                        # THE POD POOL, not the default executor. A page forward
-                        # blocks for 8-35 s, and `asyncio.to_thread` hands it to
-                        # the loop's default pool -- 32 threads, shared with
-                        # every other blocking call in the process. That was the
-                        # real ceiling on this path: 32 forwards in flight
-                        # against a 512-page semaphore and 31 idle pods, which
-                        # is 1.65 pages/s however wide the semaphore or the
-                        # pods' own gate is set. codai/api/thread_pool.py was
-                        # written for exactly this call and nothing used it.
+                        page_name = (f"{idx}.pdf" if is_pdf
+                                     else (filename or "page"))
+                        if use_async:
+                            # ON THE LOOP. A forward waits ~60 s on a socket,
+                            # and a thread is the wrong unit for that: 15
+                            # documents a second needs ~3,200 outstanding.
+                            return await _apost_page_to_pod(
+                                lease.base, lease.api_key, blob, page_name,
+                                dpi, opts, detect, engine_name)
+                        # THE POD POOL, not the default executor. `to_thread`
+                        # hands the forward to the loop's default pool -- 32
+                        # threads, shared with every other blocking call in the
+                        # process -- which was the real ceiling on this path:
+                        # 32 forwards in flight against a 512-page semaphore
+                        # and 31 idle pods is 1.65 pages/s however wide the
+                        # semaphore or the pods' own gate is set.
                         return await run_on_pod_pool(
                             _post_page_to_pod, lease.base, lease.api_key, blob,
-                            f"{idx}.pdf" if is_pdf else (filename or "page"),
-                            dpi, opts, detect, engine_name)
+                            page_name, dpi, opts, detect, engine_name)
                     except PodUnreachable as exc:
                         # A DEAD SOCKET IS NOT A VERDICT ON THE IMAGE. Ask the
                         # address whether anything is still there: a pod that
@@ -2064,8 +2176,12 @@ class OcrManager:
                         # it on a reused idle connection has cost seven healthy
                         # cards before), and one that does not is reported so
                         # the next attempt is routed elsewhere.
-                        alive = await run_on_pod_pool(
-                            _pod_still_alive, lease.base, lease.api_key)
+                        alive = (await _apod_still_alive(lease.base,
+                                                         lease.api_key)
+                                 if use_async else
+                                 await run_on_pod_pool(_pod_still_alive,
+                                                       lease.base,
+                                                       lease.api_key))
                         if not alive:
                             lease.dead()
                         _say_rate_limited(

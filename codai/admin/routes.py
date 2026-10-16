@@ -4138,6 +4138,7 @@ def build_settings_dict(c, gpu_cards):
             "max_pages": c.ocr.max_pages,
             "pod_pipeline": c.ocr.pod_pipeline,
             "pod_pipeline_wait_s": c.ocr.pod_pipeline_wait_s,
+            "pod_http_async": c.ocr.pod_http_async,
             "page_image_format": c.ocr.page_image_format,
             "page_image_jpeg_quality": c.ocr.page_image_jpeg_quality,
             "page_image_min_dpi": c.ocr.page_image_min_dpi,
@@ -5001,6 +5002,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 o.pod_pipeline_wait_s = max(0.0, float(d.get("pod_pipeline_wait_s") or 0))
             except (TypeError, ValueError):
                 pass
+        if "pod_http_async" in d:
+            v = d.get("pod_http_async")
+            o.pod_http_async = (v.strip().lower() in ("1", "true", "on", "yes")
+                                if isinstance(v, str) else bool(v))
         if "page_image_format" in d:
             _pf = str(d.get("page_image_format") or "").strip().lower()
             # An unknown value leaves the setting alone rather than silently

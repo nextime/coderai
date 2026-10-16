@@ -229,6 +229,22 @@ def test_an_abandoned_document_stops_splitting():
         next(g)
 
 
+def _stub_page_post(monkeypatch, fn):
+    """Stub BOTH page-forward twins with one callable.
+
+    The forward has two transports -- a coroutine on the event loop, and the
+    sync one on the pod thread pool -- and a test that stubs only one silently
+    stops testing its own stub the moment the default changes. Not
+    hypothetical: when the async path landed these tests began dialling
+    10.0.0.1 for real and hung for 300 s each instead of failing. Whatever
+    `fn` does, including raising, it now does on either path.
+    """
+    async def _async(*a, **k):
+        return fn(*a, **k)
+    monkeypatch.setattr(om, "_post_page_to_pod", fn)
+    monkeypatch.setattr(om, "_apost_page_to_pod", _async)
+
+
 # ------------------------------------------- the pipeline choice at runtime #
 class _Cfg:
     surya_serve = "model"
@@ -334,9 +350,9 @@ def test_a_pod_error_is_not_swallowed(monkeypatch):
     mgr._sem = asyncio.Semaphore(4)
 
     _fake_placement(monkeypatch)
-    monkeypatch.setattr(om, "_post_page_to_pod",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            OcrError("pod said 500", status=500)))
+    _stub_page_post(monkeypatch,
+                    lambda *a, **k: (_ for _ in ()).throw(
+                        OcrError("pod said 500", status=500)))
     with pytest.raises(OcrError):
         asyncio.run(mgr._read_on_pods(
             _pdf(2), "d.pdf", "application/pdf", "m",
@@ -355,7 +371,7 @@ def test_pages_come_back_in_document_order(monkeypatch):
     def _post(base, key, blob, name, dpi, opts, detect, engine="surya"):
         seen.append(name)
         return {"engine": engine, "pages": [{"text": name, "width": 1, "height": 2}]}
-    monkeypatch.setattr(om, "_post_page_to_pod", _post)
+    _stub_page_post(monkeypatch, _post)
     name, pages, blank, stamps, sigs = asyncio.run(mgr._read_on_pods(
         _pdf(5), "d.pdf", "application/pdf", "m",
         dpi=250, page_opts=None, detect=None, cfg=_Cfg()))
@@ -373,8 +389,8 @@ def test_one_page_is_one_request_so_fan_out_survives(monkeypatch):
     mgr._sem = asyncio.Semaphore(8)
     chose = {"n": 0}
     _fake_placement(monkeypatch, on_choose=lambda: chose.__setitem__("n", chose["n"] + 1))
-    monkeypatch.setattr(om, "_post_page_to_pod",
-                        lambda *a, **k: {"engine": "surya", "pages": [{"text": "x"}]})
+    _stub_page_post(monkeypatch,
+                    lambda *a, **k: {"engine": "surya", "pages": [{"text": "x"}]})
     asyncio.run(mgr._read_on_pods(_pdf(7), "d.pdf", "application/pdf", "m",
                                   dpi=250, page_opts=None, detect=None, cfg=_Cfg()))
     assert chose["n"] == 7, "the upstream must be chosen per PAGE"
@@ -391,9 +407,9 @@ def test_a_single_image_is_sent_whole(monkeypatch):
 
     _fake_placement(monkeypatch)
     sent = []
-    monkeypatch.setattr(om, "_post_page_to_pod",
-                        lambda b, k, blob, name, *a: sent.append(len(blob)) or
-                        {"engine": "surya", "pages": [{"text": "x"}]})
+    _stub_page_post(monkeypatch,
+                    lambda b, k, blob, name, *a: sent.append(len(blob)) or
+                    {"engine": "surya", "pages": [{"text": "x"}]})
     asyncio.run(mgr._read_on_pods(buf.getvalue(), "x.png", "image/png", "m",
                                   dpi=250, page_opts=None, detect=None, cfg=_Cfg()))
     assert len(sent) == 1

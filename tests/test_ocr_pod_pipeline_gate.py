@@ -228,7 +228,23 @@ def _pods_answer(monkeypatch, fn):
     from codai.models import placement
     monkeypatch.setattr(placement, "choose", lambda *_a, **_k: _Lease())
     monkeypatch.setattr(placement, "spill_threshold", lambda *_a, **_k: 0)
+    _stub_page_post(monkeypatch, fn)
+
+
+def _stub_page_post(monkeypatch, fn):
+    """Stub BOTH page-forward twins with one callable.
+
+    The forward has two transports -- a coroutine on the event loop and the
+    sync one on the pod thread pool -- and a test that stubs only one silently
+    stops testing its own stub when the default changes. That is not
+    hypothetical: when the async path landed, these tests started dialling
+    10.0.0.1 for real and hung for 300 s instead of failing. Whatever `fn`
+    does, including raising, it now does on either path.
+    """
+    async def _async(*a, **k):
+        return fn(*a, **k)
     monkeypatch.setattr(om, "_post_page_to_pod", fn)
+    monkeypatch.setattr(om, "_apost_page_to_pod", _async)
 
 
 async def _read(mgr, cfg):

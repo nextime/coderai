@@ -1150,6 +1150,18 @@
         that is momentarily full, not a cold one: after a timeout the next pages go
         straight through for five minutes rather than paying this per page.</span>
       </div>
+      <div class="form-group" style="flex:1;min-width:200px">
+        <label class="form-label">Forward pages to pods</label>
+        <select id="s-ocr-pod-http-async" class="form-input">
+          <option value="1">On the event loop (no thread per page)</option>
+          <option value="0">On the pod thread pool (one thread per page)</option>
+        </select>
+        <span class="form-hint">A forward waits <b>tens of seconds</b> on a socket, and
+        the thread-per-page path is bounded by the pod pool &mdash; 15 documents/second
+        needs thousands of forwards outstanding, which is not a number of threads to
+        carry. Change this only to rule the transport out while diagnosing something;
+        the thread path is kept working for that.</span>
+      </div>
       <div class="form-group" style="flex:1;min-width:190px">
         <label class="form-label">Page image sent to the model</label>
         <select id="s-ocr-page-image-format" class="form-input">
@@ -2311,6 +2323,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-max-pages').value = ocr.max_pages ?? 0;
     document.getElementById('s-ocr-pod-pipeline').value = ocr.pod_pipeline ?? 'prefer';
     document.getElementById('s-ocr-pod-pipeline-wait').value = ocr.pod_pipeline_wait_s ?? 60;
+    document.getElementById('s-ocr-pod-http-async').value = (ocr.pod_http_async ?? true) ? '1' : '0';
     document.getElementById('s-ocr-page-image-format').value = ocr.page_image_format ?? 'auto';
     document.getElementById('s-ocr-page-image-quality').value = ocr.page_image_jpeg_quality ?? 95;
     document.getElementById('s-ocr-page-image-min-dpi').value = ocr.page_image_min_dpi ?? 150;
@@ -2624,6 +2637,7 @@ async function saveSettings(silent){
       max_pages: parseInt(document.getElementById('s-ocr-max-pages').value) || 0,
       pod_pipeline: document.getElementById('s-ocr-pod-pipeline').value || 'prefer',
       pod_pipeline_wait_s: parseFloat(document.getElementById('s-ocr-pod-pipeline-wait').value) || 0,
+      pod_http_async: document.getElementById('s-ocr-pod-http-async').value === '1',
       page_image_format: document.getElementById('s-ocr-page-image-format').value || 'auto',
       page_image_jpeg_quality: parseInt(document.getElementById('s-ocr-page-image-quality').value) || 95,
       page_image_min_dpi: parseFloat(document.getElementById('s-ocr-page-image-min-dpi').value) || 0,
