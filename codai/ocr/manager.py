@@ -420,6 +420,35 @@ def _page_from_pod(d: dict, index: int) -> OcrPage:
     return page
 
 
+#: (engine, model, image) combinations already explained. The gate is asked
+#: once per document, and the answer only changes when the configuration does,
+#: so saying it every time would bury it; saying it never is what let a whole
+#: deployment rasterise locally for two days without a word.
+_PIPELINE_GATE_SAID: set = set()
+
+
+def _say_pipeline_gate(name: str, mid: str, image: str, runs: bool) -> None:
+    """Report, once, WHERE this engine's pipeline runs and what decided it."""
+    key = (name, mid, image, runs)
+    if key in _PIPELINE_GATE_SAID:
+        return
+    _PIPELINE_GATE_SAID.add(key)
+    if runs:
+        print(f"[ocr] {name!r}: pods for {mid!r} run {image!r}, which carries "
+              f"the rasteriser — pages go there as one-page PDFs and this box "
+              f"never rasterises", flush=True)
+    elif image:
+        print(f"[ocr] {name!r}: pods for {mid!r} run {image!r}, which serves "
+              f"the model only — THIS BOX rasterises and runs the pipeline. "
+              f"To move it to the pods, name an image carrying it (set "
+              f"`engine: coderai-vllm-ocr` on the model's runpod block, or "
+              f"`image` explicitly)", flush=True)
+    else:
+        print(f"[ocr] {name!r}: could not work out which image the pods for "
+              f"{mid!r} run, so the pipeline stays on this box — check the "
+              f"model's runpod block has an `engine` or an `image`", flush=True)
+
+
 def pod_pipeline_model(cfg, engine: str = "") -> str:
     """The model id whose pods run the OCR pipeline themselves, or "".
 
@@ -431,6 +460,10 @@ def pod_pipeline_model(cfg, engine: str = "") -> str:
     `coderai-vllm` serves only the model and the pipeline stays here. There is
     no second setting, because two switches that can disagree is the kind of
     invisible mismatch that gets blamed on a pod image.
+
+    One switch, but it has to be READ the way a launch reads it: the image is
+    usually implied by `runpod.engine` rather than written out, so this asks
+    `pod_image_for_entry()` for the image a pod would actually be given.
 
     Returns "" for every other case -- no model mode, no entry, a different
     image -- so the caller simply does what it has always done.
@@ -451,11 +484,22 @@ def pod_pipeline_model(cfg, engine: str = "") -> str:
     if not mid:
         return ""
     try:
-        from codai.api.runpod_worker import _model_entry, image_runs_ocr_pipeline
+        from codai.api.runpod_worker import (_model_entry,
+                                             image_runs_ocr_pipeline,
+                                             pod_image_for_entry)
         entry = _model_entry(mid) or {}
-        image = str((entry.get("runpod") or {}).get("image") or "")
-        return mid if image_runs_ocr_pipeline(image) else ""
-    except Exception:
+        # The image a LAUNCH would use, not the raw `image` field. `image` is
+        # optional and normally absent -- `engine: coderai-vllm-ocr` is how the
+        # image is chosen -- so reading the field answered "" for the very
+        # configuration that asks for the pod-side pipeline, and the whole
+        # thing quietly ran here instead. See pod_image_for_entry().
+        image = pod_image_for_entry(entry, model_key=mid)
+        runs = image_runs_ocr_pipeline(image)
+        _say_pipeline_gate(name, mid, image, runs)
+        return mid if runs else ""
+    except Exception as exc:
+        print(f"[ocr] {name!r}: could not decide whether the pods for {mid!r} "
+              f"run the pipeline ({exc}); reading on this box", flush=True)
         return ""
 
 

@@ -678,6 +678,47 @@ def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
     return b if b in _ENGINE_POD_BACKENDS else ""
 
 
+def pod_image_for_entry(entry: dict, mcfg: "RunpodModelConfig" = None,
+                        model_key: str = "", model_path: str = "") -> str:
+    """The image this model's pods WOULD run, resolved the way a launch does.
+
+    `runpod.image` is OPTIONAL and usually absent. Naming `engine:
+    coderai-vllm-ocr` already says which published image to pull, and
+    `pod_plan` resolves that at launch time. So anything that needs to know
+    which image a pool runs BEFORE a pod exists has to do the same resolution;
+    reading the raw `image` field instead answers "" for the ordinary
+    configuration, and "" is indistinguishable from "a plain image".
+
+    That is not hypothetical. The OCR pipeline's "do these pods rasterise for
+    themselves" gate read the raw field, saw "", and ran the whole pipeline on
+    the orchestrator for every page — while the pods it was renting carried the
+    rasteriser and served only the model. Nothing failed and nothing was
+    logged; a GPU-less box simply did the work, at 47 GB resident.
+
+    Returns "" only when nothing determines an image, which is the one case
+    `pod_plan` refuses to launch. Pure: no network, no side effects, safe to
+    call before anything is rented.
+    """
+    entry = entry or {}
+    if mcfg is None:
+        mcfg = parse_model_runpod(entry.get("runpod") or {})
+    if mcfg.image:
+        return mcfg.image
+    engine = resolve_pod_engine(mcfg, model_key, model_path, entry)
+    if engine == "llamacpp":
+        return LLAMACPP_POD_IMAGE
+    if engine not in ("coderai", "custom"):
+        return DEFAULT_POD_IMAGE
+    want = str(mcfg.engine or "").strip().lower()
+    if want in _CODERAI_SERVER_ENGINES:
+        return default_capability_image(_CODERAI_SERVER_ENGINES[want])
+    backend = engine_pod_backend(entry, mcfg)
+    if backend:
+        return default_capability_image(_ENGINE_POD_IMAGE.get(backend, "engines"))
+    cap = model_capability(entry, include_text=True)
+    return default_capability_image(cap) if cap else ""
+
+
 #: Readiness probe per engine. A coderai pod answers /healthz long before any
 #: model is loaded, which is exactly what we want: it is ready to be asked.
 _HEALTH_PATHS = {"vllm": "/v1/models", "llamacpp": "/v1/models",
@@ -704,16 +745,8 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         # the auth token AND the catalogue the pod must know about. Splitting
         # them meant a pod with an explicit image got no models and refused
         # everything with "not available".
-        image = mcfg.image
         capability_hint = model_capability(entry or {}, include_text=True)
-        _eng = engine_pod_backend(entry or {}, mcfg)
-        _want = str(mcfg.engine or "").strip().lower()
-        if not image and _want in _CODERAI_SERVER_ENGINES:
-            image = default_capability_image(_CODERAI_SERVER_ENGINES[_want])
-        if not image and _eng:
-            image = default_capability_image(_ENGINE_POD_IMAGE.get(_eng, "engines"))
-        if not image:
-            image = default_capability_image(capability_hint) if capability_hint else ""
+        image = pod_image_for_entry(entry or {}, mcfg, model_key, model_path)
         if not image:
             raise RuntimeError(
                 f"RunPod {engine} pod: set `image` on the runpod block to the image "
