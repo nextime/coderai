@@ -285,6 +285,34 @@ def _entry_name(entry: dict) -> str:
             or str(entry.get("id") or "").strip())
 
 
+def _catalogue_entries() -> list:
+    """Every model entry in the catalogue, whatever SECTION lists it.
+
+    A model's type is its section (main.py's _CATEGORY_TYPE_PREFIX), so one set
+    of weights served as text and as vision is two entries in two lists. Both
+    callers below ask a question about WEIGHTS -- which names one engine must
+    answer to, and which adapters it must register at launch -- and the answer
+    never depended on which list a name was written in. Reading only
+    `text_models` made a vision entry on the same base invisible to both: its
+    name was left off the launch (a relaunch per alternating request, which on
+    a 27B sharing a card is an OOM), and its adapter was never registered, so
+    the engine came up with no --enable-lora and answered under the adapter's
+    name with BASE weights, failing nothing.
+
+    One reader, so a third caller cannot drift from these two.
+    """
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+    except Exception:
+        return []
+    out = []
+    for lst in md.values():
+        if isinstance(lst, list):
+            out.extend(e for e in lst if isinstance(e, dict))
+    return out
+
+
 def _sibling_lora_specs(model_config: dict) -> list:
     """Adapters of this model AND of every other model loading the same base.
 
@@ -304,18 +332,13 @@ def _sibling_lora_specs(model_config: dict) -> list:
     base = _base_of(model_config or {})
     if not base:
         return specs
-    try:
-        from codai.admin.routes import config_manager
-        md = getattr(config_manager, "models_data", None) or {}
-    except Exception:
-        return specs
     # Not `id`: a SEEDED entry has none. The kind of entry a pod holds is the
     # kind that arrives in CODERAI_SEED_MODELS, and that carries `alias`, not
     # `id` — so "is this me?" compared "" with "" and matched every sibling,
     # excluding all of them. The pod then launched vLLM with no --enable-lora
     # and answered under the adapter's name with BASE weights. Nothing failed.
     mine = _entry_name(model_config)
-    for entry in (md.get("text_models") or []):
+    for entry in _catalogue_entries():
         if not isinstance(entry, dict) or entry is model_config:
             continue
         name = _entry_name(entry)
@@ -359,27 +382,11 @@ def _served_names(model_config: dict, served_name: str, fallback: str) -> list:
         # Only when there ARE adapters. A model served alone is named exactly as
         # it was before, because nothing about it is ambiguous.
         names.append(str(fallback or ""))
-        try:
-            from codai.admin.routes import config_manager
-            md = getattr(config_manager, "models_data", None) or {}
-        except Exception:
-            md = {}
-        # EVERY category, not just text_models. A model's TYPE is its section
-        # (see main.py's _CATEGORY_TYPE_PREFIX), so the same weights listed
-        # under `vision_models` to serve images are a different entry in a
-        # different list -- and scanning only text_models left that name out of
-        # the launch. The engine then did not answer to it: either a 404, or a
-        # relaunch per alternating request, which on a 27B is an OOM rather
-        # than a slowdown. The weights are what one engine serves; which list
-        # the operator wrote the name in says nothing about that.
-        for _lst in md.values():
-            if not isinstance(_lst, list):
+        for entry in _catalogue_entries():
+            if _base_of(entry) != base:
                 continue
-            for entry in _lst:
-                if not isinstance(entry, dict) or _base_of(entry) != base:
-                    continue
-                names.append(str(entry.get("alias") or "").strip())
-                names.append(str(entry.get("id") or "").strip())
+            names.append(str(entry.get("alias") or "").strip())
+            names.append(str(entry.get("id") or "").strip())
     out, seen = [], set()
     for n in names:
         if n and n not in seen and n not in adapters:
