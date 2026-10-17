@@ -761,6 +761,56 @@ def _pod_pipeline_policy(cfg) -> tuple:
 POD_LEASE_ATTEMPT_S = 2.0
 
 
+def floor_page_opts(cfg, engine: str, opts) -> dict:
+    """Raise a caller's page budget to the operator's minimum, if there is one.
+
+    A per-request `max_tokens` exists so the caller can choose, and it WINS --
+    over the engine's own default and over the operator's configured budget.
+    That is the right default and it stays the default: this does nothing until
+    `<engine>_max_tokens_floor` is set, and it never lowers a budget, because a
+    caller asking for more than the floor knows something the floor does not.
+
+    What it is for. A client sent `max_tokens: 3072` on every page of a corpus
+    whose pages need just over that, so each page generated to the cap, stopped
+    mid-text, and paid a continuation that RE-SENT the first 3072 tokens to
+    fetch the last few hundred -- and by the second cut-off the model was often
+    repeating, so the page was refused a resume and re-run whole at a higher
+    temperature. 532 of 594 observed continuations were segment 2: the
+    signature of a budget marginally too small, which is the most expensive
+    kind because nearly every page pays double. The cards idled at 1.4% KV
+    cache, the fleet grew to 65 pods, and the operator paying for them had no
+    way to decline.
+
+    Returns a NEW dict; the caller's own is never mutated.
+    """
+    out = dict(opts or {})
+    name = str(engine or "").strip().lower() or "surya"
+    try:
+        floor = int(getattr(cfg, f"{name}_max_tokens_floor", 0) or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    if floor <= 0:
+        return out
+    try:
+        asked = int(out.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        asked = 0
+    if asked <= 0 or asked >= floor:
+        return out
+    out["max_tokens"] = floor
+    # Once per engine, not per page: a 5,000-document run would otherwise write
+    # this line 30,000 times and bury it.
+    _say_rate_limited(
+        ("tokens-floor", name),
+        f"[ocr] a request asked for max_tokens={asked} on {name}, below this "
+        f"install's {name}_max_tokens_floor={floor} — raised to the floor. A "
+        f"budget just under what a page needs is the expensive case: the page "
+        f"generates to the cap, stops mid-text, and the continuation re-sends "
+        f"everything already produced to fetch the rest.",
+        every=300.0)
+    return out
+
+
 def _is_local_exhaustion(exc: BaseException) -> bool:
     """Did this fail because THIS BOX has no resources left?
 
@@ -1599,6 +1649,15 @@ class OcrManager:
             )
         return name
 
+    def resolve_engine_quietly(self, requested) -> str:
+        """`resolve_engine` without the refusal, for callers that only need a
+        name to look a setting up by. The real resolution still happens on the
+        read path and still reports."""
+        try:
+            return self.resolve_engine(requested)
+        except Exception:
+            return str(requested or "").strip().lower() or "surya"
+
     def engine_dpi(self, requested: Optional[str]) -> int:
         """PDF rasterisation DPI for the engine that will serve this request.
 
@@ -1758,6 +1817,10 @@ class OcrManager:
         """
         cfg = self._require_cfg()
         use_dpi = int(dpi) if dpi else self.engine_dpi(engine)
+        # Before either pipeline sees them, so the local read and the pod
+        # forward cannot disagree about the budget.
+        page_opts = floor_page_opts(cfg, self.resolve_engine_quietly(engine),
+                                    page_opts)
 
         # Price the document BEFORE rendering it: once the pages exist the memory is
         # already spent, so admission control has to work from the page tree.

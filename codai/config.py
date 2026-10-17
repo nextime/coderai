@@ -1306,6 +1306,26 @@ class OcrConfig:
     #: stops making progress stops early regardless, so a generous budget costs
     #: nothing on a page that cannot use it. 0 disables resumption.
     surya_max_continuations: int = 8
+    #: FLOOR on a caller-supplied page budget. 0 = off, and off is the default:
+    #: a per-request `max_tokens` exists so the caller can choose, and an
+    #: install that silently overrode it would be lying about an API.
+    #:
+    #: Why it exists at all. A client sent `max_tokens: 3072` on every page of a
+    #: corpus whose pages need just over that. Each page therefore generated to
+    #: the cap, stopped mid-text, and paid a continuation that RE-SENT the first
+    #: 3072 tokens to retrieve the last few hundred -- and by the second cut-off
+    #: the model was often repeating, so the page was refused a resume and
+    #: re-run whole at a higher temperature. Measured across 594 continuations:
+    #: 532 pages reached segment 2, which is the signature of a budget that is
+    #: marginally too small rather than far too small -- the most expensive
+    #: case, because nearly every page pays double. The cards sat at 1.4% KV
+    #: cache while the fleet grew to 65 pods, and the operator paying for them
+    #: had no way to decline.
+    #:
+    #: So: an operator may state a minimum, and a request below it is raised to
+    #: it and SAID ONCE per engine. Never lowered -- a caller asking for more
+    #: than the floor knows something this setting does not.
+    surya_max_tokens_floor: int = 0
     #: surya's repetition detector, retuned. 0 on all three leaves its own
     #: defaults (4 repeats, a 500-character window, scaling 3.0).
     #:
@@ -1437,6 +1457,8 @@ class OcrConfig:
     #: so a generation cut off before the body closes parses to metadata and no
     #: text at all.
     olmocr_max_continuations: int = 8
+    #: See `surya_max_tokens_floor`. 0 = off.
+    olmocr_max_tokens_floor: int = 0
     #: The serving model's context window, or 0 to leave resumption uncapped by
     #: one. Resumption re-sends everything so far as INPUT, so the window — not
     #: the budget — is what a long page runs out of.
@@ -1489,6 +1511,8 @@ class OcrConfig:
     #: and reads in the finished text exactly like a page the model could not
     #: transcribe. 0 disables it; a request may override it per document.
     chandra_max_continuations: int = 8
+    #: See `surya_max_tokens_floor`. 0 = off.
+    chandra_max_tokens_floor: int = 0
     #: The serving model's context window, or 0 for no ceiling of our own.
     chandra_context_tokens: int = 0
     chandra_temperature: float = 0.0     # chandra's own default: greedy
@@ -2362,6 +2386,12 @@ class ConfigManager:
                      "surya_max_continuations", int),
                     ("CODERAI_OCR_SURYA_CONTEXT_TOKENS",
                      "surya_context_tokens", int),
+                    ("CODERAI_OCR_SURYA_MAX_TOKENS_FLOOR",
+                     "surya_max_tokens_floor", int),
+                    ("CODERAI_OCR_CHANDRA_MAX_TOKENS_FLOOR",
+                     "chandra_max_tokens_floor", int),
+                    ("CODERAI_OCR_OLMOCR_MAX_TOKENS_FLOOR",
+                     "olmocr_max_tokens_floor", int),
                     ("CODERAI_OCR_SURYA_MAX_RETRIES", "surya_max_retries", int),
                     ("CODERAI_OCR_SURYA_REPEAT_MAX_REPEATS",
                      "surya_repeat_max_repeats", int),
