@@ -399,9 +399,15 @@ def _spill_pod_candidate(model_id: str) -> Optional[Candidate]:
     if pool is None:
         return None
 
-    def _acquire(timeout: float = 0.0):
-        # The pool's own default (1200 s) unless the caller bounds the attempt.
-        pod, url = pool.acquire(timeout=timeout) if timeout > 0 else pool.acquire()
+    def _acquire(timeout: float = 0.0, grow_inline: bool = True):
+        # `grow_inline=False` is "answer now": no renting in this thread, no
+        # waiting on the pool's condvar. See PodPool.acquire.
+        if not grow_inline:
+            pod, url = pool.acquire(timeout=0.0, grow_inline=False)
+        elif timeout > 0:
+            pod, url = pool.acquire(timeout=timeout)
+        else:
+            pod, url = pool.acquire()
         key = getattr(pool, "api_key", "") or ""
         return (url.rstrip("/") + "/v1", key, lambda: pool.release(pod),
                 lambda: pool.discard(pod, "connection refused"))
@@ -475,7 +481,7 @@ def _load_of(cand: Candidate) -> int:
 
 
 def choose(model_id: str, spill_after: int = 0,
-           acquire_timeout: float = 0.0) -> Lease:
+           acquire_timeout: float = 0.0, grow_inline: bool = True) -> Lease:
     """A lease on the least-loaded server for the model.
 
     ``spill_after`` is the in-flight count at which a fixed server (the local one,
@@ -511,7 +517,7 @@ def choose(model_id: str, spill_after: int = 0,
     #    pages over the pods it has and grows when they are all at their
     #    threshold. This is "on runpod only", scaling.
     for cand in [c for c in cands if c.primary and c.acquire is not None]:
-        lease = _take(cand, acquire_timeout)
+        lease = _take(cand, acquire_timeout, grow_inline)
         if lease is not None:
             return lease
         last_exc = "pool unavailable"
@@ -533,7 +539,7 @@ def choose(model_id: str, spill_after: int = 0,
     # 3. Everything we own is busy: rent. This is "local + spillover" — the
     #    overflow goes to a pool instead of queueing behind a saturated GPU.
     for cand in pools:
-        lease = _take(cand, acquire_timeout)
+        lease = _take(cand, acquire_timeout, grow_inline)
         if lease is not None:
             return lease
         last_exc = "pool unavailable"
@@ -578,7 +584,16 @@ def _say_once(key: str, message: str, every: float = 30.0) -> None:
     print(message, flush=True)
 
 
-def _take(cand: Candidate, acquire_timeout: float = 0.0) -> Optional[Lease]:
+def _accepts_grow_inline(fn) -> bool:
+    try:
+        import inspect
+        return "grow_inline" in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+def _take(cand: Candidate, acquire_timeout: float = 0.0,
+          grow_inline: bool = True) -> Optional[Lease]:
     """Acquire a pool candidate, or None when it cannot provide a server.
 
     ``acquire_timeout`` bounds ONE attempt. A pool's acquire waits for a pod and
@@ -588,9 +603,12 @@ def _take(cand: Candidate, acquire_timeout: float = 0.0) -> Optional[Lease]:
     thread per page for the length of a boot. 0 keeps the pool's own default.
     """
     try:
-        got = (cand.acquire(timeout=acquire_timeout)
-               if acquire_timeout > 0 and _accepts_timeout(cand.acquire)
-               else cand.acquire())
+        if not grow_inline and _accepts_grow_inline(cand.acquire):
+            got = cand.acquire(grow_inline=False)
+        elif acquire_timeout > 0 and _accepts_timeout(cand.acquire):
+            got = cand.acquire(timeout=acquire_timeout)
+        else:
+            got = cand.acquire()
     except Exception as exc:
         _say_once(f"take:{cand.key}",
                   f"[ocr] {cand.key} cannot serve this page: {exc}")

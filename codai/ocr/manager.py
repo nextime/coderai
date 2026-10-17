@@ -744,13 +744,21 @@ def _pod_pipeline_policy(cfg) -> tuple:
 #: budget, or at its ceiling, stays that way for minutes: without this every
 #: page of every document would pay the full wait before going local, turning a
 #: 60s ceiling into a 60s tax per page.
-#: How long ONE lease attempt may hold a pod-pool thread. A pool's acquire
-#: waits for a free pod and may rent one inline, so an unbounded attempt parks a
-#: thread for a whole boot -- several minutes on a cold start, times every page
-#: of every document in flight. Bounded, the attempt comes back and the waiting
-#: happens in `_lease_a_pod`'s own loop, on the event loop, where it is free and
-#: where the policy's ceiling is what decides how long to keep trying.
-POD_LEASE_ATTEMPT_S = 20.0
+#: How long ONE lease attempt may hold a lease-pool thread.
+#:
+#: Near zero, and it has to be: the attempt is made with `grow_inline=False`,
+#: so the pool either has a pod this instant or says so and starts growing in
+#: the background. Nothing in that path blocks, and `_lease_a_pod` does the
+#: waiting on the event loop where it is free.
+#:
+#: This was 20 s in 0.4.18, which made the lease STAGE the ceiling on
+#: everything: 256 threads x one attempt per 20 s is ~13 pages a second however
+#: many pods are up, and a thread that drew the growth branch sat through a
+#: ~9-minute boot. Measured consequence -- zero pages dispatched to 50 healthy
+#: pods in 41 minutes, not one `POST /v1/ocr` in any pod's log, while the
+#: unservable queue made the scaler rent 73 pods at $43/hr. The value is kept
+#: only as the ceiling for a pool whose acquire predates `grow_inline`.
+POD_LEASE_ATTEMPT_S = 2.0
 
 
 def _is_local_exhaustion(exc: BaseException) -> bool:
@@ -831,7 +839,8 @@ async def _lease_a_pod(model_id: str, policy: str, wait_s: float):
             lease = await run_on_lease_pool(
                 placement.choose, model_id,
                 spill_after=placement.spill_threshold(model_id),
-                acquire_timeout=POD_LEASE_ATTEMPT_S)
+                acquire_timeout=POD_LEASE_ATTEMPT_S,
+                grow_inline=False)
         except OcrError:
             raise
         except Exception as exc:

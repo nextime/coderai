@@ -2915,6 +2915,37 @@ class RunpodPodPool:
         #: Set from the pod plan at provision time; the default suits an LLM pod.
         self.health_path = mcfg.health_path or "/v1/models"
         self._cv = threading.Condition(threading.RLock())
+        #: Per-CARD arithmetic, memoised. `pod_weight`, `pod_capacity` and
+        #: `pod_threshold` depend only on the card's NAME and the model config,
+        #: but they were recomputed per pod on every acquire(): `_pick` once per
+        #: free pod, `_pods_for_demand` once per serving pod, and
+        #: `_preferred_vram_gb` iterating every pod again inside each of those
+        #: -- all while holding `_cv`.
+        #:
+        #: At 70 pods that is ~140 recomputations per acquire, each scanning the
+        #: gpu_limits/gpu_weights tables with substring matches. Measured on a
+        #: live run: 811 pages waiting, 324 of 352 engine threads parked in
+        #: futex_do_wait, /healthz answering in 1.6 ms while every lease
+        #: serialised behind the pool lock and the scaler kept renting more pods
+        #: -- each new pod making the per-acquire cost higher. The fleet grew
+        #: because it could not serve, and could not serve because it had grown.
+        #:
+        #: Keyed by card name and a generation that bumps when the pod set or
+        #: the config changes, because `_preferred_vram_gb` reads the pods.
+        self._card_cache: dict = {}
+        self._card_gen = 0
+        #: When `acquire(grow_inline=False)` last turned pages away. This is the
+        #: demand signal now that a waiting page no longer parks a thread in
+        #: `acquire` -- `_waiting` only ever counted THREADS, and the
+        #: non-blocking path has none to count.
+        #:
+        #: Counted over a window equal to the caller's RETRY interval, which
+        #: makes the count the number of DISTINCT pages waiting rather than the
+        #: attempts they have made between them: a page retrying every 2 s
+        #: appears exactly once in any 2-second window. A longer window inflates
+        #: demand by the retry rate, which is how an earlier build read its own
+        #: retries as new work and rented 73 pods for a queue it never served.
+        self._denied: list = []
         #: A warm floor a client leased through /v1/runpod/scale, and when the
         #: lease runs out. 0/0 = nobody asked.
         self._client_floor = 0
@@ -3423,6 +3454,7 @@ class RunpodPodPool:
                            healthy=True, last_used=time.time())
         with self._cv:
             self.pods.append(handle)
+            self._bump_cards()
             self._cv.notify_all()
         register_pod(shared_id, str(self.model_key), shared_url, self.api_key,
                      hourly_usd=float(shared_rate or 0.0))  # image/gpu kept
@@ -3757,6 +3789,7 @@ class RunpodPodPool:
                 raise BootCancelled(pod_id)
             with self._cv:
                 self.pods.append(h)
+                self._bump_cards()
                 self._cv.notify_all()
             with _pools_lock:
                 _provisioning_ids.discard(pod_id)
@@ -3826,17 +3859,54 @@ class RunpodPodPool:
                 self._booting = max(0, self._booting - want)
                 self._cv.notify_all()
 
+    def _say_no_pod(self, total: int, healthy: int, draining: int,
+                    at_cap: int) -> None:
+        """One rate-limited line naming WHICH of the four reasons it was."""
+        now = time.time()
+        if now < getattr(self, "_no_pod_said", 0.0):
+            return
+        self._no_pod_said = now + 15.0
+        if total == 0:
+            why = "the pool holds no pods at all"
+        elif healthy == 0:
+            why = (f"none of its {total} pod(s) is healthy — they are booting, "
+                   f"or failing their health probe")
+        elif draining >= healthy:
+            why = f"all {draining} healthy pod(s) are draining"
+        elif at_cap:
+            why = (f"all {at_cap} serving pod(s) are at their in-flight cap "
+                   f"(max_inflight_per_pod, scaled per card)")
+        else:
+            why = "no pod was eligible, for a reason this code cannot name"
+        print(f"[runpod] {self.model_key!r}: NO POD to hand out — {why} "
+              f"[{total} in pool, {healthy} healthy, {draining} draining, "
+              f"{at_cap} at cap, {self._booting} booting, "
+              f"{self._queued()} waiting]", flush=True)
+
     def _pick(self, healthy: list, affinity: str):
         """Which pod serves this request: the one that already holds the
         conversation's cache, else the least loaded."""
-        free = []
+        free, draining, at_cap = [], 0, 0
         for p in healthy:
             if p.draining:
+                draining += 1
                 continue
             cap = self.pod_capacity(p)          # scaled to THIS pod's card
             if cap <= 0 or p.inflight < cap:
                 free.append(p)
+            else:
+                at_cap += 1
         if not free:
+            # SAY WHY, or the next incident is the last one again. "811 pages
+            # waiting with 50 pods up" has four different causes -- every pod
+            # unhealthy, every pod draining, every pod at its in-flight cap, or
+            # no pod in the list at all -- and they need opposite responses.
+            # A live run spent 41 minutes and $43/hr indistinguishable between
+            # them, because this returned a bare None and the caller could only
+            # report the queue it could not drain.
+            with self._cv:
+                total = len(self.pods)
+            self._say_no_pod(total, len(healthy), draining, at_cap)
             return None
         if affinity and getattr(self.mcfg, "sticky_sessions", True):
             pid = self._affinity.get(affinity)
@@ -3882,7 +3952,90 @@ class RunpodPodPool:
                 return vram
         return 0.0
 
+    #: Must match the caller's retry interval -- see `_denied`.
+    DENY_WINDOW_S = 2.0
+
+    def _note_denied(self) -> None:
+        """Record one page turned away. Trimmed as it goes."""
+        now = time.time()
+        with self._cv:
+            self._denied.append(now)
+            cut = now - (self.DENY_WINDOW_S * 4)
+            if self._denied[0] < cut:
+                self._denied = [t for t in self._denied if t >= cut]
+            if len(self._denied) > _DENY_CAP:
+                # A hard cap as well as the age filter. Under a burst every
+                # entry is recent, so filtering by age drops nothing and the
+                # list grows with the burst -- and keeping more than the cap
+                # buys nothing, because only the newest window is ever counted.
+                del self._denied[:-_DENY_CAP]
+
+    def _denied_recent(self) -> int:
+        """Distinct pages waiting, as far as the pool can tell."""
+        cut = time.time() - self.DENY_WINDOW_S
+        with self._cv:
+            return sum(1 for t in getattr(self, "_denied", ()) if t >= cut)
+
+    def _queued(self) -> int:
+        """Work that wants a pod but has none: threads parked, or pages denied.
+
+        Either signal, never their sum -- a thread parked in acquire and a page
+        turned away that will retry are the same page counted two ways.
+        """
+        return max(max(0, self._waiting), self._denied_recent())
+
+    def _bump_cards(self) -> None:
+        """Invalidate the per-card memo. Call with `_cv` held.
+
+        Cheap on purpose: a counter, not a clear, so a caller mid-read of the
+        old generation finishes against a consistent value rather than a dict
+        that emptied underneath it.
+        """
+        self._card_gen = getattr(self, "_card_gen", 0) + 1
+        cache = getattr(self, "_card_cache", None)
+        if cache is not None and len(cache) > 256:
+            cache.clear()
+
+    def _card_facts(self, name: str) -> dict:
+        """`{weight, capacity, threshold}` for this card, computed once.
+
+        The three were separate methods doing overlapping work -- both weight
+        and threshold read `gpu_limits`, and capacity called weight -- so one
+        memo covers all of them and the tables are scanned once per card per
+        generation instead of once per pod per call.
+        """
+        # getattr-initialised: a pool may be built by a caller that did not run
+        # __init__ (a test double, a duck-typed stand-in), and a memo that
+        # raises on such a pool would turn an optimisation into an outage.
+        cache = getattr(self, "_card_cache", None)
+        if cache is None:
+            cache = self._card_cache = {}
+        key = (name or "", getattr(self, "_card_gen", 0))
+        got = cache.get(key)
+        if got is not None:
+            return got
+        facts = {"weight": self._compute_weight(name),
+                 "capacity": 0, "threshold": 1.0}
+        lim = card_limits(self.mcfg, name)
+        base_inflight = int(getattr(self.mcfg, "max_inflight_per_pod", 0) or 0)
+        stated_inflight = int(lim.get("inflight") or 0)
+        if stated_inflight != base_inflight and stated_inflight > 0:
+            facts["capacity"] = stated_inflight
+        elif base_inflight > 0:
+            facts["capacity"] = max(1, int(round(base_inflight * facts["weight"])))
+        base_up = max(1, int(getattr(self.mcfg, "scale_up_inflight_per_pod", 1) or 1))
+        stated_up = int(lim.get("scale_up") or 0)
+        facts["threshold"] = (float(stated_up) if stated_up and stated_up != base_up
+                              else base_up * facts["weight"])
+        cache[key] = facts
+        return facts
+
     def pod_weight(self, pod: "PodHandle") -> float:
+        """This pod's share of the load — memoised per card. See `_card_facts`."""
+        return self._card_facts(
+            str(getattr(pod, "gpu", "") or "").strip())["weight"]
+
+    def _compute_weight(self, name: str) -> float:
         """This pod's share of the load, relative to the preferred card.
 
         An explicit `gpu_weights` entry wins: VRAM bounds how many requests FIT
@@ -3897,11 +4050,6 @@ class RunpodPodPool:
         rotation for want of a number would turn a reporting gap into an
         outage.
         """
-        # getattr throughout: this is a duck-typed pod, and a caller holding a
-        # lighter object must get the neutral weight rather than an exception.
-        # A missing attribute is the same situation as an unknown card, and the
-        # docstring above promises that keeps the pod serving.
-        name = str(getattr(pod, "gpu", "") or "").strip()
         prefer_name = ""
         prefer = [str(g).strip() for g
                   in (getattr(self.mcfg, "gpu_types", None) or []) if str(g).strip()]
@@ -3932,36 +4080,41 @@ class RunpodPodPool:
             base = _weight_for(weights, prefer_name) if prefer_name else None
             return max(0.25, min(8.0, mine / (base or 1.0)))
         base = self._preferred_vram_gb()
-        vram = float(getattr(pod, "vram_gb", 0.0) or 0.0)
+        vram = self._vram_of_card(name)
         if base > 0 and vram > 0:
             return max(0.25, min(8.0, vram / base))
         return 1.0
 
+    def _vram_of_card(self, name: str) -> float:
+        """VRAM reported by any pod running this card, or 0.
+
+        By card rather than per pod because the weight is a property of the
+        card: two A40s do not deserve two different weights, and asking per pod
+        is what made this an O(pods) walk inside an O(pods) loop.
+        """
+        want = str(name or "").strip().lower()
+        if not want:
+            return 0.0
+        with self._cv:
+            pods = list(self.pods)
+        for p in pods:
+            if str(getattr(p, "gpu", "") or "").strip().lower() == want:
+                return float(getattr(p, "vram_gb", 0.0) or 0.0)
+        return 0.0
+
     def pod_capacity(self, pod: "PodHandle") -> int:
-        """How many requests THIS pod may hold.
+        """How many requests THIS pod may hold. 0 = unlimited.
 
         A per-card `inflight` is taken as written; otherwise the model-level
-        number is scaled by this pod's weight. Unlimited stays unlimited.
+        number is scaled by the card's weight. Memoised — see `_card_facts`.
         """
-        name = str(getattr(pod, "gpu", "") or "").strip()
-        lim = card_limits(self.mcfg, name)
-        stated = int(lim.get("inflight") or 0)
-        base = int(getattr(self.mcfg, "max_inflight_per_pod", 0) or 0)
-        if stated != base and stated > 0:
-            return stated                 # the table said so, for this card
-        if base <= 0:
-            return 0
-        return max(1, int(round(base * self.pod_weight(pod))))
+        return self._card_facts(
+            str(getattr(pod, "gpu", "") or "").strip())["capacity"]
 
     def pod_threshold(self, pod: "PodHandle") -> float:
         """The in-flight depth at which THIS pod justifies another one."""
-        name = str(getattr(pod, "gpu", "") or "").strip()
-        lim = card_limits(self.mcfg, name)
-        stated = int(lim.get("scale_up") or 0)
-        base = max(1, int(getattr(self.mcfg, "scale_up_inflight_per_pod", 1) or 1))
-        if stated and stated != base:
-            return float(stated)          # written for this card
-        return base * self.pod_weight(pod)
+        return self._card_facts(
+            str(getattr(pod, "gpu", "") or "").strip())["threshold"]
 
     def _pods_for_demand(self, serving: list) -> int:
         """How many pods the work we can SEE justifies, capped at max_pods.
@@ -3972,7 +4125,7 @@ class RunpodPodPool:
         much, so the only question it could answer was "one more?".
         """
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-        load = sum(p.inflight for p in serving) + max(0, self._waiting)
+        load = sum(p.inflight for p in serving) + self._queued()
         # Per POD, weighted: the threshold describes the preferred card, so a
         # fleet of bigger cards carries the same load in fewer pods. Dividing
         # by a flat threshold would rent ~3x more A100s than the work needs,
@@ -4049,7 +4202,7 @@ class RunpodPodPool:
         want = self._pods_for_demand(serving)
         if in_hand < want:
             threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-            load = sum(p.inflight for p in serving) + max(0, self._waiting)
+            load = sum(p.inflight for p in serving) + self._queued()
             return (f"{load} page(s) in flight or waiting at {threshold} per pod "
                     f"needs {want} pod(s), and {in_hand} are in hand")
         # And the original, anticipatory trigger: every pod is at its in-flight
@@ -4107,13 +4260,29 @@ class RunpodPodPool:
         threading.Thread(target=_run, daemon=True,
                          name=f"runpod-grow-{self.model_key}").start()
 
-    def acquire(self, timeout: float = 1200.0, affinity: str = ""):
+    def acquire(self, timeout: float = 1200.0, affinity: str = "",
+                grow_inline: bool = True):
         """Return (PodHandle, url) for a ready pod, provisioning on demand.
 
         Bumps in-flight; the caller MUST pair it with release(pod). Picks the pod
         holding this conversation's cache when ``affinity`` is given, else the
         least-loaded one, and grows the pool in the background once the least
         loaded pod is at ``scale_up_inflight_per_pod``.
+
+        ``grow_inline=False`` means "answer now": trigger growth in the
+        background and raise rather than renting a pod in the caller's thread
+        or waiting on the condition variable. For a caller that can wait
+        somewhere cheaper than a thread -- a coroutine with its own retry loop
+        -- this is the only safe mode, and the reason is arithmetic:
+
+        A page's lease ran with a 20 s bounded attempt in a 256-thread pool, so
+        the lease STAGE could pass at most ~13 pages a second however many pods
+        were up, and a thread that drew the growth branch sat through an entire
+        ~9-minute boot. Against 811 pages, each retrying every couple of
+        seconds, nothing ever got through: a live run dispatched ZERO pages to
+        50 healthy pods in 41 minutes, every pod's log showing not one
+        `POST /v1/ocr`, while the queue the scaler could see made it rent more.
+        Waiting is free on an event loop and costs a whole thread here.
         """
         from codai.api.runpod_client import RunpodError
         deadline = time.time() + timeout
@@ -4141,6 +4310,19 @@ class RunpodPodPool:
                           flush=True)
                     self._grow_in_background()      # absorbs the NEXT request
                 return chosen, url
+
+            if grow_now and not grow_inline:
+                # Growth belongs in the background; the caller waits on its own
+                # loop. Released before raising, or the booting count leaks and
+                # `_grow_reason` stops firing for everyone.
+                with self._cv:
+                    self._booting = max(0, self._booting - 1)
+                    self._cv.notify_all()
+                self._note_denied()
+                self._grow_in_background()
+                raise NoPodRightNow(
+                    f"no pod free for {self.model_key!r} right now; growth "
+                    f"started in the background")
 
             if grow_now:
                 # Before renting: is a sibling process already running a pod for
@@ -4181,6 +4363,16 @@ class RunpodPodPool:
                         self._cv.notify_all()
                 continue
 
+            if not grow_inline:
+                # Nothing to hand out and growth is someone else's job: say so
+                # at once instead of holding this thread on the condvar. The
+                # count still rises, because the scaler reads it as demand --
+                # it is just no longer a thread each.
+                self._note_denied()
+                raise NoPodRightNow(
+                    f"no pod slot for {self.model_key!r} right now "
+                    f"(max_pods={self.mcfg.max_pods})")
+
             # At max_pods with every pod at its in-flight ceiling, or someone else
             # is provisioning: wait for a slot rather than piling on. Counted
             # while waiting, so the next pass through _should_grow can see how
@@ -4220,6 +4412,7 @@ class RunpodPodPool:
                 return
             pod.healthy = False
             self.pods.remove(pod)
+            self._bump_cards()
         print(f"[runpod] pod {pod.pod_id} dropped from the pool: {reason}", flush=True)
         threading.Thread(target=self._terminate, args=(pod, reason), daemon=True).start()
 
@@ -4241,6 +4434,7 @@ class RunpodPodPool:
                 return False
             pod.healthy = False
             self.pods.remove(pod)
+            self._bump_cards()
         if getattr(pod, "gpu", "") == "(shared)":
             # Another process owns the bill; it writes the ledger entry.
             print(f"[runpod] borrowed pod {pod.pod_id} is gone ({reason}) — "
@@ -4272,6 +4466,7 @@ class RunpodPodPool:
             with self._cv:
                 if pod in self.pods:
                     self.pods.remove(pod)
+                    self._bump_cards()
             return
         from codai.api.runpod_client import RunpodClient
         from codai.api import runpod_ledger
@@ -4502,6 +4697,7 @@ class RunpodPodPool:
                 if victim.inflight == 0:
                     victim.healthy = False
                     self.pods.remove(victim)
+                    self._bump_cards()
                     terminated.append(victim.pod_id)
                     threading.Thread(target=self._terminate,
                                      args=(victim, "released by client"),
@@ -4569,6 +4765,7 @@ class RunpodPodPool:
                 if p.inflight == 0:
                     p.healthy = False
                     self.pods.remove(p)
+                    self._bump_cards()
                     threading.Thread(target=self._terminate, args=(p, "scaled down"),
                                      daemon=True).start()
 
@@ -4594,6 +4791,7 @@ class RunpodPodPool:
             if victim.inflight == 0:
                 victim.healthy = False
                 self.pods.remove(victim)
+                self._bump_cards()
                 threading.Thread(target=self._terminate, args=(victim, "scaled down"),
                                  daemon=True).start()
                 why = "terminated"
@@ -4648,6 +4846,7 @@ class RunpodPodPool:
                 if p.inflight == 0 and idle_to > 0 and (now - p.last_used) > idle_to:
                     p.healthy = False
                     self.pods.remove(p)
+                    self._bump_cards()
                     to_kill = p
                     # terminate outside the lock
                     threading.Thread(target=self._terminate, args=(to_kill, "idle"),
@@ -4760,6 +4959,20 @@ class RunpodPodPool:
 
 
 # module-level pool registry + scaler ------------------------------------- #
+#: Most denial timestamps a pool keeps. Only the newest `DENY_WINDOW_S` of
+#: them is ever counted, so this bounds memory under a burst and nothing else.
+_DENY_CAP = 4096
+
+
+class NoPodRightNow(RuntimeError):
+    """No pod is free THIS INSTANT and the caller asked not to wait here.
+
+    Distinct from a pool that cannot serve at all: growth has been started and
+    retrying shortly is the right response. Raised only for
+    ``acquire(grow_inline=False)``.
+    """
+
+
 _pools_lock = threading.RLock()
 _pools: dict = {}          # model_key -> RunpodPodPool
 _scaler_started = False
