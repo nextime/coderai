@@ -69,8 +69,18 @@ _MAX_DEFAULT = 256
 #: the right answer, not more stacks.
 _MAX_POD = 2048
 
+#: Width of the LEASE pool. Deliberately small and NOT derived from
+#: `max_concurrency`: a lease is a bounded wait (`POD_LEASE_ATTEMPT_S`) that
+#: either hands back a pod at once or comes back empty, so a few hundred
+#: threads can serve thousands of pages by cycling. Sizing it per in-flight
+#: page is what made the pod pool ask for 2048 threads and exhaust a 2048-task
+#: cgroup; the page concurrency an install wants should not decide how many
+#: thread stacks it needs.
+_LEASE_WORKERS = 256
+
 _lock = threading.Lock()
 _pod_pool: Optional[ThreadPoolExecutor] = None
+_lease_pool: Optional[ThreadPoolExecutor] = None
 _installed = False
 
 
@@ -121,13 +131,104 @@ def sized_from_config() -> bool:
     return _configured_concurrency() > 0
 
 
+def task_budget() -> int:
+    """How many threads this PROCESS is actually allowed, or 0 if unbounded.
+
+    A pool sized from a config number is a pool sized from a wish. The ceiling
+    that decides whether those threads can exist is the process's task budget,
+    and in a container that is not the kernel's -- podman defaults
+    `--pids-limit` to 2048, and systemd units carry `TasksMax`. Both appear as
+    cgroup v2 `pids.max`, which is the number to read.
+
+    Measured on a live orchestrator: `ocr.max_concurrency: 4096` asked the pod
+    pool for its 2048 ceiling inside a cgroup whose TOTAL budget was 2048. The
+    pool reached 1992 threads, the 2049th raised "can't start new thread", and
+    the OCR manager read the pages on a GPU-less box instead -- the one outcome
+    the whole pod pipeline exists to avoid. Nothing reported a limit, because
+    nothing had looked for one.
+
+    Returns the tightest of cgroup v2 pids.max and RLIMIT_NPROC, minus what is
+    already running, or 0 when neither bounds us.
+    """
+    import os
+    budget = 0
+
+    def _tighten(n):
+        nonlocal budget
+        if n and n > 0:
+            budget = n if budget <= 0 else min(budget, n)
+
+    # cgroup v2: this process's own cgroup, then its parents -- a limit on any
+    # ancestor binds us just as hard as one on our own leaf.
+    try:
+        with open("/proc/self/cgroup") as fh:
+            rel = fh.read().strip().split(":")[-1].lstrip("/")
+        node = os.path.join("/sys/fs/cgroup", rel)
+        current = 0
+        while True:
+            try:
+                with open(os.path.join(node, "pids.max")) as fh:
+                    raw = fh.read().strip()
+                if raw and raw != "max":
+                    _tighten(int(raw))
+            except Exception:
+                pass
+            try:
+                with open(os.path.join(node, "pids.current")) as fh:
+                    current = max(current, int(fh.read().strip()))
+            except Exception:
+                pass
+            parent = os.path.dirname(node)
+            if parent == node or len(parent) <= len("/sys/fs/cgroup"):
+                break
+            node = parent
+        if budget > 0 and current > 0:
+            # What is left, not what the limit says: the other processes in this
+            # cgroup (the front, the system engine, every subprocess worker)
+            # are already spending it.
+            budget = max(0, budget - current)
+    except Exception:
+        pass
+
+    try:
+        import resource
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        if soft not in (resource.RLIM_INFINITY, -1):
+            _tighten(int(soft))
+    except Exception:
+        pass
+    return budget
+
+
+#: Leave this many tasks unspent. Threads are not the only thing that needs to
+#: fork: a rasteriser worker, an isolated-venv engine, a `podman exec` to look
+#: at the box while it is busy. A pool that spends the last task takes the
+#: operator's ability to diagnose it away with it.
+_TASK_HEADROOM = 256
+
+
 def pool_sizes() -> tuple:
-    """(default_workers, pod_workers) for this install."""
+    """(default_workers, pod_workers) for this install, within its budget."""
     want = _configured_concurrency()
     general = max(_MIN_DEFAULT, min(_MAX_DEFAULT, want))
     # Room for every concurrent page to be waiting on a pod at once, plus the
     # pool's own boots and probes.
     pod = max(_MIN_POD, min(_MAX_POD, want * 2))
+
+    budget = task_budget()
+    if budget > 0:
+        spendable = budget - _TASK_HEADROOM
+        if spendable < _MIN_DEFAULT + _MIN_POD:
+            # Too tight to honour both floors: keep them, and let the operator
+            # see why from the boot line. Refusing to start would be worse --
+            # an install that serves slowly beats one that does not serve.
+            return _MIN_DEFAULT, _MIN_POD
+        if general + pod > spendable:
+            # The pod pool gives first: the general pool is what answers
+            # /healthz and the admin pages, and an install that cannot be
+            # looked at is an install that cannot be fixed.
+            general = min(general, max(_MIN_DEFAULT, spendable // 4))
+            pod = max(_MIN_POD, spendable - general)
     return general, pod
 
 
@@ -194,6 +295,39 @@ def resize_pod_pool() -> int:
             print(f"[threads] pod pool {cur} -> {want} workers "
                   f"(ocr.max_concurrency changed)", flush=True)
         return max(cur, want)
+
+
+def lease_executor() -> ThreadPoolExecutor:
+    """The pool that pod LEASES wait in, created on first use.
+
+    Separate from the pod pool on purpose. Both block, but on different things
+    and for different lengths: a forward waits on a socket for as long as a
+    page takes to read, while a lease waits for a pod to be free or to boot.
+    Sharing one pool let a cold start fill every thread with leases waiting for
+    pods, leaving none to carry the pages those pods were for -- and sizing
+    that one pool per in-flight page is what exhausted the task budget.
+    """
+    global _lease_pool
+    with _lock:
+        if _lease_pool is None:
+            budget = task_budget()
+            n = _LEASE_WORKERS
+            if budget > 0:
+                n = max(16, min(n, max(16, (budget - _TASK_HEADROOM) // 8)))
+            _lease_pool = ThreadPoolExecutor(
+                max_workers=n, thread_name_prefix="coderai-lease")
+            print(f"[threads] lease pool: {n} workers (a lease is a bounded "
+                  f"wait, so this serves far more pages than it has threads)",
+                  flush=True)
+        return _lease_pool
+
+
+async def run_on_lease_pool(func, /, *args, **kwargs):
+    """``run_on_pod_pool``, on the lease pool."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(lease_executor(), call)
 
 
 async def run_on_pod_pool(func, /, *args, **kwargs):

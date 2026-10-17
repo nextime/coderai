@@ -804,6 +804,28 @@ app.include_router(admin_router, tags=["Admin"])
 # admin login page on a public address. A pod image is not an orchestrator.
 
 
+@app.exception_handler(400)
+async def bad_request_says_why(request: Request, exc: HTTPException):
+    """Log WHY a 400 happened on an upload path, then answer it unchanged.
+
+    A malformed or truncated multipart body is rejected by the ASGI framework
+    before any handler runs, so nothing of ours ever saw it and nothing was
+    logged: a live run had 19 of 137 batches answered 400 and the only record
+    anywhere was the access line. The client knew its documents had failed and
+    this side could not say what was wrong with them -- not the filename, not
+    the size, not even that it was the body rather than a field.
+
+    Behaviour is unchanged; this only makes the class diagnosable.
+    """
+    detail = getattr(exc, "detail", "") or ""
+    print(f"[http] 400 on {request.method} {request.url.path}: {detail!r} "
+          f"(content-type {request.headers.get('content-type', '-')!r}, "
+          f"content-length {request.headers.get('content-length', '-')}, "
+          f"peer {getattr(getattr(request, 'client', None), 'host', '-')})",
+          flush=True)
+    return JSONResponse(status_code=400, content={"detail": detail or "bad request"})
+
+
 @app.exception_handler(401)
 async def unauthorized_redirect(request: Request, exc: HTTPException):
     """Redirect browser clients to login page on 401; return JSON for API clients."""

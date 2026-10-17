@@ -33,7 +33,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from codai.api.thread_pool import run_on_pod_pool
+from codai.api.thread_pool import run_on_lease_pool, run_on_pod_pool
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
                             PAGE_OPTIONS, page_estimate, render_pages,
                             iter_pdf_page_pdfs, pdf_page_count, split_pdf_page,
@@ -752,6 +752,32 @@ def _pod_pipeline_policy(cfg) -> tuple:
 #: where the policy's ceiling is what decides how long to keep trying.
 POD_LEASE_ATTEMPT_S = 20.0
 
+
+def _is_local_exhaustion(exc: BaseException) -> bool:
+    """Did this fail because THIS BOX has no resources left?
+
+    Told apart from every other failure because the answer is the opposite one.
+    An optimisation that cannot run should cost latency and not an error, so a
+    pod that cannot serve falls through to the local pipeline -- but the local
+    pipeline needs MORE of this machine than the pod path does: it rasterises
+    every page here and holds the bitmaps. Falling back when the reason is that
+    this process cannot even create a thread sends the work to the one place
+    guaranteed not to have room for it.
+
+    Seen live: a cgroup task budget of 2048 (podman's `--pids-limit` default)
+    against a pod pool sized 2048 from `ocr.max_concurrency`. 278 pages in ten
+    minutes were read on a GPU-less orchestrator while 28 rented cards sat
+    idle, each one logged as "the pod-side pipeline could not run".
+    """
+    if isinstance(exc, (MemoryError,)):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(h in text for h in (
+        "can't start new thread", "cant start new thread",
+        "can not start new thread", "unable to start thread",
+        "cannot allocate memory", "resource temporarily unavailable",
+        "too many open files", "thread limit"))
+
 _POD_WAIT_COOLDOWN: dict = {}
 POD_WAIT_COOLDOWN_S = 300.0
 
@@ -802,7 +828,7 @@ async def _lease_a_pod(model_id: str, policy: str, wait_s: float):
             # when it matters most. Measured on a 5,000-document run: 116 pods
             # rented, zero documents completed in ten minutes, and a front that
             # had stopped answering.
-            lease = await run_on_pod_pool(
+            lease = await run_on_lease_pool(
                 placement.choose, model_id,
                 spill_after=placement.spill_threshold(model_id),
                 acquire_timeout=POD_LEASE_ATTEMPT_S)
@@ -1779,6 +1805,26 @@ class OcrManager:
             except OcrError:
                 raise
             except Exception as exc:
+                if _is_local_exhaustion(exc):
+                    # NOT a verdict on the pods, and not something the local
+                    # pipeline can rescue: it needs more of this box than the
+                    # path that just failed for want of it. Answer, so the
+                    # caller retries and the pages still reach the cards this
+                    # install is paying for.
+                    _say_rate_limited(
+                        ("local-exhaustion", _remote_model),
+                        f"[ocr] this process is out of local resources "
+                        f"({exc}) — NOT reading on this box, which needs more "
+                        f"of them than the pod path does. The pods are fine; "
+                        f"this orchestrator cannot currently hand work to "
+                        f"them. Raise the container's task budget "
+                        f"(podman --pids-limit / systemd TasksMax, default "
+                        f"2048) or lower ocr.max_concurrency.", every=30.0)
+                    raise OcrError(
+                        f"the orchestrator is out of local resources ({exc}) "
+                        f"and will not rasterise this document itself; the "
+                        f"pods for {_remote_model!r} are unaffected. Retry.",
+                        status=503)
                 print(f"[ocr] the pod-side pipeline for {_remote_model!r} could "
                       f"not run ({exc}); reading locally instead", flush=True)
                 _out = None

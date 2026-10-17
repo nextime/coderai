@@ -5255,6 +5255,25 @@ def _scale_live_pool(pool, key: str, pods: int, teardown: bool = False,
     return out
 
 
+def _already_gone(exc: BaseException) -> bool:
+    """Does this error mean the pod does not exist any more?
+
+    RunPod says so several ways depending on which API answered and how long
+    ago the pod went, so the shapes are matched rather than one code. A false
+    positive here reports a live pod as gone -- which the reconcile sweep then
+    corrects from the account listing -- while a false negative answers 500 on
+    a teardown that has in fact succeeded, which is the failure this exists to
+    stop.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "404" in text or "not found" in text:
+        return True
+    return any(h in text for h in (
+        "does not exist", "no such pod", "already terminated",
+        "already been terminated", "pod not found", "unknown pod",
+        "invalid pod id", "has been removed"))
+
+
 def release_pod(pod_id: str, reason: str = "released by client") -> dict:
     """Terminate ONE pod by id, wherever it is, and stop tracking it.
 
@@ -5304,16 +5323,34 @@ def release_pod(pod_id: str, reason: str = "released by client") -> dict:
         RunpodClient(acct).terminate_pod(pid)
         out["terminated"] = True
     except Exception as exc:
-        # Say which half happened. A pod dropped from the pool but still
-        # billing is a worse state than either end, and the caller can only
-        # act on it if it is told.
-        out["error"] = str(exc)
-        if out["found_in_pool"]:
-            out["warning"] = (
-                f"pod {pid} was removed from pool {out['found_in_pool']!r} but "
-                f"RunPod did not confirm the termination — it may still be "
-                f"billing. Check the console.")
-        raise RuntimeError(out.get("warning") or f"could not terminate {pid}: {exc}")
+        # ALREADY GONE IS THE GOAL, NOT A FAILURE. A client tearing down a
+        # fleet releases pods by id, and by the time it reaches the last one
+        # some are already gone -- reaped for idle, shed by a scale-down,
+        # released by a retry of this same call. Raising for those answered 500
+        # per pod, so a teardown that was working looked like a teardown that
+        # had failed, and the operator was told the pods could not be stopped.
+        # (Observed: five 500s in three seconds on a client's own release
+        # sweep.) Terminating something that does not exist has nothing left to
+        # do, so it is success, said plainly.
+        if _already_gone(exc):
+            out["terminated"] = False
+            out["already_gone"] = True
+            out["detail"] = (f"pod {pid} no longer exists on the account; "
+                             f"nothing to terminate")
+            print(f"[runpod] pod {pid} was already gone ({reason}) — release "
+                  f"had nothing to do", flush=True)
+        else:
+            # Say which half happened. A pod dropped from the pool but still
+            # billing is a worse state than either end, and the caller can only
+            # act on it if it is told.
+            out["error"] = str(exc)
+            if out["found_in_pool"]:
+                out["warning"] = (
+                    f"pod {pid} was removed from pool {out['found_in_pool']!r} but "
+                    f"RunPod did not confirm the termination — it may still be "
+                    f"billing. Check the console.")
+            raise RuntimeError(out.get("warning")
+                               or f"could not terminate {pid}: {exc}")
     finally:
         with _pools_lock:
             _provisioning_ids.discard(pid)
