@@ -2335,6 +2335,7 @@ def auth_headers(account_cfg) -> dict:
 # --------------------------------------------------------------------------- #
 # Pods mode — coderai-managed pool of remote GPU pods
 # --------------------------------------------------------------------------- #
+import contextlib
 import threading
 import time
 import uuid
@@ -5037,6 +5038,39 @@ def _forget_unavailable(gpu_type_id: str, dc: str = "") -> None:
         _unavail.pop((str(gpu_type_id), ""), None)
 
 
+#: How long a READ-ONLY snapshot waits for a lock before giving up on it.
+#:
+#: A monitoring endpoint that blocks is worse than one that says "busy": during
+#: a boot wave /v1/runpod/status stopped answering entirely, which a client
+#: reasonably read as "the server is dead" when /healthz was answering in 2.9
+#: ms the whole time -- and it is the one surface an operator has for seeing
+#: WHY the server is busy, so it must not be the first thing a busy server
+#: stops serving. Short, because a partial answer now beats a complete one
+#: after the incident.
+SNAPSHOT_LOCK_TIMEOUT_S = 2.0
+
+
+@contextlib.contextmanager
+def _lock_for_read(lock, timeout: float = None):
+    """Hold `lock` if it can be had quickly; yield False if not.
+
+    For snapshots only. A writer must never use this: skipping the lock to
+    carry on would race. A reader that skips it reports less, which is the
+    whole point.
+    """
+    want = SNAPSHOT_LOCK_TIMEOUT_S if timeout is None else float(timeout)
+    got = False
+    try:
+        got = lock.acquire(timeout=want)
+        yield got
+    finally:
+        if got:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+
+
 class NoPodRightNow(RuntimeError):
     """No pod is free THIS INSTANT and the caller asked not to wait here.
 
@@ -5728,13 +5762,31 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
 
 
 def pods_status() -> list:
-    """Snapshot of all pods across pools for the stats/tasks pages."""
+    """Snapshot of all pods across pools for the stats/tasks pages.
+
+    Every lock here is taken with a timeout: see `_lock_for_read`. A pool whose
+    lock is busy contributes one `state: "busy"` row naming itself instead of
+    hanging the whole snapshot, so the answer is always late-but-complete about
+    what it could see and explicit about what it could not.
+    """
     now = time.time()
     out = []
-    with _pools_lock:
-        pools = list(_pools.items())
+    with _lock_for_read(_pools_lock) as got:
+        pools = list(_pools.items()) if got else []
+    if not pools:
+        out.append({"model": "", "pod_id": "", "gpu": "", "healthy": False,
+                    "inflight": 0, "state": "busy",
+                    "note": "the pool registry was locked; this snapshot is "
+                            "incomplete (a provisioning wave holds it)"})
+        return out
     for key, pool in pools:
-        with pool._cv:
+        with _lock_for_read(pool._cv) as got:
+            if not got:
+                out.append({"model": key, "pod_id": "", "gpu": "",
+                            "healthy": False, "inflight": 0, "state": "busy",
+                            "note": f"pool {key!r} was locked when this "
+                                    f"snapshot was taken"})
+                continue
             for p in pool.pods:
                 out.append({
                     "model": key, "pod_id": p.pod_id, "gpu": p.gpu,
@@ -5750,8 +5802,8 @@ def pods_status() -> list:
                 })
     # Booting pods (created, not yet serving) — visible so a slow/failing boot is
     # obvious and its vLLM log is one click away.
-    with _pools_lock:
-        prov = list(_provisioning_info.items())
+    with _lock_for_read(_pools_lock) as got:
+        prov = list(_provisioning_info.items()) if got else []
     for pid, info in prov:
         out.append({
             "model": info.get("model"), "pod_id": pid, "gpu": info.get("gpu"),

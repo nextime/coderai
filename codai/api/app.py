@@ -919,7 +919,16 @@ async def runpod_spend(request: Request):
     live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
     caps = {}
     try:
-        from codai.config import config_manager
+        # THE SHARED MANAGER LIVES IN `codai.admin.routes`. `codai.config` has
+        # no `config_manager`, so this import raised every time and the except
+        # swallowed it: `caps` has been silently empty in every answer this
+        # endpoint has ever given, which is how an operator polling it never
+        # saw the spend ceilings it is supposed to report. Same mistake, same
+        # shape, as the one that pinned both thread pools to their floors.
+        try:
+            from codai.admin.routes import config_manager
+        except Exception:
+            from codai.config import config_manager
         cfg = config_manager.config.runpod if config_manager and config_manager.config else None
         if cfg is not None:
             caps = {"global_max_hourly_usd": cfg.global_max_hourly_usd,
