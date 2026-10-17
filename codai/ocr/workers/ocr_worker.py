@@ -458,6 +458,37 @@ class _LastMime(threading.local):
 _LAST_MIME = _LastMime()
 
 
+def _page_confidence(confs):
+    """``(confidence, measured)`` for a page, from its per-line confidences.
+
+    chandra and olmOCR report one page number, the mean of ``exp(logprob)`` over
+    TOKENS. surya's predictor reports per LINE instead, so the comparable
+    aggregate weights each line by its CHARACTERS: a two-word line must not
+    count as much as a full one, or a page of mostly long confident lines is
+    dragged down by a single short uncertain one.
+
+    ``measured`` is the half that matters. A line whose confidence was never
+    reported arrives here as ``None``, and coercing that to 0.0 -- which the
+    per-line code does, by necessity, for its own field -- would be
+    indistinguishable from a model that really was certain it was unsure. One
+    such 0.0 has already produced a confidently wrong verdict in this
+    subsystem. So a page where NOTHING reported a confidence says so, rather
+    than claiming zero.
+    """
+    measured = [(int(n or 0), float(c)) for n, c in (confs or [])
+                if isinstance(c, (int, float))]
+    if not measured:
+        return 0.0, False
+    chars = sum(n for n, _ in measured)
+    if chars > 0:
+        score = sum(n * c for n, c in measured) / chars
+    else:
+        # Every line empty: fall back to a plain mean rather than divide by
+        # zero, because the confidences themselves are still real.
+        score = sum(c for _, c in measured) / len(measured)
+    return round(float(score), 4), True
+
+
 def _oc_repair_on() -> bool:
     """Whether the accent repair is active in this process, for reporting."""
     try:
@@ -1675,6 +1706,13 @@ class SuryaWorker:
         res = preds[0] if preds else None
         lines = []
         tl = getattr(res, "text_lines", None)
+        #: ``(characters, confidence-as-reported)`` per line. The RAW value, not
+        #: the coerced one: ``float(conf or 0.0)`` turns "not reported" into a
+        #: confident-looking zero, and a 0.0 that means "nothing measured this"
+        #: is indistinguishable from one that means "the model was certain it
+        #: was unsure" -- a confusion that has already produced one confidently
+        #: wrong verdict in this subsystem.
+        _confs = []
         if tl is None and isinstance(res, dict):
             tl = res.get("text_lines")
         if tl:
@@ -1691,6 +1729,7 @@ class SuryaWorker:
                 if len(bb) < 4:
                     bb = [0.0, 0.0, 0.0, 0.0]
                 lines.append({"text": str(text), "bbox": bb, "conf": float(conf or 0.0)})
+                _confs.append((len(str(text)), conf))
         else:
             # Surya2 (>=0.20): result.blocks[].{html,polygon,confidence,label,reading_order}
             blocks = getattr(res, "blocks", None)
@@ -1709,9 +1748,23 @@ class SuryaWorker:
                     conf = b.get("confidence", conf)
                 lines.append({"text": text, "bbox": _poly_to_xyxy(poly or [0, 0, 0, 0]),
                               "conf": float(conf or 0.0)})
+                _confs.append((len(text), conf))
         page = {"index": 0, "width": img.width, "height": img.height,
                 "lines": lines, "regions": [], "tables": [],
                 "text": "\n".join(l["text"] for l in lines)}
+        # A PAGE-LEVEL confidence, so surya reports the same shape chandra and
+        # olmOCR do and a caller switching engines is not handed a different
+        # kind of answer. Theirs is the mean of exp(logprob) over TOKENS;
+        # surya's predictor reports per LINE instead, so the comparable
+        # aggregate is weighted by characters -- a two-word line must not count
+        # as much as a full one.
+        #
+        # `confidence_measured` is the half that matters: it is false when NO
+        # line reported a confidence, which is the only honest way to tell that
+        # case apart from a page the model really was unsure about. The
+        # per-line numbers stay exactly as they were; this only adds the page
+        # summary.
+        page["confidence"], page["confidence_measured"] = _page_confidence(_confs)
         # Only when something actually went unread: a clean page stays byte-identical
         # to what it has always returned.
         if repairs:

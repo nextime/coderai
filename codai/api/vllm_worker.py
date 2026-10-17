@@ -298,10 +298,17 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     return out
 
 
-#: Served names (and path fragments) whose vocabulary is BYTE-level, so a lost
-#: character can only be recovered from token ids. Matched loosely because a
-#: model arrives here as a repo id, a served name or a local path.
-_BYTE_LEVEL_OCR = ("surya", "chandra", "olmocr")
+#: Served names (and path fragments) that NEED token ids: a byte-level
+#: vocabulary whose lost characters can only be recovered from them, AND a
+#: repair that actually consumes them.
+#:
+#: surya only, deliberately. chandra and olmOCR are served by coderai's own
+#: client, read their logprobs for confidence (`mean_token_prob`, a VALUE) and
+#: have no id-based repair, so for them the flag would change the `token`
+#: string that nothing reads -- and chandra demonstrably does not have the
+#: fault: on the page where surya returned 25 U+FFFD and zero 0xC3 bytes,
+#: chandra returned 40 0xC3 bytes with every accent intact.
+_BYTE_LEVEL_OCR = ("surya",)
 
 
 def _wants_token_ids(cfg, served_name: str = "", model_path: str = "") -> bool:
