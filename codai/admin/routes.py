@@ -5546,8 +5546,14 @@ async def api_hf_model_files(model_id: str, username: str = Depends(require_admi
     url = f"https://huggingface.co/api/models/{safe_id}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "coderai-admin/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
+
+        def _fetch():
+            # In a thread: a call to someone else's API is as slow as they are,
+            # and on the loop that latency belonged to every other request too.
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return _json.loads(resp.read())
+
+        data = await asyncio.to_thread(_fetch)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"HuggingFace API error: {e}")
 
@@ -5723,8 +5729,14 @@ async def api_hf_model_info(model_id: str, username: str = Depends(require_admin
     url = f"https://huggingface.co/api/models/{safe_id}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "coderai-admin/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
+
+        def _fetch():
+            # In a thread: a call to someone else's API is as slow as they are,
+            # and on the loop that latency belonged to every other request too.
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return _json.loads(resp.read())
+
+        data = await asyncio.to_thread(_fetch)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"HuggingFace API error: {e}")
 

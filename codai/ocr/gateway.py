@@ -417,6 +417,8 @@ async def chat_completions(token: str, request: Request):
     if got is None:
         return _unknown_lease()
 
+    from codai.api.thread_pool import run_on_pod_pool
+    from codai.ocr.manager import POD_LEASE_ATTEMPT_S
     from codai.models import placement
     body = await request.body()
 
@@ -430,9 +432,17 @@ async def chat_completions(token: str, request: Request):
         try:
             # How busy is too busy is the MODEL's own setting, the same one the
             # pool scales on — not a second, OCR-shaped copy of it.
-            chosen = placement.choose(
+            #
+            # OFF THE LOOP, and bounded. `choose` ends in a pool's `acquire()`,
+            # which waits up to 1200 s and may rent a pod inline: called here
+            # directly it blocked the whole process, not this request. Same
+            # defect as `_lease_a_pod`'s, on the chat path instead of the page
+            # path, and with no retry loop above it to make the wait visible.
+            chosen = await run_on_pod_pool(
+                placement.choose,
                 got["model_id"],
-                spill_after=placement.spill_threshold(got["model_id"]))
+                spill_after=placement.spill_threshold(got["model_id"]),
+                acquire_timeout=POD_LEASE_ATTEMPT_S)
         except Exception as exc:
             status = int(getattr(exc, "status", 503) or 503)
             return JSONResponse(status_code=status,

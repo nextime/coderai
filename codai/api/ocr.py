@@ -343,8 +343,15 @@ async def run_ocr_step(request: OcrStepRequest, http_request=None):
             filename = "input.pdf"
     elif ref.startswith("http://") or ref.startswith("https://"):
         import urllib.request
-        with urllib.request.urlopen(ref) as resp:      # nosec - user-provided pipeline input
-            data = resp.read()
+
+        def _fetch(u: str) -> bytes:
+            # In a thread: this is an arbitrary URL from the request, so the
+            # fetch is as slow as whoever is serving it, and on the loop that
+            # was every other request's problem too.
+            with urllib.request.urlopen(u) as resp:    # nosec - user-provided pipeline input
+                return resp.read()
+
+        data = await asyncio.to_thread(_fetch, ref)
         filename = ref.rsplit("/", 1)[-1] or filename
     else:
         data = base64.b64decode(ref) if ref else b""

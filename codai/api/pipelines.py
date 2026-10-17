@@ -464,14 +464,14 @@ async def pipeline_audio_dub(request: AudioDubPipelineRequest, http_request: Req
             cmd = ['ffmpeg', '-y', '-i', in_path, '-i', dubbed_path,
                    '-map', '0:v', '-map', '1:a',
                    '-c:v', 'copy', '-c:a', 'aac', '-shortest', out_path]
-            r = subprocess.run(cmd, capture_output=True)
+            r = await asyncio.to_thread(subprocess.run, cmd, capture_output=True)
             if r.returncode != 0:
                 raise HTTPException(status_code=500, detail=f"Audio merge failed: {r.stderr.decode()}")
 
             if request.burn_subtitles:
                 sub_out = tempfile.mktemp(suffix='_sub.mp4')
                 temps.append(sub_out)
-                r2 = subprocess.run(
+                r2 = await asyncio.to_thread(subprocess.run, 
                     ['ffmpeg', '-y', '-i', out_path, '-vf', f'subtitles={srt_path}',
                      '-c:a', 'copy', sub_out], capture_output=True)
                 if r2.returncode == 0:

@@ -112,6 +112,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[threads] could not size the default pool: {exc}", flush=True)
 
+    # And then watch whether that loop is actually free. A synchronous call made
+    # from a coroutine stops every request in the process, which from outside
+    # looks like an overloaded upstream rather than a server that is not
+    # running. See codai/api/loop_watch.py.
+    try:
+        from codai.api import loop_watch
+        loop_watch.install()
+    except Exception as exc:
+        print(f"[loop] could not watch the event loop: {exc}", flush=True)
+
     async def _archive_cleanup_loop():
         from codai.api.archive import archive_manager
         while True:

@@ -762,7 +762,7 @@ async def run_full_music_dub(request: AudioMusicDubRequest, http_request: Reques
 
         # -- 5. remix over the original instrumental --------------------------
         final_mix = os.path.join(workdir, 'final_mix.wav')
-        proc = subprocess.run(
+        proc = await asyncio.to_thread(subprocess.run, 
             ['ffmpeg', '-y', '-i', converted_path, '-i', instrumental_path,
              '-filter_complex', 'amix=inputs=2:duration=longest:normalize=0,alimiter',
              final_mix],

@@ -198,12 +198,12 @@ async def _faceswap_video(src_img, request, http_request):
         # Extract frames
         frames_dir = tempfile.mkdtemp()
         temps.append(frames_dir)
-        subprocess.run(
+        await asyncio.to_thread(subprocess.run, 
             ['ffmpeg', '-y', '-i', in_path, f'{frames_dir}/%08d.png'],
             capture_output=True, check=True)
 
         # Get FPS for reassembly
-        probe = subprocess.run(
+        probe = await asyncio.to_thread(subprocess.run, 
             ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
              '-show_entries', 'stream=r_frame_rate', '-of', 'default=nw=1:nk=1', in_path],
             capture_output=True, text=True)
@@ -236,7 +236,7 @@ async def _faceswap_video(src_img, request, http_request):
         # Reassemble video (copy original audio)
         out_path = tempfile.mktemp(suffix='_swapped.mp4')
         temps.append(out_path)
-        subprocess.run(
+        await asyncio.to_thread(subprocess.run, 
             ['ffmpeg', '-y', '-framerate', str(fps), '-i', f'{frames_dir}/%08d.png',
              '-i', in_path, '-map', '0:v', '-map', '1:a?',
              '-c:v', 'libx264', '-c:a', 'copy', '-shortest', out_path],

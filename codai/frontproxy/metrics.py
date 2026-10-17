@@ -140,6 +140,30 @@ def render(front) -> str:
                   "# TYPE coderai_front_start_time_seconds gauge",
                   f"coderai_front_start_time_seconds {m.started:.0f}"]
 
+    # Event-loop health. A front that has stopped answering looks exactly like
+    # a slow upstream from the client's side, and these three series are what
+    # tell them apart: if the loop was blocked, the latency was never the
+    # upstream's. See codai/api/loop_watch.py.
+    try:
+        from codai.api import loop_watch
+        lw = loop_watch.stats()
+        lines += [
+            "# HELP coderai_loop_lag_seconds Most recent event-loop lag.",
+            "# TYPE coderai_loop_lag_seconds gauge",
+            f"coderai_loop_lag_seconds {float(lw.get('last') or 0.0):.4f}",
+            "# HELP coderai_loop_lag_worst_seconds Worst event-loop lag seen.",
+            "# TYPE coderai_loop_lag_worst_seconds gauge",
+            f"coderai_loop_lag_worst_seconds {float(lw.get('worst') or 0.0):.4f}",
+            "# HELP coderai_loop_stalls_total Stalls over the reporting threshold.",
+            "# TYPE coderai_loop_stalls_total counter",
+            f"coderai_loop_stalls_total {int(lw.get('stalls') or 0)}",
+            "# HELP coderai_loop_blocked_seconds_total Time the loop was blocked.",
+            "# TYPE coderai_loop_blocked_seconds_total counter",
+            f"coderai_loop_blocked_seconds_total {float(lw.get('blocked_seconds') or 0.0):.3f}",
+        ]
+    except Exception:
+        pass
+
     # Engines and nodes, from the registry.
     up, infl, vfree, vtot, loaded, nup, jobs = [], [], [], [], [], [], []
     for e in front.registry.all():

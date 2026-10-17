@@ -5128,7 +5128,7 @@ async def video_subtitle(request: VideoSubtitleRequest, http_request: Request = 
             cmd = ['ffmpeg', '-y', '-i', in_path,
                    '-vf', f'subtitles={srt_path}',
                    '-c:a', 'copy', out_path]
-            r = subprocess.run(cmd, capture_output=True)
+            r = await asyncio.to_thread(subprocess.run, cmd, capture_output=True)
             if r.returncode != 0:
                 raise HTTPException(status_code=500,
                                     detail=f"ffmpeg subtitle burn failed: {r.stderr.decode()}")
@@ -5245,7 +5245,7 @@ async def video_dub(request: VideoDubRequest, http_request: Request = None):
         cmd = ['ffmpeg', '-y', '-i', in_path, '-i', audio_path,
                '-map', '0:v', '-map', '1:a',
                '-c:v', 'copy', '-c:a', 'aac', '-shortest', out_path]
-        r = subprocess.run(cmd, capture_output=True)
+        r = await asyncio.to_thread(subprocess.run, cmd, capture_output=True)
         if r.returncode != 0:
             raise HTTPException(status_code=500,
                                 detail=f"Audio merge failed: {r.stderr.decode()}")
@@ -5257,7 +5257,7 @@ async def video_dub(request: VideoDubRequest, http_request: Request = None):
             cmd2 = ['ffmpeg', '-y', '-i', out_path,
                     '-vf', f'subtitles={srt_path}',
                     '-c:a', 'copy', sub_out]
-            r2 = subprocess.run(cmd2, capture_output=True)
+            r2 = await asyncio.to_thread(subprocess.run, cmd2, capture_output=True)
             if r2.returncode == 0:
                 out_path = sub_out
 

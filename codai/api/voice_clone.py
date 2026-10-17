@@ -774,7 +774,7 @@ async def extract_voice(req: VoiceExtractRequest):
             out_tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
             out_tmp.close()
             temps.append(out_tmp.name)
-            r = subprocess.run(
+            r = await asyncio.to_thread(subprocess.run, 
                 ['ffmpeg', '-y', '-i', in_tmp.name, '-vn', '-acodec', 'pcm_s16le',
                  '-ar', '22050', '-ac', '1', out_tmp.name],
                 capture_output=True, timeout=120,

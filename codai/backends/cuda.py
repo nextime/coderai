@@ -1667,7 +1667,10 @@ class NvidiaBackend(ModelBackend):
         except Exception as e:
             print(f"Error during stream iteration: {e}")
 
-        thread.join()
+        # In a thread: the worker has normally already sent its sentinel, so
+        # this returns at once -- but "normally" is not "always", and a join on
+        # the loop is a stall for every other request in the process.
+        await asyncio.to_thread(thread.join)
         
         if generation_error == "oom":
             yield "\n[Warning: Generation stopped due to out-of-memory.]"
@@ -2426,7 +2429,7 @@ class NvidiaBackend(ModelBackend):
                     comp_tokens[0] += 1
                     yield text
             finally:
-                thread.join()
+                await asyncio.to_thread(thread.join)
 
         try:
             # First attempt: use the cached KV prefix when one is available.

@@ -2916,6 +2916,13 @@ def build_app(config, config_dir=None) -> FastAPI:
             install_default_executor()
         except Exception as exc:
             print(f"[threads] could not size the default pool: {exc}", flush=True)
+        # The front is the process the CLIENT talks to, so a stall here is the
+        # one it experiences. Exported on /metrics as coderai_loop_*.
+        try:
+            from codai.api import loop_watch
+            loop_watch.install()
+        except Exception as exc:
+            print(f"[loop] could not watch the event loop: {exc}", flush=True)
         front.supervisor = EngineSupervisor(config, None, front.registry,
                                             models_path=front._models_path,
                                             internal_token=front.internal_token,
