@@ -399,8 +399,9 @@ def _spill_pod_candidate(model_id: str) -> Optional[Candidate]:
     if pool is None:
         return None
 
-    def _acquire():
-        pod, url = pool.acquire()
+    def _acquire(timeout: float = 0.0):
+        # The pool's own default (1200 s) unless the caller bounds the attempt.
+        pod, url = pool.acquire(timeout=timeout) if timeout > 0 else pool.acquire()
         key = getattr(pool, "api_key", "") or ""
         return (url.rstrip("/") + "/v1", key, lambda: pool.release(pod),
                 lambda: pool.discard(pod, "connection refused"))
@@ -473,13 +474,18 @@ def _load_of(cand: Candidate) -> int:
     return inflight(cand.key) + _node_reported_load(cand)
 
 
-def choose(model_id: str, spill_after: int = 0) -> Lease:
+def choose(model_id: str, spill_after: int = 0,
+           acquire_timeout: float = 0.0) -> Lease:
     """A lease on the least-loaded server for the model.
 
     ``spill_after`` is the in-flight count at which a fixed server (the local one,
     a node) is considered busy enough to prefer renting instead — the
     local-plus-spillover policy, expressed where OCR can act on it. 0 means never
     spill on load alone; a pool is then used only when it is all there is.
+
+    ``acquire_timeout`` bounds each pool attempt (see :func:`_take`). This
+    function BLOCKS for as long as the pools it tries do, so a caller on an
+    event loop must both run it off the loop and bound it.
     """
     cands = candidates(model_id)
     if not cands:
@@ -505,7 +511,7 @@ def choose(model_id: str, spill_after: int = 0) -> Lease:
     #    pages over the pods it has and grows when they are all at their
     #    threshold. This is "on runpod only", scaling.
     for cand in [c for c in cands if c.primary and c.acquire is not None]:
-        lease = _take(cand)
+        lease = _take(cand, acquire_timeout)
         if lease is not None:
             return lease
         last_exc = "pool unavailable"
@@ -527,7 +533,7 @@ def choose(model_id: str, spill_after: int = 0) -> Lease:
     # 3. Everything we own is busy: rent. This is "local + spillover" — the
     #    overflow goes to a pool instead of queueing behind a saturated GPU.
     for cand in pools:
-        lease = _take(cand)
+        lease = _take(cand, acquire_timeout)
         if lease is not None:
             return lease
         last_exc = "pool unavailable"
@@ -543,12 +549,51 @@ def choose(model_id: str, spill_after: int = 0) -> Lease:
                    f"({last_exc})", status=503)
 
 
-def _take(cand: Candidate) -> Optional[Lease]:
-    """Acquire a pool candidate, or None when it cannot provide a server."""
+def _accepts_timeout(fn) -> bool:
+    """Does this candidate's acquire take a `timeout`?
+
+    Asked of the SIGNATURE rather than by calling it and catching TypeError: a
+    TypeError raised from inside a real acquire would otherwise be read as "it
+    does not accept a timeout" and the pod acquired twice.
+    """
     try:
-        got = cand.acquire()
+        import inspect
+        return "timeout" in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+#: Pool key -> when its "cannot serve" line may be said again. A bounded
+#: acquire TIMES OUT per page while a pod boots, and a boot is minutes: without
+#: this, a cold start writes one line per page per attempt and buries the
+#: reason it is waiting at all.
+_SAID: dict = {}
+
+
+def _say_once(key: str, message: str, every: float = 30.0) -> None:
+    now = time.time()
+    if now < _SAID.get(key, 0.0):
+        return
+    _SAID[key] = now + every
+    print(message, flush=True)
+
+
+def _take(cand: Candidate, acquire_timeout: float = 0.0) -> Optional[Lease]:
+    """Acquire a pool candidate, or None when it cannot provide a server.
+
+    ``acquire_timeout`` bounds ONE attempt. A pool's acquire waits for a pod and
+    may rent one inline -- minutes, for a cold boot -- and the caller holds a
+    thread for all of it. Bounding the attempt lets the caller do its waiting
+    where waiting is free (the event loop) and come back, instead of parking a
+    thread per page for the length of a boot. 0 keeps the pool's own default.
+    """
+    try:
+        got = (cand.acquire(timeout=acquire_timeout)
+               if acquire_timeout > 0 and _accepts_timeout(cand.acquire)
+               else cand.acquire())
     except Exception as exc:
-        print(f"[ocr] {cand.key} cannot serve this page: {exc}", flush=True)
+        _say_once(f"take:{cand.key}",
+                  f"[ocr] {cand.key} cannot serve this page: {exc}")
         return None
     # A pool may also hand back a way to say "this one is dead"; older
     # three-value forms simply have none.

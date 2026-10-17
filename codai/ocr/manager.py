@@ -744,6 +744,14 @@ def _pod_pipeline_policy(cfg) -> tuple:
 #: budget, or at its ceiling, stays that way for minutes: without this every
 #: page of every document would pay the full wait before going local, turning a
 #: 60s ceiling into a 60s tax per page.
+#: How long ONE lease attempt may hold a pod-pool thread. A pool's acquire
+#: waits for a free pod and may rent one inline, so an unbounded attempt parks a
+#: thread for a whole boot -- several minutes on a cold start, times every page
+#: of every document in flight. Bounded, the attempt comes back and the waiting
+#: happens in `_lease_a_pod`'s own loop, on the event loop, where it is free and
+#: where the policy's ceiling is what decides how long to keep trying.
+POD_LEASE_ATTEMPT_S = 20.0
+
 _POD_WAIT_COOLDOWN: dict = {}
 POD_WAIT_COOLDOWN_S = 300.0
 
@@ -778,8 +786,26 @@ async def _lease_a_pod(model_id: str, policy: str, wait_s: float):
     waited = 0.0
     while True:
         try:
-            lease = placement.choose(
-                model_id, spill_after=placement.spill_threshold(model_id))
+            # OFF THE LOOP. `placement.choose` is synchronous and ends in a
+            # pool's `acquire()`, which waits on a condition variable for up to
+            # its default 1200 s and may rent a pod INLINE -- a candidate sweep
+            # over every region, then a boot wait, in whichever thread asked.
+            # Called straight from this coroutine it blocked the whole event
+            # loop, so the process answered nothing at all -- not the client's
+            # next document, not even /v1/runpod/status -- for as long as one
+            # page waited for a pod.
+            #
+            # It has been on the loop since the pod pipeline was written
+            # (0.3.70) and cost nothing for as long as acquire() returned at
+            # once: a pool with a free pod answers in microseconds. It turns
+            # fatal exactly when the pool is the thing under strain, which is
+            # when it matters most. Measured on a 5,000-document run: 116 pods
+            # rented, zero documents completed in ten minutes, and a front that
+            # had stopped answering.
+            lease = await run_on_pod_pool(
+                placement.choose, model_id,
+                spill_after=placement.spill_threshold(model_id),
+                acquire_timeout=POD_LEASE_ATTEMPT_S)
         except OcrError:
             raise
         except Exception as exc:
@@ -2113,7 +2139,17 @@ class OcrManager:
                 f"{POD_PIPELINE_COOLDOWN_S:.0f}s cooldown expires",
                 every=POD_PIPELINE_COOLDOWN_S)
             return None
-        parts = (list(iter_pdf_page_pdfs(data)) if is_pdf else [data])
+        # Also off the loop: pdfium permits exactly ONE caller at a time, so
+        # every document's split serialises against every other one, and doing
+        # that on the loop stalls every request in the process for the duration
+        # rather than only this document.
+        #
+        # The DEFAULT executor, not the pod pool. The pod pool is where leases
+        # wait, and a lease waits for a pod to BOOT -- minutes. Putting a split
+        # behind thousands of those is a cold start that cannot produce the next
+        # page while it waits for the pods that page is for.
+        parts = (await asyncio.to_thread(lambda: list(iter_pdf_page_pdfs(data)))
+                 if is_pdf else [data])
         if not parts:
             return None
         sem = self._sem or asyncio.Semaphore(4)

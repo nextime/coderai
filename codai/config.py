@@ -1066,11 +1066,21 @@ class OcrConfig:
     # install where the pods exist at all.
     pod_pipeline: str = "prefer"
     # How long `prefer` (and `require`) wait for a pod before giving up on one.
-    # A pod takes minutes to boot, so this is deliberately NOT long enough to
-    # cover a cold pool: it covers a pool that is momentarily full. After a
-    # wait times out the next pages go straight through for a cooldown rather
-    # than paying the ceiling one page at a time.
-    pod_pipeline_wait_s: float = 60.0
+    #
+    # This was 60 s through 0.4.15, deliberately too short to cover a cold pool,
+    # because a waiting page held a POD-POOL THREAD for the whole wait: a long
+    # ceiling meant thousands of parked threads, so the cheaper mistake was to
+    # stop waiting and read the page here.
+    #
+    # It no longer costs a thread. The lease waits on the event loop and only
+    # each attempt touches a thread (`POD_LEASE_ATTEMPT_S`), so a page can wait
+    # out an actual boot for free -- and a boot IS minutes: image pull, vLLM
+    # load, weights. At 60 s a cold start therefore handed the whole first wave
+    # of pages to this box, one GPU-less orchestrator rasterising for a fleet it
+    # was already paying for, which is the failure mode `prefer` exists to
+    # prevent. Ten minutes covers a boot with margin; an install whose pods are
+    # always warm never reaches it, because a free pod answers at once.
+    pod_pipeline_wait_s: float = 600.0
     # --- how a page is handed to the model ---
     # Measured on A4 at 200 DPI (3.4-3.9 Mpix): rendering a page costs 21-46 ms
     # and ENCODING it 86-353 ms, so three quarters of what is called

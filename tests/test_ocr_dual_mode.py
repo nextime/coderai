@@ -309,7 +309,7 @@ def _fake_placement(monkeypatch, kind="pod", on_choose=None):
         def release(self):
             pass
 
-    def _choose(mid, spill_after=None):
+    def _choose(mid, spill_after=None, **_kw):
         if on_choose is not None:
             on_choose()
         return _Lease()
