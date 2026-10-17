@@ -59,6 +59,20 @@ class RunpodTransient(RunpodError):
 #: every boot.
 _GLOBAL_VOLUME_WARNED = False
 
+#: The GPU catalogue, shared and briefly cached: (expiry, rows).
+#:
+#: Every `_rank_gpus` asked for it, and `_rank_gpus` runs once per pod being
+#: provisioned. With 32 pods booting in parallel that is 32 identical catalogue
+#: queries and 32 large JSON bodies parsed, all within a few seconds, and the
+#: parsing is Python -- so it holds the GIL and starves whatever else the
+#: process is trying to do. On a live run that was the event loop carrying the
+#: page forwards: 1,754 pages in flight and not one socket opened to a pod.
+#:
+#: The catalogue is a price list. It does not change inside a boot storm.
+_GPU_CATALOG: tuple = (0.0, None)
+_GPU_CATALOG_LOCK = __import__("threading").Lock()
+GPU_CATALOG_TTL_S = 60.0
+
 
 def _global_field_refused(text: str) -> bool:
     """Whether a create failed *because* of the global-volume field.
@@ -223,12 +237,21 @@ class RunpodClient:
     # ------------------------------------------------------------------ #
     # GPU catalog + selection
     # ------------------------------------------------------------------ #
-    def list_gpu_types(self) -> list:
+    def list_gpu_types(self, fresh: bool = False) -> list:
         """Return the RunPod GPU catalog with pricing, normalized:
 
         [{id, display_name, memory_gb, secure_price, community_price,
           on_demand_price, spot_price}]  (prices are USD/hr for 1 GPU; None if N/A)
+
+        Cached for `GPU_CATALOG_TTL_S` across every caller in the process — see
+        `_GPU_CATALOG`. `fresh=True` forces a fetch, for a caller that is about
+        to show prices to a person rather than pick a card in a boot storm.
         """
+        global _GPU_CATALOG
+        if not fresh:
+            until, rows = _GPU_CATALOG
+            if rows is not None and until > time.time():
+                return list(rows)
         q = """
         query GpuTypes {
           gpuTypes {
@@ -259,6 +282,8 @@ class RunpodClient:
                 "on_demand_price": on_demand,
                 "spot_price": spot,
             })
+        with _GPU_CATALOG_LOCK:
+            _GPU_CATALOG = (time.time() + GPU_CATALOG_TTL_S, list(out))
         return out
 
     def pick_gpu(self, *, min_vram_gb: float = 0.0, max_hourly_usd: float = 0.0,

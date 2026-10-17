@@ -3135,6 +3135,7 @@ class RunpodPodPool:
                       f"HTTP — that image cannot take a certificate; the bearer "
                       f"token travels unencrypted", flush=True)
         last = None
+        _skipped_cached = 0
         for i in range(start, len(ranked)):
             sel = ranked[i]
             # THE POD'S OWN GATE, for the card it is about to run on. The plan
@@ -3160,6 +3161,13 @@ class RunpodPodPool:
                     + _key[:20].replace("/", "_").replace(" ", "_")
                     + "-" + uuid.uuid4().hex[:6])
             _dc = sel.get("_dc") or self._data_center()
+            # ALREADY REFUSED, recently, for somebody else? Then do not spend a
+            # round trip and a GIL slice learning it again. This is the whole
+            # saving: 32 boot threads each sweeping ~70 candidates produced 406
+            # rejections in 120 s and saturated the core the event loop needed.
+            if _is_unavailable(sel.get("gpu_type_id"), _dc):
+                _skipped_cached += 1
+                continue
             # Say so when this is not the card that was asked for. Renting a
             # different GPU than the configuration names is correct here — it is
             # what allow_other_gpus is for — but it must never be silent.
@@ -3181,6 +3189,11 @@ class RunpodPodPool:
                   f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr"
                   + (f" in {_dc}" if _dc else " (region: RunPod's choice)") + _alt,
                   flush=True)
+            if _skipped_cached:
+                print(f"[runpod] {self.model_key!r}: skipped {_skipped_cached} "
+                      f"candidate(s) already known to have no capacity "
+                      f"(cached {UNAVAIL_TTL_S:.0f}s)", flush=True)
+                _skipped_cached = 0
             try:
                 _disk_gb, _disk_note = disk_for(
                     _model_entry(self.served or self.model_key), self.mcfg, self.account)
@@ -3201,10 +3214,14 @@ class RunpodPodPool:
                                       or getattr(self.account, "registry_auth_id", "") or ""),
                     entrypoint=plan.get("entrypoint"), start_cmd=plan.get("start_cmd"),
                     direct_tcp=bool(getattr(self, "_direct", False)))
+                _forget_unavailable(sel.get("gpu_type_id"), _dc)
                 return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()
                 if "no longer any instances" in msg or "no instances" in msg or "capacity" in msg:
+                    # Shared, so the other boot threads skip it instead of each
+                    # discovering the same shortage. See `_unavail`.
+                    _mark_unavailable(sel.get("gpu_type_id"), _dc)
                     print(f"[runpod] {sel['display_name']} ({sel['cloud_type']}) unavailable — "
                           "trying next candidate", flush=True)
                     last = exc
@@ -4962,6 +4979,62 @@ class RunpodPodPool:
 #: Most denial timestamps a pool keeps. Only the newest `DENY_WINDOW_S` of
 #: them is ever counted, so this bounds memory under a burst and nothing else.
 _DENY_CAP = 4096
+
+
+#: (gpu_type_id, data_center) -> when its "no capacity" verdict expires.
+#:
+#: RunPod's answer to "can I have this card here" is the same for every caller
+#: for as long as the shortage lasts, but each boot thread re-asked
+#: independently: 32 pods booting in parallel, each sweeping ~70 candidates,
+#: produced 406 rejections in 120 seconds on a live run -- every GPU type
+#: re-probed 33 to 72 times. That saturated a core (coderai-cpu at 60%), and
+#: because CPython hands the GIL to whoever is running, it starved the event
+#: loop the page forwards live on: 1,754 pages "in flight", not one socket
+#: opened to a pod, and the undelivered queue made the scaler rent MORE pods.
+#:
+#: So the verdict is shared and short-lived. Short because capacity returns
+#: without telling us, shared because asking again is what cost the run.
+_unavail: dict = {}
+_unavail_lock = threading.Lock()
+
+#: How long a "no capacity" answer is trusted. Long enough to collapse a boot
+#: storm's duplicate probes, short enough that a freed card is picked up on the
+#: next rent rather than the next release.
+UNAVAIL_TTL_S = 90.0
+
+
+def _mark_unavailable(gpu_type_id: str, dc: str = "") -> None:
+    if not gpu_type_id:
+        return
+    with _unavail_lock:
+        _unavail[(str(gpu_type_id), str(dc or ""))] = time.time() + UNAVAIL_TTL_S
+        if len(_unavail) > 4096:
+            now = time.time()
+            for k, v in list(_unavail.items()):
+                if v <= now:
+                    _unavail.pop(k, None)
+
+
+def _is_unavailable(gpu_type_id: str, dc: str = "") -> bool:
+    """Has this card already been refused here, recently, for anyone?"""
+    if not gpu_type_id:
+        return False
+    now = time.time()
+    with _unavail_lock:
+        for key in ((str(gpu_type_id), str(dc or "")), (str(gpu_type_id), "")):
+            until = _unavail.get(key)
+            if until and until > now:
+                return True
+            if until:
+                _unavail.pop(key, None)
+    return False
+
+
+def _forget_unavailable(gpu_type_id: str, dc: str = "") -> None:
+    """A card that just deployed is available, whatever we thought."""
+    with _unavail_lock:
+        _unavail.pop((str(gpu_type_id), str(dc or "")), None)
+        _unavail.pop((str(gpu_type_id), ""), None)
 
 
 class NoPodRightNow(RuntimeError):
