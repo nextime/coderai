@@ -2385,6 +2385,13 @@ class ConfigManager:
                     ("CODERAI_OCR_SURYA_USE_GPU", "surya_use_gpu")):
                 if _os.environ.get(_env) is not None:
                     setattr(self.config.ocr, _attr, _flag(_env))
+            # vLLM settings a POD needs but cannot inherit: it launches its own
+            # engine from its own config. `return_token_ids` is the one the
+            # accent repair depends on -- see vllm_worker._wants_token_ids for
+            # what its absence cost.
+            if _os.environ.get("CODERAI_VLLM_RETURN_TOKEN_IDS") is not None:
+                self.config.vllm.return_token_ids = _flag(
+                    "CODERAI_VLLM_RETURN_TOKEN_IDS")
             if _flag("CODERAI_OCR_SURYA_ACCEPT_LICENSE"):
                 # Surya is GPL and gated on an explicit acceptance. The pod
                 # inherits the decision made here; it cannot make it itself.

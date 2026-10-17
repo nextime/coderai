@@ -458,6 +458,15 @@ class _LastMime(threading.local):
 _LAST_MIME = _LastMime()
 
 
+def _oc_repair_on() -> bool:
+    """Whether the accent repair is active in this process, for reporting."""
+    try:
+        from surya.inference.backends import openai_client as _oc
+        return bool(getattr(_oc, "_coderai_repair", False))
+    except Exception:
+        return False
+
+
 def _note_loop(raw: str) -> None:
     """Record that this page's generation ended still repeating itself.
 
@@ -1413,7 +1422,9 @@ class SuryaWorker:
         try:
             from surya.inference.backends import openai_client as _oc
         except Exception as e:
-            print(f"[surya] token trace unavailable: {e}", file=sys.stderr)
+            print(f"[surya] ACCENT REPAIR AND TOKEN TRACE UNAVAILABLE: {e} — "
+                  f"a reply whose accents are lost in detokenisation cannot be "
+                  f"rebuilt from its own bytes", flush=True)
             return
         _oc._coderai_repair = self._repair
         if getattr(_oc, "_coderai_traced", False):
@@ -1422,7 +1433,12 @@ class SuryaWorker:
             return
         inner = getattr(_oc, "_generate_one", None)
         if inner is None:
-            print("[surya] token trace: no _generate_one to hook", file=sys.stderr)
+            print("[surya] ACCENT REPAIR AND TOKEN TRACE ARE OFF: surya's "
+                  "openai_client has no `_generate_one` to hook in this "
+                  "release, so a reply whose accents are lost in "
+                  "detokenisation cannot be rebuilt from its own bytes. This "
+                  "is the one line that explains an accent regression.",
+                  flush=True)
             return
 
         def _wrapped(*args, **kwargs):
@@ -1787,7 +1803,15 @@ class SuryaWorker:
                                "repeated itself; each re-run is a full "
                                "generation at a higher temperature")
             page["model_attempts"] = info
-        if self._trace and UNREADABLE in page["text"]:
+        # NOT gated on `self._trace` any more. The trace used to require an
+        # opt-in flag, so a page full of replacement characters came back with
+        # no explanation unless somebody had remembered to turn the flag on
+        # BEFORE the run -- which is how a fixed accent bug came back and went
+        # unnoticed: the symptom was in the text, the diagnosis was switched
+        # off, and nothing in between said so. The cost is paid only on a page
+        # that already has markers in it, which is exactly when it is worth
+        # paying.
+        if UNREADABLE in page["text"]:
             try:
                 page["unreadable_trace"] = _trace_report(calls)
             except Exception as e:
@@ -1798,6 +1822,21 @@ class SuryaWorker:
                     "why": f"trace analysis failed: {e}",
                     "findings": [],
                 }
+            # On STDOUT, because that is the stream a rented pod's log ring
+            # tees and the renting install drains. One line per affected page,
+            # naming what was lost, whether the repair ran and what the bytes
+            # say -- the line whose absence let this regress unseen.
+            _tr = page.get("unreadable_trace") or {}
+            _n = page["text"].count(UNREADABLE)
+            _rep = _trace_repairs()
+            _fixed = sum(int(r.get("recovered") or 0) for r in (_rep or []))
+            print(f"[surya] page kept {_n} replacement character(s) after "
+                  f"reading; accent repair "
+                  + (f"recovered {_fixed}" if _fixed else
+                     ("ran and recovered nothing" if _oc_repair_on() else "is OFF"))
+                  + f"; byte trace: conclusive={_tr.get('conclusive')} "
+                  f"blame={_tr.get('blame') or _tr.get('why') or 'unreported'}",
+                  flush=True)
         return page
 
 

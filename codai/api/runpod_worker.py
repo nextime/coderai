@@ -1475,6 +1475,14 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         # This image carries NO docTR -- `auto` would route a failed page to an
         # engine that is not there. This engine or nothing, said out loud.
         env["CODERAI_OCR_FALLBACK_ENGINES"] = "off"
+        # The pod launches its OWN vLLM from its OWN config, so a vLLM setting
+        # made on the renting install does not reach it. That is not a detail:
+        # `--return-tokens-as-token-ids` is what the accent repair rebuilds
+        # from, an operator had set it in `vllm.extra_args` here, and the pods
+        # silently ran without it -- a fixed bug, back, invisibly. The flag is
+        # now forced for byte-level OCR models in vllm_worker, and the
+        # operator's own choice travels too, so neither door is the only one.
+        env["CODERAI_VLLM_RETURN_TOKEN_IDS"] = "1"
         # Same reasoning for the degraded-page re-read, and one more: only the
         # ORCHESTRATOR can reach another engine's pods. A pod re-reading its own
         # degraded page would re-read it on the one engine that just produced

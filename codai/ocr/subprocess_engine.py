@@ -145,6 +145,38 @@ class SubprocessOcrEngine(OcrEngine):
             status=503,
         )
 
+    def _pump_stderr(self, proc) -> None:
+        """Re-print the worker's stderr through THIS process's stdout.
+
+        Through the Python stream on purpose: that is the one the pod's log ring
+        tees, so the line reaches /logs, the drained pod log, and the
+        orchestrator's own output in one step. Prefixed with the engine so a
+        mixed log stays readable.
+
+        A daemon thread, and it never raises: this is a diagnostic path, and a
+        diagnostic that can break a page is worse than no diagnostic. It also
+        has to keep draining, because a full stderr pipe would eventually block
+        the worker mid-page.
+        """
+        import threading
+
+        def _run():
+            try:
+                for line in iter(proc.stderr.readline, ""):
+                    line = (line or "").rstrip()
+                    if line:
+                        print(f"[{self.name}:worker] {line}", flush=True)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run, name=f"ocr-{self.name}-stderr",
+                         daemon=True).start()
+
     def load(self) -> None:
         py = self._ensure_venv()
         env = dict(os.environ)
@@ -153,8 +185,23 @@ class SubprocessOcrEngine(OcrEngine):
             self._proc = subprocess.Popen(
                 [py, _WORKER, self._worker_engine],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=None, text=True, bufsize=1, env=env,
+                # ITS OWN PIPE, pumped below. `stderr=None` let the worker
+                # inherit this process's fd 2 -- which on a rented POD writes
+                # straight past the log ring: `podlog.install()` tees the
+                # Python `sys.stdout`/`sys.stderr` OBJECTS, and a subprocess
+                # holding the raw descriptor never passes through them. So
+                # every diagnostic the worker printed was invisible to /logs
+                # and therefore absent from the drained pod log -- including
+                # "token trace: no _generate_one to hook", which is exactly the
+                # line that would have said why a solved accent bug was back.
+                # `grep -r "\[surya\]"` across 343 pod logs returned nothing.
+                #
+                # NOT merged into stdout: that pipe carries the newline-JSON
+                # protocol, and a log line where a reply belongs would
+                # desynchronise it.
+                stderr=subprocess.PIPE, text=True, bufsize=1, env=env,
             )
+            self._pump_stderr(self._proc)
         except Exception as e:
             raise OcrError(f"{self.name}: failed to launch worker: {e}", status=500)
         # Handshake: wait for {"ready": true}

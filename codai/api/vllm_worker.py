@@ -261,10 +261,59 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     # was launched for it, and the message names flags the caller cannot set.
     cmd += _tool_args(cfg, model_config, model_path)
 
+    # TOKEN IDS IN LOGPROBS. `ocr.surya_repair_accents` rebuilds a reply whose
+    # accents were lost in detokenisation from the model's own token ids, and
+    # vLLM only reports ids (`token_id:2131`) when launched with this flag --
+    # `bytes` is empty for exactly the tokens that lost their characters, so
+    # without it there is nothing to rebuild from and the repair silently does
+    # nothing.
+    #
+    # Why it is forced rather than configured: the operator DID configure it
+    # (`vllm.extra_args` on the renting install) and it still regressed, because
+    # a rented pod launches its own vLLM from its own seeded config and that
+    # setting never travelled. A page then came back with 25 replacement
+    # characters, zero 0xC3 bytes and a surviving 3-byte em-dash -- the repair
+    # unable to run, on a fix that had been shipped and verified months
+    # earlier. A guard that depends on remembering to set it on every install
+    # is not a guard.
+    #
+    # Safe to force: it changes only the `token` STRING inside logprobs, which
+    # nothing in coderai reads except that repair.
+    if _wants_token_ids(cfg, served_name, model_path):
+        if "--return-tokens-as-token-ids" not in cmd:
+            cmd += ["--return-tokens-as-token-ids"]
+
     extra = (getattr(cfg, "extra_args", "") or "").strip()
     if extra:
         cmd += shlex.split(extra)
-    return cmd
+    # Deduplicate: an operator who also put the flag in `extra_args` (as the
+    # original fix did) must not launch vLLM with it twice.
+    out, seen = [], set()
+    for tok in cmd:
+        if tok == "--return-tokens-as-token-ids":
+            if tok in seen:
+                continue
+            seen.add(tok)
+        out.append(tok)
+    return out
+
+
+#: Served names (and path fragments) whose vocabulary is BYTE-level, so a lost
+#: character can only be recovered from token ids. Matched loosely because a
+#: model arrives here as a repo id, a served name or a local path.
+_BYTE_LEVEL_OCR = ("surya", "chandra", "olmocr")
+
+
+def _wants_token_ids(cfg, served_name: str = "", model_path: str = "") -> bool:
+    """Whether this engine must report token ids in its logprobs.
+
+    True when the operator asked (`vllm.return_token_ids`), and ALWAYS for a
+    byte-level OCR model, whose accent repair cannot work without them.
+    """
+    if bool(getattr(cfg, "return_token_ids", False)):
+        return True
+    hay = f"{served_name or ''} {model_path or ''}".lower()
+    return any(name in hay for name in _BYTE_LEVEL_OCR)
 
 
 def _base_of(entry: dict) -> str:
