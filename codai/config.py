@@ -2416,6 +2416,30 @@ class ConfigManager:
                     ("CODERAI_OCR_SURYA_INSTANCES", "surya_instances", int),
                     ("CODERAI_OCR_SURYA_LANES", "surya_lanes", int),
                     ("CODERAI_OCR_SURYA_LANGS", "surya_langs", str),
+                    # How many pages the engine serves AT ONCE. These were sent
+                    # to every pod and read for surya only, so a pod running
+                    # chandra or olmOCR fell back to the dataclass default of
+                    # one instance however many the operator configured -- and
+                    # a pod has no config.json, so env is the only channel it
+                    # has. Measured consequence on one A40: 32 pages in flight,
+                    # `[ocr] engine 'chandra': 1 instance(s) ready`, vLLM
+                    # reporting `Running: 1, Waiting: 0` at 1.6% KV cache and
+                    # 55 tokens/s, against surya's ~2000 on the same card. It
+                    # read as "chandra is 36x slower"; it was one page at a time.
+                    ("CODERAI_OCR_CHANDRA_INSTANCES", "chandra_instances", int),
+                    ("CODERAI_OCR_OLMOCR_INSTANCES", "olmocr_instances", int),
+                    # The rest of each engine's page budget, for the same
+                    # reason: seeding the wiring and not the tuning gives a pod
+                    # that runs the engine's defaults, which is
+                    # indistinguishable from the wrong image.
+                    ("CODERAI_OCR_CHANDRA_MAX_TOKENS", "chandra_max_tokens", int),
+                    ("CODERAI_OCR_CHANDRA_MAX_CONTINUATIONS",
+                     "chandra_max_continuations", int),
+                    ("CODERAI_OCR_CHANDRA_MAX_RETRIES", "chandra_max_retries", int),
+                    ("CODERAI_OCR_CHANDRA_DPI", "chandra_dpi", int),
+                    ("CODERAI_OCR_OLMOCR_MAX_TOKENS", "olmocr_max_tokens", int),
+                    ("CODERAI_OCR_OLMOCR_MAX_CONTINUATIONS",
+                     "olmocr_max_continuations", int),
                     ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency", int),
                     ("CODERAI_OCR_MAX_RESIDENT_MB", "max_resident_mb", int),
                     ("CODERAI_OCR_PAGE_WINDOW", "page_window", int),
