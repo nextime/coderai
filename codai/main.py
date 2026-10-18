@@ -1424,6 +1424,94 @@ def main():
     print(f"[queue] max_parallel_requests={queue_manager.max_parallel_requests} "
           f"max_size={queue_manager.max_size}", flush=True)
 
+    # An OCR install must not have to know this setting exists.
+    #
+    # The gate of 2 in flight / 6 queued is right for one local card answering
+    # chat. For an OCR install it is the throughput ceiling and nothing points
+    # at it: the pool is sized in pages (ocr.max_concurrency,
+    # max_inflight_per_pod), a rented pod is handed its own much larger limit
+    # through env, and the front in front of all of it keeps admitting two
+    # requests. Measured on one A40: the pod sat at `Running: 1, Waiting: 0` --
+    # asking for work and not getting it -- and 219 pages took 1210s, the same
+    # as reading them one at a time.
+    #
+    # So when OCR is enabled and the operator has NOT written the key, derive
+    # the gate from the page budget they did ask for instead of using a default
+    # chosen for a different deployment. An explicit value is always obeyed,
+    # however small -- deriving over the top of a deliberate choice would be a
+    # worse bug than the one this fixes.
+    #
+    # The remaining bound is memory, not CPU: an admitted request holds its
+    # whole upload plus the per-page PDFs split from it, so a slot costs what a
+    # client puts in one call. Hence the ceiling of 256 rather than something
+    # proportional to a 4096-page budget.
+    try:
+        # config_mgr is a local of main() assigned unconditionally before the
+        # config is loaded, so it is always in scope here.
+        _explicit = getattr(config_mgr, "explicit_server_keys", None) or set()
+        _ocr_cfg = getattr(config, "ocr", None)
+        _ocr_live = bool(getattr(_ocr_cfg, "enabled", False))
+        _page_budget = int(getattr(_ocr_cfg, "max_concurrency", 0) or 0)
+        if (_ocr_live and _page_budget > 0
+                and "max_parallel_requests" not in _explicit and not _mp):
+            # ~8 pages per document is what real corpora run at; a request
+            # usually carries one document.
+            _derived = max(16, min(256, _page_budget // 8))
+            if _derived > queue_manager.max_parallel_requests:
+                queue_manager.max_parallel_requests = _derived
+                config.server.max_parallel_requests = _derived
+                if "queue_max_size" not in _explicit and not _qs:
+                    _dq = min(2048, _derived * 8)
+                    queue_manager.max_size = _dq
+                    config.server.queue_max_size = _dq
+                print(f"[queue] OCR is enabled and server.max_parallel_requests "
+                      f"was not set: derived {_derived} in flight / "
+                      f"{queue_manager.max_size} queued from "
+                      f"ocr.max_concurrency={_page_budget}. The shipped default "
+                      f"of 2 would have been the throughput ceiling. Set "
+                      f"server.max_parallel_requests explicitly to override.",
+                      flush=True)
+
+    except Exception:
+        pass            # a derived default must never stop a server booting
+
+    # Say so when this gate is the ceiling, not the GPU.
+    #
+    # The admission gate defaults to 2 in flight and 6 queued, which is right
+    # for one local card answering chat. It is catastrophic for an OCR install
+    # that dispatches pages to rented pods: the pool is sized in pages
+    # (ocr.max_concurrency, max_inflight_per_pod) and the pod is handed its own
+    # much larger limit through env, while the front in front of all of it keeps
+    # admitting two requests. A fleet then idles behind a two-lane gate and
+    # every diagnostic points at the pods.
+    #
+    # This was observed costing roughly an order of magnitude: one A40 ran at
+    # `Running: 1` with `Waiting: 0` -- the pod asking for work and not getting
+    # it -- while the orchestrator reported pages in flight. The bare line above
+    # was printed at every boot throughout and read past, because a number
+    # without a consequence attached does not look like a problem. Hence a
+    # diagnostic that names what to change.
+    try:
+        _ocr = getattr(config, "ocr", None)
+        _ocr_on = bool(getattr(_ocr, "enabled", False))
+        _pages = int(getattr(_ocr, "max_concurrency", 0) or 0)
+        _gate = int(queue_manager.max_parallel_requests or 0)
+        # A request carries at least one page, so a gate below the page budget
+        # the operator asked for cannot deliver it. Four is slack for the common
+        # case where one request carries several documents.
+        if _ocr_on and _pages > 0 and _gate * 4 < _pages:
+            print(f"[queue] WARNING: OCR is enabled with ocr.max_concurrency="
+                  f"{_pages} pages, but this server admits only {_gate} request(s) "
+                  f"at a time (server.max_parallel_requests) with "
+                  f"{queue_manager.max_size} queued. The admission gate, not the "
+                  f"GPU or the pod pool, will be the throughput ceiling: pods sit "
+                  f"at 'Running: 1, Waiting: 0' while work queues here. Raise "
+                  f"server.max_parallel_requests (and server.queue_max_size) to "
+                  f"at least the number of documents you intend to have in "
+                  f"flight.", flush=True)
+    except Exception:
+        pass            # a diagnostic must never be the reason a server fails to start
+
     # RunPod: on the PRIMARY engine (which hosts runpod pods), start the scaler +
     # the independent stale-pod reaper as soon as RunPod is enabled — so pods
     # orphaned by a previous crash/restart are terminated even before the first

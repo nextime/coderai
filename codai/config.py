@@ -1773,6 +1773,16 @@ class ConfigManager:
                     print(f"[config] ignoring unknown {cls.__name__} keys: {extra}")
                 return cls(**{k: v for k, v in data.items() if k in known})
 
+            # Which server keys the operator actually WROTE, as opposed to
+            # which ones have dataclass defaults. Needed because some defaults
+            # are only right for some deployments: the admission gate of 2 is
+            # correct for one local card answering chat and crippling for an
+            # OCR install dispatching pages to a rented fleet, and the two
+            # cases are indistinguishable from the parsed value alone. An
+            # explicit 2 must be obeyed; an absent 2 may be derived.
+            self.explicit_server_keys = set(
+                (config_data.get("server") or {}).keys())
+
             self.config = Config(
                 version=config_data.get("version", "1.0"),
                 server=_dc(ServerConfig, config_data.get("server", {})),
@@ -1827,6 +1837,10 @@ class ConfigManager:
             self.config.cluster.node_name = _env["CODERAI_NODE_NAME"].strip()
         if _env.get("CODERAI_ADVERTISE_HOST"):
             self.config.cluster.advertise_host = _env["CODERAI_ADVERTISE_HOST"].strip()
+
+        if not self.config_path.exists():
+            # No config.json at all: nothing was explicitly set.
+            self.explicit_server_keys = set()
 
         # Load models.json
         if self.models_path.exists():
