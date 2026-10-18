@@ -2626,6 +2626,22 @@ class PodHandle:
     is_spot: bool = False
     healthy: bool = True
     inflight: int = 0
+    #: When each in-flight slot was taken, oldest first.
+    #:
+    #: `inflight` on its own is a ratchet: it is raised in `_pick` and lowered
+    #: only in `release`, so any dispatch path that fails to release -- a client
+    #: that disconnects, an exception on a branch nobody tested, a leak not yet
+    #: found -- raises it permanently. Once it reaches max_inflight_per_pod the
+    #: pod is locked out for the rest of its life while its card sits idle, and
+    #: the pool reports it as "at capacity", which is the single most misleading
+    #: thing this file can say.
+    #:
+    #: Observed 2026-10-18: pool said inflight=64 of 64 with 63 pages queued;
+    #: the pod itself reported `Running: 31, Waiting: 0` at 10.6% KV cache. Half
+    #: the slots did not exist. Reconciling against these timestamps lets the
+    #: pool recover from leaks it does not know about, which is the only kind
+    #: that matters.
+    inflight_since: list = field(default_factory=list)
     last_used: float = 0.0
     #: Chosen for retirement and no longer given new work. It stays healthy and
     #: keeps serving what it already has: killing a pod with requests on it to
@@ -4320,6 +4336,7 @@ class RunpodPodPool:
                     grow_now = True
                 if chosen is not None:
                     chosen.inflight += 1
+                    _slots_of(chosen).append(time.time())
                     chosen.last_used = time.time()
                     self._remember_affinity(affinity, chosen)
                     url = chosen.url
@@ -4415,6 +4432,13 @@ class RunpodPodPool:
     def release(self, pod: PodHandle):
         with self._cv:
             pod.inflight = max(0, pod.inflight - 1)
+            # Oldest first: the slots are interchangeable (nothing identifies
+            # which page holds which), and dropping the oldest keeps the list a
+            # true picture of how long the REMAINING ones have been held, which
+            # is what the staleness sweep reads.
+            slots = _slots_of(pod)
+            if slots:
+                slots.pop(0)
             pod.last_used = time.time()
             self._cv.notify_all()
 
@@ -4756,6 +4780,70 @@ class RunpodPodPool:
                 "needed": need, "floor": floor,
                 "retire_when_idle": self._release_pending}
 
+    def _reclaim_stranded_inflight(self, now: float) -> None:
+        """Give back in-flight slots that no page can still be holding.
+
+        `inflight` is a ratchet: raised in `_pick`, lowered only in `release`.
+        Any dispatch path that fails to release raises it for the life of the
+        pod, and at `max_inflight_per_pod` the pod is locked out while its card
+        idles -- reported, misleadingly, as "at capacity". Two such leaks have
+        been found and fixed (a lease dropped during acquisition, a page whose
+        client went away); the reason this sweep exists is the third, which has
+        not been found yet.
+
+        So the pool stops trusting the counter indefinitely. A slot held longer
+        than any page can legitimately take is not in flight, whatever the
+        counter says, and is returned.
+
+        Deliberately generous: this is a safety net, not a timeout. Cancelling
+        real work would be far worse than holding a phantom slot a few minutes
+        longer, so the bound is well past the slowest plausible page (a full
+        token budget, its continuations and a retry, on a contended card).
+        """
+        ttl = INFLIGHT_TTL_S
+        if ttl <= 0:
+            return
+        cutoff = now - ttl
+        freed_total = 0
+        with self._cv:
+            for pod in self.pods:
+                slots = _slots_of(pod)
+                stale = sum(1 for t in slots if t < cutoff)
+                if stale:
+                    slots = [t for t in slots if t >= cutoff]
+                    pod.inflight_since = slots
+                # The LIST is the authority, always, not only when something
+                # expired. `_pick` records a timestamp for every slot it takes,
+                # so a counter standing above the recorded slots is counting
+                # slots with no evidence that they were ever taken -- nothing
+                # can attribute them to a live page, and they can only have
+                # come from a path that raised the counter and lost the page.
+                #
+                # This also covers the upgrade itself: pods already in the pool
+                # when this code arrives carry a counter and no timestamps, and
+                # skipping them would leave exactly the locked-out pod this
+                # sweep exists to free.
+                unaccounted = max(0, pod.inflight - len(slots))
+                if not stale and not unaccounted:
+                    continue
+                pod.inflight = len(slots)
+                freed_total += stale + unaccounted
+                detail = []
+                if stale:
+                    detail.append(f"{stale} held longer than {ttl:.0f}s")
+                if unaccounted:
+                    detail.append(f"{unaccounted} with no record of being taken")
+                print(f"[runpod] pod {pod.pod_id}: returned "
+                      f"{stale + unaccounted} in-flight slot(s) that cannot "
+                      f"belong to a live page ("
+                      + ", ".join(detail)
+                      + f"). inflight is now {pod.inflight}. A slot leaks when "
+                      f"a page is lost between being granted a pod and "
+                      f"releasing it; until now the pod was being refused work "
+                      f"it could serve.", flush=True)
+            if freed_total:
+                self._cv.notify_all()
+
     def _scale_down(self, now: float) -> None:
         """Retire one surplus pod per pass, once the surplus has persisted.
 
@@ -4835,6 +4923,7 @@ class RunpodPodPool:
                 self._drain_pod_log(p)
             except Exception:
                 pass
+        self._reclaim_stranded_inflight(now)
         self._scale_down(now)
         with self._cv:
             pods = list(self.pods)
@@ -5070,6 +5159,34 @@ def _forget_unavailable(gpu_type_id: str, dc: str = "") -> None:
 #: WHY the server is busy, so it must not be the first thing a busy server
 #: stops serving. Short, because a partial answer now beats a complete one
 #: after the incident.
+#: How long an in-flight slot may be held before the pool stops believing it.
+#:
+#: A safety net against leaks in the dispatch path, not a request timeout: see
+#: `_reclaim_stranded_inflight`. Set well past the slowest page a pod can
+#: legitimately be working on -- a full token budget plus its continuations and
+#: a retry, on a card serving dozens of other pages -- because returning a slot
+#: that IS in use would hand the same pod more work than its cap allows, while
+#: holding a phantom a few minutes longer costs only those minutes.
+INFLIGHT_TTL_S = 900.0
+
+
+def _slots_of(pod) -> list:
+    """A pod's in-flight timestamp list, created on demand.
+
+    Not every object the pool is handed is a PodHandle: tests and duck-typed
+    stand-ins carry only what they need, and a field added for bookkeeping
+    should not force any of them to be rewritten. Initialised here rather than
+    required at construction, as the per-card memo is.
+    """
+    slots = getattr(pod, "inflight_since", None)
+    if slots is None:
+        slots = []
+        try:
+            pod.inflight_since = slots
+        except Exception:
+            pass                # read-only stand-in: bookkeeping degrades, nothing breaks
+    return slots
+
 SNAPSHOT_LOCK_TIMEOUT_S = 2.0
 
 
