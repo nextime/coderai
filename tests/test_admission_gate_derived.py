@@ -108,11 +108,15 @@ def test_queue_is_capped():
 
 def test_main_applies_the_same_derivation():
     src = open("codai/main.py").read()
-    assert 'max(16, min(256, _page_budget // 8))' in src
+    # Named constants, shared with the warning: a separate literal in each
+    # place is how the two rules came to disagree and warn about a value the
+    # derivation had just chosen.
+    assert '_GATE_FLOOR, _GATE_CAP = 16, 256' in src
+    assert 'max(_GATE_FLOOR, min(_GATE_CAP, _page_budget // 8))' in src
     assert '"max_parallel_requests" not in _explicit' in src
     assert 'not _mp' in src, "env override must still win"
     block = src[src.index("An OCR install must not have to know"):]
-    block = block[:block.index("# Say so when this gate is the ceiling")]
+    block = block[:block.index("# Say so when an EXPLICIT gate")]
     assert "except Exception:" in block, "must never stop a server booting"
 
 
