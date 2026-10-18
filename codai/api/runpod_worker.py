@@ -3488,10 +3488,7 @@ class RunpodPodPool:
                            # knows otherwise.
                            **_adopted_card(self.account, shared_id),
                            healthy=True, last_used=time.time())
-        with self._cv:
-            self.pods.append(handle)
-            self._bump_cards()
-            self._cv.notify_all()
+        self._add_pod(handle)
         register_pod(shared_id, str(self.model_key), shared_url, self.api_key,
                      hourly_usd=float(shared_rate or 0.0))  # image/gpu kept
         return True
@@ -3823,10 +3820,7 @@ class RunpodPodPool:
             if cancellable and self._boot_cancelled(_epoch):
                 _give_back(pod_id, "just as it came up")
                 raise BootCancelled(pod_id)
-            with self._cv:
-                self.pods.append(h)
-                self._bump_cards()
-                self._cv.notify_all()
+            self._add_pod(h)
             with _pools_lock:
                 _provisioning_ids.discard(pod_id)
                 _provisioning_info.pop(pod_id, None)
@@ -4428,6 +4422,53 @@ class RunpodPodPool:
                     self._cv.wait(min(remaining, 10.0))
                 finally:
                     self._waiting = max(0, self._waiting - 1)
+
+    def _add_pod(self, handle: PodHandle) -> bool:
+        """Put a pod in the pool, at most ONCE per pod id.
+
+        Two paths append pods -- a fresh rent and an adoption -- and neither
+        used to check whether the pod was already there. On a restart both can
+        fire for the same pod in the same second (`reclaim: took back a pod`
+        and `adopting pod <id>'s bearer token` are logged a moment apart), and
+        the pool then holds two handles for one machine.
+
+        That is not a cosmetic duplicate. Every capacity question is answered by
+        walking `self.pods`, so one A40 counted twice claims 2 x
+        max_inflight_per_pod slots -- the pool reported `2 in pool, 2 healthy,
+        2 at cap` with 128 pages in flight while the card itself ran 31 -- and
+        `max_pods` is enforced against that same inflated count, so a cap of one
+        can be satisfied by two entries for one pod and a second pod rented
+        beside them.
+
+        Returns True if the pod was added, False if it was already here. The
+        EXISTING handle is kept rather than replaced: it carries the in-flight
+        accounting for work already dispatched to that pod, and throwing it away
+        would strand every slot it holds. What can legitimately change -- the
+        address, after RunPod remaps a port -- is refreshed onto it.
+        """
+        with self._cv:
+            for p in self.pods:
+                if p.pod_id != handle.pod_id:
+                    continue
+                if handle.url and handle.url != p.url:
+                    print(f"[runpod] pod {p.pod_id} is already in the pool for "
+                          f"{self.model_key!r}; keeping the handle that holds "
+                          f"its {p.inflight} in-flight slot(s) and updating its "
+                          f"address to {handle.url}", flush=True)
+                    p.url = handle.url
+                else:
+                    print(f"[runpod] pod {p.pod_id} is already in the pool for "
+                          f"{self.model_key!r} — not adding it twice (a second "
+                          f"entry would claim a second pod's worth of capacity "
+                          f"for one card)", flush=True)
+                p.healthy = True
+                p.last_used = time.time()
+                self._cv.notify_all()
+                return False
+            self.pods.append(handle)
+            self._bump_cards()
+            self._cv.notify_all()
+            return True
 
     def release(self, pod: PodHandle):
         with self._cv:
