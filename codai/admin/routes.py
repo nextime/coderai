@@ -3847,24 +3847,40 @@ async def api_task_restart(task_id: str, username: str = Depends(require_admin))
 # --- System endpoints ---
 
 @router.post("/admin/api/system/reload", summary="Reload server configuration")
-async def api_reload_config(username: str = Depends(require_admin)):
-    """Reload configuration from disk."""
+async def api_reload_config(request: Request, username: str = Depends(require_admin)):
+    """Re-read config.json and models.json from disk, in place.
+
+    This is the alternative to restarting the server after an operator edits a
+    config file by hand, so it has to reload BOTH files: a pod pool reads its
+    ceilings (``max_pods``, ``gpu_types``, the cost caps) out of
+    ``models_data`` on every acquisition, and an edit the process has not
+    re-read is an edit that does not apply.
+
+    It used to build a bare ``Request({})`` to reach ``app.state`` and so
+    raised on every call -- the endpoint had never reloaded anything. The
+    manager is taken from the injected request, falling back to the module
+    global that ``set_config_manager`` sets, because the front proxy and the
+    engine do not both populate app state.
+    """
+    mgr = getattr(getattr(request, "app", None), "state", None)
+    mgr = getattr(mgr, "config_mgr", None) or config_manager
+    if mgr is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
     try:
-        from fastapi import Request
-        # config_mgr is stored in app state
-        request = Request({})
-        config = request.app.state.config_mgr.reload()
-        return {
-            "success": True,
-            "message": "Configuration reloaded",
-            "config": {
-                "loaded": config.models.loaded,
-                "preload": config.models.preload,
-                "load_mode": config.models.default_load_mode
-            }
-        }
+        cfg = mgr.reload()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"reload failed: {e}")
+    md = getattr(mgr, "models_data", None) or {}
+    return {
+        "success": True,
+        "message": "Configuration reloaded",
+        "models_reloaded": sum(len(v) for v in md.values() if isinstance(v, list)),
+        "config": {
+            "loaded": cfg.models.loaded,
+            "preload": cfg.models.preload,
+            "load_mode": cfg.models.default_load_mode,
+        },
+    }
 
 
 from datetime import datetime
