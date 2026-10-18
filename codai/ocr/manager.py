@@ -855,6 +855,68 @@ def _set_pod_wait_cooldown(mid: str) -> None:
         _POD_WAIT_COOLDOWN[mid] = time.time() + POD_WAIT_COOLDOWN_S
 
 
+#: Leases that were granted to a page that had already gone away. Counted, and
+#: said, because the whole cost of this bug was that it was silent.
+_ORPHAN_LEASES = [0]
+
+
+def _release_orphan(task) -> None:
+    """Give back a lease whose page was cancelled while acquiring it."""
+    try:
+        lease = task.result()
+    except BaseException:
+        return                      # it raised instead of leasing; nothing held
+    if lease is None:
+        return
+    _ORPHAN_LEASES[0] += 1
+    try:
+        lease.release()
+    except Exception:
+        pass
+    _say_rate_limited(
+        ("orphan-lease",),
+        f"[ocr] a page was cancelled while its pod lease was being granted; "
+        f"the lease was returned ({_ORPHAN_LEASES[0]} so far). A client that "
+        f"times out in bulk produces these in bulk.", every=60.0)
+
+
+async def _acquire_lease(model_id: str):
+    """Acquire a pod lease so that a CANCELLATION CANNOT LOSE ONE.
+
+    `placement.choose` runs in a thread and increments `pod.inflight` the
+    moment it picks a pod. If the awaiting coroutine is cancelled after the
+    executor has produced the Lease but before the value is delivered, the
+    object is dropped with the counter already raised -- and nothing ever
+    releases it. The page is gone, so no `finally` runs.
+
+    That is not a rare race. A client that gives up on a batch cancels every
+    page of it at once, so the leak arrives in thousands. Measured on a live
+    run: the pool reported all 52 pods at their 64-page cap -- 3,328 pages "in
+    flight" -- while `ss` showed 3 to 5 open sockets per pod and the cards sat
+    at 0.2% KV cache with `Running: 1`. About 60 of every 64 did not exist.
+    `_pick` then correctly refused every pod and the queue stopped at
+    0.33 pages/s.
+
+    It had been leaking all along. With `max_inflight_per_pod: 0` an inflated
+    counter blocked nothing, so it only showed up as demand: in-flight numbers
+    of 2,700 and 4,096 that the scaler dutifully rented pods for.
+
+    `shield` is the fix: the acquisition finishes even when the awaiting page is
+    cancelled, and the done-callback hands the lease straight back.
+    """
+    from codai.models import placement
+    task = asyncio.ensure_future(run_on_lease_pool(
+        placement.choose, model_id,
+        spill_after=placement.spill_threshold(model_id),
+        acquire_timeout=POD_LEASE_ATTEMPT_S,
+        grow_inline=False))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(_release_orphan)
+        raise
+
+
 async def _lease_a_pod(model_id: str, policy: str, wait_s: float):
     """A lease on a pod that runs the pipeline, or None to read on this box.
 
@@ -870,27 +932,22 @@ async def _lease_a_pod(model_id: str, policy: str, wait_s: float):
     waited = 0.0
     while True:
         try:
-            # OFF THE LOOP. `placement.choose` is synchronous and ends in a
-            # pool's `acquire()`, which waits on a condition variable for up to
-            # its default 1200 s and may rent a pod INLINE -- a candidate sweep
+            # OFF THE LOOP, and cancellation-safe. `placement.choose` is
+            # synchronous and ends in a pool's `acquire()`, which waits on a
+            # condition variable and may rent a pod INLINE -- a candidate sweep
             # over every region, then a boot wait, in whichever thread asked.
             # Called straight from this coroutine it blocked the whole event
             # loop, so the process answered nothing at all -- not the client's
             # next document, not even /v1/runpod/status -- for as long as one
-            # page waited for a pod.
+            # page waited for a pod. It had been on the loop since the pod
+            # pipeline was written (0.3.70), costing nothing while acquire()
+            # returned at once, and turning fatal exactly when the pool was the
+            # thing under strain.
             #
-            # It has been on the loop since the pod pipeline was written
-            # (0.3.70) and cost nothing for as long as acquire() returned at
-            # once: a pool with a free pod answers in microseconds. It turns
-            # fatal exactly when the pool is the thing under strain, which is
-            # when it matters most. Measured on a 5,000-document run: 116 pods
-            # rented, zero documents completed in ten minutes, and a front that
-            # had stopped answering.
-            lease = await run_on_lease_pool(
-                placement.choose, model_id,
-                spill_after=placement.spill_threshold(model_id),
-                acquire_timeout=POD_LEASE_ATTEMPT_S,
-                grow_inline=False)
+            # `_acquire_lease` also makes sure a cancelled page cannot LOSE a
+            # lease it was granted -- see there; that leak is what made every
+            # pod look full while the cards idled.
+            lease = await _acquire_lease(model_id)
         except OcrError:
             raise
         except Exception as exc:
