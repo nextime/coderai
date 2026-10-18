@@ -63,11 +63,28 @@ _MIN_POD = 64
 #: Ceilings. A blocked thread is cheap but not free, and a runaway config
 #: should not be able to ask for ten thousand stacks.
 _MAX_DEFAULT = 256
-#: Raised from 512 once the sizing above started working: a run that wants
-#: 100 pages/s at ~20 s per page needs ~2000 forwards outstanding, and every
-#: one of them is a thread blocked on a socket. Beyond this an async client is
-#: the right answer, not more stacks.
-_MAX_POD = 2048
+#: Raised from 512, then from 2048, as the sizing below proved able to defend
+#: itself: a run that wants 100 pages/s at ~20 s per page needs ~2000 forwards
+#: outstanding, and every one of them is a thread blocked on a socket.
+#:
+#: 2048 was a silent FLEET ceiling, which is a worse failure than a slow one. A
+#: page on the pod path holds a pod-pool thread for its whole life, so this
+#: constant -- not ocr.max_concurrency, not max_pods, not the cgroup -- decided
+#: how many pods an orchestrator could feed: 2048 threads / 64 pages per pod =
+#: 32 pods, whatever max_pods said. An operator raising max_pods to 128 got 96
+#: pods' worth of nothing, and no line anywhere said why.
+#:
+#: Nothing here removes a real limit. `pool_sizes()` still clamps against
+#: `task_budget()` -- the cgroup's pids.max minus what is already running minus
+#: headroom -- and still gives the pod pool away first so the general pool can
+#: keep answering /healthz. This only stops a CONSTANT from being the binding
+#: limit on a box that has the tasks to spare: measured here, pids.max 16384
+#: with 79 in use.
+#:
+#: Past this an async client really is the right answer rather than more
+#: stacks; 8192 covers 128 pods at 64 pages each, which is a fleet large enough
+#: that the next bottleneck is somewhere else entirely.
+_MAX_POD = 8192
 
 #: Width of the LEASE pool. Deliberately small and NOT derived from
 #: `max_concurrency`: a lease is a bounded wait (`POD_LEASE_ATTEMPT_S`) that

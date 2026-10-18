@@ -73,10 +73,19 @@ def test_an_unreadable_config_is_reported_not_disguised(monkeypatch):
 
 
 def test_the_configured_width_reaches_both_pools(holder):
+    """The configured page concurrency must size BOTH pools.
+
+    The pod pool gets two threads per in-flight page -- room for every page to
+    be waiting on a pod and still have one for the forward -- so the assertion
+    is `want * 2`, not a literal. It used to read `pod == 2048` for want=2048,
+    which was only true because _MAX_POD happened to clamp there; raising that
+    ceiling for a 128-pod fleet broke the literal while the property it was
+    protecting held.
+    """
     holder(2048)
     general, pod = thread_pool.pool_sizes()
     assert general == thread_pool._MAX_DEFAULT      # 256
-    assert pod == 2048
+    assert pod == min(thread_pool._MAX_POD, 2048 * 2)
     assert pod > thread_pool._MIN_POD * 10
 
 
