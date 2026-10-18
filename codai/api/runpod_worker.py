@@ -4432,13 +4432,19 @@ class RunpodPodPool:
         and `adopting pod <id>'s bearer token` are logged a moment apart), and
         the pool then holds two handles for one machine.
 
-        That is not a cosmetic duplicate. Every capacity question is answered by
-        walking `self.pods`, so one A40 counted twice claims 2 x
-        max_inflight_per_pod slots -- the pool reported `2 in pool, 2 healthy,
-        2 at cap` with 128 pages in flight while the card itself ran 31 -- and
-        `max_pods` is enforced against that same inflated count, so a cap of one
-        can be satisfied by two entries for one pod and a second pod rented
-        beside them.
+        That would not be a cosmetic duplicate. Every capacity question is
+        answered by walking `self.pods`, so one A40 counted twice would claim
+        2 x max_inflight_per_pod slots, and `max_pods` -- enforced against that
+        same count -- could be satisfied by two entries for one card.
+
+        Precautionary rather than a diagnosed fault, and worth keeping the
+        distinction straight. A snapshot was once seen carrying two rows for
+        one pod id, but the model key was not recorded, so two POOLS sharing
+        one pod was never ruled out -- and that case this does not fix. The
+        separate occasion when a max_pods=1 pool really did bill for two A40s
+        was two DISTINCT pod ids, caused by the warm-floor top-up counting only
+        healthy pods against the cap. What justifies this guard by itself is
+        that two paths appended pods with no identity check between them.
 
         Returns True if the pod was added, False if it was already here. The
         EXISTING handle is kept rather than replaced: it carries the in-flight

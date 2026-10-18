@@ -7,16 +7,20 @@ the same second; the log showed
     [runpod] adopting pod j74fxkxr9vs3fg's bearer token
     [runpod] reclaim: took back a pod for 'datalab-to/surya-ocr-2' ...
 
-and the pool then held one A40 twice. Every capacity question is answered by
-walking self.pods, so the consequences compound:
+a second apart. Every capacity question is answered by walking self.pods, so
+one card counted twice would claim 2 x max_inflight_per_pod slots, and max_pods
+-- enforced against that same count -- could be satisfied by two entries for
+one card.
 
-  * the pool claimed 2 x max_inflight_per_pod = 128 slots on a card serving 31,
-    reporting "2 in pool, 2 healthy, 2 at cap" with 255 pages queued
-  * max_pods is enforced against that same count, so a cap of ONE can be
-    satisfied by two entries for one pod -- and a second real pod rented beside
-    them, which is what was billed at $1.18/hr for a $0.59 configuration
-  * the in-flight staleness sweep cannot help: both entries hold legitimate
-    fresh timestamps
+Precautionary rather than a diagnosed fault, and the distinction is worth
+keeping straight: a snapshot was once seen with two rows for one pod id, but
+the model key was not recorded, so two POOLS sharing one pod was never ruled
+out -- and that case this does not fix. The occasion when a max_pods=1 pool
+really did bill for two A40s was two distinct pod ids, caused by the warm-floor
+top-up counting only healthy pods against the cap. What justifies this guard by
+itself is that two paths appended pods with no identity check between them, and
+the in-flight staleness sweep cannot catch a duplicate because both entries
+hold legitimate fresh timestamps.
 """
 import time
 import threading
