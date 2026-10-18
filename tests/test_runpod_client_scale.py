@@ -347,12 +347,24 @@ def test_the_warm_top_up_does_not_stack_on_a_booting_pod():
     """A floor of 1 must not become 2 by topping up against a pod already
     booting. 0.3.69 fills a floor in waves rather than one pod per pass, so
     the old `not self._booting` guard is gone and the intent is arithmetic:
-    `_booting` is counted in `in_hand`, so the deficit a wave may request is
-    already reduced by whatever is on the way."""
+    `_booting` is counted, so the deficit a wave may request is already reduced
+    by whatever is on the way.
+
+    The single `in_hand` this originally pinned became two counts in 0.4.27,
+    because the deficit and the max_pods cap are different questions -- the
+    deficit is in pods that can SERVE, the cap is in pods that BILL -- and
+    answering both with the healthy-only count let a pool with max_pods=1 rent
+    beside an adopted pod that was not yet healthy. Both counts still include
+    `_booting`, which is what this test is about.
+    """
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def maintain")[1].split("def close")[0]
-    assert "in_hand = len([p for p in self.pods if p.healthy]) + self._booting" in blk
-    assert "want = min(keep_min - in_hand," in blk
+    assert ("healthy_in_hand = len([p for p in self.pods if p.healthy]) "
+            "+ self._booting") in blk
+    assert "billing_in_hand = len(self.pods) + self._booting" in blk
+    assert "want = min(keep_min - healthy_in_hand," in blk
+    # the cap must be the billing count, or the regression returns
+    assert "- billing_in_hand)" in blk
     assert "sibling_is_provisioning" in blk
 
 

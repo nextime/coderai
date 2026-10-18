@@ -4930,12 +4930,33 @@ class RunpodPodPool:
             # own `scale_up_max_parallel_boots`, which already means "how many
             # pods may be booting at once", and by max_pods.
             with self._cv:
-                in_hand = len([p for p in self.pods if p.healthy]) + self._booting
+                # Two different counts, because they answer two different
+                # questions and conflating them rents cards nobody asked for.
+                #
+                # The DEFICIT is in pods that can serve, so it counts healthy
+                # ones: an unhealthy pod does not satisfy a warm floor whose
+                # whole purpose is that the next request finds a pod ready.
+                #
+                # The CAP is in pods that BILL, so it counts every pod in the
+                # pool whatever its health, exactly as `_should_grow` does. A
+                # pod that exists occupies a max_pods slot; it is charged for by
+                # the minute while it boots and while it is sick.
+                #
+                # Counting only healthy pods against max_pods is how a pool with
+                # max_pods=1 came to hold two A40s: after a restart the pool
+                # ADOPTS the pod it had before, which is briefly not yet healthy
+                # and was not booted by this process, so `_booting` is 0 and
+                # `in_hand` computed 0 -- room under a cap of one, beside a pod
+                # already running. Observed 2026-10-18: a pod adopted at 17:41,
+                # a restart at 17:43, a second pod rented at 17:46, $1.18/hr for
+                # a configuration that asked for $0.59.
+                healthy_in_hand = len([p for p in self.pods if p.healthy]) + self._booting
+                billing_in_hand = len(self.pods) + self._booting
                 parallel = max(1, int(getattr(self.mcfg,
                                               "scale_up_max_parallel_boots", 4) or 4))
-                want = min(keep_min - in_hand,
+                want = min(keep_min - healthy_in_hand,
                            max(0, parallel - self._booting),
-                           max(0, int(self.mcfg.max_pods or 0) - in_hand))
+                           max(0, int(self.mcfg.max_pods or 0) - billing_in_hand))
                 if want <= 0:
                     return
                 self._booting += want
