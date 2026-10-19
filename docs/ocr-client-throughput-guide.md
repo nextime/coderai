@@ -37,7 +37,7 @@ no deploy on either side, and they are worth +33% throughput and −25% cost.
 ## 2. Concurrency — one rule
 
 ```
-in_flight = 32 × pods_ready        (capped at 8192)
+offered   = 64 × pods_ready        (the server dispatches ~32/pod)
 ```
 
 Read `pods_ready` from `GET /v1/runpod/status` → `summary.pods_ready` and
@@ -52,14 +52,14 @@ immediately. The limits that do exist are pages, not requests:
 
 | limit | value | what it is |
 |---|---|---|
-| `max_inflight_per_pod × pods` | 32 × pods | pages a pod will take at once |
+| `max_inflight_per_pod × pods` | ~32 × pods | dispatched at once; discovered per pod |
 | `ocr.max_concurrency` | 8192 | pages admitted into the OCR manager |
 | pod thread pool | 8192 | one thread per page in flight to a pod |
 
 All three line up at **4096 pages = 128 pods**, which is the configured
 `max_pods`. Asking for more than 8192 does not fail fast — the surplus waits for
 a pod lease and eventually times out, which is worse than being refused. Stay at
-or under `32 × pods_ready`.
+or under `64 × pods_ready`.
 
 ## 3. Memory — yours to bound, not ours
 
@@ -122,44 +122,65 @@ quality at near surya's price. No human triage: both tests are mechanical.
   `%PDF` header or no `%%EOF`. Screen locally before sending; each one
   otherwise costs a request and returns an error.
 
-## CORRECTION, 2026-10-19: it is 32 per pod, not 64
+## CORRECTION, 2026-10-19: keep sending 64 — the server manages it
 
-An earlier version of this note said `in_flight = 64 × pods_ready`. That was
-wrong, and it was measured wrong: **a pod serves ~32 pages concurrently**
-(observed `Running: 29-32 reqs, Waiting: 0` on every pod of a live fleet), and
-the 0.557 pages/s figure below was itself measured at a concurrency of 32 on one
-pod. 64 was the configured ceiling, not an observed capacity.
+An earlier revision of this note told you to send `32 × pods_ready`. **Ignore
+that. Keep sending `64 × pods_ready`.**
 
-Sending 64 does not queue politely inside the orchestrator. It queues in the
-POD'S SOCKET BACKLOG, and when that overflows the pod starts refusing
-connections while remaining perfectly healthy. On 2026-10-19 that cost eight
-A40s: the orchestrator read the refusals as "the pod is gone" and terminated
-them mid-work with 522 pages in flight. coderai no longer terminates on a
-refused connection (v0.4.37), but there is still nothing to gain by offering a
-pod twice what it will take.
+The reasoning behind the 32 was half right and the conclusion was wrong. A pod
+does serve about 32 pages at once — observed `Running: 29-32 reqs, Waiting: 0`
+on every pod of a live fleet. But that is a fact about how many pages the server
+should *dispatch to one pod*, not about how many you should *offer*. Offering
+only what the pods can hold means that the instant a page finishes there is
+nothing queued to replace it, so every pod idles for one round trip between
+every page, and you lose exactly the throughput the queue exists to protect.
 
-**`32 × pods_ready` is the efficient window** — the point past which you are
-not getting more throughput, only more waiting.
+**A deep offer is what keeps the fleet at full speed.** So the split of
+responsibility is:
 
-You do not have to get it exactly right any more (v0.4.38). The server now
-bounds what it sends each pod by what that pod has shown it will accept, and
-holds a queue in front of the fleet so no pod ever waits for work. When that
-queue is full it answers **429** with:
+| | who | how much |
+|---|---|---|
+| offered by you | client | `64 × pods_ready` |
+| dispatched to each pod | server | ~32, discovered from the pod itself |
+| held queued, ready to dispatch | server | the rest |
+
+The server bounds per-pod dispatch from what each pod has shown it will accept,
+halving that pod's width if it ever refuses a connection and walking it back up
+as pages succeed (v0.4.38). You do not need to know, or track, what a pod can
+take — and you cannot overload one by offering more.
+
+The admission budget is sized for exactly this offer:
+
+```
+ocr.max_concurrency   4096    = 32 × 128 pods, dispatched
+ocr.max_queued_pages  4096    = 32 × 128 pods, queued behind them
+total accepted        8192    = 64 × 128 pods
+```
+
+### When you do get a 429
+
+Only past that total. It means you are offering more than even the queue is
+meant to hold — nothing was lost and nothing was read twice:
 
 ```
 Retry-After: 2
-X-OCR-Pages-Running: 256     pages on the pods right now
-X-OCR-Pages-Queued:  256     accepted, waiting for a slot
-X-OCR-Page-Width:    256     ocr.max_concurrency
-X-OCR-Queue-Limit:   256     ocr.max_queued_pages
+X-OCR-Pages-Running: 4096     pages dispatched right now
+X-OCR-Pages-Queued:  4096     accepted, waiting for a pod
+X-OCR-Page-Width:    4096     ocr.max_concurrency
+X-OCR-Queue-Limit:   4096     ocr.max_queued_pages
 ```
 
 **Honour the `Retry-After`.** A client that does finishes sooner than one that
 retries immediately, because its retries stop competing with work already
-accepted. The four headers are also the live tuning signal: if you are seeing
-429s with `Pages-Queued` pinned at the limit, you are offering more than the
-fleet can carry and the surplus is buying you nothing. A 429 is not an error in
-the run — nothing was lost, and nothing was read twice.
+accepted. Those four headers are also the live tuning signal: `Pages-Queued`
+well below the limit means the fleet is keeping up with you and you could offer
+more; pinned at the limit means the surplus is buying nothing.
+
+Why this changed: before v0.4.38 nothing bounded per-pod dispatch
+(`max_inflight_per_pod` defaults to unlimited), so a deep offer did not queue in
+the orchestrator — it queued in the pods' socket backlogs, and an overflowing
+backlog makes a healthy pod refuse connections. Those refusals were read as dead
+pods and cost eight A40s mid-work. The queue now forms where it belongs.
 
 ## 7. Before a large run
 
@@ -184,7 +205,7 @@ the run — nothing was lost, and nothing was read twice.
    per-model rows under `schedules` report `effective_max_pods` (the ceiling
    actually in force), `client_max_pods` (your lease's own) and
    `client_lease_expires_in_s`.
-3. Then feed, holding `in_flight = 32 × pods_ready`, recomputed as that number
+3. Then feed, offering `64 × pods_ready`, recomputed as that number
    changes.
 
 ### Staging a campaign
