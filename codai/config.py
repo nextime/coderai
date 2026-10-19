@@ -2482,7 +2482,6 @@ class ConfigManager:
                      "olmocr_max_continuations", int),
                     ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency", int),
                     ("CODERAI_OCR_MAX_QUEUED_PAGES", "max_queued_pages", int),
-                    ("CODERAI_OCR_EARLY_LOOP_ABORT", "early_loop_abort", bool),
                     ("CODERAI_OCR_EARLY_LOOP_MIN_CHARS", "early_loop_min_chars", int),
                     ("CODERAI_OCR_EARLY_LOOP_STEP", "early_loop_step", int),
                     ("CODERAI_OCR_EARLY_LOOP_PERSISTENCE", "early_loop_persistence", int),
@@ -2505,7 +2504,13 @@ class ConfigManager:
             for _env, _attr in (
                     ("CODERAI_OCR_SURYA_REPAIR_ACCENTS", "surya_repair_accents"),
                     ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace"),
-                    ("CODERAI_OCR_SURYA_USE_GPU", "surya_use_gpu")):
+                    ("CODERAI_OCR_SURYA_USE_GPU", "surya_use_gpu"),
+                    # HERE, not in the typed loop above. That loop casts with
+                    # the declared type, and `bool("0")` is True in Python -- so
+                    # a pod sent CODERAI_OCR_EARLY_LOOP_ABORT=0 turned the
+                    # feature ON. `_flag` reads the STRING, which is the only
+                    # way an env var can express false.
+                    ("CODERAI_OCR_EARLY_LOOP_ABORT", "early_loop_abort")):
                 if _os.environ.get(_env) is not None:
                     setattr(self.config.ocr, _attr, _flag(_env))
             # vLLM settings a POD needs but cannot inherit: it launches its own

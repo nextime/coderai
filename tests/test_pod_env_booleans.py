@@ -80,3 +80,45 @@ def test_the_config_can_express_off():
     assert cfg.early_loop_abort is True
     cfg.early_loop_abort = False
     assert cfg.early_loop_abort is False
+
+
+# ---------------------------------------------------------------------------
+# the READING side, which had the same bug in mirror image
+# ---------------------------------------------------------------------------
+
+def test_bool_of_the_string_zero_is_true():
+    """The other half of this file's lesson. The writer dropped False because
+    `False == 0`; the reader turned "0" into True because `bool("0")` is True.
+    One flag, two opposite coercions, both wrong in the same direction: the
+    feature could only ever be ON."""
+    assert bool("0") is True
+
+
+def test_the_abort_flag_is_parsed_as_a_flag_not_cast_as_a_type():
+    src = open("codai/config.py").read()
+    # not in the typed loop, where the cast would be bool("0") -> True
+    assert '("CODERAI_OCR_EARLY_LOOP_ABORT", "early_loop_abort", bool)' not in src
+    # in the _flag loop, which reads the string
+    i = src.index('("CODERAI_OCR_SURYA_REPAIR_ACCENTS", "surya_repair_accents")')
+    j = src.index("setattr(self.config.ocr, _attr, _flag(_env))")
+    k = src.index('("CODERAI_OCR_EARLY_LOOP_ABORT", "early_loop_abort")')
+    assert i < k < j, "the flag must sit in the _flag() loop"
+
+
+def test_the_flag_parser_reads_zero_as_false():
+    src = open("codai/config.py").read()
+    blk = src[src.index("def _flag(name: str) -> bool:"):]
+    blk = blk[:blk.index("\n\n")]
+    assert '"1", "true", "yes", "on"' in blk
+    # i.e. anything else, including "0" and "false", is False
+    for val in ("0", "false", "no", "off", ""):
+        assert val not in ("1", "true", "yes", "on")
+
+
+def test_no_ocr_env_row_casts_with_bool():
+    """A typed row whose cast is `bool` can never express false. Guard against
+    the next one."""
+    import re
+    src = open("codai/config.py").read()
+    rows = re.findall(r'\("CODERAI_[A-Z_]+",\s*"[a-z_0-9]+",\s*bool\)', src)
+    assert rows == [], f"these rows cast with bool and cannot be turned off: {rows}"
