@@ -95,9 +95,42 @@ _MAX_POD = 8192
 #: thread stacks it needs.
 _LEASE_WORKERS = 256
 
+#: Width of the CONTROL pool: the threads that answer questions ABOUT the
+#: server rather than doing its work.
+#:
+#: The general pool was sized for the install and then shared with the request
+#: path, which makes "can an operator see what is happening" depend on how busy
+#: the install is -- and the moment it is worth asking is the moment it is
+#: busiest. Measured on a live orchestrator during a boot wave:
+#:
+#:     /healthz            200 in   2.9 ms   (no thread needed)
+#:     /v1/runpod/status   no answer in 25 s (needs a thread)
+#:     /v1/runpod/scale    no answer in 25 s (needs a thread)
+#:
+#: Both of the endpoints that stopped answering are the two that hand work to
+#: a thread, and nothing was wrong with either of them. A client reasonably
+#: read that as a dead server; it also meant a client lease could not be
+#: RELEASED while the fleet was busy, so pods kept billing.
+#:
+#: Tiny and fixed, because this pool must never be the thing that is full:
+#: nothing in the request path may use it, and a control-plane answer is a
+#: snapshot measured in milliseconds once it has a thread to run on.
+_CONTROL_WORKERS = 16
+
+#: Width of the PDFIUM pool. pdfium permits exactly ONE caller at a time (see
+#: `codai.ocr.base._PDFIUM_LOCK`), so threads beyond the second buy no
+#: parallelism at all -- they only decide WHERE the queue forms. On the general
+#: executor the queue formed in the pool every control-plane request also needs.
+#:
+#: Two rather than one so a split's non-locked work (allocating the output
+#: buffer, handing the bytes back) can overlap the next split's locked work.
+_PDFIUM_WORKERS = 2
+
 _lock = threading.Lock()
 _pod_pool: Optional[ThreadPoolExecutor] = None
 _lease_pool: Optional[ThreadPoolExecutor] = None
+_control_pool: Optional[ThreadPoolExecutor] = None
+_pdfium_pool: Optional[ThreadPoolExecutor] = None
 _installed = False
 
 
@@ -234,7 +267,10 @@ def pool_sizes() -> tuple:
 
     budget = task_budget()
     if budget > 0:
-        spendable = budget - _TASK_HEADROOM
+        # The fixed pools are spent before the sized ones. They are small and
+        # they are not optional: an install that cannot answer a question about
+        # itself cannot be fixed, and a split that cannot run produces no pages.
+        spendable = budget - _TASK_HEADROOM - _CONTROL_WORKERS - _PDFIUM_WORKERS
         if spendable < _MIN_DEFAULT + _MIN_POD:
             # Too tight to honour both floors: keep them, and let the operator
             # see why from the boot line. Refusing to start would be worse --
@@ -345,6 +381,60 @@ async def run_on_lease_pool(func, /, *args, **kwargs):
     ctx = contextvars.copy_context()
     call = functools.partial(ctx.run, func, *args, **kwargs)
     return await loop.run_in_executor(lease_executor(), call)
+
+
+def control_executor() -> ThreadPoolExecutor:
+    """The pool that answers questions ABOUT the server, created on first use.
+
+    Reserved for the control plane -- the fleet snapshot, a scale request, a
+    pod teardown -- and deliberately not used by anything in the request path.
+    Its whole value is that it is empty when everything else is full.
+    """
+    global _control_pool
+    with _lock:
+        if _control_pool is None:
+            _control_pool = ThreadPoolExecutor(
+                max_workers=_CONTROL_WORKERS,
+                thread_name_prefix="coderai-control")
+            print(f"[threads] control pool: {_CONTROL_WORKERS} workers "
+                  f"(reserved for status/scale/teardown, so a busy server can "
+                  f"still say what it is busy with)", flush=True)
+        return _control_pool
+
+
+def pdfium_executor() -> ThreadPoolExecutor:
+    """The pool for pdfium work, created on first use.
+
+    pdfium is single-caller, so this is a queue with a tiny amount of overlap
+    rather than a parallel pool. Splitting a document used to go to the default
+    executor, where hundreds of concurrent documents each took a thread and
+    then waited on the same global lock -- the serialisation was unchanged, but
+    the threads they held were the ones an operator needed to look at the
+    server. Queueing here costs nothing it was not already paying.
+    """
+    global _pdfium_pool
+    with _lock:
+        if _pdfium_pool is None:
+            _pdfium_pool = ThreadPoolExecutor(
+                max_workers=_PDFIUM_WORKERS,
+                thread_name_prefix="coderai-pdfium")
+        return _pdfium_pool
+
+
+async def run_on_control_pool(func, /, *args, **kwargs):
+    """``run_on_pod_pool``, on the control pool."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(control_executor(), call)
+
+
+async def run_on_pdfium_pool(func, /, *args, **kwargs):
+    """``run_on_pod_pool``, on the pdfium pool."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(pdfium_executor(), call)
 
 
 async def run_on_pod_pool(func, /, *args, **kwargs):

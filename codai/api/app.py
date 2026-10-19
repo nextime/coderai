@@ -896,26 +896,58 @@ async def runpod_spend(request: Request):
                             detail="this endpoint needs an admin-scoped API key")
     from codai.api import runpod_worker, runpod_ledger
 
-    def _snapshot():
-        # Off the event loop. Each of these takes the pool locks and reads a
-        # file; none is slow by itself, but a lock held by a provisioning
-        # thread would otherwise stall the whole loop rather than one request.
-        try:
-            pods = runpod_worker.pods_status()
-        except Exception:
-            pods = []
-        try:
-            ledger = runpod_ledger.totals()
-        except Exception:
-            ledger = {"per_model": {}, "global": {}}
-        try:
-            schedules = runpod_worker.pools_schedule_status()
-        except Exception:
-            schedules = []
-        return pods, ledger, schedules
+    # THREE INDEPENDENT SNAPSHOTS, each with its own deadline, on the CONTROL
+    # pool.
+    #
+    # They used to be one function on one thread from the default executor, and
+    # that shape failed twice over. The thread had to be obtained from the pool
+    # the request path also draws on, so during a boot wave there was none to
+    # be had -- /v1/runpod/status answered nothing for 25s while /healthz
+    # answered in 2.9ms. And once it did run, the three sources were sequential
+    # with no bound between them, so the slowest decided the whole answer.
+    #
+    # This endpoint is the one surface an operator has for seeing WHY a server
+    # is busy. It must therefore be incapable of hanging: whatever is not back
+    # in time is reported as degraded and the rest is served. A partial answer
+    # now beats a complete one after the incident.
+    from codai.api.thread_pool import run_on_control_pool
 
-    pods, ledger, schedules = await asyncio.to_thread(_snapshot)
-    live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods if p.get("healthy"))
+    async def _part(fn, fallback, label):
+        try:
+            return await asyncio.wait_for(
+                run_on_control_pool(fn), timeout=SNAPSHOT_PART_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # The thread keeps running and will finish; what we give up on is
+            # WAITING for it, which is the only part that was hurting anyone.
+            degraded.append(f"{label} did not answer in "
+                            f"{SNAPSHOT_PART_TIMEOUT_S:.0f}s")
+            return fallback
+        except Exception as exc:                # noqa: BLE001 - reported, not raised
+            degraded.append(f"{label} failed: {exc}")
+            return fallback
+
+    degraded: list = []
+    pods, ledger, schedules = await asyncio.gather(
+        _part(runpod_worker.pods_status, [], "the pod snapshot"),
+        _part(runpod_ledger.totals, {"per_model": {}, "global": {}},
+              "the spend ledger"),
+        _part(runpod_worker.pools_schedule_status, [], "the warm-pod schedule"))
+    # EVERY POD IN THE LISTING, not only the healthy ones.
+    #
+    # RunPod bills a pod from the moment it is created. A pod spends ~12
+    # minutes booting -- pulling the image, then loading weights -- and is not
+    # healthy for any of it, so counting only healthy pods reported a fleet
+    # that is entirely in paid boot as FREE. Measured 2026-10-18: this field
+    # said $0.59 while the account billed $4.72, and $0.00 while 13 pods billed
+    # $7.67. A client reading it concluded nothing was being spent and kept
+    # feeding work, which is the most expensive way for a number to be wrong.
+    #
+    # The healthy subset is still reported, separately and under a name that
+    # says what it is: the ratio of the two is how much of the bill is boot,
+    # which is the figure that tells an operator a ramp is too steep.
+    live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods)
+    serving_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods
+                         if p.get("healthy"))
     live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
     caps = {}
     try:
@@ -941,10 +973,18 @@ async def runpod_spend(request: Request):
         summary = runpod_worker.fleet_summary(pods)
     except Exception:
         summary = {}
-    return {"summary": summary, "pods": pods, "ledger": ledger, "caps": caps,
-            "schedules": schedules,
-            "live_hourly_usd": round(live_hourly, 4),
-            "live_uncommitted_usd": round(live_cost, 4)}
+    out = {"summary": summary, "pods": pods, "ledger": ledger, "caps": caps,
+           "schedules": schedules,
+           "live_hourly_usd": round(live_hourly, 4),
+           "live_hourly_serving_usd": round(serving_hourly, 4),
+           "live_hourly_booting_usd": round(live_hourly - serving_hourly, 4),
+           "live_uncommitted_usd": round(live_cost, 4)}
+    if degraded:
+        # Named, because a zero that means "nothing is running" and a zero that
+        # means "we could not look" must not read the same -- a monitor that
+        # cannot tell them apart reports an idle fleet during an incident.
+        out["degraded"] = degraded
+    return out
 
 
 @app.get("/v1/runpod/status", summary="RunPod fleet status", tags=["Core"])
@@ -1008,6 +1048,13 @@ _scale_jobs_lock = threading.Lock()
 SCALE_JOBS_MAX = 64
 SCALE_WAIT_DEFAULT_S = 20.0
 
+#: How long the fleet snapshot waits for any ONE of its three sources.
+#:
+#: Short on purpose. Each source is a few lock acquisitions and a small file
+#: read; one that has not answered in this long is held by something, and
+#: naming it as degraded is more useful than waiting for it.
+SNAPSHOT_PART_TIMEOUT_S = 5.0
+
 
 def _scale_job_put(job_id: str, payload: dict) -> None:
     with _scale_jobs_lock:
@@ -1068,7 +1115,8 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     # during exactly the operation someone would poll it about, which makes a
     # slow rental look identical to an outage.
     job_id = uuid.uuid4().hex[:12]
-    task = asyncio.create_task(asyncio.to_thread(
+    from codai.api.thread_pool import run_on_control_pool
+    task = asyncio.create_task(run_on_control_pool(
         runpod_worker.set_client_pods,
         body.model, body.pods, teardown=bool(body.teardown),
         gpu_types=body.gpu_types, allow_other_gpus=body.allow_other_gpus,
@@ -1155,8 +1203,9 @@ async def runpod_release(body: RunpodReleaseRequest, request: Request):
                                    "admin-scoped API key")
     from codai.api import runpod_worker
     try:
-        return await asyncio.to_thread(runpod_worker.release_pod,
-                                       body.pod_id, body.reason)
+        from codai.api.thread_pool import run_on_control_pool
+        return await run_on_control_pool(runpod_worker.release_pod,
+                                         body.pod_id, body.reason)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:

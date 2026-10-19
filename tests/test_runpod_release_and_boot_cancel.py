@@ -209,7 +209,12 @@ def test_scale_runs_off_the_event_loop():
     would poll it about. A slow rental looked identical to an outage."""
     src = (ROOT / "codai/api/app.py").read_text()
     blk = src.split("async def runpod_scale(")[1].split("\n@app.")[0]
-    assert "asyncio.to_thread" in blk
+    # The CONTROL pool since v0.4.34, not the default executor: off the loop
+    # was necessary but not sufficient -- the thread it took came from the pool
+    # the request path also draws on, so during a boot wave there was none to
+    # be had and this endpoint went silent for 25s anyway.
+    assert "run_on_control_pool(" in blk
+    assert "asyncio.to_thread" not in blk
     assert "runpod_worker.set_client_pods(\n" not in blk
 
 

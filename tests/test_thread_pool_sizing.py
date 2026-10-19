@@ -227,4 +227,9 @@ def test_the_fleet_snapshot_is_off_the_event_loop():
     from codai.api import app as api_app
     src = pathlib.Path(api_app.__file__).read_text()
     blk = src.split("async def runpod_spend")[1].split("@app.get")[0]
-    assert "asyncio.to_thread(_snapshot)" in blk
+    # And on the CONTROL pool, each source with its own deadline: one thread
+    # from the general executor was still a thread the request path could take,
+    # and one function meant the slowest source decided the whole answer.
+    assert "run_on_control_pool(" in blk
+    assert "asyncio.to_thread" not in blk
+    assert "asyncio.wait_for(" in blk and "asyncio.gather(" in blk

@@ -33,7 +33,8 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from codai.api.thread_pool import run_on_lease_pool, run_on_pod_pool
+from codai.api.thread_pool import (run_on_lease_pool, run_on_pdfium_pool,
+                                   run_on_pod_pool)
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
                             PAGE_OPTIONS, page_estimate, render_pages,
                             iter_pdf_page_pdfs, pdf_page_count, split_pdf_page,
@@ -2319,11 +2320,22 @@ class OcrManager:
         # that on the loop stalls every request in the process for the duration
         # rather than only this document.
         #
-        # The DEFAULT executor, not the pod pool. The pod pool is where leases
-        # wait, and a lease waits for a pod to BOOT -- minutes. Putting a split
-        # behind thousands of those is a cold start that cannot produce the next
-        # page while it waits for the pods that page is for.
-        parts = (await asyncio.to_thread(lambda: list(iter_pdf_page_pdfs(data)))
+        # The PDFIUM pool -- not the pod pool, and no longer the default one.
+        #
+        # Not the pod pool because that is where leases wait, and a lease waits
+        # for a pod to BOOT (minutes): putting a split behind thousands of those
+        # is a cold start that cannot produce the next page while it waits for
+        # the pods that page is for.
+        #
+        # Not the default executor either, which is what this used to be. Every
+        # concurrent document took one of its threads and then blocked on the
+        # single global pdfium lock, so the serialisation was unchanged while
+        # the threads they held were the ones the control plane needs:
+        # /v1/runpod/status and /v1/runpod/scale stopped answering during
+        # exactly the operation an operator would poll them about. Queueing on
+        # a two-wide pool instead costs nothing that was not already being paid
+        # -- pdfium admits one caller whatever the pool is called.
+        parts = (await run_on_pdfium_pool(lambda: list(iter_pdf_page_pdfs(data)))
                  if is_pdf else [data])
         if not parts:
             return None

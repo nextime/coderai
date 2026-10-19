@@ -26,6 +26,19 @@ import time
 
 _lock = threading.RLock()
 
+#: How long a READ-ONLY snapshot waits for `_lock` before answering without it.
+#:
+#: `totals()` is a monitoring read, and it shared one lock with `record_spend`,
+#: which writes the file. During a boot wave the terminations that call
+#: record_spend arrive in bursts, and `totals()` was the one part of the
+#: /v1/runpod/status snapshot with no bound on how long it would wait -- so the
+#: endpoint an operator polls to understand the wave could be held by the wave.
+#:
+#: Enforcement (`spend_in_period`, `global_spend_in_period`) deliberately does
+#: NOT use this: refusing to provision is a decision, and a decision made from
+#: data that may be mid-write is worse than one made late.
+_SNAPSHOT_LOCK_TIMEOUT_S = 2.0
+
 _PERIOD_SECONDS = {
     "hour": 3600.0,
     "day": 86400.0,
@@ -126,11 +139,26 @@ def global_spend_in_period(period: str) -> float:
 
 
 def totals() -> dict:
-    """Snapshot for the stats page: trailing spend per model + global, all periods."""
+    """Snapshot for the stats page: trailing spend per model + global, all periods.
+
+    Reads the file without the lock rather than waiting indefinitely for it:
+    `_load` already returns {} for anything it cannot parse, so the worst a
+    concurrent `_save` can cost is one stale answer -- and `_save` writes to a
+    temporary file and renames, so a partial document is never read at all.
+    Reported as `degraded` so a number that may be behind is not mistaken for
+    one that is current.
+    """
     now = time.time()
     out = {"per_model": {}, "global": {}}
-    with _lock:
+    got = _lock.acquire(timeout=_SNAPSHOT_LOCK_TIMEOUT_S)
+    try:
         data = _load()
+    finally:
+        if got:
+            _lock.release()
+    if not got:
+        out["degraded"] = ("the ledger lock was busy; these totals were read "
+                           "without it and may be one entry behind")
     for period, secs in _PERIOD_SECONDS.items():
         out["global"][period] = round(_sum_in_window(data.get(_GLOBAL_KEY) or [], secs, now), 4)
     for key, entries in data.items():

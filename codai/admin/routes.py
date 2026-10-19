@@ -5342,19 +5342,29 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
     Runs on the engine hosting the RunPod pool, so it sees the live pods and the
     persistent spend ledger."""
     from codai.api import runpod_worker, runpod_ledger
-    try:
-        pods = runpod_worker.pods_status()
-    except Exception:
-        pods = []
-    try:
-        ledger = runpod_ledger.totals()
-    except Exception:
-        ledger = {"per_model": {}, "global": {}}
-    try:
-        schedules = runpod_worker.pools_schedule_status()
-    except Exception:
-        schedules = []
-    live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods if p.get("healthy"))
+    from codai.api.thread_pool import run_on_control_pool
+    # The CONTROL pool, not the event loop and not the general executor. This
+    # is the page an operator opens when the server is busy, and it used to run
+    # its three snapshots inline: a lock held anywhere in the pool stalled the
+    # whole loop rather than this one request, and the page showed
+    # "Unexpected token '<'" because nginx had answered with its error HTML.
+    async def _part(fn, fallback):
+        try:
+            return await asyncio.wait_for(run_on_control_pool(fn), timeout=5.0)
+        except Exception:                      # noqa: BLE001 - degraded, not fatal
+            return fallback
+
+    pods, ledger, schedules = await asyncio.gather(
+        _part(runpod_worker.pods_status, []),
+        _part(runpod_ledger.totals, {"per_model": {}, "global": {}}),
+        _part(runpod_worker.pools_schedule_status, []))
+    # Every pod in the listing: RunPod bills from creation, and a pod spends
+    # ~12 minutes booting without ever being healthy. Counting only healthy
+    # pods showed $0.59 against an account billing $4.72 on 2026-10-18, which
+    # is the admin page telling an operator a booting fleet is free.
+    live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods)
+    serving_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods
+                         if p.get("healthy"))
     live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
     cfg = config_manager.config.runpod if config_manager and config_manager.config else None
     caps = {}
@@ -5366,6 +5376,8 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
     return {"success": True, "pods": pods, "ledger": ledger, "caps": caps,
             "schedules": schedules,
             "live_hourly_usd": round(live_hourly, 4),
+            "live_hourly_serving_usd": round(serving_hourly, 4),
+            "live_hourly_booting_usd": round(live_hourly - serving_hourly, 4),
             "live_uncommitted_usd": round(live_cost, 4)}
 
 

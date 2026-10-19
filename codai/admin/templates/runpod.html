@@ -74,7 +74,13 @@ async function rpRefresh(){
   const running = pods.filter(p=>p.healthy);
   document.getElementById('rp-podcount').textContent = running.length + (pods.length>running.length ? ` (+${pods.length-running.length} unhealthy)` : '');
   document.getElementById('rp-rate').textContent = _usd(d.live_hourly_usd);
-  document.getElementById('rp-rate-cap').textContent = caps.global_max_hourly_usd ? ('cap ' + _usd(caps.global_max_hourly_usd) + '/hr') : 'no rate cap';
+  // The rate now counts BOOTING pods too, because RunPod bills from creation.
+  // Say how much of it is boot: a fleet that is mostly boot is a ramp that is
+  // too steep, and that was invisible while the figure excluded them.
+  const boot = d.live_hourly_booting_usd || 0;
+  const capTxt = caps.global_max_hourly_usd ? ('cap ' + _usd(caps.global_max_hourly_usd) + '/hr') : 'no rate cap';
+  document.getElementById('rp-rate-cap').textContent =
+    boot > 0 ? (capTxt + ' · ' + _usd(boot) + '/hr still booting') : capTxt;
   document.getElementById('rp-uncommitted').textContent = _usd(d.live_uncommitted_usd);
   const gperiod = caps.global_cost_period || 'unlimited';
   const gspend = (d.ledger && d.ledger.global && gperiod!=='unlimited') ? d.ledger.global[gperiod] : null;

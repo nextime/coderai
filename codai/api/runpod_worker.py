@@ -5759,14 +5759,31 @@ def pools_schedule_status() -> list:
 
     This is the monitoring surface for the schedule — what is warm, what the
     window is, whether we are inside it and when that next flips.
+
+    Every lock here is taken with a timeout, exactly as `pods_status` does.
+    This function was the half of the /v1/runpod/status snapshot that had NOT
+    been bounded, so the endpoint could still hang on a pool whose condvar was
+    busy however carefully the other half gave up -- and a monitoring endpoint
+    that hangs during a boot wave is indistinguishable from a dead server.
+    A pool that cannot be read contributes a row saying so.
     """
     out = []
-    with _pools_lock:
-        pools = list(_pools.items())
+    with _lock_for_read(_pools_lock) as got:
+        pools = list(_pools.items()) if got else []
+    if not pools:
+        return [{"model": "", "enabled": False, "busy": True,
+                 "note": "the pool registry was locked; this snapshot is "
+                         "incomplete (a provisioning wave holds it)"}]
     for key, pool in pools:
         cfg = pool.mcfg
         st = schedule_state(cfg)
-        with pool._cv:
+        with _lock_for_read(pool._cv) as got:
+            if not got:
+                out.append({"model": key, "enabled": st["enabled"],
+                            "busy": True,
+                            "note": f"pool {key!r} was locked when this "
+                                    f"snapshot was taken"})
+                continue
             healthy = len([p for p in pool.pods if p.healthy])
         out.append({
             "model": key,

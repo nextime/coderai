@@ -465,8 +465,14 @@ async function loadRunpod(){
   if (!caps.enabled && !pods.length) { document.getElementById('runpod-card').style.display = 'none'; return; }
   document.getElementById('runpod-card').style.display = '';
   const rate = d.live_hourly_usd || 0;
+  // "N pod(s)" counted only the healthy ones beside a rate that now counts
+  // every pod that bills, so a booting fleet read as "0 pod(s) · $7.67/hr".
+  // Both halves say the same thing: what is serving, out of what is charged.
+  const serving = pods.filter(p=>p.healthy).length;
   document.getElementById('runpod-rate').textContent =
-    pods.filter(p=>p.healthy).length + ' pod(s) · $' + Number(rate).toFixed(2) + '/hr';
+    (serving === pods.length ? serving + ' pod(s)'
+                             : serving + '/' + pods.length + ' pod(s) serving')
+    + ' · $' + Number(rate).toFixed(2) + '/hr';
   const body = document.getElementById('runpod-body');
   if (!pods.length) {
     body.innerHTML = '<div class="dim small" style="padding:.5rem">No pods running (scaled to zero — a request will provision one).</div>';
