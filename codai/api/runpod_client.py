@@ -254,6 +254,64 @@ def _load_saved_catalog() -> list:
         return []
 
 
+_GQL_COUNTS: dict = {}
+_GQL_COUNT_SINCE = [time.time()]
+_GQL_REPORT_EVERY_S = 600.0
+_SAID: set = set()
+
+
+def _say_once(key: str, msg: str) -> None:
+    if key not in _SAID:
+        _SAID.add(key)
+        print(msg, flush=True)
+
+
+def _count_gql(query: str) -> None:
+    """Count GraphQL calls by operation and report the rate every 10 min:
+    a ban arrives without warning, so the volume that earns one must be seen
+    before it does."""
+    import re
+    m = re.search(r"\b(query|mutation)\b\s*(\w*)[^{]*\{\s*(\w+)", query or "")
+    op = (m.group(3) if m else "?")
+    _GQL_COUNTS[op] = _GQL_COUNTS.get(op, 0) + 1
+    now = time.time()
+    span = now - _GQL_COUNT_SINCE[0]
+    if span >= _GQL_REPORT_EVERY_S:
+        total = sum(_GQL_COUNTS.values())
+        top = ", ".join(f"{k} {v}" for k, v in
+                        sorted(_GQL_COUNTS.items(), key=lambda kv: -kv[1])[:6])
+        print(f"[runpod] GraphQL: {total} calls in {span/60:.0f} min "
+              f"({total / (span / 60):.1f}/min) — {top}", flush=True)
+        _GQL_COUNTS.clear()
+        _GQL_COUNT_SINCE[0] = now
+
+
+def gql_call_counts() -> dict:
+    return dict(_GQL_COUNTS)
+
+
+def _card_for(gpu_type_id: str) -> dict:
+    """{gpuDisplayName, gpuTypeId, gpuType{memoryInGb}} for a REST pod's
+    machine, from the catalogue (in memory, else saved) -- REST names the card
+    type and nothing else."""
+    rows = (_GPU_CATALOG[1] or []) or _load_saved_catalog_quiet()
+    for g in rows:
+        if g.get("id") == gpu_type_id:
+            return {"gpuDisplayName": g.get("display_name") or gpu_type_id,
+                    "gpuTypeId": gpu_type_id,
+                    "gpuType": {"memoryInGb": g.get("memory_gb") or 0}}
+    return {"gpuDisplayName": gpu_type_id, "gpuTypeId": gpu_type_id, "gpuType": {}}
+
+
+def _load_saved_catalog_quiet() -> list:
+    try:
+        import json
+        with open(_catalog_path()) as fh:
+            return list((json.load(fh) or {}).get("rows") or [])
+    except Exception:
+        return []
+
+
 def _gql_banned() -> bool:
     """True while RunPod's GraphQL rate limit is in force (see _note_rate_limit)."""
     return _GQL_BACKOFF_UNTIL[0] > time.time()
@@ -276,6 +334,9 @@ def _rest_pod_row(p: dict, pod_id: str = "", with_ports: bool = False) -> dict:
     """A REST pod object in the same shape get_pod / list_pods return from
     GraphQL. REST carries no GPU name, so the card fields come back blank."""
     p = p if isinstance(p, dict) else {}
+    gid = str(((p.get("machine") or {}).get("gpuTypeId")) or "")
+    if gid and not (p.get("machine") or {}).get("gpuDisplayName"):
+        p = dict(p, machine=_card_for(gid))
     row = {
         **_machine_fields(p),
         "id": p.get("id") or pod_id, "name": p.get("name"),
@@ -315,6 +376,7 @@ class RunpodClient:
         # 20 every 20 s from 11,871), and it has been hours long. Asking again
         # inside that window only re-confirms the ban, so callers get the answer
         # here, without a request.
+        _count_gql(query)
         until = _GQL_BACKOFF_UNTIL[0]
         if until > time.time():
             raise RunpodTransient(
@@ -353,6 +415,32 @@ class RunpodClient:
             raise RunpodError(f"RunPod GraphQL error: {msg}")
         return body.get("data") or {}
 
+    def _rest_boot_state(self, pod_id: str, port: int) -> dict:
+        """get_pod's answer from REST, with `ready` meaning the pod's mapped port
+        ACCEPTS a TCP connection. Falls back to GraphQL if REST fails outside a
+        ban."""
+        import socket
+        try:
+            row = _rest_pod_row(self._rest("GET", f"/pods/{pod_id}?includeMachine=true"),
+                                pod_id, with_ports=True)
+        except (RunpodError, RunpodTransient):
+            if _gql_banned():
+                raise
+            return self.get_pod(pod_id)
+        ok = False
+        for pt in row.get("ports") or []:
+            if int(pt.get("privatePort") or 0) == int(port) and pt.get("ip"):
+                try:
+                    with socket.create_connection((pt["ip"], int(pt["publicPort"])),
+                                                  timeout=3):
+                        ok = True
+                except OSError:
+                    ok = False
+        row["ready"] = ok and row.get("status") == "RUNNING"
+        if not row["ready"]:
+            row["ports"] = []
+        return row
+
     def _rest(self, method: str, path: str, body: Optional[dict] = None,
               timeout: float = 30.0):
         """One call to RunPod's REST API. Raises RunpodTransient/RunpodError."""
@@ -368,7 +456,16 @@ class RunpodClient:
             cls = (RunpodTransient
                    if r.status_code >= 500 or r.status_code in (408, 425, 429)
                    else RunpodError)
-            raise cls(f"RunPod REST {method} {path} HTTP {r.status_code}: {r.text[:300]}")
+            why = ""
+            if (r.status_code == 500 and method != "GET" and _gql_banned()
+                    and "unexpected end of JSON input" in (r.text or "")):
+                # Observed through a whole ban: REST reads worked, every REST
+                # write failed this way -- writes go through RunPod's GraphQL
+                # backend and share its rate limit.
+                why = (" — RunPod's REST writes share the GraphQL rate limit, "
+                       "so this cannot succeed until the ban ends")
+            raise cls(f"RunPod REST {method} {path} HTTP {r.status_code}: "
+                      f"{r.text[:300]}{why}")
         if not r.content:
             return {}
         try:
@@ -640,8 +737,13 @@ class RunpodClient:
             body.pop(GLOBAL_VOLUME_FIELD, None)
             r = requests.post(f"{rest}/pods", json=body, headers=hdrs, timeout=90)
         if r.status_code >= 400:
-            raise RunpodError(f"RunPod REST create failed ({r.status_code}): "
-                              f"{(r.text or '')[:400]}")
+            why = (" — RunPod's REST writes share the GraphQL rate limit, so this "
+                   "cannot succeed until the ban ends"
+                   if r.status_code == 500 and _gql_banned()
+                   and "unexpected end of JSON input" in (r.text or "") else "")
+            cls = RunpodTransient if r.status_code >= 500 else RunpodError
+            raise cls(f"RunPod REST create failed ({r.status_code}): "
+                      f"{(r.text or '')[:400]}{why}")
         data = r.json() if r.content else {}
         pod_id = (data.get("id") or (data.get("pod") or {}).get("id")
                   or (data.get("data") or {}).get("id"))
@@ -673,8 +775,8 @@ class RunpodClient:
     def get_pod(self, pod_id: str) -> dict:
         """Return {id, status, uptime_s, cost_per_hr, ports:[...], ready:bool, url?}."""
         if _gql_banned():
-            return _rest_pod_row(self._rest("GET", f"/pods/{pod_id}"), pod_id,
-                                 with_ports=True)
+            return _rest_pod_row(self._rest("GET", f"/pods/{pod_id}?includeMachine=true"),
+                                 pod_id, with_ports=True)
         q = """
         query Pod($input: PodFilter!) {
           pod(input: $input) {
@@ -754,10 +856,18 @@ class RunpodClient:
 
     def list_pods(self) -> list:
         """List the account's pods: [{id, name, status, cost_per_hr, image}]."""
-        if _gql_banned():
-            rows = self._rest("GET", "/pods")
+        # REST FIRST, always. This is called every minute by the reaper and
+        # the survivor sweep, and REST reads kept answering through a 3.3 h
+        # GraphQL ban -- the fewer GraphQL calls, the less likely the ban.
+        try:
+            rows = self._rest("GET", "/pods?includeMachine=true")
             rows = rows if isinstance(rows, list) else (rows or {}).get("data") or []
             return [_rest_pod_row(p, p.get("id")) for p in rows if isinstance(p, dict)]
+        except (RunpodError, RunpodTransient) as exc:
+            if _gql_banned():
+                raise
+            _say_once("rest-list", f"[runpod] REST pod listing failed ({exc}); "
+                                   f"using GraphQL for it")
         # runtime.uptimeInSeconds is what makes the reaper's grace period real:
         # without an age every pod looked undatable, and the "never reap a pod
         # younger than GRACE" backstop abstained on all of them.
@@ -871,7 +981,14 @@ class RunpodClient:
         last_transient = None
         while time.time() < deadline:
             try:
-                info = self.get_pod(pod_id)
+                # A direct-TCP pod is polled over REST + a TCP connect: polling
+                # GraphQL every 5 s per booting pod is what a 64-pod scale-up
+                # turns into hundreds of GraphQL calls a minute, and RunPod
+                # answered that with a 3.3 h ban. The connect is also the
+                # stronger signal: RunPod refuses it until the server inside
+                # listens, while GraphQL lists the port when the container starts.
+                info = (self._rest_boot_state(pod_id, port) if direct_tcp
+                        else self.get_pod(pod_id))
             except RunpodTransient as exc:
                 last_transient = exc
                 if not api_down_since:

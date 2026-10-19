@@ -101,3 +101,60 @@ def test_the_catalogue_is_saved_and_used_during_a_ban(monkeypatch, banned):
     monkeypatch.setattr(rc, "_GPU_CATALOG", (0.0, None))
     c, _ = _client(monkeypatch, lambda *a: {})
     assert c.list_gpu_types() == rows
+
+
+# ------------------------------------------------- fewer GraphQL calls at all #
+
+def test_listing_uses_rest_even_without_a_ban(monkeypatch):
+    """The reaper and the survivor sweep list every minute."""
+    rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    c, calls = _client(monkeypatch, lambda m, p, b: [dict(REST_POD, machine={"gpuTypeId": "NVIDIA A40"})])
+    rows = c.list_pods()
+    assert calls and calls[0][1].startswith("/pods?includeMachine=true")
+    assert rows[0]["id"] == "p1"
+
+
+def test_boot_polling_is_rest_plus_a_real_connect(monkeypatch):
+    """GraphQL lists the port when the container STARTS; RunPod refuses a TCP
+    connect until the server inside LISTENS. The connect is the signal."""
+    import socket
+    rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    c, _ = _client(monkeypatch, lambda m, p, b: REST_POD)
+    monkeypatch.setattr(socket, "create_connection",
+                        lambda *a, **k: (_ for _ in ()).throw(ConnectionRefusedError()))
+    assert c._rest_boot_state("p1", 8000)["ready"] is False
+
+    class _S:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: _S())
+    st = c._rest_boot_state("p1", 8000)
+    assert st["ready"] is True and st["ports"][0]["publicPort"] == 22187
+
+
+def test_graphql_calls_are_counted_by_operation():
+    rc._GQL_COUNTS.clear()
+    rc._count_gql("query Pod($input: PodFilter!) { pod(input: $input) { id } }")
+    rc._count_gql("mutation { podTerminate(input: {podId: \"x\"}) }")
+    got = rc.gql_call_counts()
+    assert got.get("pod") == 1 and got.get("podTerminate") == 1
+
+
+def test_a_rest_write_during_a_ban_says_why(monkeypatch):
+    import requests
+    rc._GQL_BACKOFF_UNTIL[0] = time.time() + 600
+
+    class _R:
+        status_code = 500
+        content = b"x"
+        text = '{"error":"delete pod: unexpected end of JSON input","status":500}'
+    monkeypatch.setattr(requests, "request", lambda *a, **k: _R())
+    c = rc.RunpodClient.__new__(rc.RunpodClient)
+    c._api_key, c._cfg = "k" * 20, None
+    with pytest.raises(rc.RunpodTransient) as e:
+        c._rest("DELETE", "/pods/p1")
+    assert "share the GraphQL rate limit" in str(e.value)
+    rc._GQL_BACKOFF_UNTIL[0] = 0.0

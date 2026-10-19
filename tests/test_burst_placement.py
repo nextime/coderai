@@ -1085,6 +1085,10 @@ def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
     class _W(rc.RunpodClient):
         def __init__(self): pass
         def get_pod(self, pod_id): return next(infos)
+        # A direct-TCP boot is polled over REST + a TCP connect (v0.4.56); the
+        # contract tested here -- keep waiting until the mapping is there -- is
+        # the same whichever source answers.
+        def _rest_boot_state(self, pod_id, port): return next(infos)
     monkeypatch.setattr(rc.time, "sleep", lambda s: None)
     assert _W().wait_ready("p1", 8000, direct_tcp=True) == "http://203.0.113.7:41234"
 
