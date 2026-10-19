@@ -37,7 +37,7 @@ no deploy on either side, and they are worth +33% throughput and −25% cost.
 ## 2. Concurrency — one rule
 
 ```
-in_flight = 64 × pods_ready        (capped at 8192)
+in_flight = 32 × pods_ready        (capped at 8192)
 ```
 
 Read `pods_ready` from `GET /v1/runpod/status` → `summary.pods_ready` and
@@ -52,14 +52,14 @@ immediately. The limits that do exist are pages, not requests:
 
 | limit | value | what it is |
 |---|---|---|
-| `max_inflight_per_pod × pods` | 64 × pods | pages a pod will take at once |
+| `max_inflight_per_pod × pods` | 32 × pods | pages a pod will take at once |
 | `ocr.max_concurrency` | 8192 | pages admitted into the OCR manager |
 | pod thread pool | 8192 | one thread per page in flight to a pod |
 
-All three line up at **8192 pages = 128 pods**, which is the configured
+All three line up at **4096 pages = 128 pods**, which is the configured
 `max_pods`. Asking for more than 8192 does not fail fast — the surplus waits for
 a pod lease and eventually times out, which is worse than being refused. Stay at
-or under `64 × pods_ready`.
+or under `32 × pods_ready`.
 
 ## 3. Memory — yours to bound, not ours
 
@@ -122,6 +122,24 @@ quality at near surya's price. No human triage: both tests are mechanical.
   `%PDF` header or no `%%EOF`. Screen locally before sending; each one
   otherwise costs a request and returns an error.
 
+## CORRECTION, 2026-10-19: it is 32 per pod, not 64
+
+An earlier version of this note said `in_flight = 64 × pods_ready`. That was
+wrong, and it was measured wrong: **a pod serves ~32 pages concurrently**
+(observed `Running: 29-32 reqs, Waiting: 0` on every pod of a live fleet), and
+the 0.557 pages/s figure below was itself measured at a concurrency of 32 on one
+pod. 64 was the configured ceiling, not an observed capacity.
+
+Sending 64 does not queue politely inside the orchestrator. It queues in the
+POD'S SOCKET BACKLOG, and when that overflows the pod starts refusing
+connections while remaining perfectly healthy. On 2026-10-19 that cost eight
+A40s: the orchestrator read the refusals as "the pod is gone" and terminated
+them mid-work with 522 pages in flight. coderai no longer terminates on a
+refused connection (v0.4.37), but there is still nothing to gain by offering a
+pod twice what it will take.
+
+**Send `32 × pods_ready`.** It is the measured optimum, not a safety margin.
+
 ## 7. Before a large run
 
 1. Lease the fleet you want:
@@ -145,7 +163,7 @@ quality at near surya's price. No human triage: both tests are mechanical.
    per-model rows under `schedules` report `effective_max_pods` (the ceiling
    actually in force), `client_max_pods` (your lease's own) and
    `client_lease_expires_in_s`.
-3. Then feed, holding `in_flight = 64 × pods_ready`, recomputed as that number
+3. Then feed, holding `in_flight = 32 × pods_ready`, recomputed as that number
    changes.
 
 ### Staging a campaign
