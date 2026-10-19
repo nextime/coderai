@@ -2647,6 +2647,27 @@ class PodHandle:
     #: keeps serving what it already has: killing a pod with requests on it to
     #: save money would be paying for the work twice.
     draining: bool = False
+    #: What THIS pod has shown it will accept at once, 0 until it has shown
+    #: anything. An upper bound discovered from the pod's own behaviour, applied
+    #: on top of whatever the operator configured.
+    #:
+    #: `max_inflight_per_pod` defaults to 0, which means unlimited -- so out of
+    #: the box the pool dispatches every page it is given, and a client that
+    #: offers more than a pod can serve does not queue in the orchestrator where
+    #: it would be visible and bounded. It queues in the POD'S LISTEN BACKLOG,
+    #: and an overflowing backlog refuses connections from a perfectly healthy
+    #: pod. Measured 2026-10-19: a client offering 64 per pod against pods that
+    #: serve ~32 (`Running: 29-32 reqs, Waiting: 0`) produced refusals that cost
+    #: eight A40s, and no configuration anywhere said 64 was too many.
+    #:
+    #: Halved on a refusal, from the in-flight count AT the refusal -- which is
+    #: the pod's observed breaking point, not a guess -- and walked back up one
+    #: slot at a time as pages succeed. So an install needs no knowledge of its
+    #: pods' capacity, and a client may offer whatever it likes: the surplus
+    #: waits on this side, where it is counted.
+    soft_limit: int = 0
+    #: Successful releases since the limit last moved. Drives the increase.
+    since_limit_change: int = 0
     #: Set aside after a connection-level failure, until this moment, and NOT
     #: terminated. See `discard`.
     #:
@@ -3954,7 +3975,10 @@ class RunpodPodPool:
             if p.draining:
                 draining += 1
                 continue
-            cap = self.pod_capacity(p)          # scaled to THIS pod's card
+            # Scaled to THIS pod's card, and narrowed by what this pod has
+            # shown it will accept: a configured ceiling the pod cannot honour
+            # is not a ceiling, it is an overload waiting to be misdiagnosed.
+            cap = self.pod_capacity_now(p)
             if cap <= 0 or p.inflight < cap:
                 free.append(p)
             else:
@@ -4092,6 +4116,44 @@ class RunpodPodPool:
                               else base_up * facts["weight"])
         cache[key] = facts
         return facts
+
+    def pod_capacity_now(self, pod: "PodHandle") -> int:
+        """How many pages this pod may hold RIGHT NOW: 0 for no bound.
+
+        The operator's configured capacity, narrowed by what the pod has shown
+        it will actually accept. The narrowing is what lets a client offer more
+        than the fleet can take without any of it reaching a socket backlog --
+        the surplus waits in `acquire`, which counts it, reports it as demand
+        and is where a queue belongs.
+        """
+        cap = int(self.pod_capacity(pod) or 0)
+        soft = int(getattr(pod, "soft_limit", 0) or 0)
+        if soft <= 0:
+            return cap
+        return soft if cap <= 0 else min(cap, soft)
+
+    def note_refusal(self, pod: "PodHandle") -> int:
+        """This pod refused a connection: halve what we send it. Returns the new
+        width.
+
+        From the in-flight count at the moment of refusal, because that is the
+        pod's OBSERVED breaking point. Halving a configured number instead would
+        be halving a number that was already wrong.
+        """
+        with self._cv:
+            observed = max(int(pod.inflight), int(getattr(pod, "soft_limit", 0) or 0))
+            if observed <= 0:
+                observed = SOFT_LIMIT_FLOOR * 2
+            new = max(SOFT_LIMIT_FLOOR, observed // 2)
+            prev = int(getattr(pod, "soft_limit", 0) or 0)
+            pod.soft_limit = new
+            pod.since_limit_change = 0
+        if new != prev:
+            print(f"[runpod] pod {pod.pod_id} refused a connection with "
+                  f"{observed} page(s) on it — sending it at most {new} at a "
+                  f"time from now (was {prev or 'unbounded'}). The surplus waits "
+                  f"here rather than in its socket backlog.", flush=True)
+        return new
 
     def pod_weight(self, pod: "PodHandle") -> float:
         """This pod's share of the load — memoised per card. See `_card_facts`."""
@@ -4600,6 +4662,18 @@ class RunpodPodPool:
         with self._cv:
             pod.inflight = max(0, pod.inflight - 1)
             pod.last_ok = time.time()
+            # Walk a narrowed pod back up. Only a pod that WAS narrowed: an
+            # unbounded pool stays unbounded unless a pod has told us otherwise,
+            # so nothing changes for an install this never fired on.
+            soft = int(getattr(pod, "soft_limit", 0) or 0)
+            if soft > 0:
+                ceiling = int(self.pod_capacity(pod) or 0)
+                pod.since_limit_change = int(
+                    getattr(pod, "since_limit_change", 0) or 0) + 1
+                if (pod.since_limit_change >= SOFT_LIMIT_RECOVER_EVERY
+                        and (ceiling <= 0 or soft < ceiling)):
+                    pod.soft_limit = soft + 1
+                    pod.since_limit_change = 0
             # Oldest first: the slots are interchangeable (nothing identifies
             # which page holds which), and dropping the oldest keeps the list a
             # true picture of how long the REMAINING ones have been held, which
@@ -4650,15 +4724,24 @@ class RunpodPodPool:
         with self._cv:
             if pod not in self.pods:
                 return
+            held = int(pod.inflight)
+        # BEFORE the quarantine, so the width is learned from the load that
+        # actually broke it. This is the part that makes the fleet work at
+        # whatever concurrency a client offers: the pod tells us its width by
+        # refusing, and we stop exceeding it.
+        width = self.note_refusal(pod)
+        with self._cv:
+            if pod not in self.pods:
+                return
             pod.healthy = False
             pod.quarantined_until = now + QUARANTINE_S
             self._bump_cards()
-            held = int(pod.inflight)
         print(f"[runpod] pod {pod.pod_id} set aside for {QUARANTINE_S:.0f}s: "
               f"{reason}. NOT terminated — a refused connection is as likely to "
               f"mean the pod is overloaded as gone, and it still has {held} "
               f"page(s) charged to it. It is re-probed when the quarantine "
-              f"expires.", flush=True)
+              f"expires, and will then be fed at most {width} at a time.",
+              flush=True)
 
     def forget(self, pod: PodHandle, reason: str = "gone") -> bool:
         """Drop a pod that no longer exists. Like ``discard``, minus the kill.
@@ -5498,6 +5581,19 @@ QUARANTINE_S = 45.0
 #: for nothing. Fewer would start guessing again.
 QUARANTINE_STRIKES = 3
 
+#: Never let a pod's discovered width fall below this. A pod that refused once
+#: is not a pod worth one page at a time -- collapsing it that far would turn a
+#: brief overload into a fleet that cannot drain a queue.
+SOFT_LIMIT_FLOOR = 4
+
+#: Successful pages between one-slot increases. The decrease is multiplicative
+#: and the increase additive, the standard shape, because the two errors are not
+#: symmetric: overshooting costs refused connections, undershooting costs a
+#: little latency. 64 means a pod that was halved from 32 to 16 is back at 32
+#: after ~1000 successful pages -- fast enough to recover from a transient,
+#: slow enough not to re-provoke a real limit.
+SOFT_LIMIT_RECOVER_EVERY = 64
+
 
 def _slots_of(pod) -> list:
     """A pod's in-flight timestamp list, created on demand.
@@ -6320,6 +6416,13 @@ def pods_status() -> list:
                         max(0, int(p.quarantined_until - now))
                         if getattr(p, "quarantined_until", 0) else 0),
                     "probe_failures": int(getattr(p, "probe_failures", 0) or 0),
+                    # What this pod is actually being fed, and what it was
+                    # configured for. A fleet running at half its configured
+                    # width is the single most useful thing to know when
+                    # throughput is below expectation.
+                    "capacity": pool.pod_capacity_now(p) if hasattr(
+                        pool, "pod_capacity_now") else 0,
+                    "soft_limit": int(getattr(p, "soft_limit", 0) or 0),
                     "data_center": getattr(p, "data_center", "") or "",
                     "cloud_type": getattr(p, "cloud_type", "") or "",
                     "pool": (pool.mcfg.pool or "") if getattr(pool, "mcfg", None) else "",

@@ -1023,6 +1023,18 @@ class OcrConfig:
     # `max_resident_mb` below; this stays what its first line always said it was,
     # a ceiling on concurrent page WORK.
     max_concurrency: int = 64            # global ceiling on in-flight OCR pages
+    # How many pages may be ACCEPTED AND WAITING for a slot before the server
+    # starts refusing new requests with 429. 0 = follow `max_concurrency`.
+    #
+    # The queue is deliberate, not an overflow: when a pod finishes a page there
+    # must already be another page ready to hand it, or the fleet idles between
+    # every dispatch and the pods are paid for the gap. What the queue must not
+    # do is grow without limit -- a client that offers ten times the capacity
+    # then waits longer and longer for each reply, which it reads as "the pages
+    # are getting slower" rather than "stop sending". Past this depth the
+    # honest answer is 429 with a Retry-After, and a client that obeys it gets
+    # its work done sooner than one that keeps pushing.
+    max_queued_pages: int = 0
     # Ceiling on the bytes that in-flight documents may hold in RASTERISED pages,
     # charged before a page exists (codai/ocr/budget.py prices a document from its
     # page tree). 0 = derive it from the cgroup limit or host RAM, which is the
@@ -2441,6 +2453,7 @@ class ConfigManager:
                     ("CODERAI_OCR_OLMOCR_MAX_CONTINUATIONS",
                      "olmocr_max_continuations", int),
                     ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency", int),
+                    ("CODERAI_OCR_MAX_QUEUED_PAGES", "max_queued_pages", int),
                     ("CODERAI_OCR_MAX_RESIDENT_MB", "max_resident_mb", int),
                     ("CODERAI_OCR_PAGE_WINDOW", "page_window", int),
                     ("CODERAI_OCR_RASTER_WORKERS", "raster_workers", int),

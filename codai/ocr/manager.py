@@ -28,6 +28,7 @@ bounds the whole subsystem.
 """
 
 import asyncio
+import contextlib
 import os
 import threading
 import time
@@ -1410,6 +1411,15 @@ class OcrManager:
         self._sem: Optional[asyncio.Semaphore] = None
         self._lock = asyncio.Lock()
         self._releaser_registered = False
+        #: Pages holding a slot, and pages waiting for one. Two numbers, because
+        #: they answer different questions: the first is how much work is
+        #: happening, the second is how much has been accepted and is not
+        #: happening yet. Only the second can say "stop sending".
+        self._pages_running = 0
+        self._pages_queued = 0
+        #: Used until `configure` supplies the real one. Cached, because a
+        #: semaphore created per page is not a limit.
+        self._fallback_sem: Optional[asyncio.Semaphore] = None
 
     def configure(self, cfg) -> None:
         """Point the manager at the current OcrConfig. Rebuilds pools if params changed."""
@@ -1808,13 +1818,75 @@ class OcrManager:
         return [n for n in names
                 if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
 
+    def _slot_sem(self) -> "asyncio.Semaphore":
+        """The one semaphore every page waits on.
+
+        ONE, cached. The per-page expression this replaced -- `self._sem or
+        asyncio.Semaphore(4)` -- built a FRESH semaphore for every page when the
+        manager had not been configured, so the fallback bounded nothing at all:
+        forty pages of a document all ran at once against a limit of four. It
+        read as a limit in every line of code that mentioned it.
+        """
+        if self._sem is None:
+            if self._fallback_sem is None:
+                self._fallback_sem = asyncio.Semaphore(4)
+            return self._fallback_sem
+        return self._sem
+
+    @contextlib.asynccontextmanager
+    async def _page_slot(self):
+        """Hold one of the install's page slots, counted while waiting for it.
+
+        Every page goes through here so that `admission()` can answer honestly.
+        The waiting count is the whole point: without it a server under more
+        load than it can carry is indistinguishable, from outside, from one
+        working normally -- it simply answers later and later, which a client
+        reads as the pages getting slower rather than as "stop sending".
+        """
+        sem = self._slot_sem()
+        self._pages_queued += 1
+        try:
+            await sem.acquire()
+        except BaseException:
+            self._pages_queued -= 1
+            raise
+        self._pages_queued -= 1
+        self._pages_running += 1
+        try:
+            yield
+        finally:
+            self._pages_running -= 1
+            sem.release()
+
+    def admission(self) -> dict:
+        """What the install is carrying, and whether it can take more.
+
+        ``queue_limit`` is how many pages may be ACCEPTED AND WAITING before a
+        new request is refused. Derived from `max_concurrency` when the operator
+        has not set `max_queued_pages`, because the two are the same kind of
+        number and an install that tunes one should not have to discover the
+        other exists.
+        """
+        cfg = getattr(self._cfg, "max_concurrency", 0) if self._cfg else 0
+        try:
+            width = max(1, int(cfg or 0))
+        except (TypeError, ValueError):
+            width = 1
+        try:
+            qmax = int(getattr(self._cfg, "max_queued_pages", 0) or 0)
+        except (TypeError, ValueError):
+            qmax = 0
+        if qmax <= 0:
+            qmax = width
+        return {"running": self._pages_running, "queued": self._pages_queued,
+                "width": width, "queue_limit": qmax,
+                "full": self._pages_queued >= qmax}
+
     async def _pages_with(self, name: str, images: List, lang: str = "",
                           base: int = 0) -> List[OcrPage]:
         pool = await self._get_pool(name, lang)
-        sem = self._sem or asyncio.Semaphore(4)
-
         async def _one(idx, img):
-            async with sem:
+            async with self._page_slot():
                 page = await pool.recognize(img)
                 # `base` is the document-wide index of this window's first page, so
                 # a windowed read numbers pages the same way a whole-document read
@@ -2339,7 +2411,6 @@ class OcrManager:
                  if is_pdf else [data])
         if not parts:
             return None
-        sem = self._sem or asyncio.Semaphore(4)
         opts = dict(page_opts or {})
         refused: list = []
         unreachable: list = []
@@ -2357,7 +2428,7 @@ class OcrManager:
             every=300.0)
 
         async def _one(idx: int, blob: bytes):
-            async with sem:
+            async with self._page_slot():
                 if refused:
                     # Another page already found the pods cannot run it. Do not
                     # send the rest of the document one failure at a time.
@@ -2598,10 +2669,8 @@ class OcrManager:
         if mode == "off":
             return [], []
 
-        sem = self._sem or asyncio.Semaphore(4)
-
         async def _one(idx, img, page):
-            async with sem:
+            async with self._page_slot():
                 res = await asyncio.to_thread(detect_page, img, page, cfg, mode)
                 for d in res["stamps"]:
                     d["page"] = base + idx

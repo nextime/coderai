@@ -77,6 +77,54 @@ def _page_opts(max_tokens, max_continuations) -> dict:
     return out
 
 
+def _refuse_if_full(cfg) -> None:
+    """429 when the queue that keeps the pods fed is itself full.
+
+    THE QUEUE IS DELIBERATE. When a pod finishes a page there has to be another
+    page already waiting, or the fleet idles between every dispatch and is paid
+    for the gap. So the server accepts `ocr.max_concurrency` pages in flight
+    PLUS `ocr.max_queued_pages` waiting, and only past that does it refuse.
+
+    What it must not do is accept without limit. A client offering several times
+    the capacity does not get an error -- it gets replies that take longer and
+    longer, which reads as "the pages are getting slower", not as "stop
+    sending". It then does exactly the wrong thing and sends more. Measured
+    2026-10-19: a client offered 522 pages at once against a fleet that could
+    carry ~250, mean page latency went to 238 s against a 19 s service time,
+    and nothing in any reply said the server was over its capacity.
+
+    Refused BEFORE the upload is read, which matters twice: the client learns
+    immediately instead of after transferring a document the server was never
+    going to look at, and the server does not buffer megabytes it is about to
+    discard. The in-flight memory of this endpoint is concurrent requests times
+    upload size, and that product is the one that has OOM-killed it before.
+
+    `Retry-After` is the actionable half. A client that honours it finishes
+    sooner than one that retries immediately, because its retries stop
+    competing with the work already accepted.
+    """
+    try:
+        state = ocr_manager.admission()
+    except Exception:
+        return                      # never let admission accounting refuse work
+    if not state.get("full"):
+        return
+    raise HTTPException(
+        status_code=429,
+        detail=(f"{state['queued']} page(s) are already queued for a slot "
+                f"(ocr.max_queued_pages = {state['queue_limit']}, with "
+                f"{state['running']} of {state['width']} in flight). The queue "
+                f"is kept full on purpose so no pod waits for work; this "
+                f"request is past it. Retry after the Retry-After interval — "
+                f"pushing harder makes every accepted page slower, including "
+                f"this one when it is accepted."),
+        headers={"Retry-After": "2",
+                 "X-OCR-Pages-Running": str(state["running"]),
+                 "X-OCR-Pages-Queued": str(state["queued"]),
+                 "X-OCR-Page-Width": str(state["width"]),
+                 "X-OCR-Queue-Limit": str(state["queue_limit"])})
+
+
 async def _bounded(cfg, coro):
     """Run an OCR read under the install's wall-clock ceiling, if it set one.
 
@@ -151,6 +199,7 @@ async def create_ocr(
     if cfg is None:
         raise HTTPException(status_code=503, detail="OCR subsystem is not available")
     ocr_manager.configure(cfg)
+    _refuse_if_full(cfg)
 
     data = await file.read()
     if not data:
@@ -202,6 +251,7 @@ async def create_ocr_batch(
     if cfg is None:
         raise HTTPException(status_code=503, detail="OCR subsystem is not available")
     ocr_manager.configure(cfg)
+    _refuse_if_full(cfg)
 
     payloads = []
     for f in files:
