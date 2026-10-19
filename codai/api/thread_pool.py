@@ -84,7 +84,7 @@ _MAX_DEFAULT = 256
 #: Past this an async client really is the right answer rather than more
 #: stacks; 8192 covers 128 pods at 64 pages each, which is a fleet large enough
 #: that the next bottleneck is somewhere else entirely.
-_MAX_POD = 8192
+_MAX_POD = 16384
 
 #: Width of the LEASE pool. Deliberately small and NOT derived from
 #: `max_concurrency`: a lease is a bounded wait (`POD_LEASE_ATTEMPT_S`) that

@@ -27,7 +27,7 @@ import httpx
 #: binding limit on a campaign nobody could see; the ceiling is here so a
 #: mistyped config cannot ask for a file descriptor per page of a million-page
 #: corpus.
-_FWD_MIN, _FWD_MAX = 256, 8192
+_FWD_MIN, _FWD_MAX = 256, 32768
 
 
 def _forward_ceiling(config) -> int:

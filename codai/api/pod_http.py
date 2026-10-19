@@ -76,7 +76,7 @@ def _pool_size() -> int:
 
 
 #: Ceiling on the async client's connections across the WHOLE fleet.
-_MAX_FLEET_POOL = 16384
+_MAX_FLEET_POOL = 32768
 
 
 def _fleet_pool_size() -> int:
