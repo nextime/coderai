@@ -104,7 +104,12 @@ def test_an_unhealthy_pod_does_not_satisfy_the_floor_when_there_is_room():
 def test_worker_uses_two_distinct_counts():
     src = open("codai/api/runpod_worker.py").read()
     assert "billing_in_hand = len(self.pods) + self._booting" in src
-    assert "healthy_in_hand = len([p for p in self.pods if p.healthy]) + self._booting" in src
+    # The deficit count also credits a QUARANTINED pod since v0.4.37: it is
+    # ours and billing and due back in seconds, so renting over it buys ~700s
+    # of boot to cover a 45s gap. Still a count of pods that can SERVE soon,
+    # as distinct from pods that BILL.
+    assert "if p.healthy or p.quarantined_until])" in src
+    assert "healthy_in_hand" in src and "+ self._booting" in src
     assert "max(0, self.effective_max_pods() - billing_in_hand)" in src, \
         "the max_pods cap must be tested against pods that bill"
     assert "want = min(keep_min - healthy_in_hand," in src, \

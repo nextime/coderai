@@ -359,8 +359,8 @@ def test_the_warm_top_up_does_not_stack_on_a_booting_pod():
     """
     src = __import__("pathlib").Path(rw.__file__).read_text()
     blk = src.split("def maintain")[1].split("def close")[0]
-    assert ("healthy_in_hand = len([p for p in self.pods if p.healthy]) "
-            "+ self._booting") in blk
+    assert "if p.healthy or p.quarantined_until])" in blk
+    assert "healthy_in_hand" in blk
     assert "billing_in_hand = len(self.pods) + self._booting" in blk
     assert "want = min(keep_min - healthy_in_hand," in blk
     # the cap must be the billing count, or the regression returns

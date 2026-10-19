@@ -332,11 +332,17 @@ class RunpodBackend(ModelBackend):
             release()
 
     def _unreachable(self) -> None:
-        """The pod refused the connection: drop it and let the caller retry.
+        """The pod refused the connection: set it aside and let the caller retry.
 
         A pod terminated behind the pool's back (the test harness reaping by
         API, a reclaimed spot machine) stays "healthy" until the next timed
         probe; without this, one request in that window fails for nothing.
+
+        `discard` takes it out of rotation and does NOT terminate it: a refused
+        connection is as likely to mean the pod's listen backlog is full as that
+        the pod is gone, and the pool re-probes it before deciding. Reporting a
+        refusal here is therefore cheap and safe, which it was not when this
+        call destroyed the card.
         """
         pod = getattr(self, "_last_pod", None)
         if pod is not None and self._pool is not None:

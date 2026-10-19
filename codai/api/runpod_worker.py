@@ -2647,6 +2647,21 @@ class PodHandle:
     #: keeps serving what it already has: killing a pod with requests on it to
     #: save money would be paying for the work twice.
     draining: bool = False
+    #: Set aside after a connection-level failure, until this moment, and NOT
+    #: terminated. See `discard`.
+    #:
+    #: A pod whose listen backlog is full refuses connections while being
+    #: perfectly alive and busy, and refuses them on /healthz too -- so neither
+    #: the failed request nor the probe that follows it can tell "overloaded"
+    #: from "gone". Terminating on that evidence destroyed eight healthy A40s in
+    #: 69 seconds on 2026-10-19, with 522 pages in flight on them.
+    quarantined_until: float = 0.0
+    #: Consecutive post-quarantine probes that found nothing. Only a pod that
+    #: fails several of these, with no work on it, is treated as dead.
+    probe_failures: int = 0
+    #: Last time this pod answered anything at all. A pod that completed a
+    #: request a moment ago is not a candidate for "it must have vanished".
+    last_ok: float = 0.0
     console_url: str = ""
     #: How far its /logs have been drained into our own file.
     log_cursor: int = 0
@@ -4487,6 +4502,11 @@ class RunpodPodPool:
                           f"for one card)", flush=True)
                 p.healthy = True
                 p.last_used = time.time()
+                # Re-discovering a pod is positive evidence it is there, which
+                # is what the quarantine was waiting for. Clearing it keeps the
+                # two pieces of state from disagreeing about one pod.
+                p.quarantined_until = 0.0
+                p.probe_failures = 0
                 self._cv.notify_all()
                 return False
             self.pods.append(handle)
@@ -4494,9 +4514,92 @@ class RunpodPodPool:
             self._cv.notify_all()
             return True
 
+    def _recheck_quarantined(self, now: float) -> None:
+        """Bring back, or finally give up on, the pods `discard` set aside.
+
+        The decision that must not be taken on one failed connection is taken
+        here instead, on evidence that separates the two cases:
+
+        * it answers again -> back into rotation. This is the common case, and
+          the whole reason `discard` stopped terminating.
+        * it has work in flight -> left alone whatever the probe says. Killing a
+          pod with pages on it loses those pages AND pays for them.
+        * it fails `QUARANTINE_STRIKES` probes in a row with nothing in flight
+          -> treated as dead and terminated. A pod that cannot be reached over
+          several minutes while carrying no load is not under backpressure.
+
+        The account listing remains the authority on a pod that no longer
+        exists; the reconcile sweep handles that case and closes the bill
+        without an API call. This is only about a pod that still exists and
+        will not talk to us.
+        """
+        with self._cv:
+            due = [p for p in self.pods
+                   if p.quarantined_until and now >= p.quarantined_until]
+        for pod in due:
+            if pod.inflight > 0:
+                # Still carrying work -- so something IS getting through, or the
+                # slots are stale and the reclaim sweep will lower them. Either
+                # way this is not a pod to destroy.
+                with self._cv:
+                    pod.quarantined_until = now + QUARANTINE_S
+                continue
+            alive = self._pod_reachable(pod)
+            with self._cv:
+                if pod not in self.pods:
+                    continue
+                if alive:
+                    pod.healthy = True
+                    pod.quarantined_until = 0.0
+                    pod.probe_failures = 0
+                    pod.last_ok = now
+                    self._bump_cards()
+                    self._cv.notify_all()
+                    print(f"[runpod] pod {pod.pod_id} answers again — back in "
+                          f"rotation for {self.model_key!r} (it was overloaded, "
+                          f"not gone)", flush=True)
+                    continue
+                pod.probe_failures += 1
+                strikes = pod.probe_failures
+                if strikes < QUARANTINE_STRIKES:
+                    pod.quarantined_until = now + QUARANTINE_S
+            if not alive and strikes >= QUARANTINE_STRIKES:
+                with self._cv:
+                    if pod in self.pods:
+                        self.pods.remove(pod)
+                        self._bump_cards()
+                print(f"[runpod] pod {pod.pod_id} failed {strikes} probes over "
+                      f"~{QUARANTINE_S * strikes:.0f}s with nothing in flight — "
+                      f"terminating it", flush=True)
+                threading.Thread(
+                    target=self._terminate,
+                    args=(pod, f"unreachable for {strikes} probes"),
+                    daemon=True).start()
+
+    def _pod_reachable(self, pod: PodHandle) -> bool:
+        """Does anything answer at this pod's address?
+
+        Unauthenticated /healthz on purpose: the question here is "is there a
+        server there", not "may we use it". A pod that answers anything at all,
+        including an error, exists -- and a pod that exists must not be
+        destroyed by this path.
+        """
+        base = str(getattr(pod, "url", "") or "").rstrip("/")
+        if not base:
+            return False
+        if base.endswith("/v1"):
+            base = base[:-3].rstrip("/")
+        try:
+            from codai.api import pod_http
+            reply = pod_http.get(base + "/healthz", timeout=15)
+        except Exception:
+            return False
+        return int(getattr(reply, "status_code", 0) or 0) > 0
+
     def release(self, pod: PodHandle):
         with self._cv:
             pod.inflight = max(0, pod.inflight - 1)
+            pod.last_ok = time.time()
             # Oldest first: the slots are interchangeable (nothing identifies
             # which page holds which), and dropping the oldest keeps the list a
             # true picture of how long the REMAINING ones have been held, which
@@ -4508,22 +4611,54 @@ class RunpodPodPool:
             self._cv.notify_all()
 
     def discard(self, pod: PodHandle, reason: str = "unreachable") -> None:
-        """Drop a pod that refused a connection, now, not at the next sweep.
+        """Set aside a pod that refused a connection. DOES NOT TERMINATE IT.
 
-        The maintenance loop probes on a timer; between two probes a pod that
-        was terminated behind the pool's back (the test harness reaping by
-        API, RunPod reclaiming a spot machine) is still handed out, and the
-        request fails with "connection refused" for something the pool could
-        have known. The caller retries on a fresh acquire.
+        Between two timed probes a pod terminated behind the pool's back (the
+        test harness reaping by API, RunPod reclaiming a spot machine) is still
+        handed out, and the request fails for something the pool could have
+        known. Taking it out of rotation at once is right, and that part has not
+        changed: the caller retries on a fresh acquire.
+
+        KILLING IT IS NOT. This used to terminate, on the reasoning that a
+        refused connection means the pod is gone. It does not. A pod whose
+        listen backlog is full refuses connections while being perfectly alive
+        and busy -- and refuses them on /healthz too, so the "is anything still
+        there?" probe that was added to protect against exactly this agrees that
+        the pod has vanished.
+
+        Observed 2026-10-19, mid-campaign, ~58 concurrent connections per pod:
+
+            08:36:13  pod 2n69g0vt47h0hl terminated (connection refused)
+            08:36:30  pod c79lv31ayh28l1 terminated (connection refused)
+            ... eight healthy A40s in 69 seconds ...
+            08:37:22  pod n9fpbskd7owl2h terminated (connection refused)
+
+        522 pages were in flight on them. The warm floor then re-rented eight
+        more, which booted for ~12 minutes, began refusing, and were killed
+        again -- $3.72 of pods billed, more than the campaign's whole spend,
+        on boots that never produced a page. Throughput was 0.577 pages/s
+        against a measured 0.557 PER POD.
+
+        A refusal under load is backpressure. So the pod is quarantined instead:
+        out of rotation, still ours, still counted against max_pods (it is still
+        billing, and pretending otherwise is how a pool rents a replacement for
+        a card it already has). `maintain` re-probes it when the quarantine
+        expires, and only a pod that fails several probes WITH NO WORK ON IT is
+        finally treated as dead -- see `_recheck_quarantined`.
         """
+        now = time.time()
         with self._cv:
             if pod not in self.pods:
                 return
             pod.healthy = False
-            self.pods.remove(pod)
+            pod.quarantined_until = now + QUARANTINE_S
             self._bump_cards()
-        print(f"[runpod] pod {pod.pod_id} dropped from the pool: {reason}", flush=True)
-        threading.Thread(target=self._terminate, args=(pod, reason), daemon=True).start()
+            held = int(pod.inflight)
+        print(f"[runpod] pod {pod.pod_id} set aside for {QUARANTINE_S:.0f}s: "
+              f"{reason}. NOT terminated — a refused connection is as likely to "
+              f"mean the pod is overloaded as gone, and it still has {held} "
+              f"page(s) charged to it. It is re-probed when the quarantine "
+              f"expires.", flush=True)
 
     def forget(self, pod: PodHandle, reason: str = "gone") -> bool:
         """Drop a pod that no longer exists. Like ``discard``, minus the kill.
@@ -5093,6 +5228,10 @@ class RunpodPodPool:
             except Exception:
                 pass
         self._reclaim_stranded_inflight(now)
+        # Before anything else decides how many pods are serving: a quarantined
+        # pod is not healthy, so leaving it set aside inflates the warm-floor
+        # deficit and rents a replacement for a card we are already paying for.
+        self._recheck_quarantined(now)
         self._scale_down(now)
         with self._cv:
             pods = list(self.pods)
@@ -5208,7 +5347,15 @@ class RunpodPodPool:
                 # already running. Observed 2026-10-18: a pod adopted at 17:41,
                 # a restart at 17:43, a second pod rented at 17:46, $1.18/hr for
                 # a configuration that asked for $0.59.
-                healthy_in_hand = len([p for p in self.pods if p.healthy]) + self._booting
+                # A QUARANTINED POD COUNTS TOWARD THE FLOOR. It is not
+                # healthy, so it cannot serve a page right now -- but it is ours,
+                # it is billing, and it is expected back within QUARANTINE_S.
+                # Renting a replacement means ~700 s of paid boot to cover a 45 s
+                # gap, and then two cards where the floor asked for one. That is
+                # precisely the loop that turned eight refused connections into
+                # sixteen pods and $3.72 of boots on 2026-10-19.
+                healthy_in_hand = len([p for p in self.pods
+                                       if p.healthy or p.quarantined_until]) + self._booting
                 billing_in_hand = len(self.pods) + self._booting
                 parallel = max(1, int(getattr(self.mcfg,
                                               "scale_up_max_parallel_boots", 4) or 4))
@@ -5337,6 +5484,19 @@ def _forget_unavailable(gpu_type_id: str, dc: str = "") -> None:
 #: that IS in use would hand the same pod more work than its cap allows, while
 #: holding a phantom a few minutes longer costs only those minutes.
 INFLIGHT_TTL_S = 900.0
+
+#: How long a pod that refused a connection stays out of rotation before it is
+#: re-probed. Long enough for a full listen backlog to drain -- the condition
+#: that makes a healthy pod look dead -- and short enough that a fleet does not
+#: spend minutes at reduced width over a momentary burst.
+QUARANTINE_S = 45.0
+
+#: Consecutive failed probes, each a QUARANTINE_S apart and each with NO work in
+#: flight, before a quarantined pod is finally terminated. Three is ~2 minutes
+#: of a pod that exists, bills, and will not answer while carrying nothing:
+#: past that it is dead in every sense that matters and keeping it costs money
+#: for nothing. Fewer would start guessing again.
+QUARANTINE_STRIKES = 3
 
 
 def _slots_of(pod) -> list:
@@ -5728,7 +5888,12 @@ def fleet_summary(pods: list = None) -> dict:
     """
     rows = pods_status() if pods is None else pods
     ready = [p for p in rows if p.get("state") == "ready" and p.get("healthy")]
-    booting = [p for p in rows if p.get("state") != "ready"]
+    quarantined = [p for p in rows if p.get("state") == "quarantined"]
+    # A set-aside pod is not booting. Counting it as one told an operator a
+    # settled fleet was still starting up, and told a client sizing its
+    # in-flight window from pods_ready to wait for pods that were already here.
+    booting = [p for p in rows
+               if p.get("state") not in ("ready", "quarantined")]
 
     def _tally(key, src):
         out = {}
@@ -5740,6 +5905,7 @@ def fleet_summary(pods: list = None) -> dict:
     return {
         "pods_total": len(rows),
         "pods_ready": len(ready),
+        "pods_quarantined": len(quarantined),
         "pods_booting": len(booting),
         "pods_unhealthy": len([p for p in rows
                                if p.get("state") == "ready" and not p.get("healthy")]),
@@ -6142,7 +6308,18 @@ def pods_status() -> list:
                     "is_spot": p.is_spot, "healthy": p.healthy, "inflight": p.inflight,
                     "hourly_usd": p.hourly_usd, "uptime_s": int(now - p.started_at),
                     "live_cost_usd": round((now - p.started_at) / 3600.0 * p.hourly_usd, 4),
-                    "console_url": p.console_url, "state": "ready",
+                    "console_url": p.console_url,
+                    # A quarantined pod is NOT "ready" and is not gone either.
+                    # Reporting it as one or the other is how an operator sees
+                    # either a fleet that is fine or a fleet that shrank, when
+                    # what happened is that a pod was set aside and is coming
+                    # back.
+                    "state": ("quarantined"
+                              if getattr(p, "quarantined_until", 0) else "ready"),
+                    "quarantined_for_s": (
+                        max(0, int(p.quarantined_until - now))
+                        if getattr(p, "quarantined_until", 0) else 0),
+                    "probe_failures": int(getattr(p, "probe_failures", 0) or 0),
                     "data_center": getattr(p, "data_center", "") or "",
                     "cloud_type": getattr(p, "cloud_type", "") or "",
                     "pool": (pool.mcfg.pool or "") if getattr(pool, "mcfg", None) else "",
