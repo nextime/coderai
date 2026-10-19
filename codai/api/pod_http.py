@@ -75,6 +75,38 @@ def _pool_size() -> int:
     return max(_DEFAULT_POOL, min(_MAX_POOL, want))
 
 
+#: Ceiling on the async client's connections across the WHOLE fleet.
+_MAX_FLEET_POOL = 16384
+
+
+def _fleet_pool_size() -> int:
+    """Connections the async client may hold across EVERY pod at once.
+
+    NOT `_pool_size()`. That number is per pod, which is what `requests` means
+    by `pool_maxsize` -- it keeps one pool per host. httpx's `max_connections`
+    is a TOTAL across all hosts, and this client serves the whole fleet, so
+    reusing the per-pod figure capped every page forward in the install at 256.
+
+    Measured 2026-10-19 on a 31-pod fleet: 1,583 pages holding a pod lease and
+    284 TCP connections to pods in total -- six pods with 25-49 connections,
+    most with exactly one. Renting more pods added cards and no throughput,
+    because the fleet shared 256 connections. Pages that waited too long for a
+    connection failed with an empty-message timeout, which was reported as the
+    POD being unreachable and got healthy pods quarantined.
+
+    Sized from the page ceiling the install is configured for, because every
+    page in flight to a pod holds a connection for its whole life.
+    """
+    try:
+        from codai.api.thread_pool import _configured_concurrency
+        want = _configured_concurrency()
+    except Exception:
+        want = 0
+    if want <= 0:
+        return _MAX_POOL
+    return max(_MAX_POOL, min(_MAX_FLEET_POOL, want + max(256, want // 4)))
+
+
 class _PinnedAdapter(HTTPAdapter):
     """An adapter whose pool trusts our CA and skips hostname matching."""
 
@@ -228,7 +260,7 @@ def aclient(pinned: bool):
         c = _aclients.get(key)
         if c is not None and not c.is_closed:
             return c
-        size = _pool_size()
+        size = _fleet_pool_size()
         limits = httpx.Limits(max_connections=size,
                               max_keepalive_connections=size)
         kw = {"limits": limits, "timeout": httpx.Timeout(600.0, connect=30.0)}

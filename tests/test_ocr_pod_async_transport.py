@@ -117,8 +117,12 @@ def test_the_client_pool_is_sized_from_the_config(monkeypatch):
     async def go():
         await pod_http.aclose_all()
         pod_http.aclient(False)
-        assert seen["limits"].max_connections == 200
-        assert seen["limits"].max_keepalive_connections == 200
+        # The shared async client serves the WHOLE fleet, so its limit is the
+        # fleet total (_fleet_pool_size), not the per-pod 200. Asserting 200
+        # here is what kept every page forward capped at 256 fleet-wide.
+        assert seen["limits"].max_connections == pod_http._fleet_pool_size()
+        assert seen["limits"].max_connections > 200
+        assert seen["limits"].max_keepalive_connections == seen["limits"].max_connections
         await pod_http.aclose_all()
 
     asyncio.run(go())
