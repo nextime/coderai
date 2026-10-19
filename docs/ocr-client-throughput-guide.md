@@ -143,26 +143,46 @@ quality at near surya's price. No human triage: both tests are mechanical.
   `%PDF` header or no `%%EOF`. Screen locally before sending; each one
   otherwise costs a request and returns an error.
 
-### 404 means "restarting", not "gone" — keep retrying
+### Retry policy — bounded, and different per code
 
-**This stopped a real run.** On 2026-10-19 the orchestrator was restarted
-mid-campaign to deploy a fix. For about forty seconds its routes were not yet
-registered, so it answered **618 requests with HTTP 404**. The client treated
-404 as fatal, stopped sending, and nine pods sat ready and billing $5.31/hr
-with nothing to do until a human noticed.
+**An earlier revision of this note said to retry 404 and 502 "indefinitely".
+That was wrong.** It would spin forever on a document that reliably fails, and
+forever on a 404 that is not a restart — in both cases paying for pods and
+producing nothing, which is the failure it was trying to prevent.
 
-A 404 on `/v1/ocr/batch` never means the endpoint does not exist — you would
-have had 404s from the first request if it did. It means the server is coming
-back up. Treat it exactly like a 502:
+What separates the codes is what each one says about the server's health:
 
 ```
-on 404 or 502:   retry the page after a short backoff, indefinitely
-on 429:          retry after Retry-After  (see the correction below)
-on 400/413:      the document is the problem — do not retry
+429  the server is HEALTHY and full. It told you when to come back.
+     -> wait Retry-After, then retry. No attempt cap needed.
+     -> sanity bound: if 429 for >15 min with zero pages completing, alert.
+
+404  the server is RESTARTING. A real "endpoint does not exist" would have
+     been 404 from your very first request, not after thousands of 200s.
+     -> retry with backoff for up to 5 minutes.
+     -> past 5 minutes it is not a restart. STOP the run and alert: a
+        route that is gone will not come back by being asked again.
+
+502  the POD failed this page. Usually transient; sometimes the document.
+     -> up to 5 attempts per page with backoff.
+     -> then PARK the page in a failed list and move on. Never block the
+        corpus on one file — ~3-5% of pages 502 at least once, and a single
+        unparkable document stops a million-page run.
+
+400, 413  the document is the problem, not the server.
+     -> park it immediately. Do not retry.
 ```
 
-Only `4xx` other than 404 and 429 should ever retire a page. A restart is
-seconds; giving up on it costs the whole fleet.
+**And a circuit breaker, which matters more than any of the above.** If more
+than 20% of the last 200 pages ended parked or erroring, stop feeding and
+alert. At that point the fleet is costing money and producing nothing, and no
+per-page retry rule can detect it — only the aggregate can.
+
+The failure this policy exists to prevent, from 2026-10-19: a restart answered
+618 requests with 404 over ~40 seconds, the client treated 404 as fatal and
+stopped, and nine pods sat ready and billing $5.31/hr until a human noticed. A
+five-minute 404 window covers any restart; it does not cover a route that is
+genuinely gone, and it should not.
 
 ### Status fields worth watching
 
