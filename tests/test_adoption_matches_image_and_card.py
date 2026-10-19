@@ -131,7 +131,7 @@ def test_the_pool_passes_both_when_it_adopts():
     """Pinned against the source: the checks are only worth anything if the one
     caller actually uses them."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    blk = src.split("def _adopt_shared_pod")[1][:2000]
+    blk = src.split("def _adopt_shared_pod")[1][:3500]
     assert "image=want_image, gpus=want_gpus" in blk
     assert 'want_image = str(plan.get("image") or "")' in blk
     assert "narrow_gpu_choice(self.mcfg" in blk

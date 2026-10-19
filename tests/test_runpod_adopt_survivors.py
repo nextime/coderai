@@ -93,3 +93,25 @@ def test_without_a_recorded_token_healthz_alone_is_not_enough(monkeypatch):
     pid, url, _k, _r = rw.find_shared_pod("m", "/v1/models", "",
                                           image="img", gpus=["A40"])
     assert pid is None
+
+
+def test_a_pod_already_in_the_pool_is_not_offered_again(monkeypatch):
+    """The sweep re-found one pod 15-18 times in a second and never reached
+    the four behind it."""
+    monkeypatch.setattr(rw, "_registry_update", lambda fn: {
+        "held": {"pool": "m", "url": "https://10.0.0.1:1/v1", "key": "k",
+                 "image": "img", "gpu": "A40"},
+        "next": {"pool": "m", "url": "https://10.0.0.2:1/v1", "key": "k",
+                 "image": "img", "gpu": "A40"}})
+    monkeypatch.setattr(rw, "_is_this_process", lambda info: False)
+    monkeypatch.setattr(rw, "_pod_health_ok", lambda *a, **k: True)
+    pid, *_ = rw.find_shared_pod("m", "/v1/models", "", image="img",
+                                 gpus=["A40"], exclude={"held"})
+    assert pid == "next"
+
+
+def test_adopting_a_duplicate_is_not_reported_as_progress():
+    src = inspect.getsource(rw.RunpodPodPool._adopt_shared_pod)
+    assert "added = self._add_pod(handle)" in src
+    assert "return bool(added)" in src
+    assert "exclude=held" in src

@@ -3493,9 +3493,11 @@ class RunpodPodPool:
             want_gpus = list(narrow.get("gpu_types") or [])
         except Exception:
             want_gpus = list(getattr(self.mcfg, "gpu_types", []) or [])
+        with self._cv:
+            held = {str(p.pod_id) for p in self.pods}
         shared_id, shared_url, shared_key, shared_rate = find_shared_pod(
             str(self.model_key), self.health_path, self.api_key,
-            image=want_image, gpus=want_gpus)
+            image=want_image, gpus=want_gpus, exclude=held)
         if not shared_url:
             return False
         if shared_key and shared_key != self.api_key:
@@ -3556,10 +3558,13 @@ class RunpodPodPool:
                            # knows otherwise.
                            **_adopted_card(self.account, shared_id),
                            healthy=True, last_used=time.time())
-        self._add_pod(handle)
+        added = self._add_pod(handle)
         register_pod(shared_id, str(self.model_key), shared_url, self.api_key,
                      hourly_usd=float(shared_rate or 0.0))  # image/gpu kept
-        return True
+        # True only for a pod this pool did not already hold. A duplicate is
+        # not progress, and a caller looping "while it adopts something" must
+        # be able to tell.
+        return bool(added)
 
     def _warmup(self, pod_id: str, url: str) -> bool:
         """Make the pod load its weights before anyone calls it ready.
@@ -6731,7 +6736,8 @@ def _gpu_name_matches(name: str, want: str) -> bool:
 
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
                     api_key: str = "", image: str = "",
-                    gpus: Optional[list] = None) -> tuple:
+                    gpus: Optional[list] = None,
+                    exclude: Optional[set] = None) -> tuple:
     """A pod already running for this pool: (pod_id, url, key, hourly_usd).
 
     ``key`` is the token that pod was launched with, which is not necessarily
@@ -6774,6 +6780,13 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
             continue
         if _is_this_process(info):
             continue                       # our own; the local pool handles it
+        if exclude and str(pod_id) in exclude:
+            # Already in the caller's pool. Without this the survivor sweep
+            # found the SAME pod again on every iteration -- the pool ignored
+            # the duplicate, the sweep counted it as progress, and it never
+            # reached the next candidate: 15-18 adoptions of one pod in one
+            # second, and 4 pods left untracked behind it.
+            continue
         url = str(info.get("url") or "")
         if not url:
             # A pod that was still BOOTING when its owner died. register_pod
