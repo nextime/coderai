@@ -1396,7 +1396,17 @@ class _Pool:
                 eng._host_loop = asyncio.get_running_loop()
             except Exception:
                 pass
-            return await asyncio.to_thread(eng.recognize_image, image)
+            # NOT the default executor. A page holds its thread for the whole
+            # read (a minute or more), and the default pool is capped at 256
+            # and shared with everything else in the process -- model lookups,
+            # admin pages. Measured on a rented A40: 512 pages' worth of engine
+            # lanes, vLLM at 9% KV cache, and the pod's ceiling set by 256
+            # threads; past that, page waits would starve the model lookup that
+            # every page's chat request needs, and the pod would stall again.
+            # The pod pool is sized from ocr.max_concurrency (pages in flight,
+            # up to 16384, within the task budget) and on a pod nothing else
+            # uses it.
+            return await run_on_pod_pool(eng.recognize_image, image)
         finally:
             self._leave_page()
             await self._q.put(eng)
