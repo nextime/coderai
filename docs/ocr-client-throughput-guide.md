@@ -81,15 +81,36 @@ Per pod, single-page documents, A40-class card at $0.59/hr:
 
 | setting | pages/s | pages/$ | $/page |
 |---|---|---|---|
-| `max_tokens` 12288, `max_continuations` 3 | 0.413 | 2,523 | $0.000396 |
-| **`max_tokens` 4096, `max_continuations` 1** | **0.549** | **3,349** | **$0.000298** |
+| `max_tokens` 12288, `max_continuations` 3 | 0.416 | 2,523 | $0.000396 |
+| **`max_tokens` 4096, `max_continuations` 1** | **0.557** | **3,349** | **$0.000298** |
 
-Multiply by `pods_ready`. At the 128-pod ceiling that is ~70 pages/s, ~253,000
-pages/hour.
+Multiply by `pods_ready`. At the 128-pod ceiling that is ~71 pages/s, ~257,000
+pages/hour, and 996,760 pages in ~3.9 hours for ~$298.
 
 Page latency is **not** uniform: p50 44 s, p95 169 s, worst ~450 s. Set the
 client timeout to at least **600 s per request** and do not treat a slow page as
 a failure.
+
+### How these numbers were taken, and what they are not
+
+`0.557` is **concurrency ÷ mean page latency** — 32 pages in flight on one pod
+divided by a 57.5 s mean. That is the steady-state figure and the only one of
+the three that extrapolates per pod. For the same run:
+
+| | pages/s | why it is wrong for planning |
+|---|---|---|
+| 100 pages ÷ 450 s total elapsed | 0.222 | includes the tail draining alone |
+| **32 ÷ 57.5 s mean latency** | **0.557** | steady state — use this |
+| 80 pages ÷ 64 s at the 80% mark | 1.242 | completion order favours short pages |
+
+They come from a controlled bench: one pod, one client, nothing else running.
+
+**A live run on 2026-10-19 got 0.051 pages/s per pod** — eleven times slower —
+at the same `4096/1`, same card, same ~29 pages in flight per pod. The cause is
+under investigation and is not yet known; the pod image had changed between the
+bench and the run. Until that is resolved, treat `0.557` as what the hardware
+*can* do rather than what your next run *will* do, and watch
+`live_hourly_usd ÷ pages completed` rather than assuming $0.000298.
 
 ## 5. Which engine
 
@@ -121,6 +142,41 @@ quality at near surya's price. No human triage: both tests are mechanical.
 * **~10% of this archive is unreadable by anyone**: 487 of 4,961 PDFs have no
   `%PDF` header or no `%%EOF`. Screen locally before sending; each one
   otherwise costs a request and returns an error.
+
+### 404 means "restarting", not "gone" — keep retrying
+
+**This stopped a real run.** On 2026-10-19 the orchestrator was restarted
+mid-campaign to deploy a fix. For about forty seconds its routes were not yet
+registered, so it answered **618 requests with HTTP 404**. The client treated
+404 as fatal, stopped sending, and nine pods sat ready and billing $5.31/hr
+with nothing to do until a human noticed.
+
+A 404 on `/v1/ocr/batch` never means the endpoint does not exist — you would
+have had 404s from the first request if it did. It means the server is coming
+back up. Treat it exactly like a 502:
+
+```
+on 404 or 502:   retry the page after a short backoff, indefinitely
+on 429:          retry after Retry-After  (see the correction below)
+on 400/413:      the document is the problem — do not retry
+```
+
+Only `4xx` other than 404 and 429 should ever retire a page. A restart is
+seconds; giving up on it costs the whole fleet.
+
+### Status fields worth watching
+
+From `GET /v1/runpod/status`:
+
+| field | meaning |
+|---|---|
+| `summary.pods_ready` | serving now — size your window from this |
+| `summary.pods_quarantined` | set aside after refusing a connection, being re-probed. **Not gone, not booting.** They come back by themselves |
+| `pods[].capacity` | what the server will dispatch to that pod at once (~32, discovered from the pod) |
+| `pods[].soft_limit` | non-zero means that pod refused a connection and is being fed more gently |
+| `live_hourly_usd` | **every pod that bills**, including ones still booting |
+| `live_hourly_booting_usd` | the part that is paid boot producing nothing. A high share means the ramp is too steep |
+| `degraded` | one of the three sources was slow; that part of the answer is stale. **Not** a report of an idle fleet |
 
 ## CORRECTION, 2026-10-19: keep sending 64 — the server manages it
 
