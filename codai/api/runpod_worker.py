@@ -28,6 +28,7 @@ from codai.api import pod_http
 import os
 from collections import OrderedDict as _OrderedDict
 from dataclasses import dataclass, field
+from codai.api import runpod_fleet_share as _share
 from typing import Optional
 
 
@@ -2691,6 +2692,12 @@ class PodHandle:
     #: from "gone". Terminating on that evidence destroyed eight healthy A40s in
     #: 69 seconds on 2026-10-19, with 522 pages in flight on them.
     quarantined_until: float = 0.0
+    #: Pages an OCR WORKER process reports on this pod (multi-worker mode).
+    #: The controller dispatches nothing itself there, so its own `inflight`
+    #: is ~0 and every decision that asks "is this pod busy" must add this, or
+    #: a pod full of a worker's pages reads as idle and is scaled down or
+    #: reaped under them. See codai/api/runpod_fleet_share.py.
+    worker_inflight: int = 0
     #: Consecutive post-quarantine probes that found nothing. Only a pod that
     #: fails several of these, with no work on it, is treated as dead.
     probe_failures: int = 0
@@ -3471,6 +3478,10 @@ class RunpodPodPool:
         unattended upgrade rented a fresh A40 each time and left the previous
         one billing until the reaper's 20-minute grace expired.
         """
+        if _share.is_follower():
+            # A worker serves only its own slice, taken from the registry by
+            # `_follow_registry`. Adopting would take a pod outside it.
+            return False
         # What this pool would launch, and on what. Adoption is only sound when
         # the running pod matches both: the same model on a different image is
         # different code, and a pod rented as a fallback is a card this
@@ -3709,6 +3720,11 @@ class RunpodPodPool:
         boot a waiting request is blocked on is never cancellable, whatever
         arrives meanwhile -- the request is what the pod is for.
         """
+        if _share.is_follower():
+            from codai.api.runpod_client import RunpodError
+            raise RunpodError(
+                f"this process is an OCR worker; only the controller rents pods "
+                f"for {self.model_key!r}")
         from codai.api.runpod_client import RunpodClient, RunpodError, pod_console_url
         client = RunpodClient(self.account)
         # Read BEFORE anything is created, so a shed that arrives at any point
@@ -3998,7 +4014,9 @@ class RunpodPodPool:
             # shown it will accept: a configured ceiling the pod cannot honour
             # is not a ceiling, it is an overload waiting to be misdiagnosed.
             cap = self.pod_capacity_now(p)
-            if cap <= 0 or p.inflight < cap:
+            # The pod's TOTAL load: with OCR workers dispatching, a pod may be
+            # full of their pages while this process holds none of them.
+            if cap <= 0 or _load(p) < cap:
                 free.append(p)
             else:
                 at_cap += 1
@@ -4024,7 +4042,7 @@ class RunpodPodPool:
         # the fast card drains its share and idles while the slow one straggles
         # -- and a document finishes only when its LAST page lands, so the
         # slowest pod sets the latency the client sees.
-        return min(free, key=lambda x: x.inflight / max(0.01, self.pod_weight(x)))
+        return min(free, key=lambda x: _load(x) / max(0.01, self.pod_weight(x)))
 
     def _remember_affinity(self, affinity: str, pod: "PodHandle") -> None:
         if not affinity or not getattr(self.mcfg, "sticky_sessions", True):
@@ -4269,7 +4287,7 @@ class RunpodPodPool:
         much, so the only question it could answer was "one more?".
         """
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-        load = sum(p.inflight for p in serving) + self._queued()
+        load = sum(_load(p) for p in serving) + self._queued()
         # Per POD, weighted: the threshold describes the preferred card, so a
         # fleet of bigger cards carries the same load in fewer pods. Dividing
         # by a flat threshold would rent ~3x more A100s than the work needs,
@@ -4322,6 +4340,8 @@ class RunpodPodPool:
         at once, because the demand-derived number is also the number of GPUs
         that start billing together.
         """
+        if _share.is_follower():
+            return ""              # an OCR worker never rents; the controller does
         in_hand = len(self.pods) + self._booting
         if in_hand >= self.effective_max_pods():
             return ""
@@ -4346,7 +4366,7 @@ class RunpodPodPool:
         want = self._pods_for_demand(serving)
         if in_hand < want:
             threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-            load = sum(p.inflight for p in serving) + self._queued()
+            load = sum(_load(p) for p in serving) + self._queued()
             return (f"{load} page(s) in flight or waiting at {threshold} per pod "
                     f"needs {want} pod(s), and {in_hand} are in hand")
         # And the original, anticipatory trigger: every pod is at its in-flight
@@ -4359,7 +4379,7 @@ class RunpodPodPool:
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
         if self._booting:
             return ""
-        least = min(p.inflight for p in serving)
+        least = min(_load(p) for p in serving)
         if least >= threshold:
             # NOT a demand figure. Demand is already met — one pod is exactly
             # right for `threshold` in flight — and this rents ahead of the
@@ -4432,6 +4452,7 @@ class RunpodPodPool:
         deadline = time.time() + timeout
         while True:
             grow_now = False
+            self._follow_registry()
             with self._cv:
                 healthy = [p for p in self.pods if p.healthy]
                 chosen = self._pick(healthy, affinity) if healthy else None
@@ -4642,6 +4663,13 @@ class RunpodPodPool:
                       f"rotation for {self.model_key!r} with {held} page(s) "
                       f"still on it (it was overloaded, not gone)", flush=True)
                 continue
+            if strikes >= QUARANTINE_STRIKES and _share.is_follower():
+                # Kept set aside and REPORTED: the controller re-probes it and
+                # terminates it if it agrees. A worker deciding alone would be
+                # one process's network view killing a pod others can reach.
+                with self._cv:
+                    pod.quarantined_until = now + QUARANTINE_S
+                continue
             if strikes >= QUARANTINE_STRIKES:
                 with self._cv:
                     if pod in self.pods:
@@ -4655,6 +4683,110 @@ class RunpodPodPool:
                     target=self._terminate,
                     args=(pod, f"unreachable for {strikes} probes"),
                     daemon=True).start()
+
+    # ---------------------------------------------------- multi-worker mode #
+    def _follow_registry(self, force: bool = False) -> None:
+        """OCR WORKER: mirror this worker's slice of the fleet from the registry.
+
+        The controller registers a pod's address and token once it is ready, so
+        the registry already describes the fleet; a worker takes the pods whose
+        stable hash puts them in its slice (`runpod_fleet_share.owns`) and keeps
+        the handles it already has, because they hold the in-flight accounting
+        for pages already dispatched. A pod gone from the registry is dropped; a
+        page still on it releases against the detached handle harmlessly.
+        """
+        if not _share.is_follower():
+            return
+        now = time.time()
+        if not force and now - float(getattr(self, "_followed_at", 0.0) or 0.0) < FOLLOW_EVERY_S:
+            return
+        self._followed_at = now
+        slot = _share.worker_slot()
+        data = _registry_update(lambda d: False)
+        flags = _share.read_flags()
+        ready = {str(pid): info for pid, info in (data or {}).items()
+                 if isinstance(info, dict)
+                 and info.get("pool") == str(self.model_key) and info.get("url")}
+        # Balanced, recorded assignment (runpod_fleet_share.assign): a hash
+        # split 128 pods 8-29 across 8 workers. Falls back to the hash only if
+        # the assignment file cannot be used at all.
+        mapping = _share.assign(str(self.model_key), ready.keys(), slot[1])
+        if mapping:
+            want = {pid: info for pid, info in ready.items()
+                    if mapping.get(pid) == slot[0]}
+        else:
+            want = {pid: info for pid, info in ready.items()
+                    if _share.owns(pid, slot)}
+        fresh = []
+        with self._cv:
+            have = {p.pod_id: p for p in self.pods}
+            self.pods = [p for p in self.pods if p.pod_id in want]
+            for pid, info in want.items():
+                pod = have.get(pid)
+                if pod is None:
+                    fresh.append(PodHandle(
+                        pod_id=pid, url=str(info.get("url")),
+                        hourly_usd=float(info.get("hourly_usd") or 0.0),
+                        started_at=float(info.get("created") or now),
+                        gpu=str(info.get("gpu") or ""),
+                        healthy=True, last_used=now))
+                else:
+                    pod.url = str(info.get("url"))
+                    pod.draining = bool((flags.get(pid) or {}).get("draining"))
+        for pod in fresh:
+            pod.draining = bool((flags.get(pod.pod_id) or {}).get("draining"))
+            self._add_pod(pod)
+        with self._cv:
+            keys = [str(i.get("key")) for i in want.values() if i.get("key")]
+            if keys:
+                self.api_key = max(set(keys), key=keys.count)
+            self._bump_cards()
+            self._cv.notify_all()
+        self._recheck_quarantined(now)
+        self._report_to_controller(now)
+
+    def _report_to_controller(self, now: float, force: bool = False) -> None:
+        """OCR WORKER: tell the controller what is on each of this slice's pods."""
+        if not _share.is_follower():
+            return
+        if not force and now - float(getattr(self, "_reported_at", 0.0) or 0.0) < REPORT_EVERY_S:
+            return
+        self._reported_at = now
+        slot = _share.worker_slot() or (0, 1)
+        with self._cv:
+            reps = {p.pod_id: {"inflight": int(p.inflight),
+                               "used": float(p.last_used or 0.0),
+                               "suspect": bool(p.quarantined_until)}
+                    for p in self.pods}
+        _share.write_reports(f"w{slot[0]}:{self.model_key}", reps)
+
+    def _merge_worker_reports(self, now: float) -> None:
+        """CONTROLLER: fold the workers' reports into this pool's view.
+
+        Workers dispatch every page, so the controller's own in-flight is ~0;
+        without their reports every pod reads idle, and the idle timer and the
+        scale-down would take pods out from under their pages. A pod a worker
+        found unreachable is put up for the controller's OWN re-probe -- the
+        controller, not the worker, decides whether it dies.
+        """
+        if _share.is_follower():
+            return
+        reps = _share.read_reports()
+        with self._cv:
+            pods = list(self.pods)
+            for p in pods:
+                r = reps.get(p.pod_id)
+                p.worker_inflight = int((r or {}).get("inflight") or 0)
+                if r:
+                    p.last_used = max(float(p.last_used or 0.0),
+                                      float(r.get("used") or 0.0))
+                    if r.get("suspect") and not p.quarantined_until:
+                        p.healthy = False
+                        p.quarantined_until = now
+        if not reps and not any(getattr(p, "draining", False) for p in pods):
+            return
+        for p in pods:
+            _share.set_flag(p.pod_id, draining=(True if p.draining else None))
 
     def _adopt_survivors(self, now: float) -> None:
         """Take back EVERY pod of ours that outlived a restart, need or not.
@@ -4710,6 +4842,8 @@ class RunpodPodPool:
         return int(getattr(reply, "status_code", 0) or 0) > 0
 
     def release(self, pod: PodHandle):
+        if _share.is_follower():
+            self._report_to_controller(time.time())
         with self._cv:
             pod.inflight = max(0, pod.inflight - 1)
             pod.last_ok = time.time()
@@ -4832,6 +4966,18 @@ class RunpodPodPool:
         return True
 
     def _terminate(self, pod: PodHandle, reason: str):
+        if _share.is_follower():
+            # Every kill path ends here, so this one guard covers them all: an
+            # OCR worker drops the pod from its OWN view and reports it suspect.
+            # The controller re-probes it and decides; a worker that could kill
+            # would be N processes each able to destroy the shared fleet.
+            with self._cv:
+                if pod in self.pods:
+                    self.pods.remove(pod)
+                    self._bump_cards()
+            print(f"[runpod] worker: not terminating {pod.pod_id} ({reason}) — "
+                  f"reported to the controller, which owns the fleet", flush=True)
+            return
         if getattr(pod, "gpu", "") == "(shared)":
             # Borrowed from another engine: it owns the lifecycle and the bill.
             # Terminating it here would kill a pod that process is still using.
@@ -4844,6 +4990,12 @@ class RunpodPodPool:
             return
         from codai.api.runpod_client import RunpodClient
         from codai.api import runpod_ledger
+        try:
+            # Its worker reports, drain flag and slot assignment, so the next
+            # pod is assigned against the real counts.
+            _share.clear_pod(pod.pod_id)
+        except Exception:
+            pass
         cost = (time.time() - pod.started_at) / 3600.0 * pod.hourly_usd
         try:
             RunpodClient(self.account).terminate_pod(pod.pod_id)
@@ -5111,7 +5263,7 @@ class RunpodPodPool:
         flight.
         """
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
-        total = sum(p.inflight for p in serving)
+        total = sum(_load(p) for p in serving)
         need = -(-total // threshold)          # ceil, in integers
         return max(self.effective_min_pods(),
                    min(self.effective_max_pods(), need))
@@ -5134,8 +5286,8 @@ class RunpodPodPool:
         if getattr(self.mcfg, "scale_down_costliest_first", False):
             # Dearest first; then the idlest, then the coldest cache.
             return max(serving, key=lambda p: (float(p.hourly_usd or 0.0),
-                                               -p.inflight, -p.last_used))
-        return min(serving, key=lambda p: (p.inflight, p.last_used))
+                                               -_load(p), -p.last_used))
+        return min(serving, key=lambda p: (_load(p), p.last_used))
 
     def shed_now(self) -> dict:
         """Give back every pod the load no longer needs, immediately.
@@ -5167,12 +5319,12 @@ class RunpodPodPool:
             # told "kept 0, needed 1" and kept paying for all four.
             need = self._pods_needed(serving)
             surplus = max(0, len(serving) + booting - need)
-            order = sorted(serving, key=lambda p: (p.inflight, p.last_used))
+            order = sorted(serving, key=lambda p: (_load(p), p.last_used))
             if getattr(self.mcfg, "scale_down_costliest_first", False):
                 order = sorted(serving, key=lambda p: (-float(p.hourly_usd or 0.0),
-                                                       p.inflight, p.last_used))
+                                                       _load(p), p.last_used))
             for victim in order[:surplus]:
-                if victim.inflight == 0:
+                if _load(victim) == 0:
                     victim.healthy = False
                     self.pods.remove(victim)
                     self._bump_cards()
@@ -5298,13 +5450,13 @@ class RunpodPodPool:
             draining = [p for p in self.pods if p.healthy and p.draining]
             need = self._pods_needed(serving)
             surplus = len(serving) - need
-            total = sum(p.inflight for p in serving)
+            total = sum(_load(p) for p in serving)
 
             # A pod that was draining and has now emptied is done: terminate it
             # here rather than waiting for the idle reaper's timeout, which is
             # what it was taken out of service to avoid paying.
             for p in draining:
-                if p.inflight == 0:
+                if _load(p) == 0:
                     p.healthy = False
                     self.pods.remove(p)
                     self._bump_cards()
@@ -5330,7 +5482,7 @@ class RunpodPodPool:
             # does not walk the fleet down in one sweep.
             self._surplus_since = now
             victim = self._scale_down_victim(serving)
-            if victim.inflight == 0:
+            if _load(victim) == 0:
                 victim.healthy = False
                 self.pods.remove(victim)
                 self._bump_cards()
@@ -5339,7 +5491,7 @@ class RunpodPodPool:
                 why = "terminated"
             else:
                 victim.draining = True
-                why = f"draining ({victim.inflight} in flight)"
+                why = f"draining ({_load(victim)} in flight)"
         print(f"[runpod] {self.model_key!r}: {len(serving)} pod(s) for {total} "
               f"request(s) in flight, {need} needed — {why} {victim.pod_id}",
               flush=True)
@@ -5358,6 +5510,9 @@ class RunpodPodPool:
             except Exception:
                 pass
         self._reclaim_stranded_inflight(now)
+        # What the OCR workers are carrying, before anything decides whether a
+        # pod is busy. A no-op without workers.
+        self._merge_worker_reports(now)
         # Before anything else decides how many pods are serving: a quarantined
         # pod is not healthy, so leaving it set aside inflates the warm-floor
         # deficit and rents a replacement for a card we are already paying for.
@@ -5391,7 +5546,7 @@ class RunpodPodPool:
             for p in sorted(alive, key=lambda x: x.last_used):
                 if len([q for q in self.pods if q.healthy]) <= keep_min:
                     break
-                if p.inflight == 0 and idle_to > 0 and (now - p.last_used) > idle_to:
+                if _load(p) == 0 and idle_to > 0 and (now - p.last_used) > idle_to:
                     p.healthy = False
                     self.pods.remove(p)
                     self._bump_cards()
@@ -5531,6 +5686,10 @@ class RunpodPodPool:
         with self._cv:
             pods = list(self.pods)
             self.pods.clear()
+        if _share.is_follower():
+            # Runs at process EXIT (atexit). A worker restarting must leave the
+            # fleet exactly as it found it.
+            return
         for p in pods:
             self._terminate(p, "shutdown")
 
@@ -5615,6 +5774,18 @@ def _forget_unavailable(gpu_type_id: str, dc: str = "") -> None:
 #: that IS in use would hand the same pod more work than its cap allows, while
 #: holding a phantom a few minutes longer costs only those minutes.
 INFLIGHT_TTL_S = 900.0
+
+def _load(pod) -> int:
+    """Pages on a pod from EVERY process: this one's plus its worker's report."""
+    return (int(getattr(pod, "inflight", 0) or 0)
+            + int(getattr(pod, "worker_inflight", 0) or 0))
+
+
+#: How often an OCR worker re-reads its slice of the fleet from the registry,
+#: and how often it reports its pods back to the controller.
+FOLLOW_EVERY_S = 3.0
+REPORT_EVERY_S = 5.0
+
 
 #: How long a pod that refused a connection stays out of rotation before it is
 #: re-probed. Long enough for a full listen backlog to drain -- the condition
@@ -6454,7 +6625,7 @@ def pods_status() -> list:
                 out.append({
                     "model": key, "pod_id": p.pod_id, "gpu": p.gpu,
                     "gpu_count": getattr(p, "gpu_count", 1),
-                    "is_spot": p.is_spot, "healthy": p.healthy, "inflight": p.inflight,
+                    "is_spot": p.is_spot, "healthy": p.healthy, "inflight": _load(p),
                     "hourly_usd": p.hourly_usd, "uptime_s": int(now - p.started_at),
                     "live_cost_usd": round((now - p.started_at) / 3600.0 * p.hourly_usd, 4),
                     "console_url": p.console_url,
@@ -7140,6 +7311,8 @@ def reap_orphans() -> int:
     pods from a crash/restart that would otherwise bill silently. Only touches pods
     named ``coderai-<our deployment_id>-*`` (never another deployment's), and never
     a pod currently mid-provision. Returns the number reaped."""
+    if _share.is_follower():
+        return 0                   # the controller reaps; a worker never does
     try:
         from codai.models.manager import get_active_runpod_config
         acct = get_active_runpod_config()
@@ -7362,12 +7535,36 @@ def _scaler_loop():
                 print(f"[runpod-reaper] {exc}", flush=True)
 
 
+def _follower_loop():
+    """OCR WORKER: keep each pool's slice and reports current. Rents nothing,
+    reaps nothing, scales nothing -- that is the controller's job alone."""
+    while True:
+        time.sleep(FOLLOW_EVERY_S)
+        with _pools_lock:
+            pools = list(_pools.values())
+        for pool in pools:
+            try:
+                pool._follow_registry(force=True)
+            except Exception as exc:
+                print(f"[runpod] worker follow: {exc}", flush=True)
+
+
 def _ensure_scaler():
     global _scaler_started
     with _pools_lock:
         if _scaler_started:
             return
         _scaler_started = True
+    if _share.is_follower():
+        # NOT the scaler. The scaler reclaims, reaps orphans and terminates
+        # idle pods; in a worker every one of those would act on the shared
+        # fleet from a process that does not own it.
+        print(f"[runpod] OCR worker {_share.worker_slot()}: following the fleet "
+              f"from the registry; renting, scaling and reaping are the "
+              f"controller's", flush=True)
+        threading.Thread(target=_follower_loop, daemon=True,
+                         name="runpod-follower").start()
+        return
     threading.Thread(target=_scaler_loop, daemon=True, name="runpod-scaler").start()
 
 

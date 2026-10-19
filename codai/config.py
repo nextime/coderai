@@ -1177,6 +1177,15 @@ class OcrConfig:
     # 0 = auto (half the cores, at most 4). 1 = rasterise in-process under the
     # lock: no IPC and no extra processes, which a small host may prefer.
     raster_workers: int = 0
+    # How many PROCESSES forward /v1/ocr pages to rented pods. One Python process
+    # forwards at most ~16-23 pages/s however many pods it has (measured: one
+    # core at 100%, the rest of the box idle, pod GPUs mostly idle), and 128 pods
+    # need ~85. With N > 0, coderai-ocr-workers starts N extra engine processes
+    # and nginx sends /v1/ocr and /v1/ocr/batch straight to them; the main
+    # engine still owns the fleet (renting, scaling, reaping). 0 = off: every
+    # page goes through the front and one engine, as before. Rule of thumb: one
+    # worker per ~20 pods, at most the number of cores minus two.
+    workers: int = 0
     # Default document language when a request names none. "auto" (the shipped
     # default) means let the engine recognise what it finds: surya-2, olmOCR and
     # docTR are multilingual and have no language input at all, and PaddleOCR --
@@ -1666,6 +1675,15 @@ def _same_model(known: dict, seed: dict) -> bool:
     return not a or not b or a == b
 
 
+def _is_ocr_worker() -> bool:
+    """True in a process started by coderai-ocr-workers (CODERAI_OCR_WORKER=i/N)."""
+    try:
+        from codai.api.runpod_fleet_share import is_follower
+        return is_follower()
+    except Exception:
+        return False
+
+
 class ConfigManager:
     """Manages configuration loading, saving, and validation."""
     
@@ -1929,6 +1947,11 @@ class ConfigManager:
     
     def save_config(self):
         """Save config.json to disk."""
+        if _is_ocr_worker():
+            # A worker's ocr ceilings are its 1/N share, not the configured
+            # values; writing them back would shrink the real config by N on
+            # every save. The front and the main engine own this file.
+            return
         config_dict = {
             "version": self.config.version,
             "server": {
@@ -2214,6 +2237,7 @@ class ConfigManager:
                 "page_image_max_dpi_factor": self.config.ocr.page_image_max_dpi_factor,
                 "page_window": self.config.ocr.page_window,
                 "raster_workers": self.config.ocr.raster_workers,
+                "workers": self.config.ocr.workers,
                 "lang": self.config.ocr.lang,
                 "paddle_enabled": self.config.ocr.paddle_enabled,
                 "paddle_use_gpu": self.config.ocr.paddle_use_gpu,
@@ -2530,6 +2554,24 @@ class ConfigManager:
                 # decision made here and cannot make it itself.
                 self.config.ocr.chandra_accept_license = True
 
+        # An OCR worker (CODERAI_OCR_WORKER=i/N, started by coderai-ocr-workers)
+        # is one of N processes that nginx spreads /v1/ocr over. Every per-process
+        # ceiling in its config was written for ONE process, so N copies of it
+        # would admit N times the configured queue and spawn N times the local
+        # engine instances. Each worker takes its share instead, rounded up.
+        try:
+            from codai.api.runpod_fleet_share import worker_slot as _wslot
+            _slot = _wslot()
+        except Exception:
+            _slot = None
+        if _slot and _slot[1] > 1:
+            _n = _slot[1]
+            for _attr in ("max_concurrency", "max_queued_pages", "surya_instances",
+                          "chandra_instances", "olmocr_instances"):
+                _v = getattr(self.config.ocr, _attr, None)
+                if isinstance(_v, int) and _v > 0:
+                    setattr(self.config.ocr, _attr, max(1, -(-_v // _n)))
+
         # The native engines — ds4, colibri, k3 — ship disabled for the same
         # reason OCR does, and an engines pod is rented to run exactly one of
         # them. CODERAI_<ENGINE>_ENABLED switches it on; CODERAI_<ENGINE>_CONFIG
@@ -2607,6 +2649,8 @@ class ConfigManager:
 
     def save_models(self):
         """Save models.json to disk."""
+        if _is_ocr_worker():
+            return
         with open(self.models_path, 'w') as f:
             json.dump(self.models_data, f, indent=2)
 
