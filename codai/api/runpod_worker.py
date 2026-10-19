@@ -5805,8 +5805,15 @@ def pools_schedule_status() -> list:
             # The client lease, so a bill nobody expected has a visible cause.
             "client_scale_allowed": bool(getattr(cfg, "allow_client_scale", False)),
             "client_pods": pool.client_floor(),
+            # Whichever half of the lease lasts longer. Gated on the FLOOR
+            # alone, a cap-only lease -- "grow no further than 8, hold nothing
+            # warm" -- reported as already expired while it was still the
+            # reason the fleet had stopped growing.
             "client_lease_expires_in_s": max(
-                0, int(pool._client_floor_until - time.time())) if pool.client_floor() else 0,
+                0,
+                int(pool._client_floor_until - time.time()) if pool.client_floor() else 0,
+                int(getattr(pool, "_client_cap_until", 0.0) - time.time())
+                if pool.client_cap() else 0),
             # What the lease narrowed the card choice to, if anything: a pod on
             # an unexpected card should have a visible cause too, not only a
             # bill.

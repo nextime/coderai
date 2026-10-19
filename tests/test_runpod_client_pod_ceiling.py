@@ -252,6 +252,21 @@ def test_set_client_pods_forwards_it_for_both_ways_of_naming_a_pool():
         "both the live-pool branch and the by-model branch must pass it")
 
 
+def test_a_cap_only_lease_does_not_report_as_expired():
+    """Observed live on 2026-10-19: a lease with 1800 s of cap left reported
+    `client_lease_expires_in_s: 0`, because the field was gated on the FLOOR.
+    A fleet that stopped growing must say why, and for how much longer."""
+    import time as _t
+    p = _pool(max_pods=128, ttl=1800)
+    p.set_client_floor(0, max_pods=8)
+    left = max(0,
+               int(p._client_floor_until - _t.time()) if p.client_floor() else 0,
+               int(p._client_cap_until - _t.time()) if p.client_cap() else 0)
+    assert left > 1700, left
+    src = open("codai/api/runpod_worker.py").read()
+    assert 'if pool.client_cap() else 0)' in src
+
+
 def test_the_status_surface_reports_the_ceiling_in_force():
     """A fleet that stopped growing short of max_pods must say why."""
     src = inspect_source = open("codai/api/runpod_worker.py").read()
