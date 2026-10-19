@@ -2413,6 +2413,7 @@ class OcrManager:
             return None
         opts = dict(page_opts or {})
         refused: list = []
+        refusers: set = set()
         unreachable: list = []
         policy, wait_s = _pod_pipeline_policy(cfg)
         # Decided once per document, not per page: a document whose pages
@@ -2502,8 +2503,29 @@ class OcrManager:
                         # while the local pipeline sat there able to read it.
                         if int(getattr(exc, "status", 0) or 0) not in _POD_CANNOT_RUN_PIPELINE:
                             raise
-                        refused.append(str(exc))
-                        return None
+                        # BUT ONE POD IS NOT THE POOL. A single pod whose vLLM
+                        # failed to start (measured: another vLLM still held
+                        # 37 of its 47 GB) answers 503 to every page, and
+                        # setting the whole pool aside on that one answer sent
+                        # every page of the process to this box's pipeline for
+                        # five minutes at a time -- ~10 pages/s from 34 pods,
+                        # with the orchestrator's CPU doing the reading. So the
+                        # refusing pod is taken out of rotation and the page
+                        # tries ANOTHER one; only a page refused by every pod
+                        # it tried says something about the image.
+                        lease.dead()
+                        refusers.add(lease.base)
+                        _say_rate_limited(
+                            ("pod-refused", model_id, lease.base),
+                            f"[ocr] a pod for {model_id!r} at {lease.base} "
+                            f"refused to run the pipeline ({exc}); it is out "
+                            f"of rotation and this page tries another pod "
+                            f"(attempt {attempt} of {POD_PAGE_ATTEMPTS})",
+                            every=60.0)
+                        if attempt >= POD_PAGE_ATTEMPTS:
+                            refused.append(str(exc))
+                            return None
+                        continue
                     finally:
                         lease.release()
                 return None
@@ -2536,7 +2558,16 @@ class OcrManager:
                 # different fault from "nothing is rented", needs a different
                 # fix, and must carry the pod's OWN words: this is the only
                 # place they are visible.
-                if _set_aside_pod_pipeline(model_id, refused[0]):
+                if len(refusers) < 2:
+                    # Every attempt landed on the same pod (a one-pod pool, or
+                    # placement kept choosing it). Still one pod's word: the
+                    # pool is not set aside, and the next document asks again.
+                    _say_rate_limited(
+                        ("one-refuser", model_id),
+                        f"[ocr] only one pod refused ({refused[0]}) — reading "
+                        f"this document here, NOT setting the pool aside",
+                        every=60.0)
+                elif _set_aside_pod_pipeline(model_id, refused[0]):
                     print(f"[ocr] the pods for {model_id!r} run an image that "
                           f"carries the OCR pipeline, but they REFUSE to run "
                           f"it: {refused[0]} — falling back to the pipeline on "

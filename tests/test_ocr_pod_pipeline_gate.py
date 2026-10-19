@@ -204,17 +204,29 @@ def test_local_serve_mode_never_goes_to_a_pod(monkeypatch):
 # --------------------------------------------------------------------------
 
 class _Lease:
+    """A lease on a DIFFERENT pod each time, like a pool with many pods."""
     kind = "pod"
-    base = "https://10.0.0.1:1234/v1"
     api_key = "k"
+    n = 0
+    dead_bases: list = []
+
+    def __init__(self, base=None):
+        if base is None:
+            _Lease.n += 1
+            base = f"https://10.0.0.{_Lease.n}:1234/v1"
+        self.base = base
 
     def release(self):
         pass
+
+    def dead(self):
+        _Lease.dead_bases.append(self.base)
 
 
 @pytest.fixture(autouse=True)
 def _forget_set_aside_pools():
     om._POD_PIPELINE_UNUSABLE.clear()
+    _Lease.dead_bases = []
     yield
     om._POD_PIPELINE_UNUSABLE.clear()
 
@@ -324,6 +336,52 @@ async def test_the_pool_is_tried_again_once_the_cooldown_passes(monkeypatch):
     before = len(calls)
     await _read(mgr, types.SimpleNamespace())
     assert len(calls) > before
+
+
+@pytest.mark.anyio
+async def test_one_refusing_pod_does_not_set_the_pool_aside(monkeypatch):
+    """THE 2026-10-19 slowdown: one pod whose vLLM never started answered 503,
+    the whole pool was set aside, and every page of that process was read on
+    the orchestrator -- ~10 pages/s from 34 pods. The page must go to another
+    pod, the bad one must leave rotation, and the pool must stay in use."""
+    _two_page_pdf_split(monkeypatch, pages=4)
+    from codai.models import placement
+    bad = "https://10.9.9.9:1/v1"
+    picks = iter([bad] + [None] * 100)
+    monkeypatch.setattr(placement, "choose",
+                        lambda *_a, **_k: _Lease(next(picks)))
+    monkeypatch.setattr(placement, "spill_threshold", lambda *_a, **_k: 0)
+
+    def _answer(base, *_a, **_k):
+        if base == bad:
+            raise om.OcrError("pod OCR answered 503: local vLLM unusable",
+                              status=503)
+        return {"engine": "surya", "pages": [{"text": "ok"}]}
+
+    _stub_page_post(monkeypatch, _answer)
+    mgr = om.OcrManager()
+    got = await _read(mgr, types.SimpleNamespace())
+    assert got is not None, "the document fell back to this box"
+    assert bad in _Lease.dead_bases
+    assert not om._pod_pipeline_refusal("datalab-to/surya-ocr-2")
+
+
+@pytest.mark.anyio
+async def test_a_single_pod_refusing_every_attempt_is_still_not_the_pool(
+        monkeypatch):
+    _two_page_pdf_split(monkeypatch, pages=1)
+    from codai.models import placement
+    monkeypatch.setattr(placement, "choose",
+                        lambda *_a, **_k: _Lease("https://10.9.9.9:1/v1"))
+    monkeypatch.setattr(placement, "spill_threshold", lambda *_a, **_k: 0)
+
+    def _refuse(*_a, **_k):
+        raise om.OcrError("pod OCR answered 503: nope", status=503)
+
+    _stub_page_post(monkeypatch, _refuse)
+    mgr = om.OcrManager()
+    assert await _read(mgr, types.SimpleNamespace()) is None
+    assert not om._pod_pipeline_refusal("datalab-to/surya-ocr-2")
 
 
 @pytest.mark.anyio
