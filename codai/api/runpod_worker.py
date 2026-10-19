@@ -4739,11 +4739,6 @@ class RunpodPodPool:
             if pod not in self.pods:
                 return
             held = int(pod.inflight)
-        # BEFORE the quarantine, so the width is learned from the load that
-        # actually broke it. This is the part that makes the fleet work at
-        # whatever concurrency a client offers: the pod tells us its width by
-        # refusing, and we stop exceeding it.
-        width = self.note_refusal(pod)
         with self._cv:
             if pod not in self.pods:
                 return
@@ -4754,7 +4749,8 @@ class RunpodPodPool:
               f"{reason}. NOT terminated — a refused connection is as likely to "
               f"mean the pod is overloaded as gone, and it still has {held} "
               f"page(s) charged to it. It is re-probed when the quarantine "
-              f"expires, and will then be fed at most {width} at a time.",
+              f"expires. Its width is NOT reduced: the queue in front of the "
+              f"fleet absorbs the surplus.",
               flush=True)
 
     def forget(self, pod: PodHandle, reason: str = "gone") -> bool:

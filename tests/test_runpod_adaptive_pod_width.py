@@ -251,9 +251,8 @@ def test_the_snapshot_reports_the_width_in_force():
     assert '"capacity": pool.pod_capacity_now(p)' in src
 
 
-def test_discard_learns_the_width_before_setting_the_pod_aside():
-    """Afterwards it would read an in-flight count the quarantine had already
-    begun to unwind, and learn the wrong number."""
+def test_a_refusal_does_not_narrow_the_pod():
+    """Operator decision: a refusal quarantines the pod but never halves its
+    width -- the queue in front of the fleet takes the surplus."""
     import inspect
-    src = inspect.getsource(rw.RunpodPodPool.discard)
-    assert src.index("note_refusal") < src.index("quarantined_until = now")
+    assert "note_refusal" not in inspect.getsource(rw.RunpodPodPool.discard)
