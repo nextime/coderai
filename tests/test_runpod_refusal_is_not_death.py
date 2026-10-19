@@ -116,32 +116,49 @@ def test_discard_is_a_no_op_for_a_pod_we_do_not_hold():
 
 # --- 2. work in flight is sacred -----------------------------------------
 
-def test_a_pod_with_pages_on_it_is_never_terminated_by_this_path():
-    """522 pages were in flight on the pods that were destroyed."""
+def test_a_busy_pod_that_answers_comes_back_at_once():
+    """THE FIX. The first version skipped the probe while a pod had pages in
+    flight, so a healthy pod that tripped once on a connection got no new work
+    until all 64 drained. Measured 2026-10-19: two of four serving pods
+    quarantined while answering /healthz in 0.10-0.19 s."""
+    p = _pool()
+    pod = _pod(inflight=64)
+    p.pods = [pod]
+    p.discard(pod, "connection refused")
+    p._pod_reachable = lambda _p: True
+    pod.quarantined_until = time.time() - 1
+    p._recheck_quarantined(time.time())
+    assert pod.healthy is True
+    assert pod.quarantined_until == 0.0
+    assert pod.inflight == 64, "its pages stay charged to it and keep running"
+    assert _TERMINATED == []
+
+
+def test_a_pod_that_never_answers_is_terminated_even_with_pages_on_it():
+    """Those pages will never come back. Holding them until the 15-minute
+    in-flight timeout is what kept 64 pages hostage on a hung pod."""
     p = _pool()
     pod = _pod(inflight=64)
     p.pods = [pod]
     p.discard(pod, "connection refused")
     p._pod_reachable = lambda _p: False
-    for _ in range(10):                       # far past the strike limit
+    for _ in range(rw.QUARANTINE_STRIKES):
         pod.quarantined_until = time.time() - 1
         p._recheck_quarantined(time.time())
-    assert _TERMINATED == [], "a pod carrying pages was terminated"
-    assert pod in p.pods
+    assert [t[0] for t in _TERMINATED] == [pod.pod_id]
+    assert pod not in p.pods
 
 
-def test_in_flight_work_defers_the_probe_rather_than_passing_it():
-    """It must not accumulate strikes while it is excused, or it dies the
-    moment the last page drains."""
+def test_one_failed_probe_does_not_terminate_a_busy_pod():
     p = _pool()
-    pod = _pod(inflight=1)
+    pod = _pod(inflight=64)
     p.pods = [pod]
     p.discard(pod, "connection refused")
     p._pod_reachable = lambda _p: False
-    for _ in range(5):
-        pod.quarantined_until = time.time() - 1
-        p._recheck_quarantined(time.time())
-    assert pod.probe_failures == 0
+    pod.quarantined_until = time.time() - 1
+    p._recheck_quarantined(time.time())
+    assert _TERMINATED == []
+    assert pod.probe_failures == 1
 
 
 # --- 3. the floor must not rent a replacement ----------------------------

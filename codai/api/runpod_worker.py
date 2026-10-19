@@ -4593,34 +4593,28 @@ class RunpodPodPool:
     def _recheck_quarantined(self, now: float) -> None:
         """Bring back, or finally give up on, the pods `discard` set aside.
 
-        The decision that must not be taken on one failed connection is taken
-        here instead, on evidence that separates the two cases:
-
-        * it answers again -> back into rotation. This is the common case, and
-          the whole reason `discard` stopped terminating.
-        * it has work in flight -> left alone whatever the probe says. Killing a
-          pod with pages on it loses those pages AND pays for them.
-        * it fails `QUARANTINE_STRIKES` probes in a row with nothing in flight
-          -> treated as dead and terminated. A pod that cannot be reached over
-          several minutes while carrying no load is not under backpressure.
-
-        The account listing remains the authority on a pod that no longer
-        exists; the reconcile sweep handles that case and closes the bill
-        without an API call. This is only about a pod that still exists and
-        will not talk to us.
+        * it answers /healthz -> back into rotation AT ONCE, whatever it is
+          carrying. The first version of this skipped the probe entirely while
+          the pod had pages in flight, on the reasoning that a busy pod must not
+          be terminated. Terminating was never the question: a healthy pod that
+          tripped once on a connection got no new pages until all 64 had
+          drained, minutes later, and was often set aside again. Measured
+          2026-10-19: two of four serving pods quarantined while answering
+          /healthz in 0.10-0.19 s.
+        * it fails QUARANTINE_STRIKES probes in a row -> terminated, pages or no
+          pages. A pod that answers nothing for ~2 minutes is not busy -- busy
+          pods answer /healthz in a tenth of a second at full load -- and the
+          pages charged to it will never come back. Holding them until the
+          in-flight timeout (15 min) is what kept 64 pages hostage on a hung
+          pod; terminating it fails those requests now, and the client resends
+          them to a pod that works.
         """
         with self._cv:
             due = [p for p in self.pods
                    if p.quarantined_until and now >= p.quarantined_until]
         for pod in due:
-            if pod.inflight > 0:
-                # Still carrying work -- so something IS getting through, or the
-                # slots are stale and the reclaim sweep will lower them. Either
-                # way this is not a pod to destroy.
-                with self._cv:
-                    pod.quarantined_until = now + QUARANTINE_S
-                continue
             alive = self._pod_reachable(pod)
+            strikes = 0
             with self._cv:
                 if pod not in self.pods:
                     continue
@@ -4631,26 +4625,64 @@ class RunpodPodPool:
                     pod.last_ok = now
                     self._bump_cards()
                     self._cv.notify_all()
-                    print(f"[runpod] pod {pod.pod_id} answers again — back in "
-                          f"rotation for {self.model_key!r} (it was overloaded, "
-                          f"not gone)", flush=True)
-                    continue
-                pod.probe_failures += 1
-                strikes = pod.probe_failures
-                if strikes < QUARANTINE_STRIKES:
-                    pod.quarantined_until = now + QUARANTINE_S
-            if not alive and strikes >= QUARANTINE_STRIKES:
+                    held = int(pod.inflight)
+                else:
+                    pod.probe_failures += 1
+                    strikes = pod.probe_failures
+                    held = int(pod.inflight)
+                    if strikes < QUARANTINE_STRIKES:
+                        pod.quarantined_until = now + QUARANTINE_S
+            if alive:
+                print(f"[runpod] pod {pod.pod_id} answers again — back in "
+                      f"rotation for {self.model_key!r} with {held} page(s) "
+                      f"still on it (it was overloaded, not gone)", flush=True)
+                continue
+            if strikes >= QUARANTINE_STRIKES:
                 with self._cv:
                     if pod in self.pods:
                         self.pods.remove(pod)
                         self._bump_cards()
                 print(f"[runpod] pod {pod.pod_id} failed {strikes} probes over "
-                      f"~{QUARANTINE_S * strikes:.0f}s with nothing in flight — "
-                      f"terminating it", flush=True)
+                      f"~{QUARANTINE_S * strikes:.0f}s — terminating it; its "
+                      f"{held} page(s) are failed back to the client to resend",
+                      flush=True)
                 threading.Thread(
                     target=self._terminate,
                     args=(pod, f"unreachable for {strikes} probes"),
                     daemon=True).start()
+
+    def _adopt_survivors(self, now: float) -> None:
+        """Take back EVERY pod of ours that outlived a restart, need or not.
+
+        Adoption used to happen only on demand -- to fill a warm floor, or when
+        a request found no free pod. A restart drops the client's lease, so with
+        the floor at 0 and the client paused, nothing ever asked: 29 pods kept
+        billing outside the pool for as long as nobody noticed. They are already
+        paid for, so they are adopted whatever the floor or the cap say; the
+        ordinary scale-down then gives back any surplus WITH its accounting and
+        its in-flight drain, instead of the reaper finding it much later.
+
+        Rate-limited: each attempt probes the registry's candidates, and a
+        dead entry costs a probe timeout every time.
+        """
+        last = float(getattr(self, "_survivors_checked_at", 0.0) or 0.0)
+        if now - last < SURVIVOR_ADOPT_EVERY_S:
+            return
+        self._survivors_checked_at = now
+        took = 0
+        for _ in range(SURVIVOR_ADOPT_MAX):
+            try:
+                if not self._adopt_shared_pod():
+                    break
+            except Exception as exc:
+                print(f"[runpod] adopting surviving pods for "
+                      f"{self.model_key!r} stopped: {exc}", flush=True)
+                break
+            took += 1
+        if took:
+            print(f"[runpod] adopted {took} surviving pod(s) for "
+                  f"{self.model_key!r} — already billing, so they are managed "
+                  f"rather than left untracked", flush=True)
 
     def _pod_reachable(self, pod: PodHandle) -> bool:
         """Does anything answer at this pod's address?
@@ -5325,6 +5357,7 @@ class RunpodPodPool:
         # pod is not healthy, so leaving it set aside inflates the warm-floor
         # deficit and rents a replacement for a card we are already paying for.
         self._recheck_quarantined(now)
+        self._adopt_survivors(now)
         self._scale_down(now)
         with self._cv:
             pods = list(self.pods)
@@ -5590,6 +5623,11 @@ QUARANTINE_S = 45.0
 #: past that it is dead in every sense that matters and keeping it costs money
 #: for nothing. Fewer would start guessing again.
 QUARANTINE_STRIKES = 3
+
+#: How often a pool sweeps the registry for pods of its own that outlived a
+#: restart, and the most it takes per sweep.
+SURVIVOR_ADOPT_EVERY_S = 60.0
+SURVIVOR_ADOPT_MAX = 256
 
 #: Never let a pod's discovered width fall below this. A pod that refused once
 #: is not a pod worth one page at a time -- collapsing it that far would turn a
@@ -6767,7 +6805,21 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
                       f"{', '.join(gpus)}", flush=True)
                 continue
         key = str(info.get("key") or "") or api_key
-        if _pod_health_ok(url, path=health_path, api_key=key):
+        if _pod_health_ok(url, path=health_path, api_key=key, timeout=15.0):
+            return pod_id, url, key, float(info.get("hourly_usd") or 0.0)
+        # A BUSY pod is still alive. `health_path` goes through the pod's
+        # engine, and a pod still finishing 64 pages from before our restart
+        # answers it too slowly -- so after a restart under load every pod
+        # failed this probe and was left running UNTRACKED. Measured 2026-10-19:
+        # 29 pods, $17.11/hr, billing outside the pool. /healthz is answered by
+        # the pod's front without touching the engine (0.1 s at full load), and
+        # when the registry holds the token the pod was launched with, the
+        # token question is already answered.
+        if str(info.get("key") or "") and _pod_health_ok(
+                url, path="/healthz", timeout=15.0):
+            print(f"[runpod] pod {pod_id} is busy (slow on {health_path}) but "
+                  f"alive on /healthz with its recorded token — adopting it",
+                  flush=True)
             return pod_id, url, key, float(info.get("hourly_usd") or 0.0)
         # The last silent refusal. A pod that does not answer may be dead, may
         # be mid-warm-up, or may want a token we do not have — and renting
