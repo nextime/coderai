@@ -31,6 +31,7 @@ import json
 import queue
 import sys
 import threading
+import time
 
 
 #: stdout is now written by several threads (one per page in flight), and a
@@ -92,6 +93,15 @@ _PROMPT_TOKENS_GUESS = 4096
 #: Said once per worker, not per page: 8 lanes x hundreds of pages would bury
 #: the log, and the number is the same every time.
 _CAP_NOTED = [False]
+
+#: Early loop abort: [on, min_chars, step, persistence]. Module cells, like the
+#: rest of the per-load settings, because the hook that reads them wraps a
+#: module-level surya function.
+_EARLY_LOOP = [True, 2000, 400, 2]
+#: Pages abandoned this way, and the characters not generated. Logged once in a
+#: while rather than per page: on a clean corpus this fires on ~3% of pages and
+#: a line each would bury everything else.
+_ABORTED = [0, 0]
 
 #: Thresholds for surya's own repetition detector, when the operator has set
 #: them. Empty = surya's defaults (4 repeats, a 500-character window, scaling
@@ -397,6 +407,235 @@ def _encode_page(img):
         img = img.convert("RGB")
     img.save(buf, format="PNG", compress_level=1)
     return "image/png", buf.getvalue()
+
+
+#: Last time each rate-limited message was printed.
+_SAID_AT = {}
+
+
+def _say_every(key, every, msg):
+    """Print `msg` at most once per `every` seconds.
+
+    The abort fires on roughly 3% of a clean corpus, which on a million-page
+    run is thirty thousand lines. A line per page would bury everything else
+    in the log, and the interesting figure is the running total anyway.
+    """
+    now = time.time()
+    if now - _SAID_AT.get(key, 0.0) < float(every):
+        return
+    _SAID_AT[key] = now
+    print(msg, file=sys.stderr, flush=True)
+
+
+class _StreamGuard:
+    """Decides, as tokens arrive, whether this generation has gone degenerate.
+
+    SURYA'S OWN DETECTOR, not a second opinion. `surya.inference.util.
+    detect_repeat_token` is what surya already uses to decide whether to retry
+    a page, and it is what the orchestrator uses to decide whether to resume
+    one. Reusing it means the early abort can only ever reject a page that was
+    going to be rejected anyway -- it changes how much of the page is paid for,
+    never which pages are kept. A separate heuristic here could disagree with
+    the one downstream, and then a page would be abandoned and then accepted.
+
+    Two margins against cutting a page that merely LOOKS repetitive for a
+    while (a form, a table of dotted leaders, a column of repeated dates):
+    nothing is judged before `min_chars` of output, and the detector must fire
+    on `persistence` consecutive checks. A real loop never recovers.
+    """
+
+    def __init__(self, detect, min_chars, step, persistence):
+        self._detect = detect
+        self._min = max(1, int(min_chars))
+        self._step = max(1, int(step))
+        self._need = max(1, int(persistence))
+        self._parts = []
+        self._len = 0
+        self._next_at = self._min
+        self._run = 0
+        self.tripped = False
+        self.tripped_at = 0
+
+    @property
+    def text(self):
+        return "".join(self._parts)
+
+    def feed(self, piece):
+        if piece:
+            self._parts.append(piece)
+            self._len += len(piece)
+        if self.tripped or self._len < self._next_at:
+            return self.tripped
+        # One check per step boundary CROSSED, not one per call: otherwise the
+        # verdict depends on how the server frames its chunks, and a caller that
+        # fed a whole reply at once could never reach a persistence above 1.
+        text = self.text
+        while not self.tripped and self._len >= self._next_at:
+            at = self._next_at
+            self._next_at = at + self._step
+            try:
+                hit = bool(self._detect(text[:at]))
+            except Exception:
+                return False        # a detector that raises must not cut pages
+            if not hit:
+                self._run = 0
+                continue
+            self._run += 1
+            if self._run >= self._need:
+                self.tripped = True
+                self.tripped_at = at
+        return self.tripped
+
+
+class _Msg:
+    def __init__(self, content):
+        self.content = content
+
+
+class _LPWrap:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Choice:
+    def __init__(self, content, finish_reason, logprobs):
+        self.message = _Msg(content)
+        self.text = content
+        self.finish_reason = finish_reason
+        self.logprobs = _LPWrap(logprobs) if logprobs else None
+
+
+class _Usage:
+    def __init__(self, pin, pout):
+        self.prompt_tokens = int(pin or 0)
+        self.completion_tokens = int(pout or 0)
+        self.total_tokens = self.prompt_tokens + self.completion_tokens
+
+
+class _Completion:
+    """A chat completion in the shape surya's client expects to receive."""
+
+    def __init__(self, content, finish_reason, logprobs, pin, pout,
+                 aborted=False):
+        self.choices = [_Choice(content, finish_reason, logprobs)]
+        self.usage = _Usage(pin, pout)
+        self.aborted = bool(aborted)
+
+
+def _guarded_create(inner, kwargs, guard):
+    """One chat completion, streamed, stopped early if it starts repeating.
+
+    Closing the stream is the whole point: the server sees the client go away
+    and cancels the sequence, so the tokens we did not wait for were never
+    generated. Reading to the end and throwing the tail away would save
+    nothing at all.
+
+    `stream_options.include_usage` is required, not decorative. A streamed
+    reply otherwise carries no token counts, and surya decides whether a page
+    was cut off by comparing `completion_tokens` against the cap -- so a
+    missing count silently reclassifies every page as complete, which is a
+    failure this engine has had before.
+    """
+    ask = dict(kwargs)
+    ask["stream"] = True
+    ask["stream_options"] = {"include_usage": True}
+    want_lp = bool(ask.get("logprobs"))
+    logprobs = []
+    finish = ""
+    pin = pout = 0
+    stream = inner(**ask)
+    try:
+        for chunk in stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                pin = int(getattr(usage, "prompt_tokens", 0) or 0)
+                pout = int(getattr(usage, "completion_tokens", 0) or 0)
+            for ch in (getattr(chunk, "choices", None) or []):
+                fr = getattr(ch, "finish_reason", None)
+                if fr:
+                    finish = str(fr)
+                delta = getattr(ch, "delta", None)
+                piece = getattr(delta, "content", None) if delta is not None else None
+                if piece is None:
+                    piece = getattr(ch, "text", None)
+                if want_lp:
+                    lp = getattr(ch, "logprobs", None)
+                    got = getattr(lp, "content", None) if lp is not None else None
+                    for c in (got or []):
+                        logprobs.append(
+                            c.model_dump() if hasattr(c, "model_dump") else c)
+                if not piece:
+                    continue
+                if guard.feed(piece):
+                    _ABORTED[0] += 1
+                    _ABORTED[1] += guard.tripped_at
+                    _say_every(
+                        "early-abort", 60.0,
+                        "[surya] a page was repeating itself after %d "
+                        "characters and was abandoned there rather than run to "
+                        "its token cap (%d page(s) so far, %d characters not "
+                        "generated). The page is reported exactly as a looping "
+                        "page always was."
+                        % (guard.tripped_at, _ABORTED[0], _ABORTED[1]))
+                    return _Completion(
+                        guard.text,
+                        # NOT "length": a page abandoned for looping must not
+                        # look like one that merely ran long, or the resumption
+                        # logic would continue it -- and continuing a loop is
+                        # what this exists to stop.
+                        "abort_repeat", logprobs or None, pin, pout,
+                        aborted=True)
+    finally:
+        try:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+    return _Completion(guard.text, finish or "stop", logprobs or None,
+                       pin, pout)
+
+
+def _guarded_client(client, detect):
+    """`client`, with `chat.completions.create` watched by a _StreamGuard.
+
+    The client is wrapped rather than surya patched any further: surya builds
+    and sends its own request (`client.chat.completions.create(**kwargs)`), so
+    there is no request of ours to add `stream` to -- but the client object
+    arrives as a keyword to the function we already wrap.
+
+    Anything unexpected falls back to the ordinary blocking call. A page read
+    slowly is always better than a page not read, and the post-hoc detector
+    still judges whatever comes back.
+    """
+    inner = client.chat.completions.create
+
+    def _create(**kwargs):
+        if kwargs.get("stream"):
+            return inner(**kwargs)
+        guard = _StreamGuard(detect, _EARLY_LOOP[1], _EARLY_LOOP[2],
+                             _EARLY_LOOP[3])
+        try:
+            return _guarded_create(inner, kwargs, guard)
+        except Exception as exc:
+            print(f"[surya] early loop detection unavailable for this call "
+                  f"({type(exc).__name__}: {exc}) — falling back to a blocking "
+                  f"read", file=sys.stderr, flush=True)
+            return inner(**kwargs)
+
+    class _Completions:
+        create = staticmethod(_create)
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Guarded:
+        chat = _Chat()
+
+        def __getattr__(self, name):
+            return getattr(client, name)
+
+    return _Guarded()
 
 
 def _install_image_encoder():
@@ -1370,6 +1609,10 @@ class SuryaWorker:
         _RETRY_BUDGET[0] = None if budget is None else max(0, int(budget))
         #: 0 leaves surya's own 2048 in place.
         _MAX_TOKENS[0] = max(0, int(opts.get("max_tokens", 0) or 0))
+        _EARLY_LOOP[0] = bool(opts.get("early_loop_abort", True))
+        _EARLY_LOOP[1] = max(1, int(opts.get("early_loop_min_chars", 2000) or 2000))
+        _EARLY_LOOP[2] = max(1, int(opts.get("early_loop_step", 400) or 400))
+        _EARLY_LOOP[3] = max(1, int(opts.get("early_loop_persistence", 2) or 2))
         #: How a page is encoded for the model, when this process must encode
         #: it at all. Module cell, like the rest: the surya function it feeds is
         #: module-level.
@@ -1448,7 +1691,13 @@ class SuryaWorker:
         wrapper only reads, never alters, and swallows everything -- a diagnostic
         that can break OCR would be far worse than no diagnostic.
         """
-        if not (self._trace or self._repair):
+        # The early loop abort rides on the SAME hook, so this gate decides
+        # whether it is installed too. Leaving it out of the condition made the
+        # abort silently depend on `repair_accents` -- an unrelated setting
+        # whose default happens to be on, which is the worst kind of coupling:
+        # it works until someone turns off accent repair and then loses 19% of
+        # their throughput with nothing to connect the two.
+        if not (self._trace or self._repair or _EARLY_LOOP[0]):
             return
         try:
             from surya.inference.backends import openai_client as _oc
@@ -1514,6 +1763,30 @@ class SuryaWorker:
                             print(f"[surya] page budget {cap} tokens "
                                   f"(overriding surya's own {_own})",
                                   file=sys.stderr, flush=True)
+            # THE EARLY ABORT. surya sends its own request, so there is no
+            # payload of ours to add `stream` to -- but the client it sends it
+            # with arrives here as a keyword, and a client is a thing we can
+            # wrap. `create` then streams, watches the text with surya's OWN
+            # repeat detector, and closes the connection the moment the page is
+            # provably degenerate. vLLM cancels the sequence when the client
+            # goes away, so the rest of the budget is never spent.
+            #
+            # Measured on 100 pages of a real judicial corpus (A40, cap 4096 /
+            # 1 continuation): 4 pages looped and were 18.9% of the run's whole
+            # generation time; the worst spent 450 s on 17,586 characters of one
+            # repeated clause and is cut at ~2,400. 0.560 -> 0.690 pages/s.
+            if _EARLY_LOOP[0] and kwargs.get("client") is not None:
+                try:
+                    from surya.inference.util import detect_repeat_token as _drt
+                except Exception as exc:
+                    _say_every("early-abort-off", 600.0,
+                               f"[surya] EARLY LOOP ABORT IS OFF: surya's own "
+                               f"detect_repeat_token could not be imported "
+                               f"({exc}), so a looping page will again run to "
+                               f"its full token cap before being rejected.")
+                else:
+                    kwargs = dict(kwargs)
+                    kwargs["client"] = _guarded_client(kwargs["client"], _drt)
             result = inner(*args, **kwargs)
             # A reply that ran out of room is finished here, before surya parses
             # it: raising the cap only moves the cliff, and incomplete block

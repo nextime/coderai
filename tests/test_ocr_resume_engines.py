@@ -251,5 +251,8 @@ def test_both_engines_share_one_implementation():
     point of the change."""
     for mod in (ROOT / "codai/ocr/chandra.py", ROOT / "codai/ocr/olmocr.py"):
         src = mod.read_text()
-        assert "from codai.ocr import resume" in src
+        # `loopguard` rides alongside it since the early abort landed. What
+        # this pins is that neither engine grows its own resumption.
+        assert ("from codai.ocr import resume" in src
+                or "from codai.ocr import loopguard, resume" in src)
         assert "resume.resume(" in src and "resume.report(" in src

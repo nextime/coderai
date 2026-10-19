@@ -1035,6 +1035,34 @@ class OcrConfig:
     # honest answer is 429 with a Retry-After, and a client that obeys it gets
     # its work done sooner than one that keeps pushing.
     max_queued_pages: int = 0
+    # Stop a generation the moment it is provably repeating itself, instead of
+    # paying its whole token budget and then rejecting the result.
+    #
+    # A VLM that loses its place on a page repeats the last thing it saw until
+    # it runs out of tokens. Every engine here already runs the same detector
+    # over the FINISHED reply and treats a looping one as retryable -- so this
+    # changes nothing about which pages are rejected, only how much of each one
+    # is paid for. On a 100-page sample of a real judicial corpus (surya, A40,
+    # cap 4096 / 1 continuation) 4 pages looped and accounted for 18.9% of the
+    # run's entire generation time; one spent 450 s emitting 17,586 characters
+    # of the same clause.
+    #
+    # On by default BECAUSE it is the same judgement, reached sooner: a page it
+    # abandons is a page the post-hoc check would have rejected anyway.
+    early_loop_abort: bool = True
+    # Output before which nothing is judged. The largest genuine page in the
+    # measured corpus is 5,054 characters and the median ~1,900, so 2,000 is
+    # comfortably past where a real page has shown its character.
+    early_loop_min_chars: int = 2000
+    # How often to re-run the detector, in characters of new output.
+    early_loop_step: int = 400
+    # Consecutive checks that must all say "repeating" before abandoning the
+    # page. A real loop never recovers; a repetitive passage -- a form, a table
+    # of dotted leaders, a column of repeated dates -- does. Swept over 393 page
+    # reads: at min_chars 1200 with persistence 1 there was one false positive
+    # (a 1,444-character page with a repetitive middle and genuine text after
+    # it); at 2000/2 there were none, and 12 of 12 real loops were still caught.
+    early_loop_persistence: int = 2
     # Ceiling on the bytes that in-flight documents may hold in RASTERISED pages,
     # charged before a page exists (codai/ocr/budget.py prices a document from its
     # page tree). 0 = derive it from the cgroup limit or host RAM, which is the
@@ -2454,6 +2482,10 @@ class ConfigManager:
                      "olmocr_max_continuations", int),
                     ("CODERAI_OCR_MAX_CONCURRENCY", "max_concurrency", int),
                     ("CODERAI_OCR_MAX_QUEUED_PAGES", "max_queued_pages", int),
+                    ("CODERAI_OCR_EARLY_LOOP_ABORT", "early_loop_abort", bool),
+                    ("CODERAI_OCR_EARLY_LOOP_MIN_CHARS", "early_loop_min_chars", int),
+                    ("CODERAI_OCR_EARLY_LOOP_STEP", "early_loop_step", int),
+                    ("CODERAI_OCR_EARLY_LOOP_PERSISTENCE", "early_loop_persistence", int),
                     ("CODERAI_OCR_MAX_RESIDENT_MB", "max_resident_mb", int),
                     ("CODERAI_OCR_PAGE_WINDOW", "page_window", int),
                     ("CODERAI_OCR_RASTER_WORKERS", "raster_workers", int),

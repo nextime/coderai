@@ -164,9 +164,15 @@ def test_the_hook_installs_for_the_repair_even_with_the_trace_off():
 
 
 def test_neither_feature_means_no_patching():
+    """...and nor does the EARLY LOOP ABORT, which rides the same hook.
+
+    It was first added without being named in this condition, which made a
+    feature worth ~19% of throughput depend silently on `repair_accents` -- an
+    unrelated setting whose default happens to be on. That is the worst kind of
+    coupling: it works until someone turns accent repair off."""
     import inspect
     src = inspect.getsource(W.SuryaWorker._install_trace_hook)
-    assert "if not (self._trace or self._repair):" in src
+    assert "if not (self._trace or self._repair or _EARLY_LOOP[0]):" in src
 
 
 # ------------------------------------------------------- it reports what it did #

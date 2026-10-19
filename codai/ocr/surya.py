@@ -84,6 +84,18 @@ class SuryaEngine(SubprocessOcrEngine):
                 # 0 = ask the server for its own max_model_len.
                 "context_tokens": max(0, int(getattr(
                     self.cfg, "surya_context_tokens", 0) or 0)),
+                # Stop a generation the moment it is provably repeating,
+                # instead of paying its whole budget and then rejecting it. Sent
+                # at load because the hook wraps surya's client, which must be
+                # in place before page one.
+                "early_loop_abort": bool(getattr(
+                    self.cfg, "early_loop_abort", True)),
+                "early_loop_min_chars": max(1, int(getattr(
+                    self.cfg, "early_loop_min_chars", 2000) or 2000)),
+                "early_loop_step": max(1, int(getattr(
+                    self.cfg, "early_loop_step", 400) or 400)),
+                "early_loop_persistence": max(1, int(getattr(
+                    self.cfg, "early_loop_persistence", 2) or 2)),
                 # The repetition detector's thresholds, when retuned. 0 leaves
                 # surya's own, which is what every install gets until someone
                 # measures their corpus and decides otherwise.

@@ -36,7 +36,7 @@ import json
 import threading
 from typing import Optional
 
-from codai.ocr import resume
+from codai.ocr import loopguard, resume
 # chandra's port of its upstream's detector, which is not chandra-specific: it
 # answers "has this reply fallen into a repetition loop", and a looping reply
 # must not be resumed whichever engine produced it.
@@ -500,9 +500,49 @@ class OlmOcrEngine(OcrEngine):
         if key:
             headers["Authorization"] = f"Bearer {key}"
         url = (base or self._base).rstrip("/") + "/chat/completions"
+        timeout = float(getattr(self.cfg, "olmocr_timeout", 300.0) or 300.0)
+        # EARLY LOOP ABORT -- see codai/ocr/loopguard.py. The same detector
+        # that judges the finished reply a few lines below, applied to the reply
+        # as it arrives, so a page that is repeating itself stops costing the
+        # moment that is provable instead of at its token cap.
+        guarded = loopguard.settings(self.cfg)
+        # `stream_supported`: a server that has already proved it cannot stream
+        # is not asked again. One wasted request per server per process, not one
+        # per page -- paying a failed attempt on every page of a million-page
+        # run to re-learn the same fact would be its own defect.
+        if (guarded["enabled"] and not prefix
+                and loopguard.stream_supported(url)):
+            # Never on a continuation: `resume` has already decided this page is
+            # worth finishing, and the prefix it sends back is text we accepted.
+            guard = loopguard.LoopGuard(min_chars=guarded["min_chars"],
+                                        step=guarded["step"],
+                                        persistence=guarded["persistence"])
+            try:
+                got = loopguard.stream_chat(pod_http.post, url, payload,
+                                            headers, timeout, guard,
+                                            want_logprobs=bool(
+                                                payload.get("logprobs")))
+            except loopguard.StreamUnsupported as exc:
+                # NOTHING WAS CONSUMED, so the blocking call below is a retry
+                # and not a second generation. Any other failure is re-raised:
+                # once the server has begun answering, the page has been
+                # generated and paid for, and re-issuing it would run it twice.
+                loopguard.mark_no_stream(url)
+                print(f"[olmocr] this server does not stream ({exc}) — early "
+                      f"loop detection is off for it; a looping page will run "
+                      f"to its token cap before being rejected", flush=True)
+            else:
+                if got.aborted:
+                    print(f"[olmocr] {got.reason}", flush=True)
+                if got.text.strip() or got.aborted:
+                    return resume.Reply(
+                        text=got.text, finish_reason=got.finish_reason,
+                        prompt_tokens=got.prompt_tokens,
+                        completion_tokens=got.completion_tokens,
+                        conf=mean_token_prob(got.logprobs or None))
         try:
             r = pod_http.post(url, json=payload, headers=headers,
-                              timeout=float(getattr(self.cfg, "olmocr_timeout", 300.0) or 300.0))
+                              timeout=timeout)
         except Exception as e:
             raise OcrError(f"olmOCR server {url} unreachable: {e}", status=503)
         if r.status_code >= 400:
