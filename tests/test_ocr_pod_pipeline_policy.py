@@ -545,3 +545,18 @@ def test_the_hint_list_recognises_what_production_actually_logged():
     assert om._looks_like_a_dead_socket(ConnectionResetError("Connection reset by peer"))
     assert not om._looks_like_a_dead_socket(Exception("Read timed out. (read timeout=600)"))
     assert not om._looks_like_a_dead_socket(Exception("that is not a PDF"))
+
+
+def test_require_also_refuses_when_the_pods_could_not_finish_the_document():
+    """`require` used to bind only the LEASE. A page that timed out on a pod
+    (or a pool that refused) still sent the whole document to this box's
+    pipeline -- live, 4 surya processes at ~9 GB each and swap full on a
+    GPU-less orchestrator. The refusal must sit between the pod read and the
+    local one."""
+    import inspect
+    src = inspect.getsource(om.OcrManager.ocr_document)
+    i_pod = src.index("await self._read_on_pods(")
+    i_req = src.index('_pod_pipeline_policy(cfg)[0] == "require"')
+    i_local = src.index("await self._read_windowed(")
+    assert i_pod < i_req < i_local
+    assert "status=503" in src[i_req:i_local]

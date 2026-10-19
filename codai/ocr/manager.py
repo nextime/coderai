@@ -2030,6 +2030,18 @@ class OcrManager:
                 print(f"[ocr] the pod-side pipeline for {_remote_model!r} could "
                       f"not run ({exc}); reading locally instead", flush=True)
                 _out = None
+        if _out is None and _remote_model and _pod_pipeline_policy(cfg)[0] == "require":
+            # `require` means THIS BOX NEVER READS -- and until 0.4.50 it only
+            # meant that when no lease could be had. A page that timed out on a
+            # pod, or a pod that refused, still sent the whole document to the
+            # local pipeline: on a GPU-less orchestrator, 4 surya processes at
+            # ~9 GB each, swap full, and the pages they read came back slower
+            # than a retry on a pod would have. Refuse instead; the client
+            # retries and the page goes back to the cards.
+            raise OcrError(
+                f"no pod could read this document for {_remote_model!r} and "
+                f"ocr.pod_pipeline is 'require', so this box will not read it "
+                f"itself. Retry.", status=503)
         if _out is not None:
             name, pages, blank, stamps, signatures = _out
         else:
