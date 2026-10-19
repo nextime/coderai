@@ -54,7 +54,9 @@ def test_an_unbounded_budget_leaves_the_sizes_alone(monkeypatch):
     monkeypatch.setattr(thread_pool, "_configured_concurrency", lambda: 4096)
     monkeypatch.setattr(thread_pool, "task_budget", lambda: 0)
     general, pod = thread_pool.pool_sizes()
-    assert pod == thread_pool._MAX_POD
+    # The configured width (2 x 4096), not the ceiling: since v0.4.45 the
+    # ceiling is 16384, so an unbounded budget gives exactly what was asked.
+    assert pod == min(thread_pool._MAX_POD, 4096 * 2)
     assert general == thread_pool._MAX_DEFAULT
 
 

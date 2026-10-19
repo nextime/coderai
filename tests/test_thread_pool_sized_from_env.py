@@ -12,7 +12,19 @@ import pytest
 from codai.api import thread_pool as tp
 
 
+def _no_config(monkeypatch):
+    """Make "no config is readable" true, whatever an earlier test left set."""
+    import importlib
+    for mod in ("codai.admin.routes", "codai.config"):
+        try:
+            m = importlib.import_module(mod)
+            monkeypatch.setattr(m, "config_manager", None, raising=False)
+        except Exception:
+            pass
+
+
 def test_the_env_sizes_the_pools_when_no_config_is_readable(monkeypatch):
+    _no_config(monkeypatch)
     monkeypatch.setenv("CODERAI_OCR_MAX_CONCURRENCY", "4096")
     monkeypatch.setattr(tp, "task_budget", lambda: 0)
     assert tp._configured_concurrency() >= 4096
