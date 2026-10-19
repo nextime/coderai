@@ -186,6 +186,34 @@ def get_pod_machine(client, pod_id: str) -> dict:
         return {}
 
 
+#: [epoch seconds] before which GraphQL is not called at all. See _gql.
+_GQL_BACKOFF_UNTIL = [0.0]
+#: Never believe a ban longer than this (a unit we misread must not mean "never").
+_GQL_BACKOFF_MAX_S = 6 * 3600
+
+
+def _note_rate_limit(r) -> None:
+    """Remember a 429's retryAfter (seconds) or Retry-After header."""
+    wait = 0.0
+    try:
+        wait = float((r.json() or {}).get("retryAfter") or 0)
+    except Exception:
+        pass
+    if not wait:
+        try:
+            wait = float(r.headers.get("Retry-After") or 0)
+        except Exception:
+            wait = 0.0
+    wait = max(5.0, min(_GQL_BACKOFF_MAX_S, wait or 30.0))
+    until = time.time() + wait
+    if until > _GQL_BACKOFF_UNTIL[0] + 60:
+        print(f"[runpod] RunPod rate-limited the API key for {wait:.0f}s "
+              f"(until {time.strftime('%H:%M:%S', time.localtime(until))}) — "
+              f"no GraphQL calls until then; renting, terminating and status "
+              f"checks that need it will report this instead", flush=True)
+    _GQL_BACKOFF_UNTIL[0] = max(_GQL_BACKOFF_UNTIL[0], until)
+
+
 class RunpodClient:
     def __init__(self, cfg):
         self._cfg = cfg
@@ -200,6 +228,17 @@ class RunpodClient:
     def _gql(self, query: str, variables: Optional[dict] = None,
              timeout: float = 30.0) -> dict:
         import requests
+        # A 429 from RunPod carries `retryAfter` in SECONDS (watched it fall by
+        # 20 every 20 s from 11,871), and it has been hours long. Asking again
+        # inside that window only re-confirms the ban, so callers get the answer
+        # here, without a request.
+        until = _GQL_BACKOFF_UNTIL[0]
+        if until > time.time():
+            raise RunpodTransient(
+                f"RunPod rate-limited this API key ({_mask(self._api_key)}); "
+                f"not calling it again until "
+                f"{time.strftime('%H:%M:%S', time.localtime(until))} "
+                f"({until - time.time():.0f}s)")
         # RunPod authenticates GraphQL via the ?api_key= query param.
         url = self._gql_base + ("&" if "?" in self._gql_base else "?") + "api_key=" + self._api_key
         try:
@@ -219,6 +258,8 @@ class RunpodClient:
             cls = (RunpodTransient
                    if r.status_code >= 500 or r.status_code in (408, 425, 429)
                    else RunpodError)
+            if r.status_code == 429:
+                _note_rate_limit(r)
             raise cls(f"RunPod API HTTP {r.status_code}: {r.text[:300]}")
         try:
             body = r.json()

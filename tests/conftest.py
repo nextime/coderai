@@ -1,3 +1,4 @@
+import pytest
 """Guards so a runaway test cannot take the host down with it.
 
 On 2026-10-10 a full `pytest tests/` run grew to 46 GB RSS plus 20 GB of swap on a
@@ -150,3 +151,17 @@ def pytest_sessionfinish(session, exitstatus):
             os.unlink(ABORT_LOG)
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _no_runpod_rate_limit_carryover():
+    """A test that receives a RunPod 429 sets the process-wide GraphQL backoff;
+    without this, every later test that calls _gql is refused by it."""
+    try:
+        from codai.api import runpod_client as _rc
+    except Exception:
+        yield
+        return
+    _rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    yield
+    _rc._GQL_BACKOFF_UNTIL[0] = 0.0

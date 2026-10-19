@@ -328,7 +328,15 @@ async def health(token: str):
     if got is None:
         return _unknown_lease()
     from codai.models import placement
-    if not placement.any_candidate(got["model_id"]):
+    import asyncio
+    # OFF THE LOOP. any_candidate() can START the local vLLM (placement's
+    # local candidate calls vllm_worker.ensure_service), which waits for
+    # readiness in a sleep loop: on a rented OCR pod this probe, made by every
+    # surya engine, froze the whole process for up to 408 s while vLLM was
+    # being relaunched -- and the orchestrator took that pod for dead.
+    # (Not the control pool: that is reserved so status pages never starve,
+    # and this is the request path.)
+    if not await asyncio.to_thread(placement.any_candidate, got["model_id"]):
         return JSONResponse(status_code=503,
                             content={"error": {"message": "no server for "
                                                           + got["model_id"]}})

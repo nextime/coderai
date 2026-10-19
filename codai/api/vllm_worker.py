@@ -83,10 +83,10 @@ def _pump_logs(proc, tail, meta: dict = None):
             print(f"[vllm] {line}", flush=True)
 
 
-def _health_ok(url: str) -> bool:
+def _health_ok(url: str, timeout: float = 3) -> bool:
     import requests
     try:
-        r = requests.get(url + "/v1/models", timeout=3)
+        r = requests.get(url + "/v1/models", timeout=timeout)
         return r.status_code == 200
     except Exception:
         return False
@@ -750,6 +750,53 @@ def _start_ray(cfg, py: str, env: dict):
     return cluster, address
 
 
+class _StillStarting(Exception):
+    """Another caller is starting this engine; wait for it instead."""
+
+    def __init__(self, svc):
+        super().__init__("vLLM still starting")
+        self.svc = svc
+
+
+def _mark_ready(svc_key: str, proc) -> None:
+    with _lock:
+        svc = _services.get(svc_key)
+        if svc and svc.get("proc") is proc:
+            svc["ready"] = True
+            ev = svc.get("ready_event")
+            if ev is not None:
+                ev.set()
+
+
+def _wait_for_start(svc: dict, svc_key: str, ready_timeout: float) -> str:
+    """Wait for an engine another caller is starting. Its own launcher reports
+    failures; this only needs to know whether it came up."""
+    deadline = time.time() + ready_timeout
+    ev = svc.get("ready_event")
+    while time.time() < deadline:
+        if svc["proc"].poll() is not None:
+            raise RuntimeError(f"vLLM for {svc_key} exited while another caller "
+                               f"was starting it")
+        if svc.get("ready") or (ev is not None and ev.wait(2.0)):
+            return svc["url"]
+        if ev is None:
+            time.sleep(2)
+    raise RuntimeError(f"vLLM for {svc_key} did not become ready in time "
+                       f"(started by another caller)")
+
+
+_BUSY_SAID: dict = {}
+
+
+def _say_busy(svc_key: str, url: str) -> None:
+    now = time.time()
+    if now - _BUSY_SAID.get(svc_key, 0.0) > 60:
+        _BUSY_SAID[svc_key] = now
+        print(f"[vllm] {svc_key} at {url} is slow to answer its health check "
+              f"but its process is alive — treating it as BUSY and keeping it, "
+              f"not starting a second engine on the same card", flush=True)
+
+
 def _ensure_service_once(cfg, model_path: Optional[str] = None,
                          served_name: Optional[str] = None,
                          ready_timeout: float = 3600.0,
@@ -783,150 +830,178 @@ def _ensure_service_once(cfg, model_path: Optional[str] = None,
         return _remote
 
     resolved, svc_key = resolve_service_key(cfg, model_path)
-    with _lock:
-        svc = _services.get(svc_key)
-        if svc and svc["proc"].poll() is None and _health_ok(svc["url"]):
-            # Alive is not the same as useful. An engine serves the names it was
-            # LAUNCHED with, and this instance may have started before the name
-            # now being asked for existed here at all — a pod is taught models
-            # after it boots, and an adapter registered afterwards is not in any
-            # running engine's --lora-modules. Reusing it then answers 404 for
-            # as long as the engine lives.
-            #
-            # Only an answered probe that omits the name forces a relaunch: a
-            # probe that fails says nothing, and restarting a loaded 27B on a
-            # timeout would be far worse than the doubt.
-            mcfg_entry = _model_config_for(resolved or model_path or "")
-            if not served_name or _serves_name(svc["url"], served_name) is not False:
-                # It answers to the name. Does it answer with the adapter that
-                # is configured NOW? A retrain keeps the name.
-                if not _adapter_is_stale(svc["url"], mcfg_entry, served_name):
-                    return svc["url"]
-                print(f"[lora] {served_name!r} on {svc['url']} is an older "
-                      f"version of the adapter — swapping it in the running "
-                      f"engine", flush=True)
-                if _unload_lora_runtime(svc["url"], served_name) \
-                        and _load_lora_runtime(svc["url"], mcfg_entry, served_name):
-                    return svc["url"]
-                print(f"[lora] could not swap {served_name!r} in place — "
-                      f"restarting the engine so it picks up the new adapter",
-                      flush=True)
-            # An ADAPTER can usually just be handed to the running engine. Try
-            # that before throwing away a loaded base model.
-            elif _load_lora_runtime(svc["url"], mcfg_entry, served_name):
+    try:
+        with _lock:
+            svc = _services.get(svc_key)
+            _alive = bool(svc) and svc["proc"].poll() is None
+            if _alive and not svc.get("ready", True):
+                # STILL STARTING. Waiting for it is the only right answer: a
+                # second launch puts two engines on one card, each sized for
+                # all of it -- measured on a rented A40, two EngineCores one
+                # second apart, then `-9` kills and a relaunch every few
+                # seconds for twenty minutes.
+                raise _StillStarting(svc)
+            if _alive and not _health_ok(svc["url"]) and not _health_ok(
+                    svc["url"], timeout=15):
+                # BUSY, NOT DEAD. A live engine under load can miss a 3 s
+                # probe; replacing it then is what started the storm above
+                # (and the "10.22 of 47 GiB free" crash): the old process
+                # keeps the card while the new one cannot fit. It is still
+                # the engine for this model, so hand it out.
+                _say_busy(svc_key, svc["url"])
                 return svc["url"]
-            print(f"[vllm] the engine on {svc['url']} does not serve "
-                  f"{served_name!r} — it started before this model was known "
-                  f"here; restarting it so one engine serves the base and every "
-                  f"adapter of it", flush=True)
-            _services.pop(svc_key, None)
-            _stop_proc(svc, svc_key)
-        elif svc:
-            _services.pop(svc_key, None)
+            if _alive and _health_ok(svc["url"]):
+                # Alive is not the same as useful. An engine serves the names it was
+                # LAUNCHED with, and this instance may have started before the name
+                # now being asked for existed here at all — a pod is taught models
+                # after it boots, and an adapter registered afterwards is not in any
+                # running engine's --lora-modules. Reusing it then answers 404 for
+                # as long as the engine lives.
+                #
+                # Only an answered probe that omits the name forces a relaunch: a
+                # probe that fails says nothing, and restarting a loaded 27B on a
+                # timeout would be far worse than the doubt.
+                mcfg_entry = _model_config_for(resolved or model_path or "")
+                if not served_name or _serves_name(svc["url"], served_name) is not False:
+                    # It answers to the name. Does it answer with the adapter that
+                    # is configured NOW? A retrain keeps the name.
+                    if not _adapter_is_stale(svc["url"], mcfg_entry, served_name):
+                        return svc["url"]
+                    print(f"[lora] {served_name!r} on {svc['url']} is an older "
+                          f"version of the adapter — swapping it in the running "
+                          f"engine", flush=True)
+                    if _unload_lora_runtime(svc["url"], served_name) \
+                            and _load_lora_runtime(svc["url"], mcfg_entry, served_name):
+                        return svc["url"]
+                    print(f"[lora] could not swap {served_name!r} in place — "
+                          f"restarting the engine so it picks up the new adapter",
+                          flush=True)
+                # An ADAPTER can usually just be handed to the running engine. Try
+                # that before throwing away a loaded base model.
+                elif _load_lora_runtime(svc["url"], mcfg_entry, served_name):
+                    return svc["url"]
+                print(f"[vllm] the engine on {svc['url']} does not serve "
+                      f"{served_name!r} — it started before this model was known "
+                      f"here; restarting it so one engine serves the base and every "
+                      f"adapter of it", flush=True)
+                _services.pop(svc_key, None)
+                _stop_proc(svc, svc_key)
+            elif svc:
+                # The process is gone. Stop what is left of it (ray, pipes)
+                # rather than only forgetting it.
+                _services.pop(svc_key, None)
+                try:
+                    _stop_proc(svc, svc_key)
+                except Exception:
+                    pass
 
-        py = ensure_built(cfg)
-        model = resolved or (getattr(cfg, "model_path", "") or "").strip()
-        if not model:
-            raise RuntimeError(
-                "vLLM: no model resolved. Set vllm.model_path (an HF model dir or id).")
+            py = ensure_built(cfg)
+            model = resolved or (getattr(cfg, "model_path", "") or "").strip()
+            if not model:
+                raise RuntimeError(
+                    "vLLM: no model resolved. Set vllm.model_path (an HF model dir or id).")
 
-        host = (getattr(cfg, "host", "127.0.0.1") or "127.0.0.1").strip()
-        port = int(getattr(cfg, "port", 0) or 0) or _free_port()
-        url_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
-        url = f"http://{url_host}:{port}"
-        # The share is resolved by the caller (ensure_service, which may be escalating
-        # after a too-small budget) and remembered here: what this instance actually
-        # reserved is what stopping it frees, and the eviction path has to be told the
-        # truth or it over- or under-evicts for the next model.
-        gmu = float(gmu_absolute or 0.0)
-        cmd = _launch_cmd(py, cfg, host, port, model, served_name,
-                          model_config=_model_config_for(resolved or model),
-                          gpu_memory_utilization=gmu,
-                          max_model_len=max_model_len,
-                          max_num_batched_tokens=max_num_batched_tokens,
-                          max_num_seqs=max_num_seqs)
+            host = (getattr(cfg, "host", "127.0.0.1") or "127.0.0.1").strip()
+            port = int(getattr(cfg, "port", 0) or 0) or _free_port()
+            url_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+            url = f"http://{url_host}:{port}"
+            # The share is resolved by the caller (ensure_service, which may be escalating
+            # after a too-small budget) and remembered here: what this instance actually
+            # reserved is what stopping it frees, and the eviction path has to be told the
+            # truth or it over- or under-evicts for the next model.
+            gmu = float(gmu_absolute or 0.0)
+            cmd = _launch_cmd(py, cfg, host, port, model, served_name,
+                              model_config=_model_config_for(resolved or model),
+                              gpu_memory_utilization=gmu,
+                              max_model_len=max_model_len,
+                              max_num_batched_tokens=max_num_batched_tokens,
+                              max_num_seqs=max_num_seqs)
 
-        env = os.environ.copy()
-        # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on
-        # hosts without a full build toolchain (nvcc/gcc wired for it). Default it OFF so
-        # vLLM uses FLASH_ATTN + a native sampler out of the box; the user can re-enable
-        # via extra_env. (Set before extra_env so an explicit override wins.)
-        env.setdefault("VLLM_USE_FLASHINFER", "0")
-        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-        # An adapter can then be registered into the RUNNING engine
-        # (/v1/load_lora_adapter) instead of costing a reload of the base
-        # model. Only where the launch actually enabled LoRA: the flag is
-        # meaningless otherwise, and setting it everywhere would be a claim we
-        # cannot honour.
-        if "--enable-lora" in cmd:
-            env.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
-        # Pin this vLLM instance to specific NVIDIA GPU(s) if configured (CUDA-only).
-        gpu = (getattr(cfg, "gpu", "") or "").strip()
-        if gpu:
-            env["CUDA_VISIBLE_DEVICES"] = gpu
-        extra_env = (getattr(cfg, "extra_env", "") or "").strip()
-        applied = {}
-        if extra_env:
-            for tok in shlex.split(extra_env):
-                if "=" in tok:
-                    k, v = tok.split("=", 1)
-                    if k.strip():
-                        env[k.strip()] = v; applied[k.strip()] = v
-        ray = None
-        if needs_ray(cfg):
-            ray, _addr = _start_ray(cfg, py, env)
-        print(f"[vllm] launching: {' '.join(cmd)}"
-              + (f"  ({' '.join(f'{k}={v}' for k, v in applied.items())})" if applied else ""),
-              flush=True)
-        tail = collections.deque(maxlen=80)
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, env=env)
-        except Exception:
-            if ray is not None:
-                ray.stop()
-            raise
-        meta = {}
-        threading.Thread(target=_pump_logs, args=(proc, tail, meta), daemon=True).start()
-        _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray,
-                              "gmu": gmu, "meta": meta}
-        # Which VERSION of each adapter this engine was launched with, so a
-        # retrain under the same name is recognised as a different adapter
-        # rather than a name the engine already answers to.
-        _LORA_LOADED.pop((url, served_name or ""), None)
-        for _spec in _sibling_lora_specs(_model_config_for(resolved or model) or {}):
-            _nm = str(_spec.get("name") or "")
-            if _nm:
-                _LORA_LOADED[(url, _nm)] = str(_spec.get("source") or "")
+            env = os.environ.copy()
+            # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on
+            # hosts without a full build toolchain (nvcc/gcc wired for it). Default it OFF so
+            # vLLM uses FLASH_ATTN + a native sampler out of the box; the user can re-enable
+            # via extra_env. (Set before extra_env so an explicit override wins.)
+            env.setdefault("VLLM_USE_FLASHINFER", "0")
+            env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+            # An adapter can then be registered into the RUNNING engine
+            # (/v1/load_lora_adapter) instead of costing a reload of the base
+            # model. Only where the launch actually enabled LoRA: the flag is
+            # meaningless otherwise, and setting it everywhere would be a claim we
+            # cannot honour.
+            if "--enable-lora" in cmd:
+                env.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
+            # Pin this vLLM instance to specific NVIDIA GPU(s) if configured (CUDA-only).
+            gpu = (getattr(cfg, "gpu", "") or "").strip()
+            if gpu:
+                env["CUDA_VISIBLE_DEVICES"] = gpu
+            extra_env = (getattr(cfg, "extra_env", "") or "").strip()
+            applied = {}
+            if extra_env:
+                for tok in shlex.split(extra_env):
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        if k.strip():
+                            env[k.strip()] = v; applied[k.strip()] = v
+            ray = None
+            if needs_ray(cfg):
+                ray, _addr = _start_ray(cfg, py, env)
+            print(f"[vllm] launching: {' '.join(cmd)}"
+                  + (f"  ({' '.join(f'{k}={v}' for k, v in applied.items())})" if applied else ""),
+                  flush=True)
+            tail = collections.deque(maxlen=80)
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, bufsize=1, env=env)
+            except Exception:
+                if ray is not None:
+                    ray.stop()
+                raise
+            meta = {}
+            threading.Thread(target=_pump_logs, args=(proc, tail, meta), daemon=True).start()
+            _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray,
+                                  "gmu": gmu, "meta": meta, "ready": False,
+                                  "ready_event": threading.Event()}
+            # Which VERSION of each adapter this engine was launched with, so a
+            # retrain under the same name is recognised as a different adapter
+            # rather than a name the engine already answers to.
+            _LORA_LOADED.pop((url, served_name or ""), None)
+            for _spec in _sibling_lora_specs(_model_config_for(resolved or model) or {}):
+                _nm = str(_spec.get("name") or "")
+                if _nm:
+                    _LORA_LOADED[(url, _nm)] = str(_spec.get("source") or "")
 
-    def _tail_msg():
-        # The last six lines of a vLLM crash are the wrapper's own traceback
-        # ("Engine core initialization failed. See root cause above.") — the
-        # root cause IS above, and on a pod this message is all anyone gets.
-        # Prefer the lines that name an error; fall back to a longer tail.
-        lines = [l.strip() for l in tail if l.strip()]
-        keyed = [l for l in lines if any(k in l for k in ("Error", "error:", "not found",
-                                                          "No such", "CUDA", "Traceback"))]
-        chosen = (keyed[-8:] if keyed else []) + lines[-6:]
-        seen, out = set(), []
-        for l in chosen:
-            if l not in seen:
-                seen.add(l); out.append(l[:300])
-        joined = " | ".join(out)
-        return f". Last output: {joined}" if joined else ""
+        def _tail_msg():
+            # The last six lines of a vLLM crash are the wrapper's own traceback
+            # ("Engine core initialization failed. See root cause above.") — the
+            # root cause IS above, and on a pod this message is all anyone gets.
+            # Prefer the lines that name an error; fall back to a longer tail.
+            lines = [l.strip() for l in tail if l.strip()]
+            keyed = [l for l in lines if any(k in l for k in ("Error", "error:", "not found",
+                                                              "No such", "CUDA", "Traceback"))]
+            chosen = (keyed[-8:] if keyed else []) + lines[-6:]
+            seen, out = set(), []
+            for l in chosen:
+                if l not in seen:
+                    seen.add(l); out.append(l[:300])
+            joined = " | ".join(out)
+            return f". Last output: {joined}" if joined else ""
 
-    deadline = time.time() + ready_timeout
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            stop_service(svc_key)
-            raise RuntimeError(
-                f"vLLM exited (code {proc.returncode}) before becoming ready" + _tail_msg())
-        if _health_ok(url):
-            print(f"[vllm] service ready for {svc_key} at {url}", flush=True)
-            return url
-        time.sleep(2)
-    stop_service(svc_key)
-    raise RuntimeError(f"vLLM for {svc_key} did not become ready in time" + _tail_msg())
+        deadline = time.time() + ready_timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                stop_service(svc_key)
+                raise RuntimeError(
+                    f"vLLM exited (code {proc.returncode}) before becoming ready" + _tail_msg())
+            if _health_ok(url):
+                print(f"[vllm] service ready for {svc_key} at {url}", flush=True)
+                _mark_ready(svc_key, proc)
+                return url
+            time.sleep(2)
+        stop_service(svc_key)
+        raise RuntimeError(f"vLLM for {svc_key} did not become ready in time" + _tail_msg())
+    except _StillStarting as st:
+        return _wait_for_start(st.svc, svc_key, ready_timeout)
 
 
 # A budget too small for the engine's own footprint. vLLM says this whatever the model,

@@ -56,6 +56,8 @@ BLOCKING = {
     "get_model_for_request": "may load the model: minutes, e.g. a vLLM start",
     "_load_default_model": "loads the model: minutes, e.g. a vLLM start",
     "ensure_service": "starts vLLM and sleeps until it is ready",
+    "placement.any_candidate": "may start the local vLLM (ensure_service)",
+    "placement.candidates": "may start the local vLLM (ensure_service)",
 }
 
 #: Method names that block when the receiver is not an asyncio primitive.
