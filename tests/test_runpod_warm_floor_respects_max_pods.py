@@ -105,7 +105,7 @@ def test_worker_uses_two_distinct_counts():
     src = open("codai/api/runpod_worker.py").read()
     assert "billing_in_hand = len(self.pods) + self._booting" in src
     assert "healthy_in_hand = len([p for p in self.pods if p.healthy]) + self._booting" in src
-    assert "max(0, int(self.mcfg.max_pods or 0) - billing_in_hand)" in src, \
+    assert "max(0, self.effective_max_pods() - billing_in_hand)" in src, \
         "the max_pods cap must be tested against pods that bill"
     assert "want = min(keep_min - healthy_in_hand," in src, \
         "the deficit must still be tested against pods that can serve"

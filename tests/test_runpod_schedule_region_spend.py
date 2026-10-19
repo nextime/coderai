@@ -136,6 +136,14 @@ def test_effective_min_pods_drops_to_zero_outside_the_window(monkeypatch):
         _client_floor = 0
         _client_floor_until = 0.0
         _client_floor_logged = -1
+        # The floor is also clamped by the CEILING in force, which a lease may
+        # narrow (/v1/runpod/scale max_pods). No lease here either: this is the
+        # schedule.
+        effective_max_pods = rw.RunpodPodPool.effective_max_pods
+        client_cap = rw.RunpodPodPool.client_cap
+        _client_cap = 0
+        _client_cap_until = 0.0
+        _client_cap_logged = -1
 
     pool = _Pool()
     monkeypatch.setattr(rw, "schedule_state", lambda cfg, now=None: {"in_window": True})

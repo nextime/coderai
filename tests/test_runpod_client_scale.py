@@ -377,7 +377,9 @@ def test_the_demand_path_already_had_the_guard_and_keeps_it():
     # meant the fleet could grow by one pod per boot however much was queued.
     # The guard is still here, it just reads how many rather than whether.
     assert "self._booting >= parallel" in blk
-    assert "in_hand >= self.mcfg.max_pods" in blk
+    # Reads the EFFECTIVE ceiling since v0.4.33: the configured max_pods
+    # narrowed by any client lease. Same guard, one indirection on.
+    assert "in_hand >= self.effective_max_pods()" in blk
 
 
 def test_the_answer_names_the_model_the_client_asked_about():

@@ -962,6 +962,15 @@ class RunpodScaleRequest(BaseModel):
     pods: int = Field(..., ge=0,
                       description="Warm pods to hold, clamped to the model's max_pods. "
                                   "0 releases the lease.")
+    max_pods: Optional[int] = Field(
+        None, ge=0,
+        description="Cap the fleet at this many pods for the life of this "
+                    "lease. May only NARROW the model's configured max_pods: a "
+                    "larger number is clamped to it and reported back in "
+                    "`notes`. `pods` is a FLOOR and says nothing about how "
+                    "large the pool may grow, so a staged batch that wants "
+                    "8 pods for its first stage sets both. 0 drops this "
+                    "lease's own cap; omit to leave it as it is.")
     teardown: bool = Field(False,
                            description="Give the surplus pods back NOW rather than "
                                        "waiting out scale_down_after_s. Never goes "
@@ -1034,8 +1043,19 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
 
     Deliberately NOT admin-scoped: the gate is per model
     (``allow_client_scale``), the number is clamped to ``max_pods``, and the
-    lease expires (``client_scale_ttl_s``, default 30 min) so a client that dies
-    holding four A40s stops paying for them by itself. The account's $/hr and
+    ``max_pods`` is the other half of that, and the half that bounds what a
+    batch may cost. ``pods`` is a FLOOR: it says what to hold ready, and the
+    autoscaler is still free to grow the pool to the configured ``max_pods``
+    for as long as work keeps arriving. A client running a staged batch — 8
+    pods for the first stage, 32 for the next — needs to say how large the
+    fleet may BECOME, which it does by sending both. Like ``gpu_types`` it may
+    only ever narrow the operator's own number and it dies with the lease.
+    ``pods: 0`` with a ``max_pods`` keeps the cap and holds nothing warm, which
+    is what a client with a long tail of work wants; ``pods: 0`` alone releases
+    the whole lease.
+
+    The lease expires (``client_scale_ttl_s``, default 30 min) so a client that
+    dies holding four A40s stops paying for them by itself. The account's $/hr and
     spend caps still refuse to provision regardless of what is asked here.
     """
     from codai.api import runpod_worker
@@ -1051,7 +1071,8 @@ async def runpod_scale(body: RunpodScaleRequest, request: Request):
     task = asyncio.create_task(asyncio.to_thread(
         runpod_worker.set_client_pods,
         body.model, body.pods, teardown=bool(body.teardown),
-        gpu_types=body.gpu_types, allow_other_gpus=body.allow_other_gpus))
+        gpu_types=body.gpu_types, allow_other_gpus=body.allow_other_gpus,
+        max_pods=body.max_pods))
 
     def _done(t):
         try:

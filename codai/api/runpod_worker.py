@@ -2970,6 +2970,24 @@ class RunpodPodPool:
         self._client_floor = 0
         self._client_floor_until = 0.0
         self._client_floor_logged = -1
+        #: A CEILING the same lease may set, and when it lapses. 0/0 = nobody
+        #: asked, and the configured `max_pods` is the only ceiling.
+        #:
+        #: The floor and the ceiling are not the same request. A client that
+        #: says "hold 8 warm" has said nothing about how large the fleet may
+        #: become, and the autoscaler is free to grow it to `max_pods` as long
+        #: as work keeps arriving -- which is exactly what happened on
+        #: 2026-10-18: a staged run asked for 8 pods, got 13, and was heading
+        #: for 128, because the only number a request could set was the floor.
+        #: Each pod beyond the plan added ~700 s of paid boot producing nothing,
+        #: and the realised cost per page came out 16.5x the measured baseline.
+        #:
+        #: So a lease may ALSO narrow the ceiling, and like `gpu_types` it may
+        #: only ever narrow it: the operator's `max_pods` remains the budget,
+        #: and there is deliberately no way for a request to raise it.
+        self._client_cap = 0
+        self._client_cap_until = 0.0
+        self._client_cap_logged = -1
         #: GPU constraints a client attached to its lease. They expire with it.
         #: Only ever NARROWER than the operator's own settings -- see
         #: `narrow_gpu_choice`.
@@ -4165,7 +4183,7 @@ class RunpodPodPool:
         if mean <= 0:
             mean = float(threshold)
         want = int(-(-load // mean))          # ceil, in weighted pod-equivalents
-        return max(1, min(int(self.mcfg.max_pods), want))
+        return max(1, min(self.effective_max_pods(), want))
 
     def _boot_cancelled(self, epoch: int) -> bool:
         """Was this boot released while it was still booting?
@@ -4209,7 +4227,7 @@ class RunpodPodPool:
         that start billing together.
         """
         in_hand = len(self.pods) + self._booting
-        if in_hand >= self.mcfg.max_pods:
+        if in_hand >= self.effective_max_pods():
             return ""
         parallel = max(1, int(getattr(self.mcfg, "scale_up_max_parallel_boots", 1) or 1))
         if self._booting >= parallel:
@@ -4402,7 +4420,7 @@ class RunpodPodPool:
                 self._note_denied()
                 raise NoPodRightNow(
                     f"no pod slot for {self.model_key!r} right now "
-                    f"(max_pods={self.mcfg.max_pods})")
+                    f"(max_pods={self.effective_max_pods()})")
 
             # At max_pods with every pod at its in-flight ceiling, or someone else
             # is provisioning: wait for a slot rather than piling on. Counted
@@ -4414,7 +4432,7 @@ class RunpodPodPool:
                 if remaining <= 0:
                     raise RunpodError(
                         f"RunPod: no pod slot available for {self.model_key!r} "
-                        f"(max_pods={self.mcfg.max_pods}, "
+                        f"(max_pods={self.effective_max_pods()}, "
                         f"max_inflight_per_pod={self.mcfg.max_inflight_per_pod}) "
                         f"within {timeout}s.")
                 self._waiting += 1
@@ -4582,7 +4600,58 @@ class RunpodPodPool:
             return 0
         if time.time() >= self._client_floor_until:
             return 0
-        return min(self._client_floor, max(1, self.mcfg.max_pods))
+        # Against the EFFECTIVE ceiling, so a lease that later narrowed its own
+        # max_pods does not keep a floor above it -- a floor the pool would
+        # have to grow to and a ceiling forbidding it is a fleet that oscillates
+        # for as long as the lease lasts.
+        return min(self._client_floor, self.effective_max_pods())
+
+    def client_cap(self) -> int:
+        """The pod CEILING a client leased, 0 once the lease has run out.
+
+        Read-only and cheap, exactly like `client_floor`, so the scaler, the
+        status page and the endpoint all see the same number within a pass.
+
+        getattr, for the same reason `_slots_of` initialises on demand: not
+        every pool object this is asked about went through `__init__`, and a
+        READ-ONLY question about the ceiling must never be the thing that
+        raises on the path that decides whether to rent a GPU. No lease is the
+        normal answer anyway.
+        """
+        leased = int(getattr(self, "_client_cap", 0) or 0)
+        if leased <= 0:
+            return 0
+        if time.time() >= float(getattr(self, "_client_cap_until", 0.0) or 0.0):
+            return 0
+        return min(leased, max(1, self.mcfg.max_pods))
+
+    def effective_max_pods(self) -> int:
+        """The ceiling on fleet size that applies right now.
+
+        The configured `max_pods`, narrowed by a client lease if one is in
+        force. Every path that decides whether to rent another pod reads THIS
+        rather than `mcfg.max_pods`, because a ceiling only half of them honour
+        is not a ceiling -- it is a race between the grower that respects it and
+        the one that does not.
+
+        A LEASE can never drive this to zero: "do not grow past N" is not a
+        request to stop serving, and a lease asking for 0 is read as releasing
+        its cap. A configured `max_pods` of 0 is different -- that is the
+        operator having turned pod renting off for this model, and it stays 0.
+        """
+        configured = int(self.mcfg.max_pods or 0)
+        capped = self.client_cap()
+        if capped <= 0 or configured <= 0:
+            return configured
+        out = max(1, min(configured, capped))
+        if out != getattr(self, "_client_cap_logged", -1):
+            print(f"[runpod] {self.model_key!r}: fleet ceiling {out} from a "
+                  f"client lease (configured max_pods {configured})", flush=True)
+            try:
+                self._client_cap_logged = out
+            except Exception:
+                pass
+        return out
 
     def client_gpu_narrow(self) -> dict:
         """The GPU narrowing in force right now, or {} once the lease lapses.
@@ -4638,14 +4707,36 @@ class RunpodPodPool:
         return out
 
     def set_client_floor(self, pods: int, gpu_types=None,
-                         allow_other_gpus=None) -> dict:
-        """Lease (or release, with 0) a client-requested warm floor.
+                         allow_other_gpus=None, max_pods=None) -> dict:
+        """Lease (or release, with 0) a client-requested warm floor and ceiling.
 
         Clamped to max_pods: the configured ceiling is the budget, and a client
         asking for more gets the ceiling rather than an error — it asked for
         "as many as you can", and failing the call would leave it with none.
+
+        ``max_pods`` narrows the CEILING for the life of the lease. It is a
+        separate question from the floor and it needs its own answer: a client
+        that knows it is running a staged batch -- 8 pods for the first stage,
+        32 for the next -- can bound what the stage may cost, where asking for
+        8 warm pods bounds nothing at all. Only ever narrower than the
+        operator's configured `max_pods`; ``0`` drops the lease's own cap and
+        ``None`` leaves it as it was.
+
+        A floor above the ceiling is not refused: the ceiling wins, because it
+        is the number that bounds spending and the floor is a convenience. The
+        reply reports what was granted either way, so a caller that asked for
+        something incoherent can see that it did.
         """
-        cap = max(1, int(self.mcfg.max_pods))
+        configured = max(1, int(self.mcfg.max_pods))
+        # The lease's own ceiling first: the floor is clamped to it below, so a
+        # caller sending {"pods": 32, "max_pods": 8} gets 8 and not 32 warm
+        # pods under an 8-pod cap, which is a fleet that can never settle.
+        if max_pods is None:
+            leased_cap = self.client_cap()
+        else:
+            leased_cap = max(0, int(max_pods))
+            leased_cap = min(leased_cap, configured) if leased_cap else 0
+        cap = min(configured, leased_cap) if leased_cap else configured
         want = max(0, int(pods))
         granted = min(want, cap)
         if granted:
@@ -4653,6 +4744,13 @@ class RunpodPodPool:
             # its mind, and retiring what it just asked for would be absurd.
             self._release_pending = False
         ttl = max(60, int(getattr(self.mcfg, "client_scale_ttl_s", 1800) or 1800))
+        # A cap with no floor is a legitimate lease: "grow no further than 8,
+        # but hold nothing warm for me" is what a client with a long tail of
+        # work wants, and releasing the cap because the floor went to 0 would
+        # take the ceiling away at exactly the moment it still matters. So the
+        # cap lapses with its OWN deadline, and `pods: 0` clears it only when
+        # the same call did not ask for one.
+        keep_cap = leased_cap if (max_pods is not None or granted) else 0
         # Raises ValueError when the caller narrowed to nothing it is allowed to
         # have; the endpoint turns that into a 400 that names the allowed set.
         narrow = narrow_gpu_choice(self.mcfg, gpu_types, allow_other_gpus)
@@ -4660,6 +4758,9 @@ class RunpodPodPool:
             self._client_floor = granted
             self._client_floor_until = (time.time() + ttl) if granted else 0.0
             self._client_floor_logged = -1
+            self._client_cap = keep_cap
+            self._client_cap_until = (time.time() + ttl) if keep_cap else 0.0
+            self._client_cap_logged = -1
             if granted:
                 self._client_gpu_types = (list(narrow["gpu_types"])
                                           if gpu_types else [])
@@ -4673,14 +4774,31 @@ class RunpodPodPool:
                 self._client_allow_other = None
         print(f"[runpod] {self.model_key!r}: client asked for {want} warm pod(s), "
               f"granted {granted} (max_pods {cap}) for {ttl}s", flush=True)
+        if max_pods is not None:
+            print(f"[runpod] {self.model_key!r}: this lease caps the fleet at "
+                  f"{keep_cap or configured} pod(s) "
+                  f"(configured max_pods {configured}"
+                  + ("; the lease asked for more and was narrowed to it"
+                     if int(max_pods or 0) > configured else "")
+                  + (")" if keep_cap else "; the lease's own cap is released)"),
+                  flush=True)
         if granted and (gpu_types or allow_other_gpus is not None):
             print(f"[runpod] {self.model_key!r}: this lease asks for "
                   f"{narrow['gpu_types'] or 'any card'}"
                   f"{'' if narrow['allow_other_gpus'] else ' and nothing else'}"
                   + ("".join(f"; {n}" for n in narrow["notes"])), flush=True)
         out = {"model": self.model_key, "requested": want, "granted": granted,
-               "max_pods": cap, "expires_in_s": ttl if granted else 0,
+               "max_pods": cap, "configured_max_pods": configured,
+               "client_max_pods": keep_cap,
+               "expires_in_s": ttl if (granted or keep_cap) else 0,
                "clamped": want > cap}
+        if max_pods is not None and int(max_pods or 0) > configured:
+            # Reported for the same reason a narrowed gpu_types is: a caller
+            # that believes it capped the fleet at 256 would read the bill as
+            # coming from a cap it never had.
+            out.setdefault("notes", []).append(
+                f"max_pods {int(max_pods)} narrowed to the configured "
+                f"ceiling {configured}")
         if granted and (gpu_types or allow_other_gpus is not None):
             # Reported back, because a constraint that was silently dropped is
             # worse than one refused: the caller would read the numbers as
@@ -4688,7 +4806,10 @@ class RunpodPodPool:
             out["gpu_types"] = narrow["gpu_types"]
             out["allow_other_gpus"] = narrow["allow_other_gpus"]
             if narrow["notes"]:
-                out["notes"] = narrow["notes"]
+                # Extend: a narrowed max_pods may already have left a note
+                # here, and replacing the list would hide whichever of the two
+                # constraints was reported second.
+                out.setdefault("notes", []).extend(narrow["notes"])
         return out
 
     def effective_min_pods(self) -> int:
@@ -4714,7 +4835,7 @@ class RunpodPodPool:
             print(f"[runpod] {self.model_key!r}: warm floor {leased} from a client "
                   f"lease (configured {scheduled})", flush=True)
             self._client_floor_logged = leased
-        return max(scheduled, min(leased, max(1, self.mcfg.max_pods)))
+        return max(scheduled, min(leased, self.effective_max_pods()))
 
     def _pods_needed(self, serving: list) -> int:
         """How many pods the CURRENT concurrency justifies.
@@ -4727,7 +4848,8 @@ class RunpodPodPool:
         threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
         total = sum(p.inflight for p in serving)
         need = -(-total // threshold)          # ceil, in integers
-        return max(self.effective_min_pods(), min(int(self.mcfg.max_pods), need))
+        return max(self.effective_min_pods(),
+                   min(self.effective_max_pods(), need))
 
     def _scale_down_victim(self, serving: list):
         """Which surplus pod to give back.
@@ -5092,7 +5214,7 @@ class RunpodPodPool:
                                               "scale_up_max_parallel_boots", 4) or 4))
                 want = min(keep_min - healthy_in_hand,
                            max(0, parallel - self._booting),
-                           max(0, int(self.mcfg.max_pods or 0) - billing_in_hand))
+                           max(0, self.effective_max_pods() - billing_in_hand))
                 if want <= 0:
                     return
                 self._booting += want
@@ -5657,6 +5779,10 @@ def pools_schedule_status() -> list:
             "min_pods": cfg.min_pods,
             "effective_min_pods": pool.effective_min_pods(),
             "max_pods": cfg.max_pods,
+            # The ceiling actually in force, and where it came from: a fleet
+            # that stopped growing short of max_pods must say why.
+            "effective_max_pods": pool.effective_max_pods(),
+            "client_max_pods": pool.client_cap(),
             "healthy_pods": healthy,
             "data_center": cfg.data_center or "",
             # The client lease, so a bill nobody expected has a visible cause.
@@ -5745,7 +5871,8 @@ def get_live_pool(key: str):
 
 
 def _scale_live_pool(pool, key: str, pods: int, teardown: bool = False,
-                     gpu_types=None, allow_other_gpus=None) -> dict:
+                     gpu_types=None, allow_other_gpus=None,
+                     max_pods=None) -> dict:
     """`set_client_pods` for a pool addressed directly rather than by model."""
     mcfg = getattr(pool, "mcfg", None)
     if mcfg is not None and not getattr(mcfg, "allow_client_scale", False):
@@ -5754,7 +5881,8 @@ def _scale_live_pool(pool, key: str, pods: int, teardown: bool = False,
             '"allow_client_scale": true on the runpod block of a model that '
             "uses it")
     out = pool.set_client_floor(pods, gpu_types=gpu_types,
-                                allow_other_gpus=allow_other_gpus)
+                                allow_other_gpus=allow_other_gpus,
+                                max_pods=max_pods)
     if teardown:
         out["teardown"] = pool.shed_now()
     out["pool"] = out.get("model") or key
@@ -5882,7 +6010,8 @@ def release_pod(pod_id: str, reason: str = "released by client") -> dict:
 
 
 def set_client_pods(model: str, pods: int, teardown: bool = False,
-                    gpu_types=None, allow_other_gpus=None) -> dict:
+                    gpu_types=None, allow_other_gpus=None,
+                    max_pods=None) -> dict:
     """Lease a warm floor for one model on a client's behalf.
 
     Raises LookupError when the model has no RunPod block, and PermissionError
@@ -5902,6 +6031,12 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
     fallback's price for a result it cannot use. Raises ValueError when the
     narrowing leaves nothing allowed, so the caller hears about a mistake
     instead of silently getting the operator's default.
+
+    ``max_pods`` caps the fleet for the life of the lease, and may only narrow
+    the operator's own ceiling. A warm floor says what to hold ready; it says
+    nothing about how large the pool may become, so without this a client
+    running a staged batch could ask for its first stage and still be grown to
+    the configured maximum by the autoscaler.
     """
     key = str(model or "").strip()
     if not key:
@@ -5916,7 +6051,8 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
     if existing is not None:
         return _scale_live_pool(existing, key, pods, teardown=teardown,
                                 gpu_types=gpu_types,
-                                allow_other_gpus=allow_other_gpus)
+                                allow_other_gpus=allow_other_gpus,
+                                max_pods=max_pods)
     block = model_runpod_block(key)
     if not block:
         raise LookupError(
@@ -5936,7 +6072,8 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
     # has called yet is exactly when it is worth pre-warming.
     pool = get_model_pod_pool(key, _model_entry(key), block)
     out = pool.set_client_floor(pods, gpu_types=gpu_types,
-                                allow_other_gpus=allow_other_gpus)
+                                allow_other_gpus=allow_other_gpus,
+                                max_pods=max_pods)
     if teardown:
         # After the floor is lowered, so the shed measures against the new one.
         out["teardown"] = pool.shed_now()
