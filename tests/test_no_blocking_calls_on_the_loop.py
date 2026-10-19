@@ -50,6 +50,12 @@ BLOCKING = {
     "placement.choose": "ends in a pool acquire: up to 1200 s, may rent inline",
     "pod_http.post": "sync HTTP — the thread twin of apost",
     "pod_http.get": "sync HTTP — the thread twin of aget",
+    # Resolving a model that is not loaded LOADS it, and a vLLM load waits for
+    # readiness in a sleep loop: 324 s with the whole process frozen on an OCR
+    # pod, /healthz included, so the orchestrator took a busy pod for a dead one.
+    "get_model_for_request": "may load the model: minutes, e.g. a vLLM start",
+    "_load_default_model": "loads the model: minutes, e.g. a vLLM start",
+    "ensure_service": "starts vLLM and sleeps until it is ready",
 }
 
 #: Method names that block when the receiver is not an asyncio primitive.
@@ -230,3 +236,12 @@ def test_it_does_not_flag_a_coroutine_handed_to_the_loop():
 
 def test_it_catches_a_thread_join_but_not_a_path_join():
     assert _hits("async def f(thread):\n    thread.join()\n")
+
+
+def test_it_catches_a_model_load_on_the_loop():
+    """The OCR pod freeze: chat_completions resolved its model on the loop."""
+    assert _hits("async def f():\n"
+                 "    m = multi_model_manager.get_model_for_request('x')\n")
+    assert not _hits("async def f():\n"
+                     "    m = await asyncio.to_thread(\n"
+                     "        multi_model_manager.get_model_for_request, 'x')\n")

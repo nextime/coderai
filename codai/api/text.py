@@ -1283,7 +1283,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 _instance_idx = None
                 _candidate = None
         if _candidate is None:
-            _candidate = multi_model_manager.get_model_for_request(requested_model)
+            # OFF THE LOOP. Resolving a model that is not loaded yet LOADS it,
+            # and a vLLM load waits for readiness in a `time.sleep(2)` loop --
+            # on an OCR pod that froze the whole process for 324 s at boot and
+            # for minutes whenever it decided to (re)start vLLM: no request of
+            # any kind served, /healthz included, so the orchestrator took a
+            # busy pod for a dead one. Duplicate loads are already prevented by
+            # the manager's load lock.
+            _candidate = await asyncio.to_thread(
+                multi_model_manager.get_model_for_request, requested_model)
         if _candidate is None and model_manager.backend is not None:
             _candidate = model_manager
         # Validate the candidate has a working backend before accepting it
@@ -3390,7 +3398,9 @@ async def completions(request: CompletionRequest):
     if _acq:
         _instance_idx, mm = _acq
     else:
-        mm = multi_model_manager.get_model_for_request(requested_model)
+        # Off the loop: this can load the model (see chat_completions).
+        mm = await asyncio.to_thread(
+            multi_model_manager.get_model_for_request, requested_model)
 
     def _release_instance():
         if _instance_idx is not None and _model_key:
