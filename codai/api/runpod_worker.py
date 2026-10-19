@@ -1525,13 +1525,27 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                              "blank_page_max_chars"),
                             ("CODERAI_OCR_DETECT_MODE", "detect_mode"),
                             ("CODERAI_OCR_DETECT_MODEL_PATH", "detect_model_path"),
-                            ("CODERAI_OCR_DETECT_CONF", "detect_conf")]:
+                            ("CODERAI_OCR_DETECT_CONF", "detect_conf"),
+                            # Early loop abort thresholds. The on/off switch is
+                            # a BOOLEAN and goes in the loop below, not here:
+                            # this filter drops any value equal to 0, and in
+                            # Python False == 0 -- so "off" sent through here
+                            # would be silently discarded and the pod would run
+                            # with the feature on, which is exactly what made
+                            # it impossible to A/B.
+                            ("CODERAI_OCR_EARLY_LOOP_MIN_CHARS",
+                             "early_loop_min_chars"),
+                            ("CODERAI_OCR_EARLY_LOOP_STEP", "early_loop_step"),
+                            ("CODERAI_OCR_EARLY_LOOP_PERSISTENCE",
+                             "early_loop_persistence")]:
             _val = getattr(_o, _attr, None) if _o is not None else None
             if _val not in (None, "", 0, 0.0):
                 env[_var] = str(_val)
         for _var, _attr in (("CODERAI_OCR_SURYA_REPAIR_ACCENTS",
                              "surya_repair_accents"),
-                            ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace")):
+                            ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace"),
+                            ("CODERAI_OCR_EARLY_LOOP_ABORT",
+                             "early_loop_abort")):
             if _o is not None and getattr(_o, _attr, None) is not None:
                 env[_var] = "1" if getattr(_o, _attr) else "0"
         # The detector's weights are operator-supplied and a released image
