@@ -138,7 +138,28 @@ them mid-work with 522 pages in flight. coderai no longer terminates on a
 refused connection (v0.4.37), but there is still nothing to gain by offering a
 pod twice what it will take.
 
-**Send `32 × pods_ready`.** It is the measured optimum, not a safety margin.
+**`32 × pods_ready` is the efficient window** — the point past which you are
+not getting more throughput, only more waiting.
+
+You do not have to get it exactly right any more (v0.4.38). The server now
+bounds what it sends each pod by what that pod has shown it will accept, and
+holds a queue in front of the fleet so no pod ever waits for work. When that
+queue is full it answers **429** with:
+
+```
+Retry-After: 2
+X-OCR-Pages-Running: 256     pages on the pods right now
+X-OCR-Pages-Queued:  256     accepted, waiting for a slot
+X-OCR-Page-Width:    256     ocr.max_concurrency
+X-OCR-Queue-Limit:   256     ocr.max_queued_pages
+```
+
+**Honour the `Retry-After`.** A client that does finishes sooner than one that
+retries immediately, because its retries stop competing with work already
+accepted. The four headers are also the live tuning signal: if you are seeing
+429s with `Pages-Queued` pinned at the limit, you are offering more than the
+fleet can carry and the surplus is buying you nothing. A 429 is not an error in
+the run — nothing was lost, and nothing was read twice.
 
 ## 7. Before a large run
 
