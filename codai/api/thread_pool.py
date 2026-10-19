@@ -168,6 +168,18 @@ def _configured_concurrency() -> int:
                 want = max(want, int(getattr(ocr, "max_concurrency", 0) or 0))
         except Exception:
             continue
+    if want <= 0:
+        # A RENTED POD HAS NO CONFIG FILE. Its settings arrive as environment
+        # variables, and the pools are built before the config manager has
+        # read them -- so on every pod this returned 0 and the default pool
+        # took its floor of 32. Every page on a pod runs in that pool, which
+        # capped each pod at 32 pages at once while surya was ready for 512,
+        # vLLM reported room for 72x, and GPU KV cache sat at 4-10%. Measured
+        # 2026-10-19: 64 pages dispatched per pod, `Running: 32` on every card.
+        try:
+            want = int(os.environ.get("CODERAI_OCR_MAX_CONCURRENCY", "") or 0)
+        except ValueError:
+            want = 0
     return want
 
 
