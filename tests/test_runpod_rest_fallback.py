@@ -1,125 +1,142 @@
-"""While RunPod's GraphQL is rate-limited, the pool keeps working over REST.
+"""RunPod REST API v2: its own quota, and the high-volume reads moved to it.
 
-The 2026-10-19 ban lasted ~3.3 h and REST answered throughout. Without these
-fallbacks a ban stops everything: renting (create + the catalogue that prices
-cards), watching a pod boot (get_pod), the reaper (list_pods), and teardown.
+Measured 2026-10-20 with live headers: GraphQL's daily quota (43,200) was spent
+-- x-ratelimit-remaining-day: 0, Retry-After 3939 -- while REST v2 reported
+"day";r=86399 of q=86400 and terminated a pod (204). REST v1 is deprecated
+(retired 2026-11-15) and its writes failed through that ban.
 """
-import json
 import time
 
 import pytest
 
 from codai.api import runpod_client as rc
 
-REST_POD = {"id": "p1", "name": "coderai-x", "desiredStatus": "RUNNING",
-            "costPerHr": 0.59, "imageName": "img", "publicIp": "1.2.3.4",
-            "portMappings": {"8000": 22187}, "lastStatusChange": "Rented by User",
-            "lastStartedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 120))
-            + ".477 +0000 UTC"}
+V2_POD = {"id": "p1", "name": "coderai-x", "status": "RUNNING", "cost": 0.59,
+          "image": "img", "createdAt": "2026-10-19T18:38:07.482Z",
+          "gpu": {"id": "NVIDIA A40", "count": 1},
+          "dataCenterId": "EU-SE-1",
+          "runtime": {"uptime": 120, "memory": {"util": 71}, "cpu": {"util": 40},
+                      "ports": [{"private": 8000, "public": 22187, "type": "tcp",
+                                 "ip": "1.2.3.4"}]}}
 
 
-@pytest.fixture
-def banned(monkeypatch, tmp_path):
-    rc._GQL_BACKOFF_UNTIL[0] = time.time() + 3600
-    monkeypatch.setattr(rc, "_catalog_path", lambda: str(tmp_path / "cat.json"))
-    yield tmp_path
+@pytest.fixture(autouse=True)
+def _clean(monkeypatch, tmp_path):
     rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    rc._V2_BACKOFF_UNTIL[0] = 0.0
+    monkeypatch.setattr(rc, "_catalog_path", lambda: str(tmp_path / "cat.json"))
+    monkeypatch.setattr(rc, "_GPU_CATALOG", (time.time() + 600, [
+        {"id": "NVIDIA A40", "display_name": "A40", "memory_gb": 48, "secure_price": 0.59}]))
+    yield
+    rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    rc._V2_BACKOFF_UNTIL[0] = 0.0
 
 
-def _client(monkeypatch, handler):
+def _client(monkeypatch, handler, gql_ok=False):
     calls = []
 
-    def _rest(self, method, path, body=None, timeout=30.0):
+    def _rest(self, method, path, body=None, timeout=30.0, params=None):
         calls.append((method, path, body))
         return handler(method, path, body)
     monkeypatch.setattr(rc.RunpodClient, "_rest", _rest)
-    monkeypatch.setattr(rc.RunpodClient, "_gql",
-                        lambda *a, **k: pytest.fail("GraphQL called during a ban"))
+    if not gql_ok:
+        monkeypatch.setattr(rc.RunpodClient, "_gql",
+                            lambda *a, **k: pytest.fail("GraphQL was called"))
     c = rc.RunpodClient.__new__(rc.RunpodClient)
     c._api_key, c._cfg = "k" * 20, None
     return c, calls
 
 
-def test_get_pod_over_rest_has_the_same_shape(monkeypatch, banned):
-    pod = dict(REST_POD, lastStartedAt=time.strftime(
-        "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 120)) + ".477 +0000 UTC")
+def test_get_pod_is_v2_and_has_the_graphql_shape(monkeypatch):
+    c, calls = _client(monkeypatch, lambda m, p, b: V2_POD)
+    got = c.get_pod("p1")
+    assert calls[0][:2] == ("GET", "/pods/p1")
+    assert got["status"] == "RUNNING" and got["ready"] is True
+    assert got["ports"] == [{"ip": "1.2.3.4", "isIpPublic": True, "privatePort": 8000,
+                             "publicPort": 22187, "type": "tcp"}]
+    assert got["uptime_s"] == 120 and got["memory_util"] == 71
+    assert got["gpu"] == "A40" and got["vram_gb"] == 48
+
+
+def test_a_provisioning_pod_is_not_ready_and_not_failed(monkeypatch):
+    pod = dict(V2_POD, status="PROVISIONING", runtime={})
     c, _ = _client(monkeypatch, lambda m, p, b: pod)
     got = c.get_pod("p1")
-    assert got["ready"] is True and got["status"] == "RUNNING"
-    assert got["ports"] == [{"ip": "1.2.3.4", "isIpPublic": True,
-                             "privatePort": 8000, "publicPort": 22187, "type": "tcp"}]
-    assert 100 < got["uptime_s"] < 200
+    assert got["status"] == "RUNNING" and got["phase"] == "PROVISIONING"
+    assert got["ready"] is False
 
 
-def test_list_pods_over_rest(monkeypatch, banned):
-    c, _ = _client(monkeypatch, lambda m, p, b: [REST_POD])
+def test_an_errored_pod_reads_as_failed(monkeypatch):
+    c, _ = _client(monkeypatch, lambda m, p, b: dict(V2_POD, status="ERROR"))
+    assert c.get_pod("p1")["status"] == "FAILED"
+
+
+def test_listing_is_v2_with_pagination(monkeypatch):
+    pages = iter([{"pods": [V2_POD], "pagination": {"hasNextPage": True, "nextCursor": "c2"}},
+                  {"pods": [dict(V2_POD, id="p2")], "pagination": {"hasNextPage": False}}])
+    c, calls = _client(monkeypatch, lambda m, p, b: next(pages))
     rows = c.list_pods()
-    assert rows[0]["id"] == "p1" and rows[0]["cost_per_hr"] == 0.59
-    assert "uptime_s" in rows[0]
+    assert [r["id"] for r in rows] == ["p1", "p2"]
+    assert rows[0]["createdAt"] == "2026-10-19T18:38:07.482Z"   # the reaper's age
 
 
-def test_terminate_over_rest_and_a_404_is_gone(monkeypatch, banned):
+def test_terminate_is_v2_and_a_404_is_gone(monkeypatch):
     def h(m, p, b):
-        raise rc.RunpodError("RunPod REST DELETE /pods/p1 HTTP 404: not found")
+        raise rc.RunpodError("RunPod REST v2 DELETE /pods/p1 HTTP 404: not found")
     c, calls = _client(monkeypatch, h)
-    c.terminate_pod("p1")                       # no raise: already gone
+    c.terminate_pod("p1")
     assert calls[0][:2] == ("DELETE", "/pods/p1")
 
 
-def test_create_goes_to_rest_during_a_ban(monkeypatch, banned):
-    import requests
-    sent = {}
-
-    class _R:
-        status_code = 200
-        content = b"x"
-        text = ""
-
-        def json(self):
-            return {"id": "new1"}
-
-    def post(url, json=None, headers=None, timeout=None):
-        sent.update(url=url, body=json)
-        return _R()
-    monkeypatch.setattr(requests, "post", post)
-    c = rc.RunpodClient.__new__(rc.RunpodClient)
-    c._api_key, c._cfg = "k" * 20, None
+def test_create_goes_to_v2_during_a_graphql_ban(monkeypatch):
+    rc._GQL_BACKOFF_UNTIL[0] = time.time() + 3600
+    c, calls = _client(monkeypatch, lambda m, p, b: {"id": "new1"})
     pid = c.create_pod(name="n", image="img", gpu_type_id="NVIDIA A40", port=8000,
-                       env={"A": "1"}, direct_tcp=True)
+                       env={"A": "1"}, direct_tcp=True, data_center_id="EU-SE-1",
+                       network_volume_id="vol1")
     assert pid == "new1"
-    assert sent["url"].endswith("/pods")
-    assert sent["body"]["ports"] == ["8000/tcp"]
-    assert sent["body"]["gpuTypeIds"] == ["NVIDIA A40"]
+    m, path, body = calls[0]
+    assert (m, path) == ("POST", "/pods")
+    assert body["gpu"] == {"id": "NVIDIA A40", "count": 1}
+    assert body["ports"] == ["8000/tcp"] and body["cloud"] == "SECURE"
+    assert body["dataCenterIds"] == ["EU-SE-1"]
+    assert body["mounts"]["network"] == [{"volumeId": "vol1", "path": "/workspace"}]
 
 
-def test_the_catalogue_is_saved_and_used_during_a_ban(monkeypatch, banned):
-    rows = [{"id": "NVIDIA A40", "display_name": "A40", "memory_gb": 48,
-             "secure_price": 0.59}]
-    rc._GQL_BACKOFF_UNTIL[0] = 0.0
+def test_v2_will_not_rent_spot(monkeypatch):
+    rc._GQL_BACKOFF_UNTIL[0] = time.time() + 3600
+    c, _ = _client(monkeypatch, lambda *a: {"id": "x"})
+    with pytest.raises(rc.RunpodError):
+        c.create_pod(name="n", image="i", gpu_type_id="g", port=8000,
+                     is_spot=True, bid_per_gpu=0.2)
+
+
+def test_the_catalogue_comes_from_v2_during_a_ban(monkeypatch):
+    rc._GQL_BACKOFF_UNTIL[0] = time.time() + 3600
+    monkeypatch.setattr(rc, "_GPU_CATALOG", (0.0, None))
+    cat = {"gpus": [{"id": "NVIDIA A40", "name": "A40", "memory": 48, "secure": True,
+                     "community": False, "price": {"secure": 0.59, "community": 0.4}}]}
+    c, _ = _client(monkeypatch, lambda m, p, b: cat)
+    rows = c.list_gpu_types()
+    assert rows[0]["secure_price"] == 0.59 and rows[0]["community_price"] is None
+    assert rows[0]["spot_price"] is None
+
+
+def test_the_saved_catalogue_is_the_last_resort(monkeypatch):
+    rows = [{"id": "NVIDIA A40", "display_name": "A40", "memory_gb": 48, "secure_price": 0.59}]
     rc._save_catalog(rows)
     rc._GQL_BACKOFF_UNTIL[0] = time.time() + 3600
     monkeypatch.setattr(rc, "_GPU_CATALOG", (0.0, None))
-    c, _ = _client(monkeypatch, lambda *a: {})
+
+    def down(m, p, b):
+        raise rc.RunpodTransient("v2 down")
+    c, _ = _client(monkeypatch, down)
     assert c.list_gpu_types() == rows
 
 
-# ------------------------------------------------- fewer GraphQL calls at all #
-
-def test_listing_uses_rest_even_without_a_ban(monkeypatch):
-    """The reaper and the survivor sweep list every minute."""
-    rc._GQL_BACKOFF_UNTIL[0] = 0.0
-    c, calls = _client(monkeypatch, lambda m, p, b: [dict(REST_POD, machine={"gpuTypeId": "NVIDIA A40"})])
-    rows = c.list_pods()
-    assert calls and calls[0][1].startswith("/pods?includeMachine=true")
-    assert rows[0]["id"] == "p1"
-
-
-def test_boot_polling_is_rest_plus_a_real_connect(monkeypatch):
-    """GraphQL lists the port when the container STARTS; RunPod refuses a TCP
-    connect until the server inside LISTENS. The connect is the signal."""
+def test_boot_polling_is_v2_plus_a_real_connect(monkeypatch):
     import socket
-    rc._GQL_BACKOFF_UNTIL[0] = 0.0
-    c, _ = _client(monkeypatch, lambda m, p, b: REST_POD)
+    c, _ = _client(monkeypatch, lambda m, p, b: V2_POD)
     monkeypatch.setattr(socket, "create_connection",
                         lambda *a, **k: (_ for _ in ()).throw(ConnectionRefusedError()))
     assert c._rest_boot_state("p1", 8000)["ready"] is False
@@ -131,8 +148,27 @@ def test_boot_polling_is_rest_plus_a_real_connect(monkeypatch):
         def __exit__(self, *a):
             return False
     monkeypatch.setattr(socket, "create_connection", lambda *a, **k: _S())
-    st = c._rest_boot_state("p1", 8000)
-    assert st["ready"] is True and st["ports"][0]["publicPort"] == 22187
+    assert c._rest_boot_state("p1", 8000)["ready"] is True
+
+
+def test_v2_429_is_honoured(monkeypatch):
+    import requests
+
+    class _R:
+        status_code = 429
+        content = b"x"
+        text = "slow down"
+        headers = {"Retry-After": "12", "RateLimit": '"minute";r=0;t=12'}
+    sent = []
+    monkeypatch.setattr(requests, "request", lambda *a, **k: sent.append(1) or _R())
+    c = rc.RunpodClient.__new__(rc.RunpodClient)
+    c._api_key, c._cfg = "k" * 20, None
+    with pytest.raises(rc.RunpodTransient):
+        c._rest("GET", "/pods")
+    with pytest.raises(rc.RunpodTransient):
+        c._rest("GET", "/pods")
+    assert len(sent) == 1
+    assert rc.v2_quota()["text"].startswith('"minute";r=0')
 
 
 def test_graphql_calls_are_counted_by_operation():
@@ -141,20 +177,3 @@ def test_graphql_calls_are_counted_by_operation():
     rc._count_gql("mutation { podTerminate(input: {podId: \"x\"}) }")
     got = rc.gql_call_counts()
     assert got.get("pod") == 1 and got.get("podTerminate") == 1
-
-
-def test_a_rest_write_during_a_ban_says_why(monkeypatch):
-    import requests
-    rc._GQL_BACKOFF_UNTIL[0] = time.time() + 600
-
-    class _R:
-        status_code = 500
-        content = b"x"
-        text = '{"error":"delete pod: unexpected end of JSON input","status":500}'
-    monkeypatch.setattr(requests, "request", lambda *a, **k: _R())
-    c = rc.RunpodClient.__new__(rc.RunpodClient)
-    c._api_key, c._cfg = "k" * 20, None
-    with pytest.raises(rc.RunpodTransient) as e:
-        c._rest("DELETE", "/pods/p1")
-    assert "share the GraphQL rate limit" in str(e.value)
-    rc._GQL_BACKOFF_UNTIL[0] = 0.0

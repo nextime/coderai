@@ -74,7 +74,9 @@ def test_the_client_sends_the_field_on_both_api_shapes():
     """create_pod has a GraphQL body and a REST body; a volume wired into only
     one of them attaches on some code paths and silently not on others."""
     src = (ROOT / "codai/api/runpod_client.py").read_text()
-    assert src.count("GLOBAL_VOLUME_FIELD] = global_volume_id") == 2
+    # GraphQL: the (undocumented) input field. REST v2: the documented mount.
+    assert src.count("GLOBAL_VOLUME_FIELD] = global_volume_id") == 1
+    assert 'mounts["global"] = [{"volumeId": global_volume_id}]' in src
     assert "global_volume_id: str = \"\"" in src
 
 
@@ -348,7 +350,8 @@ def test_both_create_paths_retry_without_the_field():
     failing every pod."""
     src = (ROOT / "codai/api/runpod_client.py").read_text()
     assert src.count("_warn_global_volume_unsupported(global_volume_id)") == 2
-    assert src.count("pop(GLOBAL_VOLUME_FIELD, None)") == 2
+    assert src.count("pop(GLOBAL_VOLUME_FIELD, None)") == 1          # GraphQL
+    assert 'body["mounts"].pop("global", None)' in src              # REST v2
 
 
 def test_the_warning_is_said_once_not_once_per_pod():

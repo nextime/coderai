@@ -312,50 +312,64 @@ def _load_saved_catalog_quiet() -> list:
         return []
 
 
+_V2_BACKOFF_UNTIL = [0.0]
+_V2_QUOTA = {"text": "", "at": 0.0}
+
+
+def _note_v2_quota(r) -> None:
+    """Keep v2's live quota ("minute";r=179;t=41, "hour";..., "day";...)."""
+    q = r.headers.get("RateLimit") if hasattr(r, "headers") else None
+    if q:
+        _V2_QUOTA.update(text=str(q), at=time.time())
+
+
+def v2_quota() -> dict:
+    return dict(_V2_QUOTA)
+
+
+#: v2 phases -> the desiredStatus words the pool already understands.
+_V2_STATUS = {"PROVISIONING": "RUNNING", "STARTING": "RUNNING", "RUNNING": "RUNNING",
+              "EXITED": "EXITED", "ERROR": "FAILED", "TERMINATED": "TERMINATED"}
+
+
+def _v2_pod_row(p: dict, pod_id: str = "", with_ports: bool = False) -> dict:
+    """A REST v2 Pod in the shape get_pod / list_pods return from GraphQL."""
+    p = p if isinstance(p, dict) else {}
+    gpu = p.get("gpu") or {}
+    machine = _card_for(str(gpu.get("id") or "")) if gpu.get("id") else {}
+    phase = str(p.get("status") or "")
+    rt = p.get("runtime") or {}
+    row = {
+        **_machine_fields({"machine": machine, "gpuCount": gpu.get("count") or 1}),
+        "id": p.get("id") or pod_id, "name": p.get("name"),
+        "status": _V2_STATUS.get(phase, phase), "phase": phase,
+        "cost_per_hr": p.get("cost"), "image": p.get("image"),
+        "createdAt": p.get("createdAt"), "last_change": "",
+        "data_center": p.get("dataCenterId"),
+    }
+    if isinstance(rt.get("uptime"), (int, float)):
+        row["uptime_s"] = float(rt["uptime"])
+    # Pod RAM/CPU in use -- what ran an A40 pod out of memory under load.
+    if isinstance(rt.get("memory"), dict):
+        row["memory_util"] = rt["memory"].get("util")
+    if isinstance(rt.get("cpu"), dict):
+        row["cpu_util"] = rt["cpu"].get("util")
+    if with_ports:
+        ports = [{"ip": pt.get("ip") or "", "isIpPublic": bool(pt.get("ip")),
+                  "privatePort": int(pt.get("private") or 0),
+                  "publicPort": int(pt.get("public") or 0),
+                  "type": pt.get("type") or "tcp"}
+                 for pt in (rt.get("ports") or [])
+                 if isinstance(pt, dict) and pt.get("public")]
+        row["ports"] = ports
+        row["ready"] = bool(ports)
+        row.setdefault("uptime_s", 0)
+    return row
+
+
 def _gql_banned() -> bool:
     """True while RunPod's GraphQL rate limit is in force (see _note_rate_limit)."""
     return _GQL_BACKOFF_UNTIL[0] > time.time()
-
-
-def _rest_started_age(p: dict):
-    """Seconds since the REST pod's lastStartedAt ("2026-10-19 18:38:07.477
-    +0000 UTC"), or None."""
-    import re
-    from datetime import datetime, timezone
-    m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
-                 str(p.get("lastStartedAt") or ""))
-    if not m:
-        return None
-    dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    return max(0.0, time.time() - dt.timestamp())
-
-
-def _rest_pod_row(p: dict, pod_id: str = "", with_ports: bool = False) -> dict:
-    """A REST pod object in the same shape get_pod / list_pods return from
-    GraphQL. REST carries no GPU name, so the card fields come back blank."""
-    p = p if isinstance(p, dict) else {}
-    gid = str(((p.get("machine") or {}).get("gpuTypeId")) or "")
-    if gid and not (p.get("machine") or {}).get("gpuDisplayName"):
-        p = dict(p, machine=_card_for(gid))
-    row = {
-        **_machine_fields(p),
-        "id": p.get("id") or pod_id, "name": p.get("name"),
-        "status": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
-        "image": p.get("imageName"), "last_change": p.get("lastStatusChange") or "",
-    }
-    up = _rest_started_age(p)
-    if up is not None:
-        row["uptime_s"] = up
-    if with_ports:
-        ip = p.get("publicIp") or ""
-        ports = [{"ip": ip, "isIpPublic": True, "privatePort": int(k),
-                  "publicPort": int(v), "type": "tcp"}
-                 for k, v in (p.get("portMappings") or {}).items()
-                 if ip and str(k).isdigit()]
-        row["ports"] = ports
-        row["ready"] = bool(ports) and p.get("desiredStatus") == "RUNNING"
-        row.setdefault("uptime_s", 0)
-    return row
 
 
 class RunpodClient:
@@ -416,20 +430,20 @@ class RunpodClient:
         return body.get("data") or {}
 
     def _rest_boot_state(self, pod_id: str, port: int) -> dict:
-        """get_pod's answer from REST, with `ready` meaning the pod's mapped port
-        ACCEPTS a TCP connection. Falls back to GraphQL if REST fails outside a
-        ban."""
+        """get_pod's answer from REST v2, with `ready` meaning the pod's mapped
+        port ACCEPTS a TCP connection. Falls back to GraphQL if v2 fails
+        outside a ban."""
         import socket
         try:
-            row = _rest_pod_row(self._rest("GET", f"/pods/{pod_id}?includeMachine=true"),
-                                pod_id, with_ports=True)
+            row = _v2_pod_row(self._rest("GET", f"/pods/{pod_id}"), pod_id, with_ports=True)
         except (RunpodError, RunpodTransient):
             if _gql_banned():
                 raise
             return self.get_pod(pod_id)
         ok = False
         for pt in row.get("ports") or []:
-            if int(pt.get("privatePort") or 0) == int(port) and pt.get("ip"):
+            if (int(pt.get("privatePort") or 0) == int(port) and pt.get("ip")
+                    and pt.get("publicPort")):
                 try:
                     with socket.create_connection((pt["ip"], int(pt["publicPort"])),
                                                   timeout=3):
@@ -442,36 +456,75 @@ class RunpodClient:
         return row
 
     def _rest(self, method: str, path: str, body: Optional[dict] = None,
-              timeout: float = 30.0):
-        """One call to RunPod's REST API. Raises RunpodTransient/RunpodError."""
+              timeout: float = 30.0, params: Optional[dict] = None):
+        """One call to RunPod's REST API v2 (https://api.runpod.io/v2).
+
+        v2 has its OWN per-user quota -- measured 2026-10-20: GraphQL 43,200/day
+        exhausted (429, Retry-After 3939 s) while v2 reported 86,399 of 86,400
+        left and served creates and terminates. v1 (rest.runpod.io/v1) is
+        deprecated, retired 2026-11-15, and its writes failed throughout that
+        ban. Raises RunpodTransient (5xx/408/429, unreachable) or RunpodError.
+        """
         import requests
-        rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
+        if _V2_BACKOFF_UNTIL[0] > time.time():
+            raise RunpodTransient(
+                f"RunPod REST v2 rate-limited this key; not calling it until "
+                f"{time.strftime('%H:%M:%S', time.localtime(_V2_BACKOFF_UNTIL[0]))}")
+        base = (getattr(self._cfg, "rest_v2_base", "") or "https://api.runpod.io/v2").rstrip("/")
         try:
-            r = requests.request(method, rest + path, json=body, timeout=timeout,
+            r = requests.request(method, base + path, json=body, params=params,
+                                 timeout=timeout,
                                  headers={"Authorization": f"Bearer {self._api_key}",
                                           "Content-Type": "application/json"})
         except requests.RequestException as exc:
-            raise RunpodTransient(f"RunPod REST unreachable: {exc}")
+            raise RunpodTransient(f"RunPod REST v2 unreachable: {exc}")
+        _note_v2_quota(r)
         if r.status_code >= 400:
+            if r.status_code == 429:
+                try:
+                    wait = float(r.headers.get("Retry-After") or 30)
+                except ValueError:
+                    wait = 30.0
+                _V2_BACKOFF_UNTIL[0] = time.time() + max(1.0, min(wait, _GQL_BACKOFF_MAX_S))
             cls = (RunpodTransient
                    if r.status_code >= 500 or r.status_code in (408, 425, 429)
                    else RunpodError)
-            why = ""
-            if (r.status_code == 500 and method != "GET" and _gql_banned()
-                    and "unexpected end of JSON input" in (r.text or "")):
-                # Observed through a whole ban: REST reads worked, every REST
-                # write failed this way -- writes go through RunPod's GraphQL
-                # backend and share its rate limit.
-                why = (" — RunPod's REST writes share the GraphQL rate limit, "
-                       "so this cannot succeed until the ban ends")
-            raise cls(f"RunPod REST {method} {path} HTTP {r.status_code}: "
-                      f"{r.text[:300]}{why}")
+            raise cls(f"RunPod REST v2 {method} {path} HTTP {r.status_code}: "
+                      f"{(r.text or '')[:300]}")
         if not r.content:
             return {}
         try:
             return r.json()
         except ValueError:
             return {}
+
+    def _v2_pods(self) -> list:
+        """Every pod on the account, following v2 pagination."""
+        out, cursor = [], None
+        for _ in range(50):
+            d = self._rest("GET", "/pods", params={"cursor": cursor} if cursor else None)
+            out.extend(d.get("pods") or [] if isinstance(d, dict) else [])
+            pg = (d.get("pagination") or {}) if isinstance(d, dict) else {}
+            if not pg.get("hasNextPage") or not pg.get("nextCursor"):
+                break
+            cursor = pg["nextCursor"]
+        return out
+
+    def _list_gpu_types_v2(self) -> list:
+        d = self._rest("GET", "/catalog/gpus")
+        out = []
+        for g in (d.get("gpus") or [] if isinstance(d, dict) else []):
+            pr = g.get("price") or {}
+            sec = pr.get("secure") if g.get("secure") else None
+            com = pr.get("community") if g.get("community") else None
+            out.append({"id": g.get("id"), "display_name": g.get("name") or g.get("id"),
+                        "memory_gb": g.get("memory"), "secure_price": sec,
+                        "community_price": com,
+                        "on_demand_price": sec if sec is not None else com,
+                        # v2 publishes no interruptible price: a spot option is
+                        # simply not offered from this catalogue.
+                        "spot_price": None})
+        return out
 
     def ping(self) -> dict:
         """Cheap auth check — returns {"id","email"?} for the account or raises."""
@@ -510,8 +563,17 @@ class RunpodClient:
         }"""
         if _gql_banned():
             # Pricing is what keeps a pod inside its $/hr ceiling, and an
-            # unpriced card is never chosen -- so during a GraphQL ban the
-            # last catalogue this install saw is the only safe answer.
+            # unpriced card is never chosen. During a GraphQL ban REST v2's
+            # catalogue is priced too (secure/community; no spot); failing
+            # that, the last catalogue this install saw.
+            try:
+                rows = self._list_gpu_types_v2()
+                if rows:
+                    with _GPU_CATALOG_LOCK:
+                        _GPU_CATALOG = (time.time() + GPU_CATALOG_TTL_S, list(rows))
+                    return rows
+            except (RunpodError, RunpodTransient):
+                pass
             saved = _load_saved_catalog()
             if saved:
                 return saved
@@ -619,7 +681,7 @@ class RunpodClient:
             # REST too while GraphQL is rate-limited: RunPod's bans have been
             # hours long, and REST kept answering through them.
             return self._create_pod_rest(
-                global_volume_id=global_volume_id,
+                global_volume_id=global_volume_id, docker_args=docker_args,
                 network_volume_id=network_volume_id,
                 name=name, image=image, gpu_type_id=gpu_type_id, port=port,
                 cloud_type=cloud_type, gpu_count=gpu_count,
@@ -691,64 +753,63 @@ class RunpodClient:
                          env, is_spot, bid_per_gpu, data_center_id,
                          registry_auth_id, entrypoint, start_cmd,
                          network_volume_id: str = "", direct_tcp: bool = False,
-                         global_volume_id: str = "") -> str:
-        """Create a pod through the REST API, which accepts entrypoint overrides."""
-        import requests
-        rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
+                         global_volume_id: str = "", docker_args: str = "") -> str:
+        """Create a pod through REST API v2 (POST /v2/pods).
+
+        Used for entrypoint/cmd overrides (GraphQL has none) and whenever
+        GraphQL is rate-limited. v2 has no interruptible bidding, so a spot
+        request is refused here rather than silently rented on-demand.
+        """
+        if is_spot:
+            raise RunpodError("REST v2 cannot rent an interruptible (spot) pod; "
+                              "that needs GraphQL")
         body = {
             "name": name,
-            "imageName": image,
-            "gpuTypeIds": [gpu_type_id],
-            "gpuCount": int(gpu_count),
-            "cloudType": (cloud_type or "SECURE").upper(),
-            "containerDiskInGb": int(container_disk_gb),
-            "volumeInGb": int(volume_gb),
-            "volumeMountPath": volume_mount_path,
+            "image": image,
+            "gpu": {"id": gpu_type_id, "count": int(gpu_count)},
+            "cloud": (cloud_type or "SECURE").upper(),
+            "disk": int(container_disk_gb),
             "ports": [f"{int(port)}/{'tcp' if direct_tcp else 'http'}"],
             "env": {str(k): str(v) for k, v in (env or {}).items()},
         }
+        if docker_args:
+            body["args"] = docker_args
         if entrypoint:
-            body["dockerEntrypoint"] = list(entrypoint)
+            body["entrypoint"] = list(entrypoint)
         if start_cmd:
-            body["dockerStartCmd"] = list(start_cmd)
+            body["cmd"] = list(start_cmd)
         if data_center_id:
             body["dataCenterIds"] = [data_center_id]
         if registry_auth_id:
-            body["containerRegistryAuthId"] = registry_auth_id
+            body["registry"] = registry_auth_id
+        mounts = {}
+        if int(volume_gb or 0) > 0:
+            mounts["persistent"] = {"size": int(volume_gb),
+                                    "path": volume_mount_path or "/workspace"}
         if network_volume_id:
-            body["networkVolumeId"] = network_volume_id
+            mounts["network"] = [{"volumeId": network_volume_id,
+                                  "path": volume_mount_path or "/workspace"}]
         if global_volume_id:
-            body[GLOBAL_VOLUME_FIELD] = global_volume_id
-        if is_spot:
-            body["interruptible"] = True
-            body["bidPerGpu"] = float(bid_per_gpu)
-        hdrs = {"Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json"}
-        r = requests.post(f"{rest}/pods", json=body, headers=hdrs, timeout=90)
-        # RunPod has no public API for attaching a GLOBAL volume yet: v1 REST,
-        # GraphQL, the v2 pods API and templates all reject the field (probed
-        # 2026-10-09). Sending it therefore fails the whole create — so a
-        # configured global volume must not take every pod down with it. Drop
-        # the field and rent the pod without it: the weights get downloaded
-        # instead of mounted, which is slower and costs bandwidth, and is far
-        # better than serving nothing. Said once per process, loudly.
-        if r.status_code >= 400 and global_volume_id and _global_field_refused(r.text):
+            mounts["global"] = [{"volumeId": global_volume_id}]
+        if mounts:
+            body["mounts"] = mounts
+        try:
+            d = self._rest("POST", "/pods", body=body, timeout=90.0)
+        except RunpodError as exc:
+            # v2 documents global volumes as a mount, but a refused one must not
+            # fail every create: rent without it (the weights download instead)
+            # and say so once -- the same guard the GraphQL path keeps.
+            if not (global_volume_id and "global" in str(exc).lower()
+                    and (body.get("mounts") or {}).get("global")):
+                raise
             _warn_global_volume_unsupported(global_volume_id)
-            body.pop(GLOBAL_VOLUME_FIELD, None)
-            r = requests.post(f"{rest}/pods", json=body, headers=hdrs, timeout=90)
-        if r.status_code >= 400:
-            why = (" — RunPod's REST writes share the GraphQL rate limit, so this "
-                   "cannot succeed until the ban ends"
-                   if r.status_code == 500 and _gql_banned()
-                   and "unexpected end of JSON input" in (r.text or "") else "")
-            cls = RunpodTransient if r.status_code >= 500 else RunpodError
-            raise cls(f"RunPod REST create failed ({r.status_code}): "
-                      f"{(r.text or '')[:400]}{why}")
-        data = r.json() if r.content else {}
-        pod_id = (data.get("id") or (data.get("pod") or {}).get("id")
-                  or (data.get("data") or {}).get("id"))
+            body["mounts"].pop("global", None)
+            if not body["mounts"]:
+                body.pop("mounts")
+            d = self._rest("POST", "/pods", body=body, timeout=90.0)
+        pod_id = (d or {}).get("id") if isinstance(d, dict) else None
         if not pod_id:
-            raise RunpodError(f"RunPod REST create returned no pod id: {str(data)[:300]}")
+            raise RunpodError(f"RunPod REST v2 create returned no pod id: {str(d)[:300]}")
         return pod_id
 
     def list_network_volumes(self) -> list:
@@ -758,25 +819,26 @@ class RunpodClient:
         in EU-RO-1 cannot be attached to a pod anywhere else, and the failure
         arrives as an unhelpful capacity error.
         """
-        import requests
-        rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
         try:
-            r = requests.get(f"{rest}/networkvolumes",
-                             headers={"Authorization": f"Bearer {self._api_key}"},
-                             timeout=30)
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            return data if isinstance(data, list) else (data.get("data") or [])
-        except Exception as exc:
+            d = self._rest("GET", "/network-volumes")
+            rows = d.get("networkVolumes") or [] if isinstance(d, dict) else []
+            # v2 calls it dataCenter; callers read dataCenterId (the v1 name).
+            return [dict(v, dataCenterId=v.get("dataCenterId") or v.get("dataCenter"))
+                    for v in rows if isinstance(v, dict)]
+        except (RunpodError, RunpodTransient) as exc:
             print(f"[runpod] could not list network volumes: {exc}", flush=True)
             return []
 
     def get_pod(self, pod_id: str) -> dict:
         """Return {id, status, uptime_s, cost_per_hr, ports:[...], ready:bool, url?}."""
-        if _gql_banned():
-            return _rest_pod_row(self._rest("GET", f"/pods/{pod_id}?includeMachine=true"),
-                                 pod_id, with_ports=True)
+        try:
+            return _v2_pod_row(self._rest("GET", f"/pods/{pod_id}"), pod_id,
+                               with_ports=True)
+        except (RunpodError, RunpodTransient) as exc:
+            if _gql_banned() or "HTTP 404" in str(exc):
+                raise
+            _say_once("v2-get", f"[runpod] REST v2 pod lookup failed ({exc}); "
+                                f"using GraphQL for it")
         q = """
         query Pod($input: PodFilter!) {
           pod(input: $input) {
@@ -832,14 +894,19 @@ class RunpodClient:
         Raises after the last attempt. A caller that swallows that exception is
         choosing to leak a pod, and should say so in the log instead.
         """
-        if _gql_banned():
-            # REST DELETE. A 404 means it is already gone, which is success.
-            try:
-                self._rest("DELETE", f"/pods/{pod_id}")
-            except RunpodError as exc:
-                if "404" not in str(exc):
-                    raise
+        # REST v2 first: its own quota, and the one call that must not wait out
+        # a GraphQL ban (a pod that cannot be terminated bills). 404 = gone.
+        try:
+            self._rest("DELETE", f"/pods/{pod_id}")
             return
+        except RunpodError as exc:
+            if "HTTP 404" in str(exc):
+                return
+            if _gql_banned():
+                raise
+        except RunpodTransient:
+            if _gql_banned():
+                raise
         q = "mutation($input: PodTerminateInput!) { podTerminate(input: $input) }"
         delay = 2.0
         for attempt in range(1, max(1, attempts) + 1):
@@ -860,9 +927,8 @@ class RunpodClient:
         # the survivor sweep, and REST reads kept answering through a 3.3 h
         # GraphQL ban -- the fewer GraphQL calls, the less likely the ban.
         try:
-            rows = self._rest("GET", "/pods?includeMachine=true")
-            rows = rows if isinstance(rows, list) else (rows or {}).get("data") or []
-            return [_rest_pod_row(p, p.get("id")) for p in rows if isinstance(p, dict)]
+            return [_v2_pod_row(p, p.get("id")) for p in self._v2_pods()
+                    if isinstance(p, dict)]
         except (RunpodError, RunpodTransient) as exc:
             if _gql_banned():
                 raise
