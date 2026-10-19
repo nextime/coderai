@@ -21,6 +21,32 @@ import time
 from typing import Optional
 
 import httpx
+
+#: Floor and ceiling for how many requests the front may have in flight to one
+#: engine. The floor is well above httpx's default of 100, which was the
+#: binding limit on a campaign nobody could see; the ceiling is here so a
+#: mistyped config cannot ask for a file descriptor per page of a million-page
+#: corpus.
+_FWD_MIN, _FWD_MAX = 256, 8192
+
+
+def _forward_ceiling(config) -> int:
+    """How many concurrent forwards this install is configured for.
+
+    From the OCR page ceiling, because that is the one knob that says how many
+    remote calls may be outstanding at once, plus a quarter again for
+    everything else the front proxies while they are. Falls back to the floor
+    rather than to httpx's default: an unreadable config must not silently
+    reinstate the limit this exists to remove.
+    """
+    want = 0
+    try:
+        want = int(getattr(getattr(config, "ocr", None), "max_concurrency", 0) or 0)
+    except Exception:
+        want = 0
+    if want <= 0:
+        return _FWD_MIN
+    return max(_FWD_MIN, min(_FWD_MAX, want + max(64, want // 4)))
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -147,8 +173,54 @@ class FrontProxy:
         # that may legitimately wait for a model load.
         self._short = httpx.AsyncClient(timeout=config.server.proxy_status_timeout,
                                         headers=_auth)
+        # HOW MANY REQUESTS MAY BE IN FLIGHT TO AN ENGINE AT ONCE.
+        #
+        # httpx defaults to max_connections=100, and this client was built with
+        # `pool=None` -- wait forever for a free connection. Together those two
+        # defaults are a hard ceiling on everything the front forwards, and
+        # nothing anywhere said so.
+        #
+        # Measured on a live orchestrator, mid-campaign: 514 client requests
+        # established to the front, 100 of them forwarded, the rest waiting on
+        # the connection pool. Throughput 0.42 pages/s where the fleet was
+        # sized for ~3.3, mean page latency 238 s against a measured service
+        # time of ~19 s -- the difference was almost entirely queueing for a
+        # connection. Cost per page came out 12x the measured baseline, because
+        # the pods were being paid for and could not be reached.
+        #
+        # It also wedged the control plane: /v1/runpod/status is not under
+        # /admin/api/, so it takes this same unbounded path and simply never
+        # answered (http=000 at 30 s, three times in a row, while /healthz
+        # answered in 2.1 ms). A client sizing its in-flight window from
+        # `summary.pods_ready` -- which is what the throughput guide tells it to
+        # do -- was therefore also flying blind.
+        #
+        # Sized from the OCR page ceiling the operator configured, because that
+        # is the number of concurrent forwards this install has asked for, plus
+        # headroom for everything else the front proxies. A connection parked on
+        # a socket costs a file descriptor, which is why the ceiling can be this
+        # large; the real limits remain the page semaphore and the pods.
+        _fwd = _forward_ceiling(config)
         self._long = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+            timeout=httpx.Timeout(connect=10.0, read=None, write=None,
+                                  # BOUNDED, unlike the read timeout. A page may
+                                  # legitimately take minutes to be READ; waiting
+                                  # minutes for a connection to start reading it
+                                  # is a queue, and an unbounded queue reports as
+                                  # a hang. 30 s then surfaces as a 502 the client
+                                  # can retry instead of a socket that never
+                                  # answers.
+                                  pool=30.0),
+            limits=httpx.Limits(max_connections=_fwd,
+                                max_keepalive_connections=max(32, _fwd // 4)),
+            headers=_auth)
+        # The CONTROL client. Separate pool, small and fixed, for the handful of
+        # paths that say what the server is doing: its whole value is having a
+        # free connection when the forwarding pool is full, which is exactly
+        # when someone is asking. Nothing on the request path may use it.
+        self._ctl = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=10.0),
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
             headers=_auth)
         # Last-good primary task list. The primary engine can't answer the short
         # tasks poll while it's GIL-busy generating, so without this its running
@@ -161,6 +233,7 @@ class FrontProxy:
     async def aclose(self):
         await self._short.aclose()
         await self._long.aclose()
+        await self._ctl.aclose()
         for e in self.registry.remotes():
             for c in (e.http_short, e.http_long):
                 try:
@@ -171,7 +244,22 @@ class FrontProxy:
     # A cluster node is reached through ITS clients (its token, its trust
     # settings) and never with the caller's credentials: the head's user is not
     # a user of the node. Local engines keep the shared clients.
-    def _lc(self, engine):
+    #: Paths that must answer while the forwarding pool is full. All of them
+    #: are reads of, or commands to, the fleet -- the things an operator or a
+    #: client needs precisely when the install is saturated. A pod that cannot
+    #: be released because the release call cannot get a connection keeps
+    #: billing, which is the most expensive way for this to fail.
+    _CONTROL_PATHS = ("/v1/runpod/status", "/v1/runpod/spend",
+                      "/v1/runpod/scale", "/v1/runpod/release",
+                      "/healthz", "/metrics")
+
+    def _is_control_path(self, path: str) -> bool:
+        p = str(path or "")
+        return any(p == c or p.startswith(c + "/") for c in self._CONTROL_PATHS)
+
+    def _lc(self, engine, path: str = ""):
+        if path and self._is_control_path(path) and not getattr(engine, "remote", False):
+            return self._ctl
         return engine.http_long if getattr(engine, "remote", False) and engine.http_long \
             else self._long
 
@@ -438,7 +526,7 @@ class FrontProxy:
             for _attempt in range(6):
                 _last = (_attempt >= 5)
                 try:
-                    r = await self._lc(engine).request(method, engine.url + path,
+                    r = await self._lc(engine, path).request(method, engine.url + path,
                                                  headers=self._eh(engine, send_headers),
                                                  params=query or {},
                                                  content=body or b"")
@@ -594,7 +682,7 @@ class FrontProxy:
                 # (just (re)starting): wait + retry instead of relaying an instant
                 # "unreachable" (which lands as a single empty SSE chunk).
                 try:
-                    rp_req = self._lc(engine).build_request(method, engine.url + path,
+                    rp_req = self._lc(engine, path).build_request(method, engine.url + path,
                                                       headers=self._eh(engine, send_headers),
                                                       params=query or {},
                                                       content=body or b"")
@@ -2386,10 +2474,12 @@ class FrontProxy:
         headers = self._filter_headers(request.headers, _DROP_REQ)
         content = (request.stream()
                    if method in ("POST", "PUT", "PATCH") else None)
-        rp_req = self._lc(engine).build_request(method, url, headers=self._eh(engine, headers),
-                                          params=request.query_params, content=content)
+        _p = request.url.path
+        rp_req = self._lc(engine, _p).build_request(
+            method, url, headers=self._eh(engine, headers),
+            params=request.query_params, content=content)
         try:
-            rp_resp = await self._lc(engine).send(rp_req, stream=True)
+            rp_resp = await self._lc(engine, _p).send(rp_req, stream=True)
         except Exception as exc:
             return JSONResponse(
                 {"error": f"coderai-system worker unreachable: {exc}"}, status_code=502)
@@ -2553,7 +2643,7 @@ class FrontProxy:
         except Exception:
             pass
 
-        rp_req = self._lc(engine).build_request(
+        rp_req = self._lc(engine, path).build_request(
             method, url, headers=self._eh(engine, headers), params=request.query_params,
             content=content)
         # Count this as in-flight on the chosen engine so a restart can drain it:
@@ -2566,7 +2656,7 @@ class FrontProxy:
         import time as _t
         _started = _t.time()
         try:
-            rp_resp = await self._lc(engine).send(rp_req, stream=True)
+            rp_resp = await self._lc(engine, path).send(rp_req, stream=True)
         except Exception as exc:
             engine.exit_request(_rid)
             if _qkey is not None:
