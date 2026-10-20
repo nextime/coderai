@@ -195,11 +195,28 @@ class RunpodBackend(ModelBackend):
             raise RuntimeError("RunPod endpoint not resolved")
         return self._url
 
+    def _pool_key(self, pod) -> str:
+        """The bearer for ONE pod, from the pool. Pods in a pool can carry
+        different tokens, so the key belongs to the pod, not to the send."""
+        pool = getattr(self, "_pool", None)
+        getter = getattr(pool, "pod_key", None)
+        if callable(getter):
+            try:
+                return getter(pod) or ""
+            except Exception:
+                pass
+        return getattr(pool, "api_key", "") or ""
+
     def _acquire_endpoint(self):
-        """Return (base_url, release_callable) for one request. Serverless yields the
-        fixed endpoint; pods pick (and provision-on-demand) a pod from the pool."""
+        """Return (base_url, release_callable, bearer) for one request.
+
+        The bearer comes with the address because it belongs to the POD that was
+        just handed out: `self._last_pod` is one attribute shared by every
+        concurrent request, so reading the key from it afterwards can pick up
+        another request's pod. Serverless yields the fixed endpoint and "" (its
+        key is the configured header, not a pod's)."""
         if self._mode == "serverless":
-            return self._base(), (lambda: None)
+            return self._base(), (lambda: None), ""
         if not self._pool:
             raise RuntimeError("RunPod pod pool not initialised")
         pod, url = self._pool.acquire()
@@ -207,7 +224,8 @@ class RunpodBackend(ModelBackend):
         # add /v1 to match the serverless base (which already ends in /openai/v1).
         self._last_pod = pod
         self._ensure_adapters(url.rstrip("/"))
-        return url.rstrip("/") + "/v1", (lambda: self._pool.release(pod))
+        return (url.rstrip("/") + "/v1", (lambda: self._pool.release(pod)),
+                self._pool_key(pod))
 
     #: Pods already sent this model's adapters, by (pod url, model). A pod keeps
     #: what it is given and a new pod has a new URL, so this never goes stale.
@@ -263,8 +281,9 @@ class RunpodBackend(ModelBackend):
             print(f"[runpod] could not send {name!r}'s adapters to {root}: {exc}",
                   flush=True)
 
-    def _auth(self) -> dict:
-        """The bearer header for THIS send, read from the pool now.
+    def _auth(self, bearer: str = "") -> dict:
+        """The bearer header for THIS send: `bearer` when the caller holds the
+        key of the pod it acquired, else read from the pool now.
 
         Not the snapshot taken in load_model. A pool may replace its token
         between loading the model and sending a request: when a pod for this
@@ -277,11 +296,17 @@ class RunpodBackend(ModelBackend):
         when a pool adopted a running pod all failed with "Invalid API key",
         every one of them lost, while the same lease worked seconds later. The
         snapshot stays for serverless, which has no pool and no such event.
+
+        And it is THIS POD's token, not the pool's: one pool can hold pods with
+        different ones (an adopted pod keeps the token it was launched with), so
+        a pool-wide key 401s every pod that does not share it. 2026-10-20: a
+        restart adopted one pod and rented another in the same minute, and
+        qwen38 answered 401 to every request until both pods were destroyed.
         """
         pool = getattr(self, "_pool", None)
         if pool is None:
             return dict(self._headers or {})
-        key = getattr(pool, "api_key", "") or ""
+        key = (bearer or "") or self._pool_key(getattr(self, "_last_pod", None))
         return {"Authorization": f"Bearer {key}"} if key else {}
 
     def _check(self, r) -> None:
@@ -323,9 +348,9 @@ class RunpodBackend(ModelBackend):
         hold a scaling slot open, and the pod's own idle reaper decides when it goes.
         The address is therefore a lease — the caller re-resolves when it stops
         answering rather than treating it as permanent."""
-        base, release = self._acquire_endpoint()
+        base, release, bearer = self._acquire_endpoint()
         try:
-            auth = (self._auth() or {}).get("Authorization", "")
+            auth = (self._auth(bearer) or {}).get("Authorization", "")
             key = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
             return base, key
         finally:
@@ -405,7 +430,7 @@ class RunpodBackend(ModelBackend):
         self._last_logprobs = None
         try:
             for attempt in (1, 2):
-                base, release = self._acquire_endpoint()
+                base, release, bearer = self._acquire_endpoint()
                 try:
                     payload = self._chat_payload(messages, max_tokens, temperature, top_p,
                                                  stop, False, logprobs=logprobs,
@@ -421,7 +446,7 @@ class RunpodBackend(ModelBackend):
                     if tools:
                         payload["tools"] = tools
                     r = pod_http.post(base + "/chat/completions", json=payload,
-                                      headers=self._auth(), timeout=3600)
+                                      headers=self._auth(bearer), timeout=3600)
                 except requests.exceptions.ConnectionError:
                     # Nothing answered at all: the pod is gone. Once, on a
                     # fresh pod — a second refusal is a real outage.
@@ -464,7 +489,7 @@ class RunpodBackend(ModelBackend):
         try:
             for attempt in (1, 2):
                 # Pod acquire may provision (blocking) — do it off the event loop.
-                base, release = await asyncio.to_thread(self._acquire_endpoint)
+                base, release, bearer = await asyncio.to_thread(self._acquire_endpoint)
                 payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop,
                                              True, logprobs=logprobs,
                                              top_logprobs=top_logprobs)
@@ -478,7 +503,7 @@ class RunpodBackend(ModelBackend):
                 sent = False
                 try:
                     async for chunk in self._stream(base + "/chat/completions", payload,
-                                                    delta_key="delta"):
+                                                    delta_key="delta", bearer=bearer):
                         sent = True
                         yield chunk
                 except requests.exceptions.ConnectionError:
@@ -524,13 +549,13 @@ class RunpodBackend(ModelBackend):
     # ------------------------------------------------------------------ #
     # SSE streaming
     # ------------------------------------------------------------------ #
-    async def _stream(self, url: str, payload: dict, delta_key: str
-                      ) -> AsyncGenerator[str, None]:
+    async def _stream(self, url: str, payload: dict, delta_key: str,
+                      bearer: str = "") -> AsyncGenerator[str, None]:
         import json
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
-        headers = self._auth()
+        headers = self._auth(bearer)
 
         def _handle_line(line: str) -> bool:
             if not line or not line.startswith("data:"):

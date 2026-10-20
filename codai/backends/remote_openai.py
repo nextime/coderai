@@ -103,10 +103,15 @@ class RemoteOpenAIBackend(RunpodBackend):
               flush=True)
 
     def _acquire_endpoint(self):
-        """One fixed endpoint — nothing to provision or release."""
+        """One fixed endpoint — nothing to provision or release.
+
+        The third element is the per-request bearer, which a POOL fills with the
+        token of the pod it handed out. A fixed remote has no pod and keeps its
+        configured header, so it is empty.
+        """
         if not self._url:
             raise RuntimeError("remote endpoint not resolved")
-        return self._url, (lambda: None)
+        return self._url, (lambda: None), ""
 
     def health(self) -> Optional[dict]:
         import requests

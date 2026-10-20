@@ -349,12 +349,13 @@ def _pod_candidate(model_id: str) -> Optional[Candidate]:
         return None
 
     def _acquire():
-        base, release = backend._acquire_endpoint()
-        # AFTER the acquire, and from the live accessor: acquiring is what can
-        # change the pool's token (it adopts a running pod's instead of renting
-        # another), and the snapshot taken at load_model time would be the old
-        # one — which the pod answers 401 to.
-        auth = (backend._auth() or {}).get("Authorization", "")
+        base, release, bearer = backend._acquire_endpoint()
+        # The key comes WITH the address, from the pod that was just handed
+        # out. Reading it afterwards from the pool was wrong twice: the pool's
+        # token can change during the acquire (it adopts a running pod's), and
+        # pods in one pool can carry DIFFERENT tokens, so no single pool-wide
+        # key is right for all of them.
+        auth = (backend._auth(bearer) or {}).get("Authorization", "")
         key = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         # _unreachable() drops the pod the backend just handed out, which is
         # what stops the next page choosing the same dead one.

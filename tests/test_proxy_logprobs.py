@@ -131,8 +131,11 @@ def _runpod_backend(monkeypatch, seen, **kw):
     backend._served_name = "datalab-to/surya-ocr-2"
     backend._headers = {}
     backend._inflight = 0
+    # (base, release, bearer): the acquire hands out the POD's token with the
+    # address, since pods in one pool can carry different ones.
     monkeypatch.setattr(backend, "_acquire_endpoint",
-                        lambda: ("http://pod/v1", lambda: None), raising=False)
+                        lambda: ("http://pod/v1", lambda: None, "pod-tok"),
+                        raising=False)
     _answer(monkeypatch, pod_http, seen, **kw)
     return backend
 

@@ -74,16 +74,22 @@ def test_serverless_keeps_its_snapshot():
 
 def test_the_accessor_is_what_every_send_uses():
     """Pinned against the source: three sites used the snapshot, and any one of
-    them left behind would reproduce the incident on that path."""
+    them left behind would reproduce the incident on that path.
+
+    Since v0.4.59 the accessor is given the bearer of the pod the acquire just
+    handed out (`_auth(bearer)`), because one pool can hold pods carrying
+    DIFFERENT tokens -- a pool-wide key 401s whichever pod does not share it.
+    Reading the pool is still the fallback."""
     src = (ROOT / "codai/backends/runpod.py").read_text()
-    assert "headers=self._auth()" in src                 # chat completions
-    assert "headers = self._auth()" in src               # streaming
-    assert "(self._auth() or {}).get(\"Authorization\"" in src   # openai_endpoint
-    # …and the placement candidate reads it AFTER acquiring, since acquiring is
-    # what can change it.
+    assert "headers=self._auth(bearer)" in src           # chat completions
+    assert "headers = self._auth(bearer)" in src         # streaming
+    assert "(self._auth(bearer) or {}).get(\"Authorization\"" in src  # openai_endpoint
+    assert "def _auth(self, bearer: str = \"\")" in src
+    # …and the placement candidate takes it FROM the acquire, since reading it
+    # afterwards can pick up another concurrent request's pod.
     pl = (ROOT / "codai/models/placement.py").read_text()
-    after = pl.split("base, release = backend._acquire_endpoint()")[1][:400]
-    assert "backend._auth()" in after
+    after = pl.split("base, release, bearer = backend._acquire_endpoint()")[1][:500]
+    assert "backend._auth(bearer)" in after
 
 
 # --- the gateway's last line of defence ------------------------------------

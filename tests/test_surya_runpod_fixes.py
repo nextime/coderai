@@ -187,13 +187,18 @@ def test_readiness_probes_stay_open_when_tokens_are_enforced():
 
 
 def test_coderai_locks_every_pod_it_rents():
-    """The operator never sets a pod's token: the pool generates one unless the
-    model explicitly opts out, so a pod is never open on a public proxy URL."""
+    """The operator never sets a pod's token: the pool mints one unless the
+    model explicitly opts out, so a pod is never open on a public proxy URL.
+
+    Since v0.4.59 it is minted ONCE and persisted (`_pool_token`) rather than
+    generated per process: a fresh token each restart left every pod already
+    rented answering 401 to its own install."""
     src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    assert 'self.api_key = "cra-" + secrets.token_urlsafe(32)' in src
+    assert "self.api_key = _pool_token(str(self.model_key))" in src
+    assert 'secrets.token_urlsafe' in src          # still generated, in _pool_token
     assert 'allow_open_pod' in src
-    i = src.index('self.api_key = "cra-"')
-    guard = src[max(0, i - 200):i]
+    i = src.index("self.api_key = _pool_token(")
+    guard = src[max(0, i - 900):i]
     assert "allow_open_pod" in guard, "generation must be the default, not opt-in"
 
 

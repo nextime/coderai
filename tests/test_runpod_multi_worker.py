@@ -225,7 +225,11 @@ def test_a_worker_follows_only_its_slice(worker, registry):
     want = {k for k, w in mapping.items() if w == 0}
     assert got == want and len(got) == 20
     assert "other" not in got and "booting" not in got
-    assert p.api_key == "tok"
+    # The key travels WITH EACH POD now (v0.4.59): a majority vote over the
+    # registry's keys gave every pod the commonest one, so a pod carrying a
+    # different token 401'd every page sent to it.
+    assert {p.api_key for p in p.pods} == {"tok"}
+    assert p.pod_key(p.pods[0]) == "tok"
 
 
 def test_following_keeps_the_handle_that_holds_in_flight_pages(worker, registry):

@@ -25,7 +25,9 @@ The account settings (API key, endpoints, global caps) live in
 """
 
 from codai.api import pod_http
+import json
 import os
+import threading
 from collections import OrderedDict as _OrderedDict
 from dataclasses import dataclass, field
 from codai.api import runpod_fleet_share as _share
@@ -2638,6 +2640,12 @@ class PodHandle:
     hourly_usd: float
     started_at: float
     gpu: str = ""
+    #: The bearer this POD was launched with (or adopted carrying). One pool can
+    #: hold pods with different tokens: a restart that adopts a running pod takes
+    #: that pod's token, while a pod it rented seconds earlier still answers only
+    #: to the pool's own. One pool-wide key then 401s every request to one of the
+    #: two for the rest of its paid life. Empty = use the pool's key.
+    api_key: str = ""
     is_spot: bool = False
     healthy: bool = True
     inflight: int = 0
@@ -2986,10 +2994,20 @@ class RunpodPodPool:
         #: configured, so a pod is never left open on a public proxy URL.
         self.api_key = (getattr(mcfg, "api_key", "") or "").strip()
         if not self.api_key and not getattr(mcfg, "allow_open_pod", False):
-            import secrets
-            self.api_key = "cra-" + secrets.token_urlsafe(32)
+            # PERSISTED, not generated per process. A fresh random token every
+            # restart means every pod this install rented before the restart
+            # answers 401 to it, and the pool's own adoption path then has to
+            # guess which token belongs to which pod. 2026-10-20: a restart
+            # generated a new key, adopted one pod carrying the old one, rented
+            # another with the new one, and qwen38 served nothing until both
+            # were destroyed. The file sits beside the pod registry, so the
+            # pods and the key that opens them are lost or kept together.
+            self.api_key = _pool_token(str(self.model_key))
         #: Set from the pod plan at provision time; the default suits an LLM pod.
         self.health_path = mcfg.health_path or "/v1/models"
+        #: Tokens of pods this pool has seen but no longer holds, so a pod that
+        #: comes back (quarantine, re-adoption) is still reachable.
+        self._pod_keys: dict = {}
         self._cv = threading.Condition(threading.RLock())
         #: Per-CARD arithmetic, memoised. `pod_weight`, `pod_capacity` and
         #: `pod_threshold` depend only on the card's NAME and the model config,
@@ -3362,8 +3380,8 @@ class RunpodPodPool:
             return
         since = getattr(pod, "log_cursor", 0) or 0
         try:
-            headers = ({"Authorization": f"Bearer {self.api_key}"}
-                       if self.api_key else {})
+            _k = self.pod_key(pod)
+            headers = ({"Authorization": f"Bearer {_k}"} if _k else {})
             reply = pod_http.get(f"{url}/logs?since={since}&limit=2000",
                                  headers=headers, timeout=15)
             if reply.status_code != 200:
@@ -3417,8 +3435,8 @@ class RunpodPodPool:
         if url:
             try:
                 import requests
-                headers = ({"Authorization": f"Bearer {self.api_key}"}
-                           if self.api_key else {})
+                _k = self.pod_key(self._pod_by_id(pod_id))
+                headers = ({"Authorization": f"Bearer {_k}"} if _k else {})
                 r = pod_http.get(url.rstrip("/") + "/boot", headers=headers, timeout=15)
                 if r.status_code == 200:
                     data = r.json()
@@ -3447,7 +3465,40 @@ class RunpodPodPool:
     # NEXT candidate rather than failing the request.
     MAX_PROVISION_ATTEMPTS = 3
 
-    def _pod_answers_us(self, url: str) -> bool:
+    def _pod_by_id(self, pod_id: str):
+        """The handle for ``pod_id``, or None. Never raises: it is called from
+        probe and log paths that must work on a half-built pool."""
+        try:
+            with self._cv:
+                for p in list(self.pods):
+                    if str(p.pod_id) == str(pod_id):
+                        return p
+        except Exception:
+            pass
+        return None
+
+    def pod_key(self, pod) -> str:
+        """The bearer for THIS pod: its own if it carries one, else the pool's."""
+        if pod is not None:
+            own = str(getattr(pod, "api_key", "") or "")
+            if own:
+                return own
+            rec = (getattr(self, "_pod_keys", None) or {}).get(
+                str(getattr(pod, "pod_id", "") or ""))
+            if rec:
+                return rec
+        return getattr(self, "api_key", "") or ""
+
+    def _remember_pod_key(self, pod_id: str, key: str) -> None:
+        if not pod_id or not key:
+            return
+        if getattr(self, "_pod_keys", None) is None:
+            self._pod_keys = {}
+        self._pod_keys[str(pod_id)] = str(key)
+        if len(self._pod_keys) > 512:
+            self._pod_keys.pop(next(iter(self._pod_keys)), None)
+
+    def _pod_answers_us(self, url: str, key: Optional[str] = None) -> bool:
         """Whether the pod accepts the token we would use for it.
 
         Probes an AUTHENTICATED path, because the unauthenticated one proves
@@ -3459,8 +3510,8 @@ class RunpodPodPool:
             return False
         try:
             from codai.api import pod_http
-            headers = ({"Authorization": f"Bearer {self.api_key}"}
-                       if self.api_key else {})
+            _k = self.api_key if key is None else key
+            headers = ({"Authorization": f"Bearer {_k}"} if _k else {})
             reply = pod_http.get(base + "/v1/models", headers=headers, timeout=20)
         except Exception as exc:
             # Unreachable is not "unauthorised": leave that to the health
@@ -3512,16 +3563,18 @@ class RunpodPodPool:
         if not shared_url:
             return False
         if shared_key and shared_key != self.api_key:
-            # That pod only answers to the token it was launched with. Adopt the
-            # token so this pool — and the pods it rents next — speak the same
-            # one. Only safe while we hold no pod of our own; otherwise we end
-            # up with a pool whose pods want two different tokens.
-            with self._cv:
-                if self.pods:
-                    return False
-            self.api_key = shared_key
-            print(f"[runpod] adopting pod {shared_id}'s bearer token", flush=True)
-        if not self._pod_answers_us(shared_url):
+            # That pod only answers to the token it was launched with, so the
+            # token travels WITH THE POD (PodHandle.api_key) instead of
+            # replacing the pool's. Swapping the pool's used to be refused
+            # whenever the pool already held a pod -- and taken otherwise, which
+            # then 401'd every pod rented with the old one. Live, 2026-10-20:
+            # a restart adopted one pod and rented another in the same minute,
+            # and qwen38 answered 401 to everything until both were destroyed.
+            print(f"[runpod] pod {shared_id} carries its own bearer token — "
+                  f"keeping it for that pod; the pool's own token is unchanged",
+                  flush=True)
+        _use_key = shared_key or self.api_key
+        if not self._pod_answers_us(shared_url, _use_key):
             # A coderai pod's /healthz needs no token, so the probe that found
             # this pod says nothing about whether we can USE it. With no key
             # recorded we fall back to our own — and if that is not the token the
@@ -3568,9 +3621,11 @@ class RunpodPodPool:
                            # knows when we rented it ourselves; the account
                            # knows otherwise.
                            **_adopted_card(self.account, shared_id),
+                           api_key=_use_key,
                            healthy=True, last_used=time.time())
+        self._remember_pod_key(shared_id, _use_key)
         added = self._add_pod(handle)
-        register_pod(shared_id, str(self.model_key), shared_url, self.api_key,
+        register_pod(shared_id, str(self.model_key), shared_url, _use_key,
                      hourly_usd=float(shared_rate or 0.0))  # image/gpu kept
         # True only for a pod this pool did not already hold. A duplicate is
         # not progress, and a caller looping "while it adopts something" must
@@ -3616,8 +3671,9 @@ class RunpodPodPool:
                        "messages": [{"role": "user", "content": "ok"}],
                        "max_tokens": 1, "temperature": 0.0}
         headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        _wk = self.pod_key(self._pod_by_id(pod_id))
+        if _wk:
+            headers["Authorization"] = f"Bearer {_wk}"
         try:
             reply = pod_http.post(url.rstrip("/") + path,
                                   json=payload, headers=headers, timeout=budget)
@@ -3893,6 +3949,10 @@ class RunpodPodPool:
                     continue
                 raise
             h = PodHandle(pod_id=pod_id, url=url, hourly_usd=sel["price"],
+                          # The token THIS pod was launched with, so a later
+                          # adoption of a pod carrying another one cannot make
+                          # this one unreachable.
+                          api_key=self.api_key,
                           started_at=time.time(), gpu=sel["display_name"],
                           is_spot=sel["is_spot"], healthy=True, last_used=time.time(),
                           console_url=console,
@@ -3915,6 +3975,7 @@ class RunpodPodPool:
                 _provisioning_info.pop(pod_id, None)
             # Publish the URL so a sibling engine needing the same pool reuses
             # this pod instead of renting a second GPU for the same work.
+            self._remember_pod_key(pod_id, self.api_key)
             register_pod(pod_id, str(self.model_key), url, self.api_key,
                          hourly_usd=sel["price"],
                          # So a sibling — or we, after a restart — can tell
@@ -4729,17 +4790,23 @@ class RunpodPodPool:
                         hourly_usd=float(info.get("hourly_usd") or 0.0),
                         started_at=float(info.get("created") or now),
                         gpu=str(info.get("gpu") or ""),
+                        api_key=str(info.get("key") or ""),
                         healthy=True, last_used=now))
                 else:
                     pod.url = str(info.get("url"))
+                    if info.get("key"):
+                        pod.api_key = str(info["key"])
                     pod.draining = bool((flags.get(pid) or {}).get("draining"))
         for pod in fresh:
             pod.draining = bool((flags.get(pod.pod_id) or {}).get("draining"))
             self._add_pod(pod)
+        for pid, info in want.items():
+            self._remember_pod_key(pid, str(info.get("key") or ""))
         with self._cv:
-            keys = [str(i.get("key")) for i in want.values() if i.get("key")]
-            if keys:
-                self.api_key = max(set(keys), key=keys.count)
+            # NOT a majority vote over the registry's keys. Pods in one pool can
+            # legitimately carry different tokens (an adopted pod keeps its own),
+            # and the vote gave every pod the commonest one -- so the minority
+            # pod 401'd every page. Each pod's key travels on its own handle.
             self._bump_cards()
             self._cv.notify_all()
         self._recheck_quarantined(now)
@@ -6680,6 +6747,49 @@ _REGISTRY_PATH_LOGGED = False
 #: engine sees its siblings' pods as orphans. Observed live: the nvidia engine
 #: created a pod and the radeon engine terminated it four seconds later, then the
 #: reverse — a mutual kill loop that rented and destroyed pods until stopped.
+_POOL_TOKENS_FILE = "runpod-pool-tokens.json"
+_POOL_TOKEN_LOCK = threading.Lock()
+
+
+def _pool_token(pool_key: str) -> str:
+    """This install's stable bearer for ``pool_key``, created once and kept.
+
+    Generated on first use and stored next to the pod registry (0600). Every
+    process of this install reads the same one, so a pod stays reachable across
+    a restart, and a sibling engine adopting it needs no token swap at all.
+    """
+    import secrets
+    path = os.path.join(os.path.dirname(_pod_registry_path()), _POOL_TOKENS_FILE)
+    with _POOL_TOKEN_LOCK:
+        data = {}
+        try:
+            with open(path) as fh:
+                data = json.load(fh) or {}
+        except Exception:
+            data = {}
+        tok = str((data if isinstance(data, dict) else {}).get(pool_key) or "")
+        if tok:
+            return tok
+        tok = "cra-" + secrets.token_urlsafe(32)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = data if isinstance(data, dict) else {}
+            data[pool_key] = tok
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            print(f"[runpod] minted this install's bearer for pool {pool_key!r} "
+                  f"and saved it beside the pod registry — pods stay reachable "
+                  f"across a restart", flush=True)
+        except Exception as exc:
+            print(f"[runpod] could not save the pool token ({exc}); using a "
+                  f"per-process one, so a restart will orphan this pool's pods",
+                  flush=True)
+        return tok
+
+
 def _pod_registry_path() -> str:
     """The one file every process must agree on.
 
@@ -6882,6 +6992,14 @@ def sibling_is_provisioning(pool_key: str) -> bool:
     Registered at creation with no URL yet. Without this the sibling rents its
     own during the ~2.5 minutes a pod takes to boot — which is exactly what
     happened live: two pods for one capability, 45 seconds apart.
+
+    NOT true for a pod whose owner stopped heartbeating, however young it is.
+    That was tried (2026-10-20, to stop a restart renting beside the pod its
+    own previous process was booting) and reverted: an url-less marker from a
+    dead owner is exactly what froze a pool for twenty minutes once the pod
+    behind it never came up (y3nndqmh9wqwc9, killed by a deploy). A pod rented
+    twice costs cents; a pool that will not rent serves nothing. The surplus is
+    handled after the fact, by scale-down, where it can be measured.
     """
     data = _registry_update(lambda d: False)
     if not isinstance(data, dict):
