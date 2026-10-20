@@ -163,5 +163,7 @@ def _no_runpod_rate_limit_carryover():
         yield
         return
     _rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    _rc._GQL_RECENT = None
     yield
     _rc._GQL_BACKOFF_UNTIL[0] = 0.0
+    _rc._GQL_RECENT = None

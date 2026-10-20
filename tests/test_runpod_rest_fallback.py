@@ -177,3 +177,53 @@ def test_graphql_calls_are_counted_by_operation():
     rc._count_gql("mutation { podTerminate(input: {podId: \"x\"}) }")
     got = rc.gql_call_counts()
     assert got.get("pod") == 1 and got.get("podTerminate") == 1
+
+
+# ------------------------------------------- staying under the daily quota #
+
+def test_over_the_hourly_budget_routes_to_v2(monkeypatch):
+    """RunPod's GraphQL day quota (43,200) averages 1,800/h; spending it ends
+    in a ban until midnight UTC. Past our own budget, v2 does the work."""
+    import collections
+    monkeypatch.setattr(rc, "GQL_HOURLY_BUDGET", 5)
+    monkeypatch.setattr(rc, "_GQL_RECENT", collections.deque([time.time()] * 5))
+    assert rc._gql_banned() is True
+    c, calls = _client(monkeypatch, lambda m, p, b: {"id": "new1"})
+    assert c.create_pod(name="n", image="i", gpu_type_id="NVIDIA A40", port=8000,
+                        direct_tcp=True) == "new1"
+    assert calls[0][:2] == ("POST", "/pods")
+
+
+def test_old_calls_fall_out_of_the_window(monkeypatch):
+    import collections
+    monkeypatch.setattr(rc, "GQL_HOURLY_BUDGET", 5)
+    monkeypatch.setattr(rc, "_GQL_RECENT", collections.deque([time.time() - 4000] * 50))
+    assert rc._gql_banned() is False
+    assert rc._gql_calls_last_hour() == 0
+
+
+def test_the_budget_does_not_block_what_only_graphql_can_do(monkeypatch):
+    """Spot rentals have no v2 equivalent: the budget reroutes, it never
+    refuses a GraphQL call on its own -- only RunPod's 429 does that."""
+    import collections, requests
+    monkeypatch.setattr(rc, "GQL_HOURLY_BUDGET", 1)
+    monkeypatch.setattr(rc, "_GQL_RECENT", collections.deque([time.time()] * 3))
+
+    class _R:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": {"podRentInterruptable": {"id": "spot1"}}}
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _R())
+    c = rc.RunpodClient.__new__(rc.RunpodClient)
+    c._api_key, c._gql_base, c._cfg = "k" * 20, "https://api.runpod.io/graphql", None
+    assert c._gql("mutation { podRentInterruptable(input: {}) { id } }") == {
+        "podRentInterruptable": {"id": "spot1"}}
+
+
+def test_zero_disables_the_budget(monkeypatch):
+    import collections
+    monkeypatch.setattr(rc, "GQL_HOURLY_BUDGET", 0)
+    monkeypatch.setattr(rc, "_GQL_RECENT", collections.deque([time.time()] * 99999))
+    assert rc._gql_over_budget() is False

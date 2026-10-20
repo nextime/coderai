@@ -18,6 +18,7 @@ NEVER logged — only masked in error strings.
 """
 
 import os
+import threading
 import time
 from typing import Optional
 
@@ -367,9 +368,57 @@ def _v2_pod_row(p: dict, pod_id: str = "", with_ports: bool = False) -> dict:
     return row
 
 
+#: GraphQL calls this process may make per rolling hour before it routes
+#: everything REST v2 can do to REST v2. RunPod's own GraphQL limits (live
+#: headers, 2026-10-20) are 3,600/h but 43,200/DAY -- an average of 1,800/h --
+#: and the daily one is the one that ran out: a ban until midnight UTC. 1,500/h
+#: stays under the daily average with room for other clients of the same key.
+#: CODERAI_RUNPOD_GQL_HOURLY_BUDGET overrides; 0 disables the budget.
+GQL_HOURLY_BUDGET = int(os.environ.get("CODERAI_RUNPOD_GQL_HOURLY_BUDGET", "1500") or 0)
+_GQL_RECENT: "collections.deque" = None
+_GQL_RECENT_LOCK = threading.Lock()
+_GQL_OVER_SAID = [0.0]
+
+
+def _gql_record_call() -> None:
+    global _GQL_RECENT
+    with _GQL_RECENT_LOCK:
+        if _GQL_RECENT is None:
+            import collections
+            _GQL_RECENT = collections.deque()
+        _GQL_RECENT.append(time.time())
+
+
+def _gql_calls_last_hour() -> int:
+    with _GQL_RECENT_LOCK:
+        if not _GQL_RECENT:
+            return 0
+        cut = time.time() - 3600
+        while _GQL_RECENT and _GQL_RECENT[0] < cut:
+            _GQL_RECENT.popleft()
+        return len(_GQL_RECENT)
+
+
+def _gql_over_budget() -> bool:
+    if GQL_HOURLY_BUDGET <= 0:
+        return False
+    n = _gql_calls_last_hour()
+    if n < GQL_HOURLY_BUDGET:
+        return False
+    now = time.time()
+    if now - _GQL_OVER_SAID[0] > 600:
+        _GQL_OVER_SAID[0] = now
+        print(f"[runpod] GraphQL budget reached ({n} calls in the last hour, budget "
+              f"{GQL_HOURLY_BUDGET}/h) — routing everything REST v2 can do to REST "
+              f"v2 until it drops; only spot rentals still need GraphQL", flush=True)
+    return True
+
+
 def _gql_banned() -> bool:
-    """True while RunPod's GraphQL rate limit is in force (see _note_rate_limit)."""
-    return _GQL_BACKOFF_UNTIL[0] > time.time()
+    """True while GraphQL should not be used where REST v2 can do the job:
+    RunPod's rate limit is in force (see _note_rate_limit), or this process has
+    spent its own hourly GraphQL budget."""
+    return _GQL_BACKOFF_UNTIL[0] > time.time() or _gql_over_budget()
 
 
 class RunpodClient:
@@ -391,6 +440,7 @@ class RunpodClient:
         # inside that window only re-confirms the ban, so callers get the answer
         # here, without a request.
         _count_gql(query)
+        _gql_record_call()
         until = _GQL_BACKOFF_UNTIL[0]
         if until > time.time():
             raise RunpodTransient(
