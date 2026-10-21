@@ -335,15 +335,21 @@ class RunpodBackend(ModelBackend):
         raise requests.HTTPError(
             f"the pod answered {r.status_code}: {detail}", response=r)
 
-    def _teach(self, base: str) -> bool:
-        """Tell this pod about our model after it said it has never heard of it."""
+    def _teach(self, base: str, bearer: str = "") -> bool:
+        """Tell this pod about our model after it said it has never heard of it.
+
+        ``bearer`` is THIS pod's token, handed out with its address. Pods in one
+        pool can carry different ones (see _pool_key), so reading the pool's own
+        key here would 401 against any pod that does not share it -- and the
+        request would then be lost to a 404 that teaching was meant to cure.
+        """
         try:
             from codai.api.remote_gateway import teach_pod
         except Exception:
             return False
         name = self._model_id or self._served_name
         pool = getattr(self, "_pool", None)
-        key = getattr(pool, "api_key", "") if pool is not None else ""
+        key = bearer or (getattr(pool, "api_key", "") if pool is not None else "")
         # The pool's base ends in /v1; teach_pod posts to <root>/v1/models/register.
         root = base[:-3].rstrip("/") if base.endswith("/v1") else base
         return bool(teach_pod(root, key, name))
@@ -477,7 +483,7 @@ class RunpodBackend(ModelBackend):
                         # exactly once: teach it and ask the SAME pod again,
                         # rather than pay for a second card to serve a name the
                         # running one can hold.
-                        if attempt == 2 or not self._teach(base):
+                        if attempt == 2 or not self._teach(base, bearer):
                             raise
                         print(f"[runpod] pod did not know "
                               f"{self._served_name!r} ({unknown}) — taught it, "
@@ -535,7 +541,7 @@ class RunpodBackend(ModelBackend):
                     # replays nothing — but check rather than assume, because a
                     # retry after output has started would duplicate it.
                     if sent or attempt == 2 or not await asyncio.to_thread(
-                            self._teach, base):
+                            self._teach, base, bearer):
                         raise
                     print(f"[runpod] pod did not know {self._served_name!r} "
                           f"({unknown}) — taught it, retrying", flush=True)

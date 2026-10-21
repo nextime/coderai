@@ -176,3 +176,32 @@ def test_the_manager_survives_a_backend_without_the_method():
     m = ModelManager.__new__(ModelManager)
     m.backend = types.SimpleNamespace()
     assert m.get_last_tool_calls() is None
+
+
+# -------------------------------------------------- teaching the RIGHT pod #
+
+def test_teaching_a_pod_uses_that_pods_token(monkeypatch):
+    """Same class as the v0.4.59 401: pods in one pool carry different tokens,
+    so the pool's own key would 401 against a pod that does not share it -- and
+    the request is then lost to the very 404 teaching was meant to cure."""
+    import types as _t
+    b = RunpodBackend.__new__(RunpodBackend)
+    b._model_id = b._served_name = "diogene-alpha"
+    b._pool = _t.SimpleNamespace(api_key="pool-key")
+    seen = {}
+    monkeypatch.setattr("codai.api.remote_gateway.teach_pod",
+                        lambda root, key, name: seen.update(key=key, name=name) or True)
+    assert b._teach("https://pod:1", "its-own-key") is True
+    assert seen == {"key": "its-own-key", "name": "diogene-alpha"}
+
+
+def test_without_a_pod_token_the_pools_key_is_used(monkeypatch):
+    import types as _t
+    b = RunpodBackend.__new__(RunpodBackend)
+    b._model_id = b._served_name = "diogene-alpha"
+    b._pool = _t.SimpleNamespace(api_key="pool-key")
+    seen = {}
+    monkeypatch.setattr("codai.api.remote_gateway.teach_pod",
+                        lambda root, key, name: seen.update(key=key) or True)
+    b._teach("https://pod:1")
+    assert seen["key"] == "pool-key"
