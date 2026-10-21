@@ -160,12 +160,77 @@ _TOOL_PARSERS = (
 )
 
 
+def _chat_template_text(model_path: str) -> str:
+    """The model's chat template, or '' if it cannot be read.
+
+    Read rather than guessed: the template is the only place that states, in
+    the model's own words, which tool-call syntax it was trained to emit. A
+    local directory IS the answer; a repo id is fetched, because on a rented
+    pod nothing is in the cache the first time and a cache-only lookup would
+    report "no template" for every model (see _fetch_repo_file).
+    """
+    import json
+    import os
+    def _read(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except Exception:
+            return ""
+    model_path = (model_path or "").strip()
+    if not model_path:
+        return ""
+    if os.path.isdir(model_path):
+        out = _read(os.path.join(model_path, "chat_template.jinja"))
+        if out:
+            return out
+        try:
+            tc = json.loads(_read(os.path.join(model_path, "tokenizer_config.json")) or "{}")
+        except Exception:
+            return ""
+        return str(tc.get("chat_template") or "")
+    # Nothing here may raise: this only chooses a parser, and a pod that will
+    # not launch is worse than one that reads tool calls with the wrong one.
+    try:
+        from codai.api.embeddings import _fetch_repo_file
+        got = _fetch_repo_file(model_path, "chat_template.jinja")
+        if got:
+            return _read(got)
+        got = _fetch_repo_file(model_path, "tokenizer_config.json")
+        if not got:
+            return ""
+        return str(json.loads(_read(got) or "{}").get("chat_template") or "")
+    except Exception as exc:
+        print(f"[vllm] could not read the chat template for {model_path!r}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return ""
+
+
+def _emits_qwen_xml_calls(model_path: str) -> bool:
+    """True when the model's template writes tool calls as Qwen XML.
+
+    ``<tool_call><function=NAME><parameter=KEY>value</parameter></function>``
+    — what vLLM's ``qwen3_xml`` parser reads, and what ``hermes`` (JSON inside
+    ``<tool_call>``) cannot: it raises JSONDecodeError on every single call.
+    """
+    tpl = _chat_template_text(model_path)
+    return "<function=" in tpl and "<parameter=" in tpl
+
+
 def _tool_parser_for(cfg, model_config: dict, model_path: str) -> str:
     """Which vLLM tool-call parser to launch with, or '' for none.
 
     An explicit setting always wins — including "off", because a model whose
     family is guessed wrongly parses tool calls into nonsense, and silently
     producing wrong tool arguments is worse than refusing the request.
+
+    A name alone cannot separate the two Qwen tool-call syntaxes. Qwen2.5 and
+    the Hermes-style finetunes put JSON inside ``<tool_call>``; current Qwen3
+    releases emit XML ``<function=``/``<parameter=`` tags, and ``hermes`` fails
+    on every one of those with a JSONDecodeError — measured 2026-10-21 on
+    Qwen3.8-27B, where the pod logged that traceback per request and the call
+    was lost entirely when streaming. So the TEMPLATE decides between them,
+    since it is the model's own statement of what it emits.
     """
     want = str(getattr(cfg, "tool_call_parser", "") or "").strip()
     if want and want.lower() not in ("auto", "detect"):
@@ -177,7 +242,12 @@ def _tool_parser_for(cfg, model_config: dict, model_path: str) -> str:
     for needle, parser in _TOOL_PARSERS:
         if needle in hay and len(needle) > len(best):
             best, found = needle, parser
-    return dict(_TOOL_PARSERS).get(best, "") if best else ""
+    parser = dict(_TOOL_PARSERS).get(best, "") if best else ""
+    if parser == "hermes" and _emits_qwen_xml_calls(model_path):
+        print("[vllm] template emits XML tool calls — using 'qwen3_xml', "
+              "not 'hermes'", flush=True)
+        return "qwen3_xml"
+    return parser
 
 
 def _tool_args(cfg, model_config: dict, model_path: str) -> list:
