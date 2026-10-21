@@ -18,7 +18,7 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import ModelBackend
+from codai.backends.base import ModelBackend, merge_tool_call_deltas
 
 
 class VllmBackend(ModelBackend):
@@ -58,6 +58,7 @@ class VllmBackend(ModelBackend):
         self._served_name = self._model_id
         self._last_usage: Dict = {}
         self._last_logprobs: Optional[Dict] = None
+        self._last_tool_calls: Optional[List[Dict]] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -149,6 +150,16 @@ class VllmBackend(ModelBackend):
         them does not merely lose a number, it invents a perfect one.
         """
         return self._last_logprobs
+
+    def get_last_tool_calls(self):
+        """The tool calls the SERVER parsed out of the last answer, or None.
+
+        vLLM applies the chat template and runs its own tool parser, so a
+        recognised call comes back structurally — ``tool_calls`` set, ``content``
+        null — and never appears in the text ``generate_chat`` returns. See the
+        same method on RunpodBackend.
+        """
+        return self._last_tool_calls
 
     def cleanup(self) -> None:
         from codai.api import vllm_worker
@@ -346,6 +357,7 @@ class VllmBackend(ModelBackend):
         import requests
         self._enter_request()
         self._last_logprobs = None
+        self._last_tool_calls = None
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False,
                                          logprobs=logprobs, top_logprobs=top_logprobs,
@@ -366,7 +378,9 @@ class VllmBackend(ModelBackend):
             self._store_usage(data.get("usage", {}))
             choice = (data.get("choices") or [{}])[0]
             self._last_logprobs = choice.get("logprobs")
-            return choice.get("message", {}).get("content") or ""
+            message = choice.get("message") or {}
+            self._last_tool_calls = message.get("tool_calls") or None
+            return message.get("content") or ""
         finally:
             self._exit_request()
 
@@ -377,6 +391,7 @@ class VllmBackend(ModelBackend):
                                    passthrough=None) -> AsyncGenerator[str, None]:
         self._enter_request()
         self._last_logprobs = None
+        self._last_tool_calls = None
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True,
                                          logprobs=logprobs, top_logprobs=top_logprobs,
@@ -430,9 +445,14 @@ class VllmBackend(ModelBackend):
             except ValueError:
                 return False
             choice = (obj.get("choices") or [{}])[0]
-            text = (choice.get(delta_key) or {}).get("content") or ""
+            piece = choice.get(delta_key) or {}
+            text = piece.get("content") or ""
             if text:
                 loop.call_soon_threadsafe(queue.put_nowait, text)
+            # A streamed tool call arrives as deltas and carries no content at
+            # all, so it cannot travel in the text this generator yields.
+            self._last_tool_calls = merge_tool_call_deltas(
+                self._last_tool_calls, piece.get("tool_calls"))
             if obj.get("usage"):
                 self._store_usage(obj["usage"])
             self._collect_logprobs(choice.get("logprobs"))

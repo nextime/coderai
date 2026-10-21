@@ -2951,7 +2951,14 @@ async def stream_chat_response(
                     logger.debug("Error converting tool: %s (type: %s)", e, type(t))
                     continue
             try:
-                tool_calls = tool_parser.extract_tool_calls(answer_text, tool_objects)
+                # A proxy backend's remote parses the call itself and answers
+                # with structured tool_calls and no content at all (see
+                # ModelBackend.get_last_tool_calls), so there is nothing in the
+                # streamed text to extract. Prefer what the server reported.
+                tool_calls = current_manager.get_last_tool_calls() if hasattr(
+                    current_manager, 'get_last_tool_calls') else None
+                if not tool_calls:
+                    tool_calls = tool_parser.extract_tool_calls(answer_text, tool_objects)
 
                 # FIX: Validate extracted tool calls have valid JSON (stream_chat_response)
                 if tool_calls:
@@ -3234,8 +3241,13 @@ async def generate_chat_response(
                     logger.debug("Error converting tool: %s (type: %s)", e, type(t))
                     continue
             try:
-                tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
-                
+                # Same as the streamed path: a proxy backend reports the call the
+                # remote parsed, and `generated_text` is then empty by design.
+                tool_calls = current_manager.get_last_tool_calls() if hasattr(
+                    current_manager, 'get_last_tool_calls') else None
+                if not tool_calls:
+                    tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+
                 # FIX: Validate extracted tool calls have valid JSON (generate_chat_response)
                 if tool_calls:
                     from codai.models.parser import validate_json_complete

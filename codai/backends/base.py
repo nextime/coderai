@@ -66,3 +66,50 @@ class ModelBackend(ABC):
     def get_context_size(self) -> int:
         """Return the model's context window size."""
         return 2048  # Default fallback
+
+    def get_last_tool_calls(self):
+        """The tool calls the backend itself reported for the last call, or None.
+
+        A backend that generates text has none: the call is still inside the
+        generated string, and the caller's parser digs it out. A *proxy* backend
+        is the opposite case — the remote server owns the chat template, so it
+        parses the call and answers with structured ``tool_calls`` and a null
+        ``content``. The text contract of ``generate_chat`` cannot carry that, so
+        the proxy leaves them here, next to ``get_last_usage``.
+        """
+        return None
+
+
+def merge_tool_call_deltas(acc: Optional[List[dict]], delta) -> Optional[List[dict]]:
+    """Fold one streamed ``delta.tool_calls`` fragment into ``acc``.
+
+    OpenAI streams a tool call in pieces: the first fragment carries ``id`` and
+    the function name, later ones append to ``function.arguments``, and each is
+    tagged with the ``index`` of the call it belongs to. Concatenating the
+    arguments of the wrong call produces valid JSON for a call nobody made, so
+    fragments are keyed by that index and never by arrival order.
+    """
+    if not delta:
+        return acc
+    out = list(acc or [])
+    for frag in delta:
+        if not isinstance(frag, dict):
+            continue
+        # Absent index means a single call, which is what one-call servers send.
+        idx = frag.get("index")
+        idx = 0 if idx is None else int(idx)
+        while len(out) <= idx:
+            out.append({"id": "", "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+        cur = out[idx]
+        if frag.get("id"):
+            cur["id"] = frag["id"]
+        if frag.get("type"):
+            cur["type"] = frag["type"]
+        fn = frag.get("function") or {}
+        if fn.get("name"):
+            cur["function"]["name"] = fn["name"]
+        piece = fn.get("arguments")
+        if piece:
+            cur["function"]["arguments"] += piece
+    return out or None

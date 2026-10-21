@@ -25,7 +25,7 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import ModelBackend
+from codai.backends.base import ModelBackend, merge_tool_call_deltas
 
 
 class RemoteModelUnknown(RuntimeError):
@@ -106,6 +106,7 @@ class RunpodBackend(ModelBackend):
         self._pool = None                         # pods: RunpodPodPool
         self._last_usage: Dict = {}
         self._last_logprobs: Optional[Dict] = None
+        self._last_tool_calls: Optional[List[Dict]] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -181,6 +182,18 @@ class RunpodBackend(ModelBackend):
         pipeline fall back to a flat 1.0 — a confidence that was never measured.
         """
         return self._last_logprobs
+
+    def get_last_tool_calls(self):
+        """The tool calls the POD parsed out of the last answer, or None.
+
+        A pod serving an OpenAI API owns the chat template, so it is the side
+        that recognises a tool call and reports it structurally: the message
+        comes back with ``tool_calls`` set and ``content`` null. ``generate_chat``
+        returns a string, so those calls used to end here — the caller received
+        "" , found no call to parse in it, and answered the client with an empty
+        assistant message while the pod had generated a perfectly good call.
+        """
+        return self._last_tool_calls
 
     def cleanup(self) -> None:
         # Serverless: nothing to tear down (RunPod owns it). Pods: the pool
@@ -428,6 +441,7 @@ class RunpodBackend(ModelBackend):
         import requests
         self._enter_request()
         self._last_logprobs = None
+        self._last_tool_calls = None
         try:
             for attempt in (1, 2):
                 base, release, bearer = self._acquire_endpoint()
@@ -473,7 +487,9 @@ class RunpodBackend(ModelBackend):
                     self._store_usage(data.get("usage", {}))
                     choice = (data.get("choices") or [{}])[0]
                     self._last_logprobs = choice.get("logprobs")
-                    return choice.get("message", {}).get("content") or ""
+                    message = choice.get("message") or {}
+                    self._last_tool_calls = message.get("tool_calls") or None
+                    return message.get("content") or ""
                 finally:
                     release()
         finally:
@@ -486,6 +502,7 @@ class RunpodBackend(ModelBackend):
         import requests
         self._enter_request()
         self._last_logprobs = None
+        self._last_tool_calls = None
         try:
             for attempt in (1, 2):
                 # Pod acquire may provision (blocking) — do it off the event loop.
@@ -568,9 +585,14 @@ class RunpodBackend(ModelBackend):
             except ValueError:
                 return False
             choice = (obj.get("choices") or [{}])[0]
-            text = (choice.get(delta_key) or {}).get("content") or ""
+            piece = choice.get(delta_key) or {}
+            text = piece.get("content") or ""
             if text:
                 loop.call_soon_threadsafe(queue.put_nowait, text)
+            # A streamed tool call arrives as deltas and carries no content at
+            # all, so it cannot travel in the text this generator yields.
+            self._last_tool_calls = merge_tool_call_deltas(
+                self._last_tool_calls, piece.get("tool_calls"))
             if obj.get("usage"):
                 self._store_usage(obj["usage"])
             self._collect_logprobs(choice.get("logprobs"))

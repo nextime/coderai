@@ -945,6 +945,21 @@ class ModelManager:
         except Exception:
             return None
 
+    def get_last_tool_calls(self):
+        """Tool calls the backend reported structurally for the last call, or None.
+
+        Only a proxy backend has any: the remote server parsed the call itself
+        and left the text empty. A local backend answers None and the caller
+        parses the generated text as before.
+        """
+        fn = getattr(self.backend, "get_last_tool_calls", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
                       stop: Optional[List[str]] = None, tools: Optional[List] = None,
