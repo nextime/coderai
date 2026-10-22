@@ -25,8 +25,9 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import (ModelBackend, RemoteStreamError,
-                                 merge_tool_call_deltas, messages_for_the_wire)
+from codai.backends.base import (ModelBackend, RemoteStreamError, call_sink,
+                                 merge_tool_call_deltas, messages_for_the_wire,
+                                 sink_get, sink_put)
 
 
 class RemoteModelUnknown(RuntimeError):
@@ -193,7 +194,7 @@ class RunpodBackend(ModelBackend):
         return self._ctx
 
     def get_last_usage(self) -> dict:
-        return dict(self._last_usage)
+        return dict(sink_get("usage", self._last_usage) or {})
 
     def get_last_logprobs(self):
         """The pod's per-token log-probabilities for the last call, or None.
@@ -202,7 +203,7 @@ class RunpodBackend(ModelBackend):
         confidence it reports per line, and a proxy that swallows them makes the
         pipeline fall back to a flat 1.0 — a confidence that was never measured.
         """
-        return self._last_logprobs
+        return sink_get("logprobs", self._last_logprobs)
 
     def get_last_tool_calls(self):
         """The tool calls the POD parsed out of the last answer, or None.
@@ -214,7 +215,7 @@ class RunpodBackend(ModelBackend):
         "" , found no call to parse in it, and answered the client with an empty
         assistant message while the pod had generated a perfectly good call.
         """
-        return self._last_tool_calls
+        return sink_get("tool_calls", self._last_tool_calls)
 
     def get_last_reasoning(self):
         """The thought the POD separated out of the last answer, or None.
@@ -223,7 +224,7 @@ class RunpodBackend(ModelBackend):
         already had it removed, so the string ``generate_chat`` returns cannot
         carry it. See the same method on ModelBackend.
         """
-        return self._last_reasoning
+        return sink_get("reasoning", self._last_reasoning)
 
     def cleanup(self) -> None:
         # Serverless: nothing to tear down (RunPod owns it). Pods: the pool
@@ -434,6 +435,7 @@ class RunpodBackend(ModelBackend):
                 "completion_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             }
+            sink_put("usage", dict(self._last_usage))
 
     def _collect_logprobs(self, piece) -> None:
         """Accumulate a streamed chunk's logprobs into one response-shaped object."""
@@ -494,6 +496,12 @@ class RunpodBackend(ModelBackend):
         self._last_logprobs = None
         self._last_tool_calls = None
         self._last_reasoning = None
+        # The per-call store is cleared with them. A store is opened per request,
+        # but a caller that reuses one context for several calls (a pipeline, a
+        # test) would otherwise read the PREVIOUS call's tool call -- the exact
+        # staleness the attribute resets exist to prevent.
+        for _k in ("usage", "logprobs", "tool_calls", "reasoning"):
+            sink_put(_k, None)
         try:
             for attempt in (1, 2):
                 base, release, bearer = self._acquire_endpoint()
@@ -539,11 +547,16 @@ class RunpodBackend(ModelBackend):
                     data = r.json()
                     self._store_usage(data.get("usage", {}))
                     choice = (data.get("choices") or [{}])[0]
-                    self._last_logprobs = choice.get("logprobs")
                     message = choice.get("message") or {}
+                    self._last_logprobs = choice.get("logprobs")
                     self._last_tool_calls = message.get("tool_calls") or None
                     self._last_reasoning = (message.get("reasoning_content")
                                             or message.get("reasoning") or None)
+                    # ...and in THIS call's store, which no concurrent request
+                    # can reset between the answer and the caller's read.
+                    sink_put("logprobs", self._last_logprobs)
+                    sink_put("tool_calls", self._last_tool_calls)
+                    sink_put("reasoning", self._last_reasoning)
                     return message.get("content") or ""
                 finally:
                     release()
@@ -560,6 +573,12 @@ class RunpodBackend(ModelBackend):
         self._last_logprobs = None
         self._last_tool_calls = None
         self._last_reasoning = None
+        # The per-call store is cleared with them. A store is opened per request,
+        # but a caller that reuses one context for several calls (a pipeline, a
+        # test) would otherwise read the PREVIOUS call's tool call -- the exact
+        # staleness the attribute resets exist to prevent.
+        for _k in ("usage", "logprobs", "tool_calls", "reasoning"):
+            sink_put(_k, None)
         try:
             for attempt in (1, 2):
                 # Pod acquire may provision (blocking) — do it off the event loop.
@@ -632,6 +651,20 @@ class RunpodBackend(ModelBackend):
         _SENTINEL = object()
         # Whether we are inside a reconstructed <think> block for THIS stream.
         _thought = {"open": False}
+        # THIS stream's own accumulators, and the store for the call that opened
+        # it -- captured here, in the caller's context, because the reader below
+        # runs on a thread and a thread inherits no context variables. Keeping
+        # them per stream also stops two concurrent streams on this one backend
+        # object from appending their thoughts to each other.
+        _acc = {"reasoning": None, "tool_calls": None, "logprobs": None}
+        _sink = call_sink()
+
+        def _publish(key, value):
+            """Record one of the structured channels for this call."""
+            _acc[key] = value
+            if _sink is not None:
+                _sink[key] = value
+            setattr(self, "_last_" + key, value)      # the no-sink fallback
         headers = self._auth(bearer)
 
         def _handle_line(line: str) -> bool:
@@ -673,7 +706,7 @@ class RunpodBackend(ModelBackend):
             # not land in one lump at the end.
             think = piece.get("reasoning_content") or piece.get("reasoning") or ""
             if think:
-                self._last_reasoning = (self._last_reasoning or "") + think
+                _publish("reasoning", (_acc["reasoning"] or "") + think)
                 if not _thought["open"]:
                     _thought["open"] = True
                     think = "<think>" + think
@@ -685,11 +718,18 @@ class RunpodBackend(ModelBackend):
                 loop.call_soon_threadsafe(queue.put_nowait, text)
             # A streamed tool call arrives as deltas and carries no content at
             # all, so it cannot travel in the text this generator yields.
-            self._last_tool_calls = merge_tool_call_deltas(
-                self._last_tool_calls, piece.get("tool_calls"))
+            _calls = merge_tool_call_deltas(_acc["tool_calls"],
+                                            piece.get("tool_calls"))
+            if _calls != _acc["tool_calls"]:
+                _publish("tool_calls", _calls)
             if obj.get("usage"):
                 self._store_usage(obj["usage"])
-            self._collect_logprobs(choice.get("logprobs"))
+            _lp = choice.get("logprobs")
+            if isinstance(_lp, dict) and _lp.get("content"):
+                _cur = _acc["logprobs"] if isinstance(_acc["logprobs"], dict) else {}
+                _merged = {**_cur, "content": list(_cur.get("content") or [])
+                           + list(_lp["content"])}
+                _publish("logprobs", _merged)
             return bool(choice.get("finish_reason"))
 
         def _worker():

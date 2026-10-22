@@ -1292,6 +1292,12 @@ async def _compact_after_refusal(plan, messages, model, detail):
 async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
     log_request_exchange(request)
+    # One store per request, for what a backend cannot return in its text (usage,
+    # logprobs, parsed tool calls, separated reasoning). The raw and vision
+    # branches below read those too, so it is opened here rather than only in
+    # the two response helpers. See codai/backends/base.py.
+    from codai.backends.base import new_call_sink as _new_call_sink
+    _new_call_sink()
 
     # Check if we should use litellm backend
     parser_type = getattr(global_args, 'parser', 'auto') if global_args else 'auto'
@@ -2906,6 +2912,8 @@ async def stream_chat_response(
     passthrough: Optional[Dict] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
+    from codai.backends.base import new_call_sink
+    new_call_sink()          # see generate_chat_response
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     request_id = f"req-{uuid.uuid4().hex[:8]}"
@@ -3491,6 +3499,12 @@ async def generate_chat_response(
     passthrough: Optional[Dict] = None,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
+    # This request's own store for everything a backend cannot return in the
+    # text: usage, logprobs, the tool calls a remote parsed, the thought it
+    # separated. A backend object is shared by every concurrent request for its
+    # model, so those used to race -- see codai/backends/base.py.
+    from codai.backends.base import new_call_sink
+    new_call_sink()
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     
@@ -3916,6 +3930,8 @@ async def generate_completion_response(
     current_manager: ModelManager,
 ) -> Dict:
     """Generate non-streaming legacy completion response."""
+    from codai.backends.base import new_call_sink
+    new_call_sink()          # see generate_chat_response
     completion_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     

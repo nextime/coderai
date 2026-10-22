@@ -16,8 +16,60 @@
 
 """Base classes for model backends."""
 
+import contextvars
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, List, Optional
+
+#: Where a backend leaves what it cannot return.
+#:
+#: ``generate_chat`` returns a STRING, so everything else a remote reports —
+#: usage, logprobs, the tool calls it parsed, the thought it separated — travels
+#: beside it and is read by the caller afterwards (``get_last_*``). Those used to
+#: be attributes of the backend, and a backend object is shared by every
+#: concurrent request for its model: each call began by resetting them, so a
+#: second request arriving between the first one's answer and its read could
+#: blank the first one's tool call, or hand it the second one's. With parallel
+#: requests to one pod that is not a rare interleaving, it is the common case,
+#: and the symptom is a client receiving an empty message or ANOTHER client's
+#: tool call.
+#:
+#: So the store is per CALL, carried in a context variable: an asyncio task has
+#: its own context, and ``asyncio.to_thread`` copies it, so the worker thread
+#: writes into the same dict the awaiting request will read. A caller that never
+#: opens one still works — the backends keep their attributes as a fallback — so
+#: nothing outside the chat path had to change.
+_CALL_SINK: contextvars.ContextVar = contextvars.ContextVar(
+    "coderai_call_sink", default=None)
+
+
+def new_call_sink() -> dict:
+    """Open a fresh per-call store for this request and return it."""
+    sink: dict = {}
+    _CALL_SINK.set(sink)
+    return sink
+
+
+def call_sink():
+    """The store for the call in flight, or None.
+
+    A thread started with ``threading.Thread`` does NOT inherit context
+    variables, so a backend that reads a stream on its own thread must capture
+    this in the caller's context and hand the dict to the worker.
+    """
+    return _CALL_SINK.get()
+
+
+def sink_put(key: str, value) -> None:
+    sink = _CALL_SINK.get()
+    if sink is not None:
+        sink[key] = value
+
+
+def sink_get(key: str, fallback=None):
+    sink = _CALL_SINK.get()
+    if sink is not None and key in sink:
+        return sink[key]
+    return fallback
 
 
 class RemoteStreamError(RuntimeError):

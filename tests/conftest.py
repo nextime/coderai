@@ -182,3 +182,25 @@ def _no_chat_template_carryover():
     _cs.forget()
     yield
     _cs.forget()
+
+
+@pytest.fixture(autouse=True)
+def _no_call_sink_carryover():
+    """The per-call store for a backend's structured channels (usage, logprobs,
+    tool calls, reasoning) lives in a context variable, because a request is an
+    asyncio task and `to_thread` copies its context -- see
+    codai/backends/base.py.
+
+    Tests share ONE context, so a store opened by one test is still set in the
+    next, and a test that pokes `backend._last_logprobs` directly would read the
+    earlier test's value instead of the attribute it just set. Request-scoped
+    state has to be reset between tests, like the template cache above.
+    """
+    try:
+        from codai.backends import base as _base
+    except Exception:
+        yield
+        return
+    _base._CALL_SINK.set(None)
+    yield
+    _base._CALL_SINK.set(None)
