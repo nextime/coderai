@@ -25,7 +25,7 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import ModelBackend, merge_tool_call_deltas
+from codai.backends.base import ModelBackend, merge_tool_call_deltas, messages_for_the_wire
 
 
 class RemoteModelUnknown(RuntimeError):
@@ -423,7 +423,7 @@ class RunpodBackend(ModelBackend):
                       logprobs=None, top_logprobs=None):
         payload = {
             "model": self._served_name,
-            "messages": messages,
+            "messages": messages_for_the_wire(messages),
             "temperature": temperature,
             "top_p": top_p,
             "stream": stream,

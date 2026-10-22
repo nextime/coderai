@@ -80,6 +80,68 @@ class ModelBackend(ABC):
         return None
 
 
+def messages_for_the_wire(messages):
+    """``messages`` with every ``tool_call.function.arguments`` as a JSON STRING.
+
+    The OpenAI schema says that field is a string, and a server validating
+    against it refuses an object outright::
+
+        400 Bad Request ... {'type': 'string_type',
+          'loc': (..., 'ChatCompletionMessageFunctionToolCallParam',
+                  'function', 'arguments')}
+
+    But coderai hands its backends a MAPPING on purpose: several GGUF chat
+    templates render arguments with ``|items``, and llama.cpp raises "Can only
+    get item pairs from a mapping" on a string (see
+    codai.api.text._normalize_tool_call_arguments). Both are right for their own
+    side, so the conversion belongs here, at the edge where a request stops
+    being a template's input and becomes another server's HTTP body.
+
+    Only reached once a client replays an assistant turn that HAS tool calls,
+    which is why it stayed invisible while those calls were being dropped
+    (v0.4.60). Copies rather than mutates: the caller retries with the same list.
+    """
+    import json
+    if not messages:
+        return messages if isinstance(messages, list) else []
+    out = []
+    changed = False
+    for m in messages:
+        if not isinstance(m, dict) or not m.get("tool_calls"):
+            out.append(m)
+            continue
+        calls = []
+        for tc in (m.get("tool_calls") or []):
+            if hasattr(tc, "model_dump"):
+                tc = tc.model_dump()
+            if not isinstance(tc, dict):
+                calls.append(tc)
+                continue
+            fn = tc.get("function")
+            if isinstance(fn, dict) and not isinstance(fn.get("arguments"), str):
+                args = fn.get("arguments")
+                fn = dict(fn)
+                try:
+                    # None/absent means "no arguments", which on the wire is {}
+                    # — not the string "null", which a server would then try to
+                    # read as an argument object and reject.
+                    fn["arguments"] = "{}" if args is None else json.dumps(args)
+                except Exception:
+                    fn["arguments"] = "{}"
+                tc = dict(tc)
+                tc["function"] = fn
+                changed = True
+            calls.append(tc)
+        if changed:
+            m = dict(m)
+            m["tool_calls"] = calls
+        out.append(m)
+    # Nothing to convert — hand back the list that came in. Every request goes
+    # through here, OCR's page-per-request traffic included, and a conversation
+    # with no tool calls is the common case.
+    return out if changed else messages
+
+
 def merge_tool_call_deltas(acc: Optional[List[dict]], delta) -> Optional[List[dict]]:
     """Fold one streamed ``delta.tool_calls`` fragment into ``acc``.
 

@@ -22,7 +22,7 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import ModelBackend
+from codai.backends.base import ModelBackend, messages_for_the_wire
 
 
 class Ds4Backend(ModelBackend):
@@ -212,7 +212,7 @@ class Ds4Backend(ModelBackend):
     def _chat_payload(self, messages, max_tokens, temperature, top_p, stop, stream):
         payload = {
             "model": self._model_id,
-            "messages": messages,
+            "messages": messages_for_the_wire(messages),
             "temperature": temperature,
             "top_p": top_p,
             "stream": stream,

@@ -18,7 +18,7 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import ModelBackend, merge_tool_call_deltas
+from codai.backends.base import ModelBackend, merge_tool_call_deltas, messages_for_the_wire
 
 
 class VllmBackend(ModelBackend):
@@ -315,7 +315,7 @@ class VllmBackend(ModelBackend):
                       logprobs=None, top_logprobs=None, passthrough=None):
         payload = {
             "model": getattr(self, "_served_name", self._model_id),
-            "messages": messages,
+            "messages": messages_for_the_wire(messages),
             "temperature": temperature,
             "top_p": top_p,
             "stream": stream,
