@@ -23,25 +23,3 @@ torch==2.13.0+cu129
 torchvision==0.28.0+cu129
 torchaudio==2.11.0+cu129
 torchcodec==0.16.0+cu129
-# FlashInfer's PREBUILT kernels, so nothing is compiled on a rented pod.
-#
-# FP8 KV cache (--kv-cache-dtype fp8) routes attention through FlashInfer on
-# Ampere, and FlashInfer JIT-compiles its prefill kernel on first use: it calls
-# nvcc, which no image here ships (the CUDA runtime is present, the toolkit is
-# not, and PyPI's nvidia-cuda-nvcc-cu12 wheel contains only ptxas). Measured on
-# a pod 2026-10-22: the engine accepted the dtype, resolved it to
-# torch.float8_e4m3fn, then died in flashinfer/jit/cpp_ext.py with
-# "Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist".
-#
-# flashinfer-jit-cache is the upstream package of precompiled modules for this
-# exact flashinfer + CUDA pair: 959 of them, 320 with an e4m3 KV cache, head
-# dims 64/128/256. `jit/env.py` prefers it over compiling, so the engine finds
-# the module and never looks for a compiler. e5m2 is NOT in it, which is why
-# `fp8` (= e4m3fn) is the dtype to ask for.
-#
-# It costs ~2.9 GiB in the image, and a pod pulls the image on every cold
-# start. That is the trade for doubling the cache in tokens: FP16 KV on an A40
-# gave 212,321 tokens for a 27B hybrid (64 KiB/token), so a 128k window fitted
-# 1.62 times; FP8 should fit it about 3.2 times.
---extra-index-url https://flashinfer.ai/whl/cu129
-flashinfer-jit-cache==0.6.16.post3+cu129

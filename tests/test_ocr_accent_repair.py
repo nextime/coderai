@@ -270,11 +270,35 @@ def test_the_vllm_ocr_profile_runs_the_SAME_vllm_as_the_fleet():
     for what actually distinguishes it: the OCR pipeline on the pod."""
     import pathlib
     prof = pathlib.Path(__file__).resolve().parents[1] / "packaging/runpod/profiles"
-    fleet = [l.strip() for l in (prof / "vllm.venv-vllm.txt").read_text().splitlines()
-             if l.strip() and not l.strip().startswith("#")]
-    ours = [l.strip() for l in (prof / "vllm-ocr.venv-vllm.txt").read_text().splitlines()
-            if l.strip() and not l.strip().startswith("#")]
-    assert ours == fleet, "the OCR image drifted from the fleet's vLLM again"
+
+    def _lines(name):
+        return [l.strip() for l in (prof / name).read_text().splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+    fleet, ours = _lines("vllm.venv-vllm.txt"), _lines("vllm-ocr.venv-vllm.txt")
+
+    # The invariant is the ENGINE, not the file: every pin that decides which
+    # vLLM (and which torch under it) runs must be identical, because two images
+    # serving the same weights on two engines is the invisible difference this
+    # test exists to prevent.
+    #
+    # One deliberate exception, weighed and accepted 2026-10-22: the fleet image
+    # also carries flashinfer-jit-cache, FlashInfer's precompiled kernels, which
+    # the fleet needs for an FP8 KV cache (without them the engine looks for nvcc
+    # at run time and dies). The OCR models never ask for that dtype, and the
+    # package costs ~2.9 GiB in an image that is already large, so it is not
+    # installed here. Anything else diverging is the old bug coming back.
+    ALLOWED_EXTRA = {"flashinfer-jit-cache", "--extra-index-url https://flashinfer.ai/whl/cu129"}
+
+    def _name(line):
+        return line.split("==")[0].split(">=")[0].strip()
+    extra = [l for l in fleet if l not in ours]
+    assert all(_name(l) in ALLOWED_EXTRA or l in ALLOWED_EXTRA for l in extra), (
+        f"the OCR image drifted from the fleet's vLLM again: {extra}")
+    assert [l for l in ours if l not in fleet] == [], (
+        "the OCR image pins something the fleet does not")
+    for pin in ("vllm==", "torch==", "torchvision==", "torchaudio==", "torchcodec=="):
+        assert [l for l in fleet if l.startswith(pin)] == \
+               [l for l in ours if l.startswith(pin)], f"{pin} differs"
     # uv, because pip cannot resolve this pin set.
     assert (prof / "vllm-ocr.venv-vllm.uv").exists()
     # The light core, like the profile it is derived from.
