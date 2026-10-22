@@ -830,6 +830,43 @@ def _tool_loop_settings(request):
     return (guard and repeats > 0), repeats
 
 
+def _status_mode(model_name: str) -> str:
+    """Where a progress notice goes: ``silent`` | ``invisible`` | ``visible``.
+
+    The same resolution, and the same three modes, as the wait keepalive
+    (``models.wait_status_mode``, per-model override in models.json), because it
+    is the same question: the client is being told that something is happening
+    before the answer starts, and whether that notice may appear in the reply's
+    CONTENT is a property of the client, not of what coderai is doing.
+
+    It matters most for compaction, which can take a minute on a long history.
+    Those notices used to go into the content unconditionally, so an answer a
+    client stores began "Compacting context (~45406+300 tok ...)" -- measured on
+    a production install 2026-10-22, where the saved reply to a long
+    conversation would have carried four lines of coderai's own progress log.
+    """
+    mode = None
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        _cc = _mmm._config_for_model(model_name or "") or {}
+        _raw = _cc.get("_raw_cfg") if isinstance(_cc, dict) else None
+        for src in (_cc, _raw if isinstance(_raw, dict) else {}):
+            if isinstance(src, dict) and src.get("wait_status_mode"):
+                mode = src["wait_status_mode"]
+                break
+    except Exception:
+        mode = None
+    if not mode:
+        try:
+            from codai.admin.routes import config_manager as _cm
+            if _cm is not None and getattr(_cm, "config", None) is not None:
+                mode = getattr(_cm.config.models, "wait_status_mode", None)
+        except Exception:
+            mode = None
+    mode = str(mode or "invisible").strip().lower()
+    return mode if mode in ("silent", "invisible", "visible") else "invisible"
+
+
 def _detect_tool_loop(messages_dict, threshold=3, window=12):
     """Detect a degenerate tool-call loop in the incoming history and return a
     one-shot guard string (or None). A loop = the same (tool, arguments) signature
@@ -2858,15 +2895,33 @@ async def stream_chat_response(
     # the client as status content deltas (the same mechanism as the "Waiting for
     # model reply…" notices — visible text, not part of the saved completion).
     if compact_plan:
+        # Where the progress notices go. Compacting a long history can take a
+        # minute, so the client must hear something -- but it must not end up in
+        # the reply it saves, which is why this follows the wait keepalive's
+        # mode instead of always writing to the content.
+        _smode = _status_mode(model_name)
         try:
             async for _ev in _auto_compact_events(compact_plan, messages):
                 if _ev[0] == "status":
+                    if _smode == "silent":
+                        # An SSE comment: nothing for the client to render, but
+                        # it keeps the connection from idling out while a
+                        # summarizer works through a long history.
+                        yield f": compacting\n\n"
+                        continue
+                    _delta = {}
+                    if _smode == "visible":
+                        _delta["content"] = _ev[1]
+                    elif reasoning_active and not suppress_reasoning:
+                        # Thinking is already a channel for "work in progress",
+                        # and the client shows it as such.
+                        _delta["reasoning_content"] = _ev[1]
                     _sc = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model_name,
-                        "choices": [{"index": 0, "delta": {"content": _ev[1]},
+                        "choices": [{"index": 0, "delta": _delta,
                                      "finish_reason": None}],
-                        "x_compaction": {"status": "compacting"},
+                        "x_compaction": {"status": "compacting", "message": _ev[1]},
                     }
                     yield f"data: {json.dumps(_sc)}\n\n"
                 else:
@@ -2877,12 +2932,14 @@ async def stream_chat_response(
                               f"(dropped {_cinfo['dropped']} msgs via {_cinfo['strategy']})",
                               flush=True)
                     if _cerr:
-                        _ec = {
-                            "id": completion_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": {"content": "\n⚠ " + _cerr},
-                                         "finish_reason": "stop"}],
-                        }
+                        # A STRUCTURED error, not assistant text. Emitting this
+                        # as content with finish_reason "stop" told the client
+                        # the request had succeeded and handed it the error as
+                        # the model's answer -- which a client then stores,
+                        # displays and builds the next turn on.
+                        _ec = {"error": {
+                            "message": _cerr, "type": "invalid_request_error",
+                            "code": "context_length_exceeded", "param": "messages"}}
                         yield f"data: {json.dumps(_ec)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
