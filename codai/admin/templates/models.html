@@ -1383,15 +1383,35 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div class="form-row" style="margin:0">
           <label class="form-label">Trigger at <span class="muted">(% of context)</span></label>
           <input type="number" id="cfg-autocompact-pct" class="form-input" min="50" max="99" step="1" value="85">
-          <span class="form-hint" style="font-size:11px">Compacts to ~65% of the context window when the prompt reaches this %.</span>
+          <span class="form-hint" style="font-size:11px">Compacts down to the size below when the prompt reaches this %.</span>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
           <select id="cfg-autocompact-strategy" class="form-input" onchange="_toggleAutoCompact()">
             <option value="drop_oldest">Drop oldest — keep system + most recent turns</option>
-            <option value="keep_head_tail">Keep head + tail — also keep the first turn, drop the middle</option>
-            <option value="summarize">Summarize — replace the dropped middle with an LLM summary</option>
+            <option value="keep_head_tail">Keep head + tail — keep the opening turns and the recent ones, drop the middle</option>
+            <option value="summarize">Summarize the middle — keep both ends, replace the centre with an LLM summary</option>
           </select>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Compact down to <span class="muted">(% of context)</span></label>
+          <input type="number" id="cfg-autocompact-target" class="form-input" min="10" max="95" step="1" value="65">
+          <span class="form-hint" style="font-size:11px">Lower leaves more room to grow before the next compaction.</span>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Keep at the start <span class="muted">(turns)</span></label>
+          <input type="number" id="cfg-autocompact-head-msgs" class="form-input" min="0" max="50" step="1" value="1">
+          <span class="form-hint" style="font-size:11px">From the first user turn. 0 = keep nothing at the start.</span>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Start cap <span class="muted">(tokens, 0 = auto)</span></label>
+          <input type="number" id="cfg-autocompact-head-tok" class="form-input" min="0" step="256" value="0">
+          <span class="form-hint" style="font-size:11px">0 = at most half the target, so the start never starves the recent end.</span>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Keep at the end <span class="muted">(tokens, 0 = the rest)</span></label>
+          <input type="number" id="cfg-autocompact-tail-tok" class="form-input" min="0" step="256" value="0">
+          <span class="form-hint" style="font-size:11px">Recent conversation kept verbatim.</span>
         </div>
         <div class="form-row" id="cfg-autocompact-model-row" style="margin:0;grid-column:1/-1;display:none">
           <label class="form-label">Summarizer model <span class="muted">(summarize only)</span></label>
@@ -4195,6 +4215,10 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-autocompact').checked = !!s.auto_compact;
   document.getElementById('cfg-autocompact-pct').value = s.auto_compact_pct != null ? s.auto_compact_pct : 85;
   document.getElementById('cfg-autocompact-strategy').value = s.auto_compact_strategy || 'drop_oldest';
+  document.getElementById('cfg-autocompact-target').value = s.auto_compact_target_pct != null ? s.auto_compact_target_pct : 65;
+  document.getElementById('cfg-autocompact-head-msgs').value = s.auto_compact_head_messages != null ? s.auto_compact_head_messages : 1;
+  document.getElementById('cfg-autocompact-head-tok').value = s.auto_compact_head_tokens || 0;
+  document.getElementById('cfg-autocompact-tail-tok').value = s.auto_compact_tail_tokens || 0;
   _populateCompactModelSelect(s.auto_compact_model || '');
   document.getElementById('cfg-suppress-reasoning').checked = !!s.suppress_reasoning;
   _toggleAutoCompact();
@@ -5233,6 +5257,10 @@ async function saveModelConfig(){
     auto_compact:      document.getElementById('cfg-autocompact').checked,
     auto_compact_pct:  parseInt(document.getElementById('cfg-autocompact-pct').value) || 85,
     auto_compact_strategy: document.getElementById('cfg-autocompact-strategy').value || 'drop_oldest',
+    auto_compact_target_pct: parseInt(document.getElementById('cfg-autocompact-target').value) || 65,
+    auto_compact_head_messages: parseInt(document.getElementById('cfg-autocompact-head-msgs').value) || 0,
+    auto_compact_head_tokens: parseInt(document.getElementById('cfg-autocompact-head-tok').value) || 0,
+    auto_compact_tail_tokens: parseInt(document.getElementById('cfg-autocompact-tail-tok').value) || 0,
     auto_compact_model: document.getElementById('cfg-autocompact-model').value || '',
     suppress_reasoning: document.getElementById('cfg-suppress-reasoning').checked,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,

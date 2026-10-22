@@ -75,13 +75,36 @@ class VllmBackend(ModelBackend):
             _ctx = int(_ctx) if _ctx else 0
         except (TypeError, ValueError):
             _ctx = 0
-        if _ctx > 0:
-            self._ctx = _ctx
         model_path = self._resolve_model_dir(model_name)
         # This model's own `vllm` block over the global template: parallelism,
         # the machines it spans, memory fraction, flags.
         from codai.backends.overrides import VLLM_FIELDS, apply, model_block
-        self._cfg = apply(self._cfg, model_block(model_name, "vllm"), VLLM_FIELDS, "vllm")
+        _blk = model_block(model_name, "vllm") or {}
+        self._cfg = apply(self._cfg, _blk, VLLM_FIELDS, "vllm")
+        # The window this model is SERVED with, which is the only one worth
+        # reporting: the model's own `vllm.ctx` when it sets one, else a
+        # per-model `n_ctx`, else the global template. The generic kwarg must not
+        # win over an explicit block, because it can be a node-wide fallback
+        # nobody chose for this model -- `vulkan.n_ctx`, whose default is 2048 --
+        # and a 2048 reported against a 32768 server makes auto-compaction crush
+        # every conversation to a sixteenth of the window it has (measured on a
+        # production install 2026-10-22).
+        _blk_ctx = 0
+        try:
+            _blk_ctx = int((_blk or {}).get("ctx") or 0)
+        except (TypeError, ValueError):
+            _blk_ctx = 0
+        if not _blk_ctx and _ctx > 0:
+            # An explicit per-model n_ctx has to reach the LAUNCH too, or the
+            # reported window and the served one disagree by design.
+            try:
+                self._cfg = apply(self._cfg, {"ctx": _ctx}, VLLM_FIELDS, "vllm")
+            except Exception:
+                pass
+        try:
+            self._ctx = int(getattr(self._cfg, "ctx", 0) or 0) or self._ctx
+        except (TypeError, ValueError):
+            pass
         # Per-model: serve each model-list entry under ITS OWN name (like nvidia/radeon),
         # not a single engine-wide model_id. Fall back to the config model_id only for the
         # single-model convenience (a model with no list entry).
@@ -136,6 +159,16 @@ class VllmBackend(ModelBackend):
         return self._model_id
 
     def get_context_size(self) -> int:
+        """The window this model is served with.
+
+        The SERVED number when the server has already been asked for it (see
+        context_length), because that is the only one that can refuse a request;
+        the configured one otherwise. They disagree in practice, and a caller
+        sizing a conversation against the larger of the two gets a 400.
+        """
+        served = getattr(self, "_ctx_len", None)
+        if isinstance(served, int) and served > 0:
+            return served
         return self._ctx
 
     def get_last_usage(self) -> dict:
@@ -284,11 +317,18 @@ class VllmBackend(ModelBackend):
         if len(detail) > 2000:
             detail = detail[:2000] + " ...[truncated]"
         import requests as _rq
+        # What the server SAID comes first, the status line and URL after it.
+        # This error is wrapped again by every layer above -- a pod's coderai,
+        # then the orchestrator -- and each prepends its own prefix, so putting
+        # a 120-character proxy URL in front of the explanation pushes it past
+        # wherever the client truncates. The numbers in "maximum context length
+        # is 32768 ... you requested 35000" are the whole message, and a caller
+        # that reads only a prefix was getting none of them.
+        where = (f"{code} {getattr(r, 'reason', '')} from "
+                 f"{getattr(r, 'url', '?')} on {what}")
         raise _rq.HTTPError(
-            f"{code} {getattr(r, 'reason', '')} from "
-            f"{getattr(r, 'url', '?')} on {what}"
-            + (f": {detail}" if detail else " (the server sent no explanation)"),
-            response=r)
+            f"{detail} ({where})" if detail
+            else f"{where} (the server sent no explanation)", response=r)
 
     #: Never overridable by a caller: these are the request's structure, not its
     #: sampling. Letting `passthrough` rewrite them would let a client retarget

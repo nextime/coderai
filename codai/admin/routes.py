@@ -2935,7 +2935,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "turboquant", "engine", "engine_fallback",
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
                 "auto_compact", "auto_compact_pct", "auto_compact_strategy",
-                "auto_compact_model", "suppress_reasoning",
+                "auto_compact_model", "auto_compact_target_pct",
+                "auto_compact_head_messages", "auto_compact_head_tokens",
+                "auto_compact_tail_tokens", "auto_compact_tolerance_pct",
+                "auto_compact_min_output", "auto_compact_retry_on_overflow",
+                "suppress_reasoning",
                 # Speech-to-text (wav2vec2 / vosk / NeMo-Canary) options.
                 "languages", "supports_translation", "keep_resident",
                 # "local" pins the model here even when its whole capability is
@@ -4284,6 +4288,11 @@ def build_settings_dict(c, gpu_cards):
             "pct": c.compaction.pct,
             "strategy": c.compaction.strategy,
             "model": c.compaction.model,
+            "head_messages": c.compaction.head_messages,
+            "head_tokens": c.compaction.head_tokens,
+            "tail_tokens": c.compaction.tail_tokens,
+            "target_pct": c.compaction.target_pct,
+            "retry_on_overflow": c.compaction.retry_on_overflow,
         },
         "broker": {
             "enabled": c.broker.enabled,
@@ -5195,11 +5204,25 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             except (TypeError, ValueError):
                 pass
         if "strategy" in cp:
-            _st = (cp.get("strategy") or "drop_oldest").strip()
-            if _st in ("drop_oldest", "keep_head_tail", "summarize"):
-                c.compaction.strategy = _st
+            # Accepted spellings live with the implementation, so a name the
+            # engine honours is never rejected here (and vice versa).
+            from codai.api.text import _COMPACT_STRATEGIES
+            _st = (cp.get("strategy") or "drop_oldest").strip().lower().replace("-", "_")
+            if _st in _COMPACT_STRATEGIES:
+                c.compaction.strategy = _COMPACT_STRATEGIES[_st]
         if "model" in cp:
             c.compaction.model = (cp.get("model") or "").strip()
+        # The kept ends. 0 is meaningful for all three (= "whatever fits"), so
+        # these are clamped at the bottom, not forced to a minimum.
+        for _k, _lo, _hi in (("head_messages", 0, 50), ("head_tokens", 0, 1_000_000),
+                             ("tail_tokens", 0, 1_000_000), ("target_pct", 10, 95)):
+            if _k in cp:
+                try:
+                    setattr(c.compaction, _k, max(_lo, min(_hi, int(cp[_k]))))
+                except (TypeError, ValueError):
+                    pass
+        if "retry_on_overflow" in cp:
+            c.compaction.retry_on_overflow = bool(cp["retry_on_overflow"])
 
     if "broker" in data:
         bro = data["broker"]

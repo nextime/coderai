@@ -32,6 +32,14 @@ class RemoteModelUnknown(RuntimeError):
     """The pod answered that it does not know the model we asked for."""
 
 
+#: How much of a pod's explanation is kept. A pod's answer is itself a stack of
+#: wrapped messages -- vLLM's words inside the pod's coderai inside its HTTP
+#: error -- so 400 characters could end mid-prefix: a request refused for being
+#: too long arrived with the apology and WITHOUT either of the two token counts
+#: a caller needs to shrink it and retry, which read as an ordinary 500.
+_DETAIL_CHARS = 1200
+
+
 def _pod_detail(r) -> str:
     """What the pod SAID, not what requests says about the status line.
 
@@ -43,15 +51,15 @@ def _pod_detail(r) -> str:
     try:
         body = r.json()
     except Exception:
-        return (getattr(r, "text", "") or "").strip()[:400]
+        return (getattr(r, "text", "") or "").strip()[:_DETAIL_CHARS]
     if isinstance(body, dict):
         err = body.get("error")
         if isinstance(err, dict) and err.get("message"):
-            return str(err["message"])[:400]
+            return str(err["message"])[:_DETAIL_CHARS]
         for key in ("detail", "message", "error"):
             if body.get(key):
-                return str(body[key])[:400]
-    return str(body)[:400]
+                return str(body[key])[:_DETAIL_CHARS]
+    return str(body)[:_DETAIL_CHARS]
 
 
 class RunpodBackend(ModelBackend):
@@ -121,8 +129,17 @@ class RunpodBackend(ModelBackend):
         self._mcfg = runpod_worker.parse_model_runpod(block)
         # served name: explicit served_model wins, else the model's own name.
         self._served_name = self._mcfg.served_model or model_name or "runpod"
-        if self._mcfg.ctx:
-            self._ctx = self._mcfg.ctx
+        # The pod's own `ctx` wins over the generic kwarg, and that order is not
+        # a preference: `ctx` in the model's runpod block is what the pod is
+        # LAUNCHED with (`--max-model-len`), while the kwarg can be a global
+        # fallback no one chose for this model -- the node-wide `vulkan.n_ctx`,
+        # whose default is 2048. Taking the kwarg first made every pod-served
+        # model on an install without a per-model `n_ctx` report a 2048-token
+        # window while its pod served 32768: measured on a production install
+        # 2026-10-22, where `usage.context_size` said 2048, `/v1/models` said
+        # 32768 (it reads the runpod block), and auto-compaction, had it been
+        # enabled, would have crushed every conversation to ~1300 tokens to fit
+        # a window that was sixteen times larger.
         _ctx = kwargs.get("n_ctx", kwargs.get("ctx"))
         if isinstance(_ctx, (list, tuple)):
             _ctx = _ctx[0] if _ctx else None
@@ -130,7 +147,9 @@ class RunpodBackend(ModelBackend):
             _ctx = int(_ctx) if _ctx else 0
         except (TypeError, ValueError):
             _ctx = 0
-        if _ctx > 0:
+        if self._mcfg.ctx:
+            self._ctx = self._mcfg.ctx
+        elif _ctx > 0:
             self._ctx = _ctx
 
         self._mode = (self._mcfg.mode or "pods").lower()
@@ -342,8 +361,13 @@ class RunpodBackend(ModelBackend):
         detail = _pod_detail(r)
         if _is_unknown_model(r.status_code, (detail or "").encode("utf-8", "replace")):
             raise RemoteModelUnknown(detail)
+        # The pod's words first, its status code after: this message is wrapped
+        # once more before a client sees it, and the figures in it (which window,
+        # how many tokens) are what the client needs from a prefix.
         raise requests.HTTPError(
-            f"the pod answered {r.status_code}: {detail}", response=r)
+            f"{detail} (the pod answered {r.status_code})" if detail
+            else f"the pod answered {r.status_code} with no explanation",
+            response=r)
 
     def _teach(self, base: str, bearer: str = "") -> bool:
         """Tell this pod about our model after it said it has never heard of it.

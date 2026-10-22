@@ -421,8 +421,19 @@ class CompactionConfig:
 
     Per-model settings in a models.json entry (``auto_compact``,
     ``auto_compact_pct``, ``auto_compact_strategy``, ``auto_compact_model``,
-    ``auto_compact_tolerance_pct``) OVERRIDE the values here; when a model leaves
-    one unset, the global default below applies. ``model`` selects which model
+    ``auto_compact_tolerance_pct``, ``auto_compact_head_messages``,
+    ``auto_compact_head_tokens``, ``auto_compact_tail_tokens``,
+    ``auto_compact_target_pct``, ``auto_compact_retry_on_overflow``) OVERRIDE the
+    values here; when a model leaves one unset, the global default below applies.
+
+    The strategies are ``drop_oldest`` (keep the system messages and the recent
+    tail), ``keep_head_tail`` (also keep the opening turns, drop the centre) and
+    ``summarize`` (keep both ends and replace the centre with an LLM summary of
+    exactly the messages being dropped -- "keep the start and the end, compact
+    the middle"; ``summarize_middle`` is accepted as a name for it). An unknown
+    name is read as ``keep_head_tail`` rather than silently dropping the head.
+
+    ``model`` selects which model
     performs the summarization for the ``summarize`` strategy — empty means use
     the same model that serves the request. Pointing it at a smaller/faster model
     lets that model summarize the old turns while the big model answers; the
@@ -442,6 +453,22 @@ class CompactionConfig:
     tolerance_pct: int = 20              # accept prompt+max_tokens up to this % over n_ctx (trim instead of compact)
     min_output: int = 512                # always try to leave at least this many tokens for the reply
     estimate_safety: float = 1.15        # inflate the chars/4 prompt estimate by this factor for fit/trim (it undercounts code/JSON)
+    # What the kept ends are, for keep_head_tail and summarize. The head is the
+    # opening instructions a long conversation keeps drifting away from, so it is
+    # sized in MESSAGES (one turn is the anchor; a handful is a briefing), while
+    # the tail is sized in TOKENS because what matters there is how much recent
+    # conversation survives verbatim, not how many turns it took. 0 means "as
+    # much as the target allows": the whole remaining budget for the tail, half
+    # of it for the head.
+    head_messages: int = 1               # leading turns kept verbatim (from the first user turn)
+    head_tokens: int = 0                 # cap on the head, in tokens (0 = half the target)
+    tail_tokens: int = 0                 # recent turns kept verbatim, in tokens (0 = the rest)
+    target_pct: int = 65                 # compact DOWN to this % of n_ctx (leaves room to grow)
+    # Retry a request an engine refused for length, compacting against the window
+    # and prompt size the refusal reports. On by default: without it a caller is
+    # told to shorten a conversation coderai was configured to shorten for them,
+    # and the correction is learned too late to help that request.
+    retry_on_overflow: bool = True
 
 
 @dataclass
@@ -2355,6 +2382,11 @@ class ConfigManager:
                 "tolerance_pct": self.config.compaction.tolerance_pct,
                 "min_output": self.config.compaction.min_output,
                 "estimate_safety": self.config.compaction.estimate_safety,
+                "head_messages": self.config.compaction.head_messages,
+                "head_tokens": self.config.compaction.head_tokens,
+                "tail_tokens": self.config.compaction.tail_tokens,
+                "target_pct": self.config.compaction.target_pct,
+                "retry_on_overflow": self.config.compaction.retry_on_overflow,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,

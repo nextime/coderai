@@ -456,44 +456,89 @@ def _estimate_tokens(messages) -> int:
     return int(total / 4) + 8
 
 
-def _compact_messages(messages, n_ctx, pct, strategy, summary_text=None, target=None):
-    """Shrink an over-long message list to fit ``target`` tokens (default ~65% of
-    n_ctx), keeping system messages and the most recent turns. Returns
-    (new_messages, info|None). Strategies:
-      - drop_oldest : keep only system + the recent tail that fits.
-      - keep_head_tail: also keep the first user turn (context anchor) + a note.
-      - summarize   : keep_head_tail, but replace the dropped middle with an LLM
-                      summary (``summary_text``) when available, else a count note.
-    Returns info=None (no change) when not over threshold or nothing can be dropped.
-    """
-    if not messages or not n_ctx or n_ctx <= 0:
-        return messages, None
-    try:
-        pct = float(pct)
-    except (TypeError, ValueError):
-        pct = 85.0
-    pct = min(99.0, max(50.0, pct))
-    est = _estimate_tokens(messages)
-    if target is None:
-        target = int(n_ctx * 0.65)
-        if est < n_ctx * pct / 100.0:
-            return messages, None
-    else:
-        target = max(1, int(target))
-        if est <= target:
-            return messages, None
+#: Strategy spellings accepted in config, mapped to the three implemented ones.
+#: An unknown strategy must not silently become drop_oldest: an operator who
+#: asked to keep the head and tail and got the head thrown away would see a
+#: model that has forgotten its instructions and no sign of why.
+_COMPACT_STRATEGIES = {
+    "drop_oldest": "drop_oldest",
+    "keep_head_tail": "keep_head_tail",
+    "head_tail": "keep_head_tail",
+    "summarize": "summarize",
+    "summarize_middle": "summarize",       # how the behaviour is usually described
+    "summarise": "summarize",
+}
 
+
+def _compact_strategy(name) -> str:
+    """The implemented strategy for a configured name (default keep_head_tail)."""
+    key = str(name or "").strip().lower().replace("-", "_")
+    return _COMPACT_STRATEGIES.get(key, "keep_head_tail" if key else "drop_oldest")
+
+
+def _split_for_compaction(messages, target, strategy, head_messages=1,
+                          head_tokens=0, tail_tokens=0):
+    """``(system, head, middle, tail)`` for a history that must fit ``target``.
+
+    The one place that decides what survives, so the summarizer and the
+    assembler cannot disagree about it. They used to: the summary was built from
+    "everything but the last two turns", which included the very messages kept
+    verbatim, so the kept head and most of the kept tail were ALSO described in
+    the summary above them -- paying twice for the same words in a window that
+    was already too small, and inviting the model to treat a paraphrase of the
+    live conversation as earlier history. ``middle`` is exactly what is about to
+    be lost, and exactly what is worth summarizing.
+
+    Budget order matters too. The head is reserved BEFORE the tail is filled:
+    filling the tail first and adding the head afterwards (as this did) can
+    overshoot ``target`` by the whole head, which with a configurable head is
+    the difference between fitting and being refused.
+    """
     sys_msgs = [m for m in messages if m.get("role") == "system"]
     body = [m for m in messages if m.get("role") != "system"]
-    running = _estimate_tokens(sys_msgs)
+    budget = max(1, int(target) - _estimate_tokens(sys_msgs))
+    if not body:
+        return sys_msgs, [], [], []
 
-    # Track membership by object identity — message dicts can be value-equal
-    # (e.g. duplicate "try again" turns or identical tool results).
-    tail = []
-    tail_ids = set()
+    head = []
+    if strategy in ("keep_head_tail", "summarize") and len(body) > 1:
+        want = 1 if head_messages is None else max(0, int(head_messages))
+        # The opening instructions are the anchor, so the head starts at the
+        # first USER turn: a leading assistant greeting anchors nothing.
+        start = next((i for i, m in enumerate(body)
+                      if m.get("role") == "user"), None)
+        # Never more than half the budget on history that is NOT recent, unless
+        # an operator asked for a specific head size in tokens.
+        cap = int(head_tokens or 0) or max(1, int(budget * 0.5))
+        used = 0
+        if start is not None:
+            for m in body[start:-1]:          # never the current turn
+                if len(head) >= want:
+                    break
+                t = _estimate_tokens([m])
+                if head and used + t > cap:
+                    break
+                head.append(m)
+                used += t
+        # A head ending on an assistant's tool_calls would have its tool results
+        # dropped with the middle, and a chat template raises on that pair --
+        # the mirror of the orphaned-result rule applied to the tail below.
+        while head and head[-1].get("tool_calls"):
+            head.pop()
+        head = [m for m in head if m.get("role") != "tool"] if head and head[0].get("role") == "tool" else head
+    # Identity, not equality: message dicts can be value-equal (duplicate "try
+    # again" turns, identical tool results).
+    head_ids = {id(m) for m in head}
+    used = _estimate_tokens(head) if head else 0
+
+    tail_budget = int(tail_tokens or 0) or (budget - used)
+    tail_budget = max(1, min(tail_budget, max(1, budget - used)))
+    tail, tail_ids, running = [], set(), 0
     for m in reversed(body):
+        if id(m) in head_ids:
+            break
         t = _estimate_tokens([m])
-        if tail and running + t > target:
+        if tail and running + t > tail_budget:
             break
         tail.insert(0, m)
         tail_ids.add(id(m))
@@ -505,15 +550,49 @@ def _compact_messages(messages, n_ctx, pct, strategy, summary_text=None, target=
         tail_ids.discard(id(tail[0]))
         tail.pop(0)
 
-    head = []
-    head_ids = set()
-    if strategy in ("keep_head_tail", "summarize"):
-        first_user = next((m for m in body if m.get("role") == "user"), None)
-        if first_user is not None and id(first_user) not in tail_ids:
-            head = [first_user]
-            head_ids.add(id(first_user))
+    middle = [m for m in body
+              if id(m) not in head_ids and id(m) not in tail_ids]
+    return sys_msgs, head, middle, tail
 
-    dropped = [m for m in body if id(m) not in head_ids and id(m) not in tail_ids]
+
+def _compact_messages(messages, n_ctx, pct, strategy, summary_text=None, target=None,
+                      head_messages=1, head_tokens=0, tail_tokens=0,
+                      target_pct=65):
+    """Shrink an over-long message list to fit ``target`` tokens (default
+    ``target_pct``% of n_ctx), keeping system messages and the most recent turns.
+    Returns (new_messages, info|None). Strategies:
+      - drop_oldest : keep only system + the recent tail that fits.
+      - keep_head_tail: also keep the opening turn(s) (context anchor) + a note.
+      - summarize   : keep_head_tail, but replace the dropped middle with an LLM
+                      summary (``summary_text``) when available, else a count note.
+    ``head_messages``/``head_tokens``/``tail_tokens`` size the kept ends; 0 means
+    "whatever fits". Returns info=None (no change) when not over threshold or
+    nothing can be dropped.
+    """
+    if not messages or not n_ctx or n_ctx <= 0:
+        return messages, None
+    strategy = _compact_strategy(strategy)
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        pct = 85.0
+    pct = min(99.0, max(50.0, pct))
+    try:
+        target_pct = min(95.0, max(10.0, float(target_pct or 65)))
+    except (TypeError, ValueError):
+        target_pct = 65.0
+    est = _estimate_tokens(messages)
+    if target is None:
+        target = int(n_ctx * target_pct / 100.0)
+        if est < n_ctx * pct / 100.0:
+            return messages, None
+    else:
+        target = max(1, int(target))
+        if est <= target:
+            return messages, None
+
+    sys_msgs, head, dropped, tail = _split_for_compaction(
+        messages, target, strategy, head_messages, head_tokens, tail_tokens)
     if not dropped:
         return messages, None
 
@@ -533,8 +612,9 @@ def _compact_messages(messages, n_ctx, pct, strategy, summary_text=None, target=
     if last_msg is not None and (not new or id(new[-1]) != id(last_msg)):
         new = [m for m in new if id(m) != id(last_msg)] + [last_msg]
     return new, {"dropped": len(dropped), "strategy": strategy,
+                 "kept_head": len(head), "kept_tail": len(tail),
                  "before_tokens": est, "after_tokens": _estimate_tokens(new),
-                 "n_ctx": n_ctx}
+                 "target": target, "n_ctx": n_ctx}
 
 
 async def _summarize_one(manager, text: str, max_tokens: int = 400):
@@ -558,14 +638,15 @@ def _summary_chunk_chars(compact_n_ctx: int) -> int:
     return max(2000, int(usable * 4 * 0.75))
 
 
-async def _summarize_for_compact(manager, messages, keep_recent: int = 2,
-                                 compact_n_ctx: int = 8192, progress=None):
-    """Best-effort map-reduce summary of the older turns using ``manager`` (which
-    may be a DIFFERENT model than the one serving the request): CHUNK the history
-    to fit ``compact_n_ctx``, summarize each chunk, then iteratively reduce the
-    combined chunk summaries until they fit one chunk. ``progress`` is an optional
-    async callable(str) used to stream status to the client. Returns a summary
-    string or None (caller falls back to a count note)."""
+async def _summarize_for_compact(manager, middle, compact_n_ctx: int = 8192,
+                                 progress=None):
+    """Best-effort map-reduce summary of ``middle`` -- the messages that are about
+    to be dropped, and only those (see _split_for_compaction) -- using ``manager``,
+    which may be a DIFFERENT model than the one serving the request: CHUNK the
+    history to fit ``compact_n_ctx``, summarize each chunk, then iteratively
+    reduce the combined chunk summaries until they fit one chunk. ``progress`` is
+    an optional async callable(str) used to stream status to the client. Returns a
+    summary string or None (caller falls back to a count note)."""
     async def _emit(msg):
         if progress:
             try:
@@ -573,8 +654,7 @@ async def _summarize_for_compact(manager, messages, keep_recent: int = 2,
             except Exception:
                 pass
     try:
-        body = [m for m in messages if m.get("role") != "system"]
-        older = body[:-keep_recent] if len(body) > keep_recent else body
+        older = [m for m in (middle or []) if m.get("role") != "system"]
         if not older:
             return None
         lines = []
@@ -856,6 +936,12 @@ def _resolve_compaction(request, current_manager):
     except (TypeError, ValueError):
         tol_pct = 20.0
     min_output = _mc("auto_compact_min_output", _gv("min_output", 512)) or 512
+    head_messages = _mc("auto_compact_head_messages", _gv("head_messages", 1))
+    head_tokens = _mc("auto_compact_head_tokens", _gv("head_tokens", 0))
+    tail_tokens = _mc("auto_compact_tail_tokens", _gv("tail_tokens", 0))
+    target_pct = _mc("auto_compact_target_pct", _gv("target_pct", 65))
+    retry_on_overflow = bool(_mc("auto_compact_retry_on_overflow",
+                                 _gv("retry_on_overflow", True)))
     try:
         safety = max(1.0, float(_mc("auto_compact_estimate_safety", _gv("estimate_safety", 1.15))))
     except (TypeError, ValueError):
@@ -865,18 +951,43 @@ def _resolve_compaction(request, current_manager):
         n_ctx = current_manager.get_context_size() if current_manager else 0
     except Exception:
         n_ctx = 0
+    # A window an engine has already refused a request against beats the
+    # configured one, which is a hope: a proxied model's `ctx` is what coderai
+    # was told to ask for, not necessarily what the pod was launched with, and
+    # only the served number can refuse anything. Smaller wins, because
+    # compacting to a window larger than the real one is the overflow we are
+    # here to prevent.
+    try:
+        from codai.api import context_overflow as _co
+        _served = _co.learned_limit(getattr(request, "model", None) or "")
+        if _served and (not n_ctx or _served < n_ctx):
+            n_ctx = int(_served)
+    except Exception:
+        pass
 
     # NOTE: the summarizer model (``compact_model``) is resolved LAZILY in
     # _auto_compact_events, only when the prompt is actually over threshold — so a
     # configured separate model isn't loaded on every (under-threshold) request.
     # ``max_tokens`` (the reply reservation) is counted against the window too —
     # the model writes its reply into the same n_ctx as the prompt.
+    def _int(v, default):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
     return {
         "pct": float(pct), "strategy": strategy, "n_ctx": n_ctx,
         "compact_model": compact_model, "current_manager": current_manager,
+        "model": getattr(request, "model", None) or "",
         "max_tokens": getattr(request, "max_tokens", None),
         "tolerance": 1.0 + tol_pct / 100.0, "min_output": int(min_output),
         "safety": safety,
+        "head_messages": max(0, _int(head_messages, 1)),
+        "head_tokens": max(0, _int(head_tokens, 0)),
+        "tail_tokens": max(0, _int(tail_tokens, 0)),
+        "target_pct": float(_int(target_pct, 65) or 65),
+        "retry_on_overflow": retry_on_overflow,
     }
 
 
@@ -916,7 +1027,11 @@ async def _auto_compact_events(plan, messages):
     None)."""
     n_ctx = plan["n_ctx"]
     pct = plan["pct"]
-    strategy = plan["strategy"]
+    strategy = _compact_strategy(plan["strategy"])
+    head_messages = plan.get("head_messages", 1)
+    head_tokens = int(plan.get("head_tokens") or 0)
+    tail_tokens = int(plan.get("tail_tokens") or 0)
+    target_pct = float(plan.get("target_pct") or 65)
     mt = int(plan.get("max_tokens") or 0)
     tol = float(plan.get("tolerance") or 1.20)
     min_out = int(plan.get("min_output") or 512)
@@ -937,6 +1052,16 @@ async def _auto_compact_events(plan, messages):
     # prompts, and trimming to the exact n_ctx edge off an undercount still
     # overflows the backend.
     prompt_est = _estimate_tokens(messages)
+    # When an engine has already refused this prompt it reported how many tokens
+    # it really held, and that measurement replaces the guess: chars/4 undercounts
+    # token-dense text badly enough that a prompt can be refused while the
+    # estimate says it fits, which would make a retry an identical request. The
+    # ratio between what the engine counted and what we estimated is the
+    # estimator's error for THIS conversation, so apply it rather than nudging
+    # the safety factor and hoping.
+    measured = int(plan.get("measured_prompt_tokens") or 0)
+    if measured and prompt_est > 0:
+        safety = max(safety, (measured / float(prompt_est)) * 1.02)
     pest = int(prompt_est * safety)
     if pest + mt <= n_ctx:
         yield ("done", messages, None, None)
@@ -947,7 +1072,14 @@ async def _auto_compact_events(plan, messages):
     # window so the prompt isn't squeezed to nothing); the kept prompt targets the
     # rest, never more than ~65% of n_ctx.
     reserve = max(min_out, min(mt or min_out, int(n_ctx * 0.5)))
-    target = min(int(n_ctx * 0.65), max(min_out, n_ctx - reserve))
+    target = min(int(n_ctx * target_pct / 100.0), max(min_out, n_ctx - reserve))
+    # ``target`` is in real tokens; the splitter and the slicer measure in
+    # ESTIMATE tokens (chars/4). Handing them the real target asks them to
+    # compact to a size they measure differently -- by exactly the factor the
+    # estimate is wrong by -- so a prompt the engine counts as too long can be
+    # judged already small enough and left as it is. Converting once here keeps
+    # every layer in the units it actually works in.
+    est_target = max(1, int(target / safety))
 
     info = None
     compact_manager = compact_n_ctx = None
@@ -956,7 +1088,12 @@ async def _auto_compact_events(plan, messages):
     # huge max_tokens is the problem, layer 2's trim handles it).
     if pest + mt > tol_ctx and pest > target:
         summary = None
-        if strategy == "summarize":
+        # What is about to be dropped, decided ONCE, so the summarizer describes
+        # the middle rather than the whole conversation (head and tail included,
+        # which then appeared both verbatim and paraphrased).
+        _, _head, _middle, _ = _split_for_compaction(
+            messages, est_target, strategy, head_messages, head_tokens, tail_tokens)
+        if strategy == "summarize" and _middle:
             compact_manager, compact_name, compact_n_ctx = _resolve_compact_manager(plan)
             via = f" via {compact_name}" if compact_name and compact_name != "the model" else ""
             yield ("status", f"🗜 Compacting context (~{prompt_est}+{mt} tok > {int(tol * 100)}% "
@@ -973,7 +1110,7 @@ async def _auto_compact_events(plan, messages):
             async def _run():
                 try:
                     return await _summarize_for_compact(
-                        compact_manager, messages,
+                        compact_manager, _middle,
                         compact_n_ctx=compact_n_ctx, progress=_cb)
                 finally:
                     await _q.put(_DONE)
@@ -988,15 +1125,19 @@ async def _auto_compact_events(plan, messages):
         else:
             yield ("status", f"🗜 Compacting context (~{prompt_est}+{mt} tok > {int(tol * 100)}% "
                              f"of {n_ctx}) using '{strategy}'…\n")
-        messages, info = _compact_messages(messages, n_ctx, pct, strategy, summary, target=target)
+        messages, info = _compact_messages(
+            messages, n_ctx, pct, strategy, summary, target=est_target,
+            head_messages=head_messages, head_tokens=head_tokens,
+            tail_tokens=tail_tokens, target_pct=target_pct)
         if info:
             yield ("status", f"✅ Context compacted: dropped {info['dropped']} message(s), "
+                             f"kept {info['kept_head']} at the start + {info['kept_tail']} at the end, "
                              f"~{info['before_tokens']}→{info['after_tokens']} tokens.\n")
         prompt_est = _estimate_tokens(messages)
         pest = int(prompt_est * safety)
 
         # Layer 4 — a single message is still bigger than the target; slice it.
-        if pest > target:
+        if prompt_est > est_target:
             if compact_manager is None:
                 compact_manager, _cn, compact_n_ctx = _resolve_compact_manager(plan)
             yield ("status", "✂ A single message exceeds the target; slicing it…\n")
@@ -1009,7 +1150,8 @@ async def _auto_compact_events(plan, messages):
             async def _run2():
                 try:
                     return await _slice_oversized(
-                        compact_manager, messages, target, compact_n_ctx, progress=_cb2)
+                        compact_manager, messages, est_target, compact_n_ctx,
+                        progress=_cb2)
                 finally:
                     await _q2.put(_DONE2)
 
@@ -1033,11 +1175,58 @@ async def _auto_compact_events(plan, messages):
     # Final guard: even a minimal reply won't fit — the prompt alone is too big.
     err = None
     if pest + min_out > n_ctx:
-        err = ("The request is too large for this model's context window "
-               f"(~{prompt_est} prompt tokens vs n_ctx={n_ctx}) even after "
-               "auto-compaction. Shorten the latest message or increase the "
-               "model's context size (n_ctx).")
+        # Numbers first: this message is wrapped by every layer above, and a
+        # client that truncates the result must still be able to read them.
+        from codai.api import context_overflow as _co
+        err = _co.message({"limit": n_ctx, "requested": pest + min_out,
+                           "prompt": prompt_est, "completion": min_out},
+                          model=plan.get("model") or "", compacted=True)
     yield ("done", messages, info, err)
+
+
+async def _compact_after_refusal(plan, messages, model, detail):
+    """Compact again using the numbers an engine just refused us with.
+
+    A pre-flight estimate can be wrong in two ways at once: the window may not be
+    the configured one (a proxied model is launched elsewhere, and only the
+    server that launched it knows ``--max-model-len``), and chars/4 undercounts
+    token-dense prompts. Both are measured exactly in the refusal, so the retry
+    is planned from the engine's own figures instead of the guess that failed.
+
+    Returns ``(messages, effective_max_tokens, info)`` for one retry, or None
+    when the refusal taught us nothing new -- in which case retrying would send
+    an identical request, and the caller should surface the error instead.
+    """
+    from codai.api import context_overflow as _co
+    info = _co.parse(detail)
+    if not info or not info.get("limit"):
+        return None
+    limit = int(info["limit"])
+    _co.remember_limit(model, limit)
+    measured = int(info.get("prompt") or 0)
+    if not measured and info.get("requested"):
+        measured = int(info["requested"])
+    plan2 = dict(plan)
+    plan2["n_ctx"] = limit
+    plan2["measured_prompt_tokens"] = measured
+    # No tolerance on a retry. The tolerance exists to avoid compacting a
+    # conversation that is only slightly over an ESTIMATED limit, where trimming
+    # the reply is enough; here the engine has already refused the real request,
+    # so "slightly over" is simply over.
+    plan2["tolerance"] = 1.0
+    plan2.pop("effective_max_tokens", None)
+    out, eff, cinfo, cerr = messages, None, None, None
+    async for _ev in _auto_compact_events(plan2, list(messages)):
+        if _ev[0] == "status":
+            print(f"[auto-compact] retry: {_ev[1].strip()}", flush=True)
+        else:
+            _, out, cinfo, cerr = _ev
+    if cerr:
+        return None
+    eff = plan2.get("effective_max_tokens")
+    if cinfo is None and eff is None:
+        return None                      # nothing changed; don't re-send it
+    return out, eff, cinfo
 
 
 @router.post("/v1/chat/completions", summary="Chat completions")
@@ -2341,28 +2530,58 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         return StreamingResponse(_managed_stream(), media_type="text/event-stream")
     else:
         try:
-            return await generate_chat_response(
-                messages_dict,
-                response_model_name,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                stop_sequences,
-                tools_dict,
-                current_manager,
-                tool_parser,
-                request.response_format,
-                force_reasoning_args,
-                enable_thinking=reasoning_enabled,
-                suppress_reasoning=_suppress_reasoning,
-                reasoning_active=_reasoning_active,
-                repeat_penalty=request.repeat_penalty,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                logprobs=request.logprobs,
-                top_logprobs=request.top_logprobs,
-                passthrough=_chat_passthrough(request),
-            )
+            async def _generate(_msgs, _max_tokens):
+                return await generate_chat_response(
+                    _msgs,
+                    response_model_name,
+                    _max_tokens,
+                    request.temperature,
+                    request.top_p,
+                    stop_sequences,
+                    tools_dict,
+                    current_manager,
+                    tool_parser,
+                    request.response_format,
+                    force_reasoning_args,
+                    enable_thinking=reasoning_enabled,
+                    suppress_reasoning=_suppress_reasoning,
+                    reasoning_active=_reasoning_active,
+                    repeat_penalty=request.repeat_penalty,
+                    presence_penalty=request.presence_penalty,
+                    frequency_penalty=request.frequency_penalty,
+                    logprobs=request.logprobs,
+                    top_logprobs=request.top_logprobs,
+                    passthrough=_chat_passthrough(request),
+                )
+
+            try:
+                return await _generate(messages_dict, request.max_tokens)
+            except HTTPException as _he:
+                # The engine refused the prompt for its length. Its refusal
+                # carries the two numbers the pre-flight estimate got wrong --
+                # the real window and the real prompt size -- so compact against
+                # those and send it once more. Without this a caller sees an
+                # error for a conversation coderai was configured to be able to
+                # shrink, and the next request repeats it.
+                from codai.api import context_overflow as _co
+                if not (_compact_plan and _compact_plan.get("retry_on_overflow")
+                        and _he.status_code == 400 and _co.is_overflow(_he.detail)):
+                    raise
+                _retry = await _compact_after_refusal(
+                    _compact_plan, messages_dict,
+                    getattr(request, "model", "") or response_model_name,
+                    _he.detail)
+                if not _retry:
+                    raise
+                _msgs2, _eff2, _info2 = _retry
+                print(f"[auto-compact] {getattr(request, 'model', '?')}: refused for "
+                      f"length; retrying once after compaction"
+                      + (f" (dropped {_info2['dropped']} msgs via {_info2['strategy']}, "
+                         f"~{_info2['before_tokens']}→{_info2['after_tokens']} tok)"
+                         if _info2 else "")
+                      + (f", max_tokens→{_eff2}" if _eff2 is not None else ""), flush=True)
+                return await _generate(
+                    _msgs2, _eff2 if _eff2 is not None else request.max_tokens)
         finally:
             _release_instance()
 
@@ -2555,19 +2774,22 @@ def _gate_tool_content(buffer: str, final: bool = False,
     return ''.join(emit), ''
 
 
-def _context_overflow_detail(e) -> Optional[str]:
-    """If the exception is a context-window overflow (prompt + generation exceed
-    the model's n_ctx), return a clear client-facing message; else None."""
-    s = str(e)
-    low = s.lower()
-    markers = ("exceed context window", "context window of", "requested tokens",
-               "exceeds n_ctx", "exceed the context", "context length",
-               "n_ctx", "kv cache is full", "context shift is disabled")
-    if any(m in low for m in markers) or ("token" in low and "exceed" in low):
-        return ("The conversation is too long for this model's context window "
-                f"({s}). Shorten the prompt or lower max_tokens, or increase the "
-                "model's context size (n_ctx) in its configuration.")
-    return None
+def _context_overflow_detail(e, model: str = "", compacted: bool = False) -> Optional[str]:
+    """If the exception is a context-window overflow, the client-facing message
+    for it -- with the numbers FIRST; else None.
+
+    The numbers lead because this message is wrapped on its way out: the engine
+    inside a pod answers the pod's own coderai, which answers this one, and each
+    layer prefixes its own status line and URL. A client that reads a truncated
+    prefix was getting three apologies and no figures. See
+    codai.api.context_overflow.
+    """
+    from codai.api import context_overflow as _co
+    raw = str(e)
+    if not _co.is_overflow(raw):
+        return None
+    info = _co.learn_from(model, raw)
+    return _co.message(info, model=model, compacted=compacted, raw=raw)
 
 
 def _detect_runaway_repetition(text: str) -> bool:
@@ -3151,7 +3373,7 @@ async def stream_chat_response(
         print(f"Error during streaming generation: {e}")
         # Surface errors as a STRUCTURED error event (not as assistant content) so
         # the client treats it as an error and it doesn't pollute the chat history.
-        _ctx = _context_overflow_detail(e)
+        _ctx = _context_overflow_detail(e, model_name)
         if _ctx:
             err = {"error": {"message": _ctx, "type": "invalid_request_error",
                              "code": "context_length_exceeded", "param": "messages"}}
@@ -3432,7 +3654,7 @@ async def generate_chat_response(
         return formatted_response
     except Exception as e:
         print(f"Error during generation: {e}")
-        _ctx = _context_overflow_detail(e)
+        _ctx = _context_overflow_detail(e, model_name)
         if _ctx:
             raise HTTPException(status_code=400, detail=_ctx)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
@@ -3659,7 +3881,7 @@ async def generate_completion_response(
         }
     except Exception as e:
         print(f"Error during completion: {e}")
-        _ctx = _context_overflow_detail(e)
+        _ctx = _context_overflow_detail(e, model_name)
         if _ctx:
             raise HTTPException(status_code=400, detail=_ctx)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
