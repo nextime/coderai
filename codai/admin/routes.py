@@ -5354,10 +5354,26 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
         except Exception:                      # noqa: BLE001 - degraded, not fatal
             return fallback
 
-    pods, ledger, schedules = await asyncio.gather(
+    pods, ledger, schedules, endpoints = await asyncio.gather(
         _part(runpod_worker.pods_status, []),
         _part(runpod_ledger.totals, {"per_model": {}, "global": {}}),
-        _part(runpod_worker.pools_schedule_status, []))
+        _part(runpod_worker.pools_schedule_status, []),
+        _part(runpod_worker.held_pod_endpoints, []))
+
+    # Live GPU/VRAM, asked of the PODS rather than of RunPod: the pods already
+    # serve it (nvidia-smi off their own loop, 1.5s cache), while every RunPod
+    # read spends the quota that renting and boot-polling need, and lags by tens
+    # of seconds. Bounded and best-effort — a pod that does not answer simply
+    # has no numbers, and the spend figures beside them must still be right.
+    try:
+        from codai.api import pod_telemetry
+        telemetry = await pod_telemetry.collect(endpoints)
+    except Exception:                          # noqa: BLE001 - decoration only
+        telemetry = {}
+    for row in pods:
+        got = telemetry.get(row.get("pod_id"))
+        if got:
+            row.update(got)
     # Every pod in the listing: RunPod bills from creation, and a pod spends
     # ~12 minutes booting without ever being healthy. Counting only healthy
     # pods showed $0.59 against an account billing $4.72 on 2026-10-18, which

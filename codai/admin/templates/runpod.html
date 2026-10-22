@@ -32,9 +32,9 @@
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
-        <th>Model</th><th>GPU</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
+        <th>Model</th><th>GPU</th><th>Utilisation</th><th>VRAM</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
       </tr></thead>
-      <tbody id="rp-pods"><tr><td colspan="9" class="dim">No pods running.</td></tr></tbody>
+      <tbody id="rp-pods"><tr><td colspan="11" class="dim">No pods running.</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -57,6 +57,32 @@
 <script>
 function _fmtDur(s){ s=Math.max(0,s|0); const h=(s/3600)|0, m=((s%3600)/60)|0; return h?`${h}h ${m}m`:`${m}m ${s%60}s`; }
 function _usd(v){ return (v==null)?'—':('$'+Number(v).toFixed(v<1?4:2)); }
+/* A proportion as a number plus a bar. Colour marks the band an operator acts
+   on: green is working, amber is close to the limit, red is at it. */
+function _meter(pct, label){
+  const v = Math.max(0, Math.min(100, Number(pct)||0));
+  const col = v >= 90 ? '#ef4444' : (v >= 70 ? '#f59e0b' : '#22c55e');
+  return `<div style="display:flex;align-items:center;gap:.4rem;min-width:9rem">
+    <div style="flex:1;height:5px;border-radius:3px;background:var(--surface-2,#333);overflow:hidden">
+      <div style="width:${v}%;height:100%;background:${col}"></div>
+    </div>
+    <span style="font-family:var(--mono,monospace);font-size:11px;white-space:nowrap">${label}</span>
+  </div>`;
+}
+/* Telemetry is read from the pod itself, so a pod that is booting, saturated or
+   unreachable legitimately has none. Say so with a dash rather than drawing an
+   empty bar, which reads as "idle" when the truth is "not known". */
+function _utilCell(p){
+  if (p.gpu_util == null) return '<span class="dim">—</span>';
+  const t = (p.gpu_temp_c != null) ? ` · ${Math.round(p.gpu_temp_c)}°C` : '';
+  const n = (p.gpu_cards > 1) ? ` · ${p.gpu_cards}×` : '';
+  return _meter(p.gpu_util, `${Math.round(p.gpu_util)}%${t}${n}`);
+}
+function _vramCell(p){
+  if (p.vram_used_gb == null || !p.vram_total_gb) return '<span class="dim">—</span>';
+  const pct = 100 * p.vram_used_gb / p.vram_total_gb;
+  return _meter(pct, `${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB`);
+}
 
 async function rpRefresh(){
   let d;
@@ -89,11 +115,13 @@ async function rpRefresh(){
 
   // pods table
   const tb = document.getElementById('rp-pods');
-  if(!pods.length){ tb.innerHTML = '<tr><td colspan="9" class="dim">No pods running.</td></tr>'; }
+  if(!pods.length){ tb.innerHTML = '<tr><td colspan="11" class="dim">No pods running.</td></tr>'; }
   else {
     tb.innerHTML = pods.map(p => `<tr>
       <td>${p.model||''}</td>
       <td>${p.gpu||''}${p.is_spot?' <span class="dim">(spot)</span>':''}</td>
+      <td>${_utilCell(p)}</td>
+      <td>${_vramCell(p)}</td>
       <td>${p.is_spot?'spot':'on-demand'}</td>
       <td>${p.inflight||0}</td>
       <td>${_usd(p.hourly_usd)}</td>

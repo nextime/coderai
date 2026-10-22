@@ -6662,6 +6662,34 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
     return out
 
 
+def held_pod_endpoints() -> list:
+    """``[(pod_id, url, bearer)]`` for every pod a pool currently holds.
+
+    Kept separate from :func:`pods_status` because a pod's bearer must never
+    reach a browser: that snapshot is serialised into an admin page, this one
+    stays server-side and only feeds requests back to the pods themselves.
+    Locks are read with the same timeout discipline — a busy pool contributes
+    nothing rather than delaying the caller.
+    """
+    out = []
+    with _lock_for_read(_pools_lock) as got:
+        pools = list(_pools.values()) if got else []
+    for pool in pools:
+        with _lock_for_read(pool._cv) as got:
+            if not got:
+                continue
+            for p in pool.pods:
+                url = getattr(p, "url", "") or ""
+                if not url:
+                    continue
+                try:
+                    key = pool.pod_key(p)
+                except Exception:
+                    key = getattr(pool, "api_key", "") or ""
+                out.append((p.pod_id, url, key))
+    return out
+
+
 def pods_status() -> list:
     """Snapshot of all pods across pools for the stats/tasks pages.
 
