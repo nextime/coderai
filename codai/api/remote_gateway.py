@@ -1339,7 +1339,7 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
     # means nothing on the pod, so it is stripped and the pod falls through to
     # its own default. On a pod with no local GPU backend that default is "cpu":
     #
-    #   503 Model 'digesta-alpha' failed to load: Unknown backend: cpu
+    #   503 Model 'lora-alpha' failed to load: Unknown backend: cpu
     #
     # The SEED path has passed the engine since the same bug bit diogene-alpha.
     # Teaching did not, so a model seeded CORRECTLY at boot was then

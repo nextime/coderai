@@ -34,6 +34,23 @@ phase() {
 
 phase "container started"
 phase "profile=${PROFILE:-unknown} image=${CODERAI_IMAGE_TAG:-unknown}"
+
+# What the IMAGE fixes about its own engine (profiles/<profile>.env, baked by
+# Dockerfile.capability). An operator's settings are not here -- these are the
+# choices an image cannot leave to auto-selection, and they are PRINTED so a pod
+# can be asked what it decided instead of having it inferred. A variable already
+# set in the pod's environment wins, so an operator can still override one.
+if [ -s /opt/coderai/image.env ]; then
+    while IFS='=' read -r _k _v; do
+        [ -n "$_k" ] || continue
+        if [ -z "$(eval "echo \${$_k:-}")" ]; then
+            export "$_k=$_v"
+            phase "image env: $_k=$_v"
+        else
+            phase "image env: $_k kept from the pod's environment"
+        fi
+    done < /opt/coderai/image.env
+fi
 phase "user=$(id -un 2>/dev/null || echo unknown) cwd=$(pwd 2>/dev/null || echo unknown)"
 phase "python=$(python -V 2>&1)"
 

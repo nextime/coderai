@@ -6619,7 +6619,7 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
     if not key:
         raise LookupError("no model named")
     # A LIVE POOL, addressed by the key this very function reports back as
-    # `pool`. Several models share one pool, so `pool:digesta-qwen38` is not a
+    # `pool`. Several models share one pool, so `pool:shared-qwen` is not a
     # model and has no runpod block of its own -- and until now the only answer
     # to it was "has no runpod block", from code that already knew the caller
     # could not look the key up. A pool that exists can be addressed; its
@@ -6655,7 +6655,7 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
         # After the floor is lowered, so the shed measures against the new one.
         out["teardown"] = pool.shed_now()
     # Answer with the name the client asked about, not the internal pool key:
-    # several models may share one pool, and "pool:digesta-qwen38" is not
+    # several models may share one pool, and "pool:shared-qwen" is not
     # something the caller sent or can look up.
     out["pool"] = out["model"]
     out["model"] = key

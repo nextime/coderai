@@ -129,6 +129,26 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
     CMD curl -fsS http://127.0.0.1:8000/healthz || curl -fsSk https://127.0.0.1:8000/healthz || exit 1
 
+# Environment the IMAGE fixes, from `<profile>.env` (KEY=VALUE per line).
+#
+# For settings that belong to the image rather than to a model: a choice that
+# must not change under the engine's own version-dependent auto-selection. The
+# OCR image pins its attention backend this way, because FlashInfer is the one
+# backend it cannot use -- its kernels are compiled on first use and no image
+# here ships a CUDA toolkit -- and which backend vLLM picks on a given card is
+# a property of the vLLM version, not of anything configured here.
+#
+# Written to a file boot.sh sources rather than baked as ENV, so one layer
+# serves any profile and an operator can read what the image decided.
+RUN set -eux; \
+    if [ -f "/tmp/profiles/${PROFILE}.env" ]; then \
+        grep -vE '^[[:space:]]*(#|$)' "/tmp/profiles/${PROFILE}.env" \
+            > /opt/coderai/image.env; \
+        echo "image env:"; cat /opt/coderai/image.env; \
+    else \
+        : > /opt/coderai/image.env; \
+    fi
+
 COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
 RUN chmod +x /opt/coderai/boot.sh
 

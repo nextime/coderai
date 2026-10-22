@@ -256,65 +256,90 @@ def test_it_defaults_on():
 
 
 # ------------------------------------------- option 2: the pinned-vLLM image #
-def test_the_vllm_ocr_profile_runs_the_SAME_vllm_as_the_fleet():
-    """This image was built to pin vLLM 0.20.1 — the version surya spawns
-    (surya/settings.py:96) — because a page of crisp synthetic Italian came back
-    from 0.27.1 with one U+FFFD per accented letter.
+def test_each_vllm_image_says_which_engine_it_runs():
+    """The two vLLM images are free to diverge; neither may do it invisibly.
 
-    The pin was the wrong conclusion from a real measurement: surya-ocr-2's
-    tokenizer is BYTE-level, so a U+FFFD per accent does not show the model
-    choosing it, and the Digesta fleet has since been reading accented Italian on
-    0.27.1 (`coderai-vllm`). Two images serving the same weights on two vLLMs is
-    an invisible difference, and that difference cost three rounds of blaming the
-    pod image. So the pins must be IDENTICAL, and 0.3.69 repurposed this image
-    for what actually distinguishes it: the OCR pipeline on the pod."""
+    This started as "the pins must be IDENTICAL". That rule came from a real
+    incident: the OCR image pinned vLLM 0.20.1 -- the version surya spawns --
+    because a page of crisp synthetic Italian came back from 0.27.1 with one
+    U+FFFD per accented letter. The pin was the wrong conclusion from a real
+    measurement (surya-ocr-2's tokenizer is BYTE-level, so a U+FFFD per accent
+    does not show the model choosing it), and two images serving the same
+    weights on two engines cost three rounds of blaming the pod image.
+
+    What actually did the damage was not that the images differed. It was that
+    nothing said so: the difference had to be DISCOVERED, by someone who already
+    suspected it. So the images may now evolve apart -- the fleet carries
+    FlashInfer's precompiled kernels for an FP8 KV cache and this one does not,
+    because its models never ask for that dtype and the package costs ~2.9 GiB
+    -- and what is enforced instead is that each image states, in its own
+    profile, every version that decides what its engine does:
+
+      * the engine and the torch stack under it are PINNED, never floating, so
+        two builds of one profile cannot quietly differ either;
+      * a choice the engine would otherwise make by version -- which attention
+        backend -- is named by the image that depends on it;
+      * and a pod PRINTS what it was given at boot, so "which engine is this"
+        is answered from its own log instead of inferred.
+    """
     import pathlib
     prof = pathlib.Path(__file__).resolve().parents[1] / "packaging/runpod/profiles"
 
     def _lines(name):
         return [l.strip() for l in (prof / name).read_text().splitlines()
                 if l.strip() and not l.strip().startswith("#")]
-    fleet, ours = _lines("vllm.venv-vllm.txt"), _lines("vllm-ocr.venv-vllm.txt")
 
-    # The invariant is the ENGINE, not the file: every pin that decides which
-    # vLLM (and which torch under it) runs must be identical, because two images
-    # serving the same weights on two engines is the invisible difference this
-    # test exists to prevent.
-    #
-    # One deliberate exception, weighed and accepted 2026-10-22: the fleet image
-    # also carries flashinfer-jit-cache, FlashInfer's precompiled kernels, which
-    # the fleet needs for an FP8 KV cache (without them the engine looks for nvcc
-    # at run time and dies). The OCR models never ask for that dtype, and the
-    # package costs ~2.9 GiB in an image that is already large, so it is not
-    # installed here. Anything else diverging is the old bug coming back.
-    ALLOWED_EXTRA = {"flashinfer-jit-cache", "--extra-index-url https://flashinfer.ai/whl/cu129"}
+    for profile in ("vllm", "vllm-ocr"):
+        pins = _lines(f"{profile}.venv-vllm.txt")
+        for package in ("vllm", "torch", "torchvision", "torchaudio", "torchcodec"):
+            exact = [l for l in pins if l.split("==")[0].strip() == package]
+            assert exact, f"{profile}: {package} is not pinned at all"
+            assert "==" in exact[0], (
+                f"{profile}: {package} floats ({exact[0]!r}) -- two builds of "
+                f"this one image could then run different engines")
+        # uv, because pip cannot resolve this pin set.
+        assert (prof / f"{profile}.venv-vllm.uv").exists()
+        # The light core, and a C compiler for Triton's launcher stubs.
+        assert (prof / f"{profile}.light").exists()
+        assert "gcc" in (prof / f"{profile}.apt").read_text()
 
-    def _name(line):
-        return line.split("==")[0].split(">=")[0].strip()
-    extra = [l for l in fleet if l not in ours]
-    assert all(_name(l) in ALLOWED_EXTRA or l in ALLOWED_EXTRA for l in extra), (
-        f"the OCR image drifted from the fleet's vLLM again: {extra}")
-    assert [l for l in ours if l not in fleet] == [], (
-        "the OCR image pins something the fleet does not")
-    for pin in ("vllm==", "torch==", "torchvision==", "torchaudio==", "torchcodec=="):
-        assert [l for l in fleet if l.startswith(pin)] == \
-               [l for l in ours if l.startswith(pin)], f"{pin} differs"
-    # uv, because pip cannot resolve this pin set.
-    assert (prof / "vllm-ocr.venv-vllm.uv").exists()
-    # The light core, like the profile it is derived from.
-    assert (prof / "vllm-ocr.light").exists()
-    # Triton needs a C compiler for its launcher stubs.
-    assert "gcc" in (prof / "vllm-ocr.apt").read_text()
+    # The OCR image cannot use FlashInfer: its kernels compile on first use and
+    # no image here ships a CUDA toolkit. Which backend vLLM selects is a
+    # property of its VERSION, so leaving it to auto-selection means a future
+    # bump could stop this image booting for a reason nothing in its own
+    # configuration explains. It is named here instead.
+    env = (prof / "vllm-ocr.env").read_text()
+    assert "VLLM_ATTENTION_BACKEND=" in env
+    assert "FLASHINFER" not in env.split("VLLM_ATTENTION_BACKEND=")[1].split("\n")[0].upper()
 
 
-def test_the_build_check_refuses_a_silent_drift_from_the_fleet():
-    """The check no longer asserts a hardcoded version — it READS the fleet's pin
-    from disk and requires a match, so bumping profiles/vllm cannot silently
-    leave the OCR image behind on an older vLLM."""
+def test_the_image_env_reaches_the_engine():
+    """A `<profile>.env` is only a pin if the pod actually applies it: the image
+    writes it at build time and boot.sh exports it, announcing each one. An
+    operator's own value wins, so a pod can still be told otherwise."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = (root / "packaging/runpod/Dockerfile.capability").read_text()
+    assert "${PROFILE}.env" in dockerfile
+    assert "/opt/coderai/image.env" in dockerfile
+    boot = (root / "packaging/runpod/boot.sh").read_text()
+    assert "/opt/coderai/image.env" in boot
+    assert "image env:" in boot            # printed, not silently applied
+    assert "kept from the pod's environment" in boot
+
+
+def test_each_build_check_holds_its_venv_to_its_own_pin():
+    """The check reads the pin from the profile it belongs to and requires the
+    installed vLLM to match.
+
+    It used to read the FLEET's pin, which coupled the two images: bumping one
+    would fail the other's build. They are allowed to diverge now. What the
+    check still catches -- and what the cross-image version could not see -- is
+    the resolver quietly installing a vLLM this profile never asked for."""
     import pathlib
     prof = pathlib.Path(__file__).resolve().parents[1] / "packaging/runpod/profiles"
     check = (prof / "vllm-ocr.venv-vllm.check").read_text()
-    assert "vllm.venv-vllm.txt" in check, "the check does not read the fleet pin"
+    assert "vllm-ocr.venv-vllm.txt" in check, "the check reads another profile's pin"
     assert "vllm.__version__.startswith(_want)" in check
     # ...but it must not fail the build on the NAME of a private vLLM symbol.
     assert "except ImportError" in check
