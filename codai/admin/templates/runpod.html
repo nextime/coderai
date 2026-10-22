@@ -34,11 +34,11 @@
 <div class="card" style="margin-bottom:1rem">
   <div class="card-title">Running pods</div>
   <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3);white-space:nowrap">
-        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>Pool</th><th>In-flight</th><th>Served</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
+        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>In flight</th><th>Served</th><th>$/hr</th><th>Uptime</th><th>Cost</th><th>Health</th><th>Logs</th>
       </tr></thead>
-      <tbody id="rp-pods"><tr><td colspan="12" class="dim">No pods running.</td></tr></tbody>
+      <tbody id="rp-pods"><tr><td colspan="11" class="dim">No pods running.</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -169,14 +169,13 @@ async function rpRefresh(){
 
   // pods table
   const tb = document.getElementById('rp-pods');
-  if(!pods.length){ tb.innerHTML = '<tr><td colspan="12" class="dim">No pods running.</td></tr>'; }
+  if(!pods.length){ tb.innerHTML = '<tr><td colspan="11" class="dim">No pods running.</td></tr>'; }
   else {
     tb.innerHTML = pods.map(p => `<tr>
       <td>${p.model||''}</td>
       <td>${p.gpu||''}${p.is_spot?' <span class="dim">(spot)</span>':''}</td>
       <td>${_loadCell(p)}</td>
       <td>${_memCell(p)}</td>
-      <td>${p.is_spot?'spot':'on-demand'}</td>
       <td>${p.inflight||0}</td>
       <td>${_servedCell(p)}</td>
       <td>${_usd(p.hourly_usd)}</td>

@@ -172,6 +172,12 @@ tbody tr:last-child td{border-bottom:none}
 tbody tr:hover td{background:rgba(255,255,255,.015);color:var(--text)}
 .td-name{font-weight:600;color:var(--text) !important}
 td code{font-family:var(--mono);font-size:11.5px;background:var(--raised);padding:.1rem .35rem;border-radius:3px}
+/* A wide table of live state, not a reading column: the default 1rem of
+   horizontal cell padding costs 2rem per column, which is ~384px of pure
+   padding across the twelve columns of the RunPod fleet table -- enough on
+   its own to push it into a horizontal scroll on a laptop. */
+.table--dense th,.table--dense td{padding:.4rem .5rem}
+.table--dense th:first-child,.table--dense td:first-child{padding-left:.15rem}
 .empty-row td{text-align:center;padding:2.5rem;color:var(--text-3) !important}
 
 /* ── Badges ──────────────────────────────────────────────────────── */
