@@ -167,3 +167,18 @@ def _no_runpod_rate_limit_carryover():
     yield
     _rc._GQL_BACKOFF_UNTIL[0] = 0.0
     _rc._GQL_RECENT = None
+
+
+@pytest.fixture(autouse=True)
+def _no_chat_template_carryover():
+    """Chat templates are cached per model path (a model's template cannot
+    change under us). A test that stubs the fetch would otherwise leave its
+    answer visible to every later test asking about the same path."""
+    try:
+        from codai.models import chat_style as _cs
+    except Exception:
+        yield
+        return
+    _cs.forget()
+    yield
+    _cs.forget()

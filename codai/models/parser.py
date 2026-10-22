@@ -1736,6 +1736,84 @@ def _family_name(model_name: str) -> str:
         return name
 
 
+#: What an operator may type for `parser` -> the parser class that reads it.
+#: Covers the admin dropdown's values (auto/llama/mistral/chatml/phi/gemma/qwen),
+#: the style ids in codai.models.chat_style, and the class names themselves, so
+#: a setting written by hand in models.json works as well as one picked in the UI.
+_PARSER_ALIASES = {
+    "qwen": "QwenParser", "chatml": "QwenParser", "hermes": "QwenParser",
+    "hermes_json": "QwenParser", "qwen_xml": "QwenParser",
+    "qwen3_xml": "QwenParser", "qwen3_coder": "QwenParser",
+    "llama": "LlamaParser", "llama3": "LlamaParser",
+    "llama3_json": "LlamaParser", "llama_pythontag": "LlamaParser",
+    "mistral": "MistralParser", "mixtral": "MistralParser",
+    "mistral_tokens": "MistralParser",
+    "phi": "PhiParser", "gemma": "GemmaParser",
+    "glm": "GLMParser", "glm45": "GLMParser", "glm_argkey": "GLMParser",
+    "deepseek": "DeepSeekParser", "deepseek_v3": "DeepSeekParser",
+    "deepseek_tokens": "DeepSeekParser",
+    "claude": "ClaudeParser", "command": "CommandRParser",
+    "commandr": "CommandRParser", "grok": "GrokParser",
+    "apex": "ApexBig50Parser", "generic": "ApexBig50Parser",
+}
+
+
+def _parser_class(name: str):
+    """The parser class an operator's `parser` value names, or None."""
+    key = str(name or "").strip()
+    if not key or key.lower() in ("auto", "detect", ""):
+        return None
+    cls_name = _PARSER_ALIASES.get(key.lower(), key)
+    return globals().get(cls_name)
+
+
+def _configured_parser_name(model_name: str) -> str:
+    """The `parser` an operator chose FOR THIS MODEL, or globally, or ''.
+
+    The admin model dialog has had a "Chat template parser" dropdown all along,
+    it is stored on the model entry, and it even travels to rented pods in
+    seed_model_env's keep-list -- but nothing read it, so choosing one changed
+    nothing. A tool call is text in the format the model was trained on, so
+    which parser reads it belongs to the model, and an operator who has looked
+    at the output is better evidence than anything inferred from a name.
+    """
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(model_name) or {}
+        want = str(entry.get("parser") or "").strip()
+        if want:
+            return want
+    except Exception:
+        pass
+    # The global default, read the way resolve_gemma_tool_mode reads its own.
+    try:
+        from codai.admin.routes import config_manager as _cm
+        if _cm is not None and getattr(_cm, "config", None) is not None:
+            return str(getattr(_cm.config, "parser", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _template_path_for(model_name: str) -> str:
+    """Where this model's chat template can be read from, or ''.
+
+    The base repo for an adapter (a LoRA has no template of its own), else the
+    entry's own path, else the name -- which is a repo id often enough to be
+    worth trying.
+    """
+    base = _family_name(model_name)
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(base) or _model_entry_for(model_name) or {}
+        block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+        return (str(entry.get("path") or "").strip()
+                or str(block.get("hf_repo") or "").strip()
+                or base or "")
+    except Exception:
+        return base or ""
+
+
 class ModelParserDispatcher:
     """Dispatcher to select the appropriate parser based on model name."""
     
@@ -1749,13 +1827,36 @@ class ModelParserDispatcher:
         self._log_selection = True  # Enable logging for subsequent calls
     
     def _get_parser(self) -> BaseParser:
-        """Get the appropriate parser based on model name."""
+        """The parser for this model: what was CONFIGURED for it, else what its
+        chat template says it emits, else what its name suggests.
+
+        An operator's explicit choice wins — see _configured_parser_name, which
+        is also why that dropdown now does something. The template is consulted
+        only where the name places the model in no family at all: a per-family
+        parser carries more than the tool syntax (gemma's token repair, Qwen's
+        repetition guard), so one template marker should not displace a family
+        that matched, while a model the name cannot place is better served by
+        its own template than by the catch-all.
+        """
         if not self.model_name:
             parser = ApexBig50Parser(self.tools)
             # Only log if we're being used for parsing, not during init
             # (self._log_selection is False during __init__ when model_name=None)
             return parser
-        
+
+        want = _configured_parser_name(self.model_name)
+        if want:
+            cls = _parser_class(want)
+            if cls is not None:
+                if self._log_selection:
+                    print(f"DEBUG model_parser: model_name={self.model_name}, "
+                          f"configured parser {want!r}: {cls.__name__}")
+                return cls(self.tools)
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, "
+                       f"configured parser {want!r} is not one I know — "
+                       f"detecting instead")
+
         model_lower = _family_name(self.model_name).lower()
         
         # Qwen models
@@ -1829,6 +1930,21 @@ class ModelParserDispatcher:
                 print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: PhiParser")
             return parser
         
+        # The name places this model in no family. Ask the model itself: its
+        # chat template is where the tool-call format it was trained on is
+        # written down, and it is better evidence than the catch-all.
+        try:
+            from codai.models.chat_style import coderai_parser_name
+            detected = coderai_parser_name(_template_path_for(self.model_name))
+        except Exception:
+            detected = ""
+        cls = globals().get(detected) if detected else None
+        if cls is not None:
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, "
+                      f"template says: {cls.__name__}")
+            return cls(self.tools)
+
         # Default: use catch-all parser
         parser = ApexBig50Parser(self.tools)
         if self._log_selection:

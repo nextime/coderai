@@ -37,7 +37,8 @@ def _no_template_probe(monkeypatch):
     it would otherwise reach the network for every repo id. What the template
     decides when it IS readable is covered in
     tests/test_vllm_qwen_tool_parser_choice.py."""
-    monkeypatch.setattr(vw, "_chat_template_text", lambda *a, **k: "")
+    monkeypatch.setattr("codai.models.chat_style.chat_template_text",
+                        lambda *a, **k: "")
 
 
 @pytest.mark.parametrize("path,want", [

@@ -110,6 +110,7 @@ def test_an_unreadable_repo_does_not_stop_the_launch(monkeypatch):
     def _boom(*a, **k):
         raise OSError("offline")
     monkeypatch.setattr("codai.api.embeddings._fetch_repo_file", _boom)
+    __import__("codai.models.chat_style", fromlist=["forget"]).forget()
     assert vw._chat_template_text("some/repo") == ""
     assert vw._emits_qwen_xml_calls("some/repo") is False
     assert vw._tool_parser_for(_Cfg(), {"id": "qwen2.5-7b"}, "some/repo") == "hermes"
@@ -123,5 +124,6 @@ def test_a_repo_template_is_fetched_not_merely_looked_up_in_the_cache(monkeypatc
         seen.append(name)
         return None
     monkeypatch.setattr("codai.api.embeddings._fetch_repo_file", _fetch)
+    __import__("codai.models.chat_style", fromlist=["forget"]).forget()
     vw._chat_template_text("org/qwen3.8-27b")
     assert seen == ["chat_template.jinja", "tokenizer_config.json"]
