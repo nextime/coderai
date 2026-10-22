@@ -385,3 +385,65 @@ def test_the_families_each_get_their_own(tmp_path):
         cs.forget()
         cs._CACHE["p"] = tpl
         assert vllm_reasoning_parser("p") == want, style
+
+
+# ------------------- the passthrough must survive the backend-negotiation ladder #
+
+def _manager(backend):
+    from codai.models.manager import ModelManager
+    m = ModelManager.__new__(ModelManager)
+    m.backend = backend
+    return m
+
+
+class _ProxyBackend:
+    """A proxy backend's real shape: it takes `passthrough`, and it does NOT
+    take `enable_thinking` or the penalties."""
+
+    def __init__(self):
+        self.seen = None
+
+    def generate_chat(self, messages, max_tokens=None, temperature=0.7, top_p=1.0,
+                      stop=None, tools=None, response_format=None,
+                      logprobs=None, top_logprobs=None, passthrough=None):
+        self.seen = passthrough
+        return "ok"
+
+
+def test_the_passthrough_reaches_a_proxy_backend():
+    """THE BUG: every ladder variant carrying the passthrough also carried
+    enable_thinking, which a proxy backend does not accept -- so those variants
+    raised TypeError and the surviving one had dropped the passthrough. A
+    caller's chat_template_kwargs never reached a pod, which is why
+    `enable_thinking: false` came back still thinking."""
+    b = _ProxyBackend()
+    out = _manager(b).generate_chat(
+        [{"role": "user", "content": "x"}],
+        passthrough={"chat_template_kwargs": {"enable_thinking": False}})
+    assert out == "ok"
+    assert b.seen == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_a_backend_that_takes_everything_still_gets_it_all():
+    class _Full(_ProxyBackend):
+        def generate_chat(self, messages, max_tokens=None, temperature=0.7,
+                          top_p=1.0, stop=None, tools=None, response_format=None,
+                          enable_thinking=False, repeat_penalty=1.0,
+                          presence_penalty=0.0, frequency_penalty=0.0,
+                          logprobs=None, top_logprobs=None, passthrough=None):
+            self.seen = (enable_thinking, repeat_penalty, passthrough)
+            return "ok"
+    b = _Full()
+    _manager(b).generate_chat([{"role": "user", "content": "x"}],
+                              enable_thinking=True, repeat_penalty=1.2,
+                              passthrough={"k": 1})
+    assert b.seen == (True, 1.2, {"k": 1})
+
+
+def test_a_backend_that_takes_none_of_it_is_still_callable():
+    class _Bare:
+        def generate_chat(self, messages, max_tokens=None, temperature=0.7,
+                          top_p=1.0, stop=None, tools=None, response_format=None):
+            return "ok"
+    assert _manager(_Bare()).generate_chat(
+        [{"role": "user", "content": "x"}], passthrough={"k": 1}) == "ok"

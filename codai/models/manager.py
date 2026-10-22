@@ -999,10 +999,22 @@ class ModelManager:
             # business with the upstream server, never a reason to fail the
             # request on a backend that cannot carry it.
             _pt = self._passthrough_kwargs(self.backend.generate_chat, passthrough)
-            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp, **_pt),
-                           dict(enable_thinking=enable_thinking, **_pen, **_lp),
-                           dict(enable_thinking=enable_thinking, **_lp),
-                           dict(**_lp), {}):
+            # `_lp` and `_pt` are already SIGNATURE-gated, so they are empty for a
+            # backend that cannot take them and never raise TypeError. Only
+            # enable_thinking and the penalties are negotiated by TypeError, so
+            # only those are peeled off here.
+            #
+            # They used to be peeled off TOGETHER with the passthrough: every
+            # variant carrying `_pt` also carried `enable_thinking`, which a
+            # proxy backend does not accept, so the first variants raised
+            # TypeError and the ones that survived had dropped the passthrough.
+            # A caller's `chat_template_kwargs` therefore never reached a pod --
+            # which is how `enable_thinking: false` came back still thinking.
+            _safe = dict(**_lp, **_pt)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_safe),
+                           dict(enable_thinking=enable_thinking, **_safe),
+                           dict(**_pen, **_safe),
+                           dict(**_safe), {}):
                 try:
                     return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
                                                       stop, tools, response_format, **_extra)
@@ -1049,10 +1061,22 @@ class ModelManager:
             # doesn't accept (older signatures) so we never hard-fail on plumbing.
             _lp = self._logprob_kwargs(self.backend.generate_chat_stream, logprobs, top_logprobs)
             _pt = self._passthrough_kwargs(self.backend.generate_chat_stream, passthrough)
-            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_lp, **_pt),
-                           dict(enable_thinking=enable_thinking, **_pen, **_lp),
-                           dict(enable_thinking=enable_thinking, **_lp),
-                           dict(**_lp), {}):
+            # `_lp` and `_pt` are already SIGNATURE-gated, so they are empty for a
+            # backend that cannot take them and never raise TypeError. Only
+            # enable_thinking and the penalties are negotiated by TypeError, so
+            # only those are peeled off here.
+            #
+            # They used to be peeled off TOGETHER with the passthrough: every
+            # variant carrying `_pt` also carried `enable_thinking`, which a
+            # proxy backend does not accept, so the first variants raised
+            # TypeError and the ones that survived had dropped the passthrough.
+            # A caller's `chat_template_kwargs` therefore never reached a pod --
+            # which is how `enable_thinking: false` came back still thinking.
+            _safe = dict(**_lp, **_pt)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen, **_safe),
+                           dict(enable_thinking=enable_thinking, **_safe),
+                           dict(**_pen, **_safe),
+                           dict(**_safe), {}):
                 try:
                     _gen = self.backend.generate_chat_stream(
                         messages, max_tokens, temperature, top_p, stop, tools,
