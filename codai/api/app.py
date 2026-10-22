@@ -102,6 +102,20 @@ async def lifespan(app: FastAPI):
     import asyncio as _asyncio
     boot_phase("lifespan start")
 
+    # WHICH BUILD IS THIS. boot.sh already says so, but its phases are written
+    # before the app exists -- to the container's stdout and the pod's own boot
+    # log -- and the orchestrator collects a pod's log from the APP, so what it
+    # fetches begins here. A pod serving a cached `:latest` therefore could not
+    # be told from one serving a fresh image using the log an operator actually
+    # reads, which is the question these variables were baked in to answer
+    # (2026-10-22: an FP8 cache proved the new image only by inference, because
+    # this line was not in the collected log).
+    _tag = os.environ.get("CODERAI_IMAGE_TAG") or ""
+    if _tag or os.environ.get("CODERAI_GIT_SHA"):
+        boot_phase(f"build: image={_tag or 'unknown'} "
+                   f"git={os.environ.get('CODERAI_GIT_SHA') or 'unknown'} "
+                   f"profile={os.environ.get('PROFILE') or 'none'}")
+
     # Before anything schedules work: every `asyncio.to_thread` in this process
     # uses the loop's default executor, and an untold loop sizes it for
     # incidental background work rather than for a fan-out of blocking pod
