@@ -233,3 +233,66 @@ def test_the_measured_footprint_round_trips(monkeypatch):
     assert cand is not None
     # 0.60*24 = 14.4 budget, 8.0 cache => 6.4 footprint; +2.0 target => 8.4/24 = 0.35
     assert cand == pytest.approx(0.35 + vllm_worker._SHRINK_MARGIN, abs=0.01)
+
+
+# ------------------- the window the share has to be able to serve ----------- #
+#
+# 2026-10-22, A40, qwen38 at --max-model-len 131072: the engine booted with a
+# 0.900 share and 13.27 GiB of cache (212,321 tokens), and the learner
+# immediately proposed 0.460 because "2.0 GiB would still do". 2 GiB of this
+# model's cache is ~32,000 tokens -- not one full request of the window it was
+# configured for -- and a vLLM whose cache cannot hold max_model_len refuses to
+# start at all. The flat target is right for a page-at-a-time VLM and wrong for
+# an LLM serving long conversations, so it is now a floor.
+
+def test_the_floor_holds_the_window_not_a_constant():
+    """The measured numbers from that boot: 13.27 GiB bought 212,321 tokens."""
+    floor = vllm_worker._kv_floor_gb(131072, 13.27, 212321, 2.0)
+    per_token_gb = 13.27 / 212321
+    assert floor == pytest.approx(131072 * 2 * per_token_gb, rel=1e-6)
+    assert floor > 16.0                    # ...which is more than the card has
+    assert floor > 2.0
+
+
+def test_a_short_window_still_gets_the_flat_target():
+    """A VLM serving pages needs a fraction of a conversation's cache; the floor
+    must not inflate every engine to LLM proportions."""
+    assert vllm_worker._kv_floor_gb(4096, 13.27, 212321, 2.0) == 2.0
+
+
+def test_the_floor_is_skipped_when_the_boot_said_nothing():
+    """No report to read means no measured bytes-per-token. Inventing one could
+    refuse to shrink anything for ever, which is the bug this feature exists to
+    fix -- so the flat target stands."""
+    assert vllm_worker._kv_floor_gb(131072, None, None, 2.0) == 2.0
+    assert vllm_worker._kv_floor_gb(131072, 13.27, 0, 2.0) == 2.0
+    assert vllm_worker._kv_floor_gb(0, 13.27, 212321, 2.0) == 2.0
+
+
+def test_no_memory_is_given_back_when_the_window_needs_it_all():
+    """THE BUG, end to end: with the floor applied there is no slack left to
+    shrink into, so the 0.900 share stands instead of becoming 0.460."""
+    floor = vllm_worker._kv_floor_gb(131072, 13.27, 212321, 2.0)
+    assert vllm_worker._shrink_candidate(0.900, 13.27, floor, {}) is None
+
+
+def test_a_page_engine_still_hands_memory_back():
+    """The same call that must not shrink an LLM must still shrink surya: a VLM
+    that got 8 GiB of cache for 4096-token pages is sitting on memory another
+    model could have."""
+    floor = vllm_worker._kv_floor_gb(4096, 8.0, 500000, 2.0)
+    assert vllm_worker._shrink_candidate(0.60, 8.0, floor, {}) is not None
+
+
+def test_the_token_count_is_captured_from_the_boot_log():
+    """It streams past once, behind vLLM's route listing, and is gone from the
+    tail by the time the server is ready -- like the GiB figure beside it."""
+    import types
+    meta = {}
+    lines = ["INFO [gpu_worker.py:563] Available KV cache memory: 13.27 GiB",
+             "INFO [kv_cache_utils.py:2235] GPU KV cache size: 212,321 tokens",
+             "INFO Route listing follows"]
+    proc = types.SimpleNamespace(stdout=iter(lines))
+    vllm_worker._pump_logs(proc, [], meta)
+    assert meta["kv_gib"] == 13.27
+    assert meta["kv_tokens"] == 212321

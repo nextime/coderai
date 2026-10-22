@@ -80,6 +80,13 @@ def _pump_logs(proc, tail, meta: dict = None):
                         meta["kv_gib"] = float(m.group(1))
                     except Exception:
                         pass
+            if meta is not None and "kv_tokens" not in meta:
+                m = _KV_TOKENS.search(line)
+                if m:
+                    try:
+                        meta["kv_tokens"] = int(m.group(1).replace(",", ""))
+                    except Exception:
+                        pass
             print(f"[vllm] {line}", flush=True)
 
 
@@ -1104,9 +1111,25 @@ _GMU_MAX_ATTEMPTS = 4
 
 # vLLM reports what was left for the cache; this is how that figure is read back.
 _KV_REPORT = re.compile(r"Available KV cache memory:\s*(-?[\d.]+)\s*GiB", re.IGNORECASE)
+# ...and how many TOKENS that bought, which is the only way to turn a share into a
+# window: bytes-per-token depends on the model's attention shape (this hybrid puts
+# linear attention on most layers) and cannot be derived from the config.
+_KV_TOKENS = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens", re.IGNORECASE)
 # How much KV cache an instance should end up with, how much spare has to be on the table
 # before shrinking is worth a move, and the margin kept when proposing a smaller share.
+#
+# 2 GiB is the right floor for a page-at-a-time VLM, and catastrophic for an LLM
+# serving long conversations: measured on an A40 2026-10-22, 2 GiB holds ~32,000
+# tokens of this model's cache, while the engine was serving a 131,072-token
+# window -- not even one full request. The learner proposed exactly that (0.900
+# -> 0.460, "would still give ~2.0 GiB") the moment the engine booted, and a
+# vLLM whose cache cannot hold max_model_len refuses to start at all. So the
+# target is a FLOOR, raised to whatever holds the window this engine is actually
+# serving, times the concurrency below.
 _TARGET_KV_GB = 2.0
+# Full-length requests the cache must be able to hold at once before any share is
+# given back. 2 is the smallest number that is not "one request at a time".
+_KV_MIN_CONCURRENCY = 2.0
 _SHRINK_MIN_SLACK_GB = 1.0
 _SHRINK_MARGIN = 0.03
 
@@ -1197,6 +1220,28 @@ def _starting_gmu(configured: float, rec: dict) -> float:
     if failed > 0:
         start = max(start, min(failed + _GMU_ESCALATION_STEP, GMU_CEILING))
     return min(max(start, 0.0), GMU_CEILING)
+
+
+def _kv_floor_gb(ctx, kv_gib, kv_tokens, target_kv_gb: float) -> float:
+    """The smallest cache worth keeping: ``target_kv_gb``, or enough to hold
+    ``_KV_MIN_CONCURRENCY`` requests of ``ctx`` tokens when that is larger.
+
+    Bytes per token come from the boot report (``kv_gib`` for ``kv_tokens``)
+    because they depend on the model's attention shape -- this hybrid runs
+    linear attention on most of its layers -- and are not derivable from the
+    config. With no report to read, the target is returned unchanged: a floor
+    invented from a guess could refuse to shrink anything, for ever.
+    """
+    try:
+        ctx = int(ctx or 0)
+        kv_gib = float(kv_gib or 0)
+        kv_tokens = int(kv_tokens or 0)
+    except (TypeError, ValueError):
+        return float(target_kv_gb)
+    if ctx <= 0 or kv_gib <= 0 or kv_tokens <= 0:
+        return float(target_kv_gb)
+    per_token_gb = kv_gib / float(kv_tokens)
+    return max(float(target_kv_gb), ctx * _KV_MIN_CONCURRENCY * per_token_gb)
 
 
 def _shrink_candidate(gmu: float, kv_gib: float, target_kv_gb: float,
@@ -1309,12 +1354,24 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         # have done — escalation alone never gives memory back.
         _save_learned(key, ok=gmu)
         try:
-            kv = (_service_meta(cfg, model_path, served_name) or {}).get("kv_gib")
-            cand = _shrink_candidate(gmu, kv, target_kv, _load_learned(key))
+            _meta = _service_meta(cfg, model_path, served_name) or {}
+            kv = _meta.get("kv_gib")
+            # The floor the window imposes. Without it the learner hands back
+            # memory the engine needs to serve a single request of the size it
+            # was configured for, and the NEXT start of this model is the one
+            # that fails.
+            floor_kv = _kv_floor_gb(ctx, kv, _meta.get("kv_tokens"), target_kv)
+            if floor_kv > target_kv:
+                print(f"[vllm] {served_name or model_path}: keeping at least "
+                      f"{floor_kv:.2f} GiB of cache — {_KV_MIN_CONCURRENCY:g}x a "
+                      f"{ctx}-token window at the measured "
+                      f"{(kv / _meta['kv_tokens'] * 1024 * 1024):.0f} KiB/token",
+                      flush=True)
+            cand = _shrink_candidate(gmu, kv, floor_kv, _load_learned(key))
             if cand is not None:
                 print(f"[vllm] {served_name or model_path}: {kv:.2f} GiB of cache on a "
                       f"{gmu:.3f} share leaves room to spare; {cand:.3f} would still "
-                      f"give ~{target_kv:.1f} GiB — using it from the next start",
+                      f"give ~{floor_kv:.1f} GiB — using it from the next start",
                       flush=True)
                 _save_learned(key, ok=cand)
         except Exception as e:
