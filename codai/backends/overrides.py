@@ -17,7 +17,11 @@ different install, venv or service.
 
 import dataclasses
 
-VLLM_FIELDS = ("ctx", "gpu", "gpu_memory_utilization", "tensor_parallel_size",
+VLLM_FIELDS = ("ctx", "gpu", "gpu_memory_utilization",
+               # How much cache the share learner must leave this model, and how
+               # many full-length requests of its window that cache has to hold.
+               "kv_target_gb", "kv_min_concurrency",
+               "tensor_parallel_size",
                "pipeline_parallel_size", "distributed_executor_backend", "ray_address",
                "ray_port", "nodes", "nodes_ready_timeout_s", "max_num_seqs", "dtype",
                "quantization", "extra_args", "extra_env",

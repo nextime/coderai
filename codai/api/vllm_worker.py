@@ -1222,9 +1222,10 @@ def _starting_gmu(configured: float, rec: dict) -> float:
     return min(max(start, 0.0), GMU_CEILING)
 
 
-def _kv_floor_gb(ctx, kv_gib, kv_tokens, target_kv_gb: float) -> float:
+def _kv_floor_gb(ctx, kv_gib, kv_tokens, target_kv_gb: float,
+                 min_concurrency: float = None) -> float:
     """The smallest cache worth keeping: ``target_kv_gb``, or enough to hold
-    ``_KV_MIN_CONCURRENCY`` requests of ``ctx`` tokens when that is larger.
+    ``min_concurrency`` requests of ``ctx`` tokens when that is larger.
 
     Bytes per token come from the boot report (``kv_gib`` for ``kv_tokens``)
     because they depend on the model's attention shape -- this hybrid runs
@@ -1240,8 +1241,15 @@ def _kv_floor_gb(ctx, kv_gib, kv_tokens, target_kv_gb: float) -> float:
         return float(target_kv_gb)
     if ctx <= 0 or kv_gib <= 0 or kv_tokens <= 0:
         return float(target_kv_gb)
+    try:
+        conc = float(_KV_MIN_CONCURRENCY if min_concurrency is None
+                     else min_concurrency)
+    except (TypeError, ValueError):
+        conc = _KV_MIN_CONCURRENCY
+    if conc <= 0:                 # 0 opts out: keep only the flat target
+        return float(target_kv_gb)
     per_token_gb = kv_gib / float(kv_tokens)
-    return max(float(target_kv_gb), ctx * _KV_MIN_CONCURRENCY * per_token_gb)
+    return max(float(target_kv_gb), ctx * conc * per_token_gb)
 
 
 def _shrink_candidate(gmu: float, kv_gib: float, target_kv_gb: float,
@@ -1311,7 +1319,19 @@ def ensure_service(cfg, model_path: Optional[str] = None,
     key = _learned_gmu_key(cfg, (served_name or model_path or "vllm"), ctx,
                            max_num_batched_tokens)
     rec = _load_learned(key)
-    target_kv = float(target_kv_gb if target_kv_gb is not None else _TARGET_KV_GB)
+    # The caller's figure wins (the OCR subsystem passes its own), then this
+    # model's `vllm` block, then the global default.
+    if target_kv_gb is not None:
+        target_kv = float(target_kv_gb)
+    else:
+        try:
+            target_kv = float(getattr(cfg, "kv_target_gb", 0) or 0) or _TARGET_KV_GB
+        except (TypeError, ValueError):
+            target_kv = _TARGET_KV_GB
+    try:
+        kv_conc = float(getattr(cfg, "kv_min_concurrency", _KV_MIN_CONCURRENCY))
+    except (TypeError, ValueError):
+        kv_conc = _KV_MIN_CONCURRENCY
 
     if configured <= 0 and not rec:
         # No share configured anywhere: nothing to size, let vLLM use its own default.
@@ -1360,10 +1380,11 @@ def ensure_service(cfg, model_path: Optional[str] = None,
             # memory the engine needs to serve a single request of the size it
             # was configured for, and the NEXT start of this model is the one
             # that fails.
-            floor_kv = _kv_floor_gb(ctx, kv, _meta.get("kv_tokens"), target_kv)
+            floor_kv = _kv_floor_gb(ctx, kv, _meta.get("kv_tokens"), target_kv,
+                                    kv_conc)
             if floor_kv > target_kv:
                 print(f"[vllm] {served_name or model_path}: keeping at least "
-                      f"{floor_kv:.2f} GiB of cache — {_KV_MIN_CONCURRENCY:g}x a "
+                      f"{floor_kv:.2f} GiB of cache — {kv_conc:g}x a "
                       f"{ctx}-token window at the measured "
                       f"{(kv / _meta['kv_tokens'] * 1024 * 1024):.0f} KiB/token",
                       flush=True)

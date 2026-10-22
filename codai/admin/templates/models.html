@@ -672,6 +672,8 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.5rem">
           <div class="form-row" style="margin:0"><label class="form-label">Existing Ray cluster <span class="muted">(blank = start a head here)</span></label><input type="text" id="cfg-vllm-ray" class="form-input" placeholder="10.0.0.1:6379"></div>
           <div class="form-row" style="margin:0"><label class="form-label">GPU memory fraction</label><input type="number" id="cfg-vllm-gmu" class="form-input" min="0.1" max="1" step="0.05" placeholder="inherit"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Min KV cache (GiB)</label><input type="number" id="cfg-vllm-kv-target" class="form-input" min="0" step="0.5" placeholder="inherit"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Full windows the cache must hold</label><input type="number" id="cfg-vllm-kv-conc" class="form-input" min="0" step="0.5" placeholder="inherit"><span class="form-hint" style="font-size:11px">Keeps enough cache for this many requests at the model's full context. 0 = size by GiB only.</span></div>
         </div>
         <div class="form-row" style="margin:.5rem 0 0">
           <label class="form-label">Nodes <span class="muted">— one per line: <code>name | start command | stop command | gpus</code></span></label>
@@ -4709,6 +4711,7 @@ function _populateCluster(m, s){
   set('cfg-vllm-tp', v.tensor_parallel_size || ''); set('cfg-vllm-pp', v.pipeline_parallel_size || '');
   set('cfg-vllm-executor', v.distributed_executor_backend || ''); set('cfg-vllm-ray', v.ray_address || '');
   set('cfg-vllm-gmu', v.gpu_memory_utilization || ''); set('cfg-vllm-extra', v.extra_args || '');
+  set('cfg-vllm-kv-target', v.kv_target_gb || ''); set('cfg-vllm-kv-conc', v.kv_min_concurrency != null ? v.kv_min_concurrency : '');
   set('cfg-vllm-nodes', _nodesToLines(v.nodes, true));
   // LongCat-Video. Read from the FLAT entry, not a nested block: these are per-model
   // settings the worker reads off the entry, the same shape as the offload/quant fields.
@@ -4789,6 +4792,7 @@ function _collectCluster(){
     tensor_parallel_size: num('cfg-vllm-tp'), pipeline_parallel_size: num('cfg-vllm-pp'),
     distributed_executor_backend: val('cfg-vllm-executor'), ray_address: val('cfg-vllm-ray'),
     gpu_memory_utilization: num('cfg-vllm-gmu'), extra_args: val('cfg-vllm-extra'),
+    kv_target_gb: num('cfg-vllm-kv-target'), kv_min_concurrency: num('cfg-vllm-kv-conc'),
     nodes: val('cfg-vllm-nodes'),
   } : {};
   out.kt = backend === 'kt' ? {

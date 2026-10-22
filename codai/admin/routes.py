@@ -4121,6 +4121,8 @@ def build_settings_dict(c, gpu_cards):
             "port": c.vllm.port,
             "ctx": c.vllm.ctx,
             "gpu_memory_utilization": c.vllm.gpu_memory_utilization,
+            "kv_target_gb": c.vllm.kv_target_gb,
+            "kv_min_concurrency": c.vllm.kv_min_concurrency,
             "tensor_parallel_size": c.vllm.tensor_parallel_size,
             "max_num_seqs": c.vllm.max_num_seqs,
             "dtype": c.vllm.dtype,
@@ -4868,6 +4870,15 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             except (TypeError, ValueError): pass
         if "gpu_memory_utilization" in d:
             try: v.gpu_memory_utilization = float(d.get("gpu_memory_utilization") or v.gpu_memory_utilization)
+            except (TypeError, ValueError): pass
+        # How much cache the share learner must leave an engine. 0 for the
+        # concurrency means "size by GiB alone", so it is read as a number
+        # rather than falsy-checked.
+        if "kv_target_gb" in d:
+            try: v.kv_target_gb = max(0.0, float(d.get("kv_target_gb") or 0.0))
+            except (TypeError, ValueError): pass
+        if "kv_min_concurrency" in d:
+            try: v.kv_min_concurrency = max(0.0, float(d.get("kv_min_concurrency")))
             except (TypeError, ValueError): pass
         if "return_token_ids" in d: v.return_token_ids = bool(d["return_token_ids"])
         if "tensor_parallel_size" in d:

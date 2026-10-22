@@ -798,6 +798,18 @@ class VllmConfig:
     port: int = 0                        # 0 = auto-pick a free port
     ctx: int = 32768                     # --max-model-len
     gpu_memory_utilization: float = 0.90  # --gpu-memory-utilization
+    # How the share learner decides it may give memory back. It measures an
+    # engine's real footprint from the cache a successful boot reported, then
+    # proposes the smallest share that still leaves `kv_target_gb` of cache --
+    # but a cache that cannot hold the window the engine serves is useless, and
+    # a vLLM whose cache cannot hold `ctx` refuses to start. So the target is a
+    # floor, raised to `kv_min_concurrency` full-length requests of `ctx`
+    # (bytes-per-token measured from the boot report, since it depends on the
+    # model's attention shape). 2 GiB suits a page-at-a-time VLM; an LLM serving
+    # long conversations needs the window-derived figure. Both are overridable
+    # per model in its `vllm` block.
+    kv_target_gb: float = 2.0            # smallest cache worth keeping, before the floor
+    kv_min_concurrency: float = 2.0      # full-length requests the cache must hold
     tensor_parallel_size: int = 1        # --tensor-parallel-size
     max_num_seqs: int = 0                # --max-num-seqs (0 = vLLM default)
     dtype: str = ""                      # --dtype (blank = auto; e.g. bfloat16/float16)

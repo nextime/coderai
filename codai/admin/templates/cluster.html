@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Cluster — CoderAI{% endblock %}
+{# Eight tables of fleet state, the widest ten columns across: the 1100px
+   reading column cannot show a row without a horizontal scroll. Same
+   full-width wrapper the Models and RunPod pages use. #}
+{% block wrapper_class %}container container--full{% endblock %}
 
 {% block content %}
 <div class="page-header">
@@ -27,7 +31,7 @@
 <div class="card" style="margin-bottom:1rem">
   <div class="card-title">Cluster nodes <span class="dim small">— other coderai installs used as engines of this one</span></div>
   <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
         <th>Node</th><th>URL</th><th>State</th><th>Capabilities</th><th>VRAM</th><th>Its engines</th><th>Loaded</th><th>Assigned</th><th>In-flight</th><th></th>
       </tr></thead>
@@ -40,7 +44,7 @@
   <div class="card-title">Seen on the network <span class="dim small">— mDNS <code>_coderai._tcp</code>; members hold this cluster's token and join by themselves</span></div>
   <div id="cl-disc-note" class="dim small" style="margin-bottom:.4rem"></div>
   <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
         <th>Name</th><th>URL</th><th>Version</th><th>Capabilities</th><th>Member</th><th>Joined</th><th>Last seen</th>
       </tr></thead>
@@ -52,7 +56,7 @@
 <div class="card" style="margin-bottom:1rem">
   <div class="card-title">Engines on this machine <button class="btn btn-secondary" style="float:right;padding:.15rem .5rem;font-size:12px" onclick="clLogs('')">This front's log</button></div>
   <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
         <th>Engine</th><th>Backend</th><th>State</th><th>Capabilities</th><th>VRAM</th><th>Loaded</th><th>In-flight</th><th>PID</th>
       </tr></thead>
@@ -64,7 +68,7 @@
 <div class="card" style="margin-bottom:1rem">
   <div class="card-title">llama.cpp RPC servers <span class="dim small">— cards lent to a GGUF loaded elsewhere (per model: <em>Cards on other machines</em>)</span></div>
   <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
         <th>Where</th><th>Endpoint</th><th>Device</th><th>Mem cap</th><th>Process</th><th>Reachable</th><th>Last log line</th>
       </tr></thead>
@@ -76,14 +80,14 @@
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
   <div class="card">
     <div class="card-title">Hosts <span class="dim small">— <code>backend: host</code> models</span></div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)"><th>Model</th><th>URL</th><th>Mode</th><th>Answers</th></tr></thead>
       <tbody id="cl-hosts"><tr><td colspan="4" class="dim">None.</td></tr></tbody>
     </table>
   </div>
   <div class="card">
     <div class="card-title">Capability remotes <span class="dim small">— Settings → Remote capabilities</span></div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)"><th>Capability</th><th>URL</th><th>Answers</th></tr></thead>
       <tbody id="cl-remotes"><tr><td colspan="3" class="dim">None.</td></tr></tbody>
     </table>
@@ -93,14 +97,14 @@
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
   <div class="card">
     <div class="card-title">Usage by API key <span class="dim small">— since the front started; the same numbers <code>/metrics</code> exports</span></div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)"><th>Key</th><th>Requests</th><th>Errors</th><th>Time</th><th>Kinds</th><th>Where</th></tr></thead>
       <tbody id="cl-usage-key"><tr><td colspan="6" class="dim">No requests yet.</td></tr></tbody>
     </table>
   </div>
   <div class="card">
     <div class="card-title">Usage by model</div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)"><th>Model</th><th>Requests</th><th>Errors</th><th>Time</th><th>Where</th></tr></thead>
       <tbody id="cl-usage-model"><tr><td colspan="5" class="dim">No requests yet.</td></tr></tbody>
     </table>
@@ -115,7 +119,7 @@
 
 <div class="card">
   <div class="card-title">RunPod pods <span class="dim small">— live list, costs on the <a href="{{ root_path }}/admin/runpod">RunPod page</a></span></div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px">
+  <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
     <thead><tr style="text-align:left;color:var(--text-3)"><th>Model / capability</th><th>Pod</th><th>GPU</th><th>State</th><th>In-flight</th><th>$/hr</th></tr></thead>
     <tbody id="cl-pods"><tr><td colspan="6" class="dim">None running.</td></tr></tbody>
   </table>

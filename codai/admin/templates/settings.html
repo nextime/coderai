@@ -871,6 +871,11 @@
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Max num seqs</label><input type="number" id="s-vllm-mns" class="form-input" min="0" placeholder="0 = default"></div>
     </div>
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Min KV cache (GiB)</label><input type="number" id="s-vllm-kv-target" class="form-input" min="0" step="0.5" placeholder="2.0"></div>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Full windows the cache must hold</label><input type="number" id="s-vllm-kv-conc" class="form-input" min="0" step="0.5" placeholder="2"></div>
+    </div>
+    <span class="form-hint">coderai measures an engine's real footprint from the cache its boot reported and hands back the share it does not need. These two set how much it must leave: at least the GiB on the left, and never less than enough to hold this many <b>full-length</b> requests of the model's own max model len. The second is what matters for long conversations — 2 GiB of cache is ~32,000 tokens of a 27B model, so an engine serving a 128k window and sized by GiB alone could end up unable to hold a single request, and vLLM refuses to start when its cache cannot hold the window. Set the count to 0 to size by GiB only (right for a page-at-a-time OCR model). Both are overridable per model in its vLLM block.</span>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">dtype</label><input type="text" id="s-vllm-dtype" class="form-input" placeholder="auto"></div>
       <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Quantization</label><input type="text" id="s-vllm-quant" class="form-input" placeholder="none (awq/gptq/fp8)"></div>
       <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Port</label><input type="number" id="s-vllm-port" class="form-input" min="0" placeholder="0 = auto"></div>
@@ -2303,6 +2308,8 @@ async function loadSettings(){
     document.getElementById('s-vllm-gmu').value = vll.gpu_memory_utilization ?? 0.90;
     document.getElementById('s-vllm-tp').value = vll.tensor_parallel_size ?? 1;
     document.getElementById('s-vllm-mns').value = vll.max_num_seqs ?? 0;
+    document.getElementById('s-vllm-kv-target').value = vll.kv_target_gb ?? 2.0;
+    document.getElementById('s-vllm-kv-conc').value = vll.kv_min_concurrency ?? 2;
     document.getElementById('s-vllm-dtype').value = vll.dtype ?? '';
     document.getElementById('s-vllm-quant').value = vll.quantization ?? '';
     document.getElementById('s-vllm-port').value = vll.port ?? 0;
@@ -2625,6 +2632,8 @@ async function saveSettings(silent){
       gpu: document.getElementById('s-vllm-gpu').value.trim(),
       ctx: parseInt(document.getElementById('s-vllm-ctx').value) || 32768,
       gpu_memory_utilization: parseFloat(document.getElementById('s-vllm-gmu').value) || 0.90,
+      kv_target_gb: parseFloat(document.getElementById('s-vllm-kv-target').value) || 2.0,
+      kv_min_concurrency: (function(){ const v = parseFloat(document.getElementById('s-vllm-kv-conc').value); return isNaN(v) ? 2 : v; })(),
       tensor_parallel_size: parseInt(document.getElementById('s-vllm-tp').value) || 1,
       max_num_seqs: parseInt(document.getElementById('s-vllm-mns').value) || 0,
       dtype: document.getElementById('s-vllm-dtype').value.trim(),
