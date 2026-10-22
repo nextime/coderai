@@ -403,3 +403,38 @@ def test_the_summarizer_is_given_only_the_messages_being_dropped():
     assert f"{last_kept} " not in handed
     # ...and something from the middle is.
     assert "msg20" in handed or "msg15" in handed
+
+
+# ------------------------- one message bigger than the whole target ---------- #
+
+def test_a_huge_opening_turn_is_not_kept_verbatim_as_the_head():
+    """THE BUG: the head's size cap was waived for its FIRST message, so a
+    conversation that opens with a pasted 45,000-token document kept that
+    document whole, dropped the rest of the history, and overflowed anyway --
+    the exact shape compaction exists for. Measured 2026-10-22.
+    """
+    huge = {"role": "user", "content": "DOC " + ("x" * 180_000)}
+    msgs = [{"role": "system", "content": "s"}, huge]
+    msgs += [{"role": "user" if i % 2 == 0 else "assistant",
+              "content": f"m{i} " + "y" * 400} for i in range(10)]
+    _, head, middle, tail = _split_for_compaction(
+        msgs, target=12_000, strategy="summarize", head_messages=2)
+    assert huge not in head
+    assert huge in middle              # it goes to the summarizer/slicer instead
+    assert tail
+
+
+def test_the_summarizer_is_sized_by_the_window_that_refused_us():
+    """THE SECOND BUG, and the sharper one: this number sizes the summarizer's
+    own chunks. With a configured 131072 against a pod serving 32768, every
+    summarization request overflowed too -- so the slicer left the oversized
+    message exactly as it was and compaction reported that it could not help.
+    """
+    from codai.api.text import _resolve_compact_manager
+    plan = _plan([], n_ctx=131072, current_manager=_FakeManager(131072),
+                 model="qwen38")
+    _mgr, _name, n = _resolve_compact_manager(plan)
+    assert n == 131072                          # nothing refused us yet
+    co.remember_limit("qwen38", 32768)           # ...then a pod does
+    _mgr, _name, n = _resolve_compact_manager(plan)
+    assert n == 32768

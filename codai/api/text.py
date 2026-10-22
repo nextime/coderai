@@ -516,7 +516,14 @@ def _split_for_compaction(messages, target, strategy, head_messages=1,
                 if len(head) >= want:
                     break
                 t = _estimate_tokens([m])
-                if head and used + t > cap:
+                # The cap binds the FIRST message too. It used to be waived for
+                # it ("keep at least one anchor"), so a conversation whose
+                # opening turn is a pasted 45,000-token document kept that
+                # document verbatim as the head, dropped everything else, and
+                # overflowed anyway -- the one shape where compaction most needs
+                # to work. An opening turn too big to keep belongs to the
+                # slicer, which summarizes its middle, not to the head.
+                if used + t > cap:
                     break
                 head.append(m)
                 used += t
@@ -1052,6 +1059,21 @@ def _resolve_compact_manager(plan):
         compact_n_ctx = compact_manager.get_context_size() if compact_manager else 0
     except Exception:
         compact_n_ctx = 0
+    # A window an engine has already refused against beats the configured one
+    # HERE TOO, and for a sharper reason than in the plan: this number sizes the
+    # summarizer's own chunks, so trusting a configured 131072 against a pod
+    # serving 32768 makes every summarization request overflow -- and the slicer
+    # then leaves the oversized message exactly as it was and reports that
+    # compaction could not help. Measured 2026-10-22, the moment a config said
+    # 131072 before the pod had been relaunched with it.
+    try:
+        from codai.api import context_overflow as _co
+        _served = _co.learned_limit(compact_name) or _co.learned_limit(
+            plan.get("model") or "")
+        if _served and (not compact_n_ctx or _served < compact_n_ctx):
+            compact_n_ctx = int(_served)
+    except Exception:
+        pass
     return compact_manager, compact_name, (compact_n_ctx or plan.get("n_ctx") or 4096)
 
 

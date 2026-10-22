@@ -869,6 +869,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div class="form-row" style="margin:.5rem 0 0">
           <label class="form-label">Max context <span class="muted">(tokens, optional)</span></label>
           <input type="number" id="cfg-rp-ctx" class="form-input" min="0" placeholder="0 = default">
+          <span class="form-hint" style="font-size:11px">The window the pod is <b>launched</b> with (<code>--max-model-len</code>), and the one this model reports to clients and sizes auto-compaction from. The general context field above does not reach a pod. It takes effect on the <b>next pod</b>: a running one keeps the window it started with, and a pod that is re-adopted keeps it too. With a shared pool, the first model to create the pool sets this for every model on it — so set the same value on all of them.</span>
         </div>
 
         <!-- Serverless-only -->
