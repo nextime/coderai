@@ -48,6 +48,19 @@ STYLES = {
     "deepseek_tokens": ("deepseek_v3", "DeepSeekParser"),
 }
 
+#: style id -> the vLLM ``--reasoning-parser`` that separates this family's
+#: thought from its answer. Separate from STYLES because the two questions are
+#: separate: a model can emit tool calls and never think (llama_pythontag has
+#: no entry here), and the reasoning parser is only passed when the template
+#: says the model thinks at all.
+REASONING_PARSERS = {
+    "qwen_xml": "qwen3",
+    "hermes_json": "qwen3",
+    "glm_argkey": "glm45",
+    "deepseek_tokens": "deepseek_r1",
+    "mistral_tokens": "mistral",
+}
+
 _CACHE: dict = {}
 _LOCK = threading.Lock()
 
@@ -190,6 +203,25 @@ def template_path_for_model(model_name: str) -> str:
 def model_thinks(model_name: str) -> bool:
     """:func:`thinks`, for a model named the way a request names it."""
     return thinks(template_path_for_model(model_name))
+
+
+def vllm_reasoning_parser(model_path: str) -> str:
+    """The vLLM ``--reasoning-parser`` for this model, or '' for none.
+
+    Why the SERVER must do this and not us: the closing ``</think>`` is a
+    SPECIAL TOKEN. vLLM decodes with skip_special_tokens, so the tag never
+    appears in the text at all -- measured 2026-10-22, a Qwen3.8 pod returned
+    the thought and the answer concatenated with no separator of any kind, and
+    no amount of parsing downstream can find a boundary that was deleted before
+    the text was formed. Launched with a reasoning parser, vLLM splits the two
+    at the TOKEN level and reports `reasoning_content` as its own field.
+
+    Only for a model whose template says it thinks: a parser wrapped around a
+    model that does not would be looking for a tag that is never coming.
+    """
+    if not thinks(model_path):
+        return ""
+    return REASONING_PARSERS.get(tool_call_style(model_path), "")
 
 
 def vllm_tool_parser(model_path: str) -> str:

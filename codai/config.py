@@ -784,6 +784,9 @@ class VllmConfig:
     # family, so "auto" picks it from the model name and an explicit value
     # (here, or per model in its `vllm` block) wins. "off" disables it.
     tool_call_parser: str = "auto"
+    # Which vLLM parser separates a thinking model's reasoning from its answer.
+    # "auto" reads the model's chat template; "off" leaves the two joined.
+    reasoning_parser: str = "auto"
     extra_args: str = ""                 # extra flags for the api_server
     extra_env: str = ""                  # free-form KEY=VALUE env for the subprocess
     auto_build: bool = False             # create the isolated venv + pip install vllm if missing

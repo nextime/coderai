@@ -243,6 +243,36 @@ def _tool_args(cfg, model_config: dict, model_path: str) -> list:
     return ["--enable-auto-tool-choice", "--tool-call-parser", parser]
 
 
+def _reasoning_args(cfg, model_config: dict, model_path: str) -> list:
+    """`--reasoning-parser X`, when this model thinks and we know how it marks it.
+
+    Without it the thought and the answer come back as ONE string. The closing
+    </think> is a special token and vLLM decodes with skip_special_tokens, so
+    the boundary is deleted before the text exists -- there is nothing left
+    downstream to split on, and the whole thought is delivered to the client as
+    the answer (measured 2026-10-22, Qwen3.8 on an A40).
+
+    An explicit `reasoning_parser` wins, "off" included: a parser aimed at the
+    wrong family hides the answer inside a reasoning field nobody reads, which
+    is worse than not separating it.
+    """
+    want = str(getattr(cfg, "reasoning_parser", "") or "").strip()
+    if want and want.lower() not in ("auto", "detect"):
+        if want.lower() in ("off", "none", "false", "0"):
+            return []
+        print(f"[vllm] reasoning separated by {want!r} (configured)", flush=True)
+        return ["--reasoning-parser", want]
+    try:
+        from codai.models.chat_style import vllm_reasoning_parser
+        parser = vllm_reasoning_parser(model_path)
+    except Exception:
+        parser = ""
+    if not parser:
+        return []
+    print(f"[vllm] reasoning separated by {parser!r}", flush=True)
+    return ["--reasoning-parser", parser]
+
+
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
                 served_name: Optional[str] = None, model_config: dict = None,
                 gpu_memory_utilization: Optional[float] = None,
@@ -301,6 +331,7 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     # Tool calling. vLLM answers 400 to any request carrying `tools` unless it
     # was launched for it, and the message names flags the caller cannot set.
     cmd += _tool_args(cfg, model_config, model_path)
+    cmd += _reasoning_args(cfg, model_config, model_path)
 
     # TOKEN IDS IN LOGPROBS. `ocr.surya_repair_accents` rebuilds a reply whose
     # accents were lost in detokenisation from the model's own token ids, and

@@ -2894,26 +2894,44 @@ async def stream_chat_response(
             # Explicitly flush to ensure data is sent immediately
             await asyncio.sleep(0)
 
-        # Stream ended while still inside the thought (no closing </think>). Flush
-        # whatever reasoning is held as reasoning, not content.
+        # Stream ended while still inside the thought: no closing </think> ever
+        # arrived, so everything was held back as reasoning and the client has
+        # been sent NOTHING.
+        #
+        # That assumption — a pre-filled <think> means the output starts inside a
+        # thought — is only safe while a close tag eventually turns up. Measured
+        # 2026-10-22 on a Qwen3.8 pod: </think> is a SPECIAL TOKEN, vLLM decodes
+        # with skip_special_tokens, and the tag is simply gone. The thought and
+        # the answer arrive concatenated with no separator at all, so the whole
+        # reply — answer included — was being delivered as thinking and the
+        # client got an empty message.
+        #
+        # So an unclosed thought is flushed as CONTENT. A thought that really was
+        # cut off mid-sentence then shows up as the answer, which is untidy; an
+        # empty answer is not untidy, it is a lost reply. The real repair is for
+        # the server to separate the channel itself (--reasoning-parser), which
+        # makes this path unreachable.
         if _reason_active and not _reason_closed and _reason_buf:
             _r_out, _c_out, _reason_buf, _closed = _gate_reasoning(_reason_buf, final=True)
             _reason_closed = True
             if _r_out:
-                reasoning_text += _r_out
-                if not suppress_reasoning:
-                    rdata = {
+                tail, _ = _gate_tool_content(
+                    _r_out, final=True, gemma_mode=_gemma_mode,
+                    tool_names=_tool_names, gate_xml=_gate_xml)
+                if tail:
+                    data = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_name,
                         "choices": [{
                             "index": 0,
-                            "delta": {"reasoning": _r_out, "reasoning_content": _r_out},
+                            "delta": {"content": tail},
                             "finish_reason": None,
                         }],
                     }
-                    yield f"data: {json.dumps(rdata)}\n\n"
+                    client_sent_content += tail
+                    yield f"data: {json.dumps(data)}\n\n"
 
         # The post-</think> answer text — reasoning stripped — used for final tool
         # extraction and logging so the thought never re-enters the content channel.

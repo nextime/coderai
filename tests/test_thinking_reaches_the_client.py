@@ -24,6 +24,7 @@ import pytest
 from codai.models import chat_style
 from codai.models.parser import OpenAIFormatter
 from codai.backends.runpod import RunpodBackend
+from codai.api import vllm_worker as vw
 
 
 PREFILL_TPL = ("{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}"
@@ -327,3 +328,60 @@ def test_passthrough_cannot_retarget_a_pod():
     assert payload["model"] == "qwen38"
     assert payload["stream"] is False
     assert payload["messages"] is msgs
+
+
+# --------------------------- the SERVER must separate it: the tag is a token #
+
+class _Cfg:
+    tool_call_parser = "auto"
+    reasoning_parser = "auto"
+
+
+def test_a_thinking_model_launches_with_a_reasoning_parser(tmp_path):
+    """THE ROOT CAUSE: </think> is a SPECIAL TOKEN and vLLM decodes with
+    skip_special_tokens, so the tag is deleted before the text exists. A pod
+    returned the thought and the answer concatenated with no separator of any
+    kind -- nothing downstream can split on a boundary that was removed."""
+    d = tmp_path / "m"; d.mkdir()
+    (d / "chat_template.jinja").write_text(
+        "{%- if add_generation_prompt %}{{- '<think>\\n' }}{%- endif %}"
+        "<tool_call>\n<function=f>\n<parameter=k>v</parameter>")
+    assert vw._reasoning_args(_Cfg(), {}, str(d)) == ["--reasoning-parser", "qwen3"]
+
+
+def test_a_model_that_does_not_think_gets_no_parser(tmp_path):
+    """A parser looking for a tag that is never coming."""
+    d = tmp_path / "m"; d.mkdir()
+    (d / "chat_template.jinja").write_text(
+        "<tool_call>\n<function=f>\n<parameter=k>v</parameter>")
+    assert vw._reasoning_args(_Cfg(), {}, str(d)) == []
+
+
+def test_an_explicit_reasoning_parser_wins(tmp_path):
+    d = tmp_path / "m"; d.mkdir()
+    (d / "chat_template.jinja").write_text("<think>")
+    cfg = _Cfg(); cfg.reasoning_parser = "deepseek_r1"
+    assert vw._reasoning_args(cfg, {}, str(d)) == ["--reasoning-parser", "deepseek_r1"]
+
+
+def test_off_leaves_the_channels_joined(tmp_path):
+    d = tmp_path / "m"; d.mkdir()
+    (d / "chat_template.jinja").write_text("<think>")
+    cfg = _Cfg(); cfg.reasoning_parser = "off"
+    assert vw._reasoning_args(cfg, {}, str(d)) == []
+
+
+def test_an_unreadable_template_adds_no_flag(tmp_path):
+    assert vw._reasoning_args(_Cfg(), {}, str(tmp_path / "nope")) == []
+
+
+def test_the_families_each_get_their_own(tmp_path):
+    from codai.models.chat_style import REASONING_PARSERS, vllm_reasoning_parser
+    import codai.models.chat_style as cs
+    for style, tpl, want in (
+            ("glm_argkey", "<think><tool_call>x<arg_key>k</arg_key>", "glm45"),
+            ("mistral_tokens", "<think>[TOOL_CALLS]", "mistral"),
+    ):
+        cs.forget()
+        cs._CACHE["p"] = tpl
+        assert vllm_reasoning_parser("p") == want, style
