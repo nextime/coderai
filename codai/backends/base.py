@@ -20,6 +20,14 @@ from abc import ABC, abstractmethod
 from typing import AsyncGenerator, List, Optional
 
 
+class RemoteStreamError(RuntimeError):
+    """The remote reported an error INSIDE a stream it had already answered 200 to.
+
+    Raised from an SSE reader so it reaches the caller as a failure rather than
+    as a stream that ended early -- see the proxy backends' _handle_line.
+    """
+
+
 class ModelBackend(ABC):
     """Abstract base class for model backends."""
     

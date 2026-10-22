@@ -50,12 +50,27 @@ CODE = "context_length_exceeded"
 #: Phrasings seen in the wild, each yielding what it knows. Order matters only
 #: in that the first match wins, so the most specific patterns come first.
 _PATTERNS = (
-    # vLLM / OpenAI: the richest phrasing, and the one a pod answers with.
+    # vLLM 0.27 (verified against the refusal a production pod actually sent,
+    # 2026-10-22). It names the OUTPUT tokens first and the prompt second, so a
+    # pattern expecting "you requested <total> tokens" -- the older OpenAI
+    # wording -- matched nothing and the numbers were lost.
+    re.compile(
+        r"maximum context length is (?P<limit>\d+) tokens.{0,80}?"
+        r"you requested (?P<completion>\d+) output tokens and your prompt "
+        r"contains at least (?P<prompt>\d+) input tokens, for a total of at "
+        r"least (?P<requested>\d+) tokens", re.IGNORECASE | re.DOTALL),
+    # OpenAI / older vLLM: one total, then the split.
     re.compile(
         r"maximum context length is (?P<limit>\d+) tokens.{0,40}?"
         r"you requested (?P<requested>\d+) tokens?"
         r"(?:\D{0,40}?(?P<prompt>\d+) in the messages"
         r"\D{0,40}?(?P<completion>\d+) in the completion)?",
+        re.IGNORECASE | re.DOTALL),
+    # The same refusal with only the limit in that clause; the prompt size comes
+    # from the parameter vLLM appends: "(parameter=input_tokens, value=32469)".
+    re.compile(
+        r"maximum context length is (?P<limit>\d+) tokens.{0,400}?"
+        r"parameter=input_tokens, value=(?P<prompt>\d+)",
         re.IGNORECASE | re.DOTALL),
     # vLLM V1 engine, prompt-only phrasing.
     re.compile(

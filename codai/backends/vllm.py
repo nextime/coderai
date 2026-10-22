@@ -18,7 +18,8 @@ import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
-from codai.backends.base import ModelBackend, merge_tool_call_deltas, messages_for_the_wire
+from codai.backends.base import (ModelBackend, RemoteStreamError,
+                                 merge_tool_call_deltas, messages_for_the_wire)
 
 
 class VllmBackend(ModelBackend):
@@ -500,6 +501,24 @@ class VllmBackend(ModelBackend):
                 obj = json.loads(data)
             except ValueError:
                 return False
+            # An error reported INSIDE the stream. A remote serving an OpenAI
+            # API answers 200 and then says so in an SSE event (coderai does it
+            # itself, deliberately, so a client treats it as an error instead of
+            # as assistant text) -- so there is no status code to notice. This
+            # event carries no `choices`, so reading only the delta dropped it
+            # and the stream simply ended: the caller saw a clean finish with no
+            # content and reported an empty answer. Measured 2026-10-22 on a
+            # conversation past the pod's context window, which came back as a
+            # successful, empty completion.
+            # Present and not None, rather than truthy: `{"error": {}}` is a
+            # reported failure (and must not pass as a success), while some
+            # OpenAI-compatible servers put a literal `"error": null` in every
+            # ordinary chunk, which must not fail the stream.
+            err = obj.get("error", None) if isinstance(obj, dict) else None
+            if err is not None:
+                msg = err.get("message") if isinstance(err, dict) else err
+                raise RemoteStreamError(str(msg or "") or "the remote reported "
+                                        "an error with no message")
             choice = (obj.get("choices") or [{}])[0]
             piece = choice.get(delta_key) or {}
             text = piece.get("content") or ""

@@ -40,6 +40,47 @@ VLLM = ("This model's maximum context length is 32768 tokens. However, you "
         "completion). Please reduce the length of the messages or completion.")
 
 
+#: The refusal a production pod ACTUALLY sent, 2026-10-22, wrappers and all:
+#: vLLM's words inside the pod's coderai inside the pod's HTTP error. Written
+#: out in full because the first version of this parser was tested against a
+#: hand-written fixture using the older OpenAI wording and matched nothing here
+#: -- the real message names the OUTPUT tokens first and the prompt second.
+PRODUCTION = (
+    "The conversation is too long for this model's context window (400 Bad "
+    "Request from http://127.0.0.1:41721/v1/chat/completions on "
+    "chat/completions: This model's maximum context length is 32768 tokens. "
+    "However, you requested 300 output tokens and your prompt contains at "
+    "least 32469 input tokens, for a total of at least 32769 tokens. Please "
+    "reduce the length of the input prompt or the number of requested output "
+    "tokens. (parameter=input_tokens, value=32469)). Shorten the prompt or "
+    "lower max_tokens, or increase the model's context size (n_ctx) in its "
+    "configuration. (the pod answered 400)")
+
+
+def test_the_refusal_production_really_sent_parses():
+    got = co.parse(PRODUCTION)
+    assert got["limit"] == 32768
+    assert got["prompt"] == 32469
+    assert got["completion"] == 300
+    assert got["requested"] == 32769
+
+
+def test_the_production_refusal_front_loads_both_numbers():
+    """What the client keeps when it truncates: the first clause has to carry
+    them, because the wrappers above push everything else out of reach."""
+    msg = co.message(co.parse(PRODUCTION), model="qwen38")
+    assert "32769" in msg[:90] and "32768" in msg[:90]
+
+
+def test_the_prompt_size_is_recovered_from_the_parameter_clause():
+    """A build that states the limit but not the split still appends
+    "(parameter=input_tokens, value=N)", which is enough to plan a retry."""
+    got = co.parse("This model's maximum context length is 8192 tokens. "
+                   "However, the request is too long. "
+                   "(parameter=input_tokens, value=9001)")
+    assert got["limit"] == 8192 and got["prompt"] == 9001
+
+
 def test_the_vllm_refusal_gives_up_all_four_numbers():
     got = co.parse(VLLM)
     assert got == {"limit": 32768, "requested": 35000,
