@@ -1,10 +1,15 @@
 """Live GPU/VRAM for rented pods on the RunPod page, read FROM THE PODS.
 
-A pod runs coderai, so it already serves /admin/api/gpu-stats (nvidia-smi off
-its own loop, cached 1.5s there). Asking the pod is cheaper and fresher than
-asking RunPod, whose utilisation lags by tens of seconds and whose every read
-spends the same quota that renting and boot-polling need -- telemetry must
-never be able to cost a fleet its ability to rent.
+A pod serves /internal/engine-state, which already carries a `vram` block
+(used/free/total per card, cached 4s there). I first built this against
+/admin/api/gpu-stats and the pods answered 404: a pod runs the SLIM app, which
+serves /healthz, /v1/models and /internal/engine-state and no admin API at all.
+Probe the pod before choosing its endpoint.
+
+Asking the pod is cheaper and fresher than asking RunPod, whose utilisation
+lags by tens of seconds and whose every read spends the same quota that renting
+and boot-polling need -- telemetry must never be able to cost a fleet its
+ability to rent.
 """
 import asyncio
 import types
@@ -69,11 +74,23 @@ def test_the_admin_path_hangs_off_the_root(given, want):
 
 # ------------------------------------------------------------- the fetching #
 
-def _answer(cards, status=200):
+def _state(devices, status=200):
+    """A pod's /internal/engine-state answer."""
     r = types.SimpleNamespace()
     r.status_code = status
-    r.json = lambda: {"cards": cards}
+    r.json = lambda: {"ok": True, "vram": {"devices": devices,
+                                           "device_count": len(devices)}}
     return r
+
+
+def _answer(cards, status=200):
+    """Cards in summarise() shape, expressed as a pod would report them:
+    the pod reports FREE, not used."""
+    devs = [{"total": c.get("mem_total", 48),
+             "free": c.get("mem_total", 48) - c.get("mem_used", 0),
+             **{k: c[k] for k in ("util", "temp") if k in c}}
+            for c in cards]
+    return _state(devs, status)
 
 
 def test_a_pod_is_asked_with_its_own_bearer(monkeypatch):
@@ -85,7 +102,7 @@ def test_a_pod_is_asked_with_its_own_bearer(monkeypatch):
     monkeypatch.setattr("codai.api.pod_http.get", _get)
     out = asyncio.run(pt.collect([("p1", "https://pod:1/v1", "its-own-key")]))
     assert out["p1"]["gpu_util"] == 55.0
-    assert seen["url"] == "https://pod:1/admin/api/gpu-stats"
+    assert seen["url"] == "https://pod:1/internal/engine-state"
     assert seen["headers"]["Authorization"] == "Bearer its-own-key"
     assert seen["timeout"] == pt.TIMEOUT_S
 
@@ -204,3 +221,53 @@ def test_endpoints_carry_each_pods_own_key():
         rw._pools.clear()
         rw._pools.update(saved)
     assert got == {"a": "own-key", "b": "pool-key"}
+
+
+# --------------------------- the pod reports FREE, so used is the difference #
+
+def test_used_is_derived_from_free_because_that_is_what_the_pod_reports():
+    cards = pt.cards_from_engine_state(
+        {"vram": {"devices": [{"index": 0, "name": "NVIDIA A40",
+                               "free": 4.5, "total": 48.31}]}})
+    assert cards == [{"mem_total": 48.31, "mem_used": pytest.approx(43.81)}]
+
+
+def test_util_and_temp_ride_along_when_the_pod_reports_them():
+    cards = pt.cards_from_engine_state(
+        {"vram": {"devices": [{"free": 4.5, "total": 48.31,
+                               "util": 97, "temp": 74}]}})
+    assert cards[0]["util"] == 97.0 and cards[0]["temp"] == 74.0
+
+
+def test_an_older_pod_reports_vram_only():
+    """It serves engine-state without util/temp. VRAM must still show, and the
+    page shows a dash for utilisation rather than a zeroed bar."""
+    out = pt.summarise(pt.cards_from_engine_state(
+        {"vram": {"devices": [{"free": 4.5, "total": 48.31}]}}))
+    assert out["vram_used_gb"] == pytest.approx(43.81)
+    assert "gpu_util" not in out and "gpu_temp_c" not in out
+
+
+def test_a_pod_with_no_card_reports_nothing():
+    assert pt.cards_from_engine_state({"vram": None}) == []
+    assert pt.cards_from_engine_state({}) == []
+    assert pt.cards_from_engine_state({"vram": {"devices": []}}) == []
+
+
+def test_totals_without_a_device_list_are_still_used():
+    cards = pt.cards_from_engine_state({"vram": {"used": 43.8, "free": 4.5,
+                                                 "total": 48.31}})
+    assert cards[0]["mem_total"] == 48.31
+
+
+def test_the_real_shape_a_live_pod_returned():
+    """Copied from pod 997ags1r9l6im3, 2026-10-22."""
+    out = pt.summarise(pt.cards_from_engine_state({
+        "ok": True, "vram": {"used": 43.8, "free": 4.5, "total": 48.31,
+                             "gpu": "NVIDIA A40",
+                             "devices": [{"index": 0, "name": "NVIDIA A40",
+                                          "free": 4.5, "total": 48.31}],
+                             "device_count": 1}}))
+    assert out["vram_used_gb"] == pytest.approx(43.81)
+    assert out["vram_total_gb"] == 48.31
+    assert out["gpu_cards"] == 1

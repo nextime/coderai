@@ -442,8 +442,15 @@ def _cached_engine_vram():
                 used += (t - f); free += f; total += t
                 if i not in _names:
                     _names[i] = d["name"]
-                devs.append({"index": i, "name": _names[i],
-                             "free": round(f / 1e9, 2), "total": round(t / 1e9, 2)})
+                dev = {"index": i, "name": _names[i],
+                       "free": round(f / 1e9, 2), "total": round(t / 1e9, 2)}
+                # Utilisation and temperature when the collector could read
+                # them. Reported per card so a caller can see WHICH card is
+                # busy; absent rather than zero when unknown.
+                for key in ("util", "temp"):
+                    if isinstance(d.get(key), (int, float)):
+                        dev[key] = round(float(d[key]), 1)
+                devs.append(dev)
             n = len(devs)
             label = (devs[0]["name"] if n == 1 else f"{n}× GPU")
             vram = {"used": round(used / 1e9, 2), "free": round(free / 1e9, 2),

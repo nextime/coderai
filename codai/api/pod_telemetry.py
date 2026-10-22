@@ -8,10 +8,11 @@
 
 """Live GPU/VRAM telemetry for rented pods, read FROM THE PODS.
 
-A pod runs coderai, so it already serves `/admin/api/gpu-stats` — per-card
-utilisation, VRAM used and total, and temperature, collected by the front with
-nvidia-smi off its event loop and cached there for 1.5s. Asking the pod is
-therefore both cheaper and fresher than the alternatives:
+A pod serves `/internal/engine-state`, which already carries a `vram` block —
+used, free and total, per card, with the GPU's name — built context-free and
+cached there for 4s. (It is the endpoint the front health-polls, so it exists on
+every pod and costs the pod nothing extra.) Asking the pod is cheaper and
+fresher than the alternatives:
 
   * RunPod's own API reports utilisation too, but every read spends quota from
     the same budget renting and boot-polling spend (a 429 there stops the fleet
@@ -100,16 +101,51 @@ def summarise(cards: Iterable[dict]) -> dict:
     return out
 
 
+def cards_from_engine_state(state: dict) -> list:
+    """The `vram` block of `/internal/engine-state`, as :func:`summarise` cards.
+
+    The pod reports FREE and total per card (that is what a context-free query
+    returns); used is the difference. `util`/`temp` are present only on a pod
+    new enough to collect them — older pods report VRAM alone, and the page
+    shows a dash for what it was not told rather than inventing a zero.
+    """
+    vram = (state or {}).get("vram") or {}
+    devs = vram.get("devices")
+    if not isinstance(devs, list) or not devs:
+        # A single-card pod that reports only the totals is still worth showing.
+        if isinstance(vram.get("total"), (int, float)):
+            devs = [{"free": vram.get("free"), "total": vram.get("total"),
+                     "util": vram.get("util"), "temp": vram.get("temp")}]
+        else:
+            return []
+    out = []
+    for d in devs:
+        if not isinstance(d, dict):
+            continue
+        total, free = d.get("total"), d.get("free")
+        card = {}
+        if isinstance(total, (int, float)):
+            card["mem_total"] = float(total)
+            if isinstance(free, (int, float)):
+                card["mem_used"] = max(0.0, float(total) - float(free))
+        for key in ("util", "temp"):
+            if isinstance(d.get(key), (int, float)):
+                card[key] = float(d[key])
+        if card:
+            out.append(card)
+    return out
+
+
 def _fetch(pod_id: str, url: str, key: str) -> dict:
     """Ask ONE pod. Blocking; always called off the event loop."""
     from codai.api import pod_http
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        r = pod_http.get(_root(url) + "/admin/api/gpu-stats",
+        r = pod_http.get(_root(url) + "/internal/engine-state",
                          headers=headers, timeout=TIMEOUT_S)
         if r.status_code != 200:
             return {}
-        return summarise((r.json() or {}).get("cards") or [])
+        return summarise(cards_from_engine_state(r.json() or {}))
     except Exception:
         # A pod that cannot be reached has no telemetry, which is not an error
         # worth surfacing: the pod's own health is reported beside it already.

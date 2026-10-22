@@ -77,8 +77,18 @@ def _via_pynvml() -> Optional[List[Dict[str, Any]]]:
                     uuid = uuid.decode("utf-8", "replace")
             except Exception:
                 uuid = None
-            out.append({"index": i, "name": str(name), "uuid": uuid,
-                        "free": int(m.free), "total": int(m.total)})
+            row = {"index": i, "name": str(name), "uuid": uuid,
+                   "free": int(m.free), "total": int(m.total)}
+            try:
+                row["util"] = float(p.nvmlDeviceGetUtilizationRates(h).gpu)
+            except Exception:
+                pass
+            try:
+                row["temp"] = float(p.nvmlDeviceGetTemperature(
+                    h, p.NVML_TEMPERATURE_GPU))
+            except Exception:
+                pass
+            out.append(row)
         return out or None
     except Exception:
         return None
@@ -90,7 +100,11 @@ def _via_nvidia_smi() -> Optional[List[Dict[str, Any]]]:
         return None
     try:
         r = subprocess.run(
-            [exe, "--query-gpu=index,name,uuid,memory.free,memory.total",
+            # util/temp ride along with the memory query rather than costing a
+            # second nvidia-smi: the page that shows VRAM wants both, and a
+            # saturated card answers slowly enough that one call matters.
+            [exe, "--query-gpu=index,name,uuid,memory.free,memory.total,"
+                  "utilization.gpu,temperature.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
@@ -101,12 +115,21 @@ def _via_nvidia_smi() -> Optional[List[Dict[str, Any]]]:
             if len(parts) < 5:
                 continue
             try:
-                out.append({"index": int(parts[0]), "name": parts[1],
-                            "uuid": parts[2] or None,
-                            "free": int(float(parts[3])) * 1024 * 1024,
-                            "total": int(float(parts[4])) * 1024 * 1024})
+                row = {"index": int(parts[0]), "name": parts[1],
+                       "uuid": parts[2] or None,
+                       "free": int(float(parts[3])) * 1024 * 1024,
+                       "total": int(float(parts[4])) * 1024 * 1024}
             except (TypeError, ValueError):
                 continue
+            # Absent or "[N/A]" on some cards/drivers: left out rather than
+            # zeroed, because a zero reads as "idle".
+            for key, idx in (("util", 5), ("temp", 6)):
+                if len(parts) > idx:
+                    try:
+                        row[key] = float(parts[idx])
+                    except (TypeError, ValueError):
+                        pass
+            out.append(row)
         return out or None
     except Exception:
         return None
