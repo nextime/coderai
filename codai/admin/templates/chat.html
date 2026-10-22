@@ -98,6 +98,19 @@
 .msg-body { max-width:70%; }
 .msg.user .msg-body { text-align:right; }
 .msg-meta { font-size:10px; color:var(--text-3); margin-bottom:.2rem; }
+/* The model's thinking, kept visibly apart from its answer: it is how the
+   model got there, not what it said. Collapsed by default, and it fills while
+   the model is still thinking. */
+.msg-think { border-left:2px solid var(--text-3); margin-bottom:.35rem;
+  background:transparent; }
+.msg-think > summary { font-size:10px; color:var(--text-3); cursor:pointer;
+  padding:.1rem .5rem; list-style:none; user-select:none; }
+.msg-think > summary::-webkit-details-marker { display:none; }
+.msg-think > summary::before { content:'▸ '; }
+.msg-think[open] > summary::before { content:'▾ '; }
+.msg-think .think-text { font-size:11px; color:var(--text-3); padding:.1rem .5rem .4rem;
+  white-space:pre-wrap; font-family:var(--mono,monospace); line-height:1.45;
+  max-height:18rem; overflow:auto; }
 .msg-text { background:var(--surface-2); padding:.5rem .75rem; border-radius:8px;
   font-size:13px; line-height:1.55; white-space:pre-wrap; word-break:break-word; }
 .msg.user .msg-text { background:var(--accent-dim,#1d3354); }
@@ -524,7 +537,17 @@ a.dl { display:inline-block; margin-top:.4rem; }
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px"><line x1="14" y1="2" x2="7" y2="9"/><polygon points="14 2 10 14 7 9 2 6 14 2"/></svg>
           </button>
         </div>
-        <div class="chat-hint">Enter to send · Shift+Enter for newline</div>
+        <div class="chat-hint" style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap">
+          <span>Enter to send · Shift+Enter for newline</span>
+          <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer"
+                 title="Stream the reply as it is generated, so thinking shows while the model thinks">
+            <input type="checkbox" id="chat-stream" checked> stream
+          </label>
+          <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer"
+                 title="Thinking models think by default; clear this to ask the model not to think">
+            <input type="checkbox" id="chat-think" checked> thinking
+          </label>
+        </div>
       </div>
     </div>
 
@@ -4074,23 +4097,111 @@ async function sendChat() {
   chatBusy = true; $('send-btn').disabled = true;
   $('typing').textContent = 'Thinking…';
   const _chatT0 = Date.now();
+  const wantStream = $('chat-stream') ? $('chat-stream').checked : true;
+  const wantThink  = $('chat-think')  ? $('chat-think').checked  : true;
+  const body = {model:activeModel.id, messages:chatHistory, stream:wantStream};
+  // Only sent when the box is CLEARED. A thinking model thinks by default, and
+  // saying so explicitly is not the same as saying nothing: `false` is
+  // forwarded to the chat template and asks the model not to think at all.
+  if (!wantThink) body.enable_thinking = false;
   try {
     const r = await fetch(ROOT_PATH + '/v1/chat/completions',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:activeModel.id,messages:chatHistory,stream:false})
+      body:JSON.stringify(body)
     });
     if (!r.ok) throw new Error('HTTP '+r.status+': '+await r.text());
-    const d = await r.json();
-    const reply = d.choices[0].message.content;
-    const elapsed = (Date.now() - _chatT0) / 1000;
-    const toks = d.usage?.completion_tokens;
-    if (toks && elapsed > 0) {
-      $('typing').textContent = `${toks} tok · ${(toks/elapsed).toFixed(1)} tok/s`;
+
+    if (!wantStream) {
+      const d = await r.json();
+      const m = d.choices[0].message || {};
+      const elapsed = (Date.now() - _chatT0) / 1000;
+      const toks = d.usage?.completion_tokens;
+      if (toks && elapsed > 0) {
+        $('typing').textContent = `${toks} tok · ${(toks/elapsed).toFixed(1)} tok/s`;
+      }
+      const el = addMsg('assistant', m.content || '');
+      const think = m.reasoning_content || m.reasoning || '';
+      if (think) setThinking(el, think, true);
+      chatHistory.push({role:'assistant', content:m.content || '',
+                        ...(think ? {reasoning_content:think} : {})});
+      return;
     }
-    addMsg('assistant',reply);
-    chatHistory.push({role:'assistant',content:reply});
+
+    // Streamed: the answer and the thinking arrive as they are produced, which
+    // is the point of showing thinking at all.
+    const el = addMsg('assistant', '');
+    const textEl = el.querySelector('.msg-text');
+    let answer = '', think = '', nTok = 0;
+    for await (const ev of sseChunks(r)) {
+      const ch = (ev.choices || [{}])[0] || {};
+      const delta = ch.delta || {};
+      const piece = delta.reasoning_content || delta.reasoning || '';
+      if (piece) { think += piece; setThinking(el, think, false); nTok++; }
+      if (delta.content) {
+        answer += delta.content; nTok++;
+        textEl.textContent = answer;
+        $('chat-msgs').scrollTop = $('chat-msgs').scrollHeight;
+      }
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const fn = tc.function || {};
+          answer += `\n[tool call] ${fn.name || '?'}(${fn.arguments || ''})`;
+          textEl.textContent = answer;
+        }
+      }
+      if (ev.usage?.completion_tokens) nTok = ev.usage.completion_tokens;
+    }
+    // Thinking is finished: collapse it and leave the answer in front.
+    if (think) setThinking(el, think, true);
+    const elapsed = (Date.now() - _chatT0) / 1000;
+    if (nTok && elapsed > 0) {
+      $('typing').textContent = `${nTok} tok · ${(nTok/elapsed).toFixed(1)} tok/s`;
+    }
+    chatHistory.push({role:'assistant', content:answer,
+                      ...(think ? {reasoning_content:think} : {})});
   } catch(e) { addMsg('assistant','Error: '+e.message); }
   finally { chatBusy=false; $('send-btn').disabled=false; setTimeout(()=>{ $('typing').textContent=''; }, 3000); }
+}
+
+/* Read an SSE body as a stream of parsed events. Chunks split anywhere, so
+   lines are reassembled across reads rather than parsed per chunk. */
+async function* sseChunks(response) {
+  const reader = response.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream:true});
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') return;
+      try { yield JSON.parse(payload); } catch (_) { /* keepalive or partial */ }
+    }
+  }
+}
+
+/* The thinking block for one message: created on first use, kept above the
+   answer, open while the model is still thinking and collapsed once done. */
+function setThinking(msgEl, text, done) {
+  const body = msgEl.querySelector('.msg-body');
+  let box = body.querySelector('.msg-think');
+  if (!box) {
+    box = document.createElement('details');
+    box.className = 'msg-think';
+    box.open = !done;
+    box.innerHTML = '<summary></summary><div class="think-text"></div>';
+    body.insertBefore(box, body.querySelector('.msg-text'));
+  }
+  box.querySelector('.think-text').textContent = text;
+  box.querySelector('summary').textContent = done ? 'thought' : 'thinking…';
+  if (done) box.open = false;
+  const w = $('chat-msgs');
+  w.scrollTop = w.scrollHeight;
 }
 
 $('chat-in').addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();} });

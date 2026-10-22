@@ -134,6 +134,64 @@ def tool_call_style(model_path: str) -> str:
     return ""
 
 
+def thinks(model_path: str) -> bool:
+    """True when this model emits a reasoning block of its own.
+
+    Read from the template for the same reason the tool-call style is: a name
+    does not say. Measured 2026-10-22 — `qwen38` and `diogene-alpha` are the
+    SAME weights behind two aliases, and a name regex (`qwen3`) matched one and
+    not the other, so one answered cleanly and the other sent its entire chain
+    of thought to the client as the answer.
+
+    A template that pre-fills the opening tag in its generation prompt --
+
+        {%- if add_generation_prompt %}
+            {{- '<|im_start|>assistant\\n' }}
+            {{- '<think>\\n' }}
+
+    -- makes the model emit the thought body and a BARE ``</think>``, with no
+    opening tag anywhere in the output. That is the form that leaks when
+    nothing is looking for it.
+    """
+    tpl = chat_template_text(model_path)
+    if not tpl:
+        return False
+    return any(t in tpl for t in ("<think>", "</think>", "<thinking>",
+                                  "<|begin_of_thought|>", "enable_thinking"))
+
+
+def template_path_for_model(model_name: str) -> str:
+    """Where to read ``model_name``'s template from, or ''.
+
+    The base an adapter adapts (a LoRA has no template of its own), else the
+    entry's own path, else the name — a repo id often enough to be worth
+    trying. Resolved here so the tool-call style, the parser choice and the
+    reasoning check all ask about the same file.
+    """
+    name = str(model_name or "").strip()
+    if not name:
+        return ""
+    try:
+        from codai.models.parser import _family_name
+        base = _family_name(name)
+    except Exception:
+        base = name
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(base) or _model_entry_for(name) or {}
+        block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+        return (str(entry.get("path") or "").strip()
+                or str(block.get("hf_repo") or "").strip()
+                or base or name)
+    except Exception:
+        return base or name
+
+
+def model_thinks(model_name: str) -> bool:
+    """:func:`thinks`, for a model named the way a request names it."""
+    return thinks(template_path_for_model(model_name))
+
+
 def vllm_tool_parser(model_path: str) -> str:
     """The vLLM ``--tool-call-parser`` this model's template calls for, or ''."""
     return STYLES.get(tool_call_style(model_path), ("", ""))[0]

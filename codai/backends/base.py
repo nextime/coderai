@@ -67,6 +67,18 @@ class ModelBackend(ABC):
         """Return the model's context window size."""
         return 2048  # Default fallback
 
+    def get_last_reasoning(self):
+        """The reasoning the backend itself reported for the last call, or None.
+
+        A backend that generates text has none: the thought is still inside the
+        generated string, with its tags, and the caller separates it. A PROXY
+        backend is the opposite case — the remote separated it already and sent
+        it in its own field, which the text contract of ``generate_chat`` cannot
+        carry. Without this the thought is not leaked but LOST: the client sees
+        a clean answer and no sign there was any thinking at all.
+        """
+        return None
+
     def get_last_tool_calls(self):
         """The tool calls the backend itself reported for the last call, or None.
 

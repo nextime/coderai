@@ -945,6 +945,21 @@ class ModelManager:
         except Exception:
             return None
 
+    def get_last_reasoning(self):
+        """Reasoning the backend separated out for the last call, or None.
+
+        Only a proxy backend has any: the remote separated the thought itself
+        and sent it in its own field. A local backend answers None and the
+        caller separates the thought out of the generated text as before.
+        """
+        fn = getattr(self.backend, "get_last_reasoning", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
     def get_last_tool_calls(self):
         """Tool calls the backend reported structurally for the last call, or None.
 

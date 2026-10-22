@@ -1130,6 +1130,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         messages_dict = []
         for msg in request.messages:
             msg_dict = {"role": msg.role, "content": msg.content or ""}
+            _think = getattr(msg, 'reasoning_content', None) or getattr(msg, 'reasoning', None)
+            if _think:
+                msg_dict["reasoning_content"] = _think
             if hasattr(msg, 'tool_calls') and msg.tool_calls:
                 msg_dict["tool_calls"] = msg.tool_calls
             if hasattr(msg, 'tool_call_id') and msg.tool_call_id:
@@ -1360,7 +1363,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Enable thinking/reasoning mode if requested via API parameter OR CLI flag
     force_reasoning_args = getattr(global_args, 'force_reasoning', None) if global_args else None
     
-    enable_thinking_api = getattr(request, 'enable_thinking', False)
+    # None means "the caller did not say", which is NOT the same as false: a
+    # thinking model thinks by default, and only an explicit false asks it to
+    # stop. The two were indistinguishable while this field defaulted to False.
+    enable_thinking_req = getattr(request, 'enable_thinking', None)
+    enable_thinking_api = bool(enable_thinking_req)
     
     # Parse force_reasoning: can be list (from CLI) or string (legacy)
     if isinstance(force_reasoning_args, str):
@@ -1436,10 +1443,25 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # The reasoning channel must be separated whenever the model actually thinks —
     # which includes models that AUTO-think: their chat template pre-fills <think>
     # at generation regardless of the API `enable_thinking` flag (e.g. Qwen3, QwQ,
-    # DeepSeek-R1). So activate on the explicit flag OR a thinking-model name.
-    _thinking_model = bool(_re.search(
-        r'qwen3|qwq|deepseek[-_]?r[12]|[-_]reasoner|[-_]thinking|glm[-_]?z1',
-        (getattr(request, 'model', '') or ''), _re.IGNORECASE))
+    # DeepSeek-R1). Left unseparated, the whole chain of thought is delivered to
+    # the client AS THE ANSWER.
+    #
+    # Asked of the model's TEMPLATE, not its name. The name regex below is kept
+    # as a last resort for a model whose template cannot be read, but it cannot
+    # be the first answer: `qwen38` and `diogene-alpha` are the same weights
+    # behind two aliases, and `qwen3` matches one of those spellings and not the
+    # other — so on 2026-10-22 one answered cleanly and the other leaked its
+    # entire thought, from the same pod, on the same template.
+    _thinking_model = False
+    try:
+        from codai.models.chat_style import model_thinks
+        _thinking_model = model_thinks(getattr(request, 'model', '') or '')
+    except Exception:
+        pass
+    if not _thinking_model:
+        _thinking_model = bool(_re.search(
+            r'qwen3|qwq|deepseek[-_]?r[12]|[-_]reasoner|[-_]thinking|glm[-_]?z1',
+            (getattr(request, 'model', '') or ''), _re.IGNORECASE))
     _reasoning_active = bool(reasoning_enabled) or _thinking_model
 
     # System prompt addon for qwen3 with force_reasoning
@@ -1613,8 +1635,14 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             msg_dict["name"] = msg.name
         if msg.tool_call_id:
             msg_dict["tool_call_id"] = msg.tool_call_id
+        # A previous turn's thinking, when the client kept it. Qwen3's template
+        # re-renders it inside <think>, so dropping it changes the prompt the
+        # model continues from.
+        _think = getattr(msg, 'reasoning_content', None) or getattr(msg, 'reasoning', None)
+        if _think:
+            msg_dict["reasoning_content"] = _think
         messages_dict.append(msg_dict)
-    
+
     # Final safety check: ensure NO message has None content before passing to llama_cpp
     # Also ensure content key always exists (not just None check)
     for i, m in enumerate(messages_dict):
@@ -2372,11 +2400,18 @@ def _chat_passthrough(request) -> Optional[Dict]:
     unknown field is unaffected rather than broken.
     """
     try:
-        extra = getattr(request, "model_extra", None)
-        if not extra:
-            return None
+        extra = getattr(request, "model_extra", None) or {}
         out = {k: v for k, v in extra.items()
                if k not in _CHAT_CONSUMED_FIELDS and not k.startswith("_")}
+        # An EXPLICIT enable_thinking is the caller asking the model itself to
+        # think or not to, which only the chat template can decide — so it
+        # travels as a template argument. Unset sends nothing, leaving the
+        # model's own default, which for a thinking model means it thinks.
+        # Without this, a request could not turn thinking off on a served model
+        # at all: coderai consumed the field and no backend forwarded it.
+        want_think = getattr(request, "enable_thinking", None)
+        if want_think is not None and "chat_template_kwargs" not in out:
+            out["chat_template_kwargs"] = {"enable_thinking": bool(want_think)}
         return out or None
     except Exception:
         # A request that cannot be inspected is still a request to serve.
@@ -3204,6 +3239,16 @@ async def generate_chat_response(
         if reasoning_active:
             from codai.models.parser import extract_reasoning_content
             reasoning_text, generated_text = extract_reasoning_content(generated_text, model_name)
+        if not reasoning_text:
+            # A proxy backend's remote separated the thought itself and sent it
+            # in its own field, so there are no tags left in the text here to
+            # find — without asking, the thinking is lost rather than leaked.
+            try:
+                reasoning_text = (current_manager.get_last_reasoning() or ""
+                                  if hasattr(current_manager, 'get_last_reasoning')
+                                  else "")
+            except Exception:
+                reasoning_text = ""
 
         response_message = {
             "role": "assistant",
@@ -3299,7 +3344,11 @@ async def generate_chat_response(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             tool_calls=response_message.get("tool_calls"),
-            context_size=context_size
+            context_size=context_size,
+            # The thought was separated out of the content above; without this
+            # it was separated and then thrown away, so a client saw neither
+            # the thinking nor any sign that there had been any.
+            reasoning=response_message.get("reasoning_content"),
         )
         # Patch in the real cached_tokens value
         if formatted_response and 'usage' in formatted_response:

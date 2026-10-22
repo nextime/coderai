@@ -40,6 +40,12 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[List[Dict]] = None
     tool_call_id: Optional[str] = None
     cache_control: Optional[Dict] = None  # OpenAI-style: {"type": "ephemeral"}
+    # A previous turn's thinking, sent back by a client that kept it. Qwen3's own
+    # chat template reads `message.reasoning_content` and re-renders it inside
+    # <think> tags, so dropping it changes the prompt the model is continuing
+    # from. Pydantic ignores unknown fields, so it was being dropped silently.
+    reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
     
     @field_validator('content', mode='before')
     @classmethod
@@ -97,7 +103,7 @@ class ChatCompletionRequest(BaseModel):
     top_logprobs: Optional[int] = Field(None, description="Number of top log-probs to return per token.")
     response_format: Optional[Dict] = Field(None, description="Structured-output format, e.g. {'type': 'json_object'}.")
     user: Optional[str] = Field(None, description="Opaque end-user identifier (passthrough).")
-    enable_thinking: Optional[bool] = Field(False, description="Enable thinking/reasoning mode for models that support it.")
+    enable_thinking: Optional[bool] = Field(None, description="Thinking/reasoning mode. Unset leaves the model's own default, which for a thinking model means it thinks; false asks it not to think at all (forwarded to the chat template); true asks for it explicitly.")
     reasoning: Optional[Dict] = Field(None, description="Reasoning controls. OpenRouter-style; set {'exclude': true} to drop the model's thinking from the response.")
     reasoning_effort: Optional[str] = Field(None, description="OpenAI-style reasoning effort ('low'|'medium'|'high'); 'none'/'off' suppresses reasoning output.")
     suppress_reasoning: Optional[bool] = Field(None, description="Drop the model's reasoning/thinking from the response instead of returning it as a separate field.")

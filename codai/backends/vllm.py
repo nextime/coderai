@@ -59,6 +59,7 @@ class VllmBackend(ModelBackend):
         self._last_usage: Dict = {}
         self._last_logprobs: Optional[Dict] = None
         self._last_tool_calls: Optional[List[Dict]] = None
+        self._last_reasoning: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -160,6 +161,15 @@ class VllmBackend(ModelBackend):
         same method on RunpodBackend.
         """
         return self._last_tool_calls
+
+    def get_last_reasoning(self):
+        """The thought the SERVER separated out of the last answer, or None.
+
+        It arrives in ``message.reasoning_content``, beside a content that has
+        already had it removed, so the string ``generate_chat`` returns cannot
+        carry it. See the same method on ModelBackend.
+        """
+        return self._last_reasoning
 
     def cleanup(self) -> None:
         from codai.api import vllm_worker
@@ -358,6 +368,7 @@ class VllmBackend(ModelBackend):
         self._enter_request()
         self._last_logprobs = None
         self._last_tool_calls = None
+        self._last_reasoning = None
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False,
                                          logprobs=logprobs, top_logprobs=top_logprobs,
@@ -380,6 +391,8 @@ class VllmBackend(ModelBackend):
             self._last_logprobs = choice.get("logprobs")
             message = choice.get("message") or {}
             self._last_tool_calls = message.get("tool_calls") or None
+            self._last_reasoning = (message.get("reasoning_content")
+                                    or message.get("reasoning") or None)
             return message.get("content") or ""
         finally:
             self._exit_request()
@@ -392,6 +405,7 @@ class VllmBackend(ModelBackend):
         self._enter_request()
         self._last_logprobs = None
         self._last_tool_calls = None
+        self._last_reasoning = None
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True,
                                          logprobs=logprobs, top_logprobs=top_logprobs,
@@ -433,6 +447,8 @@ class VllmBackend(ModelBackend):
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
+        # Whether we are inside a reconstructed <think> block for THIS stream.
+        _thought = {"open": False}
 
         def _handle_line(line: str) -> bool:
             if not line or not line.startswith("data:"):
@@ -447,7 +463,23 @@ class VllmBackend(ModelBackend):
             choice = (obj.get("choices") or [{}])[0]
             piece = choice.get(delta_key) or {}
             text = piece.get("content") or ""
+            # A remote that separates the thought sends it in its own delta
+            # field, with the tags removed. This generator yields text, so the
+            # tags go back on: the caller's reasoning gate then splits it out
+            # again and emits it as reasoning AS IT ARRIVES, which is the whole
+            # point of thinking — it should show while the model is thinking,
+            # not land in one lump at the end.
+            think = piece.get("reasoning_content") or piece.get("reasoning") or ""
+            if think:
+                self._last_reasoning = (self._last_reasoning or "") + think
+                if not _thought["open"]:
+                    _thought["open"] = True
+                    think = "<think>" + think
+                loop.call_soon_threadsafe(queue.put_nowait, think)
             if text:
+                if _thought["open"]:
+                    _thought["open"] = False
+                    text = "</think>" + text
                 loop.call_soon_threadsafe(queue.put_nowait, text)
             # A streamed tool call arrives as deltas and carries no content at
             # all, so it cannot travel in the text this generator yields.

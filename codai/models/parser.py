@@ -1798,20 +1798,14 @@ def _configured_parser_name(model_name: str) -> str:
 def _template_path_for(model_name: str) -> str:
     """Where this model's chat template can be read from, or ''.
 
-    The base repo for an adapter (a LoRA has no template of its own), else the
-    entry's own path, else the name -- which is a repo id often enough to be
-    worth trying.
+    One resolver, in codai.models.chat_style, so the tool-call style, the
+    parser choice and the reasoning check all ask about the same file.
     """
-    base = _family_name(model_name)
     try:
-        from codai.models.manager import _model_entry_for
-        entry = _model_entry_for(base) or _model_entry_for(model_name) or {}
-        block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
-        return (str(entry.get("path") or "").strip()
-                or str(block.get("hf_repo") or "").strip()
-                or base or "")
+        from codai.models.chat_style import template_path_for_model
+        return template_path_for_model(model_name)
     except Exception:
-        return base or ""
+        return _family_name(model_name) or ""
 
 
 class ModelParserDispatcher:
@@ -1981,7 +1975,7 @@ class OpenAIFormatter:
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens
                 }
-                return ModelResponse(
+                out = ModelResponse(
                     id=self.id,
                     model=self.model_name,
                     object="chat.completion",
@@ -1993,6 +1987,19 @@ class OpenAIFormatter:
                     )],
                     usage=Usage(**usage_dict)
                 ).model_dump()
+                # litellm's Message has no reasoning field, so it is attached
+                # after the dump rather than lost. Both spellings: clients read
+                # `reasoning_content` (and Qwen's own chat template re-renders
+                # a previous turn's thought from it), while others read
+                # `reasoning`.
+                if reasoning:
+                    try:
+                        msg = out["choices"][0]["message"]
+                        msg["reasoning"] = reasoning
+                        msg["reasoning_content"] = reasoning
+                    except Exception:
+                        pass
+                return out
             except Exception as e:
                 print(f"DEBUG formatter: litellm fallback failed: {e}")
         
@@ -2003,6 +2010,7 @@ class OpenAIFormatter:
         }
         if reasoning:
             message["reasoning"] = reasoning
+            message["reasoning_content"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
         
@@ -2084,9 +2092,15 @@ class OpenAIFormatter:
         return self.format_chunk("", is_final=True, usage=usage, context_size=context_size)
 
     # Backward compatibility methods
-    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None, context_size=None) -> dict:
-        """Backward compatibility method - calls format_full."""
-        return self.format_full(text, prompt_tokens, completion_tokens, tool_calls, context_size=context_size)
+    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None, context_size=None, reasoning=None) -> dict:
+        """Backward compatibility method - calls format_full.
+
+        ``reasoning`` was missing here, so a thought the caller had carefully
+        separated out of the content was then dropped on the floor: the client
+        saw neither the thinking nor any sign that there had been any.
+        """
+        return self.format_full(text, prompt_tokens, completion_tokens, tool_calls,
+                                reasoning=reasoning, context_size=context_size)
 
     def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None, context_size: int = None) -> dict:
         """Backward compatibility method - calls format_chunk."""
