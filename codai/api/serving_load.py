@@ -28,6 +28,17 @@ What does move with load:
   is, and it is invisible in utilisation or VRAM.
 * **waiting** — requests admitted but not yet running: queueing, i.e. latency
   the client is already paying.
+* **requests served, and the tokens in and out** — the work this engine has
+  actually done since it started. Not a limit, but the figure that says whether
+  a pod being paid for by the hour is earning it: a rented pod at 0 served
+  requests is pure cost, and that was invisible on a page showing only
+  instantaneous load. Carried across an engine restart by :func:`_accumulate`,
+  since vLLM's own counters rewind to zero with the process.
+
+``vllm:prefix_cache_hits`` is deliberately absent: in vLLM 0.27.1 the gauge is
+registered from the multimodal-cache counter (`counter_prefix_cache_hits`
+assigned `counter_mm_cache_hits`), so a hit rate computed from it is not the
+prefix hit rate. A number that is wrong is worse than a dash.
 
 Read from the serving engine's own Prometheus endpoint and from cgroup memory
 accounting, both cheap, both cached briefly, and every failure degrades to
@@ -40,20 +51,31 @@ import threading
 import time
 from typing import Dict, Optional
 
-#: Gauges worth carrying, mapped to the names used in the API.
+#: Metrics worth carrying, mapped to the names used in the API. Names are the
+#: ones vLLM DECLARES; a counter is exposed by prometheus_client with a
+#: ``_total`` suffix, which :func:`parse_prometheus` accepts for either form.
 _WANTED = {
     "vllm:kv_cache_usage_perc": "kv_cache_pct",
     "vllm:num_requests_running": "running",
     "vllm:num_requests_waiting": "waiting",
     "vllm:num_preemptions": "preemptions",
-    "vllm:prefix_cache_hits": "prefix_hits",
-    "vllm:prefix_cache_queries": "prefix_queries",
+    "vllm:request_success": "requests_done",
+    "vllm:prompt_tokens": "prompt_tokens",
+    "vllm:generation_tokens": "generation_tokens",
 }
+
+#: Figures that only ever go up, and so can be carried across an engine
+#: restart. Everything else describes this instant and must not be.
+_CUMULATIVE = ("requests_done", "prompt_tokens", "generation_tokens",
+               "preemptions")
 
 TTL_S = 2.0
 TIMEOUT_S = 1.5
 
 _CACHE: Dict[str, tuple] = {}
+
+#: ``{base_url: {key: (last_raw, carried)}}`` -- see :func:`_accumulate`.
+_CARRY: Dict[str, Dict[str, tuple]] = {}
 _LOCK = threading.Lock()
 
 
@@ -76,7 +98,14 @@ def parse_prometheus(text: str) -> dict:
             _, _, value = rest.rpartition("}")
         else:
             metric, _, value = line.partition(" ")
-        key = _WANTED.get(metric.strip())
+        metric = metric.strip()
+        key = _WANTED.get(metric)
+        if key is None and metric.endswith("_total"):
+            # prometheus_client renders a Counter named "vllm:prompt_tokens" as
+            # the sample "vllm:prompt_tokens_total" (plus a "_created"
+            # timestamp, which must never be read as a count). Matching only
+            # the declared name silently dropped every counter on this page.
+            key = _WANTED.get(metric[:-len("_total")])
         if not key:
             continue
         try:
@@ -94,10 +123,37 @@ def parse_prometheus(text: str) -> dict:
         out["kv_cache_pct"] = round(maxes["kv_cache_pct"] * 100.0, 1)
     for k, v in sums.items():
         out[k] = int(v) if float(v).is_integer() else round(v, 2)
-    if out.get("prefix_queries"):
-        out["prefix_hit_pct"] = round(
-            100.0 * out.get("prefix_hits", 0) / out["prefix_queries"], 1)
     return out
+
+
+def _accumulate(base: str, data: dict) -> dict:
+    """Keep the cumulative figures cumulative across an engine restart.
+
+    vLLM's counters start again from zero every time the engine process is
+    replaced -- a model swap, a crash, an OOM kill -- so a pod that has served
+    four thousand requests reports twelve shortly after one. An operator reads
+    the column as "what this pod has done", and a counter that silently rewinds
+    is worse than no counter: it hides exactly the restart worth noticing.
+
+    So each drop is treated as a restart and the previous reading is carried
+    forward. The result is monotonic for as long as this process lives, which
+    is the pod's own lifetime.
+    """
+    if not data:
+        return data
+    with _LOCK:
+        seen = _CARRY.setdefault(base, {})
+        for key in _CUMULATIVE:
+            raw = data.get(key)
+            if not isinstance(raw, (int, float)):
+                continue
+            last, carried = seen.get(key, (0.0, 0.0))
+            if raw < last:                       # the engine was replaced
+                carried += last
+            seen[key] = (float(raw), carried)
+            total = carried + raw
+            data[key] = int(total) if float(total).is_integer() else round(total, 2)
+    return data
 
 
 def engine_load(base_url: str) -> dict:
@@ -113,6 +169,7 @@ def engine_load(base_url: str) -> dict:
         import requests
         r = requests.get(base + "/metrics", timeout=TIMEOUT_S)
         data = parse_prometheus(r.text) if r.status_code == 200 else {}
+        data = _accumulate(base, data)
     except Exception:
         data = {}
     with _LOCK:
@@ -184,5 +241,7 @@ def snapshot(base_url: str = "") -> dict:
 
 
 def forget() -> None:
+    """Drop the cached readings AND the restart carry-over."""
     with _LOCK:
         _CACHE.clear()
+        _CARRY.clear()

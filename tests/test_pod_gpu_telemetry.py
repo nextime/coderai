@@ -271,3 +271,35 @@ def test_the_real_shape_a_live_pod_returned():
     assert out["vram_used_gb"] == pytest.approx(43.81)
     assert out["vram_total_gb"] == 48.31
     assert out["gpu_cards"] == 1
+
+
+def test_what_the_pod_has_served_comes_through(monkeypatch):
+    """The counter an operator reads as "is this rented pod earning its hour?".
+    It travels in the engine-state `load` block beside the limits, and only the
+    numeric keys the page draws are copied -- a pod on an older image simply
+    does not send them, and the page shows a dash rather than a zero."""
+    r = types.SimpleNamespace()
+    r.status_code = 200
+    r.json = lambda: {"ok": True,
+                      "vram": {"devices": [{"total": 48, "free": 8}]},
+                      "load": {"requests_done": 4012, "prompt_tokens": 1250000,
+                               "generation_tokens": 412000, "running": 3,
+                               "ram_used_gb": 19.4, "ram_total_gb": 60.0,
+                               "kv_cache_pct": 26.5, "preemptions": 4,
+                               "ram_source": "cgroup"}}
+    monkeypatch.setattr("codai.api.pod_http.get",
+                        lambda *a, **k: r)
+    out = asyncio.run(pt.collect([("p1", "https://pod:1", "k")]))["p1"]
+    assert out["requests_done"] == 4012
+    assert out["prompt_tokens"] == 1250000
+    assert out["generation_tokens"] == 412000
+    assert out["kv_cache_pct"] == 26.5
+    assert "ram_source" not in out          # a string, not a figure to draw
+
+
+def test_an_older_pod_sends_no_served_counts(monkeypatch):
+    monkeypatch.setattr("codai.api.pod_http.get",
+                        lambda *a, **k: _answer([{"mem_used": 40, "mem_total": 48}]))
+    out = asyncio.run(pt.collect([("p9", "https://pod:1", "k")]))["p9"]
+    assert "requests_done" not in out
+    assert out["vram_used_gb"] == 40.0

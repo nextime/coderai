@@ -147,13 +147,14 @@ def _fetch(pod_id: str, url: str, key: str) -> dict:
             return {}
         state = r.json() or {}
         out = summarise(cards_from_engine_state(state))
-        # Host memory and serving load: the two limits that actually bind. See
-        # codai.api.serving_load for why reserved VRAM is not one of them.
+        # Host memory, serving load, and what the pod has served since it
+        # booted. See codai.api.serving_load for why reserved VRAM is not one
+        # of the limits, and why the served counters survive an engine restart.
         load = state.get("load")
         if isinstance(load, dict):
             for k in ("ram_used_gb", "ram_total_gb", "ram_free_gb",
                       "kv_cache_pct", "running", "waiting", "preemptions",
-                      "prefix_hit_pct"):
+                      "requests_done", "prompt_tokens", "generation_tokens"):
                 if isinstance(load.get(k), (int, float)):
                     out[k] = load[k]
         return out
@@ -192,7 +193,7 @@ def forget(pod_id: Optional[str] = None) -> None:
 
 async def collect(endpoints: List[Tuple[str, str, str]],
                   overall_timeout: float = 3.0) -> Dict[str, dict]:
-    """``{pod_id: {gpu_util, vram_used_gb, vram_total_gb, gpu_temp_c}}``.
+    """``{pod_id: {gpu_util, vram_*, gpu_temp_c, ram_*, requests_done, ...}}``.
 
     ``endpoints`` is ``[(pod_id, url, bearer)]``. Fresh cache entries are
     answered without a request; the rest are fetched concurrently off the loop.

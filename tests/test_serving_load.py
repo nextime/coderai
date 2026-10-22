@@ -21,15 +21,26 @@ def setup_function():
     sl.forget()
 
 
+#: Exactly as vLLM 0.27.1 exposes it. The counter names carry the ``_total``
+#: suffix prometheus_client appends -- vLLM DECLARES "vllm:num_preemptions" and
+#: serves "vllm:num_preemptions_total" -- and each one brings a "_created"
+#: sample whose value is a unix TIMESTAMP, which must never be read as a count.
 BODY = """
 # HELP vllm:kv_cache_usage_perc GPU KV-cache usage
 # TYPE vllm:kv_cache_usage_perc gauge
 vllm:kv_cache_usage_perc{engine="0",model_name="m"} 0.265
 vllm:num_requests_running{engine="0",model_name="m"} 75
 vllm:num_requests_waiting{engine="0",model_name="m"} 12
-vllm:num_preemptions{engine="0",model_name="m"} 4
-vllm:prefix_cache_hits{engine="0",model_name="m"} 250
-vllm:prefix_cache_queries{engine="0",model_name="m"} 1000
+# TYPE vllm:num_preemptions counter
+vllm:num_preemptions_total{engine="0",model_name="m"} 4.0
+vllm:num_preemptions_created{engine="0",model_name="m"} 1.76e+09
+# TYPE vllm:request_success counter
+vllm:request_success_total{engine="0",model_name="m",finished_reason="stop"} 3900.0
+vllm:request_success_total{engine="0",model_name="m",finished_reason="length"} 100.0
+vllm:request_success_created{engine="0",model_name="m",finished_reason="stop"} 1.76e+09
+# TYPE vllm:prompt_tokens counter
+vllm:prompt_tokens_total{engine="0",model_name="m"} 1250000.0
+vllm:generation_tokens_total{engine="0",model_name="m"} 412000.0
 vllm:something_else{engine="0"} 999
 """
 
@@ -41,7 +52,26 @@ def test_the_ladders_numbers_come_back():
     assert out["running"] == 75
     assert out["waiting"] == 12
     assert out["preemptions"] == 4
-    assert out["prefix_hit_pct"] == 25.0
+
+
+def test_the_counters_are_matched_despite_the_total_suffix():
+    """THE TRAP: prometheus_client renames a Counter. vLLM declares
+    "vllm:num_preemptions" and serves "vllm:num_preemptions_total", so keying on
+    the declared name alone silently dropped every counter -- the page drew a
+    dash and looked merely unsupported."""
+    out = sl.parse_prometheus(BODY)
+    assert out["requests_done"] == 4000          # summed over finished_reason
+    assert out["prompt_tokens"] == 1250000
+    assert out["generation_tokens"] == 412000
+
+
+def test_a_created_timestamp_is_never_read_as_a_count():
+    """"_created" carries a unix time; counting it would report 1.76 billion
+    preemptions on an idle pod."""
+    out = sl.parse_prometheus(
+        'vllm:num_preemptions_total{e="0"} 2.0\n'
+        'vllm:num_preemptions_created{e="0"} 1760000000.0\n')
+    assert out["preemptions"] == 2
 
 
 def test_unrelated_metrics_are_ignored():
@@ -69,10 +99,14 @@ def test_junk_is_survivable():
     assert sl.parse_prometheus("vllm:num_requests_running notanumber") == {}
 
 
-def test_no_queries_means_no_hit_rate():
-    """0/0 is not 0%."""
-    out = sl.parse_prometheus('vllm:prefix_cache_queries{e="0"} 0')
+def test_the_broken_prefix_hit_rate_is_not_reported():
+    """vLLM 0.27.1 registers its prefix-cache HIT counter from the MULTIMODAL
+    cache counter, so a rate computed from it is not the prefix hit rate. A
+    wrong number on an operator's page is worse than a dash."""
+    out = sl.parse_prometheus('vllm:prefix_cache_hits_total{e="0"} 250\n'
+                              'vllm:prefix_cache_queries_total{e="0"} 1000\n')
     assert "prefix_hit_pct" not in out
+    assert "prefix_hits" not in out
 
 
 # --------------------------------------------------------------- host memory #
@@ -148,6 +182,45 @@ def test_a_fresh_read_is_reused(monkeypatch):
     sl.engine_load("http://e:1")
     sl.engine_load("http://e:1")
     assert len(calls) == 1
+
+
+def test_a_restarted_engine_does_not_rewind_the_served_count(monkeypatch):
+    """vLLM's counters start at zero with every new engine process -- a model
+    swap, a crash, an OOM kill. An operator reads the column as "what this pod
+    has done", so a rewind would hide the restart AND lose the work."""
+    bodies = iter([
+        'vllm:request_success_total{e="0"} 4000\nvllm:generation_tokens_total{e="0"} 90\n',
+        'vllm:request_success_total{e="0"} 12\nvllm:generation_tokens_total{e="0"} 5\n',
+        'vllm:request_success_total{e="0"} 30\nvllm:generation_tokens_total{e="0"} 11\n',
+    ])
+
+    class _R:
+        status_code = 200
+        def __init__(self):
+            self.text = next(bodies)
+    monkeypatch.setattr("requests.get", lambda *a, **k: _R())
+    assert sl.engine_load("http://e:1")["requests_done"] == 4000
+    sl._CACHE.clear()                       # the TTL would answer from cache
+    assert sl.engine_load("http://e:1")["requests_done"] == 4012
+    sl._CACHE.clear()
+    out = sl.engine_load("http://e:1")
+    assert out["requests_done"] == 4030
+    assert out["generation_tokens"] == 101
+
+
+def test_the_instantaneous_figures_are_never_carried(monkeypatch):
+    """Running/waiting describe this moment; adding them up would be nonsense."""
+    bodies = iter(['vllm:num_requests_running{e="0"} 9\n',
+                   'vllm:num_requests_running{e="0"} 2\n'])
+
+    class _R:
+        status_code = 200
+        def __init__(self):
+            self.text = next(bodies)
+    monkeypatch.setattr("requests.get", lambda *a, **k: _R())
+    sl.engine_load("http://e:1")
+    sl._CACHE.clear()
+    assert sl.engine_load("http://e:1")["running"] == 2
 
 
 def test_an_engine_that_does_not_answer_is_not_a_failure(monkeypatch):

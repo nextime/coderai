@@ -20,7 +20,7 @@
 
 <!-- Cost tiles -->
 <div id="rp-tiles" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem;margin-bottom:1rem">
-  <div class="card"><div class="dim small">Running pods</div><div id="rp-podcount" style="font-size:1.6rem;font-weight:700">—</div></div>
+  <div class="card"><div class="dim small">Running pods</div><div id="rp-podcount" style="font-size:1.6rem;font-weight:700">—</div><div id="rp-served" class="dim small"></div></div>
   <div class="card"><div class="dim small">Live rate ($/hr)</div><div id="rp-rate" style="font-size:1.6rem;font-weight:700">—</div><div id="rp-rate-cap" class="dim small"></div></div>
   <div class="card"><div class="dim small">Uncommitted cost</div><div id="rp-uncommitted" style="font-size:1.6rem;font-weight:700">—</div><div class="dim small">pods running, not yet billed to the ledger</div></div>
   <div class="card"><div class="dim small">Global spend (period)</div><div id="rp-global-spend" style="font-size:1.6rem;font-weight:700">—</div><div id="rp-global-cap" class="dim small"></div></div>
@@ -32,9 +32,9 @@
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
-        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
+        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>Pool</th><th>In-flight</th><th>Served</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
       </tr></thead>
-      <tbody id="rp-pods"><tr><td colspan="11" class="dim">No pods running.</td></tr></tbody>
+      <tbody id="rp-pods"><tr><td colspan="12" class="dim">No pods running.</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -101,6 +101,30 @@ function _memCell(p){
   const pct = 100 * p.ram_used_gb / p.ram_total_gb;
   return _meter(pct, `${p.ram_used_gb.toFixed(1)}/${Math.round(p.ram_total_gb)} GB`) + vr;
 }
+/* Counts, not rates: how many requests this pod has finished and how many
+   tokens went through it since it booted. In-flight next to it is the instant;
+   this is the pod's whole working life, and it is what says whether a pod
+   billed by the hour has earned it -- a healthy pod at 0 served is pure cost.
+   vLLM's counters rewind when the engine process is replaced, so the pod
+   carries them forward (codai.api.serving_load._accumulate) and this column
+   never goes backwards while the pod lives. */
+function _fmtCount(n){
+  if (n == null) return null;
+  if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function _servedCell(p){
+  if (p.requests_done == null && p.generation_tokens == null) return '<span class="dim">—</span>';
+  const req = p.requests_done != null
+    ? `<div>${_fmtCount(p.requests_done)} <span style="color:var(--text-3)">req</span></div>` : '';
+  const tok = [];
+  if (p.prompt_tokens != null) tok.push(`${_fmtCount(p.prompt_tokens)} in`);
+  if (p.generation_tokens != null) tok.push(`${_fmtCount(p.generation_tokens)} out`);
+  return req + (tok.length
+    ? `<div style="font-size:10px;color:var(--text-3)">${tok.join(' · ')} tok</div>` : '');
+}
 
 async function rpRefresh(){
   let d;
@@ -117,6 +141,14 @@ async function rpRefresh(){
   const pods = d.pods || [];
   const running = pods.filter(p=>p.healthy);
   document.getElementById('rp-podcount').textContent = running.length + (pods.length>running.length ? ` (+${pods.length-running.length} unhealthy)` : '');
+  // What the pods now running have served between them. Pods that have already
+  // been released are not in this listing, so this is the live fleet's work,
+  // not the account's history -- the ledger below is the history.
+  const served = pods.reduce((a,p)=> a + (p.requests_done||0), 0);
+  const servedTok = pods.reduce((a,p)=> a + (p.generation_tokens||0), 0);
+  document.getElementById('rp-served').textContent = served
+    ? `${_fmtCount(served)} requests served · ${_fmtCount(servedTok)} tokens out`
+    : (pods.length ? 'nothing served yet' : '');
   document.getElementById('rp-rate').textContent = _usd(d.live_hourly_usd);
   // The rate now counts BOOTING pods too, because RunPod bills from creation.
   // Say how much of it is boot: a fleet that is mostly boot is a ramp that is
@@ -133,7 +165,7 @@ async function rpRefresh(){
 
   // pods table
   const tb = document.getElementById('rp-pods');
-  if(!pods.length){ tb.innerHTML = '<tr><td colspan="11" class="dim">No pods running.</td></tr>'; }
+  if(!pods.length){ tb.innerHTML = '<tr><td colspan="12" class="dim">No pods running.</td></tr>'; }
   else {
     tb.innerHTML = pods.map(p => `<tr>
       <td>${p.model||''}</td>
@@ -142,6 +174,7 @@ async function rpRefresh(){
       <td>${_memCell(p)}</td>
       <td>${p.is_spot?'spot':'on-demand'}</td>
       <td>${p.inflight||0}</td>
+      <td>${_servedCell(p)}</td>
       <td>${_usd(p.hourly_usd)}</td>
       <td>${_fmtDur(p.uptime_s)}</td>
       <td>${_usd(p.live_cost_usd)}</td>
