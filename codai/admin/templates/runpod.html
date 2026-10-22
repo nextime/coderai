@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 {% block title %}RunPod — CoderAI{% endblock %}
+{# Twelve columns of live fleet state: the 1100px reading column fits a page of
+   prose, not a table an operator scans across. Same full-width wrapper the
+   Models page uses. #}
+{% block wrapper_class %}container container--full{% endblock %}
 
 {% block content %}
 <div class="page-header">
@@ -31,7 +35,7 @@
   <div class="card-title">Running pods</div>
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <thead><tr style="text-align:left;color:var(--text-3)">
+      <thead><tr style="text-align:left;color:var(--text-3);white-space:nowrap">
         <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>Pool</th><th>In-flight</th><th>Served</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
       </tr></thead>
       <tbody id="rp-pods"><tr><td colspan="12" class="dim">No pods running.</td></tr></tbody>
@@ -62,7 +66,7 @@ function _usd(v){ return (v==null)?'—':('$'+Number(v).toFixed(v<1?4:2)); }
 function _meter(pct, label){
   const v = Math.max(0, Math.min(100, Number(pct)||0));
   const col = v >= 90 ? '#ef4444' : (v >= 70 ? '#f59e0b' : '#22c55e');
-  return `<div style="display:flex;align-items:center;gap:.4rem;min-width:9rem">
+  return `<div style="display:flex;align-items:center;gap:.4rem;min-width:7rem">
     <div style="flex:1;height:5px;border-radius:3px;background:var(--surface-2,#333);overflow:hidden">
       <div style="width:${v}%;height:100%;background:${col}"></div>
     </div>
