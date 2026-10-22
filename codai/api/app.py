@@ -573,6 +573,24 @@ async def internal_engine_state():
             except Exception:
                 pass
             _rg = _cfg.get("measured_ram_gb") or 0
+            # A model served by a PROXY backend (vLLM in its own process, a pod,
+            # a remote) was never loaded here, so there is nothing measured: the
+            # numbers above are a config ESTIMATE and the device string is a
+            # decision about a load that never happened. Reported as truth, that
+            # estimate claimed "CPU offload 8.1 GB" for a 4-bit model vLLM had
+            # fitted entirely on the card -- the exact opposite of the fact an
+            # operator needs. Say "served elsewhere" and leave the numbers out.
+            _proxied = False
+            try:
+                _be = multi_model_manager.models.get(_k)
+                _proxied = bool(getattr(_be, "_served_name", None)) or (
+                    type(getattr(_be, "backend", _be)).__name__
+                    in ("VllmBackend", "RunpodBackend", "RemoteOpenAIBackend"))
+            except Exception:
+                _proxied = False
+            if _proxied:
+                loaded_info.append({"model": _k, "device": "served by its own engine"})
+                continue
             loaded_info.append({
                 "model": _k,
                 "vram_gb": round(float(_vg), 2) if _vg else 0,
@@ -581,8 +599,21 @@ async def internal_engine_state():
             })
     except Exception:
         loaded_info = []
+    # How close this node is to the limits that actually bind: host memory (the
+    # measured ceiling -- an OCR pod was OOM-killed at 128 in-flight while the
+    # GPU was never the constraint) and the serving engine's KV cache, queue
+    # depth and PREEMPTION count. Reserved VRAM is not one of them: vLLM claims
+    # its gpu_memory_utilization share up front, so it reads ~90% from boot
+    # whether the pod is serving one request or sixty-four.
+    load = {}
+    try:
+        from codai.api import serving_load, vllm_worker as _vw
+        urls = _vw.running_service_urls()
+        load = serving_load.snapshot(urls[0] if urls else "")
+    except Exception:
+        load = {}
     return {"ok": True, "pid": _os.getpid(), "loaded_models": loaded,
-            "loaded_info": loaded_info,
+            "loaded_info": loaded_info, "load": load,
             "vram": vram, "tasks": tasks, "cooling": cooling, "paused": paused}
 
 

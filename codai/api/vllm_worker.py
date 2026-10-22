@@ -83,6 +83,19 @@ def _pump_logs(proc, tail, meta: dict = None):
             print(f"[vllm] {line}", flush=True)
 
 
+def running_service_urls() -> list:
+    """Base URLs of the vLLM services this process has running.
+
+    Used to read serving load (KV cache, queue depth, preemptions) from the
+    engine that actually holds the model, rather than inferring it from outside.
+    """
+    try:
+        return [svc["url"] for svc in list(_services.values())
+                if isinstance(svc, dict) and svc.get("url")]
+    except Exception:
+        return []
+
+
 def _health_ok(url: str, timeout: float = 3) -> bool:
     import requests
     try:

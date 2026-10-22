@@ -32,7 +32,7 @@
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
-        <th>Model</th><th>GPU</th><th>Utilisation</th><th>VRAM</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
+        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
       </tr></thead>
       <tbody id="rp-pods"><tr><td colspan="11" class="dim">No pods running.</td></tr></tbody>
     </table>
@@ -72,16 +72,34 @@ function _meter(pct, label){
 /* Telemetry is read from the pod itself, so a pod that is booting, saturated or
    unreachable legitimately has none. Say so with a dash rather than drawing an
    empty bar, which reads as "idle" when the truth is "not known". */
-function _utilCell(p){
-  if (p.gpu_util == null) return '<span class="dim">—</span>';
-  const t = (p.gpu_temp_c != null) ? ` · ${Math.round(p.gpu_temp_c)}°C` : '';
-  const n = (p.gpu_cards > 1) ? ` · ${p.gpu_cards}×` : '';
-  return _meter(p.gpu_util, `${Math.round(p.gpu_util)}%${t}${n}`);
+/* How close this pod is to its SERVING ceiling. Not reserved VRAM: vLLM claims
+   its gpu_memory_utilization share up front, so that reads ~90% from boot
+   whether the pod is serving one request or sixty-four. KV cache occupancy is
+   what moves with load, and a preemption is the proof the cache ran out — vLLM
+   evicts a running request and recomputes it later, so throughput collapses
+   while every other counter still looks busy. */
+function _loadCell(p){
+  const bits = [];
+  if (p.running != null) bits.push(`${p.running} run`);
+  if (p.waiting) bits.push(`<span style="color:#f59e0b">${p.waiting} wait</span>`);
+  if (p.gpu_util != null) bits.push(`${Math.round(p.gpu_util)}% gpu`);
+  if (p.gpu_temp_c != null) bits.push(`${Math.round(p.gpu_temp_c)}°C`);
+  const pre = p.preemptions ? `<div style="font-size:10px;color:#ef4444">${p.preemptions} preempted — past the KV ceiling</div>` : '';
+  if (p.kv_cache_pct == null) {
+    return (bits.length ? `<span style="font-size:11px">${bits.join(' · ')}</span>` : '<span class="dim">—</span>') + pre;
+  }
+  return _meter(p.kv_cache_pct, `${Math.round(p.kv_cache_pct)}% KV`) +
+    (bits.length ? `<div style="font-size:10px;color:var(--text-3)">${bits.join(' · ')}</div>` : '') + pre;
 }
-function _vramCell(p){
-  if (p.vram_used_gb == null || !p.vram_total_gb) return '<span class="dim">—</span>';
-  const pct = 100 * p.vram_used_gb / p.vram_total_gb;
-  return _meter(pct, `${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB`);
+/* Host memory, which is the ceiling that actually bites: an OCR pod was
+   OOM-killed at 128 in-flight with the GPU never the constraint. Reserved VRAM
+   sits underneath as static context, not as a bar — it does not move. */
+function _memCell(p){
+  const vr = (p.vram_used_gb != null && p.vram_total_gb)
+    ? `<div style="font-size:10px;color:var(--text-3)">VRAM ${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB reserved</div>` : '';
+  if (p.ram_used_gb == null || !p.ram_total_gb) return (vr || '<span class="dim">—</span>');
+  const pct = 100 * p.ram_used_gb / p.ram_total_gb;
+  return _meter(pct, `${p.ram_used_gb.toFixed(1)}/${Math.round(p.ram_total_gb)} GB`) + vr;
 }
 
 async function rpRefresh(){
@@ -120,8 +138,8 @@ async function rpRefresh(){
     tb.innerHTML = pods.map(p => `<tr>
       <td>${p.model||''}</td>
       <td>${p.gpu||''}${p.is_spot?' <span class="dim">(spot)</span>':''}</td>
-      <td>${_utilCell(p)}</td>
-      <td>${_vramCell(p)}</td>
+      <td>${_loadCell(p)}</td>
+      <td>${_memCell(p)}</td>
       <td>${p.is_spot?'spot':'on-demand'}</td>
       <td>${p.inflight||0}</td>
       <td>${_usd(p.hourly_usd)}</td>

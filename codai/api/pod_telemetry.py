@@ -145,7 +145,18 @@ def _fetch(pod_id: str, url: str, key: str) -> dict:
                          headers=headers, timeout=TIMEOUT_S)
         if r.status_code != 200:
             return {}
-        return summarise(cards_from_engine_state(r.json() or {}))
+        state = r.json() or {}
+        out = summarise(cards_from_engine_state(state))
+        # Host memory and serving load: the two limits that actually bind. See
+        # codai.api.serving_load for why reserved VRAM is not one of them.
+        load = state.get("load")
+        if isinstance(load, dict):
+            for k in ("ram_used_gb", "ram_total_gb", "ram_free_gb",
+                      "kv_cache_pct", "running", "waiting", "preemptions",
+                      "prefix_hit_pct"):
+                if isinstance(load.get(k), (int, float)):
+                    out[k] = load[k]
+        return out
     except Exception:
         # A pod that cannot be reached has no telemetry, which is not an error
         # worth surfacing: the pod's own health is reported beside it already.
