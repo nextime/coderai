@@ -1334,7 +1334,26 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
     # answering under the adapter's name would have been the silent version.
     served = (getattr(mcfg, "served_model", "") or "").strip() \
         or str(entry.get("id") or "").strip() or str(model or "").strip()
-    payload = seed_model_env(entry, served, value)
+    # WITH THE ENGINE. Without it seed_model_env pops `backend` -- a RunPod
+    # model carries `backend: "runpod"`, which is this install's placement and
+    # means nothing on the pod, so it is stripped and the pod falls through to
+    # its own default. On a pod with no local GPU backend that default is "cpu":
+    #
+    #   503 Model 'digesta-alpha' failed to load: Unknown backend: cpu
+    #
+    # The SEED path has passed the engine since the same bug bit diogene-alpha.
+    # Teaching did not, so a model seeded CORRECTLY at boot was then
+    # re-registered by teach -- which happens whenever an adapter has to be
+    # sent -- and the good entry was overwritten with a backend-less one. The
+    # model worked until something taught it, which is why it looked
+    # intermittent.
+    engine = ""
+    try:
+        from codai.api.runpod_worker import engine_pod_backend
+        engine = engine_pod_backend(entry, mcfg)
+    except Exception:
+        engine = ""
+    payload = seed_model_env(entry, served, value, engine=engine)
     if not payload:
         return False
     headers = {"Content-Type": "application/json"}
