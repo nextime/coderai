@@ -62,6 +62,7 @@ class VllmBackend(ModelBackend):
         self._last_logprobs: Optional[Dict] = None
         self._last_tool_calls: Optional[List[Dict]] = None
         self._last_reasoning: Optional[str] = None
+        self._last_finish_reason: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -196,6 +197,10 @@ class VllmBackend(ModelBackend):
         same method on RunpodBackend.
         """
         return sink_get("tool_calls", self._last_tool_calls)
+
+    def get_last_finish_reason(self):
+        """Why the REMOTE stopped generating. See ModelBackend for why it matters."""
+        return sink_get("finish_reason", self._last_finish_reason)
 
     def get_last_reasoning(self):
         """The thought the SERVER separated out of the last answer, or None.
@@ -412,11 +417,13 @@ class VllmBackend(ModelBackend):
         self._last_logprobs = None
         self._last_tool_calls = None
         self._last_reasoning = None
+        self._last_finish_reason = None
         # The per-call store is cleared with them. A store is opened per request,
         # but a caller that reuses one context for several calls (a pipeline, a
         # test) would otherwise read the PREVIOUS call's tool call -- the exact
         # staleness the attribute resets exist to prevent.
-        for _k in ("usage", "logprobs", "tool_calls", "reasoning"):
+        for _k in ("usage", "logprobs", "tool_calls", "reasoning",
+                  "finish_reason"):
             sink_put(_k, None)
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False,
@@ -446,7 +453,9 @@ class VllmBackend(ModelBackend):
             # between the answer and the caller's read.
             sink_put("logprobs", self._last_logprobs)
             sink_put("tool_calls", self._last_tool_calls)
+            self._last_finish_reason = choice.get("finish_reason") or None
             sink_put("reasoning", self._last_reasoning)
+            sink_put("finish_reason", self._last_finish_reason)
             return message.get("content") or ""
         finally:
             self._exit_request()
@@ -460,11 +469,13 @@ class VllmBackend(ModelBackend):
         self._last_logprobs = None
         self._last_tool_calls = None
         self._last_reasoning = None
+        self._last_finish_reason = None
         # The per-call store is cleared with them. A store is opened per request,
         # but a caller that reuses one context for several calls (a pipeline, a
         # test) would otherwise read the PREVIOUS call's tool call -- the exact
         # staleness the attribute resets exist to prevent.
-        for _k in ("usage", "logprobs", "tool_calls", "reasoning"):
+        for _k in ("usage", "logprobs", "tool_calls", "reasoning",
+                  "finish_reason"):
             sink_put(_k, None)
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True,
@@ -514,7 +525,8 @@ class VllmBackend(ModelBackend):
         # runs on a thread and a thread inherits no context variables. Keeping
         # them per stream also stops two concurrent streams on this one backend
         # object from appending their thoughts to each other.
-        _acc = {"reasoning": None, "tool_calls": None, "logprobs": None}
+        _acc = {"reasoning": None, "tool_calls": None, "logprobs": None,
+                "finish_reason": None}
         _sink = call_sink()
 
         def _publish(key, value):
@@ -587,7 +599,10 @@ class VllmBackend(ModelBackend):
                 _merged = {**_cur, "content": list(_cur.get("content") or [])
                            + list(_lp["content"])}
                 _publish("logprobs", _merged)
-            return bool(choice.get("finish_reason"))
+            _fr = choice.get("finish_reason")
+            if _fr:
+                _publish("finish_reason", _fr)
+            return bool(_fr)
 
         def _worker():
             import requests

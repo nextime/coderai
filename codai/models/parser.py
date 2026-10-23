@@ -1966,8 +1966,17 @@ class OpenAIFormatter:
         self.model_name = model_name
         self.id = f"chatcmpl-{uuid.uuid4()}"
 
-    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None, reasoning=None, context_size=None):
-        """Standard Response (Non-Streaming)"""
+    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None,
+                    reasoning=None, context_size=None, finish_reason=None):
+        """Standard Response (Non-Streaming)
+
+        ``finish_reason`` is the caller's: it knows whether the backend reported
+        one ("length" from a remote that cut the answer off at the token limit)
+        and this formatter does not. Omitted, it keeps the old behaviour, which
+        is the only safe default for the callers that pass nothing -- but a
+        caller that DOES know and is overruled here had its answer labelled
+        complete when it was truncated, which is the whole bug.
+        """
         if LITELLM_AVAILABLE and all([ModelResponse, Choices, Message, Usage]):
             try:
                 usage_dict = {
@@ -1981,7 +1990,8 @@ class OpenAIFormatter:
                     object="chat.completion",
                     created=int(time.time()),
                     choices=[Choices(
-                        finish_reason="tool_calls" if tool_calls else "stop",
+                        finish_reason=("tool_calls" if tool_calls
+                                       else (finish_reason or "stop")),
                         index=0,
                         message=Message(content=text if not tool_calls else None, role="assistant", tool_calls=tool_calls)
                     )],
@@ -2017,7 +2027,8 @@ class OpenAIFormatter:
         choice = {
             "index": 0,
             "message": message,
-            "finish_reason": "tool_calls" if tool_calls else "stop",
+            "finish_reason": ("tool_calls" if tool_calls
+                              else (finish_reason or "stop")),
         }
         
         usage = {
@@ -2041,8 +2052,13 @@ class OpenAIFormatter:
             },
         }
 
-    def format_chunk(self, delta_text, is_final=False, usage=None, context_size=None):
-        """Streaming Chunk (Used in a Generator)"""
+    def format_chunk(self, delta_text, is_final=False, usage=None, context_size=None,
+                     finish_reason=None):
+        """Streaming Chunk (Used in a Generator)
+
+        Only the final chunk carries a reason; see format_full for why the
+        caller's value wins over the "stop" assumed here.
+        """
         if LITELLM_AVAILABLE and all([ChatCompletionChunk, StreamingChoices, Delta, (Usage if usage else True)]):
             try:
                 return ChatCompletionChunk(
@@ -2051,7 +2067,7 @@ class OpenAIFormatter:
                     object="chat.completion.chunk",
                     created=int(time.time()),
                     choices=[StreamingChoices(
-                        finish_reason="stop" if is_final else None,
+                        finish_reason=((finish_reason or "stop") if is_final else None),
                         index=0,
                         delta=Delta(content=delta_text, role="assistant")
                     )],
@@ -2069,7 +2085,7 @@ class OpenAIFormatter:
         choice = {
             "index": 0,
             "delta": delta,
-            "finish_reason": "stop" if is_final else None,
+            "finish_reason": (finish_reason or "stop") if is_final else None,
         }
         
         chunk = {
@@ -2087,12 +2103,15 @@ class OpenAIFormatter:
             
         return chunk
 
-    def format_final_chunk(self, usage: dict = None, context_size: int = None) -> dict:
+    def format_final_chunk(self, usage: dict = None, context_size: int = None,
+                           finish_reason: str = None) -> dict:
         """Format the final streaming chunk with usage information."""
-        return self.format_chunk("", is_final=True, usage=usage, context_size=context_size)
+        return self.format_chunk("", is_final=True, usage=usage,
+                                 context_size=context_size,
+                                 finish_reason=finish_reason)
 
     # Backward compatibility methods
-    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None, context_size=None, reasoning=None) -> dict:
+    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None, context_size=None, reasoning=None, finish_reason=None) -> dict:
         """Backward compatibility method - calls format_full.
 
         ``reasoning`` was missing here, so a thought the caller had carefully
@@ -2100,11 +2119,13 @@ class OpenAIFormatter:
         saw neither the thinking nor any sign that there had been any.
         """
         return self.format_full(text, prompt_tokens, completion_tokens, tool_calls,
-                                reasoning=reasoning, context_size=context_size)
+                                reasoning=reasoning, context_size=context_size,
+                                finish_reason=finish_reason)
 
-    def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None, context_size: int = None) -> dict:
+    def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None, context_size: int = None, finish_reason: str = None) -> dict:
         """Backward compatibility method - calls format_chunk."""
-        return self.format_chunk(delta_text, is_final, usage, context_size)
+        return self.format_chunk(delta_text, is_final, usage, context_size,
+                                 finish_reason=finish_reason)
 
 
 # =============================================================================

@@ -281,6 +281,39 @@ def log_request_exchange(request):
         print(f"[debug-requests] failed to log request: {e}", flush=True)
 
 
+def _finish_reason(manager, completion_tokens, max_tokens, default="stop"):
+    """Why generation ended: what the backend says, else what the budget shows.
+
+    Hardcoding "stop" here made every answer look complete. It is wrong in the
+    one case a client needs to detect: an answer cut off because it hit
+    max_tokens is half a sentence, and reported as "stop" it is indistinguishable
+    from a finished one -- nothing to retry on, no sign anything is missing. On a
+    reasoning model the thought is generated FIRST and spends the same budget, so
+    a tight limit returns an EMPTY answer that still claims to have stopped of
+    its own accord (observed: 64 tokens asked of a reasoning model, 262
+    characters of thought, no content, finish_reason "stop").
+
+    A proxy backend is TOLD the reason by the remote, which is authoritative and
+    is used as given. A local backend says nothing, so the budget answers
+    instead: generation that used every token it was allowed was cut off, not
+    finished. The inference is only drawn when a limit was actually set and
+    reached -- never guessed from a token count alone.
+    """
+    try:
+        reported = (manager.get_last_finish_reason()
+                    if hasattr(manager, "get_last_finish_reason") else None)
+    except Exception:
+        reported = None
+    if reported:
+        return str(reported)
+    try:
+        if max_tokens and completion_tokens and int(completion_tokens) >= int(max_tokens):
+            return "length"
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
 def log_response_exchange(content, tool_calls=None, finish_reason=None,
                           streamed=False, stage="pre-format"):
     """Dump the assistant message coderai *extracted* (content + tool_calls) when
@@ -3382,11 +3415,12 @@ async def stream_chat_response(
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 }
-                log_response_exchange(generated_text, finish_reason="stop",
+                _fr = _finish_reason(current_manager, completion_tokens, max_tokens)
+                log_response_exchange(generated_text, finish_reason=_fr,
                                       streamed=True, stage="pre-format extracted")
-                log_response_exchange(client_sent_content, finish_reason="stop",
+                log_response_exchange(client_sent_content, finish_reason=_fr,
                                       streamed=True, stage="post-format sent to client")
-                final_chunk = formatter.format_litellm_chunk("", is_final=True, usage=usage_details, context_size=context_size)
+                final_chunk = formatter.format_litellm_chunk("", is_final=True, usage=usage_details, context_size=context_size, finish_reason=_fr)
                 log_response_payload(final_chunk, streamed=True)
                 yield f"data: {json.dumps(final_chunk)}\n\n"
         else:
@@ -3417,6 +3451,7 @@ async def stream_chat_response(
             # accumulated them, so the final chunk can carry the whole list.
             _lp = (current_manager.get_last_logprobs()
                    if hasattr(current_manager, "get_last_logprobs") else None)
+            _fr = _finish_reason(current_manager, completion_tokens, max_tokens)
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -3424,9 +3459,9 @@ async def stream_chat_response(
                 "model": model_name,
                 "choices": [{
                     "index": 0,
-                    "finish_reason": "stop",
+                    "finish_reason": _fr,
                     "logprobs": _lp,
-                    "native_finish_reason": "stop",
+                    "native_finish_reason": _fr,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_tokens,
@@ -3448,9 +3483,9 @@ async def stream_chat_response(
                 },
                 "system_fingerprint": None,
             }
-            log_response_exchange(generated_text, finish_reason="stop",
+            log_response_exchange(generated_text, finish_reason=_fr,
                                   streamed=True, stage="pre-format extracted")
-            log_response_exchange(client_sent_content, finish_reason="stop",
+            log_response_exchange(client_sent_content, finish_reason=_fr,
                                   streamed=True, stage="post-format sent to client")
             log_response_payload(final_chunk, streamed=True)
             yield f"data: {json.dumps(final_chunk)}\n\n"
@@ -3591,6 +3626,8 @@ async def generate_chat_response(
             response_message["reasoning"] = reasoning_text
             response_message["reasoning_content"] = reasoning_text
 
+        # Provisional: the real reason needs the token counts, which are read
+        # below. A tool call overrides it either way.
         finish_reason = "stop"
 
         # Check for tool calls
@@ -3658,6 +3695,9 @@ async def generate_chat_response(
         completion_tokens = last_usage.get('completion_tokens') or (
             len(generated_text.split()) if generated_text else 0)
         cached_tokens = last_usage.get('cached_tokens', 0)
+        if finish_reason != "tool_calls":
+            finish_reason = _finish_reason(current_manager, completion_tokens,
+                                           max_tokens)
 
         # Store in prompt cache manager for future prefix matching
         prompt_cache_manager.store(messages, _model_key_for_cache,
@@ -3682,6 +3722,10 @@ async def generate_chat_response(
             # it was separated and then thrown away, so a client saw neither
             # the thinking nor any sign that there had been any.
             reasoning=response_message.get("reasoning_content"),
+            # Without this the formatter assumed "stop" and the reason worked
+            # out above -- "length" from a remote that cut the answer off at
+            # the token limit -- was computed and then discarded.
+            finish_reason=finish_reason,
         )
         # Patch in the real cached_tokens value
         if formatted_response and 'usage' in formatted_response:
@@ -3904,7 +3948,8 @@ async def stream_completion_response(
                 "text": "",
                 "index": 0,
                 "logprobs": None,
-                "finish_reason": "stop",
+                "finish_reason": _finish_reason(current_manager, completion_tokens,
+                                                max_tokens),
             }],
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -3965,7 +4010,8 @@ async def generate_completion_response(
                 "text": generated_text,
                 "index": 0,
                 "logprobs": None,
-                "finish_reason": "stop",
+                "finish_reason": _finish_reason(current_manager, completion_tokens,
+                                                max_tokens),
             }],
             "usage": {
                 "prompt_tokens": prompt_tokens,

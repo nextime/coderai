@@ -139,6 +139,22 @@ class ModelBackend(ABC):
         """
         return None
 
+    def get_last_finish_reason(self):
+        """Why the remote stopped generating, or None if it did not say.
+
+        ``generate_chat`` returns text, and text cannot say whether it ENDED or
+        merely ran out of room. A local backend is asked to generate and the
+        caller knows the budget it set, but a proxy backend is told the answer
+        by the remote in ``choices[0].finish_reason`` -- and dropping it is not
+        a cosmetic loss. "length" means the answer is cut off mid-sentence;
+        reported as "stop" it is indistinguishable from a complete one, so a
+        client has nothing to retry on and no way to know it is reading half a
+        sentence. On a reasoning model it is worse: the thought is generated
+        first and spends the budget, so a tight limit yields an EMPTY answer
+        that still claims to have stopped naturally.
+        """
+        return None
+
     def get_last_tool_calls(self):
         """The tool calls the backend itself reported for the last call, or None.
 
