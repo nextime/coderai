@@ -62,11 +62,21 @@
 function _fmtDur(s){ s=Math.max(0,s|0); const h=(s/3600)|0, m=((s%3600)/60)|0; return h?`${h}h ${m}m`:`${m}m ${s%60}s`; }
 function _usd(v){ return (v==null)?'—':('$'+Number(v).toFixed(v<1?4:2)); }
 /* A proportion as a number plus a bar. Colour marks the band an operator acts
-   on: green is working, amber is close to the limit, red is at it. */
-function _meter(pct, label){
+   on: green is working, amber is close to the limit, red is at it.
+   `tag` names the quantity when a cell draws more than one bar, so two bars are
+   never left to be told apart by their order. `band:false` keeps a bar neutral:
+   a reserved share is high by design, and painting it red would raise an alarm
+   on every healthy pod -- the colour is then just noise an operator learns to
+   ignore, which is worse than no colour at all. */
+function _meter(pct, label, opts){
+  const o = opts || {};
   const v = Math.max(0, Math.min(100, Number(pct)||0));
-  const col = v >= 90 ? '#ef4444' : (v >= 70 ? '#f59e0b' : '#22c55e');
+  const col = (o.band === false) ? 'var(--accent,#60a5fa)'
+            : (v >= 90 ? '#ef4444' : (v >= 70 ? '#f59e0b' : '#22c55e'));
+  const tag = o.tag
+    ? `<span style="font-size:10px;color:var(--text-3);width:2.4rem;flex:none">${o.tag}</span>` : '';
   return `<div style="display:flex;align-items:center;gap:.4rem;min-width:7rem">
+    ${tag}
     <div style="flex:1;height:5px;border-radius:3px;background:var(--surface-2,#333);overflow:hidden">
       <div style="width:${v}%;height:100%;background:${col}"></div>
     </div>
@@ -95,15 +105,29 @@ function _loadCell(p){
   return _meter(p.kv_cache_pct, `${Math.round(p.kv_cache_pct)}% KV`) +
     (bits.length ? `<div style="font-size:10px;color:var(--text-3)">${bits.join(' · ')}</div>` : '') + pre;
 }
-/* Host memory, which is the ceiling that actually bites: an OCR pod was
-   OOM-killed at 128 in-flight with the GPU never the constraint. Reserved VRAM
-   sits underneath as static context, not as a bar — it does not move. */
+/* Two bars, because they are two different ceilings and only one of them is a
+   warning sign. HOST RAM is the ceiling that actually bites -- an OCR pod was
+   OOM-killed at 128 in-flight with the GPU never the constraint -- so it keeps
+   the green/amber/red bands. VRAM is what the engine RESERVED, not what it is
+   using: vLLM claims its gpu_memory_utilization share at boot, so it reads ~90%
+   from the first second whether the pod serves one request or sixty-four. It
+   gets its own neutral bar and says "reserved" in the label, so the number is
+   there to read without pretending to be a load the operator can act on.
+   Either bar is omitted when its telemetry is missing: a booting or unreachable
+   pod has none, and an empty bar reads as "idle" when the truth is "unknown". */
 function _memCell(p){
-  const vr = (p.vram_used_gb != null && p.vram_total_gb)
-    ? `<div style="font-size:10px;color:var(--text-3)">VRAM ${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB reserved</div>` : '';
-  if (p.ram_used_gb == null || !p.ram_total_gb) return (vr || '<span class="dim">—</span>');
-  const pct = 100 * p.ram_used_gb / p.ram_total_gb;
-  return _meter(pct, `${p.ram_used_gb.toFixed(1)}/${Math.round(p.ram_total_gb)} GB`) + vr;
+  const bars = [];
+  if (p.ram_used_gb != null && p.ram_total_gb) {
+    bars.push(_meter(100 * p.ram_used_gb / p.ram_total_gb,
+                     `${p.ram_used_gb.toFixed(1)}/${Math.round(p.ram_total_gb)} GB`,
+                     {tag: 'RAM'}));
+  }
+  if (p.vram_used_gb != null && p.vram_total_gb) {
+    bars.push(_meter(100 * p.vram_used_gb / p.vram_total_gb,
+                     `${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB reserved`,
+                     {tag: 'VRAM', band: false}));
+  }
+  return bars.length ? bars.join('') : '<span class="dim">—</span>';
 }
 /* Counts, not rates: how many requests this pod has finished and how many
    tokens went through it since it booted. In-flight next to it is the instant;
