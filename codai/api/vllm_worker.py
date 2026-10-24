@@ -298,6 +298,13 @@ def _reasoning_args(cfg, model_config: dict, model_path: str) -> list:
 #: tokens the model was never going to accept.
 _NGRAM_DRAFT_TOKENS = 5
 
+#: Both drafters that need no model, no second checkpoint and no VRAM. Prefer
+#: "ngram_gpu": vLLM enables async scheduling (CPU scheduling overlapped with
+#: GPU execution) by default, and plain "ngram" is on its incompatible list, so
+#: choosing it turns async scheduling OFF -- paying for the draft with a
+#: throughput loss elsewhere. "ngram_gpu" drafts the same way and keeps it.
+_NGRAM_METHODS = ("ngram", "ngram_gpu")
+
 
 def _speculative_args(cfg) -> list:
     """``--speculative-config`` for the configured mode, or nothing.
@@ -311,9 +318,9 @@ def _speculative_args(cfg) -> list:
     spec = (getattr(cfg, "speculative", "") or "").strip()
     if not spec:
         return []
-    if spec.lower() == "ngram":
+    if spec.lower() in _NGRAM_METHODS:
         n = int(getattr(cfg, "speculative_tokens", 0) or 0) or _NGRAM_DRAFT_TOKENS
-        body = {"method": "ngram", "num_speculative_tokens": n}
+        body = {"method": spec.lower(), "num_speculative_tokens": n}
     else:
         try:
             body = json.loads(spec)

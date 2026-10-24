@@ -102,10 +102,17 @@ def test_prefix_caching_off_is_forced_explicitly():
     assert "--enable-prefix-caching" not in cmd
 
 
-def test_ngram_needs_no_draft_model_and_no_json_from_the_operator():
-    cmd = _cmd(speculative="ngram")
+@pytest.mark.parametrize("method", ["ngram", "ngram_gpu"])
+def test_ngram_needs_no_draft_model_and_no_json_from_the_operator(method):
+    """Both spellings are drafters that need nothing else configured.
+
+    ngram_gpu is the one to prefer: vLLM turns async scheduling on by default
+    and names plain "ngram" among the things it is incompatible with, so asking
+    for that one pays for the draft with a throughput loss elsewhere.
+    """
+    cmd = _cmd(speculative=method)
     body = json.loads(_flag_value(cmd, "--speculative-config"))
-    assert body["method"] == "ngram"
+    assert body["method"] == method
     assert body["num_speculative_tokens"] >= 1
 
 
