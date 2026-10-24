@@ -2940,6 +2940,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "auto_compact_tail_tokens", "auto_compact_tolerance_pct",
                 "auto_compact_min_output", "auto_compact_retry_on_overflow",
                 "suppress_reasoning",
+                # Whether this model thinks when the request does not say.
+                # "auto" leaves the model's own behaviour; "off" is for a model
+                # served for extraction, where the thought is charged against
+                # max_tokens, emitted before the answer, and read by nobody.
+                "thinking",
                 # Speech-to-text (wav2vec2 / vosk / NeMo-Canary) options.
                 "languages", "supports_translation", "keep_resident",
                 # "local" pins the model here even when its whole capability is
@@ -3009,7 +3014,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                                      "distributed_executor_backend", "ray_address",
                                      "ray_port", "nodes", "nodes_ready_timeout_s",
                                      "gpu", "gpu_memory_utilization", "max_num_seqs",
-                                     "dtype", "quantization", "extra_args", "extra_env")),
+                                     "dtype", "quantization", "extra_args", "extra_env",
+                                     "max_num_batched_tokens", "prefix_caching",
+                                     "speculative", "speculative_tokens")),
                           ("kt", ("nnodes", "dist_init_addr", "tp_size", "nodes",
                                    "kt_weight_path", "extra_args", "extra_env"))):
         if _blk not in data:

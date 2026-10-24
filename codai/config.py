@@ -813,7 +813,39 @@ class VllmConfig:
     tensor_parallel_size: int = 1        # --tensor-parallel-size
     max_num_seqs: int = 0                # --max-num-seqs (0 = vLLM default)
     dtype: str = ""                      # --dtype (blank = auto; e.g. bfloat16/float16)
-    quantization: str = ""               # --quantization (blank = none; e.g. awq/gptq/fp8)
+    # --quantization. Blank means AUTO-DETECT, which is almost always what you
+    # want: vLLM reads the checkpoint's own quantization_config and picks the
+    # fastest kernel it has for it (a compressed-tensors W4A16 checkpoint gets
+    # Marlin). This field DECLARES how the weights on disk are packed -- it does
+    # not convert anything -- so naming the wrong format moves the engine onto a
+    # slower kernel or stops it booting. A checkpoint whose name says AWQ can
+    # still be compressed-tensors; believe the config, not the repo name.
+    quantization: str = ""
+    # How many tokens may be prefilled in ONE engine step (--max-num-batched-tokens).
+    # vLLM's own default is 2048, so a 60k-token prompt is prefilled as ~30
+    # sequential chunks of small, tensor-core-starved GEMMs. Raising it fills the
+    # cards better and cuts time-to-first-token on long prompts; the cost is a
+    # higher activation peak at profiling, which is taken out of the KV cache --
+    # so raise it watching `Available KV cache memory` and the concurrency the
+    # boot report prints. 0 = leave vLLM's default.
+    max_num_batched_tokens: int = 0
+    # Reuse the KV of a prompt prefix already computed (--enable-prefix-caching).
+    # "auto" leaves vLLM's per-model default, which is ON for ordinary decoder
+    # models but OFF for hybrid-attention ones (supported there, but opt-in while
+    # the feature matures upstream). "on" forces it, which is the one setting that
+    # can take a repeated-document workload -- the same file asked about again and
+    # again -- from a full prefill per question to almost none. "off" forces it off.
+    prefix_caching: str = "auto"         # auto | on | off
+    # Speculative decoding (--speculative-config). Decode on one GPU is bound by
+    # weight bandwidth, not arithmetic, so drafting several tokens and checking
+    # them in one pass is the only way to beat that ceiling. "ngram" needs no
+    # draft model and no VRAM: it drafts by finding the current suffix earlier in
+    # the prompt, which is why it pays off exactly on answers that quote their
+    # source (extraction, citation, summarising a document) and does nothing for
+    # free-form prose. Anything else is passed through as raw JSON, so a draft
+    # model can be configured without a code change.
+    speculative: str = ""                # "" | "ngram" | raw JSON for --speculative-config
+    speculative_tokens: int = 0          # draft length for "ngram" (0 = built-in default)
     # Tool calling. vLLM parses a model's tool-call syntax with a named parser
     # and REFUSES a request carrying `tools` unless it was launched with one:
     #     "auto" tool choice requires --enable-auto-tool-choice and

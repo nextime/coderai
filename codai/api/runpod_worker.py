@@ -1121,6 +1121,11 @@ _ENGINE_FORWARDED_FIELDS = {
     "kt": ("ctx", "extra_args", "extra_env", "model_id"),
     "vllm": ("ctx", "gpu_memory_utilization", "tensor_parallel_size", "max_num_seqs",
              "dtype", "quantization", "extra_args", "extra_env",
+             # The speed levers describe how to RUN the model, so they belong on
+             # the pod that runs it -- a prefill budget tuned for an A40 is
+             # useless if it stays on the orchestrator.
+             "max_num_batched_tokens", "prefix_caching",
+             "speculative", "speculative_tokens",
              # Only ever forwarded when TRUE: the loop below skips False, so
              # adding it here cannot change an install that has not asked for it.
              # A pod needs it to recover a byte-level vocabulary's characters from
@@ -1792,6 +1797,10 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
             # context and memory shape describe the MODEL, and a pod that does
             # not get them serves it differently from this install.
             "vllm",
+            # Whether the model thinks by default. A pod leased to a client
+            # answers its requests directly, so a model configured not to think
+            # must not start thinking just because it moved.
+            "thinking",
             "flash_attention", "model_template", "acceleration", "component_quantization",
             "languages", "supports_translation", "parser", "max_instances",
             # LoRA settings travel too: a coderai pod applies them itself, and

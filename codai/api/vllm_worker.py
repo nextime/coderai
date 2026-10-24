@@ -293,6 +293,42 @@ def _reasoning_args(cfg, model_config: dict, model_path: str) -> list:
     return ["--reasoning-parser", parser]
 
 
+#: Draft length for "ngram" when none was configured. Five is vLLM's own choice
+#: for the lookup window; drafting much further ahead wastes the verify pass on
+#: tokens the model was never going to accept.
+_NGRAM_DRAFT_TOKENS = 5
+
+
+def _speculative_args(cfg) -> list:
+    """``--speculative-config`` for the configured mode, or nothing.
+
+    "ngram" is spelled out here rather than left to the operator as JSON because
+    it is the mode that needs no draft model, no second checkpoint and no VRAM,
+    and so is the only one that can be turned on from a dropdown. Any other value
+    is taken as the JSON vLLM itself documents, which keeps a real draft model
+    reachable without waiting for a code change.
+    """
+    spec = (getattr(cfg, "speculative", "") or "").strip()
+    if not spec:
+        return []
+    if spec.lower() == "ngram":
+        n = int(getattr(cfg, "speculative_tokens", 0) or 0) or _NGRAM_DRAFT_TOKENS
+        body = {"method": "ngram", "num_speculative_tokens": n}
+    else:
+        try:
+            body = json.loads(spec)
+        except Exception as exc:
+            # A typo here would otherwise stop the engine booting with an
+            # argparse error about JSON, naming neither the model nor the field.
+            print(f"[vllm] speculative config ignored, not valid JSON: {exc}", flush=True)
+            return []
+        if not isinstance(body, dict):
+            print(f"[vllm] speculative config ignored, not an object: {spec!r}", flush=True)
+            return []
+    print(f"[vllm] speculative decoding: {body}", flush=True)
+    return ["--speculative-config", json.dumps(body)]
+
+
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
                 served_name: Optional[str] = None, model_config: dict = None,
                 gpu_memory_utilization: Optional[float] = None,
@@ -320,7 +356,10 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     # The profiling peak that decides whether the engine can start is driven by how many
     # tokens may be in one batch, NOT by max_model_len (chunked prefill is on), so this
     # is the lever that shrinks the footprint without shrinking the usable context.
-    mnbt = int(max_num_batched_tokens or 0)
+    # A caller's figure (a side job sizing itself down) wins; otherwise the
+    # configured one, which is how an install raises the budget to speed up long
+    # prefills instead of only ever lowering it to fit.
+    mnbt = int(max_num_batched_tokens or 0) or int(getattr(cfg, "max_num_batched_tokens", 0) or 0)
     if mnbt > 0:
         cmd += ["--max-num-batched-tokens", str(mnbt)]
     tp = int(getattr(cfg, "tensor_parallel_size", 0) or 0)
@@ -343,6 +382,16 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     quant = (getattr(cfg, "quantization", "") or "").strip()
     if quant:
         cmd += ["--quantization", quant]
+    # Prefix caching. Only ever passed when the operator asked for a value:
+    # vLLM's own default is per MODEL (on for a plain decoder, off for a hybrid
+    # one, where it is supported but kept opt-in upstream), and passing a flag
+    # unasked would override that judgement for every model at once.
+    pc = (getattr(cfg, "prefix_caching", "") or "auto").strip().lower()
+    if pc in ("on", "true", "1", "yes"):
+        cmd += ["--enable-prefix-caching"]
+    elif pc in ("off", "false", "0", "no"):
+        cmd += ["--no-enable-prefix-caching"]
+    cmd += _speculative_args(cfg)
     # LoRA adapters configured on the MODEL (not on the vLLM backend): vLLM takes
     # them at launch as name=source pairs, where source is a path on this host or
     # a HuggingFace repo id. A QLoRA adapter is an ordinary LoRA here — the

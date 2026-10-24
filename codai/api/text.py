@@ -1654,6 +1654,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # thinking model thinks by default, and only an explicit false asks it to
     # stop. The two were indistinguishable while this field defaulted to False.
     enable_thinking_req = getattr(request, 'enable_thinking', None)
+    # Still nothing from the caller? Then the MODEL's own default decides. A
+    # thinking model charges its thought against max_tokens and emits it first,
+    # so on extraction and retrieval work the thought is most of the latency and
+    # none of the answer -- long enough, on a long prompt, to spend the whole
+    # budget before the answer starts. An install that serves such a model for
+    # that kind of work needs to be able to say so once, here, instead of
+    # relying on every client to pass enable_thinking=false.
+    if enable_thinking_req is None:
+        enable_thinking_req = _model_thinking_default(getattr(request, 'model', None) or "")
     enable_thinking_api = bool(enable_thinking_req)
     
     # Parse force_reasoning: can be list (from CLI) or string (legacy)
@@ -2618,7 +2627,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     frequency_penalty=request.frequency_penalty,
                     logprobs=request.logprobs,
                     top_logprobs=request.top_logprobs,
-                    passthrough=_chat_passthrough(request),
+                    passthrough=_chat_passthrough(request, enable_thinking_req),
                 ):
                     yield chunk
             finally:
@@ -2649,7 +2658,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     frequency_penalty=request.frequency_penalty,
                     logprobs=request.logprobs,
                     top_logprobs=request.top_logprobs,
-                    passthrough=_chat_passthrough(request),
+                    passthrough=_chat_passthrough(request, enable_thinking_req),
                 )
 
             try:
@@ -2709,7 +2718,38 @@ _CHAT_CONSUMED_FIELDS = frozenset({
 })
 
 
-def _chat_passthrough(request) -> Optional[Dict]:
+#: Per-model thinking defaults, as the model page spells them.
+_THINKING_ON = ("on", "true", "1", "yes", "always")
+_THINKING_OFF = ("off", "false", "0", "no", "never")
+
+
+def _model_thinking_default(model_name: str):
+    """Whether this model should think when the request does not say, or None.
+
+    None means "leave the model's own default", which for a thinking model means
+    it thinks -- deliberately distinct from False, which asks it not to. Only a
+    configured value speaks here; an unset one must not turn thinking off for a
+    model whose answers depend on it.
+    """
+    if not model_name:
+        return None
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        cfg = _mmm._config_for_model(model_name) or {}
+    except Exception:
+        return None
+    raw = cfg.get("thinking")
+    if isinstance(raw, bool):
+        return raw
+    val = str(raw or "").strip().lower()
+    if val in _THINKING_ON:
+        return True
+    if val in _THINKING_OFF:
+        return False
+    return None
+
+
+def _chat_passthrough(request, want_think=None) -> Optional[Dict]:
     """The request fields coderai does not consume, for the backend to forward.
 
     Only reaches a backend whose signature accepts it (see
@@ -2726,7 +2766,11 @@ def _chat_passthrough(request) -> Optional[Dict]:
         # model's own default, which for a thinking model means it thinks.
         # Without this, a request could not turn thinking off on a served model
         # at all: coderai consumed the field and no backend forwarded it.
-        want_think = getattr(request, "enable_thinking", None)
+        # The caller's own value, else the one the model was configured with —
+        # already resolved by the caller, so the request path and this one cannot
+        # disagree about whether the model is meant to think.
+        if want_think is None:
+            want_think = getattr(request, "enable_thinking", None)
         if want_think is not None and "chat_template_kwargs" not in out:
             out["chat_template_kwargs"] = {"enable_thinking": bool(want_think)}
         return out or None

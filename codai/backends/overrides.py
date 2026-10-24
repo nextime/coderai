@@ -25,6 +25,13 @@ VLLM_FIELDS = ("ctx", "gpu", "gpu_memory_utilization",
                "pipeline_parallel_size", "distributed_executor_backend", "ray_address",
                "ray_port", "nodes", "nodes_ready_timeout_s", "max_num_seqs", "dtype",
                "quantization", "extra_args", "extra_env",
+               # Speed levers, per model because they trade against each other
+               # differently for each one: a bigger prefill batch buys
+               # time-to-first-token out of the KV cache, prefix caching pays
+               # only where prompts repeat, and ngram drafting pays only where
+               # the answer quotes the prompt.
+               "max_num_batched_tokens", "prefix_caching",
+               "speculative", "speculative_tokens",
                # Which parser reads this model's tool-call syntax. Per model,
                # because the syntax belongs to the model family and one install
                # serves several.

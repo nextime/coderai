@@ -680,7 +680,26 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <textarea id="cfg-vllm-nodes" class="form-input" rows="3" style="font-family:monospace;font-size:11px" placeholder="box2 | ssh box2 docker run -d --rm --name vllm-worker --gpus all --network host -e CODERAI_RAY_ADDRESS={ray_address} ghcr.io/nextime/coderai-vllm:latest | ssh box2 docker stop vllm-worker | 1"></textarea>
           <span class="form-hint" style="font-size:11px"><code>{ray_address}</code>, <code>{head}</code> and <code>{port}</code> are filled in. The <code>coderai-vllm</code> image joins as a Ray worker when started with <code>CODERAI_RAY_ADDRESS</code>; every node must run the same vLLM build.</span>
         </div>
-        <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Extra vLLM args</label><input type="text" id="cfg-vllm-extra" class="form-input" placeholder="--enable-prefix-caching"></div>
+        <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Extra vLLM args</label><input type="text" id="cfg-vllm-extra" class="form-input" placeholder="--kv-cache-dtype fp8"></div>
+        <label class="form-label" style="font-weight:600;margin-top:.75rem">Weights and speed</label>
+        <span class="form-hint" style="font-size:11px;margin-bottom:.4rem">On one GPU, <b>decode</b> is limited by how fast the weights can be read, so it cannot be tuned past the card's memory bandwidth — only drafting beats that. <b>Prefill</b> can be: it is compute-bound, and a long prompt is where nearly all of a long-context request's time goes.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Quantization</label><input type="text" id="cfg-vllm-quant" class="form-input" placeholder="auto-detect (awq/gptq/fp8/…)">
+            <span class="form-hint" style="font-size:11px">Leave blank. This <i>declares</i> how the weights on disk are already packed — it converts nothing — and vLLM reads that from the checkpoint itself and picks its fastest kernel for it. Naming the wrong format moves the engine onto a slower kernel or stops it booting, and a repo whose <i>name</i> says AWQ can still be compressed-tensors.</span></div>
+          <div class="form-row" style="margin:0"><label class="form-label">dtype</label><input type="text" id="cfg-vllm-dtype" class="form-input" placeholder="auto (bfloat16/float16)"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Prefill batch (tokens per step)</label><input type="number" id="cfg-vllm-mnbt" class="form-input" min="256" step="256" placeholder="vLLM default (2048)">
+            <span class="form-hint" style="font-size:11px">vLLM prefills this many tokens per engine step, so at the default a 60k-token prompt takes ~30 sequential passes of small, tensor-core-starved GEMMs. Raising it (8192 is a good first try) cuts time-to-first-token on long prompts. The cost comes out of the KV cache: check <code>Available KV cache memory</code> and the concurrency in the boot log afterwards.</span></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Prefix caching</label>
+            <select id="cfg-vllm-prefix" class="form-input">
+              <option value="">auto — vLLM's default for this model</option>
+              <option value="on">on — reuse prefixes already computed</option>
+              <option value="off">off</option>
+            </select>
+            <span class="form-hint" style="font-size:11px">Reuses the KV of a prompt prefix that was computed before, which turns a whole prefill into almost nothing when the same document is asked about again and again. vLLM's own default is on for ordinary models but <b>off for hybrid-attention ones</b>, where it is supported yet still opt-in upstream — so for those this switch is the only way to get it. Worth re-running a retrieval check after turning it on.</span></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Speculative decoding</label><input type="text" id="cfg-vllm-spec" class="form-input" placeholder="off — or ngram, or JSON">
+            <span class="form-hint" style="font-size:11px"><code>ngram</code> needs no draft model and no VRAM: it guesses the next tokens by finding the current text earlier in the prompt. That pays off precisely when the answer quotes its source — extraction, citation, summarising a document — and does nothing for free-form prose. Anything else is passed to vLLM as <code>--speculative-config</code> JSON, so a real draft model can be configured here too.</span></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Draft tokens <span class="muted">(ngram)</span></label><input type="number" id="cfg-vllm-spec-tokens" class="form-input" min="1" max="32" placeholder="5"></div>
+        </div>
       </div>
       <div class="form-row" id="cfg-longcat-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">LongCat-Video <span class="muted" style="font-weight:400">— stages, segments and the isolated runtime</span></label>
@@ -1430,6 +1449,18 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div style="margin-top:1rem">
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-suppress-reasoning"> Suppress reasoning output <span class="muted">(drop the model's &lt;think&gt; thinking instead of returning it)</span></label>
         <span class="form-hint" style="font-size:11px">By default the model's thinking is returned as a separate <code>reasoning</code> / <code>reasoning_content</code> field (think/thinking/thought tags, including the bare <code>&lt;/think&gt;</code> Qwen pre-fill emits) and kept out of <code>content</code>. Enable this to discard it entirely. A request can override per-call with <code>reasoning:{exclude:true}</code>, <code>reasoning_effort:"none"</code>, or <code>suppress_reasoning</code>.</span>
+      </div>
+
+      <!-- Whether the model THINKS at all, as opposed to whether its thinking is
+           returned. Suppressing the output still pays for the tokens. -->
+      <div style="margin-top:.75rem;max-width:46rem">
+        <label class="form-label">Thinking</label>
+        <select id="cfg-thinking" class="form-input">
+          <option value="">auto — the model's own behaviour</option>
+          <option value="off">off — do not think unless the request asks</option>
+          <option value="on">on — think unless the request says otherwise</option>
+        </select>
+        <span class="form-hint" style="font-size:11px">A thinking model generates its thought <i>first</i> and charges it against <code>max_tokens</code>, so on extraction and retrieval work it is most of the latency and none of the answer — and on a tight budget it can consume the whole allowance before the answer begins, returning an empty one. This is the default for requests that say nothing; <code>enable_thinking</code> on the request always wins. Different from <b>Suppress reasoning output</b> above, which still pays for the tokens and merely hides them.</span>
       </div>
 
       <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.75rem">
@@ -4224,6 +4255,9 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-autocompact-tail-tok').value = s.auto_compact_tail_tokens || 0;
   _populateCompactModelSelect(s.auto_compact_model || '');
   document.getElementById('cfg-suppress-reasoning').checked = !!s.suppress_reasoning;
+  // Stored as a string; older entries may hold a bool.
+  (function(){ const t = s.thinking; const el = document.getElementById('cfg-thinking');
+    if (el) el.value = (t === true || t === 'on') ? 'on' : (t === false || t === 'off') ? 'off' : ''; })();
   _toggleAutoCompact();
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
@@ -4678,7 +4712,12 @@ function _applyCompat(){
   const rrow = document.getElementById('cfg-rpc-row');
   if (rrow) rrow.style.display = (_requiredCap(backend) === 'gguf' && backend !== 'runpod' && backend !== 'host') ? '' : 'none';
   const vrow = document.getElementById('cfg-vllm-row');
-  if (vrow) vrow.style.display = (backend === 'vllm') ? '' : 'none';
+  // Also for a model served by a vLLM POD: the settings describe how vLLM runs
+  // the model, and it is the rented card — not this machine — that most needs
+  // them tuned. While this card was hidden for runpod models, their vLLM block
+  // was unreachable from here and _collectCluster sent it back empty, which
+  // DELETED it on save (kv-cache dtype, prefix caching, the lot).
+  if (vrow) vrow.style.display = _vllmBlockApplies() ? '' : 'none';
   const krow = document.getElementById('cfg-kt-row');
   if (krow) krow.style.display = (backend === 'kt') ? '' : 'none';
   const lcrow = document.getElementById('cfg-longcat-row');
@@ -4712,6 +4751,11 @@ function _populateCluster(m, s){
   set('cfg-vllm-executor', v.distributed_executor_backend || ''); set('cfg-vllm-ray', v.ray_address || '');
   set('cfg-vllm-gmu', v.gpu_memory_utilization || ''); set('cfg-vllm-extra', v.extra_args || '');
   set('cfg-vllm-kv-target', v.kv_target_gb || ''); set('cfg-vllm-kv-conc', v.kv_min_concurrency != null ? v.kv_min_concurrency : '');
+  set('cfg-vllm-quant', v.quantization || ''); set('cfg-vllm-dtype', v.dtype || '');
+  set('cfg-vllm-mnbt', v.max_num_batched_tokens || '');
+  // "auto" is stored by older entries; the option that means it has a blank value.
+  set('cfg-vllm-prefix', (v.prefix_caching && v.prefix_caching !== 'auto') ? v.prefix_caching : '');
+  set('cfg-vllm-spec', v.speculative || ''); set('cfg-vllm-spec-tokens', v.speculative_tokens || '');
   set('cfg-vllm-nodes', _nodesToLines(v.nodes, true));
   // LongCat-Video. Read from the FLAT entry, not a nested block: these are per-model
   // settings the worker reads off the entry, the same shape as the offload/quant fields.
@@ -4745,6 +4789,16 @@ function _populateCluster(m, s){
 function _nodesToLines(nodes, withGpus){
   if (typeof nodes === 'string') return nodes;
   return (nodes || []).map(n => [n.name || '', n.start_cmd || '', n.stop_cmd || ''].concat(withGpus ? [n.gpus || ''] : []).join(' | ').replace(/( \| )+$/, '')).join('\n');
+}
+//: Engines that are vLLM under another name. "auto" sends anything that is not
+//: a GGUF to vLLM, so a model on auto gets the card too.
+const _VLLM_POD_ENGINES = ['auto', 'vllm', 'coderai-vllm'];
+function _vllmBlockApplies(){
+  const backend = ((document.getElementById('cfg-backend') || {}).value || 'auto');
+  if (backend === 'vllm') return true;
+  if (backend !== 'runpod') return false;
+  const eng = ((document.getElementById('cfg-rp-engine') || {}).value || 'auto');
+  return _VLLM_POD_ENGINES.includes(eng);
 }
 function _collectCluster(){
   const val = id => ((document.getElementById(id) || {}).value || '').trim();
@@ -4788,17 +4842,32 @@ function _collectCluster(){
     out.use_distill = chk('cfg-longcat-distill');
     out.offload_kv_cache = chk('cfg-longcat-offload-kv');
   }
-  out.vllm = backend === 'vllm' ? {
-    tensor_parallel_size: num('cfg-vllm-tp'), pipeline_parallel_size: num('cfg-vllm-pp'),
-    distributed_executor_backend: val('cfg-vllm-executor'), ray_address: val('cfg-vllm-ray'),
-    gpu_memory_utilization: num('cfg-vllm-gmu'), extra_args: val('cfg-vllm-extra'),
-    kv_target_gb: num('cfg-vllm-kv-target'), kv_min_concurrency: num('cfg-vllm-kv-conc'),
-    nodes: val('cfg-vllm-nodes'),
-  } : {};
-  out.kt = backend === 'kt' ? {
-    nnodes: num('cfg-kt-nnodes'), tp_size: num('cfg-kt-tp'), dist_init_addr: val('cfg-kt-dist'),
-    extra_args: val('cfg-kt-extra'), nodes: val('cfg-kt-nodes'),
-  } : {};
+  // An engine block is only SENT when its card was on screen to be edited.
+  // Sending an empty block is not neutral -- the save route reads it as "this
+  // model has no vLLM settings" and drops the stored one -- so a card that was
+  // never shown must leave the key out instead, which the route ignores.
+  if (_vllmBlockApplies()) {
+    out.vllm = {
+      tensor_parallel_size: num('cfg-vllm-tp'), pipeline_parallel_size: num('cfg-vllm-pp'),
+      distributed_executor_backend: val('cfg-vllm-executor'), ray_address: val('cfg-vllm-ray'),
+      gpu_memory_utilization: num('cfg-vllm-gmu'), extra_args: val('cfg-vllm-extra'),
+      kv_target_gb: num('cfg-vllm-kv-target'), kv_min_concurrency: num('cfg-vllm-kv-conc'),
+      nodes: val('cfg-vllm-nodes'),
+      // Weights-on-disk format (blank = auto-detect, which picks the fastest
+      // kernel vLLM has) and the speed levers.
+      quantization: val('cfg-vllm-quant'), dtype: val('cfg-vllm-dtype'),
+      max_num_batched_tokens: num('cfg-vllm-mnbt'),
+      prefix_caching: val('cfg-vllm-prefix'),
+      speculative: val('cfg-vllm-spec'),
+      speculative_tokens: num('cfg-vllm-spec-tokens'),
+    };
+  }
+  if (backend === 'kt') {
+    out.kt = {
+      nnodes: num('cfg-kt-nnodes'), tp_size: num('cfg-kt-tp'), dist_init_addr: val('cfg-kt-dist'),
+      extra_args: val('cfg-kt-extra'), nodes: val('cfg-kt-nodes'),
+    };
+  }
   return out;
 }
 
@@ -5079,6 +5148,9 @@ function _updateRunpodSource(){
 }
 
 function _updateRunpodEngineHint(){
+  // The vLLM card's visibility depends on the pod's engine as well as the
+  // backend, so changing the engine has to re-decide it.
+  try { _applyCompat(); } catch (e) {}
   const el = document.getElementById('cfg-rp-engine');
   const hint = document.getElementById('cfg-rp-engine-hint');
   if (!el || !hint) return;
@@ -5268,6 +5340,7 @@ async function saveModelConfig(){
     auto_compact_tail_tokens: parseInt(document.getElementById('cfg-autocompact-tail-tok').value) || 0,
     auto_compact_model: document.getElementById('cfg-autocompact-model').value || '',
     suppress_reasoning: document.getElementById('cfg-suppress-reasoning').checked,
+    thinking: ((document.getElementById('cfg-thinking') || {}).value || '') || undefined,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
