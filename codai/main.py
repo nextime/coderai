@@ -451,21 +451,14 @@ def main():
         print(f"WARNING: ds4 kv janitor failed to start: {_e}")
 
     # Apply cache directory overrides from config before any cache module is used.
-    # We set env vars AND patch huggingface_hub.constants in case the library was
-    # already imported (constants are computed once at import time from env vars).
+    # codai/__init__.py already did this from config.json at import time, so that
+    # it happened before huggingface_hub was imported at all; this is the
+    # authoritative pass, against the config actually loaded (a --config dir that
+    # differs from CODERAI_CONFIG_DIR, or a value changed in memory), and it
+    # patches huggingface_hub's constants now that the library is imported.
     if config.models.hf_cache_dir:
-        hf_hub_cache = os.path.join(config.models.hf_cache_dir, 'hub')
-        os.environ['HF_HOME'] = config.models.hf_cache_dir
-        os.environ['HUGGINGFACE_HUB_CACHE'] = hf_hub_cache
-        try:
-            import sys as _sys
-            if 'huggingface_hub.constants' in _sys.modules:
-                import huggingface_hub.constants as _hfc
-                _hfc.HF_HUB_CACHE = hf_hub_cache
-                if hasattr(_hfc, 'HF_HOME'):
-                    _hfc.HF_HOME = config.models.hf_cache_dir
-        except Exception:
-            pass
+        from codai.hf_cache import apply_hf_cache_env
+        apply_hf_cache_env(config.models.hf_cache_dir)
     if config.models.gguf_cache_dir:
         os.environ['CODERAI_CACHE_DIR'] = config.models.gguf_cache_dir
 

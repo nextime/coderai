@@ -16,7 +16,7 @@
 
 # Canonical product version for CoderAI — single source of truth. Both the API
 # metadata and the admin web UI read from here.
-__version__ = "0.4.87"
+__version__ = "0.4.88"
 __tagline__ = "Complete orchestration, distribution and escalation of remotizable advanced inference."
 
 # Configure the CUDA caching allocator BEFORE torch is imported anywhere.
@@ -46,6 +46,20 @@ try:
         for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                      "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             _os.environ.setdefault(_var, _cap)
+except Exception:
+    pass
+
+# Point HuggingFace at the CONFIGURED cache before anything imports
+# huggingface_hub / transformers / torch, which read these variables once at
+# import time. A container bakes HF_HOME into its image (it must point somewhere
+# before any config exists), and that value otherwise wins in every process that
+# reads it -- leaving the configured cache for whoever applies it later and the
+# image's directory for everyone else, i.e. the same models downloaded twice onto
+# two different disks. Doing it here means every coderai process agrees without
+# the launcher being involved. codai/hf_cache.py has the measurements.
+try:
+    from .hf_cache import apply_hf_cache_env as _apply_hf_cache_env
+    _apply_hf_cache_env()
 except Exception:
     pass
 

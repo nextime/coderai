@@ -71,6 +71,17 @@ def config_dir() -> str:
     return os.path.join(os.environ.get("CODERAI_CONFIG_DIR", "/config"), "coderai")
 
 
+def configured_hf_cache_dir() -> str:
+    """``models.hf_cache_dir`` from config.json, or "" when it is not set. The
+    same value codai/hf_cache.py reads, read the same way."""
+    try:
+        with open(os.path.join(config_dir(), "config.json")) as fh:
+            raw = (json.load(fh).get("models") or {}).get("hf_cache_dir")
+    except Exception:
+        return ""
+    return os.path.expanduser(str(raw).strip()) if raw and str(raw).strip() else ""
+
+
 def wanted_workers() -> int:
     """N from the env (wins) or config.json ``ocr.workers``. 0 on anything odd."""
     raw = str(os.environ.get("CODERAI_OCR_WORKERS", "") or "").strip()
@@ -97,8 +108,17 @@ def worker_env(i: int, n: int) -> dict:
     env.setdefault("XDG_DATA_HOME", os.environ.get("CODERAI_MODELS_DIR", "/models"))
     cache = os.environ.get("CODERAI_CACHE_DIR", "/cache")
     env.setdefault("XDG_CACHE_HOME", cache)
-    env.setdefault("HF_HOME", os.path.join(cache, "huggingface"))
-    env.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(env["HF_HOME"], "hub"))
+    # The HuggingFace cache comes from config (models.hf_cache_dir), never from
+    # the cache dir: deriving it here pointed every worker at a second cache and
+    # had them re-download models the install already held. Read inline rather
+    # than through codai.hf_cache -- importing the package into this supervisor
+    # would cost exactly what it exists to save (see the module docstring).
+    hf = configured_hf_cache_dir()
+    if hf:
+        env["HF_HOME"] = hf
+        env["HF_HUB_CACHE"] = os.path.join(hf, "hub")
+        env["HUGGINGFACE_HUB_CACHE"] = os.path.join(hf, "hub")
+        env["TRANSFORMERS_CACHE"] = os.path.join(hf, "transformers")
     env["PYTHONUNBUFFERED"] = "1"
     env["CODERAI_OCR_WORKER"] = f"{i}/{n}"
     env["CODERAI_ENGINE_NAME"] = f"ocrw{i}"

@@ -136,10 +136,12 @@ def ensure_service(model_name: str, config: dict = None,
         url = f"http://127.0.0.1:{port}"
         env = dict(os.environ)
         try:
-            from codai.models.cache import get_hf_hub_cache_dir
-            hub = get_hf_hub_cache_dir()
-            env["HF_HUB_CACHE"] = hub
-            env["HUGGINGFACE_HUB_CACHE"] = hub
+            # All four HF variables, not just the hub pair: this worker runs in
+            # its own venv and never imports codai, so HF_HOME and
+            # TRANSFORMERS_CACHE would stay as the image set them and the model
+            # would be fetched a second time into that directory.
+            from codai.hf_cache import child_env as _hf_child_env
+            env = _hf_child_env(env)
         except Exception:
             pass
         gpu = config.get("gpu_device")
