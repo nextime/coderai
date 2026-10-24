@@ -1306,7 +1306,9 @@ class OcrConfig:
     # worse than a transcription from the second-best engine. "auto" = every other
     # ENABLED engine, fewest-ways-to-fail first (paddle, doctr, olmocr, chandra, surya);
     # "off"/"none" = no fallback (fail with the original error); or an explicit
-    # comma/space separated order.
+    # comma/space separated order. Under `pod_pipeline: require` the chain keeps
+    # only engines that can run on a pod -- paddle and docTR have no pod-side
+    # pipeline, and offering them would be this box reading after all.
     fallback_engines: str = "auto"
     # A page can come back DEGRADED without the engine ever failing: the reply
     # looped until it hit the token cap, or it stopped at the cap and could not
@@ -1315,6 +1317,12 @@ class OcrConfig:
     # anywhere. These re-read ONLY the degraded pages on another engine and keep
     # whichever answer is not degraded. "auto" = the fallback order; "off" = keep
     # what the first engine produced; or an explicit comma/space separated order.
+    #
+    # NOTE what "auto" inherits: with `fallback_engines: "off"` the chain is
+    # empty and this recovery does nothing. The two are different events -- one
+    # engine FAILING is not a page coming back ruined -- so an install that
+    # wants no engine substitution on failure and does want a looping page
+    # re-read must name the engines here rather than leave this on "auto".
     retry_degraded: str = "auto"
     # Stop re-reading after this many pages of one document, 0 = no limit. A
     # scan the whole fleet reads badly would otherwise pay twice for every page

@@ -4176,7 +4176,12 @@ class RunpodPodPool:
         Either signal, never their sum -- a thread parked in acquire and a page
         turned away that will retry are the same page counted two ways.
         """
-        return max(max(0, self._waiting), self._denied_recent())
+        # The workers' waiting pages are a THIRD signal, from processes whose
+        # pages this one never sees, so it joins the other two the same way they
+        # join each other: the largest, not the sum. One page parked here, one
+        # turned away, and one parked in a worker may well be the same page.
+        return max(max(0, self._waiting), self._denied_recent(),
+                   max(0, int(getattr(self, "_worker_waiting", 0) or 0)))
 
     def _bump_cards(self) -> None:
         """Invalidate the per-card memo. Call with `_cv` held.
@@ -4835,6 +4840,12 @@ class RunpodPodPool:
                                "suspect": bool(p.quarantined_until)}
                     for p in self.pods}
         _share.write_reports(f"w{slot[0]}:{self.model_key}", reps)
+        # And, separately, the pages that want a pod and have none. The per-pod
+        # report above cannot carry this: a cold fleet has no pods to key it on.
+        try:
+            _share.write_demand(f"w{slot[0]}", str(self.model_key), self._queued())
+        except Exception:
+            pass          # a report is never worth failing a page over
 
     def _merge_worker_reports(self, now: float) -> None:
         """CONTROLLER: fold the workers' reports into this pool's view.
@@ -4848,6 +4859,10 @@ class RunpodPodPool:
         if _share.is_follower():
             return
         reps = _share.read_reports()
+        try:
+            self._worker_waiting = int(_share.read_demand(str(self.model_key)))
+        except Exception:
+            self._worker_waiting = 0
         with self._cv:
             pods = list(self.pods)
             for p in pods:
@@ -5572,6 +5587,35 @@ class RunpodPodPool:
               f"request(s) in flight, {need} needed — {why} {victim.pod_id}",
               flush=True)
 
+    def _grow_for_workers(self) -> None:
+        """Grow for pages waiting in the OCR workers. Controller only.
+
+        Scale-up lives in `acquire`, which is correct while the process that
+        serves a page is the process that owns the fleet. With `ocr.workers`
+        set it is not: the workers dispatch every page and never rent, the
+        controller rents and never sees a page, so the only pod that ever
+        existed was the warm floor's. A cold fleet stayed cold under any load,
+        and a warm one never grew past `min_pods` -- which is the whole of
+        scaling to 128 pods, silently absent whenever the workers were on.
+
+        Here rather than in a loop of its own: `maintain()` has just folded in
+        the reports and the demand, so this reads a fresh picture, and growth
+        stays single-threaded with the shedding it must not race.
+        """
+        if _share.is_follower():
+            return
+        if not int(getattr(self, "_worker_waiting", 0) or 0):
+            return
+        with self._cv:
+            healthy = [p for p in self.pods if p.healthy]
+            why = self._grow_reason(healthy)
+            if not why:
+                return
+            self._booting += 1
+        print(f"[runpod] {self.model_key!r}: growing for the OCR workers — "
+              f"{why} [{len(healthy)} up, {self._booting} booting]", flush=True)
+        self._grow_in_background()
+
     def maintain(self):
         """One scaler pass: shed pods the load no longer needs, reap idle/dead
         ones to min_pods, keep min warm."""
@@ -5594,6 +5638,7 @@ class RunpodPodPool:
         # deficit and rents a replacement for a card we are already paying for.
         self._recheck_quarantined(now)
         self._adopt_survivors(now)
+        self._grow_for_workers()
         self._scale_down(now)
         with self._cv:
             pods = list(self.pods)

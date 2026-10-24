@@ -1808,6 +1808,38 @@ class OcrManager:
             # config still serves the document, in the configured language.
             return cfg
 
+    def _pod_capable(self, names: List[str], cfg, *, say: bool) -> List[str]:
+        """Drop engines this box would have to read ITSELF, under `require`.
+
+        `ocr.pod_pipeline: require` means this box never rasterises and never
+        reads -- it is what keeps a GPU-less orchestrator from starting four
+        surya processes at ~9 GB each. But only surya, chandra and olmOCR have
+        a pod-side pipeline, and `auto` orders the fallback chain
+        fewest-ways-to-fail first, which puts paddle and docTR at the FRONT.
+        So on such an install `auto` offered, as its first two choices, the two
+        engines that can only run here.
+
+        The way out was to set `fallback_engines: "off"` -- and that also
+        switches off the degraded-page recovery, which reads `auto` as "the
+        fallback order". An install protecting its orchestrator thereby lost
+        the mechanism that catches a page whose decode looped, with nothing
+        said anywhere. Filter instead of refuse: under `require` the chain is
+        the engines that CAN run on a pod, and `auto` stays usable.
+        """
+        if _pod_pipeline_policy(cfg)[0] != "require":
+            return names
+        keep, dropped = [], []
+        for n in names:
+            (keep if pod_pipeline_model(cfg, n) else dropped).append(n)
+        if dropped and say:
+            _say_rate_limited(
+                ("no-pod-fallback", ",".join(dropped)),
+                f"[ocr] ocr.pod_pipeline is 'require', so "
+                f"{', '.join(dropped)} cannot serve as a fallback on this "
+                f"install (no pod-side pipeline); using "
+                f"{', '.join(keep) or 'nothing'}", every=600.0)
+        return keep
+
     def _fallback_order(self, failed: str) -> List[str]:
         """Enabled engines to try after ``failed`` could not serve the document.
 
@@ -1825,8 +1857,10 @@ class OcrManager:
             names = ["paddle", "doctr", "olmocr", "chandra", "surya"]
         else:
             names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
-        return [n for n in names
-                if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
+        return self._pod_capable(
+            [n for n in names
+             if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)],
+            cfg, say=True)
 
     def _slot_sem(self) -> "asyncio.Semaphore":
         """The one semaphore every page waits on.
@@ -2223,8 +2257,10 @@ class OcrManager:
         if raw in ("auto", "", "on", "true", "1"):
             return self._fallback_order(failed)
         names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
-        return [n for n in names
-                if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)]
+        return self._pod_capable(
+            [n for n in names
+             if n != failed and n in _ENGINE_FACTORIES and _engine_enabled(cfg, n)],
+            cfg, say=True)
 
     async def _read_page_blobs(self, blobs, engine: str, *, filename: str,
                                content_type: str, dpi: int, page_opts, detect,

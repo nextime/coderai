@@ -176,6 +176,7 @@ def _locked_update(name: str, fn) -> dict:
 
 REPORTS = "runpod-worker-reports.json"
 FLAGS = "runpod-pod-flags.json"
+DEMAND = "runpod-worker-demand.json"
 
 
 def write_reports(worker: str, pods: Dict[str, dict]) -> None:
@@ -200,6 +201,49 @@ def write_reports(worker: str, pods: Dict[str, dict]) -> None:
         return True
 
     _locked_update(REPORTS, _w)
+
+
+def write_demand(worker: str, pool_key: str, waiting: int) -> None:
+    """Worker -> controller: pages that want a pod for this pool and have none.
+
+    Reports (above) are keyed by POD, which is the one thing a cold fleet has
+    none of: a worker holding pages with zero pods wrote `{}` and the controller
+    read it as an idle install. Since a worker never rents and the controller
+    only scales up inside its own `acquire` -- which it never calls while the
+    workers serve the pages -- nothing could start the first pod. A page waited
+    out `ocr.pod_pipeline_wait_s` and 503'd, and with `min_pods: 0` that was
+    every page. Demand therefore travels on its own, keyed by POOL.
+    """
+    now = time.time()
+
+    def _w(d):
+        key = f"{worker}|{pool_key}"
+        if waiting <= 0:
+            return bool(d.pop(key, None))
+        d[key] = {"worker": worker, "pool": str(pool_key),
+                  "waiting": int(waiting), "at": now}
+        return True
+
+    _locked_update(DEMAND, _w)
+
+
+def read_demand(pool_key: str, max_age: float = REPORT_MAX_AGE_S) -> int:
+    """CONTROLLER: how many pages the workers have waiting for this pool.
+
+    The SUM across workers: each one is holding different pages. A stale entry
+    is ignored on age, so a worker that died holding pages cannot keep the
+    fleet rented.
+    """
+    now = time.time()
+    data = _locked_update(DEMAND, lambda d: False)
+    total = 0
+    for v in (data or {}).values():
+        if not isinstance(v, dict) or str(v.get("pool")) != str(pool_key):
+            continue
+        if now - float(v.get("at") or 0) > max_age:
+            continue
+        total += max(0, int(v.get("waiting") or 0))
+    return total
 
 
 def read_reports(max_age: float = REPORT_MAX_AGE_S) -> Dict[str, dict]:
