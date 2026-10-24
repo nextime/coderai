@@ -127,16 +127,22 @@ def _derive_device() -> str:
 
 
 def _decode_b64_or_url(data: str) -> bytes:
+    """The bytes behind any accepted media reference.
+
+    Accepts everything the compose endpoints accept -- a ``/v1/files/...`` path
+    or a ``sha256:`` id from ``/v1/files/upload``, a ``data:`` URI, an http(s)
+    URL, or raw base64 -- so a caller that has already uploaded a file can name
+    it instead of re-sending the whole clip on every edit. A file this install
+    holds is read from disk rather than fetched over HTTP, which would need a
+    token and would fail whenever the front is bound somewhere else.
+    """
     if not data:
         return b''
-    if data.startswith("data:"):
-        _, enc = data.split(",", 1)
-        return base64.b64decode(enc)
-    if data.startswith("http://") or data.startswith("https://"):
-        import urllib.request
-        with urllib.request.urlopen(data, timeout=60) as r:
-            return r.read()
-    return base64.b64decode(data)
+    from codai.compose.media import MediaError, fetch_bytes
+    try:
+        return fetch_bytes(data)
+    except MediaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _as_b64(ref: str) -> str:
@@ -168,7 +174,8 @@ def _save_file(data: bytes, ext: str, http_request) -> dict:
         out_path = os.path.join(global_file_path, filename)
         with open(out_path, 'wb') as f:
             f.write(data)
-        return {"url": _build_url(filename, http_request)}
+        return {"url": _build_url(filename, http_request),
+                "path": f"/v1/files/{filename}"}
     else:
         return {f"b64_{ext}": base64.b64encode(data).decode()}
 
@@ -206,6 +213,98 @@ def _encode_mp4_pyav(frames, fps: int, crf: int) -> bytes:
         data = fh.read()
     os.unlink(path)
     return data
+
+
+def _has_audio(path: str) -> bool:
+    """True when ``path`` carries at least one audio stream."""
+    try:
+        import av
+        with av.open(path) as c:
+            return bool(c.streams.audio)
+    except Exception:
+        return False
+
+
+def _mux_original_audio(video_path: str, source_path: str,
+                        temps: Optional[list] = None) -> str:
+    """Put the source clip's audio back onto a re-encoded video.
+
+    The enhancement paths decode a clip to frames and encode a brand new video,
+    which leaves the audio behind: a clip that arrived with speech or music came
+    back silent, and only the ffmpeg fallback ever kept it. Both paths preserve
+    the source duration -- upscaling keeps the frame count and rate, and
+    interpolation compensates with ``output_fps`` -- so the track lines up as it
+    is, with no stretching.
+
+    The track is stream-copied when the output container accepts its codec and
+    re-encoded to AAC when it does not. Returns the new path, or ``video_path``
+    unchanged when the source has no audio or the remux fails: a silent result
+    is better than failing an enhancement that otherwise succeeded, and the
+    caller gets the frames it paid the GPU for either way.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    if not source_path or not os.path.exists(source_path):
+        return video_path
+    if not _has_audio(source_path):
+        return video_path
+    out = tempfile.mktemp(suffix='_aud.mp4')
+    try:
+        import av
+        with av.open(video_path) as vin, av.open(source_path) as ain, \
+                av.open(out, mode='w') as outc:
+            v_in = vin.streams.video[0]
+            a_in = ain.streams.audio[0]
+            v_out = outc.add_stream_from_template(v_in)
+            try:
+                a_out = outc.add_stream_from_template(a_in)
+                stream_copy = True
+            except Exception:
+                # The source codec cannot live in MP4 (opus/vorbis from a webm,
+                # say) -- re-encode rather than drop the track.
+                a_out = outc.add_stream('aac', rate=a_in.rate)
+                try:
+                    a_out.bit_rate = 192000
+                except Exception:
+                    pass
+                stream_copy = False
+            for pkt in vin.demux(v_in):
+                if pkt.dts is None:
+                    continue
+                pkt.stream = v_out
+                outc.mux(pkt)
+            if stream_copy:
+                for pkt in ain.demux(a_in):
+                    if pkt.dts is None:
+                        continue
+                    pkt.stream = a_out
+                    outc.mux(pkt)
+            else:
+                # An encoder stream may not have its format/layout filled in
+                # until it is configured, so fall back to what AAC always takes.
+                _fmt = getattr(getattr(a_out, "format", None), "name", None) or "fltp"
+                _layout = getattr(getattr(a_out, "layout", None), "name", None) \
+                    or getattr(getattr(a_in, "layout", None), "name", None) or "stereo"
+                resampler = av.AudioResampler(
+                    format=_fmt, layout=_layout, rate=a_out.rate or a_in.rate)
+                for frame in ain.decode(a_in):
+                    for rs in resampler.resample(frame):
+                        rs.pts = None
+                        for pkt in a_out.encode(rs):
+                            outc.mux(pkt)
+                for pkt in a_out.encode():
+                    outc.mux(pkt)
+    except Exception as e:
+        _log.warning("could not carry the source audio into the result: %s", e)
+        try:
+            if os.path.exists(out):
+                os.unlink(out)
+        except Exception:
+            pass
+        return video_path
+    if temps is not None:
+        temps.append(out)
+    return out
 
 
 class _Mp4Writer:
@@ -2816,8 +2915,9 @@ def _model_upscale_video(model_name: str, in_path: str, factor: int,
     except Exception:
         _wait_until_safe = None
     # Stream upscaled frames straight into the encoder so the (large, ×factor)
-    # output never has to be fully resident in memory. Audio is not carried in the
-    # pure in-process path (the enhancement targets are silent clips).
+    # output never has to be fully resident in memory. The source audio is muxed
+    # back on afterwards -- the frames are re-encoded, so it cannot survive the
+    # write itself.
     out = tempfile.mktemp(suffix='_up.mp4')
     temps.append(out)
     writer = _Mp4Writer(out, fps)
@@ -2847,7 +2947,7 @@ def _model_upscale_video(model_name: str, in_path: str, factor: int,
     finally:
         writer.close()
         _vid_progress_done()
-    return out
+    return _mux_original_audio(out, in_path, temps)
 
 
 def _count_video_frames(path: str) -> int:
@@ -3022,7 +3122,7 @@ def _interpolate_inprocess(path, multiplier, model_name, temps, tid=None, output
     temps.append(out_path)
     with open(out_path, "wb") as f:
         f.write(data)
-    return out_path
+    return _mux_original_audio(out_path, path, temps)
 
 
 def _cpu_thread_limit() -> int:
@@ -3383,7 +3483,8 @@ def _rife_ncnn_interpolate(path: str, multiplier: int, temps: list) -> str:
             raise RuntimeError(
                 f"reassembly failed: {r.stderr.decode(errors='replace')}")
         task_registry.finish(_tid, "done")
-        return out
+        # Reassembled from PNG frames, so the source audio is not in `out` yet.
+        return _mux_original_audio(out, path, temps)
     except TaskCancelled:
         task_registry.finish(_tid, "cancelled")
         raise

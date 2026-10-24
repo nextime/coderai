@@ -246,7 +246,12 @@ def fetch(ref: str, timeout: float = 120.0, max_bytes: int = 2 << 30) -> bytes:
         # this machine.
         raise MediaError(f"{ref}: not a URL, a /v1/files path, or base64 data")
     try:
-        return base64.b64decode(ref, validate=True)
+        # Whitespace is not part of base64 but is everywhere in practice: MIME
+        # wrapping at 76 columns, `base64` from a shell, Python's encodebytes.
+        # Strict validation is still what rejects a reference that is not base64
+        # at all -- it just must not reject a correctly encoded one for its line
+        # breaks, which is what every wrapped payload has.
+        return base64.b64decode("".join(ref.split()), validate=True)
     except Exception:
         raise MediaError("media reference is not a URL, a /v1/files path, a data: URI or base64")
 

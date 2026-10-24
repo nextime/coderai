@@ -234,6 +234,10 @@ def save_image_response(img, request_format="base64", http_request=None):
         # Add URL to response
         from codai.api.urlutils import build_file_url
         result["url"] = build_file_url(filename, http_request)
+        # The relative path as well, as /v1/compose returns it: a caller that
+        # feeds the result into another call should not have to know, or depend
+        # on, this install's public hostname.
+        result["path"] = f"/v1/files/{filename}"
         
         # If client explicitly requested base64, include it
         # Otherwise, only return URL when file-path is set
@@ -1726,10 +1730,12 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
 class ImageEditRequest(BaseModel):
     model: str
     prompt: str
-    image: str              # base64-encoded PNG or "data:image/...;base64,..."
-    mask: Optional[str] = None   # optional inpaint mask (base64 PNG)
+    image: str              # /v1/files path, sha256: id, data URI, URL or base64
+    mask: Optional[str] = None   # accepted but unused here -- see /v1/images/inpaint
     n: int = 1
-    size: Optional[str] = "1024x1024"
+    #: Omitted means "keep the source's shape" (see _default_edit_size), NOT a
+    #: square: defaulting to 1024x1024 silently distorted every non-square photo.
+    size: Optional[str] = None
     response_format: Optional[str] = "url"
     strength: Optional[float] = 0.75    # denoising strength (0=keep original, 1=ignore)
     steps: Optional[int] = None
@@ -1742,15 +1748,44 @@ class ImageEditRequest(BaseModel):
         extra = "allow"
 
 
-def _decode_b64_image(data: str):
-    """Decode base64 image string to PIL Image."""
+def _default_edit_size(width: int, height: int, multiple: int = 64,
+                       target_pixels: int = 1024 * 1024) -> tuple:
+    """(w, h) keeping the source aspect at ~``target_pixels``, on a grid.
+
+    An omitted ``size`` used to mean 1024x1024, which stretched every photo that
+    was not square -- a 3:2 holiday snap came back visibly squashed. Diffusion
+    models need each side on a multiple (usually 64), so the aspect is preserved
+    as closely as that grid allows rather than exactly.
+    """
+    width, height = max(1, int(width)), max(1, int(height))
+    scale = (target_pixels / float(width * height)) ** 0.5
+    w = int(round(width * scale / multiple)) * multiple
+    h = int(round(height * scale / multiple)) * multiple
+    return max(multiple, w), max(multiple, h)
+
+
+def _image_bytes(ref: str, field: str = "image") -> bytes:
+    """The bytes behind any accepted image reference.
+
+    Accepts everything the compose endpoints accept -- a ``/v1/files/...`` path
+    or a ``sha256:`` id from ``/v1/files/upload``, a ``data:`` URI, an http(s)
+    URL, or raw base64 -- so a caller that uploaded the photo once can name it
+    on each edit instead of re-sending it. A file this install already holds is
+    read from disk, never fetched back over HTTP.
+    """
+    if not ref:
+        raise HTTPException(status_code=400, detail=f"{field} is required")
+    from codai.compose.media import MediaError, fetch_bytes
+    try:
+        return fetch_bytes(ref)
+    except MediaError as e:
+        raise HTTPException(status_code=400, detail=f"{field}: {e}")
+
+
+def _decode_b64_image(data: str, field: str = "image"):
+    """Any accepted image reference → an RGB PIL image."""
     from PIL import Image as PILImage
-    if data.startswith("data:"):
-        _, encoded = data.split(",", 1)
-        raw = base64.b64decode(encoded)
-    else:
-        raw = base64.b64decode(data)
-    return PILImage.open(io.BytesIO(raw)).convert("RGB")
+    return PILImage.open(io.BytesIO(_image_bytes(data, field))).convert("RGB")
 
 
 def _load_img2img_pipeline(model_name: str, global_args):
@@ -1844,6 +1879,11 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
                     source_img = source_img.resize((width, height))
                 except ValueError:
                     pass
+        else:
+            # No size asked for: keep the photo's own shape at ~1 MP.
+            width, height = _default_edit_size(*source_img.size)
+            if (width, height) != source_img.size:
+                source_img = source_img.resize((width, height))
 
         seed = request.seed or getattr(global_args, 'image_seed', None)
         generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
@@ -2204,9 +2244,29 @@ def _run_upscale(upscaler, image_bytes: bytes, scale: int):
     return img.resize((w * scale, h * scale), PILImage.LANCZOS)
 
 
+def _configured_upscalers() -> list:
+    """Image models this install could actually upscale with."""
+    names = []
+    try:
+        from codai.models.capabilities import detect_model_capabilities
+        for m in multi_model_manager.image_models:
+            try:
+                if detect_model_capabilities(m).image_upscaling:
+                    names.append(m)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return names
+
+
 @router.post("/v1/images/upscale", summary="Upscale an image")
 async def create_image_upscale(request: ImageUpscaleRequest, http_request: Request = None):
-    """Upscale an image using Real-ESRGAN or PIL LANCZOS fallback."""
+    """Upscale an image with a real super-resolution model.
+
+    There is no PIL/LANCZOS fallback: a plain resize is not an upscale, and
+    returning one silently charged for work that did not happen.
+    """
     global global_args
     _progress_loading(request.model or "image")
     model_info = await asyncio.to_thread(
@@ -2221,7 +2281,19 @@ async def create_image_upscale(request: ImageUpscaleRequest, http_request: Reque
             raise HTTPException(status_code=500, detail=f"Failed to load upscaler: {e}")
         if upscaler[0] != 'pil':
             _UPSCALER_CACHE[model_name] = upscaler
-    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    if upscaler[0] == 'pil':
+        # _load_upscaler fell through to PIL LANCZOS, which is a plain resize:
+        # answering 200 here bills the caller for an "AI upscale" that never
+        # ran, and the result looks merely soft rather than wrong. Say so.
+        usable = _configured_upscalers()
+        raise HTTPException(
+            status_code=400,
+            detail=(f"'{model_name}' is not an upscaling model"
+                    + (f" — configured upscalers: {', '.join(usable)}"
+                       if usable else
+                       " — no upscaling model is configured; add a Real-ESRGAN "
+                       "/ SwinIR / diffusers upscaler on the model page")))
+    raw = _image_bytes(request.image)
     try:
         out_img = await asyncio.get_event_loop().run_in_executor(
             None, _run_upscale, upscaler, raw, request.scale or 4)
@@ -2492,7 +2564,7 @@ def _run_deblur(image_bytes: bytes, strength: float) -> "PILImage.Image":
 @router.post("/v1/images/deblur", summary="Deblur an image")
 async def create_image_deblur(request: ImageDeblurRequest, http_request: Request = None):
     """Remove blur from an image using Wiener deconvolution and unsharp masking."""
-    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    raw = _image_bytes(request.image)
     try:
         result_img = await asyncio.get_event_loop().run_in_executor(
             None, _run_deblur, raw, request.strength or 0.5)
@@ -2550,7 +2622,7 @@ def _run_unpixelate(image_bytes: bytes, scale: int, model_path: Optional[str]) -
 @router.post("/v1/images/unpixelate", summary="Restore a pixelated image")
 async def create_image_unpixelate(request: ImageUnpixelateRequest, http_request: Request = None):
     """Remove pixelation / upscale with detail recovery using Real-ESRGAN."""
-    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    raw = _image_bytes(request.image)
     try:
         result_img = await asyncio.get_event_loop().run_in_executor(
             None, _run_unpixelate, raw, request.scale or 4, request.model)
