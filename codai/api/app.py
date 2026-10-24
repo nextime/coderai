@@ -1272,18 +1272,29 @@ async def get_broker_capabilities():
 
 @app.get("/v1/files/{filename}", summary="Download a generated file", tags=["Files"])
 async def get_file(filename: str):
-    """Serve uploaded/generated files."""
-    if not global_file_path:
-        raise HTTPException(status_code=404, detail="File not found")
-    # Prevent path traversal: resolve to real paths and confirm the result
-    # stays inside the configured directory.
-    safe_base = os.path.realpath(global_file_path)
-    candidate = os.path.realpath(os.path.join(global_file_path, filename))
-    if not (candidate == safe_base or candidate.startswith(safe_base + os.sep)):
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not os.path.isfile(candidate):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(candidate)
+    """Serve uploaded/generated files.
+
+    Generated files come from the output directory. An uploaded one (``up-``
+    prefix, from /v1/files/upload) may instead sit in the cache store this
+    install falls back to when no output directory is configured, so it is
+    looked up there as well — otherwise an upload could be accepted and then
+    not served back."""
+    from codai.compose import media
+    bases = [global_file_path]
+    if filename.startswith(media.UPLOAD_PREFIX):
+        bases.append(media.uploads_dir())
+    for base in bases:
+        if not base:
+            continue
+        # Prevent path traversal: resolve to real paths and confirm the result
+        # stays inside the directory we are serving from.
+        safe_base = os.path.realpath(base)
+        candidate = os.path.realpath(os.path.join(base, filename))
+        if not (candidate == safe_base or candidate.startswith(safe_base + os.sep)):
+            raise HTTPException(status_code=403, detail="Access denied")
+        if os.path.isfile(candidate):
+            return FileResponse(candidate)
+    raise HTTPException(status_code=404, detail="File not found")
 
 
 _IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}

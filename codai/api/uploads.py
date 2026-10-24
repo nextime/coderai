@@ -18,8 +18,15 @@ Storage is content-addressed (sha256 of the bytes), which makes re-uploading
 the same file free and makes ``GET /v1/files/blob/{hash}`` a useful question —
 a client can ask before sending. This mirrors ``/v1/loras/upload`` for LoRA
 weights; the difference is that these files are served back by
-``/v1/files/{name}``, so they live in the ordinary output directory under their
-hash, not in a private blob store.
+``/v1/files/{name}``, so they live under their hash in the ordinary output
+directory rather than in a private blob store.
+
+An install that configured no output directory used to refuse uploads outright
+(501), which left a remote client with no way to send a 40 MB clip other than
+inlining it in every request — the exact waste this endpoint exists to avoid.
+So when there is no output directory the store falls back to the install's
+cache directory (``media.uploads_dir()``); the ``sha256:`` id and the
+``/v1/files/<name>`` URL both keep working, and nothing else is written there.
 """
 
 import os
@@ -40,12 +47,15 @@ _MAX_BYTES = 2 << 30          # 2 GiB: a minute of 4K is ~400 MB
 
 
 def _files_dir() -> str:
-    d = media.files_dir()
+    d = media.uploads_dir()
     if not d:
         raise HTTPException(status_code=501, detail=(
-            "this install has no output directory configured, so uploads cannot be "
-            "stored (start the server with --file-path / files.path)"))
-    os.makedirs(d, exist_ok=True)
+            "this install has nowhere to store uploads: neither an output directory "
+            "(--file-path / files.path) nor a writable cache directory"))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=507, detail=f"upload store {d} is not writable: {exc}")
     return d
 
 

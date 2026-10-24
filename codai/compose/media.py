@@ -150,6 +150,38 @@ def _files_dir() -> Optional[str]:
     return files_dir()
 
 
+def uploads_dir() -> Optional[str]:
+    """Where ``POST /v1/files/upload`` keeps its content-addressed store.
+
+    The output directory when there is one, so an upload is served back by
+    ``/v1/files/<name>`` beside the files this install generates. An install
+    with no output directory configured still has a cache directory, and
+    uploads land there instead of being refused: every media field accepts the
+    ``sha256:`` id the upload returns, and ``/v1/files/<name>`` serves these
+    too (codai/api/app.py). Returns None only when even the cache directory
+    cannot be determined."""
+    return files_dir() or _cache_upload_dir()
+
+
+def _cache_upload_dir() -> Optional[str]:
+    try:
+        from codai.platform_paths import user_cache_dir
+        return str(user_cache_dir() / "uploads")
+    except Exception:
+        return None
+
+
+def _upload_dirs() -> list:
+    """Every directory an upload may have landed in, nearest first. The cache
+    store stays in the list even once an output directory is configured, so an
+    install that gains one does not lose track of what it already holds."""
+    out = []
+    for d in (files_dir(), _cache_upload_dir()):
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
 def local_path_for_files_url(ref: str) -> Optional[str]:
     """If ``ref`` points at a file this install already holds, its path.
 
@@ -169,14 +201,21 @@ def local_path_for_files_url(ref: str) -> Optional[str]:
         return None
     name = path.split("/v1/files/", 1)[1].split("/")[-1]
     name = urllib.parse.unquote(name)
-    base = _files_dir()
-    if not (base and name):
+    if not name:
         return None
-    safe_base = os.path.realpath(base)
-    cand = os.path.realpath(os.path.join(base, name))
-    if not (cand == safe_base or cand.startswith(safe_base + os.sep)):
-        return None
-    return cand if os.path.isfile(cand) else None
+    # An uploaded file may live in the cache store instead, on an install with
+    # no output directory; a generated one only ever lives in the output dir.
+    bases = _upload_dirs() if name.startswith(UPLOAD_PREFIX) else [_files_dir()]
+    for base in bases:
+        if not base:
+            continue
+        safe_base = os.path.realpath(base)
+        cand = os.path.realpath(os.path.join(base, name))
+        if not (cand == safe_base or cand.startswith(safe_base + os.sep)):
+            continue
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 _SHA256 = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$", re.I)
@@ -191,17 +230,15 @@ def blob_path(ref: str) -> Optional[str]:
     if not m:
         return None
     h = m.group(1).lower()
-    base = files_dir()
-    if not base:
-        return None
-    try:
-        for name in os.listdir(base):
-            if name.startswith(UPLOAD_PREFIX + h):
-                p = os.path.join(base, name)
-                if os.path.isfile(p):
-                    return p
-    except OSError:
-        return None
+    for base in _upload_dirs():
+        try:
+            for name in os.listdir(base):
+                if name.startswith(UPLOAD_PREFIX + h):
+                    p = os.path.join(base, name)
+                    if os.path.isfile(p):
+                        return p
+        except OSError:
+            continue
     return None
 
 

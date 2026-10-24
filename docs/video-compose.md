@@ -182,6 +182,12 @@ The body may also be JSON (`{"file": "<base64 or data: URI>"}`) or the raw bytes
 with a `Content-Type`. Video, image and audio only; the type is decided by the
 content, not by the client's claim.
 
+Uploading does not need an output directory. With `--file-path` set, an upload
+lands there beside the generated files; without one it goes to the install's
+cache directory instead, and both the `sha256:` id and the `/v1/files/<name>`
+URL work the same way. (Composing a *new* video still needs an output
+directory — there has to be somewhere to write the result.)
+
 ## The talking presenter
 
 A person talking to camera is the format most short videos use, and it is
