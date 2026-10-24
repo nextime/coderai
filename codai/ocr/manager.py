@@ -2318,8 +2318,29 @@ class OcrManager:
         bad = sorted(why)
         if not bad:
             return ""
+        # SAID BEFORE anything is decided about recovering it. This used to be
+        # reported only on the way INTO a re-read, so an install with
+        # `retry_degraded` off -- or with it on "auto" behind
+        # `fallback_engines: off`, which is the same thing -- produced no line
+        # anywhere about a ruined page. The engine answers 200, nothing raises,
+        # and the only other record is in the reply, which belongs to the
+        # client: a batch could come out almost entirely truncated and leave
+        # this log looking like a clean run. Finding it is not conditional on
+        # being able to fix it.
+        print(f"[ocr] {len(bad)} of {len(pages)} page(s) came back DEGRADED from "
+              f"'{name}' ("
+              + ", ".join(f"p{i}:{why[i]}" for i in bad[:8])
+              + (" ..." if len(bad) > 8 else "")
+              + ")", flush=True)
         chain = self._retry_degraded_order(name)
         if not chain:
+            print(f"[ocr] keeping them as they are: no engine is configured to "
+                  f"re-read a degraded page (ocr.retry_degraded"
+                  + (" is 'auto', which follows ocr.fallback_engines, and that "
+                     "is off" if str(getattr(cfg, "retry_degraded", "auto")
+                                     or "auto").strip().lower() in
+                     ("auto", "", "on", "true", "1") else "")
+                  + ")", flush=True)
             return ""
         try:
             cap = max(0, int(getattr(cfg, "retry_degraded_max_pages", 0) or 0))
@@ -2347,12 +2368,9 @@ class OcrManager:
         bad = [i for i in bad if i in blobs]
         if not bad:
             return ""
-        print(f"[ocr] {len(bad)} of {len(pages)} page(s) came back DEGRADED from "
-              f"'{name}' ("
-              + ", ".join(f"p{i}:{why[i]}" for i in bad[:8])
-              + (" ..." if len(bad) > 8 else "")
-              + f") — the engine answered 200, so this is not a fallback: "
-              f"re-reading those pages on {' -> '.join(chain)}", flush=True)
+        print(f"[ocr] re-reading {len(bad)} degraded page(s) of {len(pages)} on "
+              f"{' -> '.join(chain)} — the engine answered 200, so this is not "
+              f"a fallback", flush=True)
         if dropped:
             print(f"[ocr] and leaving {dropped} more as they are "
                   f"(ocr.retry_degraded_max_pages)", flush=True)

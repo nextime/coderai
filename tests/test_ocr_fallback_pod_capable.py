@@ -107,3 +107,48 @@ def test_the_failed_engine_is_never_its_own_fallback(m):
 def test_a_disabled_engine_is_not_offered(m):
     man = m(_cfg(chandra_enabled=False))
     assert man._fallback_order("surya") == ["olmocr"]
+
+
+# -- a ruined page is reported whether or not it can be fixed --------------
+
+def test_a_degraded_page_is_logged_even_with_recovery_off(m, capsys, monkeypatch):
+    """Finding it must not be conditional on being able to fix it.
+
+    The line used to be printed on the way INTO a re-read, so an install with
+    `retry_degraded` off produced nothing at all: the engine answers 200,
+    nothing raises, and the only other record is the reply, which belongs to
+    the client. A batch could come out almost entirely truncated and leave the
+    server log looking like a clean run -- which is how ~97% of one went
+    unnoticed.
+    """
+    import asyncio
+    man = m(_cfg(retry_degraded="off"))
+    page = types.SimpleNamespace(
+        text="x" * 40, meta={"repeat_detected": True}, index=0)
+    monkeypatch.setattr(man, "_page_degraded",
+                        lambda p: "repeat_detected", raising=False)
+    monkeypatch.setattr(man, "_short_pages", lambda pages, cfg: {}, raising=False)
+    note = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        man._retry_degraded(b"%PDF-1.4 ", "d.pdf", "application/pdf", "surya",
+                            [page], dpi=200, page_opts=None, detect=None,
+                            lang="it", cfg=man._require_cfg(), window=0))
+    out = capsys.readouterr().out
+    assert "DEGRADED" in out, "a ruined page left no trace in the log"
+    assert "p0:repeat_detected" in out
+    assert note == "", "nothing was recovered, so nothing may be claimed"
+
+
+def test_the_log_says_why_nothing_was_re_read(m, capsys, monkeypatch):
+    """An operator reading "DEGRADED" must learn whether a retry was even possible."""
+    import asyncio
+    man = m(_cfg(retry_degraded="auto", fallback_engines="off"))
+    page = types.SimpleNamespace(text="x" * 40, meta={}, index=0)
+    monkeypatch.setattr(man, "_page_degraded", lambda p: "truncated", raising=False)
+    monkeypatch.setattr(man, "_short_pages", lambda pages, cfg: {}, raising=False)
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        man._retry_degraded(b"%PDF-1.4 ", "d.pdf", "application/pdf", "surya",
+                            [page], dpi=200, page_opts=None, detect=None,
+                            lang="it", cfg=man._require_cfg(), window=0))
+    out = capsys.readouterr().out
+    assert "no engine is configured to re-read" in out
+    assert "fallback_engines" in out, "the inherited 'off' must be named"
