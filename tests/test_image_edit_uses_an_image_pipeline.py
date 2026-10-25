@@ -132,31 +132,139 @@ def test_conversion_reuses_the_weights_rather_than_loading_them_twice():
     assert "from_pipe" in src
 
 
-def test_an_unconvertible_pipeline_is_refused_not_served():
-    """501, not a 200 carrying a picture of something else."""
-    src = open("codai/api/images.py").read()
-    assert "cannot \nedit an image" in src or "cannot " in src
-    assert src.count("status_code=501") >= 2, \
-        "both edits and inpaint must refuse rather than silently generate"
-    assert "has no `image` input" in src
+def _named(name, **attrs):
+    """An object whose class is called ``name``, which is how task detection
+    identifies a pipeline (diffusers' own tables are keyed by class)."""
+    body = {"__call__": lambda self, **kw: None}
+    body.update(attrs)
+    return type(name, (), body)()
 
 
-@pytest.mark.parametrize("endpoint", ["create_image_edit", "create_image_inpaint"])
-def test_the_guard_runs_on_a_cached_pipeline_too(endpoint):
-    """A pipeline loaded by an earlier version is already in the manager's
-    models dict, so checking only after a fresh load would leave every running
-    install serving text-to-image until it restarted."""
+def test_task_detection_reads_diffusers_tables():
+    assert images_mod._task_of(_named("StableDiffusionXLPipeline")) == "text2img"
+    assert images_mod._task_of(_named("StableDiffusionXLImg2ImgPipeline")) == "img2img"
+    assert images_mod._task_of(_named("StableDiffusionXLInpaintPipeline")) == "inpaint"
+
+
+def test_a_controlnet_text2img_pipeline_is_not_mistaken_for_img2img():
+    """Why detection asks the tables instead of the signature: ControlNet
+    text-to-image requires an `image` -- the control hint, not a source."""
+    pipe = _named("StableDiffusionXLControlNetPipeline")
+    assert images_mod._task_of(pipe) == "text2img"
+
+
+def test_an_unmapped_family_is_left_alone():
+    """A pipeline diffusers does not map is not converted in either direction.
+
+    Note which families ARE mapped, because the list is wider than it looks:
+    Z-Image and Flux both have text2img, img2img and inpaint entries, so they
+    share one copy of the weights across the tasks too.
+    """
+    odd = _named("SomeHouseTrainedPipeline")
+    assert images_mod._task_of(odd) is None
+    assert images_mod._task_view(odd, "text2img") is odd
+    assert images_mod._task_view(odd, "img2img") is odd
+
+
+@pytest.mark.parametrize("cls_name,task", [
+    ("ZImagePipeline", "text2img"),
+    ("ZImageImg2ImgPipeline", "img2img"),
+    ("FluxPipeline", "text2img"),
+    ("FluxImg2ImgPipeline", "img2img"),
+    ("FluxInpaintPipeline", "inpaint"),
+])
+def test_the_modern_families_are_mapped_too(cls_name, task):
+    """So the sharing is not an SD/SDXL-only arrangement."""
+    assert images_mod._task_of(_named(cls_name)) == task
+
+
+def test_asking_for_the_task_it_already_is_costs_nothing():
+    base = _named("StableDiffusionXLImg2ImgPipeline")
+    assert images_mod._task_view(base, "img2img") is base
+    assert not hasattr(base, images_mod._VIEWS_ATTR)
+
+
+def test_one_copy_of_the_weights_serves_every_task(monkeypatch):
+    """The point of the whole arrangement: Motus creates a character with a
+    model and then edits it with the same one, and that must not hold two
+    copies of an 18 GB checkpoint or evict on every alternation."""
+    import diffusers
+    conversions = []
+
+    def fake_from_pipe(pipe, **kw):
+        conversions.append(pipe)
+        return _named("StableDiffusionXLImg2ImgPipeline", image=None)
+
+    monkeypatch.setattr(diffusers.AutoPipelineForImage2Image, "from_pipe",
+                        staticmethod(fake_from_pipe))
+    base = _named("StableDiffusionXLPipeline")
+    first = images_mod._task_view(base, "img2img")
+    second = images_mod._task_view(base, "img2img")
+    assert first is second, "converted twice instead of reusing the view"
+    assert len(conversions) == 1
+    assert conversions[0] is base, "converted from something other than the base"
+    # and the view hangs off the base, so it dies when the weights do
+    assert images_mod._VIEWS_ATTR in vars(base)
+    assert vars(base)[images_mod._VIEWS_ATTR]["img2img"] is first
+
+
+def test_a_failed_conversion_is_reported_not_swallowed(monkeypatch):
+    import diffusers
+
+    def boom(pipe, **kw):
+        raise RuntimeError("no img2img for this family")
+
+    monkeypatch.setattr(diffusers.AutoPipelineForImage2Image, "from_pipe",
+                        staticmethod(boom))
+    assert images_mod._task_view(_named("StableDiffusionXLPipeline"), "img2img") is None
+
+
+def test_a_pipeline_that_cannot_do_the_task_is_refused_with_501():
+    """Not served: a 200 carrying a picture generated from the prompt alone is
+    the outcome this whole change exists to rule out."""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    info = {"model_name": "some/model", "model_key": "image:some/model",
+            "model_object": _named("ZImagePipeline")}   # unmapped, no `image`
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(images_mod._pipeline_for_task(info, "img2img"))
+    assert exc.value.status_code == 501
+    assert "cannot do img2img" in exc.value.detail
+
+
+def test_the_task_pipelines_share_the_manager_entry():
+    """One models-dict key per model. A second key per task is both a double
+    load and how a cache key reached from_pretrained in the first place."""
     src = open("codai/api/images.py").read()
-    head = src.index(f"async def {endpoint}")
-    body = src[head:head + 4000]
-    guard = body.index("_accepts_image(pipe)")
-    cached_lookup = body.index("multi_model_manager.models.get(")
-    assert guard > cached_lookup
-    # and it is not nested inside the `if pipe is None:` load branch
-    line_start = body.rindex("\n", 0, guard) + 1
-    indent = len(body[line_start:guard]) - len(body[line_start:guard].lstrip())
-    assert indent <= 4, "the guard is inside the load branch, so a cached " \
-                        "text-to-image pipeline would still be used"
+    head = src.index("async def _pipeline_for_task")
+    body = src[head:head + 2600]
+    assert "model_info.get('model_key')" in body
+    assert "add_model(model_key" in body
+    # the task-prefixed keys are gone from this module entirely
+    import re
+    assert not re.search(r'f"img2img:\{model_name\}"', src)
+    assert not re.search(r'f"inpaint:\{model_name\}"', src)
+
+
+def test_the_configured_loader_is_the_one_used():
+    """The editing endpoints used to load their own copy with a hardcoded
+    dtype, so a 4-bit model was served at 4 bits for text-to-image and bf16
+    for editing -- out of two copies of the weights."""
+    src = open("codai/api/images.py").read()
+    head = src.index("async def _pipeline_for_task")
+    body = src[head:head + 2600]
+    assert "_load_diffusers_pipeline" in body
+    assert body.index("_load_diffusers_pipeline") < body.index("_load_img2img_pipeline")
+
+
+def test_text2img_also_gets_a_view_so_the_sharing_works_both_ways():
+    """A model an edit loaded can create a character without a second copy."""
+    src = open("codai/api/images.py").read()
+    head = src.index("async def _generate_with_diffusers")
+    body = src[head:head + 1500]
+    assert '_task_view(pipeline, "text2img")' in body
 
 
 # --------------------------------------------------------------------------- #

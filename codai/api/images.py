@@ -1098,6 +1098,16 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     import numpy as np
     import time as time_module
 
+    # The same weights serve both directions: a model an edit request loaded as
+    # img2img can create a character here without a second copy. Unknown
+    # families are left exactly as they are.
+    _view = _task_view(pipeline, "text2img")
+    if _view is None:
+        raise HTTPException(status_code=501, detail=(
+            f"{type(pipeline).__name__} cannot generate from a prompt alone: "
+            f"diffusers offers no text-to-image pipeline for this family."))
+    pipeline = _view
+
     if getattr(request, 'disable_safety_checker', False):
         _disable_safety_checker(pipeline)
 
@@ -2077,24 +2087,147 @@ def _accepts_image(pipeline) -> bool:
     return not named
 
 
-def _as_image_task(pipeline, task: str):
-    """``pipeline`` as an img2img/inpaint pipeline, reusing its weights.
+#: The three things one set of image weights can be asked to do. A checkpoint
+#: is a UNet, a VAE and its text encoders; which of these tasks it performs is
+#: a property of the pipeline class wrapped around them, not of the weights.
+TASKS = ("text2img", "img2img", "inpaint")
 
-    ``AutoPipelineFor*.from_pipe`` swaps the task class around the components
-    already in VRAM, so recovering from a text-to-image pipeline costs no
-    second copy of the weights. Returns None when it cannot be converted.
+#: Where the per-task pipelines hang off the loaded model. Deliberately an
+#: attribute of the base pipeline rather than another entry in the manager's
+#: models dict: the views share the base's components, so they must die exactly
+#: when it does, and a second models-dict key is what let a cache key end up in
+#: a from_pretrained() call (see _TASK_NAMESPACES in codai/models/manager.py).
+_VIEWS_ATTR = "_coderai_task_views"
+
+
+def _task_mappings():
+    from diffusers.pipelines.auto_pipeline import (
+        AUTO_IMAGE2IMAGE_PIPELINES_MAPPING,
+        AUTO_INPAINT_PIPELINES_MAPPING,
+        AUTO_TEXT2IMAGE_PIPELINES_MAPPING,
+    )
+    return {
+        "text2img": AUTO_TEXT2IMAGE_PIPELINES_MAPPING,
+        "img2img": AUTO_IMAGE2IMAGE_PIPELINES_MAPPING,
+        "inpaint": AUTO_INPAINT_PIPELINES_MAPPING,
+    }
+
+
+def _task_of(pipeline) -> Optional[str]:
+    """Which of :data:`TASKS` this pipeline class performs, or None.
+
+    Asked of diffusers' own task tables rather than guessed: a signature check
+    would call a ControlNet text-to-image pipeline "img2img", since its
+    required ``image`` is the control hint. None means a family diffusers does
+    not map, which is left alone -- a smaller set than it sounds, since SD,
+    SDXL, Flux and Z-Image all have entries for all three tasks.
     """
-    from diffusers import AutoPipelineForImage2Image, AutoPipelineForInpainting
-    Auto = AutoPipelineForInpainting if task == "inpaint" else AutoPipelineForImage2Image
+    name = type(pipeline).__name__
+    for task, mapping in _task_mappings().items():
+        if any(getattr(c, "__name__", None) == name for c in mapping.values()):
+            return task
+    return None
+
+
+def _task_view(base, task: str):
+    """``base`` as a pipeline for ``task``, sharing one copy of the weights.
+
+    This is what lets one model serve both character creation and editing.
+    ``AutoPipelineFor*.from_pipe`` builds the task's pipeline class around the
+    components already in VRAM, so a model used for text-to-image and
+    image-to-image costs what it costs once -- 18 GB for an SDXL fine-tune,
+    which is the difference between both tasks being resident and an eviction
+    on every alternation.
+
+    Views are cached on the base and shared, so a LoRA or IP-Adapter applied
+    through one task is visible to the others: same UNet, by design.
+
+    Returns the base unchanged when it already performs ``task`` or when its
+    family is not one diffusers maps, and None when a conversion was needed
+    and failed.
+    """
+    current = _task_of(base)
+    if current == task or current is None:
+        return base
+
+    views = getattr(base, _VIEWS_ATTR, None)
+    if views is None:
+        views = {}
+        try:
+            setattr(base, _VIEWS_ATTR, views)
+        except Exception:
+            pass        # a pipeline that refuses attributes still converts
+    if task in views:
+        return views[task]
+
+    from diffusers import (AutoPipelineForImage2Image, AutoPipelineForInpainting,
+                           AutoPipelineForText2Image)
+    Auto = {"text2img": AutoPipelineForText2Image,
+            "img2img": AutoPipelineForImage2Image,
+            "inpaint": AutoPipelineForInpainting}[task]
     try:
-        converted = Auto.from_pipe(pipeline)
+        view = Auto.from_pipe(base)
     except Exception as exc:
-        _log.warning("cannot use %s as a %s pipeline: %s",
-                     type(pipeline).__name__, task, exc)
+        _log.warning("cannot use %s for %s: %s",
+                     type(base).__name__, task, exc)
         return None
-    _log.info("converted %s to %s (same weights, no second copy)",
-              type(pipeline).__name__, type(converted).__name__)
-    return converted
+    views[task] = view
+    _log.info("%s also serving %s as %s (same weights, no second copy)",
+              type(base).__name__, task, type(view).__name__)
+    return view
+
+
+async def _pipeline_for_task(model_info: dict, task: str):
+    """The pipeline for ``task``, from ONE loaded copy of the model's weights.
+
+    Motus creates characters (text-to-image) and edits them (image-to-image)
+    with the same checkpoint, so loading one per task would hold the weights
+    twice -- 18 GB each for an SDXL fine-tune, and an eviction on every
+    alternation between the two. The model is loaded once, under the manager's
+    own key so its VRAM accounting and eviction see one model, and each task
+    gets a view onto those components.
+
+    The load goes through ``_load_diffusers_pipeline``, which is the only
+    loader that honours the model's config -- precision, offload, quantization,
+    a VAE override. The editing endpoints used to load their own copy with a
+    hardcoded dtype and none of that, so a 4-bit model served text-to-image at
+    4 bits and editing at bf16, out of two copies.
+    """
+    model_name = model_info.get('model_name')
+    model_key = model_info.get('model_key') or f"image:{model_name}"
+    base = model_info.get('model_object') or multi_model_manager.models.get(model_key)
+
+    if base is None:
+        cfg = (multi_model_manager.config.get(model_key)
+               or multi_model_manager.config.get(model_name) or {})
+        try:
+            base = await asyncio.to_thread(
+                _load_diffusers_pipeline, model_name, global_args, cfg)
+        except Exception as e:
+            base = None
+            _log.warning("the configured loader could not open %r for %s (%s); "
+                         "falling back to a task-only load", model_name, task, e)
+        if base is not None:
+            multi_model_manager.add_model(model_key, base)
+            multi_model_manager.current_model_key = model_key
+
+    if base is None:
+        # Last resort: a task-specific load, which is all the editing
+        # endpoints ever did. Not registered under the shared key, because it
+        # carries none of the model's configuration.
+        loader = _load_inpaint_pipeline if task == "inpaint" else _load_img2img_pipeline
+        try:
+            return await asyncio.to_thread(loader, model_name, global_args)
+        except Exception as e:
+            raise HTTPException(status_code=500,
+                                detail=f"Failed to load {task} model: {e}")
+
+    view = _task_view(base, task)
+    if view is None or (task in ("img2img", "inpaint") and not _accepts_image(view)):
+        raise HTTPException(status_code=501, detail=(
+            f"'{model_name}' loaded as {type(base).__name__}, which cannot do "
+            f"{task}: diffusers offers no {task} pipeline for this family."))
+    return view
 
 
 def _load_img2img_pipeline(model_name: str, global_args):
@@ -2163,30 +2296,7 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         err = model_info.get('error', f"Model '{request.model}' not found or not registered")
         raise HTTPException(status_code=404, detail=err)
 
-    model_key = f"img2img:{model_name}"
-    pipe = multi_model_manager.models.get(model_key)
-
-    if pipe is None:
-        try:
-            pipe = await asyncio.get_event_loop().run_in_executor(
-                None, _load_img2img_pipeline, model_name, global_args
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load img2img model: {e}")
-        multi_model_manager.models[model_key] = pipe
-
-    # A pipeline that cannot take an image must never serve an edit: it would
-    # accept `image` into **kwargs, drop it, and answer 200 with a picture
-    # generated from the prompt alone. Convert it (same weights) or say so.
-    if not _accepts_image(pipe):
-        converted = _as_image_task(pipe, "img2img")
-        if converted is None:
-            raise HTTPException(status_code=501, detail=(
-                f"'{model_name}' loaded as {type(pipe).__name__}, which cannot "
-                f"edit an image: it has no `image` input. Editing needs a "
-                f"checkpoint diffusers can open for image-to-image."))
-        pipe = converted
-        multi_model_manager.models[model_key] = pipe
+    pipe = await _pipeline_for_task(model_info, "img2img")
 
     try:
         import torch
@@ -2326,23 +2436,8 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
     model_name = model_info.get('model_name')
     if not model_name:
         raise HTTPException(status_code=404, detail=model_info.get('error', 'Model not found'))
-    model_key = f"inpaint:{model_name}"
-    pipe = multi_model_manager.models.get(model_key)
-    if pipe is None:
-        try:
-            pipe = await asyncio.get_event_loop().run_in_executor(
-                None, _load_inpaint_pipeline, model_name, global_args)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load inpaint model: {e}")
-        multi_model_manager.models[model_key] = pipe
-    if not _accepts_image(pipe):
-        converted = _as_image_task(pipe, "inpaint")
-        if converted is None:
-            raise HTTPException(status_code=501, detail=(
-                f"'{model_name}' loaded as {type(pipe).__name__}, which cannot "
-                f"inpaint: it has no `image` input."))
-        pipe = converted
-        multi_model_manager.models[model_key] = pipe
+    pipe = await _pipeline_for_task(model_info, "inpaint")
+    model_key = model_info.get('model_key') or f"image:{model_name}"
     try:
         import torch
         source_img = _decode_b64_image(request.image)

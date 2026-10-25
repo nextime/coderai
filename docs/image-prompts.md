@@ -103,6 +103,43 @@ source photo's own aspect at about 1 MP on a 64-pixel grid. Both used to
 default to a square, which squashed every non-square photo — and on inpaint it
 pulled the mask out of alignment with the image as well.
 
+## One model, both directions
+
+A checkpoint is a UNet, a VAE and its text encoders. Whether it generates from
+a prompt, edits a picture or inpaints a region is a property of the *pipeline
+class* wrapped around those weights, not of the weights themselves — so the
+same model serves all three, from one copy in VRAM.
+
+That matters when a client creates a character with a model and then edits it
+with the same one. Loading a pipeline per task would hold an 18 GB SDXL
+fine-tune twice and evict on every alternation between the two. Instead the
+model is loaded once, under the manager's own key so its VRAM accounting and
+eviction see one model, and each task gets a view built with
+`AutoPipelineFor*.from_pipe` around the components already resident.
+
+Two consequences worth knowing:
+
+* The views **share the UNet**, so a LoRA or IP-Adapter applied through one
+  task is visible to the others. That is by design, not a leak.
+* The load goes through the configured loader, so precision, offload,
+  quantization and a VAE override apply to editing as well. They did not
+  before: the edit endpoints loaded their own copy with a hardcoded dtype, so
+  a 4-bit model was served at 4 bits for generation and bf16 for editing, out
+  of two copies.
+
+The task class comes from the checkpoint's `model_index.json`, never from
+substrings in its name. Guessing is what broke editing on the booru-tag
+fine-tunes: `nesaorg/PonyRealism-Uncensored` contains no `xl`, so it was loaded
+with the generic pipeline, which honoured the declared
+`StableDiffusionXLPipeline` — the *text-to-image* class. Every diffusers
+`__call__` ends in `**kwargs`, so `image` and `strength` were accepted and
+dropped, and every "edit" was a fresh 1024×1024 render that never saw the
+photo: `200 OK`, a plausible-looking image, and `size` apparently ignored. A
+pipeline with no `image` input is now converted or refused with `501`.
+
+SD, SDXL, Flux and Z-Image all have entries for all three tasks. A family
+diffusers does not map is left on whatever it was loaded as.
+
 ## Standing prefixes: the ladder a model always wants
 
 CoderAI never adds tags to a prompt by itself. The `score_*` ladder is yours to
