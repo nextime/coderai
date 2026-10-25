@@ -28,7 +28,7 @@ reference; these are the deep dives.
 | [ocr.md](ocr.md) | The `/v1/ocr` document-transcription subsystem |
 | [chunking.md](chunking.md) | `POST /v1/chunk`: splitting a document for a retrieval index, with the structure decided per request by a template |
 | [expressive-tts.md](expressive-tts.md) | Expressive text-to-speech |
-| [image-prompts.md](image-prompts.md) | Image prompts: the `(tag:1.3)` / `[tag]` / `BREAK` grammar, prompts past CLIP's 77 tokens, `clip_skip`, negative prompts |
+| [image-prompts.md](image-prompts.md) | Image prompts: the `(tag:1.3)` / `[tag]` / `BREAK` grammar, prompts past CLIP's 77 tokens, `clip_skip`, negative prompts, textual-inversion embeddings, size validation |
 | [zimage-lora-training.md](zimage-lora-training.md) | LoRA training for image models |
 | [dtype-auto-selection.md](dtype-auto-selection.md) | How model dtype is chosen automatically |
 

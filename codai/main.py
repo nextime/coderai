@@ -1227,6 +1227,9 @@ def main():
     global_args.clip_on_cpu = config.image.clip_on_cpu
     global_args.image_clip_skip = config.image.clip_skip
     global_args.image_prompt_weighting = config.image.prompt_weighting
+    global_args.image_max_side = config.image.max_side
+    global_args.image_max_pixels = config.image.max_pixels
+    global_args.image_embeddings_dir = config.image.embeddings_dir or None
     global_args.system_prompt = config.system_prompt
     global_args.tools_closer_prompt = config.tools_closer_prompt
     global_args.grammar_guided_gen = config.grammar_guided

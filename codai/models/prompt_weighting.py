@@ -256,6 +256,30 @@ def _is_sdxl(pipeline) -> bool:
     return getattr(pipeline, "text_encoder_2", None) is not None
 
 
+def _expand_learned_tokens(pipeline, text: str, tokenizer) -> str:
+    """``text`` with multi-vector textual inversions written out in full.
+
+    A textual inversion trained on several vectors is registered as ``tok``,
+    ``tok_1``, ``tok_2``..., and a prompt only ever says ``tok``. Diffusers
+    expands it in ``maybe_convert_prompt`` on its way into the tokenizer, so
+    anything encoding a prompt itself has to do the same -- otherwise an
+    embedding like ``easynegative`` (eight vectors) contributes exactly one of
+    them and the prompt looks like it did nothing.
+
+    It replaces only registered trigger words, so the weight grammar passes
+    through untouched and this is safe to run before parsing.
+    """
+    if not text:
+        return text
+    convert = getattr(pipeline, "maybe_convert_prompt", None)
+    if convert is None:
+        return text
+    try:
+        return convert(text, tokenizer)
+    except Exception:
+        return text
+
+
 def _hidden(out, text_encoder, clip_skip: Optional[int], sdxl: bool):
     """The hidden state a diffusers pipeline would have used.
 
@@ -331,8 +355,13 @@ def encode_weighted_prompt(pipeline, prompt: str, negative_prompt: str = "",
     tokenized = []
     n_windows = 1
     for tokenizer, _ in pairs:
-        pos = tokenize_weighted(tokenizer, prompt or "", plain=plain)
-        neg = tokenize_weighted(tokenizer, negative_prompt or "", plain=plain)
+        pos = tokenize_weighted(
+            tokenizer, _expand_learned_tokens(pipeline, prompt, tokenizer),
+            plain=plain)
+        neg = tokenize_weighted(
+            tokenizer,
+            _expand_learned_tokens(pipeline, negative_prompt, tokenizer),
+            plain=plain)
         tokenized.append((tokenizer, pos, neg))
         n_windows = max(n_windows, len(pos[0]), len(neg[0]))
 

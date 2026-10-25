@@ -310,6 +310,13 @@ class ImageConfig:
     # Parse the A1111 prompt grammar -- (tag:1.3), [tag], BREAK. Off keeps
     # brackets literal; the prompt is windowed past 77 tokens either way.
     prompt_weighting: bool = True
+    # Request-size ceiling. A size above it is a 400 naming the limit, which
+    # is a better answer than the CUDA OOM an absurd size used to produce.
+    max_side: int = 4096
+    max_pixels: int = 4096 * 1024      # 4.2 MP -- 2048x2048, 2560x1440, …
+    # A flat directory of textual-inversion embeddings, loaded by filename so
+    # a prompt copied off a model card finds its trigger word. Empty = none.
+    embeddings_dir: str = ""
 
 
 @dataclass
@@ -2137,7 +2144,10 @@ class ConfigManager:
                 "vae_tiling": self.config.image.vae_tiling,
                 "clip_on_cpu": self.config.image.clip_on_cpu,
                 "clip_skip": self.config.image.clip_skip,
-                "prompt_weighting": self.config.image.prompt_weighting
+                "prompt_weighting": self.config.image.prompt_weighting,
+                "max_side": self.config.image.max_side,
+                "max_pixels": self.config.image.max_pixels,
+                "embeddings_dir": self.config.image.embeddings_dir
             },
             "archive": {
                 "enabled": self.config.archive.enabled,

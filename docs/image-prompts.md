@@ -49,6 +49,7 @@ take:
 | `negative_prompt` | What to avoid. The counterpart of the quality tags (`score_4, score_5, score_6, worst quality`) and as load-bearing as the prompt itself. |
 | `clip_skip` | Read the embedding this many CLIP layers from the end. Omitted uses the model's configured value, then the pipeline's own default. |
 | `prompt_weighting` | `false` keeps brackets literal, for a caller sending prose. The windowing stays on either way, so turning it off never costs tokens. |
+| `embeddings` | Textual inversions to load, so their trigger words work in the prompt — `["easynegative"]`. |
 
 ```json
 {
@@ -80,6 +81,62 @@ through. Until v0.4.89 the negative prompt was not: the call hardcoded an empty
 string, so for every GGUF image model whatever the caller asked to avoid was
 discarded between the API and the engine.
 
+## Size
+
+`size` is `"WIDTHxHEIGHT"` in pixels, or `"auto"` for the model's default.
+
+A size that does not parse is a `400` saying so, rather than a silent
+fall-back: `"1024"` used to generate a square nobody asked for, and the
+response looked like a success. A side that is not a multiple of 8 is snapped
+to the nearest one and logged, because the VAE downsamples by 8 and cannot
+represent an odd side. A size above the install's ceiling is a `400` naming the
+limit — `4096x4096` used to be accepted and come back as a CUDA OOM, which
+reads like a busy GPU rather than a size the caller chose.
+
+The ceiling is `image.max_side` (default 4096) and `image.max_pixels` (default
+4.2 MP, which covers 2048×2048 and 2560×1440). Raise both if the card can take
+it.
+
+On `/v1/images/edits` and `/v1/images/inpaint`, omitting `size` keeps the
+source photo's own aspect at about 1 MP on a 64-pixel grid. Both used to
+default to a square, which squashed every non-square photo — and on inpaint it
+pulled the mask out of alignment with the image as well.
+
+## Learned prompt tokens (textual inversion)
+
+A textual inversion is a few vectors trained to sit in CLIP's embedding table
+under a word of their own. Writing that word is how much of the ecosystem's
+negative prompting is built — `easynegative`, `bad-hands-5`, `FastNegativeV2`
+— and until the file is loaded the word is an ordinary unknown token, so the
+prompt quietly asks for nothing.
+
+Three ways to get one loaded, all of which can be combined:
+
+* `embeddings: ["easynegative"]` on the request, for an ad-hoc one.
+* `textual_inversion` on the model's config (admin → Models → Prompt
+  Handling), for the ones a model always wants.
+* every file in `image.embeddings_dir`, discovered by filename — which is how
+  A1111 works, and what a prompt copied off a model card assumes.
+
+A reference is a bare name (looked up in the directory), a path to a
+`.safetensors` / `.pt` / `.bin`, or a HuggingFace repo id. `ref:token` renames
+the trigger word: `my-emb.safetensors:myneg`.
+
+A name the caller gave that cannot be loaded is a `400` — rendering without it
+would look like a success. A file in the directory that fails to load is a line
+in the log, because one bad file should not break every request.
+
+Two details that decide whether this works at all, both handled:
+
+* **SDXL keeps two text encoders**, so an SDXL-format embedding holds a
+  `clip_l` and a `clip_g` tensor that must go into the matching
+  tokenizer/encoder pair. Loading only the first gives the trigger word an
+  embedding in one encoder and nothing in the other.
+* **A multi-vector embedding occupies several tokens**, registered as `tok`,
+  `tok_1`, `tok_2`… A prompt only ever writes `tok`, so it is expanded before
+  tokenizing. Without that, an eight-vector embedding contributes one vector
+  and appears to do nothing.
+
 ## What is not covered
 
 Flux, SD3 and Z-Image carry a T5 encoder with a much longer limit and
@@ -88,10 +145,6 @@ path — the weight grammar is a CLIP-era convention and a T5 reads it as text,
 which is what those models expect. Negative prompts work there as the pipeline
 supports them.
 
-Textual-inversion embeddings (`easynegative` and friends) are not loaded by
-name yet; a LoRA is the supported way to add learned tokens
-(see [zimage-lora-training.md](zimage-lora-training.md)).
-
 ## Implementation
 
 `codai/models/prompt_weighting.py` holds the parser, the windowing and the
@@ -99,5 +152,12 @@ encoder, and documents how `clip_skip` maps to a hidden-state index — SDXL
 takes the penultimate layer by default and counts from there, SD 1.x takes the
 final output and needs the layer norm applied by hand. Getting that mapping
 wrong shifts every image, so it mirrors diffusers exactly.
+`codai/models/textual_inversion.py` resolves and loads the embeddings, and
+tracks what a pipeline already carries — a pipeline outlives the request that
+loaded it, and diffusers raises on registering the same trigger word twice.
+
 `tests/test_prompt_weighting_and_clip_skip.py` pins the grammar table, the
-window arithmetic, both layer conventions and the three defects above.
+window arithmetic and both layer conventions;
+`tests/test_image_size_and_embeddings.py` pins the size rules and the
+embedding resolution, including the SDXL two-encoder split and the
+multi-vector expansion.

@@ -23,6 +23,7 @@ import base64
 import io
 import logging
 import os
+import re as _re
 import time
 import uuid
 from typing import Optional
@@ -887,6 +888,74 @@ def _apply_loras(pipeline, loras):
         _log.warning("Could not apply LoRA weights: %s", e)
 
 
+#: Diffusers' VAE downsamples by 8, so a side that is not a multiple of 8
+#: cannot be expressed as a latent: the pipeline either raises or renders a
+#: ragged edge, depending on the model.
+_SIZE_MULTIPLE = 8
+
+_SIZE_RE = _re.compile(r"^\s*(\d+)\s*[x\u00d7*]\s*(\d+)\s*$", _re.I)
+
+
+def _size_limits(args=None):
+    """(max_side, max_pixels) this install allows, from config."""
+    a = args or global_args
+    side = getattr(a, 'image_max_side', None) or 4096
+    pixels = getattr(a, 'image_max_pixels', None) or 4096 * 1024
+    return int(side), int(pixels)
+
+
+def _parse_size(size, default_w: int, default_h: int, args=None):
+    """``"WIDTHxHEIGHT"`` as a usable (width, height), or HTTP 400.
+
+    Three things used to go wrong here, all of them quietly. A size that did
+    not parse fell through to the default, so ``"1024"`` or ``"1k x 1k"``
+    generated a square nobody asked for and the response looked successful. A
+    side that was not a multiple of 8 went to the pipeline as-is, where the
+    VAE cannot represent it. And there was no ceiling at all, so ``4096x4096``
+    was accepted and the request came back as a CUDA OOM -- which reads like a
+    busy GPU rather than a size the caller chose.
+
+    So: a malformed size is a 400 that says what was wrong, an oversized one
+    is a 400 that names the limit, and a side off the grid is snapped to the
+    nearest multiple of 8 and logged. ``"auto"`` means the default, as it does
+    in the OpenAI image API.
+    """
+    if not size or str(size).strip().lower() == "auto":
+        return default_w, default_h
+
+    m = _SIZE_RE.match(str(size))
+    if not m:
+        raise HTTPException(status_code=400, detail=(
+            f"size {size!r} is not understood: expected \"WIDTHxHEIGHT\" in "
+            f"pixels (e.g. \"1024x1024\"), or \"auto\""))
+    width, height = int(m.group(1)), int(m.group(2))
+    if width == 0 or height == 0:
+        # Snapping this up to the 8-pixel minimum would answer an uninitialised
+        # client variable with an 8x8 image, which is not what it asked for.
+        raise HTTPException(status_code=400, detail=(
+            f"size {size!r} has a zero dimension"))
+
+    max_side, max_pixels = _size_limits(args)
+    if width > max_side or height > max_side:
+        raise HTTPException(status_code=400, detail=(
+            f"size {width}x{height} exceeds the maximum side of {max_side} px "
+            f"(image.max_side)"))
+    if width * height > max_pixels:
+        raise HTTPException(status_code=400, detail=(
+            f"size {width}x{height} is {width * height / 1e6:.1f} MP, above "
+            f"this install's limit of {max_pixels / 1e6:.1f} MP "
+            f"(image.max_pixels). Raise it if the card can take it."))
+
+    snapped_w = max(_SIZE_MULTIPLE,
+                    int(round(width / _SIZE_MULTIPLE)) * _SIZE_MULTIPLE)
+    snapped_h = max(_SIZE_MULTIPLE,
+                    int(round(height / _SIZE_MULTIPLE)) * _SIZE_MULTIPLE)
+    if (snapped_w, snapped_h) != (width, height):
+        _log.info("size %dx%d is not on the 8-pixel grid the VAE needs — "
+                  "generating %dx%d", width, height, snapped_w, snapped_h)
+    return snapped_w, snapped_h
+
+
 def _resolve_clip_skip(request, model_config, args=None):
     """``clip_skip`` for this request: asked for, else the model's, else global.
 
@@ -916,6 +985,30 @@ def _resolve_prompt_weighting(request, model_config, args=None) -> bool:
         if v is not None:
             return bool(v)
     return True
+
+
+def _apply_embeddings(pipeline, request, model_config=None, args=None):
+    """Load this request's textual inversions onto the pipeline, if any.
+
+    Must happen before the prompt is tokenized: loading registers the trigger
+    word, and until it is registered the word tokenizes as ordinary text, so
+    the prompt quietly asks for something else. A name the caller gave
+    explicitly and that cannot be loaded is a 400 -- rendering without it
+    would look like a success.
+    """
+    try:
+        from codai.models import textual_inversion as ti
+    except Exception:
+        return []
+    refs = list(getattr(request, 'embeddings', None) or [])
+    refs += list((model_config or {}).get('textual_inversion') or [])
+    directory = getattr(args or global_args, 'image_embeddings_dir', None)
+    if not refs and not directory:
+        return []
+    try:
+        return ti.apply(pipeline, refs, directory, strict=bool(refs))
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _weighted_embed_kwargs(pipeline, prompt, neg_prompt, clip_skip, weighting):
@@ -972,21 +1065,9 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     if getattr(request, 'loras', None):
         _apply_loras(pipeline, request.loras)
 
-    # Determine size
-    width, height = 1024, 1024
-    if request.size:
-        parts = request.size.split("x")
-        if len(parts) == 2:
-            try:
-                width = int(parts[0])
-                height = int(parts[1])
-            except ValueError:
-                pass
-
-    if width != width or width == float('inf'):
-        width = 512
-    if height != height or height == float('inf'):
-        height = 512
+    # Determine size. A malformed or oversized size is a 400 from here, not a
+    # silent fall-back to a square the caller did not ask for.
+    width, height = _parse_size(request.size, 1024, 1024, global_args)
 
     # Enable memory optimizations
     try:
@@ -1042,13 +1123,17 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     neg_prompt = getattr(request, 'negative_prompt', None) or ""
     do_cfg = cfg_scale > 1.0
 
+    # Learned prompt tokens first: they change what the prompt tokenizes TO.
+    _ti_tokens = _apply_embeddings(pipeline, request, model_config, global_args)
+
     # clip_skip and the weight grammar both change what the embeddings ARE, so
     # they belong in the cache key: without them the first request's layer
     # choice would be served to every later one.
     _clip_skip = _resolve_clip_skip(request, model_config, global_args)
     _weighting = _resolve_prompt_weighting(request, model_config, global_args)
     model_id = (f"{_model_name}#{id(pipeline)}"
-                f"|cs={_clip_skip}|w={int(_weighting)}")
+                f"|cs={_clip_skip}|w={int(_weighting)}"
+                f"|ti={','.join(_ti_tokens)}")
 
     # Some pipelines (Z-Image) return prompt embeddings as *per-sample lists*
     # rather than stacked tensors, and the pipeline consumes/extends those
@@ -1319,7 +1404,8 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                 getattr(request, 'model', None) or model_id,
                 request.prompt,
                 {
-                    "size": request.size,
+                    "size": f"{width}x{height}",
+                    "requested_size": request.size,
                     "n": request.n,
                     "steps": num_steps,
                     "guidance_scale": cfg_scale,
@@ -1345,16 +1431,9 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     """Generate images using stable-diffusion-cpp-python."""
     import time
 
-    # Parse size
-    width, height = 512, 512
-    if request.size:
-        parts = request.size.split("x")
-        if len(parts) == 2:
-            try:
-                width = int(parts[0])
-                height = int(parts[1])
-            except ValueError:
-                pass
+    # Parse size (same validation as the diffusers path: sd.cpp's VAE is also
+    # an 8x downsample, and it answers an off-grid size with a C-level abort).
+    width, height = _parse_size(request.size, 512, 512, global_args)
 
     # Acceleration/distillation defaults (Lightning / Turbo / LCM): sd.cpp can't
     # fuse a diffusers LoRA, but honour the preset's low step-count / guidance and
@@ -1468,7 +1547,8 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
                 getattr(request, 'model', None),
                 request.prompt,
                 {
-                    "size": request.size,
+                    "size": f"{width}x{height}",
+                    "requested_size": request.size,
                     "n": request.n,
                     "steps": steps,
                     "seed": seed,
@@ -1757,6 +1837,12 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     return await _generate_with_diffusers(pipeline, request, global_args,
                                                           http_request, model_config=_diff_cfg)
                     
+            except HTTPException:
+                # The model loaded and the request itself was rejected (a bad
+                # size, an embedding that does not exist). Falling through to
+                # the next backend would answer a 400 with a confused report
+                # about which backends failed to load.
+                raise
             except ImportError as e:
                 diffusers_error = str(e)
                 print(f"diffusers not available: {diffusers_error}")
@@ -1798,6 +1884,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 sdcpp_error = f"Model '{model_name}' is not a local file, cannot use sd.cpp"
                 print(sdcpp_error)
                 
+        except HTTPException:
+            raise                   # the request was rejected, not the backend
         except ImportError as e:
             sdcpp_error = str(e)
             print(f"stable-diffusion-cpp-python not available: {sdcpp_error}")
@@ -1898,6 +1986,7 @@ def _prompt_call_kwargs(pipeline, request, model_config=None):
     Either way the negative prompt is passed -- the edit endpoints used to have
     nowhere to put one, so an edit could only ever be steered positively.
     """
+    _apply_embeddings(pipeline, request, model_config, global_args)
     neg = getattr(request, 'negative_prompt', None) or ""
     kw = _weighted_embed_kwargs(
         pipeline, request.prompt, neg,
@@ -1991,14 +2080,12 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         source_img = _decode_b64_image(request.image)
 
         width, height = source_img.size
-        if request.size:
-            parts = request.size.split("x")
-            if len(parts) == 2:
-                try:
-                    width, height = int(parts[0]), int(parts[1])
-                    source_img = source_img.resize((width, height))
-                except ValueError:
-                    pass
+        if request.size and str(request.size).strip().lower() != "auto":
+            # Validated, so a typo is a 400 instead of an edit at some other
+            # size; snapped, because the VAE needs the 8-pixel grid.
+            width, height = _parse_size(request.size, width, height, global_args)
+            if (width, height) != source_img.size:
+                source_img = source_img.resize((width, height))
         else:
             # No size asked for: keep the photo's own shape at ~1 MP.
             width, height = _default_edit_size(*source_img.size)
@@ -2025,6 +2112,8 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
                 **_prompt_call_kwargs(pipe, request, _edit_cfg),
             )
         )
+    except HTTPException:
+        raise                       # a 400 from here is the caller's, not ours
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image editing failed: {e}")
 
@@ -2047,11 +2136,14 @@ class ImageInpaintRequest(BaseModel):
     prompt: str
     image: str              # base64 source image
     mask: str               # base64 mask (white = inpaint region)
+    #: Omitted means "keep the source's shape" (see _default_edit_size), as on
+    #: /v1/images/edits. It used to default to 1024x1024, which squashed every
+    #: non-square photo -- and dragged the mask out of alignment with it.
+    size: Optional[str] = None
     negative_prompt: Optional[str] = None
     clip_skip: Optional[int] = None
     prompt_weighting: Optional[bool] = None
     n: int = 1
-    size: Optional[str] = "1024x1024"
     response_format: Optional[str] = "url"
     steps: Optional[int] = None
     guidance_scale: Optional[float] = None
@@ -2131,15 +2223,18 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
         import torch
         source_img = _decode_b64_image(request.image)
         mask_img = _decode_b64_image(request.mask).convert("L")  # greyscale mask
-        if request.size:
-            parts = request.size.split("x")
-            if len(parts) == 2:
-                try:
-                    w, h = int(parts[0]), int(parts[1])
-                    source_img = source_img.resize((w, h))
-                    mask_img = mask_img.resize((w, h))
-                except ValueError:
-                    pass
+        if request.size and str(request.size).strip().lower() != "auto":
+            w, h = _parse_size(request.size, *source_img.size, args=global_args)
+            if (w, h) != source_img.size:
+                source_img = source_img.resize((w, h))
+                mask_img = mask_img.resize((w, h))
+        else:
+            # No size asked for: keep the photo's own shape on the grid, the
+            # same rule the edit endpoint follows.
+            w, h = _default_edit_size(*source_img.size)
+            if (w, h) != source_img.size:
+                source_img = source_img.resize((w, h))
+                mask_img = mask_img.resize((w, h))
         seed = request.seed or getattr(global_args, 'image_seed', None)
         generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
         quality = request.quality or "standard"
@@ -2160,6 +2255,8 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
                 **_prompt_call_kwargs(pipe, request, _inp_cfg),
             )
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inpainting failed: {e}")
     images = [save_image_response(img, request.response_format, http_request) for img in result.images]
@@ -2770,6 +2867,8 @@ class ImageOutfitRequest(BaseModel):
     video: Optional[str] = None            # base64 source video (video mode)
     prompt: str                             # description of the new outfit
     negative_prompt: Optional[str] = None
+    clip_skip: Optional[int] = None         # None = the model's configured default
+    prompt_weighting: Optional[bool] = None # None = on
     mask: Optional[str] = None             # optional manual mask (base64); auto-generated if absent
     steps: Optional[int] = 30
     guidance_scale: Optional[float] = 7.5
@@ -2851,15 +2950,13 @@ async def create_image_outfit(request: ImageOutfitRequest, http_request: Request
 
     def _run():
         kwargs = dict(
-            prompt=request.prompt,
             image=img,
             mask_image=mask_img,
             num_inference_steps=request.steps or 30,
             guidance_scale=request.guidance_scale or 7.5,
             strength=request.strength or 0.99,
+            **_prompt_call_kwargs(pipeline, request),
         )
-        if request.negative_prompt:
-            kwargs['negative_prompt'] = request.negative_prompt
         if generator:
             kwargs['generator'] = generator
         if hasattr(pipeline, 'safety_checker'):
@@ -2868,6 +2965,8 @@ async def create_image_outfit(request: ImageOutfitRequest, http_request: Request
 
     try:
         result_img = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Outfit change failed: {e}")
 
@@ -2918,6 +3017,9 @@ async def _outfit_video(request: ImageOutfitRequest, http_request):
         generator = torch.Generator().manual_seed(request.seed) if request.seed is not None else None
 
         def _process_frames():
+            # Encoded once for the whole clip: the prompt does not change
+            # between frames, and a text-encoder pass per frame is pure waste.
+            prompt_kwargs = _prompt_call_kwargs(pipeline, request)
             for fname in sorted(os.listdir(frames_dir)):
                 fpath = os.path.join(frames_dir, fname)
                 img = PILImage.open(fpath).convert("RGB")
@@ -2929,15 +3031,13 @@ async def _outfit_video(request: ImageOutfitRequest, http_request):
                     mask_arr = _generate_clothing_mask(img_arr)
                     mask_img = PILImage.fromarray(mask_arr)
                 kwargs = dict(
-                    prompt=request.prompt,
                     image=img,
                     mask_image=mask_img,
                     num_inference_steps=request.steps or 30,
                     guidance_scale=request.guidance_scale or 7.5,
                     strength=request.strength or 0.99,
+                    **prompt_kwargs,
                 )
-                if request.negative_prompt:
-                    kwargs['negative_prompt'] = request.negative_prompt
                 if generator:
                     kwargs['generator'] = generator
                 if hasattr(pipeline, 'safety_checker'):

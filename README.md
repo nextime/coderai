@@ -838,9 +838,11 @@ persisted per `config_id`, so the configs don't overwrite each other.
 | `POST /v1/images/from3d` | 3D model → rendered 2D image |
 | `GET /v1/images/progress` | Current generation progress (step/total) |
 
-Generations, edits and inpaint take `negative_prompt`, `clip_skip` and the
-`(tag:1.3)` / `[tag]` / `BREAK` prompt grammar, and encode prompts of any
-length (CLIP's 77-token limit does not apply) — see
+Generations, edits and inpaint take `negative_prompt`, `clip_skip`,
+`embeddings` (textual inversions, so `easynegative` and friends work in a
+prompt) and the `(tag:1.3)` / `[tag]` / `BREAK` prompt grammar, and encode
+prompts of any length — CLIP's 77-token limit does not apply. `size` is
+validated rather than silently replaced. See
 [docs/image-prompts.md](docs/image-prompts.md).
 
 ### Video

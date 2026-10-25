@@ -57,6 +57,12 @@ class ImageGenerationRequest(BaseModel):
         "Take the text embedding this many CLIP layers from the end instead of the last. "
         "The booru-tag SDXL fine-tune families (Pony, Illustrious, NoobAI) are trained at 2. "
         "Omitted uses the model's configured default, then the pipeline's own."))
+    embeddings: Optional[List[str]] = Field(None, description=(
+        "Textual-inversion embeddings to load before generating, so their trigger "
+        "words work in the prompt (e.g. [\"easynegative\"]). A bare name is looked "
+        "up in image.embeddings_dir; a path or a HuggingFace repo id also works, and "
+        "'ref:token' renames the trigger word. Everything in embeddings_dir, plus the "
+        "model's own textual_inversion list, is loaded whether this is set or not."))
     prompt_weighting: Optional[bool] = Field(None, description=(
         "Parse the A1111 prompt grammar: '(tag:1.3)' to emphasise, '[tag]' to attenuate, "
         "'(tag)' for 1.1, nesting multiplies, '\\\\(' escapes, and BREAK starts a new "
