@@ -44,6 +44,12 @@ geopy>=2.4
 geographiclib>=2.0
 diffusers>=0.25.0  # For Stable Diffusion image generation
 safetensors>=0.4.0  # Required by diffusers
+# Reads GGUF-quantized pipeline COMPONENTS (a Q4_K_M transformer served on the
+# base pipeline's VAE and text encoder — see build_gguf_pipeline_components).
+# diffusers requires it for GGUFQuantizationConfig and says so only when a load
+# is already under way, so without it that whole path fails at request time
+# with "Unable to load weights from checkpoint file".
+gguf>=0.10.0
 ftfy>=6.0  # Prompt text cleaning for diffusers Wan/T5 pipelines (prompt_clean)
 # stable-diffusion-cpp-python is installed by build.sh with CMAKE_ARGS to fix the libwebm submodule issue
 

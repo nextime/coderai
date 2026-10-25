@@ -304,8 +304,16 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             continue
         try:
             print(f"  Loading GGUF component '{name}' from {path}")
+            # `config` names the architecture the file's tensors belong to.
+            # Without it, from_single_file INFERS one -- and its fallback is
+            # Stable Diffusion 1.5, so a Qwen-Image / Flux / Wan transformer
+            # fails with "stable-diffusion-v1-5 does not appear to have a file
+            # named config.json". The base pipeline's own component subfolder
+            # is the right answer and is already at hand.
             model = cls.from_single_file(
                 path.strip(),
+                config=model_name,
+                subfolder=name,
                 quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
                 torch_dtype=dtype,
             )
@@ -313,6 +321,75 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             descs.append(f"{name}:gguf")
         except Exception as e:
             print(f"  GGUF load failed for '{name}' ({path}): {e}")
+    return components, ', '.join(descs)
+
+
+def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype):
+    """Components taken from a DIFFERENT repo than the pipeline's own.
+
+    ``component_models`` maps a component name to a repo id or local path, e.g.
+    ``{"transformer": "prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19"}``. The
+    named component is loaded from there and handed to the pipeline's
+    ``from_pretrained`` as a prebuilt object, exactly as the GGUF components
+    are.
+
+    This is how a fine-tuned transformer is served without republishing the
+    whole pipeline around it. Several Qwen-Image-Edit derivatives ship as a
+    transformer and nothing else -- the base supplies the VAE, the text encoder
+    and the scheduler -- and the upstream recipe for them is literally
+    ``QwenImageEditPlusPipeline.from_pretrained(base, transformer=
+    QwenImageTransformer2DModel.from_pretrained(derivative))``.
+
+    The component's own entry in ``component_quantization`` still applies, so a
+    bf16 or fp8 transformer too large for the card can be quantized as it
+    loads: ``{"transformer": "4bit"}`` alongside the override above.
+
+    Returns ``(components_dict, description)``; empty when none configured.
+    """
+    c = _norm(cfg)
+    overrides = c.get('component_models') or {}
+    if not overrides:
+        return {}, ''
+
+    try:
+        import diffusers
+    except Exception as e:
+        print(f"  component_models unavailable: {e}")
+        return {}, ''
+
+    comp_q = c.get('component_quantization') or {}
+    specs = _discover_components(model_name)   # name -> [library, class_name]
+    components: Dict[str, Any] = {}
+    descs = []
+    for name, source in overrides.items():
+        source = str(source or '').strip()
+        if not source:
+            continue
+        spec = specs.get(name)
+        cls_name = spec[1] if spec and len(spec) > 1 else None
+        cls = getattr(diffusers, cls_name, None) if cls_name else None
+        if cls is None:
+            print(f"  component_models skip '{name}': the base pipeline has no "
+                  f"loadable class for it (got {spec}).")
+            continue
+        kwargs: Dict[str, Any] = {"torch_dtype": dtype}
+        mode = str(comp_q.get(name) or '').strip().lower()
+        if mode in ("4bit", "8bit"):
+            try:
+                from diffusers import BitsAndBytesConfig as DiffBnb
+                kwargs["quantization_config"] = DiffBnb(
+                    **({"load_in_4bit": True, "bnb_4bit_compute_dtype": dtype}
+                       if mode == "4bit" else {"load_in_8bit": True}))
+            except Exception as e:
+                print(f"  component_models '{name}': {mode} unavailable ({e}), "
+                      f"loading unquantized")
+        try:
+            print(f"  Loading component '{name}' from {source}"
+                  f"{' (' + mode + ')' if mode else ''}")
+            components[name] = cls.from_pretrained(source, **kwargs)
+            descs.append(f"{name}:{source.split('/')[-1]}{'/' + mode if mode else ''}")
+        except Exception as e:
+            print(f"  component_models load failed for '{name}' ({source}): {e}")
     return components, ', '.join(descs)
 
 

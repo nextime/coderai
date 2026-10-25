@@ -26,7 +26,7 @@ import os
 import re as _re
 import time
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -432,13 +432,21 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     # 'component_quantization' overrides win; otherwise the global flag applies
     # to all heavy components (backbone + text encoders).
     from codai.models.hf_loading import (
-        build_pipeline_quant_config, build_gguf_pipeline_components)
+        build_pipeline_quant_config, build_gguf_pipeline_components,
+        build_component_models)
     _img_quant_config, _img_quant_desc = build_pipeline_quant_config(model_name, _mc, dtype)
     if _img_quant_config is not None:
         print(f"Image quantization: {_img_quant_desc}")
     _img_gguf_components, _img_gguf_desc = build_gguf_pipeline_components(model_name, _mc, dtype)
     if _img_gguf_components:
         print(f"Image GGUF components: {_img_gguf_desc}")
+    # A component taken from another repo (a fine-tuned transformer served on
+    # the base pipeline's VAE and text encoder). Merged after the GGUF ones so
+    # an explicit override wins over a GGUF file for the same component.
+    _img_comp_models, _img_comp_desc = build_component_models(model_name, _mc, dtype)
+    if _img_comp_models:
+        print(f"Image components from other repos: {_img_comp_desc}")
+        _img_gguf_components = {**_img_gguf_components, **_img_comp_models}
     
     # --no-ram mode: never use CPU offload
     if no_ram and use_sequential_offload:
@@ -1979,6 +1987,13 @@ class ImageEditRequest(BaseModel):
     prompt: str
     image: str              # /v1/files path, sha256: id, data URI, URL or base64
     mask: Optional[str] = None   # accepted but unused here -- see /v1/images/inpaint
+    #: Up to two FURTHER images, for an instruction model that can compose them
+    #: ("put the person from image 2 in image 1"). Ignored by denoising models.
+    images: Optional[List[str]] = None
+    #: Alias of `steps`, which is what the instruction-edit model cards call it.
+    num_inference_steps: Optional[int] = None
+    #: Accepted and ignored by instruction-edit models, which have no such knob
+    #: -- a client cannot know which kind of model it is addressing.
     negative_prompt: Optional[str] = None   # what to avoid; CFG needs it as much as a t2i call does
     clip_skip: Optional[int] = None         # None = the model's configured default
     prompt_weighting: Optional[bool] = None # None = on; see codai/models/prompt_weighting.py
@@ -2230,6 +2245,75 @@ async def _pipeline_for_task(model_info: dict, task: str):
     return view
 
 
+def _is_instruction_edit(pipeline) -> bool:
+    """Whether this pipeline edits by instruction rather than by denoising.
+
+    Decided from the signature, not a list of class names, because the rule is
+    exact and generalises: an instruction-edit pipeline takes an ``image`` and
+    has **no** ``strength``. Measured across this diffusers::
+
+        QwenImageEditPlus / QwenImageEdit / FluxKontext   image ✓  strength ✗
+        SDXL-Img2Img / QwenImageImg2Img / FluxImg2Img     image ✓  strength ✓
+
+    ``strength`` is what makes img2img img2img: the fraction of the source to
+    destroy before re-denoising. A model that rewrites the picture from an
+    instruction has nothing to put there, which is why "add a necklace, keep
+    everything else" cannot work on the denoising path at any strength.
+
+    ``true_cfg_scale`` is NOT the discriminator -- QwenImageImg2Img and
+    FluxImg2Img have it too.
+    """
+    import inspect
+    try:
+        params = inspect.signature(pipeline.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "image" in params and "strength" not in params
+
+
+def _edit_call_kwargs(pipeline, request, images, steps, cfg, generator, n):
+    """Call kwargs for an edit, shaped to what THIS pipeline accepts.
+
+    Filtered against the signature rather than branched on the model, so one
+    code path serves denoising img2img and instruction editing. Two specifics
+    the instruction models need:
+
+    * ``strength`` is dropped where it does not exist. It must not be an error
+      for a caller to send it -- a client cannot know which kind of model it is
+      talking to, and these pipelines have no ``**kwargs`` to swallow it, so
+      passing it through would be a hard TypeError.
+    * ``guidance_scale`` becomes ``true_cfg_scale``, which is the knob those
+      pipelines actually read; with a Lightning-distilled checkpoint it wants
+      to be 1.0 and the step count 4.
+    """
+    import inspect
+    try:
+        params = set(inspect.signature(pipeline.__call__).parameters)
+    except (TypeError, ValueError):
+        params = set()
+
+    instruction = _is_instruction_edit(pipeline)
+    kwargs = {
+        "image": images if (instruction and len(images) > 1) else images[0],
+        "num_inference_steps": steps,
+        "num_images_per_prompt": n,
+        "generator": generator,
+    }
+    if "strength" in params:
+        kwargs["strength"] = request.strength
+    if instruction and "true_cfg_scale" in params:
+        kwargs["true_cfg_scale"] = cfg
+    else:
+        kwargs["guidance_scale"] = cfg
+    if params:
+        dropped = [k for k in kwargs if k not in params]
+        for k in dropped:
+            kwargs.pop(k)
+        if dropped:
+            _log.debug("edit: %s does not take %s", type(pipeline).__name__, dropped)
+    return kwargs
+
+
 def _load_img2img_pipeline(model_name: str, global_args):
     """Load a diffusers img2img pipeline.
 
@@ -2301,7 +2385,16 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
 
     try:
         import torch
-        source_img = _decode_b64_image(request.image)
+        # Up to three images for an instruction edit ("put the person from
+        # image 2 into image 1"); `image` remains the first and only one for
+        # every denoising model.
+        refs = [request.image] + list(getattr(request, 'images', None) or [])
+        if len(refs) > 3:
+            raise HTTPException(status_code=400, detail=(
+                f"{len(refs)} images given; an instruction edit takes at most 3 "
+                f"(`image` plus up to 2 in `images`)"))
+        sources = [_decode_b64_image(r) for r in refs]
+        source_img = sources[0]
 
         width, height = source_img.size
         if request.size and str(request.size).strip().lower() != "auto":
@@ -2316,23 +2409,37 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
             if (width, height) != source_img.size:
                 source_img = source_img.resize((width, height))
 
+        # source_img is what the size logic above resized; put it back as the
+        # first reference, or the pipeline is handed the original instead and
+        # `size` silently does nothing.
+        sources[0] = source_img
+        if len(sources) > 1:
+            # Every reference is conditioning for the same output, so they go
+            # in at one shape.
+            sources = [im if im.size == source_img.size else im.resize(source_img.size)
+                       for im in sources]
+
         seed = request.seed or getattr(global_args, 'image_seed', None)
         generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
         quality = request.quality or "standard"
-        num_steps = request.steps or (30 if quality == "standard" else 50)
-        cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
+        _instruction = _is_instruction_edit(pipe)
+        # A distilled instruction model is tuned for 4 steps at CFG 1.0;
+        # handing it a denoising model's 30 steps and 7.5 wastes a minute per
+        # image and overcooks the result.
+        _steps_default = 4 if _instruction else (30 if quality == "standard" else 50)
+        _cfg_default = 1.0 if _instruction else (
+            getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
+        num_steps = (getattr(request, 'num_inference_steps', None)
+                     or request.steps or _steps_default)
+        cfg_scale = request.guidance_scale or _cfg_default
 
         _edit_cfg = (multi_model_manager.config.get(_edit_key)
                      or multi_model_manager.config.get(model_name) or {})
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: pipe(
-                image=source_img,
-                strength=request.strength,
-                num_inference_steps=num_steps,
-                guidance_scale=cfg_scale,
-                num_images_per_prompt=request.n,
-                generator=generator,
+                **_edit_call_kwargs(pipe, request, sources, num_steps, cfg_scale,
+                                    generator, request.n),
                 **_prompt_call_kwargs(pipe, request, _edit_cfg),
             )
         )

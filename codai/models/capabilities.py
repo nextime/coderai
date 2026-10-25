@@ -36,6 +36,13 @@ class ModelCapabilities:
     # Image generation & editing
     image_generation: bool = False      # Text-to-image (SD, Flux, …)
     image_to_image: bool = False        # img2img denoising
+    # Editing from an instruction ("make the dress red") rather than by
+    # denoising. A different thing from img2img, not a better one: these models
+    # have no `strength`, because they rewrite the picture from the instruction
+    # instead of destroying a fraction of it and re-imagining that. Reported
+    # separately so a client can hide the strength slider and treat the prompt
+    # as an instruction, which is the whole reason it needs telling apart.
+    instruction_edit: bool = False      # Qwen-Image-Edit, FLUX.1 Kontext, …
     inpainting: bool = False            # Inpaint with mask
     controlnet: bool = False            # ControlNet-guided generation
 
@@ -215,6 +222,18 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
             or re.search(r'\b[hd]at-', n)):
         caps.image_upscaling = True
         caps.image_to_image = True
+        return caps
+
+    # ── Image: instruction editing ───────────────────────────────────────────
+    # Before the inpaint/generation branches: these ids carry "edit", and
+    # falling through to img2img would advertise a `strength` they do not have.
+    if (any(x in n for x in ['qwen-image-edit', 'qwen_image_edit',
+                             'flux.1-kontext', 'flux-kontext', 'flux_kontext',
+                             'image-edit-rapid', 'firered-image-edit'])
+            or re.search(r'\bstep1x-edit', n)):
+        caps.instruction_edit = True
+        caps.image_to_image = True      # it is still an image-in, image-out edit
+        caps.image_generation = True
         return caps
 
     # ── Image: generation ────────────────────────────────────────────────────
