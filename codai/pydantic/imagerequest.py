@@ -53,6 +53,15 @@ class ImageGenerationRequest(BaseModel):
         "Null out the diffusers safety_checker so uncensored fine-tunes are not blocked. "
         "Only affects SD 1.x/2.x (SDXL/Flux ship no checker)."))
     negative_prompt: Optional[str] = Field(None, description="What to avoid in the output.")
+    clip_skip: Optional[int] = Field(None, description=(
+        "Take the text embedding this many CLIP layers from the end instead of the last. "
+        "The booru-tag SDXL fine-tune families (Pony, Illustrious, NoobAI) are trained at 2. "
+        "Omitted uses the model's configured default, then the pipeline's own."))
+    prompt_weighting: Optional[bool] = Field(None, description=(
+        "Parse the A1111 prompt grammar: '(tag:1.3)' to emphasise, '[tag]' to attenuate, "
+        "'(tag)' for 1.1, nesting multiplies, '\\\\(' escapes, and BREAK starts a new "
+        "75-token window. False keeps brackets literal. Either way the prompt is encoded "
+        "in as many windows as it needs, so nothing is truncated at 77 tokens."))
 
     # Per-request component overrides
     vae_model: Optional[str] = Field(None, description="Override the VAE for this request.")

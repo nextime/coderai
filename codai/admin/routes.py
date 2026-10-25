@@ -2927,6 +2927,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "lora_scale",
                 "lora_train_base_model", "lora_train_nodes",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
+                # Image prompt handling: which CLIP layer to read, and whether
+                # the A1111 weight grammar is parsed. Per model because the
+                # booru-tag fine-tunes need clip_skip 2 whatever the caller
+                # sends, and an OpenAI-API client has no field to send it in.
+                "clip_skip", "prompt_weighting",
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
                 "cache_type_k", "cache_type_v", "kv_offload", "n_batch", "n_ubatch", "n_seq_max",

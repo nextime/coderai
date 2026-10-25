@@ -887,7 +887,75 @@ def _apply_loras(pipeline, loras):
         _log.warning("Could not apply LoRA weights: %s", e)
 
 
-async def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
+def _resolve_clip_skip(request, model_config, args=None):
+    """``clip_skip`` for this request: asked for, else the model's, else global.
+
+    None means "whatever the pipeline does by default", which is the last CLIP
+    layer on SD 1.x and the penultimate one on SDXL. The booru-tag fine-tunes
+    want 2, and a client speaking the OpenAI image API has no field to say so,
+    so the model's own config has to be able to.
+    """
+    for v in (getattr(request, 'clip_skip', None),
+              (model_config or {}).get('clip_skip'),
+              getattr(args or global_args, 'image_clip_skip', None)):
+        if v is None:
+            continue
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            continue
+        return v if v > 0 else None
+    return None
+
+
+def _resolve_prompt_weighting(request, model_config, args=None) -> bool:
+    """Whether to parse the A1111 weight grammar. On unless something says no."""
+    for v in (getattr(request, 'prompt_weighting', None),
+              (model_config or {}).get('prompt_weighting'),
+              getattr(args or global_args, 'image_prompt_weighting', None)):
+        if v is not None:
+            return bool(v)
+    return True
+
+
+def _weighted_embed_kwargs(pipeline, prompt, neg_prompt, clip_skip, weighting):
+    """Encode prompt + negative ourselves, or None to use the pipeline's path.
+
+    Keeps the whole prompt (as many 75-token windows as it takes) and applies
+    per-token weights, which is the only way the booru-tag prompting style
+    survives contact with CLIP's 77-token limit.
+    """
+    try:
+        from codai.models.prompt_weighting import (
+            encode_weighted_prompt, has_weighting_syntax, supports_weighted_embeds,
+            window_count,
+        )
+        if not supports_weighted_embeds(pipeline):
+            return None
+        if not weighting and has_weighting_syntax(prompt):
+            # Worth saying: the caller wrote the grammar and asked for it not to
+            # be parsed, so those brackets are about to reach CLIP as text.
+            _log.info("prompt_weighting is off: '(tag:1.3)' / BREAK in this "
+                      "prompt are being sent to the model literally")
+        kwargs = encode_weighted_prompt(
+            pipeline, prompt or "", neg_prompt or "",
+            clip_skip=clip_skip, plain=not weighting,
+            dtype=getattr(getattr(pipeline, 'text_encoder', None), 'dtype', None),
+        )
+        if kwargs and _log.isEnabledFor(logging.INFO):
+            n = window_count(pipeline.tokenizer, prompt or "", plain=not weighting)
+            if n > 1:
+                _log.info("Prompt encoded in %d windows: %d tokens of room, "
+                          "none truncated (CLIP alone holds 75)", n, n * 75)
+        return kwargs
+    except Exception as e:
+        _log.warning("Weighted prompt encode failed (%s) — falling back to the "
+                     "pipeline's own encoder", e)
+        return None
+
+
+async def _generate_with_diffusers(pipeline, request, global_args, http_request=None,
+                                   model_config=None):
     """Generate images using a diffusers pipeline (with prompt-embedding cache)."""
     import torch
     import numpy as np
@@ -971,9 +1039,16 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # cache miss instead of feeding stale GPU tensors into a fresh pipeline.
     _pipe_cls = str(type(pipeline).__name__)
     _model_name = getattr(pipeline, 'model_name_or_path', None) or _pipe_cls
-    model_id = f"{_model_name}#{id(pipeline)}"
     neg_prompt = getattr(request, 'negative_prompt', None) or ""
     do_cfg = cfg_scale > 1.0
+
+    # clip_skip and the weight grammar both change what the embeddings ARE, so
+    # they belong in the cache key: without them the first request's layer
+    # choice would be served to every later one.
+    _clip_skip = _resolve_clip_skip(request, model_config, global_args)
+    _weighting = _resolve_prompt_weighting(request, model_config, global_args)
+    model_id = (f"{_model_name}#{id(pipeline)}"
+                f"|cs={_clip_skip}|w={int(_weighting)}")
 
     # Some pipelines (Z-Image) return prompt embeddings as *per-sample lists*
     # rather than stacked tensors, and the pipeline consumes/extends those
@@ -996,7 +1071,17 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         # native encode + batching (the only path that survives reuse here).
         pass
     else:
-        # Try to encode and cache
+        # First choice: encode it ourselves, in as many 75-token windows as the
+        # prompt needs and with per-token weights. The pipeline's own encoder
+        # cannot do either — it truncates at 77 and reads the brackets as text.
+        embed_kwargs = _weighted_embed_kwargs(
+            pipeline, request.prompt, neg_prompt, _clip_skip, _weighting) or {}
+        if embed_kwargs and _embed_cacheable:
+            _embed_cache.put(request.prompt, neg_prompt, model_id, embed_kwargs)
+
+    if not embed_kwargs and not cache_hit and _embed_cacheable:
+        # Not a CLIP-pair pipeline (Flux, SD3), or the encode failed: the
+        # pipeline's own path, as before.
         try:
             if hasattr(pipeline, 'encode_prompt'):
                 import inspect as _inspect
@@ -1311,31 +1396,41 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     # Use request seed if provided, otherwise use CLI default seed
     seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
 
+    # sd.cpp parses the weight grammar and the token windows itself, inside the
+    # engine, so the prompt goes through as written. What it was never given is
+    # the negative prompt: this call hardcoded '' and silently discarded
+    # whatever the caller asked to avoid -- the half of the booru-tag idiom that
+    # holds quality down (score_4, score_5, score_6) stopped at the API.
+    _sd_kwargs = dict(
+        prompt=prompt,
+        negative_prompt=getattr(request, 'negative_prompt', None) or '',
+        width=width,
+        height=height,
+        cfg_scale=cfg_scale,
+        sample_steps=steps,
+        seed=seed if seed is not None else 42,
+        batch_count=request.n if request.n else 1,
+        progress_callback=_sdcpp_progress,
+    )
+    _cs = _resolve_clip_skip(request, model_config, global_args)
+    if _cs:
+        _sd_kwargs['clip_skip'] = _cs
+    # Drop anything this build of the binding does not take, rather than losing
+    # the whole call to a TypeError and retrying blind.
     try:
-        result = await asyncio.to_thread(
-            sd_model.generate_image,
-            prompt=prompt,
-            negative_prompt='',
-            width=width,
-            height=height,
-            cfg_scale=cfg_scale,
-            sample_steps=steps,
-            seed=seed if seed is not None else 42,
-            batch_count=request.n if request.n else 1,
-            progress_callback=_sdcpp_progress,
-        )
+        import inspect as _inspect
+        _accepted = set(_inspect.signature(sd_model.generate_image).parameters)
+        if 'kwargs' not in _accepted:
+            _sd_kwargs = {k: v for k, v in _sd_kwargs.items() if k in _accepted}
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        result = await asyncio.to_thread(sd_model.generate_image, **_sd_kwargs)
     except TypeError:
-        result = await asyncio.to_thread(
-            sd_model.generate_image,
-            prompt=prompt,
-            negative_prompt='',
-            width=width,
-            height=height,
-            cfg_scale=cfg_scale,
-            sample_steps=steps,
-            seed=seed if seed is not None else 42,
-            batch_count=request.n if request.n else 1,
-        )
+        _sd_kwargs.pop('progress_callback', None)
+        _sd_kwargs.pop('clip_skip', None)
+        result = await asyncio.to_thread(sd_model.generate_image, **_sd_kwargs)
     except Exception as e:
         task_registry.finish(_tid, "error", str(e)[:200])
         _progress_done()
@@ -1619,7 +1714,10 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             else:
                 # Assume it's a diffusers pipeline
                 print(f"Using cached diffusers pipeline for generation")
-                return await _generate_with_diffusers(pipeline, request, global_args, http_request)
+                _diff_cfg = (multi_model_manager.config.get(model_key)
+                             or multi_model_manager.config.get(model_name) or {})
+                return await _generate_with_diffusers(pipeline, request, global_args,
+                                                      http_request, model_config=_diff_cfg)
         
         # =====================================================================
         # Step 4: Model not loaded - try to load it
@@ -1656,7 +1754,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     print(f"Loaded diffusers model: {model_name}")
 
                     _treg.finish(_ltid, "done")
-                    return await _generate_with_diffusers(pipeline, request, global_args, http_request)
+                    return await _generate_with_diffusers(pipeline, request, global_args,
+                                                          http_request, model_config=_diff_cfg)
                     
             except ImportError as e:
                 diffusers_error = str(e)
@@ -1732,6 +1831,9 @@ class ImageEditRequest(BaseModel):
     prompt: str
     image: str              # /v1/files path, sha256: id, data URI, URL or base64
     mask: Optional[str] = None   # accepted but unused here -- see /v1/images/inpaint
+    negative_prompt: Optional[str] = None   # what to avoid; CFG needs it as much as a t2i call does
+    clip_skip: Optional[int] = None         # None = the model's configured default
+    prompt_weighting: Optional[bool] = None # None = on; see codai/models/prompt_weighting.py
     n: int = 1
     #: Omitted means "keep the source's shape" (see _default_edit_size), NOT a
     #: square: defaulting to 1024x1024 silently distorted every non-square photo.
@@ -1786,6 +1888,24 @@ def _decode_b64_image(data: str, field: str = "image"):
     """Any accepted image reference → an RGB PIL image."""
     from PIL import Image as PILImage
     return PILImage.open(io.BytesIO(_image_bytes(data, field))).convert("RGB")
+
+
+def _prompt_call_kwargs(pipeline, request, model_config=None):
+    """Prompt kwargs for an img2img / inpaint call: embeddings, or plain text.
+
+    The weighted encoder keeps the whole prompt and the weights; if this is not
+    a CLIP-pair pipeline it returns None and the text goes through as before.
+    Either way the negative prompt is passed -- the edit endpoints used to have
+    nowhere to put one, so an edit could only ever be steered positively.
+    """
+    neg = getattr(request, 'negative_prompt', None) or ""
+    kw = _weighted_embed_kwargs(
+        pipeline, request.prompt, neg,
+        _resolve_clip_skip(request, model_config, global_args),
+        _resolve_prompt_weighting(request, model_config, global_args))
+    if kw:
+        return kw
+    return {"prompt": request.prompt, "negative_prompt": neg or None}
 
 
 def _load_img2img_pipeline(model_name: str, global_args):
@@ -1891,16 +2011,18 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         num_steps = request.steps or (30 if quality == "standard" else 50)
         cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
 
+        _edit_cfg = (multi_model_manager.config.get(model_key)
+                     or multi_model_manager.config.get(model_name) or {})
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: pipe(
-                prompt=request.prompt,
                 image=source_img,
                 strength=request.strength,
                 num_inference_steps=num_steps,
                 guidance_scale=cfg_scale,
                 num_images_per_prompt=request.n,
                 generator=generator,
+                **_prompt_call_kwargs(pipe, request, _edit_cfg),
             )
         )
     except Exception as e:
@@ -1925,6 +2047,9 @@ class ImageInpaintRequest(BaseModel):
     prompt: str
     image: str              # base64 source image
     mask: str               # base64 mask (white = inpaint region)
+    negative_prompt: Optional[str] = None
+    clip_skip: Optional[int] = None
+    prompt_weighting: Optional[bool] = None
     n: int = 1
     size: Optional[str] = "1024x1024"
     response_format: Optional[str] = "url"
@@ -2020,10 +2145,11 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
         quality = request.quality or "standard"
         num_steps = request.steps or (30 if quality == "standard" else 50)
         cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
+        _inp_cfg = (multi_model_manager.config.get(model_key)
+                    or multi_model_manager.config.get(model_name) or {})
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: pipe(
-                prompt=request.prompt,
                 image=source_img,
                 mask_image=mask_img,
                 strength=request.strength,
@@ -2031,6 +2157,7 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
                 guidance_scale=cfg_scale,
                 num_images_per_prompt=request.n,
                 generator=generator,
+                **_prompt_call_kwargs(pipe, request, _inp_cfg),
             )
         )
     except Exception as e:

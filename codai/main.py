@@ -1225,6 +1225,8 @@ def main():
     global_args.image_seed = config.image.seed
     global_args.vae_tiling = config.image.vae_tiling
     global_args.clip_on_cpu = config.image.clip_on_cpu
+    global_args.image_clip_skip = config.image.clip_skip
+    global_args.image_prompt_weighting = config.image.prompt_weighting
     global_args.system_prompt = config.system_prompt
     global_args.tools_closer_prompt = config.tools_closer_prompt
     global_args.grammar_guided_gen = config.grammar_guided

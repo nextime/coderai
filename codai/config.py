@@ -303,6 +303,13 @@ class ImageConfig:
     seed: Optional[int] = None
     vae_tiling: bool = False
     clip_on_cpu: bool = False
+    # Which CLIP layer the text embedding comes from, counted from the end.
+    # None = the pipeline's own choice. The booru-tag SDXL fine-tunes (Pony,
+    # Illustrious, NoobAI) are trained at 2; a model can override this.
+    clip_skip: Optional[int] = None
+    # Parse the A1111 prompt grammar -- (tag:1.3), [tag], BREAK. Off keeps
+    # brackets literal; the prompt is windowed past 77 tokens either way.
+    prompt_weighting: bool = True
 
 
 @dataclass
@@ -2128,7 +2135,9 @@ class ConfigManager:
                 "cpu_offload": self.config.image.cpu_offload,
                 "seed": self.config.image.seed,
                 "vae_tiling": self.config.image.vae_tiling,
-                "clip_on_cpu": self.config.image.clip_on_cpu
+                "clip_on_cpu": self.config.image.clip_on_cpu,
+                "clip_skip": self.config.image.clip_skip,
+                "prompt_weighting": self.config.image.prompt_weighting
             },
             "archive": {
                 "enabled": self.config.archive.enabled,
