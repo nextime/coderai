@@ -281,23 +281,92 @@ def _expand_learned_tokens(pipeline, text: str, tokenizer) -> str:
 
 
 def _hidden(out, text_encoder, clip_skip: Optional[int], sdxl: bool):
-    """The hidden state a diffusers pipeline would have used.
+    """The hidden state for ``clip_skip``, counted the way users count it.
 
-    Mirrors diffusers exactly, because anything else shifts every output:
-    SDXL always takes the penultimate layer, so its ``clip_skip`` counts from
-    there, while SD 1.x takes the final (already normalised) output and a
-    ``clip_skip`` there needs the final layer norm applied by hand.
+    ``clip_skip`` here is A1111's ``CLIP_stop_at_last_layers``, which is what
+    every model card, every prompt pasted from one, and every other UI means by
+    the name: **1 is the final layer, 2 is the penultimate, n is the n-th from
+    the end**. For the booru-tag SDXL families that is 2, and on SDXL 2 is also
+    the default -- those models are trained against the penultimate layer.
+
+    Diffusers' own ``clip_skip`` argument counts something else, and following
+    it is a trap worth spelling out. Its SDXL path does::
+
+        hidden_states[-2]                 # clip_skip is None
+        hidden_states[-(clip_skip + 2)]   # otherwise
+
+    so diffusers' ``clip_skip`` is the number of layers skipped *beyond* the
+    penultimate one SDXL already uses. Passing a caller's 2 straight through
+    therefore reads ``hidden_states[-4]`` -- two layers deeper than asked for,
+    which on a Pony-family model is the difference between a photograph and
+    mush. SD 1.x is off by one in the same direction. So the mapping happens
+    here, once, instead of being inherited.
     """
+    k = int(clip_skip) if clip_skip else 0
     if sdxl:
-        layer = -2 if not clip_skip else -(int(clip_skip) + 2)
-        return out.hidden_states[layer]
-    if not clip_skip:
+        if k == 1:
+            return out.hidden_states[-1]
+        # Trained against the penultimate layer, so that is also the default.
+        return out.hidden_states[-max(2, k)]
+    if k <= 1:
+        # The encoder's final output, already normalised.
         return out[0]
-    emb = out.hidden_states[-(int(clip_skip) + 1)]
+    emb = out.hidden_states[-k]
     try:
+        # hidden_states are pre-norm; the final output a pipeline would have
+        # used is not, so taking an earlier layer means applying it by hand.
         return text_encoder.text_model.final_layer_norm(emb)
     except AttributeError:
         return emb
+
+
+def _pooled(out, text_encoder, ids):
+    """SDXL's pooled conditioning vector, reconstructed if it is not offered.
+
+    SDXL conditions on two things: the per-token hidden states, and a single
+    projected vector that feeds the UNet's ``added_cond_kwargs``. The UNet
+    cannot run without the second, and diffusers refuses ``prompt_embeds``
+    that arrive without it ("If `prompt_embeds` are provided,
+    `pooled_prompt_embeds` also have to be passed") -- a ValueError raised in
+    ``check_inputs``, before any denoising, so the request dies instantly.
+
+    A properly loaded SDXL pipeline hands it over as ``text_embeds``, because
+    its second encoder is a ``CLIPTextModelWithProjection``. When something
+    else is in that slot, the parts to build it are usually still there: CLIP
+    pools at the end-of-text token and then projects, so that is done here
+    rather than giving up the weighting and the window count that this module
+    exists for.
+
+    Returns None only when even that is impossible, which the caller treats as
+    "use the pipeline's own encoder".
+    """
+    import torch
+
+    pooled = getattr(out, "text_embeds", None)
+    if pooled is not None:
+        return pooled
+
+    projection = getattr(text_encoder, "text_projection", None)
+    if projection is None:
+        return None
+
+    hidden = getattr(out, "last_hidden_state", None)
+    if hidden is None:
+        return None
+
+    try:
+        eos = getattr(getattr(text_encoder, "config", None), "eos_token_id", None)
+        if eos is None:
+            # The window is built here, so the end marker is the last id.
+            index = ids.shape[-1] - 1
+        else:
+            # Where CLIP pools: the first end-of-text token. argmax on the
+            # boolean takes the first True, which is how transformers finds it.
+            index = int((ids[0] == int(eos)).int().argmax())
+        vector = hidden[:, index]
+        return projection(vector)
+    except Exception:
+        return None
 
 
 def _apply_weights(emb, weights):
@@ -380,8 +449,8 @@ def encode_weighted_prompt(pipeline, prompt: str, negative_prompt: str = "",
             # The pooled vector summarises a whole 77-token pass, so there is
             # no meaningful way to pool across windows: SDXL gets the first
             # one, which holds the start of the prompt.
-            if pooled is None and sdxl and hasattr(out, "text_embeds"):
-                pooled = out.text_embeds
+            if pooled is None and sdxl:
+                pooled = _pooled(out, text_encoder, ids)
             embeds.append(_apply_weights(emb, [1.0] + list(w) + [1.0]))
         return torch.cat(embeds, dim=1), pooled
 
@@ -398,6 +467,13 @@ def encode_weighted_prompt(pipeline, prompt: str, negative_prompt: str = "",
             if pooled is not None:
                 pooled_neg = pooled
 
+    if sdxl and (pooled_pos is None or pooled_neg is None):
+        # _pooled could neither read nor rebuild it. Handing SDXL prompt_embeds
+        # without the pooled vector is an instant ValueError, so this goes back
+        # to the pipeline's own encoder instead: unweighted and capped at 77
+        # tokens, but it renders, and a failed request does not.
+        return None
+
     # SDXL conditions on both encoders' states concatenated on the feature
     # axis (768 + 1280); SD 1.x has only the one.
     prompt_embeds = torch.cat(pos_parts, dim=-1) if len(pos_parts) > 1 else pos_parts[0]
@@ -411,7 +487,7 @@ def encode_weighted_prompt(pipeline, prompt: str, negative_prompt: str = "",
         "prompt_embeds": prompt_embeds,
         "negative_prompt_embeds": negative_embeds,
     }
-    if sdxl and pooled_pos is not None and pooled_neg is not None:
+    if sdxl:
         if dtype is not None:
             pooled_pos = pooled_pos.to(dtype)
             pooled_neg = pooled_neg.to(dtype)

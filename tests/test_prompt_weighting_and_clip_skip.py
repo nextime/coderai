@@ -274,20 +274,45 @@ def test_sd15_clip_skip_picks_the_layer_and_normalises_it():
     plain = encode_weighted_prompt(pipe, "a cat", "")
     # No clip_skip: the encoder's final output (marked -1), untouched.
     assert plain["prompt_embeds"].flatten()[0].item() == pytest.approx(-1.0)
-    # clip_skip=2 on SD 1.x: hidden_states[-3] (layer 3 of 6), then the final
-    # layer norm, which the fake multiplies by 100.
+    # clip_skip=2 means the penultimate layer -- hidden_states[-2], layer 4 of
+    # 6 -- then the final layer norm, which the fake multiplies by 100.
     skipped = encode_weighted_prompt(pipe, "a cat", "", clip_skip=2)
-    assert skipped["prompt_embeds"].flatten()[0].item() == pytest.approx(300.0)
+    assert skipped["prompt_embeds"].flatten()[0].item() == pytest.approx(400.0)
 
 
-def test_sdxl_counts_clip_skip_from_the_penultimate_layer():
-    """SDXL pipelines always take hidden_states[-2], so a clip_skip there is
-    relative to that -- getting this wrong shifts every image."""
+@pytest.mark.parametrize("clip_skip,layer", [
+    (None, 4),    # hidden_states[-2]: what SDXL is trained against
+    (1,    5),    # hidden_states[-1]: the final layer
+    (2,    4),    # hidden_states[-2]: what every Pony model card asks for
+    (3,    3),
+    (4,    2),
+])
+def test_clip_skip_counts_layers_from_the_end_as_users_do(clip_skip, layer):
+    """``clip_skip`` is A1111's CLIP_stop_at_last_layers: 1 is the final layer,
+    2 the penultimate, n the n-th from the end.
+
+    Diffusers' argument of the same name counts something else -- layers
+    skipped BEYOND the penultimate one SDXL already uses, so its SDXL path
+    reads ``hidden_states[-(clip_skip + 2)]``. Passing a caller's 2 through to
+    it read ``hidden_states[-4]``: two layers deeper than asked for, which on a
+    Pony-family model is the difference between a photograph and mush. It
+    shipped that way in 0.4.89 and this is what caught it.
+    """
     pipe = _fake_sdxl_pipeline()
-    default = encode_weighted_prompt(pipe, "a cat", "")
-    assert default["prompt_embeds"].flatten()[0].item() == pytest.approx(4.0)  # hs[-2]
-    skipped = encode_weighted_prompt(pipe, "a cat", "", clip_skip=2)
-    assert skipped["prompt_embeds"].flatten()[0].item() == pytest.approx(2.0)  # hs[-4]
+    out = encode_weighted_prompt(pipe, "a cat", "", clip_skip=clip_skip)
+    assert out["prompt_embeds"].flatten()[0].item() == pytest.approx(float(layer))
+
+
+def test_clip_skip_2_means_the_same_layer_on_both_families():
+    """It is one number in one API: whichever family the model belongs to,
+    clip_skip 2 is the penultimate layer. The old mapping made it
+    hidden_states[-4] on SDXL and [-3] on SD 1.x -- two different depths from
+    the same request."""
+    sdxl = encode_weighted_prompt(_fake_sdxl_pipeline(), "a cat", "", clip_skip=2)
+    sd15 = encode_weighted_prompt(_fake_sd15_pipeline(), "a cat", "", clip_skip=2)
+    # layer 4 of 6 == hidden_states[-2] in both; SD 1.x also applies the norm
+    assert sdxl["prompt_embeds"].flatten()[0].item() == pytest.approx(4.0)
+    assert sd15["prompt_embeds"].flatten()[0].item() == pytest.approx(4.0 * 100)
 
 
 def test_sdxl_concatenates_both_encoders_and_pools_the_second():
@@ -296,6 +321,74 @@ def test_sdxl_concatenates_both_encoders_and_pools_the_second():
     assert out["prompt_embeds"].shape == (1, WINDOW + 2, HIDDEN + HIDDEN_2)
     assert out["pooled_prompt_embeds"].shape == (1, HIDDEN_2)
     assert out["negative_pooled_prompt_embeds"].shape == (1, HIDDEN_2)
+
+
+class CLIPTextModelNoProjection(CLIPTextModel):
+    """A second encoder that offers no ``text_embeds``, but can still be pooled.
+
+    Named for what it stands in for: ``supports_weighted_embeds`` identifies
+    the encoder families by class name, so a fake called anything else is
+    turned away before the pooling is ever reached.
+
+    Stands in for anything other than a CLIPTextModelWithProjection landing in
+    text_encoder_2: the pooled vector is not handed over, but the projection
+    and the hidden states to build it from are both there.
+    """
+
+    projection = False
+
+    def __init__(self, hidden_size):
+        super().__init__(hidden_size)
+        self.config = types.SimpleNamespace(eos_token_id=49407)
+        # A real text_projection is a Linear; marking the output is enough to
+        # prove it was applied rather than the raw hidden state being passed.
+        self.text_projection = lambda v: v * 3.0
+
+
+def test_sdxl_pooled_is_rebuilt_when_it_is_not_offered():
+    """Giving up the weighting and the window count is a worse answer than
+    pooling the way CLIP does: at the end-of-text token, then projected."""
+    pipe = _fake_sdxl_pipeline()
+    pipe.text_encoder_2 = CLIPTextModelNoProjection(HIDDEN_2)
+    out = encode_weighted_prompt(pipe, "a cat", "blurry")
+    assert out is not None, "fell back instead of rebuilding the pooled vector"
+    assert out["pooled_prompt_embeds"].shape == (1, HIDDEN_2)
+    # last_hidden_state is -1.0 in the fake, and the projection triples it
+    assert out["pooled_prompt_embeds"].flatten()[0].item() == pytest.approx(-3.0)
+    # and the per-token path is still the weighted, windowed one
+    assert out["prompt_embeds"].shape == (1, WINDOW + 2, HIDDEN + HIDDEN_2)
+
+
+def test_sdxl_falls_back_only_when_it_cannot_be_rebuilt():
+    """No text_embeds and no projection: SDXL would raise on prompt_embeds
+    without a pooled vector, so this returns None and the caller uses the
+    pipeline's own encoder -- unweighted, but served."""
+    pipe = _fake_sdxl_pipeline()
+    pipe.text_encoder_2 = CLIPTextModel(HIDDEN_2)   # no projection at all
+    assert supports_weighted_embeds(pipe)           # still looks encodable
+    assert encode_weighted_prompt(pipe, "a cat", "") is None
+
+
+def test_sdxl_never_returns_embeds_without_the_pooled_pair():
+    """The invalid combination is the one that 500s instantly, so it must not
+    be constructible: either all four keys, or None."""
+    for second in (CLIPTextModelWithProjection(HIDDEN_2),
+                   CLIPTextModelNoProjection(HIDDEN_2),
+                   CLIPTextModel(HIDDEN_2)):
+        pipe = _fake_sdxl_pipeline()
+        pipe.text_encoder_2 = second
+        out = encode_weighted_prompt(pipe, "a cat", "blurry")
+        if out is None:
+            continue
+        assert {"prompt_embeds", "negative_prompt_embeds",
+                "pooled_prompt_embeds", "negative_pooled_prompt_embeds"} <= set(out)
+
+
+def test_sd15_needs_no_pooled_vector():
+    """Only SDXL conditions on one; SD 1.x must not be held to it."""
+    out = encode_weighted_prompt(_fake_sd15_pipeline(), "a cat", "")
+    assert out is not None
+    assert "pooled_prompt_embeds" not in out
 
 
 def test_a_weight_changes_the_tokens_but_not_the_window_mean():

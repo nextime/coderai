@@ -47,7 +47,7 @@ take:
 | Field | Meaning |
 |---|---|
 | `negative_prompt` | What to avoid. The counterpart of the quality tags (`score_4, score_5, score_6, worst quality`) and as load-bearing as the prompt itself. |
-| `clip_skip` | Read the embedding this many CLIP layers from the end. Omitted uses the model's configured value, then the pipeline's own default. |
+| `clip_skip` | Which CLIP layer to read, counted from the end: **1 is the final layer, 2 the penultimate, n the n-th from the end** — A1111's `CLIP_stop_at_last_layers`, the number every model card quotes. Omitted uses the model's configured value, then the family's default (the penultimate layer on SDXL, the final one on SD 1.x). |
 | `prompt_weighting` | `false` keeps brackets literal, for a caller sending prose. The windowing stays on either way, so turning it off never costs tokens. |
 | `embeddings` | Textual inversions to load, so their trigger words work in the prompt — `["easynegative"]`. |
 | `prompt_prefix` / `negative_prompt_prefix` | Override the model's standing prefix; `""` switches it off for this call. |
@@ -176,10 +176,24 @@ supports them.
 ## Implementation
 
 `codai/models/prompt_weighting.py` holds the parser, the windowing and the
-encoder, and documents how `clip_skip` maps to a hidden-state index — SDXL
-takes the penultimate layer by default and counts from there, SD 1.x takes the
-final output and needs the layer norm applied by hand. Getting that mapping
-wrong shifts every image, so it mirrors diffusers exactly.
+encoder, and documents how `clip_skip` maps to a hidden-state index.
+
+That mapping is worth knowing about, because diffusers' argument of the same
+name counts something else. Its SDXL path reads `hidden_states[-2]` by default
+and `hidden_states[-(clip_skip + 2)]` otherwise, so **diffusers' `clip_skip` is
+layers skipped *beyond* the penultimate one SDXL already uses**. Passing a
+caller's 2 straight through reads `hidden_states[-4]` — two layers deeper than
+asked for, which on a Pony-family model is the difference between a photograph
+and mush. CoderAI shipped exactly that in 0.4.89 and fixed it in 0.4.92; the
+mapping now happens once, here, instead of being inherited. SD 1.x additionally
+needs the final layer norm applied by hand when an earlier layer is taken,
+since `hidden_states` are pre-norm.
+
+SDXL also conditions on a pooled vector that the UNet cannot run without, and
+diffusers refuses `prompt_embeds` that arrive without it. Where a pipeline does
+not hand one over, it is rebuilt the way CLIP produces it — pooled at the
+end-of-text token, then projected — and only if even that is impossible does
+the encoder stand down and let the pipeline encode the prompt itself.
 `codai/models/textual_inversion.py` resolves and loads the embeddings, and
 tracks what a pipeline already carries — a pipeline outlives the request that
 loaded it, and diffusers raises on registering the same trigger word twice.

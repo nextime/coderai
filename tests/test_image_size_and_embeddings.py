@@ -389,8 +389,18 @@ def test_a_400_is_not_relabelled_as_a_server_fault():
     src = open("codai/api/images.py").read()
     for message in ("Image editing failed", "Inpainting failed",
                     "Outfit change failed"):
-        idx = src.index(message)
-        assert "except HTTPException:" in src[max(0, idx - 250):idx], message
+        # The LAST occurrence is the `raise`; the first is the log line that
+        # now sits beside it, which is why this does not measure a distance.
+        idx = src.rindex(f'detail=f"{message}')
+        before = src[:idx]
+        assert "except HTTPException:" in before, message
+        # The pass-through must be the nearest handler above the catch-all,
+        # not merely present somewhere in the file.
+        assert before.rindex("except HTTPException:") > \
+            before.rindex("async def "), message
+        # And the cause reaches the log, not only the response body.
+        assert "exc_info=True" in src[before.rindex("except HTTPException:"):idx], \
+            message
 
 
 def test_a_rejected_request_is_not_mistaken_for_a_failed_backend():

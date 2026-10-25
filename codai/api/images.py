@@ -2169,6 +2169,10 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
     except HTTPException:
         raise                       # a 400 from here is the caller's, not ours
     except Exception as e:
+        # The traceback goes to the log, not only into the response body: a
+        # 500 whose cause reaches the caller alone is one nobody can diagnose
+        # afterwards, and the log showed the request and then just the status.
+        _log.error("Image editing failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Image editing failed: {e}")
 
     images = []
@@ -2316,6 +2320,10 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
     except HTTPException:
         raise
     except Exception as e:
+        # The traceback goes to the log, not only into the response body: a
+        # 500 whose cause reaches the caller alone is one nobody can diagnose
+        # afterwards, and the log showed the request and then just the status.
+        _log.error("Inpainting failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Inpainting failed: {e}")
     images = [save_image_response(img, request.response_format, http_request) for img in result.images]
     return {"created": int(time.time()), "data": images}
@@ -3030,6 +3038,10 @@ async def create_image_outfit(request: ImageOutfitRequest, http_request: Request
     except HTTPException:
         raise
     except Exception as e:
+        # The traceback goes to the log, not only into the response body: a
+        # 500 whose cause reaches the caller alone is one nobody can diagnose
+        # afterwards, and the log showed the request and then just the status.
+        _log.error("Outfit change failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Outfit change failed: {e}")
 
     result = save_image_response(result_img, request.response_format, http_request)
