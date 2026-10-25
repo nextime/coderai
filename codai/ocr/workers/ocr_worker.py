@@ -2125,7 +2125,7 @@ class SuryaWorker:
         # `regions` and `tables` were hardcoded empty here while the engine
         # catalogue advertised both, so the arrays a client was told to expect
         # were always there and always empty.
-        if self._layout is not None and bool(_opt("layout", True)):
+        if self._layout is not None and bool(_page_override("layout", True)):
             page["regions"], page["tables"] = self._run_layout(img)
         # A PAGE-LEVEL confidence, so surya reports the same shape chandra and
         # olmOCR do and a caller switching engines is not handed a different
