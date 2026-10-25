@@ -12,7 +12,10 @@ tiktoken>=0.5.0
 tokenizers>=0.15.0
 protobuf>=3.20.0
 optimum-quanto>=0.2.0
-gguf>=0.9.0
+# 0.10.0, not 0.9: diffusers' GGUFQuantizationConfig refuses anything older
+# ("requires both PyTorch and GGUF>=0.10.0"), so a 0.9.x install satisfies this
+# line and still cannot load a GGUF pipeline component.
+gguf>=0.10.0
 turboquant-py>=0.1.0  # optional TurboQuant embedding-vector quantization backend (1-4 bit)
 
 # Native wheels are built by packaging/linux/Dockerfile.oci with CUDA+Vulkan enabled.
