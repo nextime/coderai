@@ -57,6 +57,13 @@ class ImageGenerationRequest(BaseModel):
         "Take the text embedding this many CLIP layers from the end instead of the last. "
         "The booru-tag SDXL fine-tune families (Pony, Illustrious, NoobAI) are trained at 2. "
         "Omitted uses the model's configured default, then the pipeline's own."))
+    prompt_prefix: Optional[str] = Field(None, description=(
+        "Text prepended to the prompt, comma-joined. Omitted uses the model's own "
+        "prompt_prefix (how a model fine-tuned on a quality ladder gets it on every "
+        "request); an empty string switches it off for this call. Applied at most "
+        "once -- a prompt that already starts with it is left alone."))
+    negative_prompt_prefix: Optional[str] = Field(None, description=(
+        "The same, for the negative prompt (e.g. 'score_4, score_5, score_6')."))
     embeddings: Optional[List[str]] = Field(None, description=(
         "Textual-inversion embeddings to load before generating, so their trigger "
         "words work in the prompt (e.g. [\"easynegative\"]). A bare name is looked "

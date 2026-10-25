@@ -1554,6 +1554,15 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <span class="form-hint">On, the A1111 grammar is parsed: <code>(tag:1.3)</code> emphasises, <code>[tag]</code> attenuates, bare <code>(tag)</code> is 1.1, nesting multiplies, <code>\(</code> is a literal bracket, and <code>BREAK</code> starts a new 75-token window. Off, brackets reach the model as text. Either way the prompt is encoded in as many windows as it needs, so nothing is cut at 77 tokens.</span>
 
       <div class="form-row" style="margin-top:.75rem">
+        <label class="form-label">Prompt prefix <span class="muted">(prepended to every prompt)</span></label>
+        <input type="text" id="cfg-prompt-prefix" class="form-input" placeholder="score_9, score_8_up, score_7_up, score_6_up">
+        <span class="form-hint">Comma-joined in front of whatever the caller sent. This is how a model trained on a quality ladder gets it on every request, including from a client that speaks the plain OpenAI image API and only sends a sentence. Applied at most once — a prompt that already starts with it is left alone — and a request can override it, or send an empty string to switch it off.</span>
+      </div>
+      <div class="form-row" style="margin-top:.75rem">
+        <label class="form-label">Negative prompt prefix</label>
+        <input type="text" id="cfg-negative-prompt-prefix" class="form-input" placeholder="score_4, score_5, score_6, worst quality">
+      </div>
+      <div class="form-row" style="margin-top:.75rem">
         <label class="form-label">Textual inversions <span class="muted">(comma-separated; always loaded for this model)</span></label>
         <input type="text" id="cfg-textual-inversion" class="form-input" placeholder="easynegative, bad-hands-5, my-emb.safetensors:myneg">
         <span class="form-hint">Learned prompt tokens, so their trigger words work in any prompt sent to this model. A bare name is looked up in the server's embeddings directory (<code>image.embeddings_dir</code> — everything in it is loaded anyway); a path or a HuggingFace repo id also works, and <code>ref:token</code> renames the trigger word. A request's own <code>embeddings</code> list is loaded on top of these.</span>
@@ -4311,6 +4320,8 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-vae-tiling').checked = !!s.vae_tiling;
   document.getElementById('cfg-clip-skip').value = (s.clip_skip != null ? s.clip_skip : '');
   document.getElementById('cfg-prompt-weighting').checked = (s.prompt_weighting !== false);
+  document.getElementById('cfg-prompt-prefix').value = (s.prompt_prefix || '');
+  document.getElementById('cfg-negative-prompt-prefix').value = (s.negative_prompt_prefix || '');
   document.getElementById('cfg-textual-inversion').value =
     (Array.isArray(s.textual_inversion) ? s.textual_inversion.join(', ') : (s.textual_inversion || ''));
   document.getElementById('cfg-output-crf').value = (s.output_crf != null ? s.output_crf : '');
@@ -5418,6 +5429,8 @@ async function saveModelConfig(){
     clip_skip:         (document.getElementById('cfg-clip-skip').value.trim() === ''
                           ? null : parseInt(document.getElementById('cfg-clip-skip').value, 10)),
     prompt_weighting:  document.getElementById('cfg-prompt-weighting').checked,
+    prompt_prefix:     document.getElementById('cfg-prompt-prefix').value.trim(),
+    negative_prompt_prefix: document.getElementById('cfg-negative-prompt-prefix').value.trim(),
     textual_inversion: document.getElementById('cfg-textual-inversion').value
                          .split(',').map(v => v.trim()).filter(v => v !== ''),
   };

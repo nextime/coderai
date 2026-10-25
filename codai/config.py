@@ -1176,6 +1176,13 @@ class OcrConfig:
     # It must never look like an empty or failed read -- see the "a degraded
     # page still answers 200" trap this subsystem already carries.
     max_pages: int = 0
+    # Ceiling on ONE upload, in MB. A scan is as big as its DPI and its page
+    # count make it -- a 300 DPI colour filing passes 100 MB without being
+    # unusual -- so this is a setting rather than the constant it used to be.
+    # 0 = no ceiling here (the reverse proxy's body limit still applies, and
+    # nginx's own default of 1 MB is the usual reason a large page is refused
+    # before coderai ever sees it: see docs/ocr.md).
+    max_upload_mb: int = 100
     # What to do when the model's pods are the ones that run the OCR pipeline
     # (their image carries the rasteriser) but no pod can take a page.
     #
@@ -2329,6 +2336,7 @@ class ConfigManager:
                 "max_concurrency": self.config.ocr.max_concurrency,
                 "max_resident_mb": self.config.ocr.max_resident_mb,
                 "max_pages": self.config.ocr.max_pages,
+                "max_upload_mb": self.config.ocr.max_upload_mb,
                 "pod_pipeline": self.config.ocr.pod_pipeline,
                 "pod_pipeline_wait_s": self.config.ocr.pod_pipeline_wait_s,
                 "pod_http_async": self.config.ocr.pod_http_async,

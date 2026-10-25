@@ -50,6 +50,7 @@ take:
 | `clip_skip` | Read the embedding this many CLIP layers from the end. Omitted uses the model's configured value, then the pipeline's own default. |
 | `prompt_weighting` | `false` keeps brackets literal, for a caller sending prose. The windowing stays on either way, so turning it off never costs tokens. |
 | `embeddings` | Textual inversions to load, so their trigger words work in the prompt — `["easynegative"]`. |
+| `prompt_prefix` / `negative_prompt_prefix` | Override the model's standing prefix; `""` switches it off for this call. |
 
 ```json
 {
@@ -101,6 +102,33 @@ On `/v1/images/edits` and `/v1/images/inpaint`, omitting `size` keeps the
 source photo's own aspect at about 1 MP on a 64-pixel grid. Both used to
 default to a square, which squashed every non-square photo — and on inpaint it
 pulled the mask out of alignment with the image as well.
+
+## Standing prefixes: the ladder a model always wants
+
+CoderAI never adds tags to a prompt by itself. The `score_*` ladder is yours to
+send — in both directions — and what the sections above do is make sure it is
+read correctly, not supply it.
+
+When a model should always get it, that belongs to the model:
+`prompt_prefix` and `negative_prompt_prefix` on its config entry (admin →
+Models → Prompt Handling). They are comma-joined in front of whatever the
+caller sent, which is what makes a Pony-family model usable from a client that
+speaks the plain OpenAI image API and only sends a sentence:
+
+```json
+{ "prompt_prefix": "score_9, score_8_up, score_7_up, score_6_up",
+  "negative_prompt_prefix": "score_4, score_5, score_6" }
+```
+
+A request can send its own `prompt_prefix` / `negative_prompt_prefix` to
+override either, and an **empty string switches the prefix off for that call** —
+what a caller writing its own complete prompt needs. The prefix is applied at
+most once: a prompt that already opens with it is left alone, so pasting a full
+prompt does not get the ladder twice. Both default to empty, so an install that
+configures nothing sends exactly what the caller wrote.
+
+The prefix is prompt text like any other, so the weight grammar works in it:
+`(masterpiece:1.2), score_9` is a valid prefix.
 
 ## Learned prompt tokens (textual inversion)
 

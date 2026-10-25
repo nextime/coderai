@@ -548,6 +548,39 @@ GET  /v1/ocr/engines    what this install offers, and what each engine returns
 GET/POST/DELETE /v1/ocr/schemas[/{name}]   manage extraction schemas
 ```
 
+### How big a document may be
+
+| Limit | Default | Where |
+|---|---|---|
+| One upload | 100 MB | `ocr.max_upload_mb` (0 = no ceiling here) |
+| Pages per document | no ceiling | `ocr.max_pages` |
+| Pixels per page | ~6.29 MP | the engines' own cap (see below) |
+
+**There is no per-page byte limit.** A page over a megabyte is ordinary — an A4
+scan at 300 DPI is several — and nothing in the OCR path stops at one.
+
+So if a large page comes back `413` while `ocr.max_upload_mb` is nowhere near
+reached, the body was stopped **in front of coderai**. nginx defaults
+`client_max_body_size` to **1 MB**, and that default is exactly the shape of
+"anything over a megabyte fails". coderai's own bundled nginx raises it to
+4096m and the generated `/v1/ocr` routing does not lower it, so the culprit is
+a reverse proxy added in front — raise it there
+(see [reverse-proxy-nginx.md](reverse-proxy-nginx.md)):
+
+```nginx
+client_max_body_size 1024m;
+proxy_request_buffering off;    # stream it rather than spool the whole scan
+```
+
+coderai's own 413 names the setting and says the document was **not read**, so
+it can be told apart from a proxy's terse refusal.
+
+What *is* capped is **pixels**, not bytes: Surya-2 and Chandra both top out
+around 6,291,456 pixels (3072×2048), which an A4 page reaches at about 255 DPI.
+Above that the page is scaled down to fit before the model sees it — a
+deliberate downscale, not a refusal, and the reason `ocr.surya_dpi` defaults to
+250 rather than something higher.
+
 `engine=` takes an engine name (`paddle`, `doctr`, `surya`, `olmocr`) **or** the id
 of the model a pipeline drives, so `engine=surya` and
 `engine=datalab-to/surya-ocr-2` reach the same place. Omit it and

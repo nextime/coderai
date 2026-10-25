@@ -38,8 +38,30 @@ from codai.ocr.schemas import schema_store
 
 router = APIRouter()
 
-# Maximum upload size: 100 MB (multi-page scanned PDFs can be large).
-_MAX_OCR_BYTES = 100 * 1024 * 1024
+# Default ceiling on one upload, when the config says nothing: 100 MB. A scan
+# is as big as its DPI and its page count make it, so `ocr.max_upload_mb`
+# overrides this and 0 removes the ceiling altogether.
+_DEFAULT_MAX_OCR_MB = 100
+
+
+def _max_upload_bytes(cfg) -> int:
+    """Bytes one upload may be, or 0 for no ceiling.
+
+    Note what this is NOT: a per-page limit. Nothing in the OCR path caps a
+    single page, and a page bigger than a megabyte is ordinary -- a 300 DPI A4
+    scan is several. When a large page is refused with 413 and this ceiling is
+    nowhere near reached, the body was stopped by a reverse proxy in front:
+    nginx defaults `client_max_body_size` to 1 MB, which is exactly the shape
+    of "anything over a megabyte fails".
+    """
+    mb = getattr(cfg, "max_upload_mb", None)
+    if mb is None:
+        mb = _DEFAULT_MAX_OCR_MB
+    try:
+        mb = int(mb)
+    except (TypeError, ValueError):
+        mb = _DEFAULT_MAX_OCR_MB
+    return max(0, mb) * 1024 * 1024
 
 global_args = None
 
@@ -204,8 +226,13 @@ async def create_ocr(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
-    if len(data) > _MAX_OCR_BYTES:
-        raise HTTPException(status_code=413, detail="file too large (max 100 MB)")
+    _cap = _max_upload_bytes(cfg)
+    if _cap and len(data) > _cap:
+        raise HTTPException(status_code=413, detail=(
+            f"upload is {len(data) / 1048576:.1f} MB, over the "
+            f"{_cap // 1048576} MB ceiling this install sets for one document "
+            f"(ocr.max_upload_mb) — it was NOT read. Raise the ceiling, or "
+            f"split the document and send the parts."))
 
     try:
         result = await _bounded(cfg, ocr_manager.ocr_document(
@@ -258,11 +285,16 @@ async def create_ocr_batch(
         data = await f.read()
         payloads.append((f.filename or "", f.content_type or "", data))
 
+    _cap = _max_upload_bytes(cfg)
+
     async def _one(name, ctype, data):
         if not data:
             return {"filename": name, "error": "empty upload"}
-        if len(data) > _MAX_OCR_BYTES:
-            return {"filename": name, "error": "file too large (max 100 MB)"}
+        if _cap and len(data) > _cap:
+            return {"filename": name, "error": (
+                f"{len(data) / 1048576:.1f} MB, over the {_cap // 1048576} MB "
+                f"ceiling this install sets for one document "
+                f"(ocr.max_upload_mb) — it was NOT read")}
         try:
             res = await ocr_manager.ocr_document(
                 data, filename=name, content_type=ctype, engine=engine, dpi=dpi,

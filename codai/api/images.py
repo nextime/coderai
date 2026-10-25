@@ -987,6 +987,50 @@ def _resolve_prompt_weighting(request, model_config, args=None) -> bool:
     return True
 
 
+def _apply_prefix(prefix, text: str) -> str:
+    """``prefix`` in front of ``text``, comma-joined, applied at most once.
+
+    Booru-tag prompts are a comma-separated list, so the two parts join with
+    ", " and the prefix's own trailing comma is not doubled. If ``text``
+    already starts with the prefix -- a caller who pasted a full prompt
+    including the ladder -- it is left alone rather than repeated, which would
+    only dilute the rest of the prompt.
+    """
+    head = (prefix or "").strip().rstrip(",").strip()
+    body = (text or "").strip()
+    if not head:
+        return text or ""
+    if body.lower().startswith(head.lower()):
+        return body
+    return f"{head}, {body}" if body else head
+
+
+def _effective_prompts(request, model_config=None):
+    """``(prompt, negative_prompt)`` with the model's standing prefixes applied.
+
+    A model fine-tuned on a quality ladder wants it on every request, and a
+    client speaking the plain OpenAI image API sends a sentence and has no
+    field to put the ladder in. So the prefix belongs to the model:
+    ``prompt_prefix`` and ``negative_prompt_prefix`` on its config entry.
+
+    A request can override either one -- its own value wins, and an empty
+    string switches the prefix off for that call, which is what a caller
+    writing its own complete prompt needs. Nothing configured means the
+    prompts are returned exactly as sent.
+    """
+    cfg = model_config or {}
+    pos = getattr(request, 'prompt_prefix', None)
+    if pos is None:
+        pos = cfg.get('prompt_prefix')
+    neg = getattr(request, 'negative_prompt_prefix', None)
+    if neg is None:
+        neg = cfg.get('negative_prompt_prefix')
+
+    prompt = _apply_prefix(pos, getattr(request, 'prompt', '') or "")
+    negative = _apply_prefix(neg, getattr(request, 'negative_prompt', None) or "")
+    return prompt, negative
+
+
 def _apply_embeddings(pipeline, request, model_config=None, args=None):
     """Load this request's textual inversions onto the pipeline, if any.
 
@@ -1120,7 +1164,9 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # cache miss instead of feeding stale GPU tensors into a fresh pipeline.
     _pipe_cls = str(type(pipeline).__name__)
     _model_name = getattr(pipeline, 'model_name_or_path', None) or _pipe_cls
-    neg_prompt = getattr(request, 'negative_prompt', None) or ""
+    # The model's standing prefixes, applied once here so the encode, the
+    # cache key and the pipeline call all see the same text.
+    prompt, neg_prompt = _effective_prompts(request, model_config)
     do_cfg = cfg_scale > 1.0
 
     # Learned prompt tokens first: they change what the prompt tokenizes TO.
@@ -1142,7 +1188,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # unpatchify).  These are not safe to cache, so encode fresh every time.
     _embed_cacheable = "ZImage" not in _pipe_cls
 
-    cached_embeds = _embed_cache.get(request.prompt, neg_prompt, model_id) if _embed_cacheable else None
+    cached_embeds = _embed_cache.get(prompt, neg_prompt, model_id) if _embed_cacheable else None
     embed_kwargs = {}
     cache_hit = False
 
@@ -1160,9 +1206,9 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         # prompt needs and with per-token weights. The pipeline's own encoder
         # cannot do either — it truncates at 77 and reads the brackets as text.
         embed_kwargs = _weighted_embed_kwargs(
-            pipeline, request.prompt, neg_prompt, _clip_skip, _weighting) or {}
+            pipeline, prompt, neg_prompt, _clip_skip, _weighting) or {}
         if embed_kwargs and _embed_cacheable:
-            _embed_cache.put(request.prompt, neg_prompt, model_id, embed_kwargs)
+            _embed_cache.put(prompt, neg_prompt, model_id, embed_kwargs)
 
     if not embed_kwargs and not cache_hit and _embed_cacheable:
         # Not a CLIP-pair pipeline (Flux, SD3), or the encode failed: the
@@ -1171,7 +1217,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             if hasattr(pipeline, 'encode_prompt'):
                 import inspect as _inspect
                 _ep_params = set(_inspect.signature(pipeline.encode_prompt).parameters)
-                _ep_kwargs = {"prompt": request.prompt}
+                _ep_kwargs = {"prompt": prompt}
                 if "device" in _ep_params:
                     _ep_kwargs["device"] = pipeline.device
                 if "num_images_per_prompt" in _ep_params:
@@ -1198,7 +1244,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                         'negative_pooled_prompt_embeds': enc[3],
                     }
                 if embed_kwargs and _embed_cacheable:
-                    _embed_cache.put(request.prompt, neg_prompt, model_id, embed_kwargs)
+                    _embed_cache.put(prompt, neg_prompt, model_id, embed_kwargs)
                     print(f"Prompt embed cache STORE for model '{model_id}'")
         except Exception as e:
             print(f"Warning: prompt encode/cache failed ({e}), using plain text prompt")
@@ -1255,7 +1301,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         )
     else:
         call_kwargs = dict(
-            prompt=request.prompt,
+            prompt=prompt,
             negative_prompt=neg_prompt or None,
             num_images_per_prompt=request.n,
             height=height,
@@ -1402,8 +1448,10 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                 archive_manager.save_generation,
                 "image", "/v1/images/generations",
                 getattr(request, 'model', None) or model_id,
-                request.prompt,
+                prompt,
                 {
+                    "requested_prompt": request.prompt if prompt != request.prompt else None,
+                    "negative_prompt": neg_prompt or None,
                     "size": f"{width}x{height}",
                     "requested_size": request.size,
                     "n": request.n,
@@ -1447,7 +1495,7 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     steps = request.steps if request.steps else (_accel_steps or 4)
     cfg_scale = request.guidance_scale or _accel_cfg or get_cfg_scale()
 
-    prompt = request.prompt
+    prompt, neg_prompt = _effective_prompts(request, model_config)
     if _accel and _accel.get('lora') and (model_config or {}).get('lora_model_dir'):
         from codai.models.acceleration import _split_lora_ref
         _repo, _wn = _split_lora_ref(_accel['lora'])
@@ -1482,7 +1530,7 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     # holds quality down (score_4, score_5, score_6) stopped at the API.
     _sd_kwargs = dict(
         prompt=prompt,
-        negative_prompt=getattr(request, 'negative_prompt', None) or '',
+        negative_prompt=neg_prompt or '',
         width=width,
         height=height,
         cfg_scale=cfg_scale,
@@ -1545,8 +1593,10 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
                 archive_manager.save_generation,
                 "image", "/v1/images/generations",
                 getattr(request, 'model', None),
-                request.prompt,
+                prompt,
                 {
+                    "requested_prompt": request.prompt if prompt != request.prompt else None,
+                    "negative_prompt": neg_prompt or None,
                     "size": f"{width}x{height}",
                     "requested_size": request.size,
                     "n": request.n,
@@ -1922,6 +1972,10 @@ class ImageEditRequest(BaseModel):
     negative_prompt: Optional[str] = None   # what to avoid; CFG needs it as much as a t2i call does
     clip_skip: Optional[int] = None         # None = the model's configured default
     prompt_weighting: Optional[bool] = None # None = on; see codai/models/prompt_weighting.py
+    #: Prepended to the prompts, comma-joined. None = the model's own prefix,
+    #: "" = none for this call. See _effective_prompts.
+    prompt_prefix: Optional[str] = None
+    negative_prompt_prefix: Optional[str] = None
     n: int = 1
     #: Omitted means "keep the source's shape" (see _default_edit_size), NOT a
     #: square: defaulting to 1024x1024 silently distorted every non-square photo.
@@ -1987,14 +2041,14 @@ def _prompt_call_kwargs(pipeline, request, model_config=None):
     nowhere to put one, so an edit could only ever be steered positively.
     """
     _apply_embeddings(pipeline, request, model_config, global_args)
-    neg = getattr(request, 'negative_prompt', None) or ""
+    prompt, neg = _effective_prompts(request, model_config)
     kw = _weighted_embed_kwargs(
-        pipeline, request.prompt, neg,
+        pipeline, prompt, neg,
         _resolve_clip_skip(request, model_config, global_args),
         _resolve_prompt_weighting(request, model_config, global_args))
     if kw:
         return kw
-    return {"prompt": request.prompt, "negative_prompt": neg or None}
+    return {"prompt": prompt, "negative_prompt": neg or None}
 
 
 def _load_img2img_pipeline(model_name: str, global_args):
@@ -2143,6 +2197,10 @@ class ImageInpaintRequest(BaseModel):
     negative_prompt: Optional[str] = None
     clip_skip: Optional[int] = None
     prompt_weighting: Optional[bool] = None
+    #: Prepended to the prompts, comma-joined. None = the model's own prefix,
+    #: "" = none for this call. See _effective_prompts.
+    prompt_prefix: Optional[str] = None
+    negative_prompt_prefix: Optional[str] = None
     n: int = 1
     response_format: Optional[str] = "url"
     steps: Optional[int] = None
@@ -2869,6 +2927,10 @@ class ImageOutfitRequest(BaseModel):
     negative_prompt: Optional[str] = None
     clip_skip: Optional[int] = None         # None = the model's configured default
     prompt_weighting: Optional[bool] = None # None = on
+    #: Prepended to the prompts, comma-joined. None = the model's own prefix,
+    #: "" = none for this call. See _effective_prompts.
+    prompt_prefix: Optional[str] = None
+    negative_prompt_prefix: Optional[str] = None
     mask: Optional[str] = None             # optional manual mask (base64); auto-generated if absent
     steps: Optional[int] = 30
     guidance_scale: Optional[float] = 7.5

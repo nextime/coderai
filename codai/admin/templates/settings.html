@@ -1136,6 +1136,16 @@
         over-long document is refused in milliseconds with a 413 naming its page
         count &mdash; never a silent or empty read.</span>
       </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Max upload size (MB)</label>
+        <input type="number" id="s-ocr-max-upload-mb" class="form-input" min="0" placeholder="100">
+        <span class="form-hint">Ceiling on ONE document, not on a page: a 300 DPI
+        colour scan is several MB per page. <b>0 = no ceiling here.</b> If a large
+        page is refused with 413 well under this, the body was stopped by a reverse
+        proxy in front &mdash; nginx defaults <code>client_max_body_size</code> to
+        <b>1 MB</b>, which is exactly the shape of &ldquo;anything over a megabyte
+        fails&rdquo;.</span>
+      </div>
       <div class="form-group" style="flex:1;min-width:170px">
         <label class="form-label">When no pod can take a page</label>
         <select id="s-ocr-pod-pipeline" class="form-input">
@@ -2363,6 +2373,7 @@ async function loadSettings(){
     document.getElementById('s-ocr-surya-dpi').value = ocr.surya_dpi ?? 250;
     document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 64;
     document.getElementById('s-ocr-max-pages').value = ocr.max_pages ?? 0;
+    document.getElementById('s-ocr-max-upload-mb').value = ocr.max_upload_mb ?? 100;
     document.getElementById('s-ocr-pod-pipeline').value = ocr.pod_pipeline ?? 'prefer';
     document.getElementById('s-ocr-pod-pipeline-wait').value = ocr.pod_pipeline_wait_s ?? 60;
     document.getElementById('s-ocr-pod-http-async').value = (ocr.pod_http_async ?? true) ? '1' : '0';
@@ -2679,6 +2690,7 @@ async function saveSettings(silent){
       surya_dpi: parseInt(document.getElementById('s-ocr-surya-dpi').value) || 0,
       max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 64,
       max_pages: parseInt(document.getElementById('s-ocr-max-pages').value) || 0,
+      max_upload_mb: parseInt(document.getElementById('s-ocr-max-upload-mb').value) || 0,
       pod_pipeline: document.getElementById('s-ocr-pod-pipeline').value || 'prefer',
       pod_pipeline_wait_s: parseFloat(document.getElementById('s-ocr-pod-pipeline-wait').value) || 0,
       pod_http_async: document.getElementById('s-ocr-pod-http-async').value === '1',
