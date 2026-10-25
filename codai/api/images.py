@@ -2297,6 +2297,7 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         raise HTTPException(status_code=404, detail=err)
 
     pipe = await _pipeline_for_task(model_info, "img2img")
+    _edit_key = model_info.get('model_key') or f"image:{model_name}"
 
     try:
         import torch
@@ -2321,7 +2322,7 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         num_steps = request.steps or (30 if quality == "standard" else 50)
         cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
 
-        _edit_cfg = (multi_model_manager.config.get(model_key)
+        _edit_cfg = (multi_model_manager.config.get(_edit_key)
                      or multi_model_manager.config.get(model_name) or {})
         result = await asyncio.get_event_loop().run_in_executor(
             None,
