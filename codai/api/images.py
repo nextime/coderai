@@ -2051,27 +2051,73 @@ def _prompt_call_kwargs(pipeline, request, model_config=None):
     return {"prompt": prompt, "negative_prompt": neg or None}
 
 
+def _accepts_image(pipeline) -> bool:
+    """Whether this pipeline's ``__call__`` takes an ``image`` at all.
+
+    Worth checking, because the answer was no and nothing said so. Every
+    diffusers ``__call__`` ends in ``**kwargs`` (it carries the deprecated
+    ``callback`` pair), so a *text-to-image* pipeline handed ``image=`` and
+    ``strength=`` accepts both, drops them, and renders a brand-new picture
+    from the prompt at its default 1024x1024. The request answers 200 with an
+    image, so it reads as a poor edit rather than as no edit at all -- and as
+    "size was ignored", since 1024x1024 is the text-to-image default rather
+    than the source's shape.
+    """
+    import inspect
+    try:
+        params = inspect.signature(pipeline.__call__).parameters
+    except (TypeError, ValueError):
+        return True          # can't introspect it; let the pipeline speak
+    if "image" in params:
+        return True
+    # Only *args/**kwargs: there is no parameter list to judge, so do not
+    # refuse on the strength of not finding a name in it.
+    named = [p for p in params.values()
+             if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
+    return not named
+
+
+def _as_image_task(pipeline, task: str):
+    """``pipeline`` as an img2img/inpaint pipeline, reusing its weights.
+
+    ``AutoPipelineFor*.from_pipe`` swaps the task class around the components
+    already in VRAM, so recovering from a text-to-image pipeline costs no
+    second copy of the weights. Returns None when it cannot be converted.
+    """
+    from diffusers import AutoPipelineForImage2Image, AutoPipelineForInpainting
+    Auto = AutoPipelineForInpainting if task == "inpaint" else AutoPipelineForImage2Image
+    try:
+        converted = Auto.from_pipe(pipeline)
+    except Exception as exc:
+        _log.warning("cannot use %s as a %s pipeline: %s",
+                     type(pipeline).__name__, task, exc)
+        return None
+    _log.info("converted %s to %s (same weights, no second copy)",
+              type(pipeline).__name__, type(converted).__name__)
+    return converted
+
+
 def _load_img2img_pipeline(model_name: str, global_args):
-    """Load a diffusers img2img pipeline."""
+    """Load a diffusers img2img pipeline.
+
+    The class comes from the checkpoint's own ``model_index.json``, through
+    ``AutoPipelineForImage2Image``, rather than from guessing at the model's
+    name. Guessing is what broke editing on the booru-tag fine-tunes:
+    "nesaorg/PonyRealism-Uncensored" contains none of 'xl', 'sdxl',
+    'stable-diffusion' or 'sd', so it fell through to the generic
+    ``DiffusionPipeline`` -- which faithfully honours ``_class_name``, and that
+    checkpoint declares ``StableDiffusionXLPipeline``, the TEXT-TO-IMAGE class.
+    See :func:`_accepts_image` for why that failed silently.
+    """
     import torch
-    from diffusers import (
-        StableDiffusionImg2ImgPipeline,
-        StableDiffusionXLImg2ImgPipeline,
-        DiffusionPipeline,
-    )
+    from diffusers import AutoPipelineForImage2Image
 
     device = _derive_diffusers_device(global_args)
     precision = getattr(global_args, 'image_precision', 'bf16') if global_args else 'bf16'
     dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
     torch_dtype = dtype_map.get(precision, torch.bfloat16)
 
-    name_lower = model_name.lower()
-    if 'xl' in name_lower or 'sdxl' in name_lower or 'flux' in name_lower:
-        PipeClass = StableDiffusionXLImg2ImgPipeline
-    elif 'stable-diffusion' in name_lower or 'sd' in name_lower:
-        PipeClass = StableDiffusionImg2ImgPipeline
-    else:
-        PipeClass = DiffusionPipeline   # generic fallback
+    PipeClass = AutoPipelineForImage2Image
 
     for attempt in range(3):
         try:
@@ -2127,6 +2173,19 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load img2img model: {e}")
+        multi_model_manager.models[model_key] = pipe
+
+    # A pipeline that cannot take an image must never serve an edit: it would
+    # accept `image` into **kwargs, drop it, and answer 200 with a picture
+    # generated from the prompt alone. Convert it (same weights) or say so.
+    if not _accepts_image(pipe):
+        converted = _as_image_task(pipe, "img2img")
+        if converted is None:
+            raise HTTPException(status_code=501, detail=(
+                f"'{model_name}' loaded as {type(pipe).__name__}, which cannot "
+                f"edit an image: it has no `image` input. Editing needs a "
+                f"checkpoint diffusers can open for image-to-image."))
+        pipe = converted
         multi_model_manager.models[model_key] = pipe
 
     try:
@@ -2218,23 +2277,18 @@ class ImageInpaintRequest(BaseModel):
 
 
 def _load_inpaint_pipeline(model_name: str, global_args):
+    """Load a diffusers inpainting pipeline.
+
+    Same rule as :func:`_load_img2img_pipeline`: the task class comes from the
+    checkpoint, not from substrings in its name.
+    """
     import torch
-    from diffusers import (
-        StableDiffusionInpaintPipeline,
-        StableDiffusionXLInpaintPipeline,
-        DiffusionPipeline,
-    )
+    from diffusers import AutoPipelineForInpainting
     device = _derive_diffusers_device(global_args)
     precision = getattr(global_args, 'image_precision', 'bf16') if global_args else 'bf16'
     dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
     torch_dtype = dtype_map.get(precision, torch.bfloat16)
-    n = model_name.lower()
-    if 'xl' in n or 'sdxl' in n:
-        PClass = StableDiffusionXLInpaintPipeline
-    elif 'stable-diffusion' in n or 'inpaint' in n:
-        PClass = StableDiffusionInpaintPipeline
-    else:
-        PClass = DiffusionPipeline
+    PClass = AutoPipelineForInpainting
     for attempt in range(3):
         try:
             with _DIFFUSERS_LOAD_LOCK:
@@ -2280,6 +2334,14 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
                 None, _load_inpaint_pipeline, model_name, global_args)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load inpaint model: {e}")
+        multi_model_manager.models[model_key] = pipe
+    if not _accepts_image(pipe):
+        converted = _as_image_task(pipe, "inpaint")
+        if converted is None:
+            raise HTTPException(status_code=501, detail=(
+                f"'{model_name}' loaded as {type(pipe).__name__}, which cannot "
+                f"inpaint: it has no `image` input."))
+        pipe = converted
         multi_model_manager.models[model_key] = pipe
     try:
         import torch

@@ -1557,6 +1557,15 @@ class ModelInstancePool:
             self.ref_counts.clear()
 
 
+#: Namespaces that other code keeps its OWN pipelines under inside
+#: ``MultiModelManager.models``, built from a task rather than from a model
+#: name. ``/v1/images/edits`` and ``/v1/images/inpaint`` each load a
+#: task-specific pipeline for a model that may also be loaded for text-to-image,
+#: so they key it by task. Name resolution has to skip these: a key is not a
+#: model id, and treating one as an id sends it to ``from_pretrained``.
+_TASK_NAMESPACES = ("img2img:", "inpaint:", "depth:", "segment:")
+
+
 class MultiModelManager:
     """
     Manages multiple models: main text model, audio transcription, and image generation.
@@ -5404,6 +5413,18 @@ class MultiModelManager:
 
             short = _norm_id(resolved_name)
             for k, v in self.models.items():
+                # Keys from another namespace are keys, not model names. The
+                # image edit endpoints keep their own pipelines in self.models
+                # under "img2img:<repo>" / "inpaint:<repo>", and matching one
+                # here set resolved_name to the KEY -- so the caller went on to
+                # ask HuggingFace for a repo literally called
+                # "img2img:nesaorg/PonyRealism-Uncensored" and got
+                # "Repo id must use alphanumeric chars" on a model that loads
+                # perfectly well. Those endpoints look their keys up exactly;
+                # this fuzzy pass must leave them alone.
+                if (k.startswith(_TASK_NAMESPACES)
+                        and not (type_prefix and k.startswith(type_prefix))):
+                    continue
                 k_name = k[len(type_prefix):] if type_prefix and k.startswith(type_prefix) else k
                 if (k_name == resolved_name or k_name.split("/")[-1] == resolved_name.split("/")[-1]
                         or _norm_id(k_name) == short):
