@@ -376,6 +376,15 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
 
     _mc = model_config or {}
 
+    # A multi-config sibling is registered under its alias, so `model_name` may
+    # BE that alias rather than something from_pretrained can open. The config
+    # carries the checkpoint it is a config of; prefer it when present. For a
+    # primary entry the two are the same string.
+    _cfg_path = str(_mc.get('path') or '').strip()
+    if _cfg_path and _cfg_path != model_name:
+        print(f"Image model '{model_name}' is a config of '{_cfg_path}'")
+        model_name = _cfg_path
+
     def _cfg(key, default=None):
         """Read a value from the per-model configuration only (source of truth)."""
         v = _mc.get(key)
@@ -604,7 +613,37 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     if hasattr(pipeline, 'enable_attention_slicing'):
                         pipeline.enable_attention_slicing()
 
-                if _img_quant_config is not None:
+                if use_sequential_offload or load_attempt >= 3:
+                    # Offload was asked for (or we are on the last-ditch attempt).
+                    # This is checked BEFORE the quantized branch on purpose: a
+                    # model can need both, and it used to be impossible to have
+                    # them. Quantizing the text encoder set _img_quant_config,
+                    # which took the .to("cuda") branch below and discarded
+                    # offload_strategy without a word -- so a pipeline that fits
+                    # the card only in pieces was loaded whole and OOMed on its
+                    # activations instead. Measured: Qwen-Image-Edit-2511 with a
+                    # Q4_K_M transformer and a 4-bit text encoder is 22.68 GiB
+                    # resident on a 24 GB card, which leaves 1.32 GiB and dies
+                    # needing 390 MiB.
+                    #
+                    # "model" and "sequential" are also no longer the same thing.
+                    # Model offload keeps the component in USE on the GPU, so
+                    # peak is the transformer plus activations and a text encoder
+                    # pays one PCIe trip per request. Sequential offload walks
+                    # submodules: far less VRAM, far slower. The admin UI has
+                    # described them as different for a long time; the image path
+                    # ran both as sequential.
+                    _strategy = (_offload_strategy or '').strip().lower()
+                    if _strategy == 'model' and hasattr(pipeline, 'enable_model_cpu_offload'):
+                        print("Enabling MODEL CPU offload (active component on GPU)...")
+                        pipeline.enable_model_cpu_offload()
+                    elif hasattr(pipeline, 'enable_sequential_cpu_offload'):
+                        print("Enabling sequential CPU offload for lower VRAM usage...")
+                        pipeline.enable_sequential_cpu_offload()
+                    else:
+                        print("Pipeline supports no CPU offload — loading on GPU")
+                        pipeline = pipeline.to("cuda")
+                elif _img_quant_config is not None:
                     # Quantized (bitsandbytes) pipelines are already placed on GPU
                     # by from_pretrained and cannot be moved with .to(); only the
                     # non-quantized components need an explicit device move.
@@ -613,11 +652,6 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                         pipeline = pipeline.to("cuda")
                     except Exception:
                         pass  # bitsandbytes components stay where loaded
-                elif load_attempt >= 3 or use_sequential_offload:
-                    # Third attempt or offload requested: enable sequential CPU offload
-                    print("Enabling sequential CPU offload for lower VRAM usage...")
-                    if hasattr(pipeline, 'enable_sequential_cpu_offload'):
-                        pipeline.enable_sequential_cpu_offload()
                 else:
                     # First attempt: try regular GPU
                     pipeline = pipeline.to("cuda")

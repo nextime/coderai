@@ -919,7 +919,11 @@ def main():
         if isinstance(m, dict):
             # config_id/config_name carry the entry's identity so runtime-measured
             # fields persist back to the EXACT entry (multi-config siblings share a path).
-            for k in ("load_mode", "used_vram_gb", "alias", "max_instances",
+            # `path` travels with the config because a multi-config sibling is
+            # registered under its ALIAS (its own config key), and the alias is
+            # not something from_pretrained can open. Without this the sibling
+            # has no way to say which checkpoint it is a config OF.
+            for k in ("path", "load_mode", "used_vram_gb", "alias", "max_instances",
                       "config_id", "config_name"):
                 if k in m:
                     cfg[k] = m[k]
@@ -1014,12 +1018,35 @@ def main():
 
     # Image models
     image_models = models_config.get("image_models", [])
+    # Two configs of ONE checkpoint is a legitimate arrangement -- the same base
+    # repo served with a different transformer, quantization or step count -- and
+    # text models have always supported it by addressing the second under its
+    # alias. Image models did not: set_image_model keys config by path, so a
+    # second entry for the same path overwrote the first with no warning. The
+    # symptom is nasty, because both entries still appear in /v1/models and
+    # register their aliases: a request for either one is served with whichever
+    # config happened to be registered LAST. Measured here as a request for a
+    # GGUF-transformer config being answered by a 4-bit one.
+    _seen_image_paths = set()
     for m in image_models:
         mid = _model_id(m)
-        if mid:
-            multi_model_manager.set_image_model(mid, config=_model_cfg(m, "image"))
-            if isinstance(m, dict) and m.get("alias"):
-                multi_model_manager.set_model_alias(m["alias"], mid)
+        if not mid:
+            continue
+        _alias = m.get("alias") if isinstance(m, dict) else None
+        if mid in _seen_image_paths:
+            if not _alias:
+                print(f"[config] skipping duplicate image config for '{mid}' "
+                      f"(add an alias to address it as a separate config)")
+                continue
+            # Register the sibling under its alias so it has a config key of its
+            # own, and do NOT alias it back to the shared path -- that mapping is
+            # what collapses the two into one again.
+            multi_model_manager.set_image_model(_alias, config=_model_cfg(m, "image"))
+            continue
+        _seen_image_paths.add(mid)
+        multi_model_manager.set_image_model(mid, config=_model_cfg(m, "image"))
+        if _alias:
+            multi_model_manager.set_model_alias(_alias, mid)
 
     # Vision models
     vision_models = models_config.get("vision_models", [])
