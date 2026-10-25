@@ -273,13 +273,44 @@ class Policy:
 
     # -- adapters --------------------------------------------------------- #
     @classmethod
-    def from_cfg(cls, cfg):
-        """From an ``OcrConfig``-shaped object, tolerating one that predates it."""
+    def from_cfg(cls, cfg, overrides=None):
+        """From an ``OcrConfig``-shaped object, tolerating one that predates it.
+
+        ``overrides`` is what THIS request asked for (the ``page_opts`` dict),
+        applied over the install's settings. It is passed in rather than read
+        from a context variable because this module may not import
+        ``codai.ocr`` -- the rasteriser worker needs it and must stay clear of
+        the 377 MB that import costs.
+
+        ``native_dpi`` is the one that needs a name of its own: it removes the
+        UPPER bound, so a scan more detailed than the target DPI is sent at its
+        own resolution instead of being rendered down to the target. The lower
+        bound stays where it is on purpose -- passing a scan through that is
+        COARSER than the target silently shows the model a lower-resolution
+        page, which is what cost surya-ocr-2 its Italian accents once already.
+        """
         g = lambda k, d: getattr(cfg, k, d) if cfg is not None else d  # noqa: E731
-        return cls(g("page_image_format", "auto"),
-                   g("page_image_jpeg_quality", 95),
-                   g("page_image_min_dpi", 0.0),
-                   g("page_image_max_dpi_factor", 3.0))
+        fmt = g("page_image_format", "auto")
+        quality = g("page_image_jpeg_quality", 95)
+        min_dpi = g("page_image_min_dpi", 0.0)
+        max_factor = g("page_image_max_dpi_factor", 3.0)
+
+        o = overrides or {}
+        if o.get("page_image_format"):
+            fmt = o["page_image_format"]
+        if o.get("page_image_jpeg_quality") is not None:
+            quality = o["page_image_jpeg_quality"]
+        if o.get("page_image_min_dpi") is not None:
+            min_dpi = o["page_image_min_dpi"]
+        if o.get("page_image_max_dpi_factor") is not None:
+            max_factor = o["page_image_max_dpi_factor"]
+        if o.get("native_dpi"):
+            # No ceiling at all, and never a re-encode: "whatever the scanner
+            # wrote, as it wrote it".
+            max_factor = float("inf")
+            if (fmt or "auto") == "png":
+                fmt = "auto"
+        return cls(fmt, quality, min_dpi, max_factor)
 
     def as_dict(self) -> dict:
         """For the rasteriser worker's ``open`` frame."""

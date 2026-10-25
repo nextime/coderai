@@ -42,7 +42,7 @@ from codai.ocr import loopguard, resume
 # must not be resumed whichever engine produced it.
 from codai.ocr.chandra import detect_repeat_token
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, logprobs_of,
-                            mean_token_prob, vlm_serve_limits)
+                            mean_token_prob, page_options, vlm_serve_limits)
 
 
 #: olmocr.prompts.build_no_anchoring_v4_yaml_prompt() — kept verbatim: the model was
@@ -364,7 +364,7 @@ class OlmOcrEngine(OcrEngine):
         data_uri = prepare_image(
             image, int(getattr(self.cfg, "olmocr_longest_side", DEFAULT_LONGEST_SIDE) or
                        DEFAULT_LONGEST_SIDE),
-            page_image.Policy.from_cfg(self.cfg))
+            page_image.Policy.from_cfg(self.cfg, page_options()))
         messages = [{
             "role": "user",
             "content": [

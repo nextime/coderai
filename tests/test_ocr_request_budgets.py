@@ -101,9 +101,19 @@ def test_a_negative_budget_is_clamped_not_passed_on():
 
 
 def test_the_batch_path_forwards_them_to_the_document_call():
-    """The signature accepting a field proves nothing about it being used."""
+    """The signature accepting a field proves nothing about it being used.
+
+    Asserted on the ARGUMENTS rather than on the whole call as it was once
+    written: ``_page_opts`` has since grown the page-image overrides, and an
+    exact-string match on its argument list failed on a change that forwarded
+    strictly more than before. What this test is for is that the budgets reach
+    the document call at all.
+    """
     from codai.api import ocr as ocr_api
     src = inspect.getsource(_endpoint("/v1/ocr/batch"))
     body = src.split("ocr_manager.ocr_document")[1]
-    assert "page_opts=_page_opts(max_tokens, max_continuations)" in body, (
-        "the batch path accepts the budgets and then drops them")
+    call = body.split("page_opts=_page_opts(")
+    assert len(call) > 1, "the batch path accepts the budgets and then drops them"
+    args = call[1].split(")")[0]
+    for name in ("max_tokens", "max_continuations"):
+        assert name in args, f"the batch path drops {name}"

@@ -1599,6 +1599,18 @@ class SuryaWorker:
         self._run_ocr = None
         self._langs = [l.strip() for l in str(opts.get("langs", "it")).split(",") if l.strip()] or ["it"]
         self._trace = bool(opts.get("token_trace", False))
+        #: Whether this worker LOADS surya's layout predictor and table
+        #: recogniser. Load time, not request time, and the distinction is the
+        #: whole point: a predictor is a model (~0.25 GB), so deciding to have
+        #: one at the moment a page asks for it would grow the footprint
+        #: invisibly to the VRAM accounting that is supposed to be managing it.
+        #: An install that wants layout configures it (``ocr.surya_layout``, or
+        #: a named config whose override sets it) and the pool is built with
+        #: it; a REQUEST then chooses whether to spend the pass.
+        self._want_layout = bool(opts.get("layout", False))
+        self._want_table_rec = bool(opts.get("table_rec", False))
+        self._layout = None
+        self._table_rec = None
         #: Rebuild a reply's text from the model's own bytes when the text we are
         #: handed has lost characters. On by default: the alternative is shipping
         #: text we have MEASURED to be corrupt (see repair_content).
@@ -1672,6 +1684,15 @@ class SuryaWorker:
             self._rec = RecognitionPredictor()
         self._det = DetectionPredictor()
         self._mode = "predictor"
+        # Layout and table recognition, when this worker was built for them.
+        # Imported here rather than at module import because every surya
+        # release has had them and not every install wants to pay for them.
+        if self._want_layout:
+            from surya.layout import LayoutPredictor
+            self._layout = LayoutPredictor()
+            if self._want_table_rec:
+                from surya.table_rec import TableRecPredictor
+                self._table_rec = TableRecPredictor()
         self._install_trace_hook()
         _install_image_encoder()
         return
@@ -1966,6 +1987,81 @@ class SuryaWorker:
                 last = e
         raise last
 
+    def _run_layout(self, img):
+        """``(regions, tables)`` from surya's layout predictor.
+
+        The reading order is surya's OWN: a ``LayoutBox`` carries ``position``,
+        its index in the order the model read the page in, which is the thing
+        that differs from detection order exactly where it matters — two
+        columns, a sidebar, a caption under a figure. Enumerating the output
+        instead would silently substitute our order for the model's.
+
+        The table recogniser works on a CROP of one table rather than on a
+        page, so each region the layout labelled a table is cut out and passed
+        in on its own. It returns cells with row and column ids, so a table
+        comes back as structure (and as HTML) instead of as a bounding box.
+
+        Failures are contained: a layout pass that dies costs this page its
+        regions, not its text, and one confusing table costs only that table.
+        """
+        regions, tables = [], []
+        try:
+            res = self._layout([img])[0]
+        except Exception as e:
+            print(f"[surya] layout pass failed: {e}", file=sys.stderr, flush=True)
+            return regions, tables
+        for b in (getattr(res, "bboxes", None) or []):
+            poly = getattr(b, "polygon", None)
+            if poly is None and isinstance(b, dict):
+                poly = b.get("polygon")
+            label = str((getattr(b, "label", None)
+                         or (b.get("label") if isinstance(b, dict) else "")) or "") or "block"
+            conf = getattr(b, "confidence", None)
+            if conf is None and isinstance(b, dict):
+                conf = b.get("confidence")
+            pos = getattr(b, "position", None)
+            if pos is None and isinstance(b, dict):
+                pos = b.get("position")
+            regions.append({
+                "label": label,
+                "bbox": _poly_to_xyxy(poly or [0, 0, 0, 0]),
+                "conf": float(conf or 0.0),
+                "order": int(pos) if pos is not None else -1,
+            })
+        if self._table_rec is None:
+            return regions, tables
+        for r in regions:
+            if r["label"].strip().lower().replace("-", "_") not in (
+                    "table", "table_of_contents"):
+                continue
+            x0, y0, x1, y1 = (int(v) for v in r["bbox"])
+            x0 = max(0, min(x0, img.width - 1)); x1 = max(x0 + 1, min(x1, img.width))
+            y0 = max(0, min(y0, img.height - 1)); y1 = max(y0 + 1, min(y1, img.height))
+            if (x1 - x0) < 8 or (y1 - y0) < 8:
+                continue
+            try:
+                tr = self._table_rec([img.crop((x0, y0, x1, y1))])[0]
+            except Exception as e:
+                print(f"[surya] table recognition failed for a region: {e}",
+                      file=sys.stderr, flush=True)
+                continue
+            cells = []
+            for c in (getattr(tr, "cells", None) or []):
+                cells.append({
+                    "bbox": _poly_to_xyxy(getattr(c, "polygon", None) or [0, 0, 0, 0]),
+                    "row": getattr(c, "row_id", None),
+                    "col": getattr(c, "col_id", None),
+                    "conf": float(getattr(c, "confidence", 0.0) or 0.0),
+                })
+            entry = {"bbox": r["bbox"], "cells": cells,
+                     "rows": len(getattr(tr, "rows", None) or []),
+                     "cols": len(getattr(tr, "cols", None) or [])}
+            html = getattr(tr, "html", None)
+            if html:
+                entry["html"] = html
+            tables.append(entry)
+        return regions, tables
+
     def ocr(self, img):
         img = img.convert("RGB")
         # One page per call, so the trace is started here rather than accumulated:
@@ -2025,6 +2121,12 @@ class SuryaWorker:
         page = {"index": 0, "width": img.width, "height": img.height,
                 "lines": lines, "regions": [], "tables": [],
                 "text": "\n".join(l["text"] for l in lines)}
+        # Layout, when this worker holds the predictor AND this page wants it.
+        # `regions` and `tables` were hardcoded empty here while the engine
+        # catalogue advertised both, so the arrays a client was told to expect
+        # were always there and always empty.
+        if self._layout is not None and bool(_opt("layout", True)):
+            page["regions"], page["tables"] = self._run_layout(img)
         # A PAGE-LEVEL confidence, so surya reports the same shape chandra and
         # olmOCR do and a caller switching engines is not handed a different
         # kind of answer. Theirs is the mean of exp(logprob) over TOKENS;

@@ -1445,6 +1445,34 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     # capability pod is not what makes its pod able to read a page.
     if pod_runs_ocr_pipeline(mcfg, image):
         _o = _ocr_cfg()
+        # WHICH CONFIGURATION of that engine this pool is for.
+        #
+        # Everything below derives the pod's settings from the orchestrator's
+        # single `ocr` config, which is right until two pools serve the same
+        # model differently. A pool whose entry names an `ocr_engine_config`
+        # gets that named configuration's overrides applied first, so a
+        # "surya-layout" pool can boot a pod that LOADS the layout predictor
+        # while the plain surya pool beside it does not -- same model, same
+        # image, two pods that differ in what they hold. Without this the two
+        # would be sent identical env and the second id would be decoration.
+        # On the model ENTRY, which is a dict, not on the parsed runpod block
+        # (a RunpodModelConfig object) — and the entry is where it belongs:
+        # which configuration of an engine this model is served as is a
+        # property of the model, not of how its pods are rented.
+        _ocr_cid = str((entry or {}).get("ocr_engine_config") or "").strip()
+        if _ocr_cid and _o is not None:
+            from codai.ocr import engine_configs as _ec
+            try:
+                _o = _ec.effective(_o, _ec.resolve(_o, _ocr_cid)[2])
+                print(f"[runpod] this pool serves OCR configuration "
+                      f"'{_ocr_cid}' ({_ec.describe(_o, _ocr_cid)})", flush=True)
+            except ValueError as _e:
+                # A typo in the overrides. Said out loud rather than booting a
+                # pod that quietly serves the base settings under the other
+                # id's name -- the pod would look right and read differently.
+                print(f"[runpod] ocr_engine_config '{_ocr_cid}' is unusable "
+                      f"({_e}) — this pod boots with the install's own OCR "
+                      f"settings instead", flush=True)
         # WHICH engine this pod's pipeline is for. A pod serves one model, and
         # that model is what decides -- surya-ocr-2, chandra-ocr-2 or olmOCR.
         # Hardcoding surya told a chandra pod to run surya against chandra's
@@ -1552,6 +1580,15 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         for _var, _attr in (("CODERAI_OCR_SURYA_REPAIR_ACCENTS",
                              "surya_repair_accents"),
                             ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace"),
+                            # Whether this pod's surya worker LOADS the layout
+                            # predictor and the table recogniser. A boolean, so
+                            # it belongs in this loop and not the one above:
+                            # that filter drops any value equal to 0 and
+                            # False == 0 in Python, so "off" sent through there
+                            # would be discarded and the pod would load them
+                            # anyway -- paying for two models nobody asked for.
+                            ("CODERAI_OCR_SURYA_LAYOUT", "surya_layout"),
+                            ("CODERAI_OCR_SURYA_TABLE_REC", "surya_table_rec"),
                             ("CODERAI_OCR_EARLY_LOOP_ABORT",
                              "early_loop_abort")):
             if _o is not None and getattr(_o, _attr, None) is not None:

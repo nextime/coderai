@@ -44,7 +44,7 @@ def _as_list(value) -> list:
     return [value]
 
 
-def configured_specs(config: dict) -> List[dict]:
+def configured_specs(config: dict, include_dirs: bool = True) -> List[dict]:
     """The LoRA adapters a model's config asks for, normalised.
 
     Accepts every shape the config has grown:
@@ -53,6 +53,12 @@ def configured_specs(config: dict) -> List[dict]:
       ``loras``            a list of {path|id|model, weight, name} dicts
 
     Returns ``[{"source": str, "weight": float, "name": str}, …]``.
+
+    ``include_dirs=False`` drops ``lora_model_dir``. The question "which
+    adapters does this model want" is the same for every kind of model, but the
+    answer "every file in this directory" is not: a diffusion model's adapters
+    are stacked by NAME at a chosen weight, and sweeping a shared LoRA
+    directory would silently activate whatever else is sitting in it.
     """
     if not isinstance(config, dict):
         return []
@@ -77,7 +83,7 @@ def configured_specs(config: dict) -> List[dict]:
                         "weight": float(config.get("lora_scale", 1.0) or 1.0),
                         "name": _default_name(str(raw))})
 
-    for d in _as_list(config.get("lora_model_dir")):
+    for d in (_as_list(config.get("lora_model_dir")) if include_dirs else []):
         d = os.path.expanduser(str(d or ""))
         if not d or not os.path.isdir(d):
             continue

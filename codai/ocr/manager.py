@@ -41,6 +41,7 @@ from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
                             iter_pdf_page_pdfs, pdf_page_count, split_pdf_page,
                             unreadable_report)
 from codai.ocr.budget import get_budget
+from codai.ocr import engine_configs
 
 
 # Engine registry: name → factory(cfg) → OcrEngine. Imports are deferred inside each
@@ -424,6 +425,86 @@ def _page_post_url(base: str) -> str:
     return url + "/ocr" if url.endswith("/v1") else url + "/v1/ocr"
 
 
+def _check_layout_request(cfg, base: str, requested_id: str, opts: dict) -> None:
+    """Refuse ``layout=true`` where no layout would actually happen.
+
+    A capability is configured and a cost is requested. ``layout`` chooses
+    whether to spend the pass on an engine that HOLDS the predictor; it cannot
+    make an engine acquire one mid-page, because loading a model at the moment
+    a page asks for it grows the footprint past whatever the VRAM accounting
+    reserved — the failure that has already cost this install one OOM.
+
+    So the only two honest answers are "done" and "cannot, here is what to
+    configure". Accepting the flag and returning empty ``regions`` would be the
+    engine catalogue's old lie wearing a request field.
+    """
+    if not (opts or {}).get("layout"):
+        return              # false, or unset: nothing to promise
+    if base == "surya" and not bool(getattr(cfg, "surya_layout", False)):
+        others = [cid for cid in engine_configs.ids_for(cfg, "surya")
+                  if cid != requested_id
+                  and bool(engine_configs.effective(
+                      cfg, engine_configs.resolve(cfg, cid)[2]).surya_layout)]
+        hint = (f" — ask for {' or '.join(repr(o) for o in others)} instead"
+                if others else
+                " — set ocr.surya_layout, or add an engine_configs entry whose "
+                "overrides set it, to serve this alongside plain surya")
+        raise OcrError(
+            f"'{requested_id or base}' does not run surya's layout predictor"
+            f"{hint}", status=400)
+    if base == "chandra" and not bool(getattr(cfg, "chandra_layout", True)):
+        raise OcrError(
+            f"'{requested_id or base}' has chandra's layout prompt switched "
+            f"off (ocr.chandra_layout), so it returns no regions", status=400)
+    if base == "olmocr":
+        raise OcrError(
+            "olmOCR transcribes a page in reading order and has no notion of "
+            "where a block was, so it cannot return layout regions — use "
+            "chandra, or a surya configuration with the layout predictor",
+            status=400)
+
+
+def _returns_shapes(cfg) -> dict:
+    """What each engine can put in a page, under THIS config.
+
+    So a client can choose on capability rather than on folklore — which only
+    works if the answer is true. It was not: surya's row claimed
+    ``regions: true`` and ``tables: true`` while its worker built every page
+    with ``"regions": [], "tables": []`` hardcoded, so a client that picked
+    surya BECAUSE the catalogue said it returned regions got empty arrays, no
+    error, and nothing to ask about. surya ships a layout predictor and a table
+    recogniser; it simply never ran them.
+
+    Both of those rows are now read from the settings that decide whether the
+    predictors run, which makes the claim true by construction in either
+    direction — and is why a named configuration with ``surya_layout`` on gets
+    its own row saying so.
+    """
+    _surya_layout = bool(getattr(cfg, "surya_layout", False))
+    return {
+        "paddle":  {"boxes": True,  "regions": True,  "tables": True,  "meta": False},
+        "doctr":   {"boxes": True,  "regions": True,  "tables": False, "meta": False},
+        # surya's DETECTOR gives boxes whatever else is switched off; regions
+        # and tables need the layout pass, and tables the table recogniser on
+        # top of it.
+        "surya":   {"boxes": True,
+                    "regions": _surya_layout,
+                    "tables": _surya_layout and bool(
+                        getattr(cfg, "surya_table_rec", False)),
+                    "meta": False},
+        "olmocr":  {"boxes": False, "regions": False, "tables": True,  "meta": True},
+        # Chandra is a VLM like olmOCR but it is ASKED for boxes: its ocr_layout
+        # prompt returns one div per block with data-bbox and data-label, so it is
+        # the only engine here that gives boxes, labelled regions, tables AND page
+        # metadata in a single pass. (With ocr.chandra_layout off it has none of
+        # the three, which is why the row is read from the setting.)
+        "chandra": {"boxes": bool(getattr(cfg, "chandra_layout", True)),
+                    "regions": bool(getattr(cfg, "chandra_layout", True)),
+                    "tables": bool(getattr(cfg, "chandra_layout", True)),
+                    "meta": True},
+    }
+
+
 def _page_post_fields(api_key: str, dpi: int, opts: dict, detect,
                       engine: str = "surya"):
     """``(fields, headers)`` for one page forward.
@@ -443,6 +524,22 @@ def _page_post_fields(api_key: str, dpi: int, opts: dict, detect,
         v = (opts or {}).get(k_src)
         if v:
             fields[k_dst] = str(int(v))
+    # How the page becomes bytes, forwarded because on this path the POD
+    # rasterises it: the page travels as a one-page PDF and is rendered there.
+    # Sending these means one request behaves the same whether the page was
+    # rendered in this process or on a pod -- the alternative is a flag that
+    # works locally and is silently ignored the moment a pool is in use.
+    if (opts or {}).get("native_dpi"):
+        fields["native_dpi"] = "true"
+    _layout = (opts or {}).get("layout")
+    if _layout is not None:
+        fields["layout"] = "true" if _layout else "false"
+    _fmt = (opts or {}).get("page_image_format")
+    if _fmt:
+        fields["page_image_format"] = str(_fmt)
+    _factor = (opts or {}).get("page_image_max_dpi_factor")
+    if _factor is not None:
+        fields["max_dpi_factor"] = repr(float(_factor))
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     return fields, headers
 
@@ -1609,21 +1706,7 @@ class OcrManager:
         # What each engine can put in a page, so a client can choose on capability
         # rather than on folklore. olmOCR is a document VLM: it transcribes a whole
         # page in reading order and has no notion of where a word was.
-        shapes = {
-            "paddle":  {"boxes": True,  "regions": True,  "tables": True,  "meta": False},
-            "doctr":   {"boxes": True,  "regions": True,  "tables": False, "meta": False},
-            "surya":   {"boxes": True,  "regions": True,  "tables": True,  "meta": False},
-            "olmocr":  {"boxes": False, "regions": False, "tables": True,  "meta": True},
-            # Chandra is a VLM like olmOCR but it is ASKED for boxes: its ocr_layout
-            # prompt returns one div per block with data-bbox and data-label, so it is
-            # the only engine here that gives boxes, labelled regions, tables AND page
-            # metadata in a single pass. (With ocr.chandra_layout off it has none of
-            # the three, which is why the row is read from the setting.)
-            "chandra": {"boxes": bool(getattr(cfg, "chandra_layout", True)),
-                        "regions": bool(getattr(cfg, "chandra_layout", True)),
-                        "tables": bool(getattr(cfg, "chandra_layout", True)),
-                        "meta": True},
-        }
+        shapes = _returns_shapes(cfg)
         # A pipeline drives a model somebody else serves; an engine owns its own
         # weights and runs in process. The distinction decides whether "where does
         # it run" is even a question, so it is worth saying out loud.
@@ -1680,6 +1763,43 @@ class OcrManager:
                 row["serve"] = str(getattr(cfg, f"{name}_serve", "") or "").strip()
             data.append(row)
 
+        # One row per NAMED CONFIGURATION (ocr.engine_configs), each reporting
+        # what IT returns rather than what its base engine would. An id that
+        # turns a capability on is only worth having if a client can see that
+        # it did, and the alternative — a row saying what the shared config
+        # says — is the catalogue being wrong again in a new place.
+        for cid, spec in engine_configs.configured(cfg).items():
+            base = spec["engine"]
+            if base not in _ENGINE_FACTORIES:
+                data.append({"id": cid, "kind": "config", "enabled": False,
+                             "base_engine": base,
+                             "reason": f"unknown base engine '{base}'"})
+                continue
+            try:
+                eff = engine_configs.effective(cfg, spec["overrides"])
+            except ValueError as e:
+                # A typo in the overrides. Reported on the row rather than
+                # raised: the rest of the catalogue is still the answer to
+                # "what can I ask for", and this id is precisely what cannot.
+                data.append({"id": cid, "kind": "config", "enabled": False,
+                             "base_engine": base, "reason": str(e)})
+                continue
+            crow = {
+                "id": cid,
+                "kind": "config",
+                "base_engine": base,
+                "enabled": bool(_engine_enabled(eff, base)),
+                "instances": _engine_instances(eff, base),
+                "returns": _returns_shapes(eff).get(base, {}),
+                "language_aware": engine_uses_language(base),
+                "lang": resolve_lang(eff, base, None),
+                "confidence": _CONFIDENCE[base],
+                "overrides": dict(spec["overrides"]),
+            }
+            if not crow["enabled"]:
+                crow["reason"] = f"its base engine is not enabled (ocr.{base}_enabled)"
+            data.append(crow)
+
         default = str(getattr(cfg, "default_engine", "") or "").strip()
         try:
             resolved = self.resolve_engine(None)
@@ -1709,8 +1829,19 @@ class OcrManager:
         return ""
 
     def resolve_engine(self, requested: Optional[str]) -> str:
+        """The ENGINE that will serve ``requested``, which may be a named config.
+
+        A configured id resolves to its base engine here, so everything that
+        looks a setting up by engine name — the DPI, the enabled check, the
+        fallback chain, the pod gate — keeps working unchanged. Which
+        CONFIGURATION was asked for is carried separately, to the one place
+        that needs it: the pool, whose instances are built from it.
+        """
         cfg = self._require_cfg()
         name = (requested or cfg.default_engine or "paddle").strip().lower()
+        _cid, _base, _ov = engine_configs.resolve(cfg, name)
+        if _ov or _base != name:
+            name = _base
         if name not in _ENGINE_FACTORIES:
             by_model = self._engine_serving_model(name)
             if by_model:
@@ -1759,7 +1890,8 @@ class OcrManager:
         per_engine = int(getattr(cfg, f"{name}_dpi", 0) or 0)
         return per_engine if per_engine > 0 else int(cfg.dpi)
 
-    async def _get_pool(self, name: str, lang: str = "") -> _Pool:
+    async def _get_pool(self, name: str, lang: str = "",
+                        config_id: str = "") -> _Pool:
         """The pool serving ``name``, in ``lang`` for the engines that read by it.
 
         A language-sensitive engine gets one pool PER language, because its
@@ -1767,8 +1899,18 @@ class OcrManager:
         (see ``_LANG_SENSITIVE``). Every other engine keeps a single pool whatever
         the caller asks for — keying those by language would duplicate loaded
         instances, and VRAM, for a parameter they cannot act on.
+
+        ``config_id`` is a named configuration of this engine
+        (``ocr.engine_configs``). It joins the key and its overrides are applied
+        to the config the pool builds its instances with: two ids of one engine
+        that differ in what they load must not share a pool, since an instance
+        is built for its settings and cannot be re-settinged afterwards.
         """
         cfg = self._require_cfg()
+        if config_id and config_id != name:
+            from codai.ocr import engine_configs
+            _cid, _base, _ov = engine_configs.resolve(cfg, config_id)
+            cfg = engine_configs.effective(cfg, _ov)
         if engine_uses_language(name):
             # Key on what the engine is BUILT with, not what was asked: `auto` and
             # the language it maps to are the same loaded model, and must not be
@@ -1777,6 +1919,8 @@ class OcrManager:
             key = f"{name}:{lang}"
         else:
             lang, key = "", name
+        if config_id and config_id != name:
+            key = f"{config_id}@{key}"
         async with self._lock:
             pool = self._pools.get(key)
             if pool is None:
@@ -1927,8 +2071,8 @@ class OcrManager:
                 "full": self._pages_queued >= qmax}
 
     async def _pages_with(self, name: str, images: List, lang: str = "",
-                          base: int = 0) -> List[OcrPage]:
-        pool = await self._get_pool(name, lang)
+                          base: int = 0, config_id: str = "") -> List[OcrPage]:
+        pool = await self._get_pool(name, lang, config_id)
         async def _one(idx, img):
             async with self._page_slot():
                 page = await pool.recognize(img)
@@ -1950,10 +2094,22 @@ class OcrManager:
         necessarily the one asked for: when an engine cannot serve, the remaining
         enabled engines are tried in turn (see :meth:`_fallback_order`) rather than
         failing the document. Callers surface the name, so a caller that cares can see
-        it fell back."""
+        it fell back.
+
+        A named configuration (``ocr.engine_configs``) is reported under ITS
+        id, not its base engine's: the whole point of the id is that a caller
+        asked for that configuration, so an answer saying "surya" would not say
+        which surya. A FALLBACK still reports the plain engine that served,
+        because that is what happened -- falling back from one configuration of
+        an engine to another configuration nobody asked for would be a
+        surprise, so the chain is of base engines.
+        """
+        cfg_id, _base, _ov = engine_configs.resolve(self._require_cfg(), engine)
         name = self.resolve_engine(engine)
+        served_as = cfg_id if cfg_id != name else name
         try:
-            return name, await self._pages_with(name, images, lang, base)
+            return served_as, await self._pages_with(name, images, lang, base,
+                                                     config_id=cfg_id)
         except Exception as first:
             chain = self._fallback_order(name)
             if not chain:
@@ -1995,6 +2151,16 @@ class OcrManager:
         # forward cannot disagree about the budget.
         page_opts = floor_page_opts(cfg, self.resolve_engine_quietly(engine),
                                     page_opts)
+        # Before a single page is rendered: a document read in full and then
+        # handed back without the regions it asked for has cost the caller the
+        # whole read to find out.
+        _req_id, _req_base, _req_ov = engine_configs.resolve(cfg, engine)
+        try:
+            _req_cfg = engine_configs.effective(cfg, _req_ov)
+        except ValueError as e:
+            raise OcrError(str(e), status=400)
+        _check_layout_request(_req_cfg, self.resolve_engine_quietly(engine),
+                              _req_id, page_opts)
 
         # Price the document BEFORE rendering it: once the pages exist the memory is
         # already spent, so admission control has to work from the page tree.
@@ -2039,7 +2205,15 @@ class OcrManager:
         # resident budget to charge, no bitmap crossing the network. Falls
         # through to the local path whenever a pod cannot serve, because an
         # optimisation that cannot run must cost latency and not an error.
-        _remote_model = pod_pipeline_model(cfg, engine)
+        # From the EFFECTIVE config, so a named configuration can select its
+        # own pool. Pods are chosen by `<engine>_model_id`, so two
+        # configurations of one engine reach two sets of pods only if the id
+        # they ask for differs — a config whose overrides set `surya_model_id`
+        # to its own entry gets pods booted from that entry (and so with its
+        # own `ocr_engine_config`). Read from the shared config instead, both
+        # ids would land on the same pods and the second would be decoration.
+        # Identical to `cfg` for a plain engine name.
+        _remote_model = pod_pipeline_model(_req_cfg, engine)
         _out = None
         if _remote_model:
             try:
@@ -2726,7 +2900,7 @@ class OcrManager:
         stream = render_pages(data, filename=filename, content_type=content_type,
                               dpi=dpi, raster_workers=self._raster_workers(cfg),
                               chunk=window,
-                              policy=page_image.Policy.from_cfg(cfg))
+                              policy=page_image.Policy.from_cfg(cfg, page_opts))
         pages_all: List[OcrPage] = []
         blank_all: list = []
         stamps_all: list = []

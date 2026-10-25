@@ -543,6 +543,8 @@ aggregate throughput without vLLM (a continuous-batching path is a future option
 
 ```
 POST /v1/ocr            multipart: file=@doc.pdf [engine=] [lang=] [dpi=] [detect=] [structured=] [schema=]
+                                   [max_tokens=] [max_continuations=]
+                                   [native_dpi=] [page_image_format=] [max_dpi_factor=]
 POST /v1/ocr/batch      multipart: files=@a.pdf files=@b.png [...same fields...]
 GET  /v1/ocr/engines    what this install offers, and what each engine returns
 GET/POST/DELETE /v1/ocr/schemas[/{name}]   manage extraction schemas
@@ -580,6 +582,131 @@ around 6,291,456 pixels (3072×2048), which an A4 page reaches at about 255 DPI.
 Above that the page is scaled down to fit before the model sees it — a
 deliberate downscale, not a refusal, and the reason `ocr.surya_dpi` defaults to
 250 rather than something higher.
+
+### Several ids for one engine
+
+Image models have had this for a long time: one checkpoint on disk, several
+entries in the catalogue, each with its own settings and its own line in
+`/v1/models`, sharing one copy of the weights. OCR engines are a fixed registry
+of five names, each reading flat `ocr.<engine>_*` fields, so an install could
+run surya exactly one way. `ocr.engine_configs` is the name layer that fixes
+that:
+
+```json
+"engine_configs": [
+  {"id": "surya-layout", "engine": "surya",
+   "overrides": {"surya_layout": true, "surya_table_rec": true}},
+  {"id": "chandra-plain", "engine": "chandra",
+   "overrides": {"chandra_layout": false}}
+]
+```
+
+Each id is accepted wherever `engine=` is, gets its own row in
+`GET /v1/ocr/engines` (`kind: "config"`, with `base_engine`, `overrides`, and a
+`returns` computed from **its** settings), and is reported back as the engine
+that served the document — so an answer says *which* surya read the page.
+
+Two things worth knowing before configuring ten of them:
+
+* **An id is a pool.** Instances are built for their settings and cannot be
+  re-settinged afterwards, so ids that differ in what they LOAD must not share
+  a pool. Ids differing only in what they ask of an already-loaded model still
+  pay for a second pool today.
+* **A fallback is to a base engine**, not to another id. Falling back from the
+  configuration a caller asked for to one nobody asked for would be a surprise.
+
+An override naming a setting that does not exist is **refused**, and the id's
+catalogue row carries the reason. The alternative is an id that looks
+configured, quietly serves the base settings, and differs from its sibling in
+nothing at all.
+
+### Layout regions: surya's predictor, and asking for the pass
+
+`pages[].regions[]` (`label`, `bbox`, `conf`, `order`) and `pages[].tables[]`
+have been in the response all along, and chandra has always filled them — one
+`<div>` per block with `data-bbox` and `data-label`, tables as HTML with
+colspan/rowspan. **surya did not.** Its worker built every page with
+`"regions": [], "tables": []` hardcoded while `/v1/ocr/engines` advertised
+`regions: true` and `tables: true`, so a client that chose surya *because* the
+catalogue said it returned regions got empty arrays, no error, and nothing to
+ask about. surya ships `surya.layout` and `surya.table_rec`; they were never
+run.
+
+Both halves are now true by construction:
+
+| setting | what it does |
+|---|---|
+| `ocr.surya_layout` | the worker **loads** the layout predictor (~0.25 GB) and fills `regions` with labelled blocks in surya's own reading order |
+| `ocr.surya_table_rec` | adds the table recogniser, so a table region comes back as **cells** (row/col ids) and HTML, not a bbox |
+
+`returns` for surya is read from those two, so the row and the response agree
+whichever way they are set.
+
+**Loading is configured; spending is per request.** `layout=true|false` on a
+request chooses whether to run the pass on an engine that *holds* the
+predictor — the saving when a caller wants only text. It cannot make an engine
+acquire a predictor mid-page: loading a model at the moment a page asks for it
+grows the footprint past whatever the VRAM accounting reserved, which is how
+this install earned one OOM already. So `layout=true` where none is loaded is
+**refused with the configuration to use instead**:
+
+```
+400  'surya' does not run surya's layout predictor — ask for 'surya-layout' instead
+```
+
+Answering 200 with empty `regions` would be the catalogue's old lie wearing a
+request field.
+
+`order` is the engine's own reading-order index (surya's `LayoutBox.position`,
+chandra's emission order), or **-1** where the engine does not state one. It is
+explicit because list position is the same thing only until a page has two
+columns, a sidebar or a caption under a figure — and a client that sorts or
+filters regions would lose an order it was never told was there.
+
+### Rasterisation: what the model is actually shown
+
+A scanned page is usually one full-page JPEG inside the PDF, and that stream can
+go to the model exactly as the scanner wrote it: **0.1 ms and 147 KB**, against
+21-46 ms to render plus 86-353 ms of zlib and ~1.8 MB to encode one. So the
+default is to pass it through — but only while its own resolution is between
+the target DPI and `ocr.page_image_max_dpi_factor` (3.0) times it.
+
+Both bounds earn their place, and they are not symmetrical:
+
+* **The floor is the target DPI.** A page passed through *below* it shows the
+  model a coarser image than it would have rendered. That is a different page,
+  not a faster one: an earlier version used an absolute 150-DPI floor, and
+  surya-ocr-2 lost Italian accents on every 150-DPI scan read at a 250-DPI
+  target.
+* **The ceiling is an economic one.** A 1200-DPI A4 is ~35 megapixels; sending
+  it for the engine to scale down costs more than rendering 3 megapixels here.
+
+Only the second is worth overriding per request, because only the caller knows
+that *this* document is a high-resolution scan worth the bytes:
+
+| field | default | meaning |
+|---|---|---|
+| `native_dpi` | from config | `true` removes the ceiling: pass the scan at **its own** resolution, however high. The floor stays. |
+| `max_dpi_factor` | `ocr.page_image_max_dpi_factor` (3.0) | the ceiling as a multiple of the target DPI. Below 1.0 is refused. |
+| `page_image_format` | `ocr.page_image_format` (`auto`) | `auto` passes a scan through, `png` always re-encodes, `jpeg` is lossy and opt-in. |
+
+```bash
+curl -F file=@scan.pdf -F engine=chandra -F native_dpi=true .../v1/ocr
+```
+
+`native_dpi=true` also overrides a configured `page_image_format: png`, since
+"always re-encode" is the one setting under which passing the original bytes
+through is impossible.
+
+**Mind the pixel cap.** Surya-2 and Chandra scale anything over ~6.29 MP down
+before the model sees it, so past about 255 DPI on A4 `native_dpi` buys the
+*engine* more pixels to downscale, not the model more detail. Where it pays is
+the band between the target DPI and that cap, and on engines without one.
+
+These travel with the page, not with the pool: on the pooled path the page goes
+to the pod as a one-page PDF and the **pod** renders it, so the same three
+fields are forwarded and applied there. A flag that only worked in-process
+would be silently ignored the moment a pool was in use.
 
 `engine=` takes an engine name (`paddle`, `doctr`, `surya`, `olmocr`) **or** the id
 of the model a pipeline drives, so `engine=surya` and

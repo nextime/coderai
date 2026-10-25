@@ -2925,6 +2925,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "model_template", "vae_path", "t5xxl_path", "clip_l_path",
                 "clip_g_path", "clip_vision_path", "lora_path", "lora_model_dir",
                 "lora_scale",
+                # Several LoRAs, each with its own name and weight, that are
+                # part of what this model IS: a base checkpoint plus a style
+                # LoRA is a different published id sharing the base weights.
+                "loras",
+                # The diffusers pipeline class for a single-file checkpoint,
+                # when what the file is cannot be inferred from the file.
+                "pipeline_class",
                 "lora_train_base_model", "lora_train_nodes",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 # Image prompt handling: which CLIP layer to read, and whether

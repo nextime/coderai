@@ -262,6 +262,101 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
         return None, ''
 
 
+_SINGLE_FILE_SUFFIXES = ('.safetensors', '.ckpt')
+
+# Tried in order when the config does not name a pipeline class. Each one's
+# from_single_file infers the rest of the architecture from the checkpoint's own
+# tensors, so the first class whose inference succeeds is the right one; SDXL
+# comes first because that is what the community ships most of.
+_SINGLE_FILE_CLASSES = ('StableDiffusionXLPipeline', 'StableDiffusionPipeline')
+
+
+def is_single_file_ref(ref) -> bool:
+    """True when a model path names ONE checkpoint file, not a repo.
+
+    Two shapes are accepted, because community checkpoints arrive as both:
+
+      ``/AI/models/someMix_v18.safetensors``   a file on this machine
+      ``org/repo:someMix_v18.safetensors``     one file out of a repo that
+                                               holds several versions
+    """
+    s = str(ref or '').strip()
+    if not s:
+        return False
+    head = s.rpartition(':')[2] if ':' in s else s
+    return head.lower().endswith(_SINGLE_FILE_SUFFIXES)
+
+
+def resolve_single_file(ref) -> str:
+    """The local path of the checkpoint `ref` names, fetching it if needed."""
+    s = str(ref or '').strip()
+    if os.path.isfile(s):
+        return s
+    if ':' in s:
+        repo, _, filename = s.rpartition(':')
+        repo = repo.strip()
+        if repo and filename:
+            from huggingface_hub import hf_hub_download
+            # Already-downloaded files resolve from the cache without network.
+            return hf_hub_download(repo, filename)
+    raise FileNotFoundError(f"single-file checkpoint not found: {ref}")
+
+
+def build_single_file_pipeline(model_name: str, cfg: Optional[Dict[str, Any]],
+                               dtype, extra: Optional[Dict[str, Any]] = None):
+    """Build a pipeline from a single ComfyUI/A1111-style checkpoint file.
+
+    Returns None when `model_name` is not a single-file reference, so callers
+    can use it as a branch on their ordinary repo load.
+
+    Civitai — which is where most community fine-tunes live — ships one
+    ``.safetensors`` holding the whole pipeline, not a diffusers directory
+    tree. ``from_pretrained`` cannot open one, and until this existed such a
+    checkpoint could only be served if somebody had published a converted copy
+    on the Hub. Conversions lag: the fine-tune asked for here (v18) had
+    conversions only up to v14.1.
+    """
+    if not is_single_file_ref(model_name):
+        return None
+
+    import diffusers
+    path = resolve_single_file(model_name)
+    c = _norm(cfg)
+
+    named = (c.get('pipeline_class') or '').strip()
+    candidates = [named] if named else list(_SINGLE_FILE_CLASSES)
+
+    kwargs: Dict[str, Any] = {'torch_dtype': dtype}
+    # Quantization is honoured when the class accepts it (a 12B single-file
+    # transformer needs it on a 24 GB card); retried without it otherwise,
+    # rather than failing a load that would have worked unquantized.
+    if extra and extra.get('quantization_config') is not None:
+        kwargs['quantization_config'] = extra['quantization_config']
+
+    errors = []
+    for cls_name in candidates:
+        cls = getattr(diffusers, cls_name, None)
+        if cls is None or not hasattr(cls, 'from_single_file'):
+            errors.append(f"{cls_name}: no such pipeline class with from_single_file")
+            continue
+        for attempt_kwargs in ([kwargs, {'torch_dtype': dtype}]
+                               if 'quantization_config' in kwargs else [kwargs]):
+            try:
+                print(f"  Loading single-file checkpoint as {cls_name}: {path}")
+                return cls.from_single_file(path, **attempt_kwargs)
+            except TypeError as e:
+                errors.append(f"{cls_name}: {e}")
+                continue        # unsupported kwarg — retry without quantization
+            except Exception as e:
+                errors.append(f"{cls_name}: {e}")
+                break           # this class is wrong for the file; try the next
+    raise RuntimeError(
+        "could not load single-file checkpoint " + str(path) + ". Tried: "
+        + "; ".join(errors)
+        + ". Set the model's pipeline_class if the architecture is not one "
+          "from_single_file can infer.")
+
+
 def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]], dtype):
     """Load pipeline components from GGUF files (Q2_K..Q8_0 — incl. 5/6-bit).
 

@@ -1419,6 +1419,21 @@ class OcrConfig:
     #: 1 keeps the rescue a retry does buy and drops the long tail; 0 disables
     #: it; -1 means "whatever surya decides".
     surya_max_retries: int = 1
+    #: Run surya's LAYOUT predictor beside recognition, filling each page's
+    #: ``regions`` with labelled blocks in reading order.
+    #:
+    #: Off by default because it is a second model (~0.25 GB) and a second pass
+    #: over every page, and most callers want text. It is not free and it is
+    #: not nothing: ``/v1/ocr/engines`` advertised ``regions: true`` for surya
+    #: for a long time while the worker returned a hardcoded empty list, so a
+    #: client that chose surya BECAUSE the catalogue said it returned regions
+    #: got none, with no error to ask about. The row is now read from this
+    #: setting, so the claim is true by construction either way.
+    surya_layout: bool = False
+    #: Run surya's TABLE RECOGNITION predictor over the regions layout labelled
+    #: as tables, filling ``tables`` with cell structure rather than a bbox
+    #: alone. Needs ``surya_layout`` (it works from the layout's table regions).
+    surya_table_rec: bool = False
     #: Cap on the tokens surya may generate for one page, or 0 for surya's own
     #: 2048 (`chat_completions_batch(max_tokens_default=2048)`, which its vLLM
     #: backend never overrides, so 2048 was the only value available).
@@ -1682,6 +1697,27 @@ class OcrConfig:
     # line carries it, with meta.confidence_scope saying so; a server that
     # declines the field leaves conf at 0.0 and confidence_measured false.
     chandra_logprobs: bool = True
+
+    # --- several published ids for one engine ---
+    #: Named configurations, each served under its own id and reported as its
+    #: own row by ``/v1/ocr/engines``::
+    #:
+    #:     "engine_configs": [
+    #:       {"id": "surya-layout", "engine": "surya",
+    #:        "overrides": {"surya_layout": true, "surya_table_rec": true}},
+    #:       {"id": "chandra-plain", "engine": "chandra",
+    #:        "overrides": {"chandra_layout": false}}
+    #:     ]
+    #:
+    #: The same thing image models have had: one set of weights, several
+    #: published ids, each with its own settings and its own line in the
+    #: catalogue. An id gets its own engine pool, so two ids of one engine that
+    #: differ in what they LOAD are two pools, while ids that differ only in
+    #: what they ask of a loaded model still cost one.
+    #:
+    #: Every key in ``overrides`` must be a real OcrConfig field; a typo is
+    #: refused at resolution rather than silently serving the base settings.
+    engine_configs: list = field(default_factory=list)
 
     # --- stamp / signature detection ---  [O3]
     detect_mode: str = "off"             # off|layout|detector|both
@@ -2643,6 +2679,12 @@ class ConfigManager:
                     ("CODERAI_OCR_SURYA_REPAIR_ACCENTS", "surya_repair_accents"),
                     ("CODERAI_OCR_SURYA_TOKEN_TRACE", "surya_token_trace"),
                     ("CODERAI_OCR_SURYA_USE_GPU", "surya_use_gpu"),
+                    # Whether this pod's surya worker loads the layout
+                    # predictor and the table recogniser. Both are models, so
+                    # "off" has to be expressible: see the note below for why
+                    # a boolean cannot travel through the typed loop.
+                    ("CODERAI_OCR_SURYA_LAYOUT", "surya_layout"),
+                    ("CODERAI_OCR_SURYA_TABLE_REC", "surya_table_rec"),
                     # HERE, not in the typed loop above. That loop casts with
                     # the declared type, and `bool("0")` is True in Python -- so
                     # a pod sent CODERAI_OCR_EARLY_LOOP_ABORT=0 turned the

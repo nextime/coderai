@@ -157,7 +157,8 @@ def resolve_acceleration(model_cfg: Optional[dict]) -> Optional[dict]:
 
     Returns ``None`` when acceleration is absent or disabled. Otherwise returns::
 
-        {preset, lora, lora_weight, steps, guidance_scale, flow_shift, scheduler}
+        {preset, lora, lora_weight, steps, guidance_scale, flow_shift,
+         scheduler, scheduler_config}
 
     Explicit fields in the config override the preset; unset fields fall back to
     the preset (when ``preset`` names a catalog entry).
@@ -194,6 +195,10 @@ def resolve_acceleration(model_cfg: Optional[dict]) -> Optional[dict]:
         "guidance_scale": _pick("guidance_scale"),
         "flow_shift": _pick("flow_shift"),
         "scheduler": (_pick("scheduler", "") or ""),
+        # The sampler's own options, merged over the current scheduler config
+        # (e.g. {"algorithm_type": "sde-dpmsolver++", "use_karras_sigmas": true}
+        # — "DPM++ 2M SDE Karras" is a class plus these, not a class alone).
+        "scheduler_config": _pick("scheduler_config") or {},
     }
     # Coerce numeric fields.
     for f in _NUMERIC_FIELDS:
@@ -248,8 +253,20 @@ def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
             sched_cls = getattr(_diffusers, sched_name, None)
             cur = getattr(pipe, "scheduler", None)
             if sched_cls is not None and cur is not None:
-                pipe.scheduler = sched_cls.from_config(cur.config)
-                log.info("[accel] scheduler set to %s", sched_name)
+                # `scheduler_config` carries the sampler's own settings, because
+                # the class name alone does not identify a sampler. The samplers
+                # community checkpoints are tuned for are named like "DPM++ 2M
+                # SDE Karras", which is ONE diffusers class
+                # (DPMSolverMultistepScheduler) plus two options
+                # (algorithm_type="sde-dpmsolver++", use_karras_sigmas=True).
+                # Without them the class swap silently gives plain DPM++ 2M and
+                # the model is run on a sampler it was not tuned for.
+                extra = accel.get("scheduler_config") or {}
+                new_cfg = dict(cur.config)
+                new_cfg.update(extra)
+                pipe.scheduler = sched_cls.from_config(new_cfg)
+                log.info("[accel] scheduler set to %s%s", sched_name,
+                         f" {extra}" if extra else "")
         except Exception as e:
             log.warning("[accel] scheduler swap to %s failed: %s", sched_name, e)
 

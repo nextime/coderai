@@ -83,19 +83,57 @@ def _ocr_config():
     return None
 
 
-def _page_opts(max_tokens, max_continuations) -> dict:
+def _page_opts(max_tokens, max_continuations, native_dpi=None,
+               page_image_format=None, max_dpi_factor=None,
+               layout=None) -> dict:
     """Per-request engine overrides, or {} when the caller said nothing.
 
     One global cap cannot serve a public deployment: a four-page contract and a
     fifty-page judgment need different budgets, and only the caller knows which
     it is sending. Omitted means "use the configured value" -- NOT zero, which
     is a meaningful setting for both of these.
+
+    ``native_dpi`` is the same argument about resolution. A scanned page that
+    is one embedded JPEG is normally handed to the model as the scanner wrote
+    it, but only while its resolution is between the target DPI and
+    ``ocr.page_image_max_dpi_factor`` times it; past that ceiling the page is
+    rendered DOWN to the target, because shipping 35 megapixels for the engine
+    to scale is slower than rendering 3. ``native_dpi=true`` removes the
+    ceiling for this request: whatever the scanner wrote, as it wrote it.
+
+    The floor stays. A page passed through BELOW the target DPI would show the
+    model a lower-resolution image than it would have rendered, which is a
+    different page rather than a faster one.
     """
     out = {}
     if max_tokens is not None:
         out["max_tokens"] = max(0, int(max_tokens))
     if max_continuations is not None:
         out["max_continuations"] = max(0, int(max_continuations))
+    if native_dpi is not None:
+        out["native_dpi"] = bool(native_dpi)
+    if page_image_format:
+        fmt = str(page_image_format).strip().lower()
+        if fmt not in ("auto", "png", "jpeg"):
+            raise HTTPException(status_code=400, detail=(
+                f"page_image_format must be auto, png or jpeg (got {fmt!r})"))
+        out["page_image_format"] = fmt
+    if layout is not None:
+        # Whether to SPEND the layout pass on this document, on an engine that
+        # holds the predictor. Capability is configured (it is a model); cost
+        # is per request. Asking for it where it was never loaded cannot
+        # conjure the model mid-page -- that is how a footprint grows past what
+        # the VRAM accounting reserved -- so it is refused on the read path
+        # with the configuration to use instead.
+        out["layout"] = bool(layout)
+    if max_dpi_factor is not None:
+        f = float(max_dpi_factor)
+        if f < 1.0:
+            raise HTTPException(status_code=400, detail=(
+                "max_dpi_factor is a multiple of the target DPI and cannot be "
+                "below 1.0 — a page may not be passed through at a LOWER "
+                "resolution than it would have been rendered at."))
+        out["page_image_max_dpi_factor"] = f
     return out
 
 
@@ -216,6 +254,10 @@ async def create_ocr(
     detect: Optional[str] = Form(None),        # off|layout|detector|both
     max_tokens: Optional[int] = Form(None),    # cap on the model's reply for ONE page (engine default if unset)
     max_continuations: Optional[int] = Form(None),  # resumptions allowed for a page that hits the cap
+    native_dpi: Optional[bool] = Form(None),   # pass an embedded scan through at ITS resolution, however high
+    page_image_format: Optional[str] = Form(None),  # auto|png|jpeg — how a page is encoded when it must be
+    max_dpi_factor: Optional[float] = Form(None),   # passthrough ceiling, as a multiple of the target DPI
+    layout: Optional[bool] = Form(None),       # run the layout pass (engines that hold the predictor)
 ):
     cfg = _ocr_config()
     if cfg is None:
@@ -245,7 +287,9 @@ async def create_ocr(
             structured=bool(structured),
             schema=schema_,
             lang=lang,
-            page_opts=_page_opts(max_tokens, max_continuations),
+            page_opts=_page_opts(max_tokens, max_continuations, native_dpi,
+                                 page_image_format, max_dpi_factor,
+                                 layout),
         ))
         return _answer(result, cfg)
     except OcrError as e:
@@ -265,6 +309,10 @@ async def create_ocr_batch(
     detect: Optional[str] = Form(None),
     max_tokens: Optional[int] = Form(None),
     max_continuations: Optional[int] = Form(None),
+    native_dpi: Optional[bool] = Form(None),
+    page_image_format: Optional[str] = Form(None),
+    max_dpi_factor: Optional[float] = Form(None),
+    layout: Optional[bool] = Form(None),
 ):
     """Fan a batch of documents across the engine's instance pool. Per-file failures are
     reported inline (not fatal) so one bad scan doesn't sink the batch.
@@ -299,7 +347,9 @@ async def create_ocr_batch(
             res = await ocr_manager.ocr_document(
                 data, filename=name, content_type=ctype, engine=engine, dpi=dpi,
                 detect=detect, structured=bool(structured), schema=schema_, lang=lang,
-                page_opts=_page_opts(max_tokens, max_continuations),
+                page_opts=_page_opts(max_tokens, max_continuations, native_dpi,
+                                 page_image_format, max_dpi_factor,
+                                 layout),
             )
             res["filename"] = name
             return res

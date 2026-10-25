@@ -115,9 +115,17 @@ class OcrRegion:
     label: str
     bbox: List[float]             # [x0, y0, x1, y1] in pixels
     conf: float = 0.0
+    #: Position in the page's READING ORDER, or -1 when this engine does not
+    #: state one. Set only by engines that emit blocks in reading order rather
+    #: than in detection order, because the two differ exactly where it matters
+    #: -- a two-column page, a sidebar, a caption under a figure. A client that
+    #: sorts or filters regions would otherwise lose an order it was never told
+    #: was there, list position being the only record of it.
+    order: int = -1
 
     def to_dict(self) -> dict:
-        return {"label": self.label, "bbox": self.bbox, "conf": round(self.conf, 4)}
+        return {"label": self.label, "bbox": self.bbox,
+                "conf": round(self.conf, 4), "order": self.order}
 
 
 @dataclass
@@ -533,12 +541,30 @@ def render_pages(data: bytes, filename: str = "", content_type: str = "",
         raise OcrError(f"could not decode image: {e}", status=400)
 
     n = getattr(img, "n_frames", 1)
+    # AN UPLOADED IMAGE IS ALREADY THE BITMAP. There is no page to rasterise,
+    # and when the upload is a single-frame JPEG or PNG of a kind the model can
+    # be shown directly, its own bytes are the best thing to send: decoding and
+    # re-encoding it costs a PNG encode (86-353 ms) and roughly 1.8 MB per page
+    # to arrive at a picture the caller already had. `convert` returns a new
+    # object that carries nothing, so the bytes are attached AFTER it, and only
+    # when the conversion cannot have changed the pixels -- a palette, CMYK or
+    # 16-bit image really does become a different image here, and claiming
+    # otherwise would send the model something the bytes do not encode.
+    _fmt = (getattr(img, "format", "") or "").upper()
+    _carry = None
+    if n == 1 and img.mode in ("RGB", "L") and _fmt in ("JPEG", "PNG"):
+        from codai.ocr.workers import page_image
+        _carry = (page_image.MIME_JPEG if _fmt == "JPEG" else page_image.MIME_PNG)
     for i in range(n):
         try:
             img.seek(i)
         except Exception:
             pass
-        yield img.convert("RGB")
+        out = img.convert("RGB")
+        if _carry is not None:
+            from codai.ocr.workers import page_image
+            out = page_image.attach(out, _carry, data)
+        yield out
 
 
 def _page_or_render(page, dpi: float, scale: float, policy):

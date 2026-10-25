@@ -111,7 +111,14 @@ class SuryaEngine(SubprocessOcrEngine):
                 "page_image_format": str(getattr(
                     self.cfg, "page_image_format", "auto") or "auto"),
                 "page_image_jpeg_quality": max(1, min(100, int(getattr(
-                    self.cfg, "page_image_jpeg_quality", 95) or 95)))}
+                    self.cfg, "page_image_jpeg_quality", 95) or 95))),
+                # Whether this worker LOADS the layout predictor and the table
+                # recogniser. At load because each is a model: a worker decides
+                # what it holds when it is built, and a request then decides
+                # whether to spend the pass (see `layout` in the page options).
+                "layout": bool(getattr(self.cfg, "surya_layout", False)),
+                "table_rec": bool(getattr(self.cfg, "surya_layout", False)
+                                  and getattr(self.cfg, "surya_table_rec", False))}
 
     #: Modes where the recognition VLM lives in a model server we only talk to.
     SERVED_MODES = ("model", "vllm", "llamacpp", "server")

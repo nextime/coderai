@@ -140,6 +140,91 @@ pipeline with no `image` input is now converted or refused with `501`.
 SD, SDXL, Flux and Z-Image all have entries for all three tasks. A family
 diffusers does not map is left on whatever it was loaded as.
 
+## One checkpoint, several published models
+
+A base checkpoint plus a LoRA is a different model to the people using it. It
+wants its own id, its own defaults and its own line in `/v1/models` — while
+sharing one copy of the base weights in VRAM with its siblings.
+
+`loras` on a model entry is how that is said:
+
+```json
+{
+  "alias": "SomeBase-Style",
+  "path": "org/some-base",
+  "loras": [{"model": "org/style-lora", "weight": 0.8, "name": "style"},
+            {"model": "org/other:file_v2.safetensors", "weight": 1.0}]
+}
+```
+
+Each entry takes a repo id, a local path, or `repo:file.safetensors` when the
+repo holds several adapters. `weight` is the adapter scale; `name` is optional
+and defaults to the file or repo name. A single `lora_path` (with `lora_scale`)
+works too — that field had been in the config and the admin page for a long
+time and nothing on the diffusers image path ever read it, so configuring a
+LoRA there did nothing at all.
+
+Three kinds of adapter can be active on one pipeline, and they do not
+interfere:
+
+| where from | example | lifetime |
+|---|---|---|
+| `acceleration` | a Lightning or LCM distill LoRA | the pipeline's |
+| `loras` | the style/tune that makes this id what it is | the pipeline's |
+| the request | a character, an environment | that request |
+
+`set_adapters` replaces the *whole* active set, so the first two are re-named
+on every activation. Without that, a request carrying its own LoRA silently
+switched the model's own adapters off: a 4-step distilled preset would run on
+an un-distilled model (mush), and an id published as a fine-tune would quietly
+serve the base checkpoint — `200 OK`, a plausible picture, nothing in the logs.
+
+A LoRA named in `loras` that cannot be loaded **fails the model load**. The
+acceleration path logs and carries on, because the cost there is speed; the
+cost here is identity, and a model serving something other than what its id
+says is the failure nobody notices.
+
+## Single-file checkpoints
+
+Civitai — where most community fine-tunes live — ships one `.safetensors`
+holding the whole pipeline, not a diffusers directory tree. `from_pretrained`
+cannot open one. A model's `path` may therefore name a file:
+
+```json
+{"path": "/AI/models/someMix_v18.safetensors"}
+{"path": "org/repo:someMix_v18.safetensors"}
+```
+
+The second form is usually the better one: community repos keep every version
+of a checkpoint side by side, so the repo id alone does not say which to serve,
+and the file is re-resolved from the local cache on each load rather than
+pinned to one snapshot directory.
+
+The architecture is inferred from the checkpoint's own tensors (SDXL is tried
+first, then SD). `pipeline_class` names the diffusers class when inference
+cannot get there. img2img and inpainting work as they do for any other model,
+through `from_pipe` on the loaded pipeline.
+
+## A sampler is a class plus its options
+
+`acceleration.scheduler` names a diffusers scheduler class, and a class name
+does not identify a sampler. "DPM++ 2M SDE Karras" — what a great many SDXL
+fine-tunes are tuned for — is `DPMSolverMultistepScheduler` *plus two
+options*. `scheduler_config` carries them, merged over the pipeline's current
+scheduler config:
+
+```json
+"acceleration": {
+  "enabled": true, "preset": "custom", "steps": 30, "guidance_scale": 5.0,
+  "scheduler": "DPMSolverMultistepScheduler",
+  "scheduler_config": {"algorithm_type": "sde-dpmsolver++",
+                       "use_karras_sigmas": true}
+}
+```
+
+Naming the class alone gives plain DPM++ 2M: a different sampler to the one the
+checkpoint was tuned on, with nothing to indicate the substitution.
+
 ## Standing prefixes: the ladder a model always wants
 
 CoderAI never adds tags to a prompt by itself. The `score_*` ladder is yours to

@@ -342,7 +342,8 @@ class SubprocessOcrEngine(OcrEngine):
         # client did it a SECOND time to build the request. `image.convert`
         # used to be unconditional, which also quietly dropped the carried
         # bytes on every page, since convert returns a copy.
-        mime, raw = page_image.Policy.from_cfg(self.cfg).encode(image)
+        mime, raw = page_image.Policy.from_cfg(
+            self.cfg, page_options()).encode(image)
         b64 = base64.b64encode(raw).decode("ascii")
         # Per-request overrides travel WITH the page, not with the load: a pool
         # is built once and then serves every caller, so anything set at load
@@ -368,8 +369,14 @@ class SubprocessOcrEngine(OcrEngine):
                        width=int(d.get("width", 0)), height=int(d.get("height", 0)))
         page.lines = [OcrLine(text=l.get("text", ""), bbox=list(l.get("bbox", [0, 0, 0, 0])),
                               conf=float(l.get("conf", 0.0))) for l in d.get("lines", [])]
+        # `order` is the engine's own reading-order index where it reports one
+        # (surya's LayoutBox.position); -1 where it does not. Dropping it here
+        # would reduce the model's reading order to our list order, which is
+        # the same thing only until a page has two columns.
         page.regions = [OcrRegion(label=r.get("label", ""), bbox=list(r.get("bbox", [0, 0, 0, 0])),
-                                  conf=float(r.get("conf", 0.0))) for r in d.get("regions", [])]
+                                  conf=float(r.get("conf", 0.0)),
+                                  order=int(r.get("order", -1)))
+                        for r in d.get("regions", [])]
         page.tables = list(d.get("tables", []))
         # The worker's byte-level diagnosis of an unreadable page, when it made one.
         # Carried on meta rather than a field of its own so engines that cannot

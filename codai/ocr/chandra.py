@@ -47,7 +47,8 @@ from typing import List, Optional
 
 from codai.ocr import loopguard, resume
 from codai.ocr.base import (OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError,
-                            logprobs_of, mean_token_prob, vlm_serve_limits)
+                            logprobs_of, mean_token_prob, page_options,
+                            vlm_serve_limits)
 
 
 DEFAULT_MODEL = "datalab-to/chandra-ocr-2"
@@ -410,7 +411,12 @@ def parse_page(content: str, width: int, height: int, index: int = 0,
         text = html_to_text(blk["html"])
         labels[label] = labels.get(label, 0) + 1
         if box is not None:
-            page.regions.append(OcrRegion(label=label, bbox=box, conf=score))
+            # Chandra's prompt emits one div per block IN READING ORDER, so the
+            # position here IS that order -- recorded explicitly rather than
+            # left implicit in the list, which is the only engine here that can
+            # honestly claim it.
+            page.regions.append(OcrRegion(label=label, bbox=box, conf=score,
+                                          order=len(page.regions)))
         if not text:
             continue
         # ``score`` is the mean token probability of the whole reply, because
@@ -587,7 +593,7 @@ class ChandraEngine(OcrEngine):
         src_w, src_h = image.size
         from codai.ocr.workers import page_image
         data_uri, (w, h) = prepare_image(
-            image, page_image.Policy.from_cfg(self.cfg))
+            image, page_image.Policy.from_cfg(self.cfg, page_options()))
         content, meta, conf = self._ask_with_retries(data_uri)
         page = parse_page(
             content, w, h,

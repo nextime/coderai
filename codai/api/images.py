@@ -353,6 +353,23 @@ def _apply_image_acceleration(pipeline, model_config):
     return pipeline
 
 
+def _finish_image_load(pipeline, model_config):
+    """Apply everything the model's own config adds to a loaded pipeline.
+
+    Acceleration first, then the per-model LoRA stack — in that order because
+    the LoRA step activates the union of both adapter groups, so it needs the
+    acceleration adapters to already be registered.
+
+    A failing acceleration LoRA costs speed and is swallowed; a failing
+    per-model LoRA costs identity and is raised, which fails the load rather
+    than quietly serving the base checkpoint under the fine-tune's name.
+    """
+    pipeline = _apply_image_acceleration(pipeline, model_config)
+    from codai.models.diffusion_loras import apply_model_loras
+    apply_model_loras(pipeline, model_config)
+    return pipeline
+
+
 def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = None):
     """
     Try to load a model using the diffusers library.
@@ -442,7 +459,7 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     # to all heavy components (backbone + text encoders).
     from codai.models.hf_loading import (
         build_pipeline_quant_config, build_gguf_pipeline_components,
-        build_component_models)
+        build_component_models, build_single_file_pipeline)
     _img_quant_config, _img_quant_desc = build_pipeline_quant_config(model_name, _mc, dtype)
     if _img_quant_config is not None:
         print(f"Image quantization: {_img_quant_desc}")
@@ -489,27 +506,29 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
             if _img_gguf_components:
                 _xtra.update(_img_gguf_components)
             with _DIFFUSERS_LOAD_LOCK:
-                try:
-                    pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        use_safetensors=True,
-                        **_xtra,
-                    )
-                except Exception:
-                    pipeline = DiffusionPipeline.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        use_safetensors=True,
-                        **_xtra,
-                    )
+                pipeline = build_single_file_pipeline(model_name, _mc, dtype, _xtra)
+                if pipeline is None:
+                    try:
+                        pipeline = StableDiffusionXLPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            use_safetensors=True,
+                            **_xtra,
+                        )
+                    except Exception:
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            use_safetensors=True,
+                            **_xtra,
+                        )
             try:
                 pipeline = pipeline.to(cuda_device)
             except Exception:
                 if _img_quant_config is None:
                     raise  # only quantized pipelines may reject .to()
             print(f"--no-ram: Diffusers model loaded on {cuda_device}")
-            return _apply_image_acceleration(pipeline, _mc)
+            return _finish_image_load(pipeline, _mc)
         except Exception as e:
             raise RuntimeError(
                 f"--no-ram: Failed to load diffusers model entirely on GPU ({cuda_device}). "
@@ -588,22 +607,27 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     _xtra['quantization_config'] = _img_quant_config
                 if _img_gguf_components:
                     _xtra.update(_img_gguf_components)
+                # A single ComfyUI/A1111-style checkpoint file, when that is
+                # what the model's path names; None otherwise, which leaves the
+                # ordinary repo load below untouched.
+                pipeline = build_single_file_pipeline(model_name, _mc, dtype, _xtra)
                 # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
-                try:
-                    pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        use_safetensors=True,
-                        **_xtra,
-                    )
-                except Exception:
-                    # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
-                    pipeline = DiffusionPipeline.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        use_safetensors=True,
-                        **_xtra,
-                    )
+                if pipeline is None:
+                    try:
+                        pipeline = StableDiffusionXLPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            use_safetensors=True,
+                            **_xtra,
+                        )
+                    except Exception:
+                        # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            use_safetensors=True,
+                            **_xtra,
+                        )
 
             # Apply memory optimizations based on attempt
             if torch.cuda.is_available():
@@ -682,7 +706,7 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     raise
                 pipeline = None
 
-    return _apply_image_acceleration(pipeline, _mc)
+    return _finish_image_load(pipeline, _mc)
 
 
 async def _apply_vae_override(pipeline, vae_model_id: str):
@@ -909,6 +933,18 @@ def _apply_loras(pipeline, loras):
             except Exception:
                 pass
             pipeline._coderai_request_adapters = []
+            if not loras:
+                # This request carries no LoRA of its own and the previous
+                # one's adapters are gone. Re-activate the pipeline's own
+                # adapters explicitly: deleting the active set must not leave
+                # the model running without the LoRAs that define it.
+                from codai.models.diffusion_loras import persistent_adapters
+                keep_names, keep_weights = persistent_adapters(pipeline)
+                if keep_names:
+                    try:
+                        pipeline.set_adapters(keep_names, keep_weights)
+                    except Exception as e:
+                        _log.warning("could not re-activate %s: %s", keep_names, e)
         names = []
         weights = []
         for i, lora in enumerate(loras):
@@ -923,9 +959,19 @@ def _apply_loras(pipeline, loras):
             names.append(name)
             weights.append(float(lora.weight if lora.weight is not None else 1.0))
         if names:
-            pipeline.set_adapters(names, weights)
+            # set_adapters replaces the ACTIVE SET, so the pipeline's own
+            # adapters have to be named again here or this request silently
+            # switches them off: the acceleration LoRA (the model stops being
+            # distilled, and 4 steps on an un-distilled model is mush) and the
+            # per-model LoRA (the id stops being the fine-tune it is published
+            # as). The video path has always re-included them; the image path
+            # did not.
+            from codai.models.diffusion_loras import persistent_adapters
+            keep_names, keep_weights = persistent_adapters(pipeline)
+            pipeline.set_adapters(names + keep_names, weights + keep_weights)
             pipeline._coderai_request_adapters = list(names)
-            _log.info("LoRA weights applied: %s", names)
+            _log.info("LoRA weights applied: %s%s", names,
+                      f" (kept {keep_names})" if keep_names else "")
     except Exception as e:
         _log.warning("Could not apply LoRA weights: %s", e)
 
