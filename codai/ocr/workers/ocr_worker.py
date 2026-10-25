@@ -2046,16 +2046,35 @@ class SuryaWorker:
                       file=sys.stderr, flush=True)
                 continue
             cells = []
+            measured = False
             for c in (getattr(tr, "cells", None) or []):
-                cells.append({
+                cell = {
                     "bbox": _poly_to_xyxy(getattr(c, "polygon", None) or [0, 0, 0, 0]),
                     "row": getattr(c, "row_id", None),
                     "col": getattr(c, "col_id", None),
-                    "conf": float(getattr(c, "confidence", 0.0) or 0.0),
-                })
+                }
+                # ONLY WHEN IT WAS MEASURED. surya's table recogniser does not
+                # score cells in the mode we call it in, so every cell came
+                # back `conf: 0.0` -- a field that looks like a measurement and
+                # is a placeholder, which is exactly the confusion
+                # `confidence_measured` exists to prevent elsewhere in this
+                # subsystem. A 0.0 that means "not measured" must not be
+                # mistaken for one that means "certainly wrong".
+                conf = getattr(c, "confidence", None)
+                if isinstance(conf, (int, float)):
+                    cell["conf"] = float(conf)
+                    measured = True
+                cells.append(cell)
             entry = {"bbox": r["bbox"], "cells": cells,
                      "rows": len(getattr(tr, "rows", None) or []),
-                     "cols": len(getattr(tr, "cols", None) or [])}
+                     "cols": len(getattr(tr, "cols", None) or []),
+                     # Says which: a caller gating on cell confidence needs to
+                     # know whether there is one to gate on.
+                     "confidence_measured": bool(measured)}
+            # Surya returns cells; its HTML is empty in this mode. Chandra
+            # returns HTML. The key is present only when there is one, so a
+            # caller can tell "no table markup from this engine" from "empty
+            # table markup".
             html = getattr(tr, "html", None)
             if html:
                 entry["html"] = html

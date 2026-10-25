@@ -30,6 +30,22 @@ from codai.ocr.base import OcrError, OcrRegion
 from codai.api import ocr as ocr_api
 
 
+def _function_source(path, name):
+    """One function's whole body, by AST.
+
+    Not a byte window: a slice of N characters after the `def` breaks the
+    moment the function grows, which is how two of these assertions failed on
+    an edit that was correct.
+    """
+    import ast
+    src = open(path).read()
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == name):
+            return ast.get_source_segment(src, node) or ""
+    raise AssertionError("no function %r in %s" % (name, path))
+
+
 def _cfg(**kw):
     return OcrConfig(**kw)
 
@@ -345,3 +361,59 @@ def test_the_gateway_asks_with_the_image():
     head = src.index("if cap == \"ocr\":")
     body = src[head:head + 900]
     assert "pod_image_for_entry" in body
+
+
+# --------------------------------------------------------------------------- #
+#  the answer says WHICH configuration served it
+# --------------------------------------------------------------------------- #
+
+def test_the_pod_path_reports_the_configuration_not_the_base_engine():
+    """A pod answers with the engine it ran, because the configuration ids are
+    an orchestrator-side naming layer it has never heard of. Reported as-is,
+    both `surya` and `surya-layout` came back as "surya" and a caller
+    comparing them could not tell which had served -- which is most of the
+    point of having two ids.
+
+    Verified live 2026-10-25: a page through `engine=surya-layout` answered
+    `engine: surya`.
+    """
+    src = open("codai/ocr/manager.py").read()
+    head = src.index("name, pages, blank, stamps, signatures = _out")
+    body = src[head:head + 1200]
+    assert "_req_id" in body and "name = _req_id" in body
+    assert "_req_id != _req_base" in body, \
+        "a plain engine name must keep reporting itself"
+
+
+def test_the_local_path_already_reported_it():
+    """Both paths have to agree, or the answer depends on where the page was
+    read -- which is configuration, and nothing a client should see."""
+    src = open("codai/ocr/manager.py").read()
+    head = src.index("async def ocr_pages")
+    body = src[head:head + 2000]
+    assert "served_as" in body
+
+
+# --------------------------------------------------------------------------- #
+#  a confidence that was never measured does not look like one
+# --------------------------------------------------------------------------- #
+
+def test_a_table_cell_carries_no_confidence_unless_one_was_measured():
+    """surya's table recogniser does not score cells in the mode we call, so
+    every cell came back `conf: 0.0` -- a placeholder wearing a
+    measurement's clothes. Same confusion `confidence_measured` prevents for
+    pages elsewhere in this subsystem."""
+    body = _function_source("codai/ocr/workers/ocr_worker.py", "_run_layout")
+    assert 'cell["conf"] = float(conf)' in body
+    assert "isinstance(conf, (int, float))" in body, \
+        "presence has to decide it, not truthiness: a real 0.0 is a measurement"
+    assert '"confidence_measured": bool(measured)' in body
+    assert '"conf": float(getattr(c, "confidence", 0.0) or 0.0)' not in body, \
+        "the unconditional placeholder is what made every cell read 0.00"
+
+
+def test_table_markup_is_absent_rather_than_empty():
+    """So a caller can tell "this engine returns no HTML" from "this table's
+    HTML is empty"."""
+    body = _function_source("codai/ocr/workers/ocr_worker.py", "_run_layout")
+    assert "if html:" in body and 'entry["html"] = html' in body

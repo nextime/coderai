@@ -2262,6 +2262,15 @@ class OcrManager:
                 f"itself. Retry.", status=503)
         if _out is not None:
             name, pages, blank, stamps, signatures = _out
+            # REPORT THE CONFIGURATION THAT WAS ASKED FOR, not the engine the
+            # pod ran. A pod answers with its base engine because it has never
+            # heard of this install's configuration ids -- they are an
+            # orchestrator-side naming layer -- so a caller comparing two
+            # configurations of one engine got "surya" from both and could not
+            # tell which had served it. That is most of the point of having two
+            # ids. The local path already reports the id (see ocr_pages).
+            if _req_id and _req_id != _req_base:
+                name = _req_id
         else:
             async with budget.reserve(reserve):
                 name, pages, blank, stamps, signatures = await self._read_windowed(
