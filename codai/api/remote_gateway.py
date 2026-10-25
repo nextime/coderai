@@ -747,11 +747,21 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
                                              resolve_model_source, pod_ocr_engine)
         target = Target(pool=get_model_pod_pool(model, entry, block),
                         reason=f"model {model!r} on its own RunPod pod")
+        mcfg = parse_model_runpod(block)
         if cap == "ocr":
-            served = pod_ocr_engine(model)
+            # WITH THE IMAGE, because what a pod can serve depends on it: a
+            # pipeline image (coderai-vllm-ocr) serves surya/chandra/olmOCR
+            # itself and carries no docTR, while a plain one is the other way
+            # round. Asked without it, this rewrote every OCR forward to docTR
+            # and a pipeline pod answered "docTR is not enabled".
+            from codai.api.runpod_worker import pod_image_for_entry
+            try:
+                _img = pod_image_for_entry(entry, mcfg)
+            except Exception:
+                _img = str(block.get("image") or "")
+            served = pod_ocr_engine(model, _img)
             if served and served != model.strip().lower():
                 target.rewrite_field = (_MODEL_FIELD.get(path, "model"), served)
-        mcfg = parse_model_runpod(block)
         kind, _ = resolve_model_source(entry, mcfg)
         if kind == "upload":
             target.upload_entry = entry

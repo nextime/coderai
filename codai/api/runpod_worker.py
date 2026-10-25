@@ -1204,17 +1204,44 @@ def volume_env(mount: str) -> dict:
     }
 
 
-def pod_ocr_engine(requested: str) -> str:
+def pod_ocr_engine(requested: str, image: str = "") -> str:
     """The OCR engine a pod will actually serve for a request naming ``requested``.
 
-    Mirrors the env a pod is launched with: the VLM engines (surya, olmOCR,
-    chandra) need a model server the image does not carry, so a pod serves docTR
-    for them. The gateway uses this to rewrite the request's own `engine` field,
-    because the pod honours what the request asks for over its configured default.
+    Mirrors the env a pod is launched with. The gateway uses it to rewrite the
+    request's own `engine` field, because the pod honours what the request asks
+    for over its configured default.
+
+    TWO KINDS OF POD IMAGE, and this used to answer for only one. On a plain
+    `coderai-vllm` pod the VLM engines (surya, olmOCR, chandra) need a model
+    server the image does not carry, so such a pod serves docTR for them --
+    which is what the whole function said. But a `coderai-vllm-ocr` pod carries
+    surya, the rasteriser and its own vLLM: it serves those engines itself,
+    which is the entire pod-side pipeline. Worse, that image carries **no
+    docTR** (`CODERAI_OCR_FALLBACK_ENGINES=off` is set for exactly that
+    reason), so rewriting to docTR there asks a pod for the one engine it
+    cannot possibly have, and the answer is "OCR engine 'doctr' is not
+    enabled". Every whole-request `/v1/ocr` forward to a pipeline pod failed
+    that way.
+
+    A NAMED CONFIGURATION resolves to its base engine. `ocr.engine_configs` is
+    an orchestrator-side naming layer: the pod is a pre-configured instance of
+    one configuration (its env already carries the overrides), so telling it
+    the id would name an engine it has never heard of.
     """
     r = (requested or "").strip().lower()
+    try:
+        from codai.ocr import engine_configs
+        from codai.admin.routes import config_manager
+        ocfg = getattr(getattr(config_manager, "config", None), "ocr", None)
+        if ocfg is not None:
+            _cid, _base, _ov = engine_configs.resolve(ocfg, r)
+            if _ov or _base != r:
+                r = _base
+    except Exception:
+        pass
     if r in ("surya", "olmocr", "chandra"):
-        return "doctr"
+        # The pipeline image serves these itself; anything else cannot.
+        return r if image_runs_ocr_pipeline(image) else "doctr"
     return r if r in ("paddle", "doctr") else "doctr"
 
 

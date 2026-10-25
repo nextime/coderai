@@ -287,3 +287,61 @@ def test_the_layout_switches_travel_to_a_pod_as_booleans():
     blk = blk[:blk.index("CODERAI_VLLM_RETURN_TOKEN_IDS")]
     assert "CODERAI_OCR_SURYA_LAYOUT" in blk
     assert "CODERAI_OCR_SURYA_TABLE_REC" in blk
+
+
+# --------------------------------------------------------------------------- #
+#  what a POD is told the engine is
+# --------------------------------------------------------------------------- #
+
+PIPE_IMG = "ghcr.io/nextime/coderai-vllm-ocr:0.4.98"
+PLAIN_IMG = "ghcr.io/nextime/coderai-vllm:latest"
+
+
+def test_a_pipeline_pod_is_asked_for_the_engine_it_actually_carries():
+    """Found by running a page through it, not by reading the code.
+
+    `pod_ocr_engine` rewrote EVERY OCR forward to docTR, on the premise that a
+    pod image cannot carry a VLM's model server. `coderai-vllm-ocr` does carry
+    one -- that is the whole pod-side pipeline -- and carries no docTR at all,
+    so the rewrite asked a pipeline pod for the one engine it cannot have and
+    the pod answered "OCR engine 'doctr' is not enabled". Every whole-request
+    /v1/ocr forward to a pipeline pod failed that way.
+    """
+    from codai.api.runpod_worker import pod_ocr_engine
+    for eng in ("surya", "chandra", "olmocr"):
+        assert pod_ocr_engine(eng, PIPE_IMG) == eng
+
+
+def test_a_plain_pod_still_falls_back_to_doctr():
+    """The original reasoning, still right for an image with no model server."""
+    from codai.api.runpod_worker import pod_ocr_engine
+    for eng in ("surya", "chandra", "olmocr"):
+        assert pod_ocr_engine(eng, PLAIN_IMG) == "doctr"
+
+
+def test_the_detector_engines_pass_through_either_way():
+    from codai.api.runpod_worker import pod_ocr_engine
+    for img in (PIPE_IMG, PLAIN_IMG):
+        assert pod_ocr_engine("paddle", img) == "paddle"
+        assert pod_ocr_engine("doctr", img) == "doctr"
+
+
+def test_an_unknown_engine_is_still_doctr():
+    from codai.api.runpod_worker import pod_ocr_engine
+    assert pod_ocr_engine("nonsense", PIPE_IMG) == "doctr"
+
+
+def test_omitting_the_image_keeps_the_old_answer():
+    """Callers that cannot know the image must not change behaviour."""
+    from codai.api.runpod_worker import pod_ocr_engine
+    assert pod_ocr_engine("surya") == "doctr"
+
+
+def test_the_gateway_asks_with_the_image():
+    """A pod's capability depends on its image, so the question cannot be asked
+    without one — that omission is what sent every OCR forward to docTR."""
+    src = open("codai/api/remote_gateway.py").read()
+    assert "pod_ocr_engine(model, _img)" in src
+    head = src.index("if cap == \"ocr\":")
+    body = src[head:head + 900]
+    assert "pod_image_for_entry" in body
