@@ -2349,6 +2349,58 @@ class MultiModelManager:
         self._whisper_alias_counters[name] = idx + 1
         return self.whisper_servers.get(ids[idx])
 
+    def resolve_whisper_server_key(self, name: str) -> Optional[str]:
+        """The registered whisper-server runner that serves ``name``, or None.
+
+        A whisper-server model is described by TWO models.json rows: a runner
+        (``model_path`` + ``server_path`` + ``port``, registered under its
+        ``id``) and a model row naming the weights (``path``, no
+        ``model_path``), which is skipped at registration as "config, not a
+        runner". But it is the model row that gives ``/v1/models`` its id, so a
+        client reading the catalogue asks for the weights' name -- and that name
+        matched no runner key, no alias, and so no whisper-server at all. The
+        request then fell through to the generic audio path, which tried to
+        treat ``whisper-large-v3-turbo-q8_0.bin`` as a HuggingFace repo id:
+
+            500 ... is not a local folder and is not a valid model identifier
+            listed on 'https://huggingface.co/models'
+
+        So every name that identifies the same weights resolves here: the
+        runner's own id, an alias (round-robin across its runners), and the
+        weights path by full path, basename, or basename without extension.
+        """
+        if not name:
+            return None
+        if name in self.whisper_servers:
+            return name
+        mid = self.resolve_whisper_alias_model_id(name)
+        if mid and mid in self.whisper_servers:
+            return mid
+        import os as _os
+        want = str(name)
+        wants = {want, _os.path.basename(want)}
+        wants.add(_os.path.splitext(_os.path.basename(want))[0])
+        wants = {w for w in wants if w}
+        # Prefer an idle runner, so naming the weights load-balances the way an
+        # alias does instead of always landing on the first one registered.
+        matches = []
+        for key, wsm in self.whisper_servers.items():
+            mp = getattr(wsm, "_model_path", None)
+            if not mp:
+                continue
+            cands = {str(mp), _os.path.basename(str(mp)),
+                     _os.path.splitext(_os.path.basename(str(mp)))[0]}
+            if wants & cands:
+                matches.append(key)
+        if not matches:
+            return None
+        try:
+            idle = [k for k in matches if self.whisper_servers[k].is_idle()]
+        except Exception:
+            idle = []
+        choices = idle or matches
+        return choices[0] if len(choices) == 1 else random.choice(choices)
+
     def resolve_whisper_alias_model_id(self, name: str) -> Optional[str]:
         """Return an idle whisper-server model id for an alias, else a random one."""
         ids = self.whisper_aliases.get(name)

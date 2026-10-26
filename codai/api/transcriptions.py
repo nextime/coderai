@@ -517,12 +517,13 @@ async def _run_transcription_inner(
     return point so diarization + word timestamps are handled uniformly."""
     # Check if the requested model maps to a configured whisper-server instance first.
     # Try alias round-robin resolution before direct ID lookup.
-    whisper_model_id = multi_model_manager.resolve_whisper_alias_model_id(model)
-    whisper_server = (
-        multi_model_manager.whisper_servers.get(whisper_model_id)
-        if whisper_model_id is not None
-        else multi_model_manager.whisper_servers.get(model)
-    )
+    # Resolve by every name that identifies the same runner: its id, an alias,
+    # or the weights path /v1/models advertises. Asking by the advertised id
+    # used to match nothing and fall through to the HuggingFace loader, which
+    # reported a whisper.cpp file as a missing hub repo.
+    whisper_model_id = multi_model_manager.resolve_whisper_server_key(model)
+    whisper_server = (multi_model_manager.whisper_servers.get(whisper_model_id)
+                      if whisper_model_id else None)
     if whisper_server is not None:
         await asyncio.to_thread(
             multi_model_manager.request_model, requested_model=model, model_type="audio")

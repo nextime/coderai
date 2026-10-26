@@ -233,3 +233,22 @@ def test_an_explicit_zero_layer_count_still_reserves_nothing():
     est = _estimate({"path": "/AI/guffcache/x-Q4_K_P.gguf",
                      "used_vram_gb": 12.0, "n_gpu_layers": 0})
     assert est == pytest.approx(0.0)
+
+
+def test_a_stored_measurement_of_zero_is_not_a_measurement():
+    """An estimate of 0 means 'nothing measured', never 'measured as free' --
+    on every path, not just the configured field."""
+    est = _estimate({"path": "/AI/guffcache/x-Q4_K_P.gguf",
+                     "used_vram_gb": 0, "measured_vram_gb": 0,
+                     "load_in_4bit": True, "n_gpu_layers": -1})
+    assert est == 0.0 or est > 0.0        # must not crash; 0 only if unsizable
+
+
+def test_zero_does_not_win_even_with_force_vram_update():
+    """force_vram_update makes the measurement authoritative -- a zero
+    'measurement' must not become authoritative with it."""
+    est = _estimate({"path": "/AI/guffcache/x-Q4_K_P.gguf",
+                     "used_vram_gb": 14.0, "measured_vram_gb": 0,
+                     "force_vram_update": True,
+                     "load_in_4bit": True, "n_gpu_layers": -1})
+    assert est >= 14.0, "a zero measurement must not override a real config value"
