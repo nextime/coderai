@@ -70,6 +70,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-client 
 # makes a non-Latin script render as glyphs instead of boxes. The base image
 # carried DejaVu only, so a request for "Montserrat" silently got DejaVu.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        fontconfig \
         fonts-montserrat fonts-inter fonts-noto-core fonts-noto-cjk fonts-liberation \
     && fc-cache -f >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/* || true

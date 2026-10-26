@@ -230,6 +230,82 @@ def _ass_time(t: float) -> str:
     return f"{h:d}:{m:02d}:{s:05.2f}"
 
 
+_FACE_CACHE: dict = {}
+
+
+def _loaded_font(font: str, bold: bool, size: int):
+    """A PIL face for (family, weight, size), parsed once.
+
+    Measuring is per EVENT -- a few hundred times in a long video -- and
+    ``truetype()`` re-reads and re-parses the file on every call.
+    """
+    key = (font or "", bool(bold), int(size))
+    if key in _FACE_CACHE:
+        return _FACE_CACHE[key]
+    face = None
+    try:
+        from PIL import ImageFont
+        from codai.compose.media import font_file
+        path = font_file(font, bold=bold)
+        if path:
+            face = ImageFont.truetype(path, size)
+    except Exception:
+        face = None
+    _FACE_CACHE[key] = face
+    return face
+
+
+def _text_width(text: str, size: int, font: str, bold: bool, spacing: float) -> Optional[float]:
+    """Rendered width of one line in pixels, or None if it cannot be measured.
+
+    Measured with the real font file rather than estimated from the character
+    count: the whole point is to catch a line that does not fit, and glyph
+    advances differ enough between families (Montserrat vs its DejaVu
+    substitute) that a per-character guess is wrong in exactly the case that
+    matters. ASS ``Spacing`` is extra advance per character, so it is added
+    here the way libass adds it.
+    """
+    if not text:
+        return 0.0
+    try:
+        fnt = _loaded_font(font, bold, size)
+        if fnt is None:
+            return None
+        return float(fnt.getlength(text)) + float(spacing or 0.0) * max(0, len(text) - 1)
+    except Exception:
+        return None
+
+
+def _fit_size(rows, size: int, usable: float, font: str, bold: bool,
+              spacing: float, upper: bool) -> int:
+    """The largest size <= ``size`` at which every row fits in ``usable`` px.
+
+    Line breaking happens upstream, on a word budget, which cannot know how
+    wide the words actually are -- a line of five long words in a wide font
+    overflows a frame that five short ones fit. WrapStyle is 2 (no automatic
+    wrapping), so an overflowing line is simply drawn past the frame edge
+    instead of being folded. Shrinking that one event is the least surprising
+    repair: the caption stays on one line, where the caller put it.
+    """
+    if usable <= 0 or not rows:
+        return size
+    widest = 0.0
+    for row in rows:
+        text = " ".join(row)
+        if upper:
+            text = text.upper()
+        w = _text_width(text, size, font, bold, spacing)
+        if w is None:
+            return size                      # cannot measure -> do not guess
+        widest = max(widest, w)
+    if widest <= usable:
+        return size
+    # Advance scales linearly with size, so one ratio gets there; floor() and a
+    # 1px margin keep a rounding error from leaving it a hair too wide.
+    scaled = int(size * usable / widest)
+    return max(12, min(size, scaled))
+
+
 def _ass_escape(text: str) -> str:
     return (text or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
@@ -245,11 +321,18 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
     at 1080x1920 and 720x1280; margins keep every line inside the safe area."""
     p = PRESETS.get((preset or "karaoke").lower(), PRESETS["karaoke"])
     upper = bool(uppercase) or p["upper"]
-    base = height * 0.052 * p["scale"] * float(font_scale or 1.0)
+    # Sized from the SHORT side of the frame, not its height. Caption text is
+    # limited by the width it has to fit across, and on a vertical video the
+    # height is the long side: at 1080x1920, height*0.052 gave a 100px font in
+    # a 1080px-wide frame, so lines ran off both edges. min() makes a landscape
+    # frame size exactly as before (there the short side IS the height) and
+    # brings 9:16 back to the same text-to-width ratio as 16:9.
+    base = min(int(width), int(height)) * 0.052 * p["scale"] * float(font_scale or 1.0)
     size = max(12, int(round(base)))
     align = _ALIGN.get((position or "center").lower(), 5)
     margin_v = int(round(height * 0.10))
     margin_h = int(round(width * 0.06))
+    usable_w = int(width) - 2 * margin_h
     primary = _ass_colour(colour)
     hi = _ass_colour(highlight)
     outline = _ass_colour(outline_colour)
@@ -282,11 +365,17 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
         # A scene with a presenter bubble at the bottom pushes its captions up:
         # ASS takes a per-event MarginV, so only those events move.
         mv = int(ev.get("margin_v") or 0)
+        # Does this event's widest line actually fit? If not, it gets its own
+        # smaller size through an inline \fs override -- per event, so one long
+        # line never shrinks the whole video.
+        ev_size = _fit_size(rows, size, usable_w, font or "DejaVu Sans",
+                            bool(p["bold"]), p["spacing"], upper)
+        fs = f"{{\\fs{ev_size}}}" if ev_size != size else ""
         if not p["karaoke"]:
             text = "\\N".join(" ".join(_ass_escape(w.upper() if upper else w) for w in row)
                               for row in rows)
             body.append(f"Dialogue: 0,{_ass_time(ev['start'])},{_ass_time(ev['end'])},"
-                        f"cap,,0,0,{mv},,{text}")
+                        f"cap,,0,0,{mv},,{fs}{text}")
             continue
         # Karaoke: one event per word, the whole line drawn each time with the
         # active word in the highlight colour. Simpler than \k timings and it
@@ -308,7 +397,7 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
             if end <= start:
                 end = start + 0.04
             body.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},"
-                        f"cap,,0,0,{mv},,{{\\c{primary}}}" + "\\N".join(parts))
+                        f"cap,,0,0,{mv},,{fs}{{\\c{primary}}}" + "\\N".join(parts))
     return "\n".join(head + body) + "\n"
 
 

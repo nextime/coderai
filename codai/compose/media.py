@@ -424,6 +424,93 @@ def font_file(name: str = "", bold: bool = True) -> Optional[str]:
     return out
 
 
+_FONT_EXTS = (".ttf", ".otf", ".ttc", ".pfb", ".woff", ".woff2")
+_FONTS_REGISTERED = False
+
+
+def operator_font_dirs() -> list:
+    """Directories an operator may drop caption fonts into, highest priority first.
+
+    ``CODERAI_FONT_DIR`` lets a deployment point somewhere else entirely (a
+    shared asset mount, say); otherwise it is ``<config>/fonts``, which rides
+    the config volume and so survives both a restart and a new image.
+    """
+    out = []
+    env = os.environ.get("CODERAI_FONT_DIR")
+    if env:
+        out.extend(d for d in env.split(os.pathsep) if d.strip())
+    try:
+        from codai.platform_paths import default_fonts_dir
+        out.append(str(default_fonts_dir()))
+    except Exception:
+        pass
+    seen, uniq = set(), []
+    for d in out:
+        d = os.path.abspath(os.path.expanduser(d))
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+
+
+def register_operator_fonts(force: bool = False) -> list:
+    """Make operator-supplied fonts visible to fontconfig, and so to libass.
+
+    Captions are burned by ffmpeg's libass, a SUBPROCESS that does its own
+    fontconfig lookup -- so it is not enough for this process to find the file.
+    The directory has to be in fontconfig's own configuration, and the one
+    place a non-root process can put it that a child also reads is the user
+    config: ``$XDG_CONFIG_HOME/fontconfig/conf.d``, inherited through the
+    environment. (Writing to /usr/local/share/fonts would be cleaner and is
+    not available: the container runs unprivileged.)
+
+    Returns the directories registered. Idempotent, and cheap enough to call at
+    every startup: it rewrites the snippet only when the content changes, since
+    fc-cache on a large font tree is not free.
+    """
+    global _FONTS_REGISTERED
+    if _FONTS_REGISTERED and not force:
+        return []
+    dirs = [d for d in operator_font_dirs() if os.path.isdir(d)]
+    have = [d for d in dirs
+            if any(f.lower().endswith(_FONT_EXTS) for f in os.listdir(d))]
+    _FONTS_REGISTERED = True
+    if not have:
+        return []
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    conf_d = os.path.join(xdg, "fontconfig", "conf.d")
+    body = ("<?xml version=\"1.0\"?>\n"
+            "<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n"
+            "<!-- written by coderai; operator caption fonts -->\n"
+            "<fontconfig>\n"
+            + "".join(f"  <dir>{d}</dir>\n" for d in have)
+            + "</fontconfig>\n")
+    conf = os.path.join(conf_d, "99-coderai-fonts.conf")
+    try:
+        os.makedirs(conf_d, exist_ok=True)
+        try:
+            unchanged = open(conf, encoding="utf-8").read() == body
+        except Exception:
+            unchanged = False
+        if not unchanged:
+            with open(conf, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        fccache = shutil.which("fc-cache")
+        if fccache and not unchanged:
+            subprocess.run([fccache, "-f"] + have,
+                           capture_output=True, timeout=180)
+        _FONT_CACHE.clear()          # a new font changes what was resolved
+        try:                         # ...and what the caption measurer loaded
+            from codai.compose.captions import _FACE_CACHE
+            _FACE_CACHE.clear()
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[fonts] could not register {have}: {exc}")
+        return []
+    return have
+
+
 def font_installed(name: str) -> bool:
     """Is this exact family available? (A caption font that is not gets a warning.)"""
     if not name:

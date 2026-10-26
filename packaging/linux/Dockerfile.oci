@@ -178,6 +178,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libvulkan1 \
       lm-sensors \
       espeak \
+      fontconfig \
       fonts-montserrat \
       fonts-inter \
       fonts-noto-core \

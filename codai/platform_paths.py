@@ -136,6 +136,20 @@ def default_loras_dir() -> Path:
     return ensure_dir(legacy_style_config_dir() / "loras")
 
 
+def default_fonts_dir() -> Path:
+    """Where an operator drops font files for captions and overlays.
+
+    Beside voices and characters, because it is the same kind of thing: content
+    the installation supplies, not something the image can know in advance. A
+    caption font is a hard requirement of a render -- libass substitutes
+    silently when a family is missing, and a wider substitute pushes text out
+    of frame -- so an operator must be able to add one WITHOUT rebuilding the
+    image. This directory is on the config volume, so what lands here survives
+    a restart and a new image.
+    """
+    return ensure_dir(legacy_style_config_dir() / "fonts")
+
+
 def default_whisper_server_path() -> str:
     if os.name == "nt":
         local = _windows_dir("LOCALAPPDATA", _home_dir() / "AppData" / "Local")

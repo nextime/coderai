@@ -4520,9 +4520,33 @@ class MultiModelManager:
         # Config-declared LoRA(s) are added on top — they load into VRAM beyond
         # the base weights. (Not added to forced/measured: forced is the user's
         # final number; a measurement already reflects any load-time adapters.)
-        if explicit is not None:
+        try:
+            _explicit_val = float(explicit) if explicit is not None else None
+        except (TypeError, ValueError):
+            _explicit_val = None
+        if _explicit_val is not None and _explicit_val > 0:
             return _dbg_est("used_vram_gb",
-                            _apply_factors(float(explicit)) + self._config_lora_vram_gb(cfg))
+                            _apply_factors(_explicit_val) + self._config_lora_vram_gb(cfg))
+        if _explicit_val is not None and _explicit_val <= 0 and (measured or 0) > 0:
+            # A configured ZERO is not a declaration that the model needs no
+            # VRAM -- zero is this function's own "could not determine" sentinel
+            # (see the docstring), and it is what the admin UI stores for a field
+            # the operator never filled in. Honouring it as authoritative told
+            # the planner a model was free, so nothing was evicted for it and it
+            # was loaded with every layer aimed at a GPU that did not have room.
+            #
+            # Measured on zeiss, 2026-10-26: a 27B Q4_K_P with used_vram_gb=0 and
+            # measured_vram_gb=18.0 estimated 0.00 GB against 8.6 GB free. The
+            # load failed and retried down a ladder -- all -> 52 -> 39 -> 26
+            # layers, each rung re-reading the weights -- for 11m50s, landed with
+            # 39 of 66 layers on the CPU, and then generated so slowly that the
+            # request outlived its client while still owning the GPU, queueing
+            # every other model behind it.
+            #
+            # A real measurement is strictly better information than an unset
+            # field, so it wins. An operator who truly wants no reservation has
+            # n_gpu_layers=0, which is handled above and means it.
+            return _dbg_est("measured-over-zero-config", float(measured))
 
         # No configured used_vram_gb → the real measurement is GROUND TRUTH.
         if measured:

@@ -126,6 +126,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[threads] could not size the default pool: {exc}", flush=True)
 
+    # Operator-supplied caption fonts, before any render can ask for one. This
+    # writes a fontconfig snippet into the user config, so the ffmpeg/libass
+    # SUBPROCESS that burns captions resolves the same families this process
+    # does -- a font found only here would still be substituted there.
+    try:
+        from codai.compose.media import register_operator_fonts
+        _fdirs = register_operator_fonts()
+        if _fdirs:
+            boot_phase(f"fonts: registered {', '.join(_fdirs)}")
+    except Exception as exc:
+        print(f"[fonts] could not register operator fonts: {exc}", flush=True)
+
     # And then watch whether that loop is actually free. A synchronous call made
     # from a coroutine stops every request in the process, which from outside
     # looks like an overloaded upstream rather than a server that is not

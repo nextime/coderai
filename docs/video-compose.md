@@ -297,7 +297,28 @@ claimed.
   captions). Without it every compose request answers `501`.
 * **Fonts**: captions ask for a family by name. The images ship Montserrat,
   Inter, DejaVu and Noto (including CJK); a family that is not installed falls
-  back to the closest one and adds a warning, it does not fail.
+  back to the closest one and adds a warning, it does not fail. Treat that
+  warning as an error in disguise when the layout matters: the substitute is a
+  different width, and a wider one pushes lines towards the frame edge.
+
+  **Adding your own**: drop font files (`.ttf`, `.otf`, `.ttc`) into
+  `<config>/fonts` — `~/.coderai/fonts`, or `/config/coderai/fonts` in the
+  images — and restart. They are registered with fontconfig at startup, so the
+  ffmpeg/libass child that burns the captions resolves them too, and because
+  the directory lives on the config volume they survive a restart and a new
+  image. `CODERAI_FONT_DIR` points somewhere else (several paths, `:`-separated).
+  Check with `fc-match -f '%{family}\n' 'Your Family:style=Bold'` inside the
+  container: it must echo the family you asked for.
+
+* **Caption size** is derived from the SHORT side of the frame, times `0.052`,
+  times the preset's scale, times `captions.font_scale`. A 16:9 frame is
+  unchanged by this (there the short side is the height); a vertical frame is
+  sized as if it were that square, rather than from its 1920px height, which
+  used to put a ~100px font in a 1080px-wide frame. On top of that, any single
+  line still too wide for the text area (`width - 2 * 6%`) is measured against
+  the real font file and given its own smaller size, so one long line shrinks
+  instead of running off the edge. Clients that were scaling `font_scale` down
+  by hand for 9:16 or 4:5 should drop that factor.
 * **Where the files go**: the ordinary output directory (`--file-path`), served
   by `/v1/files/`, under normal retention. A composed video is typically read
   once by the client and copied to its own storage.

@@ -116,10 +116,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   variable or set triton.knobs.build.impl.
 # which surfaces only as "vLLM exited (code 1) before becoming ready" — so every
 # vLLM engine, surya OCR included, silently fell back to another engine.
+# Caption fonts are a RUNTIME dependency of the compose renderer, not a nicety:
+# libass resolves a family name through fontconfig, and when the family is
+# missing it silently substitutes. DejaVu is much wider than Montserrat, so a
+# 9:16 render came back with caption lines running past the frame edges and
+# only a log line to say why. Dockerfile.oci and Dockerfile.update carried
+# these packages; THIS file -- the one build_oci_image.sh actually builds --
+# never did, so every image built the normal way shipped without them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       ffmpeg \
+      fontconfig \
+      fonts-montserrat \
+      fonts-inter \
+      fonts-noto-core \
+      fonts-noto-cjk \
+      fonts-liberation \
+      fonts-dejavu-core \
       gcc \
       libc6-dev \
       git \
