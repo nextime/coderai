@@ -199,9 +199,18 @@ class _Wav2Vec2Backend:
             src = audio_path
 
         def _run(ts):
-            if ts is None:
-                return self._pipe(src, generate_kwargs=gen_kwargs or None)
-            return self._pipe(src, return_timestamps=ts, generate_kwargs=gen_kwargs or None)
+            # `generate_kwargs` is OMITTED when empty rather than passed as
+            # None: a CTC pipeline (wav2vec2, MMS) iterates it unconditionally
+            # and raises `TypeError: 'NoneType' object is not iterable`, which
+            # the retry below then swallowed into a text-only answer. So every
+            # wav2vec2 request for word timings returned none of them, and the
+            # only trace was one line in the log.
+            kw = {}
+            if gen_kwargs:
+                kw["generate_kwargs"] = gen_kwargs
+            if ts is not None:
+                kw["return_timestamps"] = ts
+            return self._pipe(src, **kw)
 
         try:
             out = _run(mode)

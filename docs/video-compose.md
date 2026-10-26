@@ -103,10 +103,13 @@ so a mis-heard word cannot reach the screen. `timing`:
 * `estimate` — never load a speech model.
 
 Not every speech backend reports *per-word* timings: the HF pipelines
-(`wav2vec2`, `whisper_hf`, CrisperWhisper), `vosk` and plain faster-whisper do;
-a `whisper-server` (whisper.cpp) model and the NeMo worker behind canary return
-text only. `auto` therefore picks a model that can, whatever it is called, and
-`captions.stt_model` overrides the pick. A model that returns no timings is not
+(`wav2vec2`, `whisper_hf`, CrisperWhisper), `vosk` and plain faster-whisper do
+— measured, on one install: CrisperWhisper 14 words for a 4.3 s Italian line,
+wav2vec2 the same 14 — while a `whisper-server` (whisper.cpp) model and the
+NeMo worker behind canary return text only. `auto` therefore picks a model that can, whatever it is called, and
+`captions.stt_model` overrides the pick. A model that declares
+`languages` refuses the rest with a `400`, so the pick also skips a
+per-language model when the narration is in a language it does not declare. A model that returns no timings is not
 an error — the render continues with estimated ones — but it is reported in the
 job's `warnings`, because the captions will drift against the voice.
 

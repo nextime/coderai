@@ -704,19 +704,50 @@ def _stt_words(loop, audio_path: str, model: str, language: Optional[str]) -> Li
     return list((res or {}).get("words") or [])
 
 
-def _stt_backend(model_id: str) -> str:
-    """The configured ``backend`` of an audio model, without loading it."""
+def _stt_entry(model_id: str) -> dict:
+    """An audio model's own models.json entry, without loading the model."""
     try:
         from codai.models.manager import multi_model_manager
         cfg = multi_model_manager._config_for_model(model_id) or {}
         raw = cfg.get("_raw_cfg") if isinstance(cfg, dict) else None
-        entry = raw if isinstance(raw, dict) else cfg
-        return str((entry or {}).get("backend") or "").strip().lower()
+        return raw if isinstance(raw, dict) else (cfg if isinstance(cfg, dict) else {})
     except Exception:
-        return ""
+        return {}
 
 
-def _pick_stt_model(caps: CaptionSpec) -> Optional[str]:
+def _stt_backend(model_id: str) -> str:
+    """The configured ``backend`` of an audio model, without loading it."""
+    return str(_stt_entry(model_id).get("backend") or "").strip().lower()
+
+
+def _stt_speaks(model_id: str, languages) -> bool:
+    """Whether this model accepts every language the render narrates in.
+
+    A model that declares no ``languages`` accepts anything. One that declares
+    them REFUSES the rest with a 400 (see transcriptions._validate_language),
+    and a per-language model is easy to pick by accident: an install with
+    ``wav2vec2-it`` and ``wav2vec2-en`` has two models that each report word
+    timings and each reject the other's language.
+    """
+    declared = {str(x).strip().lower()
+                for x in (_stt_entry(model_id).get("languages") or [])}
+    if not declared:
+        return True
+    return all(str(l).strip().lower() in declared for l in languages if l)
+
+
+def _request_languages(req) -> list:
+    """The languages the narration is in, in order of first appearance."""
+    out = []
+    for sc in getattr(req, "scenes", None) or []:
+        lang = (getattr(sc, "voice", None) or req.voice).language
+        lang = str(lang or "").strip().lower()
+        if lang and lang not in out:
+            out.append(lang)
+    return out
+
+
+def _pick_stt_model(caps: CaptionSpec, languages=()) -> Optional[str]:
     """An audio model to time the words with: one that CAN time words, first.
 
     The previous order preferred anything named "whisper", then canary. Both are
@@ -734,14 +765,15 @@ def _pick_stt_model(caps: CaptionSpec) -> Optional[str]:
         return None
     import codai.api.stt_backends as stt_backends
     able = [i for i in ids if stt_backends.reports_word_timings(_stt_backend(i))]
+    speaks = [i for i in able if _stt_speaks(i, languages)] or able
     # Among those, a whisper-family model reads running speech best; wav2vec2 is
     # per-language and vosk is a small CPU model, so they come after.
     for want in ("whisper", "wav2vec", "vosk"):
-        for i in able:
+        for i in speaks:
             if want in i.lower():
                 return i
-    if able:
-        return able[0]
+    if speaks:
+        return speaks[0]
     # Nothing configured can report words. Still return something: the timings
     # will be estimated, the renderer says so, and the transcript is unused.
     return ids[0]
@@ -829,7 +861,8 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
         if caps and caps.enabled:
             stage("captions", 30.0, "timing the words")
             timing = (caps.timing or "auto").lower()
-            model = _pick_stt_model(caps) if timing in ("auto", "stt") else None
+            model = (_pick_stt_model(caps, _request_languages(req))
+                     if timing in ("auto", "stt") else None)
             if timing == "stt" and not model:
                 raise rnd.RenderError("captions.timing=stt but no speech model is configured")
             if timing == "auto" and not model:

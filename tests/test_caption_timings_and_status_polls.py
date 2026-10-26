@@ -216,15 +216,26 @@ class _Model:
 
 
 def _audio_catalogue(monkeypatch, entries):
-    """``entries``: {model id: backend}. Patched at the manager boundary."""
+    """``entries``: {model id: backend} or {model id: (backend, [languages])}.
+
+    Patched at the manager boundary, in the shape the manager really returns:
+    runtime kwargs with the models.json entry nested under ``_raw_cfg``.
+    """
     import codai.api.compose as comp
     from codai.models import manager as mgr
+
+    def _raw(name):
+        spec = entries.get(name, "")
+        backend, langs = spec if isinstance(spec, tuple) else (spec, None)
+        entry = {"backend": backend}
+        if langs is not None:
+            entry["languages"] = langs
+        return {"_raw_cfg": entry}
 
     monkeypatch.setattr(mgr.multi_model_manager, "list_models",
                         lambda *a, **k: [_Model(i) for i in entries], raising=False)
     monkeypatch.setattr(mgr.multi_model_manager, "_config_for_model",
-                        lambda name: {"_raw_cfg": {"backend": entries.get(name, "")}},
-                        raising=False)
+                        _raw, raising=False)
     return comp
 
 
@@ -286,3 +297,115 @@ def test_the_renderer_warns_when_a_model_returns_no_timings():
     src = inspect.getsource(comp._run_job)
     assert "returned no word timings" in src
     assert "_no_words_warned" in src
+
+
+def test_a_per_language_model_is_not_picked_for_a_language_it_refuses(monkeypatch):
+    """`wav2vec2-it` reports word timings AND answers 400 for English.
+
+    A model that declares `languages` refuses the rest outright, so picking one
+    for the wrong language turns the whole feature into the warning path again
+    -- with a 400 this time instead of an AttributeError.
+    """
+    comp = _audio_catalogue(monkeypatch, {
+        "wav2vec2-it": ("wav2vec2", ["it"]),
+        "wav2vec2-en": ("wav2vec2", ["en"]),
+    })
+    from codai.api.compose import CaptionSpec
+    spec = CaptionSpec(enabled=True)
+    assert comp._pick_stt_model(spec, ["en"]) == "wav2vec2-en"
+    assert comp._pick_stt_model(spec, ["it"]) == "wav2vec2-it"
+
+
+def test_a_multilingual_model_wins_when_the_render_mixes_languages(monkeypatch):
+    comp = _audio_catalogue(monkeypatch, {
+        "wav2vec2-it": ("wav2vec2", ["it"]),
+        "whisper3-it": ("crisperwhisper", ["it"]),
+        "crisperwhisper": ("crisperwhisper", None),   # declares none = any
+    })
+    from codai.api.compose import CaptionSpec
+    spec = CaptionSpec(enabled=True)
+    assert comp._pick_stt_model(spec, ["it", "en"]) == "crisperwhisper"
+    # ...and with one language, the one tuned for it is still fine to pick
+    assert comp._pick_stt_model(spec, ["it"]) in ("whisper3-it", "crisperwhisper")
+
+
+def test_no_language_covers_it_still_returns_a_model(monkeypatch):
+    """Estimated timings beat refusing the render; the warning says which."""
+    comp = _audio_catalogue(monkeypatch, {"wav2vec2-it": ("wav2vec2", ["it"])})
+    from codai.api.compose import CaptionSpec
+    assert comp._pick_stt_model(CaptionSpec(enabled=True), ["de"]) == "wav2vec2-it"
+
+
+def test_the_languages_come_from_the_request(monkeypatch):
+    """Each scene's voice language, in order, de-duplicated."""
+    import codai.api.compose as comp
+    from codai.api.compose import ComposeRequest
+    req = ComposeRequest(
+        canvas={"width": 1080, "height": 1920},
+        voice={"language": "it"},
+        scenes=[{"text": "uno", "visual": {"type": "color", "color": "#000"}},
+                {"text": "two", "voice": {"language": "en"},
+                 "visual": {"type": "color", "color": "#000"}},
+                {"text": "tre", "visual": {"type": "color", "color": "#000"}}])
+    assert comp._request_languages(req) == ["it", "en"]
+
+
+# ===========================================================================
+#  1c. and the backend's own call, which threw the timings away
+# ===========================================================================
+#  Measured on a running install: `wav2vec2-it` answered 200 with 14 words'
+#  worth of text and no timings at all. `generate_kwargs=None` is what a CTC
+#  pipeline cannot take -- `TypeError: 'NoneType' object is not iterable` --
+#  and the retry turned that into a text-only success.
+
+class _FakePipe:
+    """Stands in for a transformers CTC pipeline, with its real fussiness."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, src, **kw):
+        self.calls.append(kw)
+        if "generate_kwargs" in kw and kw["generate_kwargs"] is None:
+            raise TypeError("'NoneType' object is not iterable")
+        if kw.get("return_timestamps") in ("word", "char"):
+            return {"text": "questa frase",
+                    "chunks": [{"text": "questa", "timestamp": (0.04, 0.28)},
+                               {"text": "frase", "timestamp": (0.34, 0.6)}]}
+        return {"text": "questa frase"}
+
+
+def _ctc_backend(monkeypatch, tmp_path):
+    import codai.api.stt_backends as stt
+    be = stt._Wav2Vec2Backend("jonatasgrosman/wav2vec2-large-xlsr-53-italian",
+                                None, {})
+    pipe = _FakePipe()
+    be._pipe = pipe
+    monkeypatch.setattr(be, "_ensure", lambda: None)
+    # The real backend decodes to 16 kHz mono first; keep the fixture a path.
+    monkeypatch.setattr(stt, "_to_wav_16k_mono", lambda p: str(p))
+    audio = tmp_path / "narration.wav"
+    audio.write_bytes(b"RIFF....WAVEfmt ")
+    return be, pipe, str(audio)
+
+
+def test_a_ctc_pipeline_is_not_handed_a_none_generate_kwargs(monkeypatch, tmp_path):
+    be, pipe, audio = _ctc_backend(monkeypatch, tmp_path)
+    out = be.transcribe(audio, language="it", word_timestamps=True)
+    assert [w["word"] for w in out["words"]] == ["questa", "frase"]
+    assert out["words"][0]["start"] == 0.04
+    # One call, first time: no TypeError, so no retry that drops the timings.
+    assert len(pipe.calls) == 1
+    assert "generate_kwargs" not in pipe.calls[0]
+    assert pipe.calls[0]["return_timestamps"] == "word"
+
+
+def test_a_whisper_checkpoint_still_gets_its_generate_kwargs(monkeypatch, tmp_path):
+    """The seq2seq path needs language/task; only the EMPTY dict is dropped."""
+    import codai.api.stt_backends as stt
+    be, pipe, audio = _ctc_backend(monkeypatch, tmp_path)
+    be._is_whisper = True
+    out = be.transcribe(audio, language="it", word_timestamps=True)
+    assert out["words"]
+    assert pipe.calls[0]["generate_kwargs"] == {"task": "transcribe",
+                                                "language": "it"}
