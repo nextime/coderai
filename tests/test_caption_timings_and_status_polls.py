@@ -224,18 +224,27 @@ def _audio_catalogue(monkeypatch, entries):
     import codai.api.compose as comp
     from codai.models import manager as mgr
 
-    def _raw(name):
-        spec = entries.get(name, "")
+    rows = []
+    for name, spec in entries.items():
         backend, langs = spec if isinstance(spec, tuple) else (spec, None)
-        entry = {"backend": backend}
+        row = {"id": name, "alias": name, "backend": backend}
         if langs is not None:
-            entry["languages"] = langs
-        return {"_raw_cfg": entry}
+            row["languages"] = langs
+        rows.append(row)
+
+    from codai.admin import routes as admin_routes
+
+    class _ConfigManager:
+        models_data = {"audio_models": rows}
 
     monkeypatch.setattr(mgr.multi_model_manager, "list_models",
                         lambda *a, **k: [_Model(i) for i in entries], raising=False)
-    monkeypatch.setattr(mgr.multi_model_manager, "_config_for_model",
-                        _raw, raising=False)
+    # The entry comes from models.json, which is where the backend is written:
+    # the manager's config map holds runtime kwargs and has no row at all for a
+    # whisper-server model. (`config_manager` is None until a server boots, so
+    # the whole object is replaced, not one attribute of it.)
+    monkeypatch.setattr(admin_routes, "config_manager", _ConfigManager(),
+                        raising=False)
     return comp
 
 
@@ -409,3 +418,42 @@ def test_a_whisper_checkpoint_still_gets_its_generate_kwargs(monkeypatch, tmp_pa
     assert out["words"]
     assert pipe.calls[0]["generate_kwargs"] == {"task": "transcribe",
                                                 "language": "it"}
+
+
+def test_a_whisper_server_model_is_recognised_from_models_json(monkeypatch):
+    """The live miss: its backend is in models.json and NOWHERE else.
+
+    A whisper-server model is not in the manager's per-model config map at all
+    (it lives in `whisper_servers`), so asking that map answered "no backend"
+    and the model looked able. Same alias twice -- one row naming `path`, one
+    naming `model_path` -- is also how the real catalogue stores it.
+    """
+    import codai.api.compose as comp
+    from codai.admin import routes as admin_routes
+    from codai.models import manager as mgr
+
+    rows = [
+        {"id": "whisper2", "alias": "whisper2", "backend": "whisper-server",
+         "model_path": "/AI/guffcache/whisper-large-v3-q8_0.gguf"},
+        {"id": None, "alias": "whisper2", "backend": "whisper-server",
+         "path": "/AI/guffcache/whisper-large-v3-q8_0.gguf"},
+        {"id": "whisper3-it", "alias": "whisper3-it", "backend": "crisperwhisper",
+         "path": "LocalAI-io/whisper-large-v3-turbo-it"},
+    ]
+
+    class _ConfigManager:
+        models_data = {"audio_models": rows}
+
+    monkeypatch.setattr(admin_routes, "config_manager", _ConfigManager(),
+                        raising=False)
+    # The map the old code asked: it knows nothing about either model.
+    monkeypatch.setattr(mgr.multi_model_manager, "_config_for_model",
+                        lambda name: {}, raising=False)
+    monkeypatch.setattr(mgr.multi_model_manager, "list_models",
+                        lambda *a, **k: [_Model("whisper2"), _Model("whisper3-it")],
+                        raising=False)
+
+    assert comp._stt_backend("whisper2") == "whisper-server"
+    assert comp._stt_backend("whisper3-it") == "crisperwhisper"
+    from codai.api.compose import CaptionSpec
+    assert comp._pick_stt_model(CaptionSpec(enabled=True), ["it"]) == "whisper3-it"

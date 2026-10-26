@@ -375,7 +375,10 @@ async def api_list_models(username: str = Depends(require_admin)):
         # all_engines=True: the admin config view must show every configured model,
         # including ones pinned to a secondary engine (e.g. whisper-servers on the
         # radeon engine) which the per-engine assignment filter would otherwise hide.
-        return multi_model_manager.list_models(all_engines=True)
+        # include_disabled=True: and the parked ones, since this page is where
+        # they get re-enabled. No other caller asks for those.
+        return multi_model_manager.list_models(all_engines=True,
+                                               include_disabled=True)
     except Exception:
         return []
 

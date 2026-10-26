@@ -705,7 +705,49 @@ def _stt_words(loop, audio_path: str, model: str, language: Optional[str]) -> Li
 
 
 def _stt_entry(model_id: str) -> dict:
-    """An audio model's own models.json entry, without loading the model."""
+    """An audio model's own models.json entry, without loading the model.
+
+    Read from models.json rather than from the manager's per-model config map:
+    that map holds RUNTIME kwargs, keyed by registration id, and a
+    whisper-server model has no entry in it at all -- it lives in
+    ``whisper_servers``. Asking it therefore answered "no backend" for exactly
+    the models whose backend matters, which picked `whisper2` for a render that
+    needed word timings (seen on a real render, 2026-10-26).
+
+    Matched on id, alias, path or basename, because an audio model is referred
+    to by any of them and the same alias may appear twice -- one entry naming
+    ``path``, another ``model_path``. An entry that names a backend wins over
+    one that does not.
+    """
+    want = str(model_id or "").strip().lower()
+    if not want:
+        return {}
+    tail = want.rstrip("/").split("/")[-1]
+    entries = []
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", {}) or {}
+        entries = [e for e in (md.get("audio_models") or []) if isinstance(e, dict)]
+    except Exception:
+        entries = []
+    found = {}
+    for e in entries:
+        names = set()
+        for key in ("id", "alias", "name", "path", "model_path"):
+            val = str(e.get(key) or "").strip().lower()
+            if val:
+                names.add(val)
+                names.add(val.rstrip("/").split("/")[-1])
+        if want in names or tail in names:
+            if e.get("backend") or not found:
+                found = e
+            if e.get("backend"):
+                break
+    if found:
+        return found
+    # No models.json in reach (a pod seeds its catalogue differently): fall back
+    # to the manager's map, which carries the entry under `_raw_cfg` when it has
+    # one.
     try:
         from codai.models.manager import multi_model_manager
         cfg = multi_model_manager._config_for_model(model_id) or {}

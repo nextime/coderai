@@ -5915,13 +5915,23 @@ class MultiModelManager:
                     return info.id
         return None
 
-    def list_models(self, all_engines: bool = False) -> List[ModelInfo]:
+    def list_models(self, all_engines: bool = False,
+                    include_disabled: bool = False) -> List[ModelInfo]:
         """List all available models (configured + runtime aliases) with type/capability metadata.
 
         all_engines=True bypasses the per-engine assignment filter so the admin
         config UI sees every configured model — otherwise, on a multi-engine node,
         models pinned to a secondary engine (e.g. whisper-servers on `radeon`) are
-        hidden from the primary's list, which serves /admin/api/models."""
+        hidden from the primary's list, which serves /admin/api/models.
+
+        include_disabled=True additionally lists entries parked as
+        ``enabled: false``. It is a SEPARATE question from all_engines, found
+        out the hard way: hiding them behind all_engines meant they stayed
+        hidden only on a per-engine list, while the one list clients actually
+        read -- the node-wide one the system worker serves, which must pass
+        all_engines=True because it has no engine of its own -- advertised
+        every parked model and answered 500 for it. Only the admin config view
+        asks for them, because that is where they get re-enabled."""
         from codai.models.capabilities import detect_model_capabilities, ModelCapabilities
 
         models = []
@@ -6041,9 +6051,8 @@ class MultiModelManager:
                         # else, so an entry configured ahead of a blocker --
                         # weights downloaded, settings written, waiting on a
                         # dependency -- was offered to clients and answered
-                        # 500. The admin view (all_engines) still shows it,
-                        # because that is where it gets re-enabled.
-                        if (not all_engines and isinstance(m, dict)
+                        # 500. Only the admin config view asks for them.
+                        if (not include_disabled and isinstance(m, dict)
                                 and m.get("enabled") is False):
                             continue
                         if isinstance(m, str):
