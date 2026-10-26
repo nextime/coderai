@@ -252,3 +252,36 @@ def test_zero_does_not_win_even_with_force_vram_update():
                      "force_vram_update": True,
                      "load_in_4bit": True, "n_gpu_layers": -1})
     assert est >= 14.0, "a zero measurement must not override a real config value"
+
+
+def test_an_unwritable_xdg_dir_falls_back_to_our_own_fontconfig_file(monkeypatch):
+    """In the container XDG_CONFIG_HOME is the config VOLUME root, which an
+    unprivileged process cannot create a directory in. The fallback must still
+    reach the ffmpeg child, which means FONTCONFIG_FILE."""
+    from codai.compose import media
+    import codai.platform_paths as pp
+    import pathlib
+    with tempfile.TemporaryDirectory() as fonts, \
+         tempfile.TemporaryDirectory() as cfg:
+        open(os.path.join(fonts, "Fake-Regular.ttf"), "wb").write(b"\x00")
+        monkeypatch.setenv("CODERAI_FONT_DIR", fonts)
+        monkeypatch.setenv("XDG_CONFIG_HOME", "/proc/nonwritable")
+        monkeypatch.delenv("FONTCONFIG_FILE", raising=False)
+        monkeypatch.setattr(pp, "legacy_style_config_dir", lambda: pathlib.Path(cfg))
+        monkeypatch.setattr(media.shutil, "which", lambda *_a, **_k: None)
+        got = media.register_operator_fonts(force=True)
+        assert os.path.abspath(fonts) in got
+        conf = os.environ.get("FONTCONFIG_FILE")
+        assert conf and os.path.isfile(conf), "a child needs FONTCONFIG_FILE"
+        body = open(conf).read()
+        assert os.path.abspath(fonts) in body
+        # Replacing the main config must not discard the system fonts.
+        assert "/etc/fonts/fonts.conf" in body
+
+
+def test_the_generated_config_includes_the_system_one():
+    from codai.compose import media
+    body = media._fontconfig_snippet(["/srv/fonts"], "/srv/cache")
+    assert "<include" in body and "/etc/fonts/fonts.conf" in body
+    assert "<dir>/srv/fonts</dir>" in body
+    assert "<cachedir>/srv/cache</cachedir>" in body

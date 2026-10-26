@@ -453,20 +453,55 @@ def operator_font_dirs() -> list:
     return uniq
 
 
+def _fontconfig_snippet(dirs: list, cachedir: str = "") -> str:
+    return ("<?xml version=\"1.0\"?>\n"
+            "<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n"
+            "<!-- written by coderai; operator caption fonts -->\n"
+            "<fontconfig>\n"
+            "  <include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>\n"
+            + "".join(f"  <dir>{d}</dir>\n" for d in dirs)
+            + (f"  <cachedir>{cachedir}</cachedir>\n" if cachedir else "")
+            + "</fontconfig>\n")
+
+
+def _write_if_changed(path: str, body: str) -> bool:
+    """Write ``body`` to ``path``; True if the file changed. Raises on failure."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        if open(path, encoding="utf-8").read() == body:
+            return False
+    except Exception:
+        pass
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return True
+
+
 def register_operator_fonts(force: bool = False) -> list:
     """Make operator-supplied fonts visible to fontconfig, and so to libass.
 
     Captions are burned by ffmpeg's libass, a SUBPROCESS that does its own
     fontconfig lookup -- so it is not enough for this process to find the file.
-    The directory has to be in fontconfig's own configuration, and the one
-    place a non-root process can put it that a child also reads is the user
-    config: ``$XDG_CONFIG_HOME/fontconfig/conf.d``, inherited through the
-    environment. (Writing to /usr/local/share/fonts would be cleaner and is
-    not available: the container runs unprivileged.)
+    The directory has to reach fontconfig's own configuration, and a child
+    process has to see the same thing.
 
-    Returns the directories registered. Idempotent, and cheap enough to call at
-    every startup: it rewrites the snippet only when the content changes, since
-    fc-cache on a large font tree is not free.
+    Two ways, in order:
+
+    1. A snippet in ``$XDG_CONFIG_HOME/fontconfig/conf.d``, which fontconfig
+       reads on its own. Preferred, because it needs no environment variable
+       and so survives into a grandchild.
+    2. Failing that, our own ``fonts.conf`` in a directory we definitely own,
+       exported as ``FONTCONFIG_FILE``. It ``<include>``s the system config so
+       nothing is lost by replacing it, and the variable is inherited by every
+       child this process starts.
+
+    Step 2 is not a theoretical fallback: in the container the launcher sets
+    XDG_CONFIG_HOME to the config VOLUME root, which an unprivileged process
+    cannot create directories in ("Permission denied: '/config/fontconfig'"),
+    while the config dir one level down is writable and bind-mounted.
+
+    Returns the directories registered. Idempotent and cheap to call at every
+    startup: fc-cache runs only when the configuration actually changed.
     """
     global _FONTS_REGISTERED
     if _FONTS_REGISTERED and not force:
@@ -477,28 +512,35 @@ def register_operator_fonts(force: bool = False) -> list:
     _FONTS_REGISTERED = True
     if not have:
         return []
+
+    changed = None
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    conf_d = os.path.join(xdg, "fontconfig", "conf.d")
-    body = ("<?xml version=\"1.0\"?>\n"
-            "<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n"
-            "<!-- written by coderai; operator caption fonts -->\n"
-            "<fontconfig>\n"
-            + "".join(f"  <dir>{d}</dir>\n" for d in have)
-            + "</fontconfig>\n")
-    conf = os.path.join(conf_d, "99-coderai-fonts.conf")
     try:
-        os.makedirs(conf_d, exist_ok=True)
+        changed = _write_if_changed(
+            os.path.join(xdg, "fontconfig", "conf.d", "99-coderai-fonts.conf"),
+            _fontconfig_snippet(have))
+    except Exception as exc:
         try:
-            unchanged = open(conf, encoding="utf-8").read() == body
+            from codai.platform_paths import legacy_style_config_dir
+            own = str(legacy_style_config_dir() / "fontconfig")
         except Exception:
-            unchanged = False
-        if not unchanged:
-            with open(conf, "w", encoding="utf-8") as fh:
-                fh.write(body)
+            own = os.path.join(os.path.dirname(have[0]), "fontconfig")
+        cache = os.path.join(own, "cache")
+        conf = os.path.join(own, "fonts.conf")
+        try:
+            os.makedirs(cache, exist_ok=True)
+            changed = _write_if_changed(conf, _fontconfig_snippet(have, cache))
+            # Children inherit this, which is the whole point: ffmpeg/libass
+            # must resolve the same families this process does.
+            os.environ["FONTCONFIG_FILE"] = conf
+        except Exception as exc2:
+            print(f"[fonts] could not register {have}: {exc} / {exc2}", flush=True)
+            return []
+
+    try:
         fccache = shutil.which("fc-cache")
-        if fccache and not unchanged:
-            subprocess.run([fccache, "-f"] + have,
-                           capture_output=True, timeout=180)
+        if fccache and changed:
+            subprocess.run([fccache, "-f"] + have, capture_output=True, timeout=180)
         _FONT_CACHE.clear()          # a new font changes what was resolved
         try:                         # ...and what the caption measurer loaded
             from codai.compose.captions import _FACE_CACHE
@@ -506,8 +548,8 @@ def register_operator_fonts(force: bool = False) -> list:
         except Exception:
             pass
     except Exception as exc:
-        print(f"[fonts] could not register {have}: {exc}")
-        return []
+        print(f"[fonts] registered {have} but could not refresh the cache: {exc}",
+              flush=True)
     return have
 
 
