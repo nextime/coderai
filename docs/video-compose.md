@@ -102,6 +102,14 @@ so a mis-heard word cannot reach the screen. `timing`:
 * `stt` — require the model; `501` at submission time if there is none;
 * `estimate` — never load a speech model.
 
+Not every speech backend reports *per-word* timings: the HF pipelines
+(`wav2vec2`, `whisper_hf`, CrisperWhisper), `vosk` and plain faster-whisper do;
+a `whisper-server` (whisper.cpp) model and the NeMo worker behind canary return
+text only. `auto` therefore picks a model that can, whatever it is called, and
+`captions.stt_model` overrides the pick. A model that returns no timings is not
+an error — the render continues with estimated ones — but it is reported in the
+job's `warnings`, because the captions will drift against the voice.
+
 Presets `karaoke`, `bold`, `neon` highlight the active word; `classic`, `boxed`,
 `minimal` draw whole lines. Lines break at `max_words_per_line` and stay inside a
 safe area of 10% top/bottom and 6% at the sides, clear of the TikTok/Reels/Shorts
@@ -299,6 +307,12 @@ claimed.
   engine makes the job fail with that engine's own "model not allowed here"
   message. Supplying each scene's `audio` and `captions.timing: "estimate"`
   needs no model at all.
+* **Polling is free**: `GET /v1/video/compose/{id}` and
+  `GET /v1/video/talking-head/{id}` are exempt from the `/v1/video/` rate limit
+  (10 requests a minute per IP by default), so polling a long render does not
+  spend the budget its own renders need. They still require a Bearer token --
+  the document names the job's output -- and the sibling `POST .../cancel` is
+  limited like any other action.
 * **Jobs live in memory** (the last 100, plus whatever is running): a front
   restart loses them, and a client polling a lost id gets `404` — treat that as
   "restart the render", not as an error in the request.

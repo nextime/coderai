@@ -20,6 +20,7 @@ import types
 
 import pytest
 from PIL import Image
+from fastapi import HTTPException
 
 from codai.api import images as images_mod
 
@@ -32,7 +33,14 @@ class _RecordingPipe:
 
     def __call__(self, image=None, strength=None, prompt=None, **kw):
         self.calls.append(dict(image=image, strength=strength, prompt=prompt, **kw))
-        return types.SimpleNamespace(images=[Image.new("RGB", (8, 8))])
+        # NOT a flat image. `Image.new("RGB", …)` defaults to BLACK, and the
+        # endpoint now refuses a uniformly black result because that is what
+        # NaN latents decode to -- the Z-Image-Turbo failure reported from
+        # production. A fixture returning one would be asserting that the
+        # silent-failure path still works.
+        out = Image.new("RGB", (8, 8), (30, 60, 90))
+        out.putpixel((0, 0), (200, 180, 160))
+        return types.SimpleNamespace(images=[out])
 
 
 @pytest.fixture
@@ -177,3 +185,24 @@ def test_every_edit_endpoint_has_a_test_that_executes_it():
     src = open(__file__).read()
     for name in executed:
         assert f"images_mod.{name}(" in src, f"{name} is never called here"
+
+
+@pytest.mark.anyio
+async def test_a_black_result_reaches_the_client_as_an_error_not_as_a_png(wired):
+    """End to end, through the endpoint: the Z-Image-Turbo failure reported
+    from production answered 200 OK with a black PNG, so the only person who
+    could notice was someone looking at the picture."""
+    original = _RecordingPipe.__call__
+
+    def _black(self, image=None, strength=None, prompt=None, **kw):
+        return types.SimpleNamespace(images=[Image.new("RGB", (8, 8))])
+
+    _RecordingPipe.__call__ = _black
+    try:
+        with pytest.raises(HTTPException) as e:
+            await images_mod.create_image_edit(
+                images_mod.ImageEditRequest(model="m", prompt="p", image="x"))
+        assert e.value.status_code == 500
+        assert "uniformly black" in str(e.value.detail)
+    finally:
+        _RecordingPipe.__call__ = original

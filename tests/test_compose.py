@@ -293,7 +293,7 @@ def test_the_final_render_is_uploadable_and_carries_captions_and_overlays(tmp_pa
     out = str(work / "final.mp4")
     rnd.final_render(silent, audio, out, width=240, height=426, fps=24, total=2.0,
                      ass_file=str(ass),
-                     overlays=[{"type": "text", "text": "made with motus",
+                     overlays=[{"type": "text", "text": "made with coderai",
                                "position": "bottom-right", "opacity": 0.6, "size": 0.04}],
                      crf=28)
     info = media.probe(out)
@@ -340,7 +340,7 @@ def _spec(tmp_path, **over):
         ],
         "captions": {"enabled": True, "timing": "estimate", "preset": "karaoke",
                      "font": "DejaVu Sans", "max_words_per_line": 2},
-        "overlays": [{"type": "text", "text": "motus", "position": "bottom-right"}],
+        "overlays": [{"type": "text", "text": "caption", "position": "bottom-right"}],
         "thumbnail": {"at": 0.3, "text": "3 hearts?!"},
         "output": {"crf": 30},
         "outputs": ["video", "thumbnail", "srt", "vtt", "narration"],

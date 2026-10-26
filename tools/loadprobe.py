@@ -80,6 +80,9 @@ def main(argv=None):
                     help="front base URL, e.g. http://127.0.0.1:18776")
     ap.add_argument("--out", default="", help="TSV file to append to")
     ap.add_argument("--token", default="", help="API token, for /metrics")
+    ap.add_argument("--token-file", default="",
+                    help="read the token from this file instead of the command "
+                         "line, which every process listing can read")
     ap.add_argument("--interval", type=float, default=1.0,
                     help="seconds between probes (default 1)")
     ap.add_argument("--window", type=float, default=30.0,
@@ -91,6 +94,12 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     base = a.base.rstrip("/")
+    if a.token_file:
+        try:
+            a.token = open(a.token_file).read().strip()
+        except Exception as exc:
+            print(f"could not read --token-file: {exc}", file=sys.stderr)
+            return 2
     cols = ("ts", "n", "ok", "fail", "p50_ms", "p90_ms", "p99_ms", "max_ms",
             "loop_worst_s", "stalls", "blocked_s")
     fh = open(a.out, "a") if a.out else None

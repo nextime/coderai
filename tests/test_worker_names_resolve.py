@@ -24,6 +24,13 @@ import pytest
 
 WORKER_FILES = sorted(glob.glob("codai/ocr/workers/*.py"))
 
+#: The whole package, because the same mistake is not confined to the workers.
+#: Run over it, this check found `_QUANT_RE` -- used twice in
+#: codai/admin/routes.py and defined nowhere, lost in a rewrite, so browsing
+#: any HuggingFace repo containing a .gguf raised NameError. Nothing had ever
+#: executed those two lines either.
+PACKAGE_FILES = sorted(glob.glob("codai/**/*.py", recursive=True))
+
 
 def _bound_names(tree):
     out = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
@@ -79,3 +86,27 @@ def test_the_check_would_have_caught_the_bug_that_prompted_it():
     known = _bound_names(tree)
     assert "_opt" not in known
     assert "_page_override" in known
+
+
+@pytest.mark.parametrize("path", PACKAGE_FILES)
+def test_every_private_helper_in_the_package_is_defined(path):
+    """Not only the workers: a private name used and never bound is a
+    NameError waiting for the first caller, wherever it lives."""
+    bad = _undefined(path)
+    assert not bad, "%s uses undefined private name(s): %s" % (
+        path, ", ".join("%s (line %d)" % (n, l) for n, l in sorted(bad.items())))
+
+
+def test_the_package_sweep_covers_a_realistic_number_of_files():
+    """A glob that silently matched three files would make the sweep useless."""
+    assert len(PACKAGE_FILES) > 100, len(PACKAGE_FILES)
+
+
+def test_the_quant_label_regex_the_sweep_found_missing_now_exists():
+    """It is used by the HF repo browser to label each GGUF file."""
+    from codai.admin.routes import _QUANT_RE
+    assert _QUANT_RE.search("TheDrummer_Artemis-31B-v1.2-Q4_K_M.gguf").group(1).upper() == "Q4_K_M"
+    assert _QUANT_RE.search("Gemma-4-14B-A4B-Heretic.i1-IQ4_XS.gguf").group(1).upper() == "IQ4_XS"
+    assert _QUANT_RE.search("m-Q4_K_M-00001-of-00002.gguf").group(1).upper() == "Q4_K_M"
+    # No label in the name: reported as unknown rather than guessed at.
+    assert _QUANT_RE.search("surya-2.gguf") is None

@@ -33,6 +33,25 @@ _MAX_AUDIO_BYTES = 100 * 1024 * 1024
 # Safe audio extensions (user-supplied extension is NOT trusted for the suffix)
 _SAFE_EXTENSIONS = {'.wav', '.mp3', '.ogg', '.flac', '.m4a', '.webm', '.mp4'}
 
+
+def _upload_name(file) -> str:
+    """The name of the audio being transcribed, whatever ``file`` is.
+
+    The HTTP endpoint hands this an UploadFile, but transcription is also called
+    in-process -- the compose renderer asks for word timings on a narration clip
+    it just wrote to disk -- and there the audio is a path, not an upload. Taking
+    ``.filename`` unconditionally made every one of those calls raise
+    ``'str' object has no attribute 'filename'``, which the caller caught and
+    reported as "word timestamps failed", so captions silently fell back to
+    estimated timings on every scene of every render.
+
+    Only the extension is read from it, so a plain name serves just as well.
+    """
+    if isinstance(file, (str, bytes)):
+        name = file.decode("utf-8", "replace") if isinstance(file, bytes) else file
+        return os.path.basename(name)
+    return getattr(file, "filename", None) or ""
+
 # Import from codai modules
 from codai.models.manager import multi_model_manager
 
@@ -572,7 +591,7 @@ async def _run_transcription_inner(
 
     # Determine a safe file extension from the upload's content-type or filename,
     # never trusting the raw user-supplied value for arbitrary suffixes.
-    raw_ext = os.path.splitext(file.filename or '')[1].lower()
+    raw_ext = os.path.splitext(_upload_name(file))[1].lower()
     safe_ext = raw_ext if raw_ext in _SAFE_EXTENSIONS else '.wav'
 
     # Save to temp file (needed for some backends)

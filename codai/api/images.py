@@ -259,6 +259,52 @@ def save_image_response(img, request_format="base64", http_request=None):
     return result
 
 
+def _refuse_uniform_output(images, model_name: str, dtype=None) -> None:
+    """Raise when a pipeline returned a FLAT image -- one single colour.
+
+    A black PNG answered 200 OK is the worst shape a failure can take: the
+    client gets a plausible file, the log shows a success, and the only way
+    anyone learns is a person looking at the picture. It was reported from the
+    field exactly that way: an image-edit request that answered with a black
+    picture and no error.
+
+    Its cause is almost always numeric. fp16 tops out near 65504, a
+    flow-matching DiT runs past it, the latents become NaN, and a VAE decodes
+    NaN to uniform black. So the message names the dtype, which is the thing
+    worth changing.
+
+    A real picture is never one colour: even a photograph of a dark room has
+    sensor noise, and a diffusion sample has more. A uniform result is
+    therefore evidence of arithmetic, not of content -- and the check is on
+    the extremes only (0 or 255), so a deliberately flat mid-grey render is
+    left alone.
+    """
+    from PIL import Image as _Image
+    for idx, img in enumerate(images or []):
+        if not isinstance(img, _Image.Image):
+            continue
+        try:
+            extrema = img.convert("RGB").getextrema()
+        except Exception:
+            continue                      # cannot judge it: let it through
+        flat = all(lo == hi for lo, hi in extrema)
+        if not flat:
+            continue
+        value = tuple(lo for lo, _hi in extrema)
+        if value not in ((0, 0, 0), (255, 255, 255)):
+            continue                      # flat, but not an overflow signature
+        where = "black" if value == (0, 0, 0) else "white"
+        note = ""
+        if dtype is not None and "float16" in str(dtype):
+            note = (" The model was run in fp16, whose range a diffusion "
+                    "transformer can exceed; set this model's precision to "
+                    "bf16 (same VRAM, far wider range).")
+        raise RuntimeError(
+            f"{model_name!r} returned a uniformly {where} image "
+            f"(image {idx + 1} of {len(images)}), which is what NaN latents "
+            f"decode to rather than a picture.{note}")
+
+
 def set_global_args(args):
     """Set global args from coderai."""
     global global_args
@@ -353,6 +399,96 @@ def _apply_image_acceleration(pipeline, model_config):
     return pipeline
 
 
+def _model_call_kwargs(pipeline, model_config) -> dict:
+    """Extra ``__call__`` arguments this model's card specifies.
+
+    Some published models document a setting that is neither steps, guidance
+    nor a scheduler option, and a client has no field to send it in: MOSS-Image
+    asks for ``uncond_skip_layers=[22]`` on every call. Without a passthrough
+    the only way to honour a card like that is to hardcode the model, so
+    ``call_kwargs`` on the model entry carries them::
+
+        "call_kwargs": {"uncond_skip_layers": [22], "shift": 5}
+
+    Filtered against the pipeline's own signature, like every other kwarg here:
+    a diffusers ``__call__`` ends in ``**kwargs``, so an argument it does not
+    understand is accepted and silently dropped, and a setting that does
+    nothing is worse than one that is refused. What is dropped is logged.
+    """
+    extra = {}
+    try:
+        extra = dict((model_config or {}).get("call_kwargs") or {})
+    except Exception:
+        return {}
+    if not extra:
+        return {}
+    try:
+        import inspect
+        params = inspect.signature(pipeline.__call__).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        pass            # a strict signature: filter below is enough
+    if params:
+        kept = {k: v for k, v in extra.items() if k in params}
+        dropped = sorted(set(extra) - set(kept))
+        if dropped:
+            _log.warning("%s does not take %s from this model's call_kwargs; "
+                         "they were NOT applied", type(pipeline).__name__,
+                         ", ".join(dropped))
+        return kept
+    return extra
+
+
+def _apply_component_dtypes(pipeline, model_config):
+    """Cast named pipeline components to their configured dtype.
+
+    A pipeline loads at one dtype, and some models need a component at
+    another: MOSS-Image's card asks for the **VAE in fp32** while the
+    transformer and text encoder run bf16, because its latents overflow a half
+    type in the decoder -- the same arithmetic that turns a picture black.
+
+        "component_dtype": {"vae": "f32"}
+
+    Applied after the load, so it costs one cast rather than a second copy of
+    the weights. A component that is quantized is left alone and said so: a
+    bnb 4-bit module cannot be cast, and silently not casting it would be the
+    quiet kind of wrong.
+    """
+    import torch
+    want = {}
+    try:
+        want = dict((model_config or {}).get("component_dtype") or {})
+    except Exception:
+        return pipeline
+    if not want:
+        return pipeline
+    table = {"f32": torch.float32, "fp32": torch.float32,
+             "f16": torch.float16, "fp16": torch.float16,
+             "bf16": torch.bfloat16}
+    for name, spec in want.items():
+        dt = table.get(str(spec or "").strip().lower())
+        comp = getattr(pipeline, name, None)
+        if dt is None:
+            _log.warning("component_dtype %r for %r is not a dtype I know",
+                         spec, name)
+            continue
+        if comp is None:
+            _log.warning("component_dtype: this pipeline has no %r", name)
+            continue
+        if getattr(comp, "is_quantized", False) or getattr(
+                comp, "quantization_method", None):
+            _log.warning("component_dtype: %r is quantized, leaving it as it "
+                         "is (a quantized module cannot be cast)", name)
+            continue
+        try:
+            comp.to(dt)
+            print(f"  component '{name}' cast to {spec}")
+        except Exception as e:
+            _log.warning("could not cast %r to %s: %s", name, spec, e)
+    return pipeline
+
+
 def _finish_image_load(pipeline, model_config):
     """Apply everything the model's own config adds to a loaded pipeline.
 
@@ -365,6 +501,7 @@ def _finish_image_load(pipeline, model_config):
     than quietly serving the base checkpoint under the fine-tune's name.
     """
     pipeline = _apply_image_acceleration(pipeline, model_config)
+    _apply_component_dtypes(pipeline, model_config)
     from codai.models.diffusion_loras import apply_model_loras
     apply_model_loras(pipeline, model_config)
     return pipeline
@@ -421,8 +558,24 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     
     # --no-ram mode: override dtype to auto-select best for GPU
     if no_ram:
-        dtype = torch.float16  # Use fp16 to maximize VRAM efficiency
-        print(f"--no-ram mode: Using precision fp16 for maximum VRAM efficiency")
+        # ONLY FROM f32. fp16 and bf16 are both two bytes per parameter, so
+        # coercing a configured bf16 to fp16 saves nothing at all -- it only
+        # narrows the dynamic range, and it silently overrode a precision the
+        # operator had chosen for the model.
+        #
+        # Measured 2026-10-25: Z-Image-Turbo, configured bf16 and loaded fp16
+        # by this line, returned a BLACK image for every edit. fp16 tops out
+        # near 65504 and a flow-matching DiT runs past it, so the latents go
+        # NaN and the VAE decodes NaN to uniform black -- answered 200 OK, with
+        # a plausible-looking PNG and nothing in the log.
+        if dtype is torch.float32:
+            dtype = torch.float16
+            print("--no-ram mode: precision was f32 -> using fp16 "
+                  "(half the VRAM, and FlashAttention needs a half type)")
+        else:
+            print(f"--no-ram mode: keeping the configured precision "
+                  f"{precision} (fp16 would be the same size and a narrower "
+                  f"range)")
     else:
         # A quantized checkpoint — pre-quantized (bnb 4/8-bit, fp8, nf4, gptq, awq;
         # e.g. Z-Image-Turbo-unsloth-bnb-4bit) or runtime-quantized via config —
@@ -469,6 +622,23 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     # A component taken from another repo (a fine-tuned transformer served on
     # the base pipeline's VAE and text encoder). Merged after the GGUF ones so
     # an explicit override wins over a GGUF file for the same component.
+    # A pipeline that ships in its own repository (MOSS, Kromoss). Resolved
+    # here so a refusal happens BEFORE any weights move, and so the ordinary
+    # repo load is untouched when no model asks for it.
+    _img_remote = {}
+    try:
+        from codai.models import remote_code
+        from codai.admin.routes import config_manager as _cm
+        _img_remote = remote_code.kwargs_for(
+            getattr(_cm, "config", None), model_name, _cfg('custom_pipeline'))
+        if _img_remote:
+            print(f"  Custom pipeline from the repository: "
+                  f"{_img_remote['custom_pipeline']} (allow-listed)")
+    except PermissionError:
+        raise
+    except Exception as e:
+        print(f"  custom_pipeline check skipped: {e}")
+
     _img_comp_models, _img_comp_desc = build_component_models(model_name, _mc, dtype)
     if _img_comp_models:
         print(f"Image components from other repos: {_img_comp_desc}")
@@ -505,6 +675,7 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 _xtra['quantization_config'] = _img_quant_config
             if _img_gguf_components:
                 _xtra.update(_img_gguf_components)
+            _xtra.update(_img_remote)
             with _DIFFUSERS_LOAD_LOCK:
                 pipeline = build_single_file_pipeline(model_name, _mc, dtype, _xtra)
                 if pipeline is None:
@@ -607,12 +778,24 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     _xtra['quantization_config'] = _img_quant_config
                 if _img_gguf_components:
                     _xtra.update(_img_gguf_components)
+                _xtra.update(_img_remote)
                 # A single ComfyUI/A1111-style checkpoint file, when that is
                 # what the model's path names; None otherwise, which leaves the
                 # ordinary repo load below untouched.
                 pipeline = build_single_file_pipeline(model_name, _mc, dtype, _xtra)
                 # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
-                if pipeline is None:
+                if pipeline is None and _img_remote:
+                    # A model whose pipeline class lives in its own repository
+                    # is only loadable through DiffusionPipeline: trying SDXL
+                    # first would fail on every such model and bury the real
+                    # error under a class mismatch.
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        use_safetensors=True,
+                        **_xtra,
+                    )
+                elif pipeline is None:
                     try:
                         pipeline = StableDiffusionXLPipeline.from_pretrained(
                             model_name,
@@ -1410,6 +1593,9 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             callback_on_step_end=_step_cb,
         )
 
+    # Arguments this model's card specifies that no request field carries.
+    call_kwargs.update(_model_call_kwargs(pipeline, model_config))
+
     # Inject IP-Adapter images if character references provided.  The pipeline
     # must have IP-Adapter *weights* loaded first — _ensure_ip_adapter_loaded
     # lazily downloads + loads the right checkpoint for the architecture.
@@ -1521,6 +1707,11 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         result_images = getattr(result, 'image', None) or getattr(result, 'output', None)
         if result_images is None:
             raise Exception(f"Could not extract images from diffusers result: {img_err}")
+
+    # A flat image is arithmetic, not content -- see _refuse_uniform_output.
+    _refuse_uniform_output(result_images,
+                           getattr(request, "model", None) or _model_name,
+                           getattr(pipeline, "dtype", None))
 
     _archive_artifacts = []
     for img in result_images:
@@ -2275,8 +2466,8 @@ def _task_view(base, task: str):
 async def _pipeline_for_task(model_info: dict, task: str):
     """The pipeline for ``task``, from ONE loaded copy of the model's weights.
 
-    Motus creates characters (text-to-image) and edits them (image-to-image)
-    with the same checkpoint, so loading one per task would hold the weights
+    A client that creates characters (text-to-image) and then edits them
+    (image-to-image) uses the same checkpoint for both, so loading one per task would hold the weights
     twice -- 18 GB each for an SDXL fine-tune, and an eviction on every
     alternation between the two. The model is loaded once, under the manager's
     own key so its VRAM accounting and eviction see one model, and each task
@@ -2292,6 +2483,8 @@ async def _pipeline_for_task(model_info: dict, task: str):
     model_key = model_info.get('model_key') or f"image:{model_name}"
     base = model_info.get('model_object') or multi_model_manager.models.get(model_key)
 
+    configured_error = None
+    cfg = {}
     if base is None:
         cfg = (multi_model_manager.config.get(model_key)
                or multi_model_manager.config.get(model_name) or {})
@@ -2300,16 +2493,33 @@ async def _pipeline_for_task(model_info: dict, task: str):
                 _load_diffusers_pipeline, model_name, global_args, cfg)
         except Exception as e:
             base = None
-            _log.warning("the configured loader could not open %r for %s (%s); "
-                         "falling back to a task-only load", model_name, task, e)
+            configured_error = e
+            _log.warning("the configured loader could not open %r for %s (%s)",
+                         model_name, task, e)
         if base is not None:
             multi_model_manager.add_model(model_key, base)
             multi_model_manager.current_model_key = model_key
 
     if base is None:
-        # Last resort: a task-specific load, which is all the editing
-        # endpoints ever did. Not registered under the shared key, because it
-        # carries none of the model's configuration.
+        # THE CONFIGURED LOADER'S FAILURE IS THE ONE WORTH REPORTING.
+        #
+        # The task-only fallback below knows nothing about the model: not its
+        # path, so an alias-keyed sibling is handed to from_pretrained as if it
+        # were a repo id, and not its quantization, so a model that only fits
+        # when quantized is attempted whole. For a CONFIGURED model it
+        # therefore fails later and worse, and its error describes a different
+        # problem entirely.
+        #
+        # Measured in production 2026-10-25: 'Qwen-Image-Edit-Rapid-AIO' failed
+        # because its fp8 component cannot be 4-bit quantized and the whole
+        # pipeline then OOMed -- and the client was told
+        # "Qwen-Image-Edit-Rapid-AIO is not a local folder and is not a valid
+        # model identifier listed on huggingface.co/models", which sent
+        # everyone looking for a missing repo. Credits were refunded for it.
+        if cfg:
+            raise HTTPException(status_code=500, detail=(
+                f"could not load {model_name!r} for {task}: {configured_error}"))
+        # No configuration at all: the task-only load is all there ever was.
         loader = _load_inpaint_pipeline if task == "inpaint" else _load_img2img_pipeline
         try:
             return await asyncio.to_thread(loader, model_name, global_args)
@@ -2531,6 +2741,13 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         # afterwards, and the log showed the request and then just the status.
         _log.error("Image editing failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Image editing failed: {e}")
+
+    try:
+        _refuse_uniform_output(result.images, request.model,
+                              getattr(pipe, "dtype", None))
+    except RuntimeError as e:
+        _log.error("%s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
     images = []
     for img in result.images:

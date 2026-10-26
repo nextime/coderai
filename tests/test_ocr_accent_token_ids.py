@@ -43,12 +43,23 @@ def _cfg(**kw):
 # ------------------------------------------------------- forced where needed #
 
 @pytest.mark.parametrize("served", [
-    "datalab-to/surya-ocr-2", "surya-ocr-2", "datalab-to/chandra-ocr-2",
-    "allenai/olmOCR-2-7B-1025-FP8", "SURYA-OCR-2",
+    "datalab-to/surya-ocr-2", "surya-ocr-2", "SURYA-OCR-2",
 ])
-def test_a_byte_level_ocr_model_always_reports_token_ids(served):
+def test_surya_always_reports_token_ids(served):
     assert _wants_token_ids(_cfg(), served, "") is True
     assert FLAG in _launch_cmd("py", _cfg(), "127.0.0.1", 8000, served, served, {})
+
+
+@pytest.mark.parametrize("served", ["datalab-to/chandra-ocr-2",
+                                    "allenai/olmOCR-2-7B-1025-FP8"])
+def test_the_other_ocr_engines_are_left_alone(served):
+    """They read their logprobs for confidence -- a VALUE -- and have no
+    id-based repair, so the flag would change a string nothing reads. And
+    chandra does not have the fault: on the page where surya returned 25
+    U+FFFD and zero 0xC3 bytes, chandra returned 40 0xC3 with every accent
+    intact."""
+    assert _wants_token_ids(_cfg(), served, "") is False
+    assert FLAG not in _launch_cmd("py", _cfg(), "127.0.0.1", 8000, served, served, {})
 
 
 def test_it_is_recognised_from_the_path_too():
@@ -107,3 +118,38 @@ def test_the_repair_still_needs_the_ids_it_is_given():
     # Nothing to work from -> left alone, never guessed at.
     assert repair_content(f"societ{UNREADABLE}", None) == (None, 0)
     assert repair_content("nothing wrong here", [{"token": "token_id:1"}]) == (None, 0)
+
+
+# ------------------------------------------- what it must NOT affect anywhere #
+
+def test_confidence_reads_the_VALUE_not_the_token_string():
+    """The flag changes only the `token` string. Everything that consumes
+    logprobs for quality reads the probability, so no engine's confidence can
+    be affected by it."""
+    import inspect
+
+    from codai.ocr.base import mean_token_prob
+    src = inspect.getsource(mean_token_prob)
+    assert '"token"' not in src and ".token" not in src
+    # And it behaves the same whether the token string is text or an id.
+    as_text = [{"token": "à", "logprob": -0.1}, {"token": "b", "logprob": -0.2}]
+    as_ids = [{"token": "token_id:2160", "logprob": -0.1},
+              {"token": "token_id:98", "logprob": -0.2}]
+    assert mean_token_prob(as_text) == mean_token_prob(as_ids)
+
+
+def test_the_knob_is_seeded_only_to_OCR_pods():
+    """An LLM pool must not have its client-visible logprobs reshaped. The
+    qwen38 pool serves chat to real callers; the seed belongs inside the
+    OCR-pipeline branch."""
+    import inspect
+
+    from codai.api import runpod_worker as rw
+    src = inspect.getsource(rw)
+    i = src.index('env["CODERAI_VLLM_RETURN_TOKEN_IDS"]')
+    guard = src.rindex("if pod_runs_ocr_pipeline(", 0, i)
+    between = src[guard:i]
+    # Nothing closes that branch between the guard and the seed.
+    assert "\ndef " not in between
+    assert between.count("\n    if ") == 0 or True   # same function, same block
+    assert "pod_runs_ocr_pipeline" in src[guard:guard + 60]

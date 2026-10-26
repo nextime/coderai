@@ -4086,9 +4086,33 @@ def main():
                   file=sys.stderr)
         else:
             try:
-                loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as e:
+                _raw = cfg_path.read_text(encoding="utf-8")
+            except OSError as e:
                 raise SystemExit(f"Could not read config {cfg_path}: {e}")
+            if not _raw.strip():
+                # AN EMPTY FILE IS THE SAME SITUATION AS A MISSING ONE: a
+                # fresh install that has never saved. It was fatal, and the
+                # bundled launcher always points --config at this path, so a
+                # container whose /cache had a zero-byte config could not start
+                # the tool at all -- supervisor reported "Exited too quickly"
+                # and the reason was a config nobody had written yet.
+                #
+                # A MALFORMED non-empty file stays fatal on purpose: there are
+                # settings in there that somebody saved, and starting with
+                # defaults would silently discard them.
+                print(f"ℹ  Config {cfg_path} is empty — starting with defaults "
+                      "(it'll be written when you Save from the web UI).",
+                      file=sys.stderr)
+                loaded = {}
+            else:
+                try:
+                    loaded = json.loads(_raw)
+                except json.JSONDecodeError as e:
+                    raise SystemExit(
+                        f"Could not read config {cfg_path}: {e}. It is not "
+                        f"empty, so it holds settings somebody saved — fix or "
+                        f"remove the file rather than letting defaults "
+                        f"silently replace them.")
             for k in SETTINGS_KEYS:
                 if loaded.get(k) is not None:
                     settings[k] = loaded[k]

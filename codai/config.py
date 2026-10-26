@@ -182,6 +182,21 @@ class ModelsConfig:
     # Per-engine overrides for max_model_instances, keyed by engine name
     # (e.g. {"nvidia": 2, "radeon": 1}). Applied per-engine process; blank = default.
     max_model_instances_overrides: dict = field(default_factory=dict)
+    #: Repositories whose OWN CODE may be executed when loading a model
+    #: (``custom_pipeline`` / ``trust_remote_code``). An ALLOW-LIST, because
+    #: the alternative is a server that runs arbitrary Python from any
+    #: checkpoint an operator happens to name -- and the published pipelines
+    #: that need it (MOSS, Kromoss) ship the pipeline class in the repo.
+    #:
+    #: Entries are exact repo ids or an ``org/*`` prefix::
+    #:
+    #:     "trust_remote_code": ["OpenMOSS-Team/MOSS-Image-SFT",
+    #:                           "lodestones/*"]
+    #:
+    #: Empty (the default) means no model may run remote code, and a model
+    #: configured to want it is refused by name rather than loaded quietly
+    #: without the pipeline it asked for.
+    trust_remote_code: list = field(default_factory=list)
     # Node-wide cap on a reply's max_tokens. A client's requested max_tokens is
     # honored only when it is SMALLER than this; a larger (or absent) request is
     # clamped to this value. None = no cap (use the client's value, or the 2048

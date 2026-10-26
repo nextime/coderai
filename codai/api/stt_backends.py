@@ -477,6 +477,29 @@ def load_stt_backend(model_name: str, model_path: Optional[str], config: Optiona
 # Family names that this module (not whisper-server / faster-whisper) handles.
 STT_FAMILIES = {"wav2vec2", "vosk", "nemo", "whisper_hf", "crisperwhisper"}
 
+#: Backends whose ``transcribe()`` fills ``words`` with per-WORD start/end
+#: times. Not every one does, and the difference is invisible from the outside:
+#: a backend that ignores ``word_timestamps`` answers 200 with timings missing,
+#: so a caller that needs them (burned captions, which must sit on the syllable)
+#: silently falls back to estimating from character counts.
+#:
+#:   * the HF pipeline families return them (``return_timestamps="word"``)
+#:   * vosk returns them (``SetWords(True)``)
+#:   * faster-whisper, the default when no backend is named, returns them
+#:   * whisper-server returns TEXT ONLY -- the whisper.cpp runner's JSON has no
+#:     word array -- and the NeMo worker ignores the flag
+_WORD_TIMING_BACKENDS = {"", "wav2vec2", "whisper_hf", "crisperwhisper", "vosk",
+                         "faster-whisper", "faster_whisper"}
+
+
+def reports_word_timings(backend) -> bool:
+    """Whether a model served by ``backend`` can return per-word timings.
+
+    Conservative about names it does not know: used to PREFER a model, never to
+    refuse one, and the caller checks the actual result as well.
+    """
+    return str(backend or "").strip().lower() in _WORD_TIMING_BACKENDS
+
 
 def resolve_family(model_name: str, config: Optional[dict]) -> str:
     """Public helper for the dispatcher: which family serves this model."""

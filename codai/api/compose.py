@@ -294,7 +294,7 @@ def cancel_job(job_id: str) -> bool:
 
 
 def _queue_positions() -> None:
-    """Tell every waiting job where it is in the line (Motus shows this)."""
+    """Tell every waiting job where it is in the line (clients show this)."""
     with _jobs_lock:
         waiting = list(_queue)
     for pos, jid in enumerate(waiting, 1):
@@ -704,17 +704,46 @@ def _stt_words(loop, audio_path: str, model: str, language: Optional[str]) -> Li
     return list((res or {}).get("words") or [])
 
 
+def _stt_backend(model_id: str) -> str:
+    """The configured ``backend`` of an audio model, without loading it."""
+    try:
+        from codai.models.manager import multi_model_manager
+        cfg = multi_model_manager._config_for_model(model_id) or {}
+        raw = cfg.get("_raw_cfg") if isinstance(cfg, dict) else None
+        entry = raw if isinstance(raw, dict) else cfg
+        return str((entry or {}).get("backend") or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def _pick_stt_model(caps: CaptionSpec) -> Optional[str]:
+    """An audio model to time the words with: one that CAN time words, first.
+
+    The previous order preferred anything named "whisper", then canary. Both are
+    the wrong way round here: a whisper-server (whisper.cpp) model returns text
+    with no word array, and the NeMo worker behind canary ignores the request --
+    so the obvious pick returned no timings at all and captions fell back to
+    estimating from character counts, which drifts against the voice. The
+    backends that do report words are the HF pipelines (wav2vec2, whisper_hf,
+    CrisperWhisper), vosk, and plain faster-whisper.
+    """
     if caps.stt_model and _has_model("audio", caps.stt_model):
         return caps.stt_model
     ids = _model_ids("audio")
     if not ids:
         return None
-    # Prefer something whisper-shaped: it is what reports word timings.
-    for want in ("whisper", "canary", "wav2vec"):
-        for i in ids:
+    import codai.api.stt_backends as stt_backends
+    able = [i for i in ids if stt_backends.reports_word_timings(_stt_backend(i))]
+    # Among those, a whisper-family model reads running speech best; wav2vec2 is
+    # per-language and vosk is a small CPU model, so they come after.
+    for want in ("whisper", "wav2vec", "vosk"):
+        for i in able:
             if want in i.lower():
                 return i
+    if able:
+        return able[0]
+    # Nothing configured can report words. Still return something: the timings
+    # will be estimated, the renderer says so, and the transcript is unused.
     return ids[0]
 
 
@@ -806,6 +835,7 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
             if timing == "auto" and not model:
                 warn("no speech model configured; caption timings are estimated")
             words: List[dict] = []
+            _no_words_warned: set = set()
             for i, sc in enumerate(req.scenes):
                 text = (sc.text or "").strip()
                 if not text:
@@ -817,6 +847,19 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                                          (sc.voice or req.voice).language)
                     except Exception as exc:
                         warn(f"scene {i}: word timestamps failed ({exc}); estimated instead")
+                    else:
+                        # A backend that cannot time words answers 200 with none
+                        # of them, so without this the downgrade is invisible and
+                        # the captions just drift. Named once, for the model, and
+                        # only when the call itself succeeded -- a failure has
+                        # already been reported above.
+                        if not stt and model not in _no_words_warned:
+                            _no_words_warned.add(model)
+                            warn(f"{model!r} returned no word timings; caption "
+                                 f"timings are estimated. Set captions.stt_model "
+                                 f"to a model whose backend reports them "
+                                 f"(wav2vec2, whisper_hf, CrisperWhisper, vosk "
+                                 f"or faster-whisper).")
                 span = max(0.2, scene_dur[i] - max(0.0, float(sc.padding or 0.0)))
                 got = (cap.align_words(text, stt, starts[i], span) if stt
                        else cap.estimate_words(text, starts[i], span))

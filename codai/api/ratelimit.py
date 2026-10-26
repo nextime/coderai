@@ -50,6 +50,27 @@ _PROGRESS_PATHS = {
 }
 
 
+#: Read-only job-status documents, polled for as long as a job runs. They are
+#: NOT in _PROGRESS_PATHS because that set also waives authentication, and a
+#: composition's status names its output URL -- it is per-job and per-caller, so
+#: it stays behind the Bearer check. What it must not do is spend the generation
+#: budget: /v1/video/ allows 10 requests a minute, and a client that renders,
+#: edits and polls from one IP spent that budget on the polls and got 429 on the
+#: real work. Matched as a prefix because the job id is part of the path, and
+#: only for GET, so the sibling POST .../cancel stays limited.
+_STATUS_POLL_PREFIXES = (
+    "/v1/video/compose/",
+    "/v1/video/talking-head/",
+)
+
+
+def _is_status_poll(method: str, path: str) -> bool:
+    """Whether this is a cheap read-only status poll of a long-running job."""
+    if str(method or "").upper() != "GET":
+        return False
+    return any(path.startswith(p) for p in _STATUS_POLL_PREFIXES)
+
+
 def _unauthorized():
     return JSONResponse(
         status_code=401,
@@ -256,7 +277,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         path = request.url.path
 
-        if path in self._EXEMPT_PATHS:
+        if path in self._EXEMPT_PATHS or _is_status_poll(request.method, path):
             return await call_next(request)
 
         # Queue-size enforcement for authenticated API requests (not for status

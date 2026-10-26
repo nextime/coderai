@@ -185,7 +185,7 @@ def test_asking_for_the_task_it_already_is_costs_nothing():
 
 
 def test_one_copy_of_the_weights_serves_every_task(monkeypatch):
-    """The point of the whole arrangement: Motus creates a character with a
+    """The point of the whole arrangement: a client creates a character with a
     model and then edits it with the same one, and that must not hold two
     copies of an 18 GB checkpoint or evict on every alternation."""
     import diffusers
@@ -248,15 +248,43 @@ def test_the_task_pipelines_share_the_manager_entry():
     assert not re.search(r'f"inpaint:\{model_name\}"', src)
 
 
+def _function_source(path, name):
+    """One function's whole body, by AST — not a byte window.
+
+    This test used to take a fixed 2600 characters after the `def`, which made
+    it fail the moment a comment was added inside the function: a test that
+    breaks on an unrelated edit teaches people to stop reading it.
+    """
+    import ast
+    tree = ast.parse(open(path).read())
+    for node in ast.walk(tree):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == name):
+            return ast.get_source_segment(open(path).read(), node) or ""
+    raise AssertionError("no function %r in %s" % (name, path))
+
+
 def test_the_configured_loader_is_the_one_used():
     """The editing endpoints used to load their own copy with a hardcoded
     dtype, so a 4-bit model was served at 4 bits for text-to-image and bf16
     for editing -- out of two copies of the weights."""
-    src = open("codai/api/images.py").read()
-    head = src.index("async def _pipeline_for_task")
-    body = src[head:head + 2600]
+    body = _function_source("codai/api/images.py", "_pipeline_for_task")
     assert "_load_diffusers_pipeline" in body
     assert body.index("_load_diffusers_pipeline") < body.index("_load_img2img_pipeline")
+
+
+def test_a_configured_model_is_never_handed_to_the_task_only_loader():
+    """The task-only fallback knows neither the model's path nor its
+    quantization, so for a configured model it fails later and with an error
+    about something else -- in production, "Qwen-Image-Edit-Rapid-AIO is not a
+    local folder and is not a valid model identifier", when the real cause was
+    an fp8 component that cannot be 4-bit quantized."""
+    body = _function_source("codai/api/images.py", "_pipeline_for_task")
+    assert "if cfg:" in body
+    gate = body.index("if cfg:")
+    fallback = body.index("loader = _load_inpaint_pipeline")
+    assert gate < fallback, "the gate has to come before the fallback"
+    assert "configured_error" in body[gate:fallback]
 
 
 def test_text2img_also_gets_a_view_so_the_sharing_works_both_ways():

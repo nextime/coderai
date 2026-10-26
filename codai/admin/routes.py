@@ -382,6 +382,17 @@ async def api_list_models(username: str = Depends(require_admin)):
 
 _DISK_MIN_FREE_BYTES = 256 * 1024 * 1024  # 256 MB safety margin
 
+#: The quantisation label in a GGUF filename ("…-Q4_K_M.gguf" -> "Q4_K_M"),
+#: for the HuggingFace repo browser's file list.
+#:
+#: It was USED in two places and defined in none -- lost in a rewrite -- so
+#: both of those paths raised NameError the moment a repo with a .gguf in it
+#: was browsed. Anchored at the extension and requiring a separator before the
+#: label, so a quant named mid-filename is reported as unknown rather than
+#: guessed at; callers already handle None.
+_QUANT_RE = re.compile(r'(?i)[-._](I?Q\d+(?:_[A-Z0-9]+)*|BF16|F16|F32|FP16|FP8)'
+                       r'(?:-\d+-of-\d+)?\.gguf$')
+
 
 def _check_disk_space(path: str, needed_bytes: int = 0) -> None:
     """Raise RuntimeError if `path`'s filesystem lacks enough free space."""
@@ -2932,6 +2943,15 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # The diffusers pipeline class for a single-file checkpoint,
                 # when what the file is cannot be inferred from the file.
                 "pipeline_class",
+                # A pipeline that ships in the model's own repository. Loading
+                # it executes code from there, so the repo must also be in
+                # models.trust_remote_code.
+                "custom_pipeline",
+                # Arguments a model's card specifies that no request field
+                # carries (MOSS asks for uncond_skip_layers=[22]), and
+                # per-component dtypes (MOSS wants its VAE in fp32 while the
+                # rest runs bf16).
+                "call_kwargs", "component_dtype",
                 "lora_train_base_model", "lora_train_nodes",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 # Image prompt handling: which CLIP layer to read, and whether

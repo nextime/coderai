@@ -5966,11 +5966,26 @@ class MultiModelManager:
                         setattr(caps, f, True)
             else:
                 caps = detect_model_capabilities(model_id)
-            # Apply minimum capability for the config-declared category only when
-            # detection found nothing at all (unrecognized model name). If any caps
-            # were detected (e.g. image_upscaling for latent-upscaler models), trust
-            # the detection result — TYPE_MIN_CAP must not override it.
-            if model_type and model_type in TYPE_MIN_CAP and not caps.to_list():
+            # Apply minimum capability for the config-declared category when
+            # detection found nothing -- or found ONLY its own fallback.
+            #
+            # Detection is a name heuristic and its default is
+            # `text_generation`, which is not "nothing": it is an answer, and a
+            # wrong one for an entry the operator filed under image_models.
+            # Because the old test was `not caps.to_list()`, that default won
+            # and the model was advertised as a text model. Measured
+            # 2026-10-25: Z-Image, MOSS-Image-SFT and Kromoss all came back
+            # `type: image, capabilities: [text_generation]`, so no client
+            # would ever have sent them an image request -- while
+            # FLUX.2-klein-4B, whose NAME the heuristic happens to recognise,
+            # was right. A model's category is configuration; a guess from its
+            # name does not get to overrule it.
+            _detected = caps.to_list()
+            _bare_default = _detected == ["text_generation"]
+            if model_type and model_type in TYPE_MIN_CAP and (
+                    not _detected or (_bare_default and model_type != "text")):
+                if _bare_default:
+                    caps = ModelCapabilities()      # drop the wrong guess
                 setattr(caps, TYPE_MIN_CAP[model_type], True)
             resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
             # A video model carries its geometry: the frame rate it was trained at,
@@ -6019,6 +6034,17 @@ class MultiModelManager:
                         # per-engine /v1/models reflects what it actually serves).
                         # The admin config view passes all_engines=True to see them all.
                         if not all_engines and not self._entry_assigned(m):
+                            continue
+                        # A model PARKED as disabled is not available, so it is
+                        # not advertised. `enabled: false` was honoured when
+                        # deciding whether to rent a pod for it and nowhere
+                        # else, so an entry configured ahead of a blocker --
+                        # weights downloaded, settings written, waiting on a
+                        # dependency -- was offered to clients and answered
+                        # 500. The admin view (all_engines) still shows it,
+                        # because that is where it gets re-enabled.
+                        if (not all_engines and isinstance(m, dict)
+                                and m.get("enabled") is False):
                             continue
                         if isinstance(m, str):
                             mid = m

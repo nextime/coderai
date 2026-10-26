@@ -484,7 +484,29 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
             components[name] = cls.from_pretrained(source, **kwargs)
             descs.append(f"{name}:{source.split('/')[-1]}{'/' + mode if mode else ''}")
         except Exception as e:
-            print(f"  component_models load failed for '{name}' ({source}): {e}")
+            # RAISE. A component named here IS the model: `component_models`
+            # is how one published id serves a fine-tuned transformer on
+            # another pipeline's VAE and text encoder. Skipping it loads the
+            # BASE component instead, so the id quietly serves a different
+            # model than its name promises -- and the load goes on to succeed,
+            # which is the failure nobody can see.
+            #
+            # Measured in production 2026-10-25: this skipped the V19
+            # transformer ("Blockwise 4bit quantization only supports 16/32-bit
+            # floats, but got torch.float8_e4m3fn"), the pipeline fell back to
+            # plain Qwen-Image-Edit-2511, then OOMed trying to hold it whole --
+            # and the client was told the model id did not exist.
+            hint = ""
+            if "float8" in str(e) or "fp8" in str(e).lower():
+                hint = (f" The source is stored in fp8, which bitsandbytes "
+                        f"cannot quantize from (it needs 16- or 32-bit "
+                        f"floats). Serve this component from a GGUF of it "
+                        f"instead -- component_quantization accepts a .gguf "
+                        f"path -- or drop '{name}' from component_quantization "
+                        f"and give the model enough room to load it as it is.")
+            raise RuntimeError(
+                f"component '{name}' could not be loaded from {source!r}"
+                f"{' as ' + mode if mode else ''}: {e}.{hint}") from e
     return components, ', '.join(descs)
 
 

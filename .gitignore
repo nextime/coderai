@@ -22,6 +22,9 @@ debug.log
 # Runtime model cache (downloads, self-quantized checkpoints, job state).
 # Root-anchored so it never shadows the tracked codai/models/ source package.
 /models/
+# A HuggingFace cache a voice-conversion model writes beside the source when it
+# is given no cache dir (1.4 GB of weights, with its CACHEDIR.TAG).
+/checkpoints/
 
 # Third-party source clone of the GPTQ quantizer — installed into the venv from
 # source; the working tree is not part of this repo (it has its own .git).
