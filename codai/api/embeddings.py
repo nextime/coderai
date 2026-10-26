@@ -727,6 +727,56 @@ def _vpr_embed_images(model, pil_images, dimensions=None):
 _SALAD_IDS = {'salad', 'dinov2-salad'}
 
 
+#: Where a locally compiled `dinov2-embed` may live, in order. The image
+#: installs helper binaries it collected (whisper-server, ds4-server, …) into
+#: /usr/local/bin, so that is the first place to look -- NOT
+#: /opt/coderai/bin, which was the only place this used to look and which does
+#: not exist in the image at all. Consequence, measured on 2026-10-26: 6,176
+#: image-embedding requests answered 500 over about twelve hours, with the
+#: binary absent from the image and the error naming a directory nobody
+#: installs to.
+_DINOV2_EMBED_CANDIDATES = (
+    "/usr/local/bin/dinov2-embed",
+    "/opt/coderai/bin/dinov2-embed",
+    # The working tree, for a developer who built it where the source is. This
+    # path is bind-mounted into the container in live-code mode, so a build
+    # landing here is reachable without rebuilding the image.
+    "/opt/coderai/app/third_party/bin/dinov2-embed",
+)
+
+
+def _dinov2_embed_bin() -> str:
+    """The `dinov2-embed` binary, or a RuntimeError naming every place looked.
+
+    DINOV2_EMBED_BIN still wins, so an operator can point at a build anywhere;
+    without it, PATH and the install locations are searched. The error has to
+    list what was tried, because the one-path version sent whoever read it to
+    build a binary into a directory that would not have been used anyway.
+    """
+    import os as _os
+    import shutil as _shutil
+    explicit = (_os.environ.get("DINOV2_EMBED_BIN") or "").strip()
+    if explicit:
+        if _os.path.isfile(explicit):
+            return explicit
+        raise RuntimeError(
+            f"dinov2-embed binary not found at {explicit!r} (from "
+            f"DINOV2_EMBED_BIN) — build it with packaging/dinov2cpp/build.sh")
+    on_path = _shutil.which("dinov2-embed")
+    if on_path:
+        return on_path
+    for cand in _DINOV2_EMBED_CANDIDATES:
+        if _os.path.isfile(cand):
+            return cand
+    raise RuntimeError(
+        "dinov2-embed binary not found — looked on PATH and at "
+        + ", ".join(_DINOV2_EMBED_CANDIDATES)
+        + ". Build it with packaging/dinov2cpp/build.sh and install it to "
+          "/usr/local/bin (where the image collects helper binaries), or point "
+          "DINOV2_EMBED_BIN at it. This model is image-only and has no "
+          "fallback runtime: without the binary every request for it fails.")
+
+
 def _is_salad(model_name) -> bool:
     return str(model_name).strip().lower().replace('_', '-') in _SALAD_IDS
 
@@ -827,11 +877,7 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
             and 'dinov2' in _os_basename(model_name).lower()):
         import os as _os
         import subprocess
-        _bin = _os.environ.get('DINOV2_EMBED_BIN', '/opt/coderai/bin/dinov2-embed')
-        if not _os.path.isfile(_bin):
-            raise RuntimeError(
-                f"dinov2-embed binary not found at {_bin} — build it with "
-                "packaging/dinov2cpp/build.sh")
+        _bin = _dinov2_embed_bin()
         cfg = model_config or {}
         raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
         env = dict(_os.environ)

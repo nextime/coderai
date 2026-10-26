@@ -101,6 +101,12 @@ add_local_binary() {
   local path="$1"
   local abs_path
   [[ -x "$path" && -f "$path" ]] || return 0
+  # A "<name>-libs" directory beside a binary holds that binary's PRIVATE
+  # shared libraries, reached through its own RPATH. Those .so files are
+  # executable, so a --local-binary-dir sweep would otherwise flatten them
+  # into bin/ as if they were programs -- and away from the one place the
+  # RPATH looks for them.
+  [[ "$(dirname "$path")" == *-libs ]] && return 0
   abs_path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
   for existing in "${LOCAL_BINARIES[@]}"; do
     [[ "$existing" == "$abs_path" ]] && return 0
@@ -120,6 +126,16 @@ done
 for b in "${LOCAL_BINARIES[@]}"; do
   [[ -x "$b" ]] || { echo "Error: local binary is not executable: $b" >&2; exit 2; }
   cp -a "$b" "$STAGE/bin/"
+  # ...and its private library directory, if it has one. dinov2-embed needs
+  # OpenCV, which no coderai artefact carries as system libraries (only the
+  # venv's cv2 wheel, at a different version and with mangled sonames), so the
+  # libraries travel beside the binary on its RPATH. Shipping the binary
+  # without them produces a program that cannot start -- which is exactly how
+  # the DINOv2 embedder came to answer 500 for twelve hours.
+  if [[ -d "${b}-libs" ]]; then
+    rsync -a "${b}-libs/" "$STAGE/bin/$(basename "${b}")-libs/"
+    echo "Included private libraries for $(basename "$b"): $(find "${b}-libs" -type f | wc -l) file(s)"
+  fi
 done
 
 if [[ "$INCLUDE_LOCAL_LIBS" == "1" ]]; then

@@ -25,6 +25,10 @@ debug.log
 # A HuggingFace cache a voice-conversion model writes beside the source when it
 # is given no cache dir (1.4 GB of weights, with its CACHEDIR.TAG).
 /checkpoints/
+# Locally compiled helper binaries and the private shared libraries that
+# travel with them (packaging/dinov2cpp/build.sh puts dinov2-embed here, which
+# live-code mode bind-mounts into the container). Build products, not source.
+/third_party/bin/
 
 # Third-party source clone of the GPTQ quantizer — installed into the venv from
 # source; the working tree is not part of this repo (it has its own .git).

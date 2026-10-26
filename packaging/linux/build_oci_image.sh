@@ -324,6 +324,14 @@ discover_local_binaries() {
     "${CODERAI_K3_DIR:-$HOME/.coderai/kimi-k3-in-c}/bin/k3"
     "/usr/local/bin/rife-ncnn-vulkan"
     "$HOME/.local/bin/rife-ncnn-vulkan"
+    # dinov2.cpp's embed server (packaging/dinov2cpp/build.sh). The DINOv2 GGUF
+    # embedder has no other runtime -- llama.cpp cannot load a ViT-only arch --
+    # so an image built without this binary serves that model as a 500 and
+    # nothing else notices. It was missing for exactly that reason: built by
+    # hand, never listed here, dropped by the next rebuild.
+    "/usr/local/bin/dinov2-embed"
+    "$HOME/.local/bin/dinov2-embed"
+    "${CODERAI_DINOV2_DIR:-/tmp/dinov2cpp-build}/dinov2.cpp/build/bin/dinov2-embed"
   )
   local path
   for path in "${candidates[@]}"; do
@@ -367,6 +375,22 @@ prepare_venv_bundle() {
     # entries are often symlinks to a build dir (e.g. ~/whisper.cpp/build/bin);
     # copying the link verbatim leaves a dangling symlink in the image.
     cp -aL --remove-destination "$bin_path" "$dest_path"
+  done
+
+  # A helper binary may carry PRIVATE shared libraries in a sibling
+  # "<name>-libs" directory, reached through its own RPATH ($ORIGIN/<name>-libs)
+  # rather than through LD_LIBRARY_PATH. dinov2-embed needs OpenCV, which this
+  # image does not have as system libraries -- only the venv's cv2 wheel, at a
+  # different version and with mangled sonames -- and putting OpenCV in
+  # local-libs would offer it to every process in the image, cv2 included.
+  # A private directory on one binary's RPATH cannot shadow anything.
+  for bin_path in "${LOCAL_BINARIES[@]}"; do
+    local priv_libs="${bin_path}-libs"
+    [[ -d "$priv_libs" ]] || continue
+    mkdir -p "$bundle/local-bin/$(basename "$priv_libs")"
+    rsync -a "$priv_libs/" "$bundle/local-bin/$(basename "$priv_libs")/"
+    printf 'Included private libraries for %s: %s file(s)\n' \
+      "$(basename "$bin_path")" "$(find "$priv_libs" -type f | wc -l)"
   done
 
   if [[ ${#LOCAL_BINARIES[@]} -gt 0 ]]; then
