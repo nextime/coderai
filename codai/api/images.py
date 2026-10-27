@@ -1655,7 +1655,20 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                     _ep_kwargs["negative_prompt"] = neg_prompt or None
                 enc = pipeline.encode_prompt(**_ep_kwargs)
                 # enc is a tuple; length varies by pipeline type
-                if len(enc) == 2:
+                _call_params = set(
+                    _inspect.signature(pipeline.__call__).parameters)
+                if len(enc) == 2 and 'prompt_embeds_mask' in _call_params:
+                    # Krea 2 and the Qwen-Image family also return a 2-tuple,
+                    # but it is (prompt_embeds, prompt_embeds_mask) -- not a
+                    # negative. Passing the mask AS the negative is what the
+                    # pipeline reports as "If `prompt_embeds` are provided,
+                    # `prompt_embeds_mask` also have to be passed", which reads
+                    # like a missing argument rather than a mislabelled one.
+                    # These are not CLIP-pair pipelines, so weighted 75-token
+                    # windows mean nothing to them: let the pipeline encode the
+                    # prompt itself, the way Z-Image already does.
+                    embed_kwargs = {}
+                elif len(enc) == 2:
                     # SD 1.x: (prompt_embeds, negative_prompt_embeds)
                     embed_kwargs = {
                         'prompt_embeds': enc[0],
