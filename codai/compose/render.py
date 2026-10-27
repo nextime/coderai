@@ -350,17 +350,30 @@ def bubble_geometry(width: int, height: int, size: float, position: str,
 def composite_pip(base: str, presenter: str, out_path: str, *, width: int, height: int,
                   fps: int, size: float = 0.38, position: str = "bottom-right",
                   shape: str = "circle", border: Optional[dict] = None,
+                  alpha_video: Optional[str] = None,
                   workdir: str = "", cancel=None, log=None) -> str:
-    """The presenter as a bubble over the scene's visuals."""
+    """The presenter as a bubble over the scene's visuals.
+
+    ``alpha_video`` is a per-frame mask (see ``codai/compose/matting.py``) and
+    takes the shape mask's place: the person is cut out instead of a circle of
+    the room they were filmed in. ``size`` and ``position`` still place them,
+    but a border would outline nothing, so it is not drawn."""
     bw, bh, x, y = bubble_geometry(width, height, size, position, shape)
     border = border or {}
-    mask, ring = bubble_mask(os.path.join(workdir or ".", f"bubble-{bw}x{bh}"), bw, bh,
-                             shape, int(border.get("width") or 0),
-                             border.get("color") or border.get("colour") or "#FFFFFF")
+    if alpha_video:
+        mask, ring = alpha_video, None
+        mask_filter = (f"[2:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+                       f"crop={bw}:{bh},format=gray[pm]")
+    else:
+        mask, ring = bubble_mask(
+            os.path.join(workdir or ".", f"bubble-{bw}x{bh}"), bw, bh,
+            shape, int(border.get("width") or 0),
+            border.get("color") or border.get("colour") or "#FFFFFF")
+        mask_filter = "[2:v]format=gray[pm]"
     inputs = ["-i", base, "-i", presenter, "-i", mask]
     graph = [f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
              f"crop={bw}:{bh},format=rgba[pv]",
-             "[2:v]format=gray[pm]",
+             mask_filter,
              "[pv][pm]alphamerge[pa]"]
     top = "pa"
     if ring:
@@ -374,19 +387,36 @@ def composite_pip(base: str, presenter: str, out_path: str, *, width: int, heigh
 
 
 def composite_split(base: str, presenter: str, out_path: str, *, width: int, height: int,
-                    fps: int, presenter_half: str = "bottom", cancel=None,
+                    fps: int, presenter_half: str = "bottom",
+                    alpha_video: Optional[str] = None, cancel=None,
                     log=None) -> str:
-    """Presenter and B-roll stacked, each filling its half."""
+    """Presenter and B-roll stacked, each filling its half.
+
+    With ``alpha_video`` the presenter's half is the person cut out **over** the
+    B-roll rather than over their own background, so both halves show the
+    scene's visuals and only one of them has someone standing in it."""
     half = int(height / 2 / 2) * 2
     fill = (f"scale={width}:{half}:force_original_aspect_ratio=increase,"
             f"crop={width}:{half},setsar=1")
-    top_in, bottom_in = ((1, 0) if (presenter_half or "bottom").lower() == "top"
-                         else (0, 1))
-    graph = [f"[{top_in}:v]{fill}[t]", f"[{bottom_in}:v]{fill}[b]",
-             f"[t][b]vstack=inputs=2,pad={width}:{height}:0:0,"
-             f"format=yuv420p,fps={fps}[vout]"]
-    run(["-i", base, "-i", presenter, "-filter_complex", ";".join(graph),
-         "-map", "[vout]", "-an"] + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    presenter_top = (presenter_half or "bottom").lower() == "top"
+    if alpha_video:
+        graph = [f"[0:v]{fill},split=2[bplain][bunder]",
+                 f"[1:v]{fill},format=rgba[pv]",
+                 f"[2:v]{fill},format=gray[pm]",
+                 "[pv][pm]alphamerge[pa]",
+                 "[bunder][pa]overlay=0:0[ph]"]
+        top, bottom = ("ph", "bplain") if presenter_top else ("bplain", "ph")
+        inputs = ["-i", base, "-i", presenter, "-i", alpha_video]
+    else:
+        top_in, bottom_in = (1, 0) if presenter_top else (0, 1)
+        graph = [f"[{top_in}:v]{fill}[t]", f"[{bottom_in}:v]{fill}[b]"]
+        top, bottom = "t", "b"
+        inputs = ["-i", base, "-i", presenter]
+    graph.append(f"[{top}][{bottom}]vstack=inputs=2,pad={width}:{height}:0:0,"
+                 f"format=yuv420p,fps={fps}[vout]")
+    run(inputs + ["-filter_complex", ";".join(graph),
+                  "-map", "[vout]", "-an"] + _INTER_ARGS + [out_path],
+        cancel=cancel, log=log)
     return out_path
 
 

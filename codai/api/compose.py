@@ -751,6 +751,43 @@ def _gpu_lease(loop, model_key: str) -> _Lease:
     return _Lease(loop, lease)
 
 
+def _matte_presenter(pres: dict, *, index: int, work: str, fps: int, warn, stage,
+                     progress: float, scene_no: str, cancel, log, gpu_lease) -> None:
+    """Cut this scene's presenter out of their background, or say why not.
+
+    `remove_background` is documented as optional, so nothing here is fatal: a
+    scene whose background cannot be removed still gets its presenter, filmed
+    room and all, plus a warning naming the scene. The alpha it leaves behind is
+    what the compositor uses in place of the bubble's shape mask."""
+    layout = (pres.get("layout") or "full").lower()
+    if layout not in ("pip", "split"):
+        warn(f"scene {index}: presenter.remove_background needs the pip or split "
+             f"layout — a full-screen presenter has no B-roll to stand in front of")
+        return
+    try:
+        from codai.compose import matting
+    except Exception as exc:
+        warn(f"scene {index}: background removal is unavailable here ({exc}); "
+             f"the presenter is composited as filmed")
+        return
+    if not matting.available():
+        warn(f"scene {index}: no matting engine (install torchvision, or point "
+             f"CODERAI_MATTING_MODEL at a TorchScript matting model); the "
+             f"presenter is composited as filmed")
+        return
+    stage("presenter", progress, f"scene {scene_no}: removing the background")
+    try:
+        pres["alpha"] = matting.matte(
+            pres["path"], os.path.join(work, f"pres{index}-alpha.mp4"),
+            fps=fps, cancel=cancel, log=log, gpu_lease=gpu_lease)
+        pres["matted"] = matting.engine_name()
+    except rnd.Cancelled:
+        raise
+    except Exception as exc:
+        warn(f"scene {index}: the background could not be removed ({exc}); "
+             f"the presenter is composited as filmed")
+
+
 def _b64_to_file(b64: str, path: str) -> str:
     with open(path, "wb") as f:
         f.write(base64.b64decode(b64))
@@ -1389,9 +1426,6 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                     continue
                 stage("presenter", 30.0 + 9.0 * i / max(1, n_scenes),
                       f"scene {i + 1}/{n_scenes}: lip-sync")
-                if spec.get("remove_background"):
-                    warn(f"scene {i}: presenter.remove_background is not available on "
-                         f"this install; the presenter is composited as filmed")
                 try:
                     presenters[i] = _pres.build_scene_presenter(
                         spec, narration=scene_audio[i], duration=scene_dur[i] + extra_t,
@@ -1400,6 +1434,13 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                         gpu_lease=lambda: _gpu_lease(loop, "lipsync"))
                     presenters[i]["layout"] = (spec.get("layout") or "full").lower()
                     presenters[i]["spec"] = spec
+                    if spec.get("remove_background"):
+                        _matte_presenter(presenters[i], index=i, work=work,
+                                         fps=canvas.fps, warn=warn, stage=stage,
+                                         progress=30.0 + 9.0 * i / max(1, n_scenes),
+                                         scene_no=f"{i + 1}/{n_scenes}",
+                                         cancel=cancel, log=log,
+                                         gpu_lease=lambda: _gpu_lease(loop, "lipsync"))
                 except rnd.Cancelled:
                     raise
                 except Exception as exc:
@@ -1485,13 +1526,15 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                                           fps=canvas.fps, size=spec.get("size", 0.38),
                                           position=spec.get("position") or "bottom-right",
                                           shape=spec.get("shape") or "circle",
-                                          border=spec.get("border"), workdir=work,
+                                          border=spec.get("border"),
+                                          alpha_video=pres.get("alpha"), workdir=work,
                                           cancel=cancel, log=log)
                     else:
                         rnd.composite_split(joined, pres["path"], comp,
                                             width=canvas.width, height=canvas.height,
                                             fps=canvas.fps,
                                             presenter_half=spec.get("split") or "bottom",
+                                            alpha_video=pres.get("alpha"),
                                             cancel=cancel, log=log)
                     clips.append(comp)
                 except rnd.Cancelled:
@@ -1684,7 +1727,12 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
             {"index": i, "start": starts[i],
              "end": round(starts[i] + scene_dur[i], 3),
              "presenter": ({"engine": presenters[i]["engine"],
-                            "layout": presenters[i]["layout"]}
+                            "layout": presenters[i]["layout"],
+                            # Which matting engine cut them out, or None when
+                            # the scene was composited as filmed -- a client
+                            # that asked for remove_background can tell the two
+                            # apart without reading the warnings.
+                            "matted": presenters[i].get("matted")}
                            if presenters[i] else None)}
             for i in range(n_scenes)]
         result["duration"] = total
@@ -1904,10 +1952,18 @@ async def presenter_engines(_auth=Depends(_require_api_auth)):
     feature instead of discovering a 501 at submission."""
     from codai.compose import presenter as _pres
     have = _pres.available_engines()
+    try:
+        from codai.compose import matting
+        matte = matting.engine_name()
+    except Exception:
+        matte = None
     return {"engines": have, "available": bool(have),
             "video_engines": [e for e in have if e in _pres.VIDEO_ENGINES],
             "portrait_engines": [e for e in have if e in _pres.PORTRAIT_ENGINES],
             "layouts": ["full", "pip", "split"],
+            # remove_background is a separate model from the lip-sync engine, so
+            # a client greys out that toggle on its own.
+            "matting_engine": matte, "remove_background": bool(matte),
             "talking_head_max_seconds": TALKING_HEAD_MAX_SECONDS}
 
 

@@ -796,7 +796,11 @@ def test_a_full_screen_presenter_replaces_the_scenes_visuals(tmp_path, files_dir
     assert calls and calls[0]["engine"] == "wav2lip"
     # It was driven by THIS scene's narration, and the clip is the scene's length.
     assert calls[0]["audio_seconds"] == pytest.approx(1.0, abs=0.1)
-    assert doc["result"]["scenes"][0]["presenter"] == {"engine": "wav2lip", "layout": "full"}
+    # "matted" is None unless remove_background cut the presenter out: the field
+    # is how a client tells "composited as filmed" from "cut out".
+    assert doc["result"]["scenes"][0]["presenter"] == {"engine": "wav2lip",
+                                                      "layout": "full",
+                                                      "matted": None}
     vid = files_dir / doc["result"]["video"]["path"].split("/")[-1]
     info = media.probe(str(vid))
     assert (info["width"], info["height"]) == (160, 284)

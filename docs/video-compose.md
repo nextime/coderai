@@ -307,7 +307,7 @@ identity-locked video generation are here too.
     "shape": "circle",              // pip: circle | rounded | rect
     "split": "bottom",              // split: which half the presenter takes
     "border": {"color": "#FFFFFF", "width": 6},
-    "remove_background": false      // ignored (with a warning) when no matting is installed
+    "remove_background": false      // pip/split: cut the person out of their own background
   },
   "scenes": [
     {"text": "Hi! Today: three hearts.", "visuals": [...]},                      // the default presenter
@@ -335,18 +335,31 @@ identity-locked video generation are here too.
   each filling its half. With a presenter, a scene's visuals are joined without a
   transition *between them* and composited as one clip; without one, nothing
   changes.
+* **`remove_background`** cuts the presenter out of the room they were filmed in,
+  so a `pip` bubble is a person rather than a circle of their kitchen and a
+  `split` half shows them standing in the B-roll. It produces a per-frame mask
+  that takes the bubble shape's place — `size` and `position` still place them,
+  but a `border` would outline nothing and is not drawn, and `full` has no
+  B-roll to stand in front of, so it is declined with a warning. The engine is
+  torchvision's DeepLabV3 (already in the stack, weights fetched once), or a
+  TorchScript matting model — a Robust Video Matting export is the obvious one,
+  and being recurrent it is steadier over time — named by
+  `CODERAI_MATTING_MODEL`. `GET /v1/video/presenter/engines` reports
+  `matting_engine`, and `result.scenes[i].presenter.matted` names the engine
+  that actually ran (`null` when the scene was composited as filmed).
 * **Nothing fails the render**: no engine, no face, a crash, a failed composite —
   each falls back to the scene's visuals (or a gradient when there are none) and
   adds a warning naming the scene. `stage` is `presenter`, with
   `message: "scene 2/6: lip-sync"`, and `result.scenes[i].presenter` is
-  `{"engine": …, "layout": …}` or `null`.
+  `{"engine": …, "layout": …, "matted": …}` or `null`.
 * **Errors at submission**: `400` for an unknown character, an invalid layout,
   position, size, shape, motion or a `pip` scene with no visuals; `501` when a
   presenter is asked for and no lip-sync engine is installed, naming what to
   install.
-* **GPU**: lip-sync is the only GPU step in a composition (the rest is ffmpeg), so
-  it takes a lease from the same scheduler ordinary model requests use instead of
-  fighting a generation for the card.
+* **GPU**: lip-sync and background removal are the GPU steps in a composition
+  (the rest is ffmpeg), so each takes a lease from the same scheduler ordinary
+  model requests use instead of fighting a generation for the card, and the
+  matting model is dropped as soon as the scene's mask is written.
 
 ### `POST /v1/video/talking-head`
 
