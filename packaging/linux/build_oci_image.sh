@@ -58,6 +58,13 @@ MAKE_DIST=1
 # build). Off with --no-prune. Only dangling images are removed — never tagged
 # images (the final image, the pulled CUDA base, or anything else you have).
 PRUNE_BUILD_IMAGES=1
+# Before capturing the venv, compare it against the packages the PREVIOUS image
+# shipped and refuse to build when something has fallen out of it. The image is
+# a capture: a package uninstalled from the dev venv months ago leaves no trace
+# in the build log and simply disappears from every install. `gguf` did exactly
+# that, and the symptom was diffusers calling a GGUF file unreadable.
+REQ_CHECK=1
+REQ_CHECK_BASELINE="${CODERAI_REQ_CHECK_IMAGE:-coderai:base}"
 # --versioned auto-derives a structured image tag from the app version + build
 # mode + target GPU: full_<gpu>_<version> for a local-venv build, base_<gpu>_<version>
 # for a from-scratch build (e.g. coderai:full_all_0.1.0). GPU_SEL is a label only —
@@ -104,6 +111,8 @@ Options:
                           only — the image always bundles both CUDA and Vulkan.
   --no-dist               Just build the image; skip exporting + bundling for distribution.
   --dist                  Force building the distribution bundle (default ON).
+  --no-req-check          Skip the "did this venv lose a package the last image had?"
+                          check (baseline: $CODERAI_REQ_CHECK_IMAGE or coderai:base).
   --no-prune              Keep the dangling/intermediate images the build created.
   --prune                 Prune dangling build images after building (default ON).
   -h, --help              Show this help.
@@ -226,6 +235,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-dist)
       MAKE_DIST=0
+      shift
+      ;;
+    --no-req-check)
+      REQ_CHECK=0
       shift
       ;;
     --no-prune)
@@ -687,6 +700,12 @@ Set PYTHON_VERSION in packaging/versions.env to a python-build-standalone releas
 or use a matching virtualenv.
 EOF
     exit 2
+  fi
+  if [[ "$REQ_CHECK" == "1" ]]; then
+    if ! python3 "$ROOT_DIR/packaging/linux/check_venv_requirements.py" \
+         "$VENV_PATH/bin/python" "$REQ_CHECK_BASELINE" "${DOCKER_CMD[@]}"; then
+      exit 2
+    fi
   fi
   VENV_CONTEXT="$ROOT_DIR/.packaging-cache/oci-venv-context"
   prepare_venv_bundle "$VENV_PATH" "$VENV_CONTEXT" "$INCLUDE_LOCAL_LIBS"
