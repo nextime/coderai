@@ -93,3 +93,42 @@ def test_the_helper_is_the_shared_one(monkeypatch):
     src = inspect.getsource(presenter._run) + inspect.getsource(lipsync.run_wav2lip)
     assert src.count("clean_py_env()") == 2
     assert "dict(os.environ)" not in src
+
+
+def test_the_servers_own_native_libraries_are_not_on_the_childs_loader_path():
+    """Second layer of the same bug, found the same way. The container
+    launcher exports
+
+        LD_LIBRARY_PATH=/opt/coderai/python/lib:/opt/coderai/local-libs:…
+
+    so SadTalker's 3.10 torch loaded THIS python's extension module and died:
+
+        ImportError: /opt/coderai/local-libs/libtorch_python.so:
+        undefined symbol: PyObject_GetOptionalAttrString
+
+    which is a CPython 3.13 API. The variable is filtered, not dropped: an
+    isolated venv ships its own torch and CUDA wheels and still needs whatever
+    the operator put on that path."""
+    from codai.api.venv_env import clean_py_env
+
+    env = clean_py_env({
+        "LD_LIBRARY_PATH": ":".join([
+            "/opt/coderai/python/lib",
+            "/opt/coderai/local-libs",
+            "/opt/coderai/python/lib/python3.13/site-packages/nvidia/cublas/lib",
+            "/usr/local/cuda/lib64",
+            "/opt/rocm/lib",
+        ])})
+    kept = env["LD_LIBRARY_PATH"].split(":")
+    assert "/opt/coderai/local-libs" not in kept
+    assert not any(e.startswith("/opt/coderai/python") for e in kept)
+    assert kept == ["/usr/local/cuda/lib64", "/opt/rocm/lib"]
+
+
+def test_a_child_with_nothing_left_on_the_path_gets_no_variable_at_all():
+    """An empty LD_LIBRARY_PATH is not the same as an unset one: the empty
+    string means 'the current directory' to the loader."""
+    from codai.api.venv_env import clean_py_env
+
+    env = clean_py_env({"LD_LIBRARY_PATH": "/opt/coderai/local-libs"})
+    assert "LD_LIBRARY_PATH" not in env
