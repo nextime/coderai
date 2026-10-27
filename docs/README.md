@@ -31,6 +31,7 @@ reference; these are the deep dives.
 | [expressive-tts.md](expressive-tts.md) | Expressive text-to-speech |
 | [image-prompts.md](image-prompts.md) | Image prompts: the `(tag:1.3)` / `[tag]` / `BREAK` grammar, prompts past CLIP's 77 tokens, `clip_skip`, negative prompts, textual-inversion embeddings, size validation |
 | [zimage-lora-training.md](zimage-lora-training.md) | LoRA training for image models |
+| [text-to-music.md](text-to-music.md) | `POST /v1/audio/generate` with ACE-Step: style prompt + sung lyrics → a 48 kHz stereo track, the python-3.12 worker it needs, and the two image variants (`--with-acestep`) |
 | [dtype-auto-selection.md](dtype-auto-selection.md) | How model dtype is chosen automatically |
 | [model-defaults-and-sources.md](model-defaults-and-sources.md) | A model's own `defaults` (steps/guidance/sampler/modes/licence), the sampler names and the flow-matching boundary, and where weights come from: repo, single file, `org/repo:file` or `civitai:<versionId>` |
 

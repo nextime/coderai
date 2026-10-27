@@ -36,6 +36,14 @@ LONGCAT_VENV="${CODERAI_LONGCAT_VENV:-$HOME/.coderai/longcat_venv}"
 # …and its CODE: LongCatVideoPipeline lives in the repo's own `longcat_video` package,
 # not on PyPI, so the source is bundled like Wav2Lip/SadTalker. Weights are NOT.
 LONGCAT_SRC="${CODERAI_LONGCAT_SRC:-$HOME/.coderai/LongCat-Video}"
+# ACE-Step (text-to-music) runs in a PYTHON 3.12 venv of its own -- it pins
+# spacy==3.8.4, which publishes no cp313 wheel, so it cannot share the server's
+# interpreter at all. The venv is ~6.4 GB, which is why it is OFF by default:
+# the slim image builds it on the first request to an ACE-Step model, exactly
+# as every other isolated worker does, and the --with-acestep variant bakes it
+# in for installs that would rather pay the size than the first-call wait.
+ACESTEP_VENV="${CODERAI_ACESTEP_VENV:-$HOME/.coderai/acestep_venv}"
+INCLUDE_ACESTEP=0
 WAV2LIP_DIR="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"
 SADTALKER_DIR="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"
 DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
@@ -80,6 +88,12 @@ Options:
                           $CODERAI_PARLER_VENV or ~/.coderai/parler_venv if present).
   --no-parler             Do not bundle the Parler-TTS venv overlay.
   --no-tools              Do not bundle the lip-sync (wav2lip/sadtalker) venvs or ds4.
+  --with-acestep          Bake the ACE-Step python-3.12 venv into the image (~6.4 GB).
+                          Off by default: without it the worker builds the venv on the
+                          first request to an ACE-Step model. Copies the existing dev
+                          venv ($CODERAI_ACESTEP_VENV or ~/.coderai/acestep_venv) when
+                          there is one, and builds it with uv when there is not.
+  --acestep-venv PATH     Bundle this ACE-Step venv (implies --with-acestep).
   -t, --tag TAG           Image tag to create (default: coderai:local or OCI_IMAGE from versions.env).
   --versioned             Auto-derive the tag from the app version + build mode + GPU:
                             local-venv build -> coderai:full_<gpu>_<version>
@@ -153,6 +167,21 @@ while [[ $# -gt 0 ]]; do
     --no-tools)
       INCLUDE_TOOLS=0
       shift
+      ;;
+    --with-acestep)
+      BUILD_MODE="venv"
+      INCLUDE_ACESTEP=1
+      shift
+      ;;
+    --acestep-venv)
+      BUILD_MODE="venv"
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --acestep-venv requires a path" >&2
+        exit 2
+      fi
+      ACESTEP_VENV="$2"
+      INCLUDE_ACESTEP=1
+      shift 2
       ;;
     --include-local-bin)
       BUILD_MODE="venv"
@@ -410,6 +439,70 @@ prepare_venv_bundle() {
       echo "Bundled Parler-TTS overlay from: $parler_sp"
     else
       echo "Warning: --parler-venv given but no site-packages at $parler_sp (skipping)" >&2
+    fi
+  fi
+
+  # ACE-Step's python-3.12 venv, and the interpreter it has to run on. The base
+  # image is Ubuntu 22.04, whose system python is 3.10, so a 3.12 venv needs its
+  # own standalone interpreter bundled alongside it and re-pointed during the
+  # image build -- the same arrangement as the py3.10 venvs below.
+  if [[ "$INCLUDE_ACESTEP" == "1" ]]; then
+    # The dev install is the preferred source: it is already built and already
+    # the thing being tested. Only build one when there is none.
+    if [[ ! -d "$ACESTEP_VENV" ]]; then
+      echo "No ACE-Step venv at $ACESTEP_VENV — building it (needs uv; several GB)…"
+      local _uv
+      _uv="$(command -v uv || true)"
+      [[ -z "$_uv" && -x "$HOME/.local/bin/uv" ]] && _uv="$HOME/.local/bin/uv"
+      if [[ -z "$_uv" ]]; then
+        echo "Error: --with-acestep needs either an existing venv at $ACESTEP_VENV or uv to build one" >&2
+        exit 2
+      fi
+      # unsafe-best-match is required, not a tuning knob: uv's default is
+      # first-index-wins, so with the PyTorch index in that requirements file it
+      # resolves unrelated packages off it and pins e.g. requests 2.28.1.
+      "$_uv" venv --python 3.12 "$ACESTEP_VENV"
+      "$_uv" pip install --python "$ACESTEP_VENV/bin/python" \
+             --index-strategy unsafe-best-match \
+             -r "$ROOT_DIR/requirements-acestep.txt"
+    fi
+    if [[ -d "$ACESTEP_VENV" ]]; then
+      local _ace_excl=(--exclude '__pycache__' --exclude '*.pyc' --exclude '*.dist-info/RECORD')
+      rsync -a "${_ace_excl[@]}" "$ACESTEP_VENV/" "$bundle/acestep_venv/"
+      echo "Bundled ACE-Step venv from: $ACESTEP_VENV"
+      # Find a RELOCATABLE 3.12. The dev venv's pyvenv.cfg usually says
+      # `home = /usr/bin`, which is the host's own python and cannot be copied
+      # into the image, so that case falls through to a uv-managed build.
+      local py312_dir=""
+      local _home
+      _home="$(sed -n 's/^home *= *//p' "$ACESTEP_VENV/pyvenv.cfg" 2>/dev/null | head -1)"
+      if [[ -n "$_home" && "$_home" != "/usr/bin" && "$_home" != "/usr/local/bin" ]]; then
+        py312_dir="$(dirname "$_home")"
+      fi
+      if [[ -z "$py312_dir" ]]; then
+        py312_dir="$(find "$HOME/.local/share/uv/python" -maxdepth 1 -type d \
+                     -name 'cpython-3.12*-linux-*' 2>/dev/null | sort | tail -1)"
+      fi
+      if [[ -z "$py312_dir" ]]; then
+        local _uv2
+        _uv2="$(command -v uv || true)"
+        [[ -z "$_uv2" && -x "$HOME/.local/bin/uv" ]] && _uv2="$HOME/.local/bin/uv"
+        if [[ -n "$_uv2" ]]; then
+          echo "Fetching a relocatable Python 3.12 for the image…"
+          "$_uv2" python install 3.12 >/dev/null 2>&1 || true
+          py312_dir="$(find "$HOME/.local/share/uv/python" -maxdepth 1 -type d \
+                       -name 'cpython-3.12*-linux-*' 2>/dev/null | sort | tail -1)"
+        fi
+      fi
+      if [[ -n "$py312_dir" && -d "$py312_dir" ]]; then
+        mkdir -p "$bundle/py312"
+        rsync -a "$py312_dir/" "$bundle/py312/"
+        echo "Bundled standalone Python 3.12 from: $py312_dir"
+      else
+        echo "Error: bundled the ACE-Step venv but found no relocatable Python 3.12 to run it on." >&2
+        echo "       Install one with 'uv python install 3.12' and rebuild, or drop --with-acestep." >&2
+        exit 2
+      fi
     fi
   fi
 

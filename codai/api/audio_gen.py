@@ -314,6 +314,30 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
         audio_np = wav[0, 0].cpu().numpy()
         sr = pipe.sample_rate
 
+    elif model_type == 'ace_step':
+        # The worker returns a finished wav: generation happened in another
+        # interpreter, so there is no array to resample or clip here, and the
+        # pipeline exposes no per-step callback to report progress from.
+        _aud_progress_reset(0, unit="s")
+        # Which fields the CLIENT actually sent, not which have a value: the
+        # shared request defaults are MusicGen's (10s, cfg 3.0) and would make
+        # every ACE-Step call a 10-second clip at a guidance it is not tuned
+        # for. A field left out falls back to ACE-Step's own default; a field
+        # explicitly set to 10 still means 10.
+        _sent = getattr(request, 'model_fields_set', set())
+        wav = pipe.generate(
+            prompt=request.prompt,
+            lyrics=getattr(request, 'lyrics', None) or "",
+            duration=(float(request.duration) if 'duration' in _sent
+                      and request.duration else 60.0),
+            steps=int(getattr(request, 'steps', None) or 60),
+            guidance_scale=(float(request.cfg_coef) if 'cfg_coef' in _sent
+                            and request.cfg_coef is not None else 15.0),
+            seed=request.seed,
+        )
+        task_registry.raise_if_cancelled(task_id)
+        return wav, 'wav'
+
     elif model_type == 'stable_audio':
         num_steps = int(getattr(request, 'steps', None) or 100)
         _aud_progress_reset(num_steps, unit="it")
@@ -439,16 +463,14 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
                     pipe = await asyncio.get_event_loop().run_in_executor(
                         None, _load_stable_audio, model_name, device, _ag_cfg)
                 elif model_type == 'ace_step':
-                    # ACE-Step ships its own package, which pins a stack this
-                    # venv cannot hold. It belongs in an isolated-venv worker
-                    # like CrisperWhisper and Canary; until that exists, say
-                    # so plainly rather than loading it as a MusicGen and
-                    # failing with a shape error three minutes later.
-                    raise RuntimeError(
-                        f"{model_name} is an ACE-Step model, which needs the "
-                        "`acestep` package in its own venv; coderai has no "
-                        "ACE-Step worker yet. Use a Stable Audio or MusicGen "
-                        "model for now.")
+                    # ACE-Step ships its own package pinning a stack this venv
+                    # cannot hold, so it runs in an isolated venv behind a
+                    # local HTTP service, like CrisperWhisper and Canary. The
+                    # handle cached here exposes cleanup(), so a model swap
+                    # evicts it and frees its VRAM like any other model.
+                    from codai.api.acestep_worker import AceStep
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, AceStep, model_name, _ag_cfg)
                 else:
                     pipe = await asyncio.get_event_loop().run_in_executor(
                         None, _load_audioldm, model_name, device, _ag_cfg)

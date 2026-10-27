@@ -63,17 +63,25 @@ def test_stable_audio_is_not_routed_to_audioldm():
     assert _detect_audio_gen_type("stabilityai/stable-audio-open-1.0") != "audioldm"
 
 
-def test_stable_audio_has_a_loader_and_ace_step_says_why_it_has_none():
+def test_stable_audio_and_ace_step_each_have_their_own_loader():
+    """ACE-Step used to raise here, naming the venv it needed; it now has that
+    venv and a worker in it (see tests/test_acestep_worker.py). What must not
+    come back is the old failure mode: loading it as a MusicGen and failing
+    with a shape error minutes later."""
     import inspect
 
     from codai.api import audio_gen
     assert hasattr(audio_gen, "_load_stable_audio")
     src = inspect.getsource(audio_gen)
-    i = src.index("elif model_type == 'ace_step':")
-    window = src[i:i + 700]
-    # Named plainly rather than loaded as a MusicGen and failing with a shape
-    # error minutes later.
-    assert "acestep" in window and "own venv" in window
+    # Two branches now carry that condition -- one to load, one to generate --
+    # so take the LAST, which is the loader.
+    load = src[src.rindex("elif model_type == 'ace_step':"):][:900]
+    assert "acestep_worker" in load and "AceStep" in load
+    assert "_load_musicgen" not in load
+    # ...and the generate branch returns the worker's wav rather than falling
+    # through to the array-to-int16 writer, which would see no audio_np at all.
+    gen = src[src.index("elif model_type == 'ace_step':"):][:1400]
+    assert "return wav, 'wav'" in gen
 
 
 def test_a_stereo_waveform_is_written_as_stereo():

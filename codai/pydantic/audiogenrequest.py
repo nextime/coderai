@@ -29,6 +29,15 @@ class AudioGenerationRequest(BaseModel):
     temperature: Optional[float] = 1.0
     cfg_coef: Optional[float] = 3.0        # classifier-free guidance coefficient
     seed: Optional[int] = None
+    # Diffusion models (Stable Audio, ACE-Step) count steps; the autoregressive
+    # ones (MusicGen, AudioGen) ignore this. Both branches already read it off
+    # the request -- undeclared it only arrived because `extra="allow"` let it
+    # through, so it was absent from the schema and from the docs.
+    steps: Optional[int] = None
+    # Sung lyrics, for the models that take them separately from the style
+    # prompt (ACE-Step). Supports its [verse]/[chorus] tags and the special
+    # values the model documents, e.g. "[inst]" for an instrumental.
+    lyrics: Optional[str] = None
     # Reference audio for melody conditioning (MusicGen Melody)
     melody: Optional[str] = None           # base64/URL
     # Voice profile for singing/speech conditioning

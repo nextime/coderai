@@ -5,23 +5,47 @@
 # server cannot hold -- the server runs transformers 5.x and a much newer
 # diffusers -- so it runs in its own venv and coderai talks to it over HTTP,
 # the same shape as CrisperWhisper and NeMo-Canary
-# (codai/api/acestep_worker.py + tools/acestep_service.py, both still to be
-# written). Do NOT merge these into requirements.txt.
+# (codai/api/acestep_worker.py + tools/acestep_service.py). Do NOT merge these
+# into requirements.txt.
 #
-# NOT YET INSTALLED. The `acestep` package is not on PyPI, so it installs from
-# the upstream git repository, and nothing here has been run or verified. The
-# audio_gen loader therefore refuses an ACE-Step model with an explicit
-# message rather than loading it as a MusicGen and failing with a shape error
-# minutes later. Install this venv, then introspect the package before
-# writing the service -- the API below the pin is not guessed at here.
+# The `acestep` package is not on PyPI, so it installs from the upstream git
+# repository at a pinned commit.
+#
+# BUILD THIS VENV WITH PYTHON 3.12, not the server's 3.13:
+#
+#     python3.12 -m venv ~/.coderai/acestep_venv
+#
+# ...except that a Debian host often has /usr/bin/python3.12 WITHOUT the
+# python3.12-venv package, so ensurepip is missing and that command fails. The
+# worker falls back to `uv venv --python 3.12`, which also fetches a 3.12 if
+# the host has none; with uv, `--index-strategy unsafe-best-match` is
+# mandatory (its default is first-index-wins, which resolves every shared name
+# off the PyTorch index below and pins e.g. requests 2.28.1).
+#
+# ACE-Step pins spacy==3.8.4, which has no cp313 wheel (3.8.7+ do, 3.8.4 does
+# not), so the install cannot be satisfied on 3.13 at all. Upstream's pin is
+# exact and respecting it is cheaper than fighting it. codai/api/lipsync's
+# venv already sets the precedent of a per-worker interpreter (3.10).
 #
 # CUDA build for the 3090; cu124 wheels run on this box's newer driver.
+#
+# 2.6.0 and not 2.5.1: there is no torchaudio==2.5.1+cu124 wheel for the
+# interpreters this can run on -- torch 2.5.1 has one, torchaudio does not, so
+# the pair cannot be satisfied. ACE-Step itself pins neither (its
+# requirements.txt asks for bare torch/torchaudio/torchvision), so the pair
+# here only has to be internally consistent.
 
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.5.1+cu124
-torchaudio==2.5.1+cu124
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
 soundfile>=0.12.0
 
-# ACE-Step itself, from the upstream repository. Pin the commit you install so
-# a rebuild is reproducible:
-#   acestep @ git+https://github.com/ace-step/ACE-Step.git@<commit>
+# ACE-Step itself, from the upstream repository. Pinned to a commit, not a
+# branch, so a rebuild gets the same code: `main` would silently change what
+# this venv contains between builds.
+# The DISTRIBUTION is ace-step (setup.py name="ace_step"); the importable
+# module is `acestep`. Naming it `acestep` here makes pip discard the wheel it
+# just built: "has inconsistent name: expected 'acestep', but metadata has
+# 'ace-step'".
+ace-step @ git+https://github.com/ace-step/ACE-Step.git@1bee4c9f5b43e30995f8d4d33b3919197ce1bd68

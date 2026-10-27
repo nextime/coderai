@@ -1454,7 +1454,8 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     for _var, _name in (("CODERAI_PYANNOTE_VENV", "pyannote"),
                         ("CODERAI_NEMO_VENV", "nemo"),
                         ("CODERAI_CRISPERWHISPER_VENV", "transformers"),
-                        ("CODERAI_XTTS_VENV", "TTS")):
+                        ("CODERAI_XTTS_VENV", "TTS"),
+                        ("CODERAI_ACESTEP_VENV", "acestep")):
         env.setdefault(_var, f"/opt/coderai/venvs/{_name}")
 
     if cap in ("tts", "voice"):
