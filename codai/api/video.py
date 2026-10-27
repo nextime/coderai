@@ -1177,6 +1177,30 @@ def _sage_usable() -> bool:
             return False
 
 
+#: Pipeline families that pass an ATTENTION MASK into attention.
+#:
+#: NEITHER of the fast backends accepts one. Both raise at the first denoising
+#: step, with the same sentence and a different name:
+#:
+#:     ValueError: `attn_mask` is not supported for sage attention
+#:     ValueError: `attn_mask` is not supported for flash-attn 2.
+#:
+#: So for these families the only working backend is the default SDPA, and
+#: "fall back to the other fast one" is not a fix -- measured 2026-10-27 on
+#: LTX-2.3-10Eros, which loaded cleanly, failed on sage, was moved to flash by
+#: a first version of this guard, and failed again identically.
+#:
+#: Matched on the pipeline class name, which is what names the family. LTX-2
+#: masks its text conditioning; the LTX 0.9 family is a different architecture
+#: and is not affected.
+_ATTN_MASK_FAMILIES = ("LTX2",)
+
+
+def _pipeline_uses_attn_mask(pipe) -> bool:
+    cls = type(pipe).__name__ if pipe is not None else ""
+    return any(f in cls for f in _ATTN_MASK_FAMILIES)
+
+
 def _apply_attention_backend(pipe, model_cfg: dict) -> None:
     """Switch the Wan transformer(s) to a faster attention backend (diffusers 0.38+
     dispatcher). Best-effort and per-component: if a backend isn't available it
@@ -1184,6 +1208,18 @@ def _apply_attention_backend(pipe, model_cfg: dict) -> None:
     name = _resolve_attn_backend(model_cfg)
     if not name:
         return
+    # `auto` picked sage for a family that masks its attention. An operator who
+    # named 'sage' explicitly is left alone -- that is their call to make, and
+    # they get the error -- but auto must not choose a backend that cannot run
+    # the model at all.
+    if name in ("sage", "flash") and _pipeline_uses_attn_mask(pipe):
+        _explicit = str((model_cfg or {}).get("video_attention_backend")
+                        or "").strip().lower()
+        if _explicit not in ("sage", "flash"):
+            print(f"  [video][attn] {type(pipe).__name__} passes an attention "
+                  f"mask, which neither SageAttention nor flash-attn 2 accepts "
+                  f"— keeping the default (SDPA)")
+            return
     applied = []
     for cn in ('transformer', 'transformer_2'):
         comp = getattr(pipe, cn, None)
