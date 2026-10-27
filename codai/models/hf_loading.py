@@ -714,6 +714,18 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             problems.append(f"{name}: {cls_name or 'its class'} is not loadable "
                             f"from a single file in this diffusers")
             continue
+        # A configured path that is simply not there is the commonest way this
+        # fails, and diffusers reports it as "Invalid `pretrained_model_name_
+        # _or_path` provided. Please set it to a valid URL." -- which reads
+        # like the repo id is wrong, not like a missing file. Measured: an
+        # entry pointing at ~/.cache on the HOST, which a container does not
+        # mount, cost a full round trip to diagnose.
+        _p = str(path).strip()
+        if not _p.startswith(("http://", "https://")) and not os.path.isfile(_p):
+            problems.append(
+                f"{name}: no such file: {_p} (a path this process cannot see "
+                f"-- in a container, check that it is under a mounted volume)")
+            continue
         try:
             print(f"  Loading GGUF component '{name}' from {path}")
             _undo = _patch_converter_key_aliases(cls_name, cls, cfg, name)
