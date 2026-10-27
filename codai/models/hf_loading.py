@@ -487,6 +487,84 @@ def build_single_file_pipeline(model_name: str, cfg: Optional[Dict[str, Any]],
           "from_single_file can infer.")
 
 
+def _missing_tensor_hint(exc, name: str, path: str, cfg) -> str:
+    """Turn a meta-tensor failure into the list of parameters actually absent.
+
+    ``Cannot copy out of meta tensor; no data!`` means some parameters were
+    never materialised, which for a GGUF almost always means the checkpoint
+    does not contain them -- and the message says nothing about WHICH. That
+    sends the reader looking for a corrupt file when the real answer is a
+    fine-tune exported without a branch the class declares.
+
+    Measured 2026-10-27 on LTX-2.3-10Eros and -PinkCherry: diffusers'
+    ``convert_ltx2_transformer_to_diffusers`` maps their 4444 GGUF tensors
+    onto exactly the 4186 the class expects, and precisely 12 remain -- all of
+    them ``audio_prompt_adaln.*``. Both fine-tunes, identically. So the
+    checkpoints are fine and the gap is one unused conditioning branch.
+
+    Best effort: any failure here returns "" and the original error stands.
+    """
+    if "meta tensor" not in str(exc).lower():
+        return ""
+    try:
+        import torch
+        from gguf import GGUFReader
+
+        from diffusers.loaders.single_file_model import (
+            SINGLE_FILE_LOADABLE_CLASSES)
+        specs = _discover_components(
+            (cfg or {}).get("path") or (cfg or {}).get("model") or "")
+        cls_name = (specs.get(name) or [None, None])[1]
+        conv = (SINGLE_FILE_LOADABLE_CLASSES.get(cls_name) or {}).get(
+            "checkpoint_mapping_fn")
+        if conv is None:
+            return ""
+        sd = {t.name: torch.zeros(1) for t in GGUFReader(path.strip()).tensors}
+        converted = set(conv(sd, config={}))
+        import diffusers
+        cls = getattr(diffusers, cls_name)
+        import json as _json
+        import os as _os
+        conf = _os.path.join(_component_dir(cfg, name) or "", "config.json")
+        if not _os.path.isfile(conf):
+            return ""
+        c = _json.load(open(conf))
+        c.pop("_class_name", None)
+        c.pop("_diffusers_version", None)
+        with torch.device("meta"):
+            m = cls.from_config(c)
+        expected = set(dict(m.named_parameters())) | set(dict(m.named_buffers()))
+        missing = sorted(expected - converted)
+        if not missing:
+            return ""
+        groups = sorted({k.split(".")[0] for k in missing})
+        return (f" -- the conversion mapped {len(converted)} of the "
+                f"checkpoint's tensors onto this class, and {len(missing)} "
+                f"parameter(s) remain unprovided, all in: {', '.join(groups)}. "
+                f"Those stay on the meta device, which is what this error "
+                f"means. The checkpoint is not corrupt -- it was exported "
+                f"without that branch. Supplying the weights would be "
+                f"inventing them, so this refuses instead; use a checkpoint "
+                f"that carries them, or a class whose config omits that "
+                f"branch.")
+    except Exception:
+        return ""
+
+
+def _component_dir(cfg, name: str):
+    """The local directory of one component of the base pipeline, or None."""
+    import os
+    base = (cfg or {}).get("path") or (cfg or {}).get("model") or ""
+    try:
+        from huggingface_hub import snapshot_download
+        root = (base if os.path.isdir(base)
+                else snapshot_download(base, local_files_only=True))
+    except Exception:
+        return None
+    d = os.path.join(root, name)
+    return d if os.path.isdir(d) else None
+
+
 def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]], dtype):
     """Load pipeline components from GGUF files (Q2_K..Q8_0 — incl. 5/6-bit).
 
@@ -555,7 +633,8 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             components[name] = model
             descs.append(f"{name}:gguf")
         except Exception as e:
-            problems.append(f"{name} ({path}): {e}")
+            _hint = _missing_tensor_hint(e, name, path, cfg)
+            problems.append(f"{name} ({path}): {e}{_hint}")
     if problems:
         raise RuntimeError(
             "this model configures GGUF component(s) that could not be loaded, "
