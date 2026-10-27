@@ -2484,6 +2484,39 @@ class MultiModelManager:
         self._remember_registered_type(model_name, "spatial")
         print(f"Registered spatial model: {model_name}")
 
+    def _alias_from_config(self, alias: str) -> Optional[str]:
+        """The ``path`` of a models.json entry whose ``alias`` is ``alias``.
+
+        Reads the config file's current contents rather than the registry
+        built at startup, so an entry added while the server runs can still be
+        resolved. Returns None when nothing matches, which leaves the caller's
+        existing behaviour untouched.
+        """
+        want = str(alias or "").strip().lower()
+        if not want:
+            return None
+        try:
+            from codai.admin.routes import config_manager
+            md = getattr(config_manager, "models_data", {}) or {}
+        except Exception:
+            return None
+        for section, entries in (md or {}).items():
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                if str(e.get("alias") or "").strip().lower() != want:
+                    continue
+                # A parked entry is not servable, and resolving its alias would
+                # defeat the parking.
+                if e.get("enabled") is False:
+                    return None
+                target = e.get("path") or e.get("model_path")
+                if target and str(target).strip().lower() != want:
+                    return str(target)
+        return None
+
     def set_model_alias(self, alias: str, model_name: str):
         """Register an alias for a model."""
         self.model_aliases[alias] = model_name
@@ -5488,6 +5521,25 @@ class MultiModelManager:
             # that was serving the request.
             if requested_model in self.model_aliases:
                 requested_model = self.model_aliases[requested_model]
+            else:
+                # The alias map is built ONCE, when models.json is read at
+                # startup. The /v1/models listing re-reads models.json on every
+                # call, so a model added to the config while the server runs is
+                # ADVERTISED immediately and cannot be loaded at all: the alias
+                # resolves to nothing, the raw alias is handed to diffusers as a
+                # repo id, and the caller gets
+                # "Repository Not Found for url .../api/models/<alias>" -- a 401
+                # against HuggingFace for a model sitting on the local disk.
+                # Measured 2026-10-27 with a freshly added Wan2.2-TI2V-5B, whose
+                # weights were cached and whose `path` was correct.
+                #
+                # So an alias the map has not seen is looked up in the config
+                # itself before giving up. Advertising and serving then agree,
+                # which is the whole contract of /v1/models.
+                _late = self._alias_from_config(requested_model)
+                if _late:
+                    self.set_model_alias(requested_model, _late)
+                    requested_model = _late
 
             # Handle "default" alias
             if requested_model == "default":
