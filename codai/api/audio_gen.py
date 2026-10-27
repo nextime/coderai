@@ -95,7 +95,41 @@ def _derive_device() -> str:
     return "cuda:0"
 
 
-def _save_audio_response(audio_data: bytes, ext: str, http_request: Request) -> dict:
+def _to_mp3(wav_bytes: bytes) -> bytes:
+    """Transcode with ffmpeg, which every media path here already requires."""
+    import subprocess, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, "in.wav"), os.path.join(d, "out.mp3")
+        with open(src, 'wb') as f:
+            f.write(wav_bytes)
+        r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-i", src,
+                            "-codec:a", "libmp3lame", "-q:a", "2", dst],
+                           capture_output=True)
+        if r.returncode != 0 or not os.path.exists(dst):
+            tail = (r.stderr or b"").decode(errors="replace").strip()[-300:]
+            raise RuntimeError(f"mp3 encoding failed: {tail}")
+        with open(dst, 'rb') as f:
+            return f.read()
+
+
+def _save_audio_response(audio_data: bytes, ext: str, http_request: Request,
+                         response_format: str = None) -> dict:
+    """Return the generated audio the way the CALLER asked for it.
+
+    This used to switch on whether a file directory was configured, so
+    `response_format` -- a declared field documented as url | b64_wav | b64_mp3
+    -- did nothing whenever one was: a client asking for base64 silently got a
+    URL instead of bytes. Same bug the image endpoint had with b64_json.
+    """
+    want = (response_format or "url").strip().lower()
+    if want in ("b64_mp3", "mp3"):
+        # Asked for mp3, so send mp3. Returning base64 of a wav under a
+        # b64_mp3 key would be a decoding failure at the client, not a format
+        # it can use.
+        return {"b64_mp3": base64.b64encode(_to_mp3(audio_data)).decode()}
+    if want.startswith("b64") or want in ("base64", "bytes"):
+        return {f"b64_{ext}": base64.b64encode(audio_data).decode()}
+
     filename = f"{uuid.uuid4().hex}.{ext}"
     if global_file_path:
         os.makedirs(global_file_path, exist_ok=True)
@@ -104,9 +138,9 @@ def _save_audio_response(audio_data: bytes, ext: str, http_request: Request) -> 
             f.write(audio_data)
         from codai.api.urlutils import build_file_url
         return {"url": build_file_url(filename, http_request)}
-    else:
-        b64 = base64.b64encode(audio_data).decode()
-        return {f"b64_{ext}": b64}
+    # No directory to serve from: base64 is the only thing left, and it is
+    # better than a URL that would 404.
+    return {f"b64_{ext}": base64.b64encode(audio_data).decode()}
 
 
 class _TransformersMusicGen:
@@ -496,7 +530,8 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
         _aud_progress_done()
     task_registry.finish(_tid, "done")
 
-    result = _save_audio_response(audio_bytes, ext, http_request)
+    result = _save_audio_response(audio_bytes, ext, http_request,
+                                  getattr(request, 'response_format', None))
 
     try:
         from codai.api.archive import archive_manager

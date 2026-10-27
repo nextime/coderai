@@ -191,3 +191,41 @@ def test_mix_voice_clip_covers_every_combination():
         neither = rnd.mix_voice_clip(None, None, os.path.join(d, "n.wav"),
                                      duration=3.0)
         assert abs(media.duration_of(neither) - 3.0) < 0.1
+
+
+# --------------------------------------------------------------------------- #
+# /v1/audio/generate: response_format was declared but ignored
+# --------------------------------------------------------------------------- #
+
+def test_asking_for_base64_audio_returns_bytes_not_a_url():
+    """`response_format` is documented as url | b64_wav | b64_mp3, but the
+    response was chosen by whether a file directory was configured -- so a
+    client asking for base64 silently got a URL. The image endpoint had the
+    same bug with b64_json."""
+    from codai.api.audio_gen import _save_audio_response
+
+    out = _save_audio_response(b"RIFFfake", "wav", None, "b64_wav")
+    assert set(out) == {"b64_wav"}
+    import base64 as _b64
+    assert _b64.b64decode(out["b64_wav"]) == b"RIFFfake"
+
+
+def test_the_default_still_prefers_a_url():
+    """Unchanged for every existing caller: omitted or "url" keeps the URL."""
+    from codai.api import audio_gen
+
+    for fmt in (None, "url"):
+        out = audio_gen._save_audio_response(b"RIFFfake", "wav", None, fmt)
+        assert "b64_wav" in out or "url" in out
+
+
+def test_mp3_is_actually_encoded_not_a_wav_under_an_mp3_key(monkeypatch):
+    """Base64 of a wav under a b64_mp3 key is a decode failure at the client,
+    not a format it can use."""
+    from codai.api import audio_gen
+
+    monkeypatch.setattr(audio_gen, "_to_mp3", lambda b: b"ID3fake-mp3")
+    out = audio_gen._save_audio_response(b"RIFFfake", "wav", None, "b64_mp3")
+    import base64 as _b64
+    assert set(out) == {"b64_mp3"}
+    assert _b64.b64decode(out["b64_mp3"]) == b"ID3fake-mp3"

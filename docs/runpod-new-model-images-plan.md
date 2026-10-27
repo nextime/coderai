@@ -19,9 +19,9 @@ mechanism, the two cores, and the size line that constrains both.
 ## 1. ACE-Step: a new profile on the light core
 
 The one real finding: **the pod cores are `python:3.12-slim`**, which is exactly
-the interpreter ACE-Step needs. Locally this model forced a bundled standalone
-3.12 because the local image is Ubuntu 22.04 (system python 3.10); on a pod that
-whole problem disappears. `Dockerfile.capability`'s venv loop already does
+the interpreter ACE-Step needs. The local image is on Ubuntu 24.04, whose system python is
+also 3.12, so neither place needs a bundled interpreter — only a base older
+than 24.04 would. `Dockerfile.capability`'s venv loop already does
 `python -m venv /opt/coderai/venvs/<name>` with the image's own python, so a
 3.12 venv is what it produces by default.
 

@@ -57,6 +57,21 @@ expects (`ace_step_transformer`, `music_dcae_f8c8`, `music_vocoder`,
 `umt5-base`), so the worker points the pipeline straight at the snapshot
 coderai already has rather than letting it fetch a second copy.
 
+### The environment the worker is spawned into
+
+The container's **per-engine launchers export `PYTHONHOME=/opt/coderai/python`**
+(the standalone 3.13), while PID 1 and an interactive `docker exec` do not. A
+3.12 interpreter that inherits it aborts at startup before running any code, so
+the worker's "can this venv import what I need?" probe failed in milliseconds
+and the caller reported a missing requirements file instead — while the exact
+same command, run by hand in the same container, worked perfectly.
+
+Every spawn of the venv's python therefore goes through
+`codai/api/venv_env.clean_py_env()`, which strips `PYTHONHOME`, `PYTHONPATH`,
+`VIRTUAL_ENV` and friends. LongCat had this fix first for its 3.10 venv; it is
+shared now, because any worker on an interpreter that is not the server's hits
+it.
+
 ### It evicts like any other model
 
 The handle cached in the model manager exposes `cleanup()`, which is what the
@@ -103,11 +118,17 @@ and already the thing that was tested. Only when there is none does it build one
 with `uv`. `--acestep-venv PATH` bundles a specific venv and implies
 `--with-acestep`.
 
-Because the base image is Ubuntu 22.04, whose system python is 3.10, a baked
-3.12 venv also needs a **relocatable 3.12 interpreter** bundled beside it; the
-build fetches one with `uv python install 3.12` if the host has none, and the
-image re-points the venv's `pyvenv.cfg` at `/opt/coderai/py312` — the same
-arrangement the 3.10 lip-sync and LongCat venvs use.
+The interpreter usually comes from the image itself: `versions.env` pins
+**Ubuntu 24.04**, whose system python *is* 3.12, so a venv built against
+`/usr/bin/python3.12` runs inside the image unchanged and its `pyvenv.cfg` is
+left alone. (Verified in the running container: `/usr/bin/python3.12` is
+3.12.3, and the bundled venv imports `acestep` and sees CUDA.)
+
+A venv built on a **relocatable** interpreter instead — one `uv` fetched for
+itself — travels with that interpreter, which is bundled as `/opt/coderai/py312`
+and re-pointed during the build, the same arrangement the 3.10 lip-sync and
+LongCat venvs use. On a base older than 24.04 that is the only way it can work,
+and the build says so.
 
 Both variants resolve the venv the same way at runtime, so neither needs an
 environment variable: the worker uses `/opt/coderai/acestep_venv` (local image)

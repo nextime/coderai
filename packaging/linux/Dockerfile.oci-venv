@@ -77,8 +77,14 @@ RUN set -eux; \
     done; \
     cfg=/opt/coderai/acestep_venv/pyvenv.cfg; \
     if [ -f "$cfg" ]; then \
-      sed -i 's|^home *=.*|home = /opt/coderai/py312/bin|; s|^command *=.*|command = /opt/coderai/py312/bin/python3.12|' "$cfg"; \
-      for p in python python3 python3.12; do ln -sf /opt/coderai/py312/bin/python3.12 "/opt/coderai/acestep_venv/bin/$p"; done; \
+      if [ -x /opt/coderai/py312/bin/python3.12 ]; then \
+        sed -i 's|^home *=.*|home = /opt/coderai/py312/bin|; s|^command *=.*|command = /opt/coderai/py312/bin/python3.12|' "$cfg"; \
+        for p in python python3 python3.12; do ln -sf /opt/coderai/py312/bin/python3.12 "/opt/coderai/acestep_venv/bin/$p"; done; \
+      elif [ -x /usr/bin/python3.12 ]; then \
+        for p in python python3 python3.12; do ln -sf /usr/bin/python3.12 "/opt/coderai/acestep_venv/bin/$p"; done; \
+      else \
+        echo "ERROR: an ACE-Step venv was bundled but this image has no python3.12 to run it on" >&2; exit 1; \
+      fi; \
     fi; \
     if [ -d /tmp/local-bundle/local-bin ]; then \
       mkdir -p /opt/coderai/staged-local-bin; \
@@ -87,6 +93,12 @@ RUN set -eux; \
     rm -rf /tmp/local-bundle; \
     find /opt/coderai -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf '{}' + || true
 
+# On the ACE-Step venv's interpreter: the 24.04 base (versions.env) ships
+# python3.12, so a venv built against /usr/bin/python3.12 runs here unchanged
+# and its pyvenv.cfg is left alone — rewriting it to a py312 that was not
+# bundled would break a venv that works. A venv built on a relocatable
+# interpreter (uv fetched its own) travels with it, and is re-pointed instead.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 # runtime: the shipped image. Copies the assembled tree once (no bundle dup).
 # ─────────────────────────────────────────────────────────────────────────────

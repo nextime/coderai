@@ -257,15 +257,14 @@ def _clean_py_env() -> dict:
     Anything that points a Python at ANOTHER interpreter's files makes the child
     die at startup with "No module named 'encodings'" — PYTHONHOME is the usual
     one, but PYTHONPATH, VIRTUAL_ENV and friends all leak the 3.13 runtime into a
-    3.10 process. coderai does not set them today; it is stripped anyway because
-    the failure mode is fatal, silent in the parent, and costs nothing to prevent.
+    3.10 process. This said "coderai does not set them today", which was wrong:
+    the container's per-engine launchers DO set PYTHONHOME, which is how an
+    ACE-Step worker spawned from an engine process came to fail in milliseconds
+    while the same command by hand in the same container worked. Shared now, so
+    every isolated venv gets it.
     """
-    env = os.environ.copy()
-    for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
-                "VIRTUAL_ENV", "PYTHONNOUSERSITE", "PYTHONUSERBASE",
-                "__PYVENV_LAUNCHER__"):
-        env.pop(var, None)
-    return env
+    from codai.api.venv_env import clean_py_env
+    return clean_py_env()
 
 
 def _run_py310(cmd: list, what: str) -> None:

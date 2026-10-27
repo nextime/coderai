@@ -442,10 +442,15 @@ prepare_venv_bundle() {
     fi
   fi
 
-  # ACE-Step's python-3.12 venv, and the interpreter it has to run on. The base
-  # image is Ubuntu 22.04, whose system python is 3.10, so a 3.12 venv needs its
-  # own standalone interpreter bundled alongside it and re-pointed during the
-  # image build -- the same arrangement as the py3.10 venvs below.
+  # ACE-Step's python-3.12 venv. The image's own base supplies the interpreter
+  # when it can: versions.env pins UBUNTU_VERSION=24.04, whose system python IS
+  # 3.12, so a venv created against /usr/bin/python3.12 keeps working inside the
+  # image with nothing bundled and nothing rewritten (verified in the running
+  # container: /usr/bin/python3.12 is 3.12.3 and the venv imports).
+  #
+  # A venv built on a RELOCATABLE interpreter (uv fetched its own) is different:
+  # that path does not exist in the image, so the interpreter is bundled beside
+  # the venv and re-pointed during the build, like the py3.10 venvs below.
   if [[ "$INCLUDE_ACESTEP" == "1" ]]; then
     # The dev install is the preferred source: it is already built and already
     # the thing being tested. Only build one when there is none.
@@ -470,38 +475,30 @@ prepare_venv_bundle() {
       local _ace_excl=(--exclude '__pycache__' --exclude '*.pyc' --exclude '*.dist-info/RECORD')
       rsync -a "${_ace_excl[@]}" "$ACESTEP_VENV/" "$bundle/acestep_venv/"
       echo "Bundled ACE-Step venv from: $ACESTEP_VENV"
-      # Find a RELOCATABLE 3.12. The dev venv's pyvenv.cfg usually says
-      # `home = /usr/bin`, which is the host's own python and cannot be copied
-      # into the image, so that case falls through to a uv-managed build.
+      # Is this venv's interpreter one that can be copied into the image?
+      # A dev venv built with the host's python says `home = /usr/bin`, which
+      # cannot: that venv relies on the image's own python3.12 instead.
       local py312_dir=""
       local _home
       _home="$(sed -n 's/^home *= *//p' "$ACESTEP_VENV/pyvenv.cfg" 2>/dev/null | head -1)"
       if [[ -n "$_home" && "$_home" != "/usr/bin" && "$_home" != "/usr/local/bin" ]]; then
         py312_dir="$(dirname "$_home")"
       fi
-      if [[ -z "$py312_dir" ]]; then
-        py312_dir="$(find "$HOME/.local/share/uv/python" -maxdepth 1 -type d \
-                     -name 'cpython-3.12*-linux-*' 2>/dev/null | sort | tail -1)"
-      fi
-      if [[ -z "$py312_dir" ]]; then
-        local _uv2
-        _uv2="$(command -v uv || true)"
-        [[ -z "$_uv2" && -x "$HOME/.local/bin/uv" ]] && _uv2="$HOME/.local/bin/uv"
-        if [[ -n "$_uv2" ]]; then
-          echo "Fetching a relocatable Python 3.12 for the image…"
-          "$_uv2" python install 3.12 >/dev/null 2>&1 || true
-          py312_dir="$(find "$HOME/.local/share/uv/python" -maxdepth 1 -type d \
-                       -name 'cpython-3.12*-linux-*' 2>/dev/null | sort | tail -1)"
-        fi
-      fi
       if [[ -n "$py312_dir" && -d "$py312_dir" ]]; then
         mkdir -p "$bundle/py312"
         rsync -a "$py312_dir/" "$bundle/py312/"
         echo "Bundled standalone Python 3.12 from: $py312_dir"
       else
-        echo "Error: bundled the ACE-Step venv but found no relocatable Python 3.12 to run it on." >&2
-        echo "       Install one with 'uv python install 3.12' and rebuild, or drop --with-acestep." >&2
-        exit 2
+        # Not an error: on a 24.04 base the venv runs on the image's own
+        # /usr/bin/python3.12. Only say something when the base cannot.
+        case "$UBUNTU_VERSION" in
+          24.*|25.*|26.*)
+            echo "ACE-Step venv will use the image's own python3.12 (Ubuntu $UBUNTU_VERSION)" ;;
+          *)
+            echo "Warning: the ACE-Step venv needs python3.12 and Ubuntu $UBUNTU_VERSION does not ship one." >&2
+            echo "         Build the venv with 'uv venv --python 3.12' so a relocatable interpreter" >&2
+            echo "         can be bundled with it, or build the image on a 24.04+ base." >&2 ;;
+        esac
       fi
     fi
   fi

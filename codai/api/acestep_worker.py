@@ -31,6 +31,8 @@ import threading
 import time
 from pathlib import Path
 
+from codai.api.venv_env import clean_py_env
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "acestep_service.py"
 _REQUIREMENTS = _REPO_ROOT / "requirements-acestep.txt"
@@ -65,11 +67,24 @@ def _venv_python(venv: Path) -> Path:
 
 
 def _pip_ok(py: Path) -> bool:
+    """Does this venv's python import what the service needs?
+
+    clean_py_env() is load-bearing, not hygiene: the container's engine
+    processes export PYTHONHOME pointing at the standalone 3.13, and a 3.12
+    interpreter inheriting it dies before running a byte of this. That looked
+    exactly like a venv with missing packages, and sent the caller down the
+    rebuild path to report something unrelated.
+    """
     try:
-        return subprocess.run(
+        r = subprocess.run(
             [str(py), "-c", "import acestep, torch, soundfile"],
-            capture_output=True).returncode == 0
-    except Exception:
+            capture_output=True, env=clean_py_env())
+        if r.returncode != 0:
+            why = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+            print(f"[acestep] venv at {py} is not usable: {why[-400:]}", flush=True)
+        return r.returncode == 0
+    except Exception as exc:
+        print(f"[acestep] could not probe the venv at {py}: {exc}", flush=True)
         return False
 
 
@@ -95,7 +110,7 @@ def _create_venv(venv: Path) -> None:
     errors = []
     if base:
         r = subprocess.run([base, "-m", "venv", str(venv)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=clean_py_env())
         if r.returncode == 0:
             return
         errors.append(f"python{_PY_VERSION} -m venv: "
@@ -105,7 +120,7 @@ def _create_venv(venv: Path) -> None:
     uv = _uv()
     if uv:
         r = subprocess.run([uv, "venv", "--python", _PY_VERSION, str(venv)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=clean_py_env())
         if r.returncode == 0:
             return
         errors.append(f"uv venv: {(r.stderr or r.stdout).strip()[:300]}")
@@ -135,14 +150,16 @@ def _install(py: Path) -> None:
             [uv, "pip", "install", "--python", str(py),
              "--index-strategy", "unsafe-best-match",
              "-r", str(_REQUIREMENTS)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, env=clean_py_env())
         if r.returncode == 0:
             return
         print(f"[acestep] uv pip install failed, falling back to pip: "
               f"{(r.stderr or r.stdout).strip()[-600:]}", flush=True)
-    subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
+    env = clean_py_env()
+    subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"],
+                   check=True, env=env)
     subprocess.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
-                   check=True)
+                   check=True, env=env)
 
 
 def _bootstrap_venv() -> Path:
@@ -253,7 +270,7 @@ def ensure_service(model_name: str, config: dict = None,
         py = _bootstrap_venv()
         port = _free_port()
         url = f"http://127.0.0.1:{port}"
-        env = dict(os.environ)
+        env = clean_py_env()
         try:
             # All four HF variables: this worker never imports codai, so
             # HF_HOME and TRANSFORMERS_CACHE would otherwise stay as the image

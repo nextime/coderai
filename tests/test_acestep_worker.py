@@ -200,3 +200,47 @@ def test_quantized_without_the_int4_weights_says_what_is_missing():
         eng._ensure()
     msg = str(err.value)
     assert "int4" in msg and "/nonexistent/ckpt" in msg
+
+
+# --------------------------------------------------------------------------- #
+# the environment a foreign interpreter is spawned into
+# --------------------------------------------------------------------------- #
+
+def test_the_leaky_python_vars_are_stripped_for_a_foreign_interpreter():
+    """Measured in the shipped container: the per-engine launchers export
+    PYTHONHOME=/opt/coderai/python (the standalone 3.13) while PID 1 and an
+    interactive `docker exec` do not. A 3.12 interpreter inheriting it aborts
+    before running any code -- so the probe failed in milliseconds, and the
+    caller reported a missing requirements file instead."""
+    from codai.api.venv_env import clean_py_env
+    env = clean_py_env({"PYTHONHOME": "/opt/coderai/python",
+                        "PYTHONPATH": "/opt/coderai/app",
+                        "VIRTUAL_ENV": "/opt/coderai/python",
+                        "HF_HOME": "/cache/huggingface"})
+    assert "PYTHONHOME" not in env and "PYTHONPATH" not in env
+    assert "VIRTUAL_ENV" not in env
+    # Everything else is left alone: the worker needs the HF cache vars.
+    assert env["HF_HOME"] == "/cache/huggingface"
+
+
+def test_every_spawn_of_the_venvs_python_cleans_the_environment():
+    """One missed call site is a worker that dies only inside the container."""
+    import inspect
+
+    src = inspect.getsource(acestep_worker)
+    spawns = [l for l in src.splitlines()
+              if "subprocess.run(" in l or "subprocess.Popen(" in l]
+    assert spawns, "no spawn sites found -- did the worker stop using subprocess?"
+    # Each spawn either passes env= explicitly or is in a block that built one.
+    assert src.count("clean_py_env()") >= 5, (
+        "expected every spawn path (probe, venv create x2, install, service) "
+        f"to clean the env; found {src.count('clean_py_env()')} uses")
+
+
+def test_longcat_shares_the_same_helper():
+    """It had this fix first, with a docstring saying coderai never sets those
+    vars -- which the container disproved. One implementation now."""
+    import inspect
+
+    from codai.api import longcat_worker
+    assert "clean_py_env" in inspect.getsource(longcat_worker._clean_py_env)
