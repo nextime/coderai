@@ -1,0 +1,27 @@
+# Isolated venv for ACE-Step (ACE-Step/ACE-Step-v1-3.5B).
+#
+# ACE-Step is a text-to-music model (Apache-2.0 weights) that ships its own
+# package. It pins a torch/diffusers/transformers combination the coderai
+# server cannot hold -- the server runs transformers 5.x and a much newer
+# diffusers -- so it runs in its own venv and coderai talks to it over HTTP,
+# the same shape as CrisperWhisper and NeMo-Canary
+# (codai/api/acestep_worker.py + tools/acestep_service.py, both still to be
+# written). Do NOT merge these into requirements.txt.
+#
+# NOT YET INSTALLED. The `acestep` package is not on PyPI, so it installs from
+# the upstream git repository, and nothing here has been run or verified. The
+# audio_gen loader therefore refuses an ACE-Step model with an explicit
+# message rather than loading it as a MusicGen and failing with a shape error
+# minutes later. Install this venv, then introspect the package before
+# writing the service -- the API below the pin is not guessed at here.
+#
+# CUDA build for the 3090; cu124 wheels run on this box's newer driver.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchaudio==2.5.1+cu124
+soundfile>=0.12.0
+
+# ACE-Step itself, from the upstream repository. Pin the commit you install so
+# a rebuild is reproducible:
+#   acestep @ git+https://github.com/ace-step/ACE-Step.git@<commit>

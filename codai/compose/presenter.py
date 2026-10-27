@@ -42,13 +42,51 @@ from codai.compose import media
 from codai.compose import render as rnd
 
 #: Engines that drive a VIDEO (they need a base clip; the mouth is replaced).
-VIDEO_ENGINES = ("wav2lip",)
+VIDEO_ENGINES = ("latentsync", "musetalk", "wav2lip")
 #: Engines that animate a PORTRAIT (they make their own motion from a still).
 PORTRAIT_ENGINES = ("sadtalker",)
 #: Preference order for ``engine: "auto"`` — best mouth first for a clip, best
 #: motion first for a still.
-_AUTO_WITH_BASE = ("wav2lip", "sadtalker")
-_AUTO_STILL = ("sadtalker", "wav2lip")
+#:
+#: LatentSync and MuseTalk come before wav2lip because wav2lip works at 96x96
+#: and upscales, which is where the soft, smeared mouth on a 1080p reel comes
+#: from; both of these run at 256-512 px natively. They need a base clip, so
+#: for a still portrait sadtalker still leads — it is the one that invents
+#: head motion rather than replacing a mouth.
+_AUTO_WITH_BASE = ("latentsync", "musetalk", "wav2lip", "sadtalker")
+_AUTO_STILL = ("sadtalker", "latentsync", "musetalk", "wav2lip")
+
+#: Where a managed LatentSync / MuseTalk install is looked for when no shim is
+#: on PATH. One directory per engine under the coderai config root, which is
+#: also where their weights land.
+def _managed_engine_dir(name: str):
+    try:
+        from codai.platform_paths import legacy_style_config_dir
+        return legacy_style_config_dir() / name
+    except Exception:
+        return None
+
+
+def _managed_engine_ready(name: str) -> bool:
+    """Whether a managed install of this engine is usable WITHOUT downloading.
+
+    An inference entrypoint and at least one checkpoint. Deliberately not
+    "could be downloaded": a compose job is the wrong place to fetch several
+    GB, which is the same rule wav2lip follows above.
+    """
+    d = _managed_engine_dir(name)
+    if not d:
+        return False
+    try:
+        if not any((d / e).exists() for e in
+                   ("inference.py", "scripts/inference.py", "run.py")):
+            return False
+        for pat in ("*.pt", "*.pth", "*.safetensors", "*.ckpt", "*.bin"):
+            if any(d.rglob(pat)):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 class PresenterError(Exception):
@@ -74,6 +112,15 @@ def available_engines() -> List[str]:
             pass
     if shutil.which("sadtalker"):
         out.append("sadtalker")
+    # LatentSync (ByteDance, Apache-2.0) and MuseTalk (MIT) — either a shim on
+    # PATH or a managed install with its weights already present.
+    for name in ("latentsync", "musetalk"):
+        if shutil.which(name) or _managed_engine_ready(name):
+            out.append(name)
+    # Reported in the documented preference order rather than discovery order,
+    # so `engine: "auto"` and this listing agree about which is best.
+    _rank = {n: i for i, n in enumerate(_AUTO_WITH_BASE)}
+    out.sort(key=lambda n: _rank.get(n, 99))
     return out
 
 
@@ -130,6 +177,48 @@ def run_engine(engine: str, face_path: str, audio_path: str, out_path: str,
         from codai.api.lipsync import run_wav2lip
         return run_wav2lip(face_path, audio_path, out_path, timeout=timeout)
 
+    if eng in ("latentsync", "musetalk"):
+        # Both are video-driven: they replace the mouth in a clip, so `face`
+        # here is a base clip rather than a still. Both also take the same
+        # three arguments under their own CLI, and both upstream repos drive
+        # them through a scripts/inference.py, so a shim on PATH is tried
+        # first and the managed checkout second.
+        binary = shutil.which(eng)
+        if binary:
+            cmd = [binary, "--video_path", face_path, "--audio_path", audio_path,
+                   "--video_out_path", out_path]
+            _run(cmd, cancel=cancel, timeout=timeout, log=log)
+            if os.path.isfile(out_path):
+                return out_path
+            # Some builds take the wav2lip-shaped flags instead. Tried once
+            # rather than guessed at, so a shim written either way works.
+            _run([binary, "--face", face_path, "--audio", audio_path,
+                  "--outfile", out_path], cancel=cancel, timeout=timeout, log=log)
+            if os.path.isfile(out_path):
+                return out_path
+            raise PresenterError(f"{eng} produced no output")
+        d = _managed_engine_dir(eng)
+        script = None
+        for cand in ("scripts/inference.py", "inference.py", "run.py"):
+            if d and (d / cand).exists():
+                script = d / cand
+                break
+        if script is None:
+            raise PresenterError(
+                f"{eng} is neither on PATH nor installed under {d} "
+                f"(expected scripts/inference.py and its checkpoints)")
+        import sys as _sys
+        env_extra = str(d)
+        cmd = [_sys.executable, str(script),
+               "--video_path", os.path.abspath(face_path),
+               "--audio_path", os.path.abspath(audio_path),
+               "--video_out_path", os.path.abspath(out_path)]
+        _run(cmd, cancel=cancel, timeout=timeout, log=log, cwd=str(d),
+             pythonpath=env_extra)
+        if not os.path.isfile(out_path):
+            raise PresenterError(f"{eng} produced no output")
+        return out_path
+
     if eng == "sadtalker":
         binary = shutil.which("sadtalker")
         if not binary:
@@ -161,10 +250,23 @@ def run_engine(engine: str, face_path: str, audio_path: str, out_path: str,
     return out_path
 
 
-def _run(cmd: List[str], cancel=None, timeout: int = 3600, log=None) -> None:
+def _run(cmd: List[str], cancel=None, timeout: int = 3600, log=None,
+         cwd: Optional[str] = None, pythonpath: Optional[str] = None) -> None:
+    """Run an engine, cancellable and with a hard timeout.
+
+    ``cwd`` and ``pythonpath`` exist for a managed checkout: these repos'
+    inference scripts import their own package as a top-level module, so they
+    only resolve when run from inside the checkout with it on the path -- the
+    same thing codai.api.lipsync does for wav2lip's inference.py.
+    """
     if log:
         log("presenter: " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    env = None
+    if pythonpath:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = pythonpath + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            cwd=cwd, env=env)
     waited = 0.0
     while True:
         try:

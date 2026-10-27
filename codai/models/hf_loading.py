@@ -22,7 +22,8 @@ The configuration is the single source of truth — nothing here reads CLI args.
 """
 
 import os
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 def resolve_offload_dir(offload_dir) -> str:
@@ -283,8 +284,135 @@ def is_single_file_ref(ref) -> bool:
     s = str(ref or '').strip()
     if not s:
         return False
+    if s.lower().startswith("civitai:"):
+        # A Civitai reference names a version id, not a filename, so there is
+        # no suffix to test -- but it is unambiguously a single checkpoint.
+        return True
     head = s.rpartition(':')[2] if ':' in s else s
     return head.lower().endswith(_SINGLE_FILE_SUFFIXES)
+
+
+def civitai_token() -> Optional[str]:
+    """The operator's Civitai API token, or None.
+
+    Read from ``CIVITAI_TOKEN`` or ``<config>/civitai_token``. Never logged:
+    it is a credential, and the download URL carries it.
+    """
+    tok = (os.environ.get("CIVITAI_TOKEN") or "").strip()
+    if tok:
+        return tok
+    try:
+        from codai.platform_paths import legacy_style_config_dir
+        p = legacy_style_config_dir() / "civitai_token"
+        if p.is_file():
+            t = p.read_text().strip()
+            return t or None
+    except Exception:
+        pass
+    return None
+
+
+def resolve_civitai(ref: str) -> str:
+    """``civitai:<modelVersionId>`` -> a local checkpoint path, downloading once.
+
+    Civitai is where a large part of the community's fine-tunes actually live,
+    and they are published as ONE ComfyUI-style checkpoint file -- exactly the
+    shape ``build_single_file_pipeline`` already handles. The only thing
+    missing was a way to fetch them, so an operator had to download by hand
+    and hard-code a path.
+
+    The version id, not the model id: a Civitai "model" is a family with many
+    versions, and a config that named the family would silently change
+    underneath the operator when a new version was published.
+
+    Cached under ``<cache>/civitai/<id>/`` and never re-downloaded. Most
+    models need a token (see :func:`civitai_token`); without one the API
+    answers 401 and this says so rather than saving the HTML error page as a
+    checkpoint -- which is what a naive fetch does, and it surfaces hours
+    later as an unreadable safetensors header.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    vid = str(ref).split(":", 1)[1].strip()
+    if not vid.isdigit():
+        raise ValueError(
+            f"civitai reference must be civitai:<modelVersionId> (a number), "
+            f"got {ref!r}")
+    try:
+        from codai.platform_paths import legacy_style_cache_root
+        base = legacy_style_cache_root() / "civitai" / vid
+    except Exception:
+        base = Path(os.path.expanduser(f"~/.cache/coderai/civitai/{vid}"))
+    base.mkdir(parents=True, exist_ok=True)
+    existing = [p for p in base.iterdir()
+                if p.suffix.lower() in _SINGLE_FILE_SUFFIXES]
+    if existing:
+        return str(max(existing, key=lambda p: p.stat().st_size))
+
+    tok = civitai_token()
+    hdrs = {"User-Agent": "coderai"}
+    if tok:
+        hdrs["Authorization"] = f"Bearer {tok}"
+
+    # Ask the API what the file is called before downloading it, so the cached
+    # name is the real one and a later lookup finds it.
+    name = f"civitai-{vid}.safetensors"
+    try:
+        req = urllib.request.Request(
+            f"https://civitai.com/api/v1/model-versions/{vid}", headers=hdrs)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            meta = _json.loads(r.read().decode("utf-8", "replace"))
+        files = [f for f in (meta.get("files") or [])
+                 if str(f.get("name", "")).lower().endswith(_SINGLE_FILE_SUFFIXES)]
+        if files:
+            files.sort(key=lambda f: -(f.get("sizeKB") or 0))
+            name = files[0]["name"]
+    except Exception:
+        pass        # the download below still works; only the name is a guess
+
+    url = f"https://civitai.com/api/download/models/{vid}"
+    dest = base / name
+    tmp = base / (name + ".part")
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if "text/html" in ctype or "application/json" in ctype:
+                # The 401/403 page. Saving it would produce a file with a
+                # .safetensors name and HTML inside.
+                raise RuntimeError(
+                    "Civitai returned a web page instead of a checkpoint, which "
+                    "means this version needs authentication"
+                    + ("" if tok else " and no CIVITAI_TOKEN / "
+                                      "<config>/civitai_token is set"))
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+    except urllib.error.HTTPError as e:
+        tmp.unlink(missing_ok=True)
+        extra = ("" if tok else
+                 " No Civitai token is configured; set CIVITAI_TOKEN or write "
+                 "one to <config>/civitai_token.")
+        raise RuntimeError(
+            f"Civitai download of version {vid} failed: HTTP {e.code}.{extra}") from e
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    # A checkpoint that small is an error page, whatever it claims to be.
+    if tmp.stat().st_size < 1_000_000:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Civitai version {vid} downloaded only "
+            f"{tmp.stat().st_size if tmp.exists() else 0} bytes — not a checkpoint")
+    tmp.rename(dest)
+    print(f"  civitai: fetched version {vid} -> {dest} "
+          f"({dest.stat().st_size/1e9:.1f} GB)")
+    return str(dest)
 
 
 def resolve_single_file(ref) -> str:
@@ -292,6 +420,8 @@ def resolve_single_file(ref) -> str:
     s = str(ref or '').strip()
     if os.path.isfile(s):
         return s
+    if s.lower().startswith("civitai:"):
+        return resolve_civitai(s)
     if ':' in s:
         repo, _, filename = s.rpartition(':')
         repo = repo.strip()
@@ -386,16 +516,26 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
     specs = _discover_components(model_name)  # name -> [library, class_name]
     components: Dict[str, Any] = {}
     descs = []
+    # Why these are collected rather than merely printed: a component named in
+    # `component_quantization` that does not load here is simply ABSENT from
+    # the returned dict, and the base pipeline then loads its own
+    # full-precision copy. So the operator asked for a 14 GB quantized
+    # transformer, got a 38 GB bf16 one, and the only trace was a line in a log
+    # nobody reads -- while the VRAM estimate still said 14 GB, so the planner
+    # freed a third of what the load actually took. A silent downgrade to
+    # something that does not fit is worse than a refusal.
+    problems: List[str] = []
     for name, path in gguf_entries.items():
         spec = specs.get(name)
         if not spec or spec[0] != 'diffusers':
-            print(f"  GGUF skip '{name}': only diffusers components supported "
-                  f"(got {spec}).")
+            problems.append(f"{name}: only diffusers components can be GGUF "
+                            f"(this one is {spec})")
             continue
         cls_name = spec[1] if len(spec) > 1 else None
         cls = getattr(diffusers, cls_name, None) if cls_name else None
         if cls is None or not hasattr(cls, 'from_single_file'):
-            print(f"  GGUF skip '{name}': no loadable class {cls_name}.")
+            problems.append(f"{name}: {cls_name or 'its class'} is not loadable "
+                            f"from a single file in this diffusers")
             continue
         try:
             print(f"  Loading GGUF component '{name}' from {path}")
@@ -415,7 +555,14 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             components[name] = model
             descs.append(f"{name}:gguf")
         except Exception as e:
-            print(f"  GGUF load failed for '{name}' ({path}): {e}")
+            problems.append(f"{name} ({path}): {e}")
+    if problems:
+        raise RuntimeError(
+            "this model configures GGUF component(s) that could not be loaded, "
+            "and loading it anyway would silently substitute the "
+            "full-precision weights -- several times the size the VRAM "
+            "estimate was told to expect. Fix the path/class or remove it from "
+            "component_quantization. Problems: " + "; ".join(problems))
     return components, ', '.join(descs)
 
 

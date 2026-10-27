@@ -37,6 +37,7 @@ Functions available:
 
 import os
 import hashlib
+import threading
 import pathlib
 from typing import Optional, Dict, List, Tuple
 
@@ -107,6 +108,49 @@ def get_all_cache_dirs() -> dict:
     return caches
 
 
+#: The last HuggingFace cache scan, memoised. ``scan_cache_dir`` stats every
+#: blob of every repo, so on a large cache it costs SECONDS -- and the callers
+#: here are hot: a per-model VRAM estimate, a GGUF path lookup, an engine-state
+#: poll. The loop watchdog measured 6631 stalls over 0.5s (worst 13.0s) in this
+#: call stack, during which no request of any kind was served.
+#:
+#: A short TTL rather than a permanent cache: a model downloaded while the
+#: server runs has to become visible, and 30 seconds is far below the time any
+#: download takes while being far above the poll interval.
+_HF_SCAN_TTL = 30.0
+_hf_scan_cache: dict = {}
+_hf_scan_lock = threading.Lock()
+
+
+def _scan_hf_cache(hf_dir):
+    """``scan_cache_dir(hf_dir)``, memoised for ``_HF_SCAN_TTL`` seconds.
+
+    Returns None when huggingface_hub is unavailable or the scan fails, which
+    the callers treat as "not found" exactly as they treated an exception.
+    """
+    import time as _time
+    key = str(hf_dir)
+    now = _time.monotonic()
+    with _hf_scan_lock:
+        hit = _hf_scan_cache.get(key)
+        if hit and (now - hit[0]) < _HF_SCAN_TTL:
+            return hit[1]
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir(hf_dir)
+    except Exception:
+        return None
+    with _hf_scan_lock:
+        _hf_scan_cache[key] = (now, info)
+    return info
+
+
+def invalidate_hf_cache_scan() -> None:
+    """Drop the memoised scan — call after downloading into the HF cache."""
+    with _hf_scan_lock:
+        _hf_scan_cache.clear()
+
+
 def get_cached_model_path(model_path: str) -> Optional[str]:
     """
     Check if a model is already cached. Works with URLs, HF model IDs, and local files.
@@ -128,8 +172,9 @@ def get_cached_model_path(model_path: str) -> Optional[str]:
         hf_dir = caches.get('huggingface')
         if hf_dir:
             try:
-                from huggingface_hub import scan_cache_dir
-                cache_info = scan_cache_dir(hf_dir)
+                cache_info = _scan_hf_cache(hf_dir)
+                if cache_info is None:
+                    raise RuntimeError("cache scan unavailable")
 
                 # Look for the model in the cache
                 for repo in cache_info.repos:

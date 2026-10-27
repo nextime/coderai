@@ -578,22 +578,33 @@ async def internal_engine_state():
     # estimate) plus the separately-measured host-RAM slice when the model is
     # CPU-offloading.
     loaded_info = []
+
+    def _footprint(_k):
+        """One model's footprint. Runs in a THREAD -- see below."""
+        try:
+            # A load that happened while the card was already full measures
+            # a ~0 VRAM delta (free_before ≈ free_after) — never report that
+            # as the model's footprint; take the max of measurement and the
+            # config estimate.
+            _meas = multi_model_manager._measured_vram_gb.get(_k) or 0
+            _est = multi_model_manager._get_model_used_vram_gb(_k) or 0
+            return max(float(_meas), float(_est))
+        except Exception:
+            return 0
+
     try:
         _seen_li = set()
         for _k in loaded:
             if _k in _seen_li:
                 continue
             _seen_li.add(_k)
-            try:
-                # A load that happened while the card was already full measures
-                # a ~0 VRAM delta (free_before ≈ free_after) — never report that
-                # as the model's footprint; take the max of measurement and the
-                # config estimate.
-                _meas = multi_model_manager._measured_vram_gb.get(_k) or 0
-                _est = multi_model_manager._get_model_used_vram_gb(_k) or 0
-                _vg = max(float(_meas), float(_est))
-            except Exception:
-                _vg = 0
+            # Off the event loop, deliberately. _get_model_used_vram_gb can
+            # walk the HuggingFace cache (scan_cache_dir stats every blob of
+            # every repo), which on a 900 GB cache takes seconds -- and this
+            # endpoint is polled. The loop watchdog recorded 6631 stalls over
+            # 0.5s with a worst of 13.0s, every one of them this call stack,
+            # during which NO request of any kind was served.
+            _vg = await asyncio.to_thread(_footprint, _k)
             _cfg = {}
             try:
                 _cfg = multi_model_manager._config_for_model_key(_k) or {}

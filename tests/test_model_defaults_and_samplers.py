@@ -161,14 +161,27 @@ def test_the_listing_can_carry_defaults_modes_and_licence():
 
 
 def test_modes_and_licence_are_read_from_either_place():
-    # An operator should not have to remember whether these go at the top
-    # level of the entry or inside `defaults`.
+    """An operator should not have to remember whether these go at the top
+    level of the entry or inside `defaults`.
+
+    Asserted over the whole ``ModelInfo(...)`` call rather than a fixed slice
+    of source: the first version of this test read 700 characters from an
+    anchor and broke the moment a comment was added inside the block, which
+    tested the comment density rather than the behaviour.
+    """
     import inspect
 
     from codai.models import manager
     src = inspect.getsource(manager)
-    i = src.index('defaults=(meta.get("defaults") or None)')
-    window = src[i:i + 700]
-    assert 'meta.get("modes")' in window
-    assert 'meta.get("license")' in window
-    assert '"licence"' in window
+    anchor = 'defaults=(meta.get("defaults") or None)'
+    i = src.index(anchor)
+    # The enclosing ModelInfo(...) call: from the nearest preceding
+    # `models.append(ModelInfo(` to the `))` that closes it.
+    start = src.rindex("models.append(ModelInfo(", 0, i)
+    end = src.index("))", i)
+    block = src[start:end]
+    for spelling in ('meta.get("modes")', 'meta.get("video_subtypes")',
+                     'meta.get("license")', 'meta.get("licence")',
+                     '(meta.get("defaults") or {}).get("modes")',
+                     '(meta.get("defaults") or {}).get("license")'):
+        assert spelling in block, spelling

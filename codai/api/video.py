@@ -28,6 +28,7 @@ Endpoints:
 import asyncio
 import base64
 import io
+import re
 import os
 import signal
 import subprocess
@@ -481,6 +482,22 @@ def _detect_pipeline_class(model_name: str, mode: str):
         if 'cogvideox' in n or 'cogvideo' in n:
             return CogVideoXImageToVideoPipeline if (mode in ('i2v', 'ti2v')) else CogVideoXPipeline
         if 'ltx' in n:
+            # LTX-2.x is a DIFFERENT architecture from LTX-Video 0.9, with its
+            # own pipeline, transformer, video VAE and -- uniquely among the
+            # video models here -- an audio VAE, so it generates a soundtrack
+            # with the picture. Handing an LTX-2 checkpoint to LTXPipeline
+            # cannot work, which is why every LTX-2 entry in models.json sat
+            # parked: the name matched, the class did not.
+            #
+            # Matched on the version in the name, since both families are just
+            # called "LTX": 2.x if it says 2.3/2.4/2.5/ltx2, else the 0.9
+            # family. A fine-tune keeps its base version in its name
+            # (10Eros is LTX2.3, PinkCherry is LTX23), which is what makes
+            # this readable at all.
+            if re.search(r'ltx[-_ ]?2|2\.[0-9]', n):
+                from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
+                return (LTX2ImageToVideoPipeline if mode in ('i2v', 'ti2v')
+                        else LTX2Pipeline)
             return LTXImageToVideoPipeline if (mode in ('i2v', 'ti2v')) else LTXPipeline
         if 'svd' in n or 'stable-video-diffusion' in n:
             return StableVideoDiffusionPipeline

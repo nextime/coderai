@@ -3722,12 +3722,14 @@ class MultiModelManager:
 
         # --- Try local HF hub cache first (no network) ---
         try:
-            from huggingface_hub import scan_cache_dir
+            from codai.models.cache import _scan_hf_cache as scan_cache_dir
             from codai.models.cache import get_all_cache_dirs
             import json as _json
             hf_dir = get_all_cache_dirs().get("huggingface")
             if hf_dir:
                 info = scan_cache_dir(hf_dir)
+                if info is None:
+                    raise RuntimeError('hf cache scan unavailable')
                 for repo in info.repos:
                     if repo.repo_id != model_id:
                         continue
@@ -4020,7 +4022,7 @@ class MultiModelManager:
                                     pass
             # HuggingFace hub cache.
             if not st_files:
-                from huggingface_hub import scan_cache_dir
+                from codai.models.cache import _scan_hf_cache as scan_cache_dir
                 from codai.models.cache import get_all_cache_dirs, is_huggingface_model_id
                 hf_dir = get_all_cache_dirs().get("huggingface")
                 for c in candidates:
@@ -4028,6 +4030,8 @@ class MultiModelManager:
                     if not (hf_dir and is_huggingface_model_id(repo_id)):
                         continue
                     info = scan_cache_dir(hf_dir)
+                    if info is None:
+                        raise RuntimeError('hf cache scan unavailable')
                     for repo in info.repos:
                         if repo.repo_id != repo_id:
                             continue
@@ -4103,7 +4107,7 @@ class MultiModelManager:
                     scanned = True
                     break
             if not scanned:
-                from huggingface_hub import scan_cache_dir
+                from codai.models.cache import _scan_hf_cache as scan_cache_dir
                 from codai.models.cache import get_all_cache_dirs, is_huggingface_model_id
                 hf_dir = get_all_cache_dirs().get("huggingface")
                 for c in candidates:
@@ -4111,6 +4115,8 @@ class MultiModelManager:
                     if not (hf_dir and is_huggingface_model_id(repo_id)):
                         continue
                     info = scan_cache_dir(hf_dir)
+                    if info is None:
+                        raise RuntimeError('hf cache scan unavailable')
                     for repo in info.repos:
                         if repo.repo_id != repo_id:
                             continue
@@ -4195,7 +4201,7 @@ class MultiModelManager:
         if not conf_paths:
             # HuggingFace hub cache: find the newest snapshot directory.
             try:
-                from huggingface_hub import scan_cache_dir
+                from codai.models.cache import _scan_hf_cache as scan_cache_dir
                 from codai.models.cache import (get_all_cache_dirs,
                                                 is_huggingface_model_id)
                 hf_dir = get_all_cache_dirs().get("huggingface")
@@ -4204,6 +4210,8 @@ class MultiModelManager:
                     if not (hf_dir and is_huggingface_model_id(repo_id)):
                         continue
                     info = scan_cache_dir(hf_dir)
+                    if info is None:
+                        raise RuntimeError('hf cache scan unavailable')
                     for repo in info.repos:
                         if repo.repo_id != repo_id:
                             continue
@@ -6242,8 +6250,13 @@ class MultiModelManager:
                 # `modes` may live in `defaults` (where a card's settings
                 # naturally go) or at the top level; both are read, because an
                 # operator should not have to remember which.
+                # `video_subtypes` is the long-standing spelling on a video
+                # entry; `modes` and `defaults.modes` are the newer general
+                # ones. All three are read, because an operator should not have
+                # to remember which a given model type uses.
                 modes=((meta.get("defaults") or {}).get("modes")
-                       or meta.get("modes") or None),
+                       or meta.get("modes")
+                       or meta.get("video_subtypes") or None),
                 license=((meta.get("defaults") or {}).get("license")
                          or meta.get("license") or meta.get("licence") or None),
                 available=meta.get("available"),
