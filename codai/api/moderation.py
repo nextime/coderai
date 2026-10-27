@@ -452,16 +452,42 @@ def _reference_embeddings(spec: Optional[FaceMatchSpec]) -> List[Any]:
     if spec is None:
         return []
     srcs = list(spec.reference or [])
+    # Each named profile is resolved separately and its failure is REPORTED.
+    # This was a bare `except Exception: pass`, which turned every possible
+    # cause -- a misspelt name, a profile with no image files, a
+    # characters directory the server resolves elsewhere -- into the single
+    # message "face_match was requested with no reference images". That told
+    # the caller the opposite of the truth (they had supplied references) and
+    # left no way to find out what went wrong; it cost a long debugging
+    # session on a live server to establish which of those it was.
+    problems: List[str] = []
     for name in (spec.character_profiles or []):
         try:
             from codai.api.characters import resolve_character_profiles
-            srcs += resolve_character_profiles([name])
-        except Exception:
-            pass
+            got = resolve_character_profiles([name])
+        except Exception as exc:
+            problems.append(f"{name!r}: {type(exc).__name__}: {exc}")
+            continue
+        if not got:
+            problems.append(
+                f"{name!r}: no reference images (is the profile name right, "
+                f"and does it have images saved?)")
+            continue
+        srcs += got
     if not srcs:
-        raise HTTPException(
-            status_code=400,
-            detail="face_match was requested with no reference images")
+        detail = "face_match was requested with no usable reference images"
+        if problems:
+            detail += ": " + "; ".join(problems)
+        elif not spec.character_profiles:
+            detail = ("face_match was requested with neither `reference` nor "
+                      "`character_profiles`")
+        raise HTTPException(status_code=400, detail=detail)
+    if problems:
+        # Some resolved and some did not. Not fatal -- there ARE references to
+        # match against -- but a performer the caller believes is enrolled and
+        # is not would make a genuine face read as unmatched, so it is said.
+        print(f"[moderation] some face_match profiles were unusable: "
+              f"{'; '.join(problems)}", flush=True)
     app = _get_face_app()
     embs = []
     for i, s in enumerate(srcs):

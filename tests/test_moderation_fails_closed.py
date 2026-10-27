@@ -63,6 +63,67 @@ async def test_a_missing_model_is_a_503_before_anything_is_examined(monkeypatch)
     assert "could not be loaded" in str(e.value.detail)
 
 
+def test_an_unusable_profile_says_which_one_and_why(monkeypatch):
+    """The swallowed cause.
+
+    This was a bare ``except Exception: pass``, so a misspelt profile name, a
+    profile with no saved images and a characters directory the server
+    resolves elsewhere all produced the same message: "face_match was
+    requested with no reference images" -- which told the caller the opposite
+    of the truth, since they HAD supplied references. It cost a long debugging
+    session against a live server to find out which of them it was.
+    """
+    import codai.api.characters as C
+    monkeypatch.setattr(C, "resolve_character_profiles", lambda names: [])
+    with pytest.raises(HTTPException) as e:
+        M._reference_embeddings(M.FaceMatchSpec(character_profiles=["ghost"]))
+    detail = str(e.value.detail)
+    assert "ghost" in detail, detail
+    assert "no reference images" in detail
+
+
+def test_a_raising_profile_lookup_is_reported_not_swallowed(monkeypatch):
+    import codai.api.characters as C
+
+    def _boom(names):
+        raise PermissionError("characters dir unreadable")
+
+    monkeypatch.setattr(C, "resolve_character_profiles", _boom)
+    with pytest.raises(HTTPException) as e:
+        M._reference_embeddings(M.FaceMatchSpec(character_profiles=["alice"]))
+    detail = str(e.value.detail)
+    assert "PermissionError" in detail, detail
+    assert "alice" in detail
+
+
+def test_neither_field_given_says_so_specifically(monkeypatch):
+    with pytest.raises(HTTPException) as e:
+        M._reference_embeddings(M.FaceMatchSpec())
+    assert "neither" in str(e.value.detail)
+
+
+def test_one_bad_profile_among_good_ones_is_not_fatal(monkeypatch, capsys):
+    # There ARE references to match against, so the request proceeds -- but a
+    # performer the caller believes is enrolled and is not would make a real
+    # face read as unmatched, so it is said out loud.
+    import codai.api.characters as C
+    monkeypatch.setattr(C, "resolve_character_profiles",
+                        lambda names: ["imgdata"] if names[0] == "ok" else [])
+
+    class _Face:
+        bbox = [0, 0, 100, 100]
+        embedding = [1.0, 0.0]
+        normed_embedding = None
+
+    monkeypatch.setattr(M, "_get_face_app",
+                        lambda: types.SimpleNamespace(get=lambda a: [_Face()]))
+    monkeypatch.setattr(M, "_load_image", lambda s: _img())
+    embs = M._reference_embeddings(
+        M.FaceMatchSpec(character_profiles=["ok", "missing"]))
+    assert len(embs) == 1
+    assert "missing" in capsys.readouterr().out
+
+
 @pytest.mark.anyio
 async def test_a_reference_with_no_face_is_refused(monkeypatch):
     """An enrolled performer who is not actually enrolled.
