@@ -2517,6 +2517,36 @@ class MultiModelManager:
                     return str(target)
         return None
 
+    def _sibling_model_key(self, model_type, resolved_name, requested_id):
+        """A per-entry key when several configs share one weights path.
+
+        Returns ``"<kind>:<alias>"`` when ALL of:
+
+        * the caller named something (``requested_id``),
+        * two or more distinct aliases point at ``resolved_name``,
+        * ``requested_id`` is one of them.
+
+        Otherwise None, and the caller keeps the ordinary path-based key. That
+        narrowness is the point: one model with an alias, or a request that
+        names the path, must behave exactly as before.
+        """
+        if not requested_id:
+            return None
+        want = str(resolved_name or "").strip()
+        if not want:
+            return None
+        aliases = set()
+        for _k, _c in (self.config or {}).items():
+            if not isinstance(_c, dict):
+                continue
+            target = str(_c.get("path") or _c.get("model_path") or "").strip()
+            alias = str(_c.get("alias") or "").strip()
+            if alias and target == want:
+                aliases.add(alias)
+        if len(aliases) < 2 or requested_id not in aliases:
+            return None
+        return f"{(model_type or 'text')}:{requested_id}"
+
     def _store_type_config(self, kind: str, model_name: str, config: Dict = None):
         """Store a model's config under its type key, and under its ALIAS too.
 
@@ -5705,7 +5735,25 @@ class MultiModelManager:
                 pass
 
         # Step 2: Build the model key (prefixed with type)
-        if model_type and model_type != "text":
+        #
+        # Siblings first: when two or more config entries name the SAME weights
+        # path, one key means one entry in self.models, so the second model is
+        # served by the first one's resident pipeline -- HTTP 200 with the
+        # wrong weights, silently. Measured 2026-10-27: LTX-2.3-PinkCherry
+        # requested while LTX-2.3-10Eros was resident never loaded its own
+        # transformer and generated from 10Eros's. It also meant both wrote
+        # measured_vram_gb to the same key and corrupted each other's sizing.
+        #
+        # Only a real collision splits the key, and only when the caller named
+        # an alias: a lone model, or a request that names the path, keeps the
+        # key it has always had. That matters because collapsing every name
+        # form to ONE key is deliberate elsewhere (see the GGUF note above) --
+        # this is not a licence to key by whatever the caller typed.
+        _sib_key = self._sibling_model_key(model_type, resolved_name,
+                                           _requested_id)
+        if _sib_key:
+            model_key = _sib_key
+        elif model_type and model_type != "text":
             model_key = f"{model_type}:{resolved_name}"
         else:
             model_key = resolved_name

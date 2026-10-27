@@ -8,6 +8,8 @@ the wrong model, silently, because both are "valid" configs for that path.
 The VRAM estimator already disambiguated this way for lisa vs lisa-32k (same
 weights file, 178000 ctx vs 32768). The config used to LOAD did not.
 """
+import pytest
+
 from codai.models.manager import MultiModelManager
 
 
@@ -138,3 +140,79 @@ def test_every_type_setter_uses_the_shared_store():
                            src)
     assert not leftovers, leftovers
     assert src.count("_store_type_config(") >= 9
+
+
+# ------------------------------------------------------- the loaded-model key
+def _sibs():
+    m = object.__new__(MultiModelManager)
+    m.config = {
+        "video:diffusers/LTX-2.3-Diffusers": {
+            "alias": "LTX-2.3-PinkCherry", "path": "diffusers/LTX-2.3-Diffusers"},
+        "video:LTX-2.3-PinkCherry": {
+            "alias": "LTX-2.3-PinkCherry", "path": "diffusers/LTX-2.3-Diffusers"},
+        "video:LTX-2.3-10Eros": {
+            "alias": "LTX-2.3-10Eros", "path": "diffusers/LTX-2.3-Diffusers"},
+        "video:solo": {"alias": "solo", "path": "org/solo"},
+    }
+    return m
+
+
+def test_siblings_get_their_own_cache_key():
+    """The silent one: one key meant one resident pipeline for two models.
+
+    PinkCherry requested while 10Eros was resident never loaded its own
+    transformer -- it generated from 10Eros's weights and answered 200.
+    """
+    m = _sibs()
+    a = m._sibling_model_key("video", "diffusers/LTX-2.3-Diffusers",
+                             "LTX-2.3-10Eros")
+    b = m._sibling_model_key("video", "diffusers/LTX-2.3-Diffusers",
+                             "LTX-2.3-PinkCherry")
+    assert a == "video:LTX-2.3-10Eros"
+    assert b == "video:LTX-2.3-PinkCherry"
+    assert a != b, "two models must not share one self.models slot"
+
+
+def test_a_lone_model_keeps_the_path_key():
+    # Splitting every aliased model would undo the deliberate collapse of all
+    # name forms onto one key (one instance pool, no duplicate loads).
+    m = _sibs()
+    assert m._sibling_model_key("video", "org/solo", "solo") is None
+
+
+def test_a_request_naming_the_path_is_not_split():
+    m = _sibs()
+    assert m._sibling_model_key("video", "diffusers/LTX-2.3-Diffusers",
+                                "diffusers/LTX-2.3-Diffusers") is None
+
+
+def test_an_unknown_id_is_not_split():
+    m = _sibs()
+    assert m._sibling_model_key("video", "diffusers/LTX-2.3-Diffusers",
+                                "something-else") is None
+
+
+@pytest.mark.parametrize("rid", [None, "", "   "])
+def test_no_requested_id_means_no_split(rid):
+    m = _sibs()
+    assert m._sibling_model_key("video", "diffusers/LTX-2.3-Diffusers", rid) is None
+
+
+def test_model_path_counts_as_a_shared_target():
+    m = object.__new__(MultiModelManager)
+    m.config = {
+        "audio:a": {"alias": "a", "model_path": "/g/shared.gguf"},
+        "audio:b": {"alias": "b", "model_path": "/g/shared.gguf"},
+    }
+    assert m._sibling_model_key("audio", "/g/shared.gguf", "a") == "audio:a"
+
+
+def test_request_model_consults_the_sibling_key_first():
+    import inspect
+    src = inspect.getsource(MultiModelManager.request_model)
+    i = src.index("# Step 2: Build the model key")
+    window = src[i:i + 1400]
+    assert "_sibling_model_key" in window
+    # and it must come BEFORE the ordinary path key, or it never applies
+    assert window.index("_sibling_model_key") < window.index(
+        'model_key = f"{model_type}:{resolved_name}"')
