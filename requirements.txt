@@ -42,7 +42,12 @@ accelerate>=0.24.0
 geoclip>=1.2.0
 geopy>=2.4
 geographiclib>=2.0
-diffusers>=0.25.0  # For Stable Diffusion image generation
+diffusers>=0.42.1  # Stable Diffusion and every other diffusion pipeline.
+# The floor is 0.42 because that is where Krea2Pipeline and LTX-2.5's
+# LTX2DurationHead / LTX2VideoDiffusionDecoderModel landed; 0.38 loads neither.
+# It also moves the huggingface_hub floor: diffusers 0.42 wants >=1.32, while
+# transformers 5.x refuses >=2.0, so the usable window is narrow and pinned.
+huggingface_hub>=1.33.0,<2.0
 safetensors>=0.4.0  # Required by diffusers
 # Reads GGUF-quantized pipeline COMPONENTS (a Q4_K_M transformer served on the
 # base pipeline's VAE and text encoder — see build_gguf_pipeline_components).

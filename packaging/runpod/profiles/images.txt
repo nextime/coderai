@@ -2,7 +2,7 @@
 torchvision
 transformers>=4.35.0
 accelerate>=0.24.0
-diffusers>=0.25.0
+diffusers>=0.42.1  # Krea2Pipeline and the LTX-2.5 classes; see requirements.txt
 ftfy>=6.0
 timm>=0.9.0
 realesrgan>=0.3.0

@@ -16,7 +16,8 @@ setproctitle>=1.1
 Pillow>=10.0.0
 numpy>=1.24.0
 safetensors>=0.4.0
-huggingface_hub>=0.25.0
+huggingface_hub>=1.33.0,<2.0  # the window diffusers 0.42 (>=1.32) and
+# transformers 5.x (<2.0) share; resolving outside it breaks one of them
 
 # Imported at MODULE level somewhere in the graph `import codai.api.app` walks,
 # so every pod needs them regardless of profile — app.py mounts every router, and

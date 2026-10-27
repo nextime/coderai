@@ -8,7 +8,7 @@ transformers>=4.35.0
 # real A40 for the embeddings image: 303s of boot paid before anyone could find
 # out. Every profile that carries transformers carries this with it.
 accelerate>=0.26.0
-diffusers>=0.25.0
+diffusers>=0.42.1  # Krea2Pipeline and the LTX-2.5 classes; see requirements.txt
 demucs>=4.0.1
 deepfilternet>=0.5.6
 soundfile>=0.12.0
