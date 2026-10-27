@@ -487,6 +487,104 @@ def build_single_file_pipeline(model_name: str, cfg: Optional[Dict[str, Any]],
           "from_single_file can infer.")
 
 
+#: Segment suffixes diffusers' own converters sometimes carry when the model
+#: class does not. Checked one at a time, both directions, and only ever
+#: applied when BOTH of these hold: the produced key is not wanted by the
+#: class, and the renamed key IS. That makes it a rename of a tensor the
+#: checkpoint already contains -- never the invention of one it lacks.
+_KEY_ALIAS_SUFFIXES = ("_single",)
+
+
+def _rename_unexpected_keys(state, expected):
+    """Rename converter keys the class does not want but would under an alias.
+
+    Returns ``(new_state, [(old, new), ...])``. A key is only moved when the
+    class does not expect its current name AND does expect the renamed one AND
+    nothing already occupies the target, so this can neither overwrite a real
+    weight nor fabricate a missing one.
+    """
+    moved = []
+    out = dict(state)
+    for key in list(out):
+        if key in expected:
+            continue
+        for suf in _KEY_ALIAS_SUFFIXES:
+            parts = key.split(".")
+            hit = None
+            for i, seg in enumerate(parts):
+                if seg.endswith(suf) and len(seg) > len(suf):
+                    cand = ".".join(parts[:i] + [seg[: -len(suf)]] + parts[i + 1:])
+                    if cand in expected and cand not in out:
+                        hit = cand
+                        break
+            if hit:
+                out[hit] = out.pop(key)
+                moved.append((key, hit))
+                break
+    return out, moved
+
+
+def _patch_converter_key_aliases(cls_name, cls, cfg, comp_name):
+    """Repair a converter/class naming disagreement for one load.
+
+    diffusers 0.38 converts an LTX-2 checkpoint's prompt-adaln weights to
+    ``prompt_adaln_single.*`` and ``audio_prompt_adaln_single.*`` while
+    LTX2VideoTransformer3DModel expects ``prompt_adaln.*`` and
+    ``audio_prompt_adaln.*``. Twelve names, one-to-one, the same tensors --
+    so the load failed with "Cannot copy out of meta tensor" for parameters
+    that were present all along, under a name nobody reconciled.
+
+    Measured identically on LTX-2.3-10Eros v1.5 and PinkCherry v1.8.
+
+    The patch wraps that class's registered converter for the duration of ONE
+    ``from_single_file`` call and restores it afterwards; the returned callable
+    is that restore. Returns None when there is nothing to do, which is the
+    case for every model whose converter and class already agree.
+    """
+    try:
+        import json as _json
+        import os as _os
+
+        import torch
+
+        from diffusers.loaders.single_file_model import (
+            SINGLE_FILE_LOADABLE_CLASSES)
+        entry = SINGLE_FILE_LOADABLE_CLASSES.get(cls_name)
+        if not entry or "checkpoint_mapping_fn" not in entry:
+            return None
+        conf = _os.path.join(_component_dir(cfg, comp_name) or "", "config.json")
+        if not _os.path.isfile(conf):
+            return None
+        c = _json.load(open(conf))
+        c.pop("_class_name", None)
+        c.pop("_diffusers_version", None)
+        with torch.device("meta"):
+            probe = cls.from_config(c)
+        expected = set(dict(probe.named_parameters())) | set(
+            dict(probe.named_buffers()))
+        original = entry["checkpoint_mapping_fn"]
+
+        def _wrapped(checkpoint, **kw):
+            out = original(checkpoint, **kw)
+            fixed, moved = _rename_unexpected_keys(out, expected)
+            if moved:
+                groups = sorted({a.split(".")[0] for a, _ in moved})
+                print(f"  [gguf] reconciled {len(moved)} key name(s) this "
+                      f"diffusers' converter and {cls_name} disagree on "
+                      f"({', '.join(groups)}); the tensors are the "
+                      f"checkpoint's own, only the names differed")
+            return fixed
+
+        entry["checkpoint_mapping_fn"] = _wrapped
+
+        def _restore():
+            entry["checkpoint_mapping_fn"] = original
+
+        return _restore
+    except Exception:
+        return None
+
+
 def _missing_tensor_hint(exc, name: str, path: str, cfg) -> str:
     """Turn a meta-tensor failure into the list of parameters actually absent.
 
@@ -603,6 +701,7 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
     # freed a third of what the load actually took. A silent downgrade to
     # something that does not fit is worse than a refusal.
     problems: List[str] = []
+    _undo = None
     for name, path in gguf_entries.items():
         spec = specs.get(name)
         if not spec or spec[0] != 'diffusers':
@@ -617,6 +716,7 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             continue
         try:
             print(f"  Loading GGUF component '{name}' from {path}")
+            _undo = _patch_converter_key_aliases(cls_name, cls, cfg, name)
             # `config` names the architecture the file's tensors belong to.
             # Without it, from_single_file INFERS one -- and its fallback is
             # Stable Diffusion 1.5, so a Qwen-Image / Flux / Wan transformer
@@ -635,6 +735,13 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
         except Exception as e:
             _hint = _missing_tensor_hint(e, name, path, cfg)
             problems.append(f"{name} ({path}): {e}{_hint}")
+        finally:
+            try:
+                if _undo:
+                    _undo()
+            except Exception:
+                pass
+            _undo = None
     if problems:
         raise RuntimeError(
             "this model configures GGUF component(s) that could not be loaded, "
