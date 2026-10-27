@@ -1321,6 +1321,16 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             model_name, model_cfg, torch_dtype)
         if _gguf_components:
             print(f"  Video GGUF components: {_gguf_desc}")
+            # A GGUF component is a PRE-BUILT object handed to from_pretrained,
+            # exactly like a cached one -- so the hazard below is the same:
+            # accelerate's device_map only dispatches components it LOADS, and
+            # one it was handed keeps whatever device it is on with no offload
+            # hook. Measured on LTX-2.5, whose every placement strategy ended in
+            #     Expected all tensors to be on the same device, but got index
+            #     is on cuda:0, different from other tensors on cpu
+            # while the flag that would have kept the pipeline resident was
+            # never consulted, because only the cache path set this.
+            _have_injected_components = True
         # Incremental per-component cache: load each bnb-quantizable heavy component
         # from the per-component cache (or build+cache it one-at-a-time on the GPU),
         # then inject like GGUF components so the offload ladder assembles them. This
