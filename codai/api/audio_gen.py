@@ -251,11 +251,41 @@ def _load_audioldm(model_name: str, device: str, model_config: dict = None):
 
 def _detect_audio_gen_type(model_name: str) -> str:
     n = model_name.lower()
-    if 'audioldm' in n or 'stable-audio' in n:
+    # Stable Audio is NOT AudioLDM. It was mapped here to 'audioldm', which
+    # loads AudioLDM2Pipeline -- a different architecture with a different
+    # projection model and a different sample rate -- so a configured
+    # stable-audio-open entry could only ever fail at load. It has its own
+    # pipeline in diffusers and its own branch below.
+    if 'stable-audio' in n or 'stable_audio' in n:
+        return 'stable_audio'
+    if 'audioldm' in n:
         return 'audioldm'
     if 'audiogen' in n:
         return 'audiogen'
+    if 'ace-step' in n or 'acestep' in n:
+        return 'ace_step'
     return 'musicgen'
+
+
+def _load_stable_audio(model_name: str, device: str, model_config: dict = None):
+    """Stable Audio Open: text (and a negative prompt) to music or an effect.
+
+    44.1 kHz stereo, up to about 47 seconds, which is what makes it the right
+    model for a loop or a sound effect rather than a whole track.
+    """
+    import torch
+    from diffusers import StableAudioPipeline
+
+    from codai.models.hf_loading import resolve_dtype
+    dtype = resolve_dtype(model_config, default='f16')
+    pipe = StableAudioPipeline.from_pretrained(model_name, torch_dtype=dtype)
+    _off = (model_config or {}).get('offload_strategy')
+    if _off in ('cpu', 'sequential', 'model', 'disk') and hasattr(
+            pipe, 'enable_model_cpu_offload'):
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(device)
+    return pipe
 
 
 def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task_id=None):
@@ -284,6 +314,36 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
         audio_np = wav[0, 0].cpu().numpy()
         sr = pipe.sample_rate
 
+    elif model_type == 'stable_audio':
+        num_steps = int(getattr(request, 'steps', None) or 100)
+        _aud_progress_reset(num_steps, unit="it")
+
+        def _sa_step_cb(pipe, step_index, timestep, callback_kwargs):
+            task_registry.raise_if_cancelled(task_id)
+            task_registry.wait_if_paused(task_id)
+            task_registry.step(task_id, step_index + 1)
+            _aud_progress_step(step_index + 1)
+            return callback_kwargs
+
+        import torch
+        _gen = None
+        if getattr(request, 'seed', None) is not None:
+            _gen = torch.Generator(pipe.device).manual_seed(int(request.seed))
+        result = pipe(
+            request.prompt,
+            negative_prompt=getattr(request, 'negative_prompt', None),
+            num_inference_steps=num_steps,
+            audio_end_in_s=float(request.duration or 10.0),
+            num_waveforms_per_prompt=1,
+            generator=_gen,
+            callback_on_step_end=_sa_step_cb,
+        )
+        # (channels, samples) float32 at 44.1 kHz. Kept STEREO: this model's
+        # point is that it produces a usable stereo bed, and folding it to mono
+        # here would throw that away.
+        audio_np = result.audios[0].T.float().cpu().numpy()
+        sr = int(pipe.vae.config.sampling_rate)
+
     elif model_type == 'audioldm':
         num_steps = 50
         _aud_progress_reset(num_steps, unit="it")
@@ -307,7 +367,13 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
     # Write to wav
     import scipy.io.wavfile as wavfile
     buf = _io.BytesIO()
-    audio_int16 = (audio_np * 32767).astype(np.int16)
+    # scipy writes (samples,) as mono and (samples, channels) as multichannel.
+    # Clipped before the cast: a float sample above 1.0 wraps round to a loud
+    # negative one on int16 overflow, which is heard as a click.
+    audio_np = np.asarray(audio_np)
+    if audio_np.ndim > 1 and audio_np.shape[0] < audio_np.shape[-1]:
+        audio_np = audio_np.T          # (channels, samples) -> (samples, channels)
+    audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
     wavfile.write(buf, sr, audio_int16)
     return buf.getvalue(), 'wav'
 
@@ -369,6 +435,20 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
                 if model_type in ('musicgen', 'audiogen'):
                     pipe = await asyncio.get_event_loop().run_in_executor(
                         None, _load_musicgen, model_name, device, _ag_cfg)
+                elif model_type == 'stable_audio':
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_stable_audio, model_name, device, _ag_cfg)
+                elif model_type == 'ace_step':
+                    # ACE-Step ships its own package, which pins a stack this
+                    # venv cannot hold. It belongs in an isolated-venv worker
+                    # like CrisperWhisper and Canary; until that exists, say
+                    # so plainly rather than loading it as a MusicGen and
+                    # failing with a shape error three minutes later.
+                    raise RuntimeError(
+                        f"{model_name} is an ACE-Step model, which needs the "
+                        "`acestep` package in its own venv; coderai has no "
+                        "ACE-Step worker yet. Use a Stable Audio or MusicGen "
+                        "model for now.")
                 else:
                     pipe = await asyncio.get_event_loop().run_in_executor(
                         None, _load_audioldm, model_name, device, _ag_cfg)

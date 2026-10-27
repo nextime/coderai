@@ -183,6 +183,28 @@ class ModelInfo(BaseModel):
     # be, how many scenes fill a minute) instead of hardcoding a table per family.
     # See codai/models/video_geometry.py.
     video: Optional[Dict] = None
+    # What this model recommends for itself, from its card: steps, guidance
+    # scale, sampler. Published because a client cannot otherwise know: a
+    # distilled model wants 8 steps at CFG 1 and its non-distilled sibling
+    # wants 30 at CFG 4, and a client with no table of its own gets 30 from
+    # the 8-step model -- four times the cost for a worse picture. The server
+    # applies these when a request omits them; this field is so a UI can SHOW
+    # them.
+    defaults: Optional[Dict] = None
+    # Which directions this model generates in: "t2v", "i2v", "v2v" for video,
+    # "t2i", "i2i" for images. A caller otherwise discovers that a model has no
+    # image-to-video path by sending one and getting a 400.
+    modes: Optional[List[str]] = None
+    # The licence the weights are under, as the operator recorded it. Some
+    # models are free only below a revenue threshold or require a content
+    # filter, and that is a fact about the model which belongs beside it
+    # rather than in a document somewhere.
+    license: Optional[str] = None
+    # Whether this model is usable RIGHT NOW. Used by the built-in endpoints
+    # whose models are not model-manager models (moderation): an unavailable
+    # check has to be visible before content is sent for it, and an omitted
+    # entry would read as "this server does not do that at all".
+    available: Optional[bool] = None
 
 
 class ModelList(BaseModel):

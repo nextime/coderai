@@ -67,6 +67,9 @@ def set_global_file_path(path: str) -> None:
 
 _MAX_SCENES = 200
 _MAX_VISUALS_PER_SCENE = 12
+#: Lines in one dialogue scene. A scene is a beat, not an act; a longer
+#: exchange is several scenes, which is also how it gets its own visuals.
+_MAX_SPEAKERS_PER_SCENE = 20
 _JOB_HISTORY = 100
 _STAGES = ("queued", "narration", "captions", "presenter", "visuals", "music",
            "render", "thumbnail")
@@ -101,6 +104,40 @@ class Visual(BaseModel):
     ken_burns: Optional[Any] = None
     colors: Optional[List[str]] = None
     color: Optional[str] = None
+    # Keep THIS clip's own sound. Every visual is rendered silent (ffmpeg -an),
+    # which is right for a stock shot under a voice-over and wrong for footage
+    # whose sound IS the content -- a crowd, a demo, a piece to camera that was
+    # filmed with its audio. Ignored for image/gradient/colour visuals, which
+    # have none, and for a visual that is not the one carrying the scene (only
+    # the first audible video in a scene is taken; see _scene_clip_audio).
+    keep_audio: bool = False
+    # How loud this clip sits when it is mixed UNDER the narration
+    # (``audio_mix: "both"``). A per-visual override of the scene's
+    # ``clip_volume``.
+    volume: Optional[float] = None
+    model_config = ConfigDict(extra="allow")
+
+
+class SpeakerLine(BaseModel):
+    """One character's turn in a scene's dialogue.
+
+    A scene has always had one voice and one presenter, which is a monologue.
+    Two characters talking needs three things a per-scene override cannot
+    give: an ORDER (who speaks when), a voice per turn, and a place in the
+    frame for each of them to be while the other one talks.
+    """
+    character: Optional[str] = None       # a saved character profile
+    image: Optional[str] = None           # or an explicit portrait
+    text: Optional[str] = None            # what they say
+    audio: Optional[str] = None           # or ready-made audio for this line
+    voice: Optional[VoiceSpec] = None     # this character's voice
+    # Where this character is while the scene runs: "left"/"right" (a column
+    # of a side-by-side frame, held for the whole scene) or "full" (the frame
+    # cuts to whoever is speaking). Mixing the two in one scene is refused:
+    # a character cannot both hold a column and not be on screen.
+    layout: Optional[str] = None
+    # Silence after this line, so a reply does not tread on the question.
+    gap: float = 0.25
     model_config = ConfigDict(extra="allow")
 
 
@@ -112,6 +149,24 @@ class Scene(BaseModel):
     padding: float = 0.15
     visuals: List[Visual] = Field(default_factory=list)
     voice: Optional[VoiceSpec] = None       # per-scene override (a second speaker)
+    # Two or more characters talking, in order. Replaces `text`/`voice`/
+    # `presenter` for this scene: the lines ARE the narration, each in its own
+    # character's voice, and each character is lip-synced in its own region of
+    # the frame.
+    speakers: List[SpeakerLine] = Field(default_factory=list)
+    # What this scene SOUNDS like:
+    #   "voice" (default) — the narration only, as before.
+    #   "clip"            — the clip's own sound only, no narration. The scene
+    #                       then lasts as long as the clip, because the clip is
+    #                       the content and cutting it mid-sentence is never
+    #                       what was meant. An explicit `duration` still wins.
+    #   "both"            — narration over the clip, the clip ducked under it.
+    # Only "clip"/"both" need `visual.keep_audio`; "voice" ignores it.
+    audio_mix: str = "voice"
+    # The clip's level under the voice in "both", 0-1. A per-visual `volume`
+    # overrides it. Not used by "clip", where the clip is the whole mix and is
+    # loudness-normalised like narration.
+    clip_volume: float = 0.35
     # A presenter block for this scene, or false to opt out of the request's one.
     presenter: Optional[Any] = None
     model_config = ConfigDict(extra="allow")
@@ -379,7 +434,39 @@ def _validate(req: ComposeRequest) -> None:
         raise HTTPException(status_code=400, detail=(
             "transition.type: expected none, fade, crossfade, slide, wipe or dissolve"))
     for i, sc in enumerate(req.scenes):
-        has_narration = bool((sc.text or "").strip()) or bool(sc.audio)
+        # A dialogue's lines ARE the scene's narration and its presenter, so a
+        # dialogue scene needs neither `text` nor visuals. Validated here, or a
+        # perfectly renderable scene would be refused for having neither.
+        if sc.speakers:
+            try:
+                _speaker_layout(sc)
+            except ValueError as exc:
+                raise HTTPException(status_code=400,
+                                    detail=f"scenes[{i}].speakers: {exc}")
+            if len(sc.speakers) > _MAX_SPEAKERS_PER_SCENE:
+                raise HTTPException(status_code=400, detail=(
+                    f"scenes[{i}].speakers: at most {_MAX_SPEAKERS_PER_SCENE} "
+                    f"lines per scene"))
+            for k, sp in enumerate(sc.speakers):
+                if not ((sp.text or "").strip() or sp.audio):
+                    raise HTTPException(status_code=400, detail=(
+                        f"scenes[{i}].speakers[{k}]: a line needs `text` or "
+                        f"`audio`"))
+                if not (sp.character or sp.image
+                        or (req.presenter and (req.presenter.character
+                                               or req.presenter.image))):
+                    raise HTTPException(status_code=400, detail=(
+                        f"scenes[{i}].speakers[{k}]: a speaker needs a "
+                        f"`character` or an `image` to be lip-synced (or a "
+                        f"request-level presenter to inherit one from)"))
+                # The same check the presenter gets: a profile name that does
+                # not exist is a typo, and finding out mid-render costs the
+                # caller the narration they have already paid to synthesise.
+                if sp.character:
+                    _validate_character_name(sp.character,
+                                             f"scenes[{i}].speakers[{k}]")
+        has_narration = (bool((sc.text or "").strip()) or bool(sc.audio)
+                         or bool(sc.speakers))
         if not has_narration and not (sc.duration and sc.duration > 0):
             raise HTTPException(status_code=400, detail=(
                 f"scenes[{i}]: a scene with no text and no audio needs an explicit "
@@ -387,7 +474,8 @@ def _validate(req: ComposeRequest) -> None:
         pres = presenter_for(sc, req)
         if pres is not None:
             _validate_presenter(pres, f"scenes[{i}].presenter" if sc.presenter else "presenter")
-        if not sc.visuals and not (pres and (pres.get("layout") or "full").lower() == "full"):
+        if (not sc.visuals and not sc.speakers
+                and not (pres and (pres.get("layout") or "full").lower() == "full")):
             raise HTTPException(status_code=400, detail=(
                 f"scenes[{i}].visuals: at least one visual is required "
                 f"(a scene with no visuals needs a full-screen presenter)"))
@@ -463,6 +551,28 @@ def presenter_for(scene: Scene, req: ComposeRequest) -> Optional[dict]:
     return dict(base) if base else None
 
 
+def _validate_character_name(char: str, where: str) -> None:
+    """A named profile must exist, or the render fails after paying for TTS.
+
+    Its own function because a dialogue's speakers need exactly this check and
+    nothing else from presenter validation -- calling the whole validator for a
+    speaker rejected it for having no `layout`, which a speaker has no business
+    carrying.
+    """
+    char = (char or "").strip()
+    if not char:
+        return
+    try:
+        from codai.api.characters import _load_character_meta
+        known = bool(_load_character_meta(char))
+    except Exception:
+        known = True          # cannot check → let the render warn instead
+    if not known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{where}.character: no character profile named {char!r}")
+
+
 def _validate_presenter(spec: dict, where: str) -> None:
     layout = (spec.get("layout") or "full").lower()
     if layout not in ("full", "pip", "split"):
@@ -500,14 +610,7 @@ def _validate_presenter(spec: dict, where: str) -> None:
         raise HTTPException(status_code=400,
                             detail=f"{where}: needs a character or an image")
     if char:
-        try:
-            from codai.api.characters import _load_character_meta
-            known = bool(_load_character_meta(char))
-        except Exception:
-            known = True          # cannot check → let the render warn instead
-        if not known:
-            raise HTTPException(status_code=400,
-                                detail=f"{where}.character: no character profile named {char!r}")
+        _validate_character_name(char, where)
     from codai.compose import presenter as _pres
     want = (spec.get("engine") or "auto").strip()
     if not _pres.engine_installed(want):
@@ -541,23 +644,47 @@ def _has_model(mtype: str, name: str = "") -> bool:
                for i in ids)
 
 
+def _voice_specs(req: ComposeRequest) -> list:
+    """Every voice this render will actually use, resolved.
+
+    A dialogue's lines each carry their own voice, so reading only
+    ``scene.voice`` misses them -- which meant a dialogue-only request passed
+    the "is TTS configured" check and then failed at the first line, after the
+    job had been accepted.
+    """
+    out = []
+    for sc in req.scenes:
+        if getattr(sc, "speakers", None):
+            for sp in sc.speakers:
+                if (sp.text or "").strip() and not sp.audio:
+                    out.append(sp.voice or sc.voice or req.voice)
+        if (sc.text or "").strip() and not sc.audio:
+            out.append(sc.voice or req.voice)
+    return out
+
+
 def _voice_needed(req: ComposeRequest) -> bool:
-    return any((sc.text or "").strip() and not sc.audio for sc in req.scenes)
+    return bool(_voice_specs(req))
 
 
 def _voice_available(req: ComposeRequest) -> bool:
-    engines = {(sc.voice or req.voice).engine or "tts" for sc in req.scenes}
+    specs = _voice_specs(req) or [req.voice]
+    engines = {(v.engine or "tts") for v in specs}
     if "clone" in engines:
         try:
             from codai.api.voice_clone import _load_voice
-            names = {(sc.voice or req.voice).voice_name for sc in req.scenes
-                     if ((sc.voice or req.voice).engine or "tts") == "clone"}
+            names = {v.voice_name for v in specs if (v.engine or "tts") == "clone"}
             if not all(n and _load_voice(n) for n in names):
                 return False
         except Exception:
             return False
     if engines - {"clone"}:
-        return _has_model("tts", req.voice.model or "")
+        # Every distinct TTS model a line asks for has to be installed, not
+        # just the request-level default: a dialogue may give each character a
+        # different one.
+        models = {(v.model or req.voice.model or "") for v in specs
+                  if (v.engine or "tts") != "clone"}
+        return all(_has_model("tts", m) for m in (models or {""}))
     return True
 
 
@@ -691,6 +818,79 @@ def _generate_music(loop, spec: dict, total: float, out_path: str) -> str:
     return out_path
 
 
+def _speaker_key(sp, idx: int) -> str:
+    """What identifies a character across the lines they speak.
+
+    Their profile name where they have one, else their portrait, else their
+    position -- so a dialogue written with inline images still groups the same
+    character's lines together instead of putting them in two columns.
+    """
+    return (str(getattr(sp, "character", None) or "").strip().lower()
+            or str(getattr(sp, "image", None) or "").strip()
+            or f"_speaker{idx}")
+
+
+def _speaker_layout(sc) -> str:
+    """``row`` or ``cut`` for a dialogue scene, validated.
+
+    ``row`` keeps every character on screen in their own column for the whole
+    scene -- the default, because a listener's reaction is half of a dialogue.
+    ``cut`` gives the frame to whoever is speaking.
+    """
+    wants = {str(getattr(sp, "layout", None) or "").strip().lower()
+             for sp in (getattr(sc, "speakers", None) or [])}
+    wants.discard("")
+    if not wants:
+        return "row"
+    if wants == {"full"}:
+        return "cut"
+    if wants <= {"left", "right", "centre", "center"}:
+        return "row"
+    raise ValueError(
+        "a scene's speakers must all use a column layout (left/right) or all "
+        f"use full; got {sorted(wants)}. A character cannot both hold a column "
+        "and be off screen while the other speaks.")
+
+
+def _speaker_order(sc) -> List[tuple]:
+    """``[(key, speaker), ...]`` — the distinct characters, in first-speaking
+    order. That order is the left-to-right order of the columns."""
+    out, seen = [], set()
+    for i, sp in enumerate(getattr(sc, "speakers", None) or []):
+        k = _speaker_key(sp, i)
+        if k not in seen:
+            seen.add(k)
+            out.append((k, sp))
+    return out
+
+
+def _scene_mix(sc) -> str:
+    """The scene's audio_mix, validated down to one of the three it can be."""
+    m = str(getattr(sc, "audio_mix", None) or "voice").strip().lower()
+    return m if m in ("voice", "clip", "both") else "voice"
+
+
+def _scene_clip_visual(sc):
+    """The visual whose own sound this scene carries, or ``None``.
+
+    The FIRST video visual that asks to keep its audio. A scene may show
+    several clips in sequence, and summing all their soundtracks over one
+    narration is a mess nobody asked for; the caller who wants a second clip's
+    sound gives it its own scene, where it also gets its own duration. With
+    ``audio_mix`` set but no visual marked, the first video visual is taken --
+    asking for the clip's sound and not saying which clip can only mean the
+    one clip.
+    """
+    vids = [v for v in (getattr(sc, "visuals", None) or [])
+            if str(getattr(v, "type", "") or "").lower() == "video"]
+    for v in vids:
+        if bool(getattr(v, "keep_audio", False)):
+            return v
+    if _scene_mix(sc) != "voice" and len(vids) == 1:
+        return vids[0]
+    return None
+
+
 def _stt_words(loop, audio_path: str, model: str, language: Optional[str]) -> List[dict]:
     """Word timestamps for a narration clip (only the timings are used)."""
     from codai.api.transcriptions import _run_transcription
@@ -771,11 +971,17 @@ def _stt_speaks(model_id: str, languages) -> bool:
     ``wav2vec2-it`` and ``wav2vec2-en`` has two models that each report word
     timings and each reject the other's language.
     """
-    declared = {str(x).strip().lower()
-                for x in (_stt_entry(model_id).get("languages") or [])}
+    from codai.api.lang_codes import aliases
+    declared = set()
+    for x in (_stt_entry(model_id).get("languages") or []):
+        declared |= aliases(x)
     if not declared:
         return True
-    return all(str(l).strip().lower() in declared for l in languages if l)
+    # By meaning, like the validator: a model declaring "english" does speak
+    # the "en-gb" a British voice narrates in, and comparing the strings
+    # literally disqualified every usable model as soon as a render asked for
+    # an accent.
+    return all(aliases(l) & declared for l in languages if l)
 
 
 def _request_languages(req) -> list:
@@ -858,17 +1064,104 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
         n_scenes = len(req.scenes)
         scene_audio: List[Optional[str]] = []
         scene_dur: List[float] = []
+        scene_mixes: List[str] = []
+        # Per scene, for a dialogue: the layout and every line with its
+        # character, offset and length. Read by the presenter pass (who is
+        # lip-synced where) and by the captions pass (who is speaking).
+        scene_lines: Dict[int, dict] = {}
+        # Per scene: the visual whose own sound it keeps, already resolved and
+        # probed. Resolved HERE, in the narration pass, because with
+        # audio_mix="clip" the clip's length IS the scene's length and that has
+        # to be known before anything is timed. Stage 3 reuses what this
+        # resolved rather than fetching the same file twice.
+        clip_media: Dict[int, dict] = {}
         for i, sc in enumerate(req.scenes):
             stage("narration", 2.0 + 26.0 * i / max(1, n_scenes),
                   f"scene {i + 1}/{n_scenes}: narration")
+            mix = _scene_mix(sc)
+            cv = _scene_clip_visual(sc)
+            if cv is not None:
+                try:
+                    _cp = media.resolve(getattr(cv, "src", None) or "", work,
+                                        f"s{i}-clipaudio")
+                    if not rnd.has_audio_stream(_cp):
+                        raise media.MediaError("the clip has no audio stream")
+                    clip_media[i] = {"path": _cp, "probe": media.probe(_cp),
+                                     "src": getattr(cv, "src", None) or "",
+                                     "trim_start": max(0.0, float(
+                                         getattr(cv, "trim_start", 0.0) or 0.0)),
+                                     "volume": getattr(cv, "volume", None)}
+                except (media.MediaError, OSError) as exc:
+                    # Not fatal: the scene still has its narration, or silence.
+                    # Said out loud, because a caller who asked to keep a
+                    # clip's sound and silently got none would ship it.
+                    warn(f"scene {i}: keep_audio requested but {exc}; "
+                         f"rendered with {'narration only' if mix == 'both' else 'no sound'}")
+                    mix = "voice" if mix == "both" else mix
+            elif mix != "voice":
+                warn(f"scene {i}: audio_mix={mix!r} but no video visual keeps its "
+                     f"audio; narration used instead")
+                mix = "voice"
+            scene_mixes.append(mix)
+
             apath = None
-            if sc.audio:
+            # ---- a dialogue: every line in its own character's voice -------
+            if sc.speakers:
+                try:
+                    _lay = _speaker_layout(sc)
+                except ValueError as exc:
+                    raise rnd.RenderError(f"scene {i}: {exc}")
+                _lines, _t = [], 0.0
+                for k, sp in enumerate(sc.speakers):
+                    _lp = None
+                    if sp.audio:
+                        try:
+                            _lp = media.resolve(sp.audio, work, f"s{i}l{k}-audio")
+                        except media.MediaError as exc:
+                            warn(f"scene {i} line {k}: audio could not be fetched "
+                                 f"({exc}); synthesised from text instead")
+                    if _lp is None and (sp.text or "").strip():
+                        _lp = _synth_scene(
+                            loop, sp.text, sp.voice or sc.voice or req.voice,
+                            os.path.join(work, f"s{i}l{k}-voice.wav"))
+                    if not _lp:
+                        warn(f"scene {i} line {k}: no text and no audio; skipped")
+                        continue
+                    try:
+                        _ld = media.duration_of(_lp)
+                    except media.MediaError as exc:
+                        warn(f"scene {i} line {k}: could not be probed ({exc}); skipped")
+                        continue
+                    _lines.append({"path": _lp, "start": round(_t, 3),
+                                   "dur": round(_ld, 3),
+                                   "key": _speaker_key(sp, k),
+                                   "character": sp.character,
+                                   "text": (sp.text or "").strip(),
+                                   "index": k})
+                    _t += _ld + max(0.0, float(sp.gap or 0.0))
+                if _lines:
+                    # The lines ARE the narration: one track, each line where
+                    # it falls, so captions and music ducking see a normal
+                    # scene and need to know nothing about dialogue.
+                    apath = rnd.place_at(
+                        [(ln["path"], ln["start"]) for ln in _lines],
+                        os.path.join(work, f"scene{i}-dialogue.wav"),
+                        duration=_t, cancel=cancel, log=log)
+                    scene_lines[i] = {"layout": _lay, "lines": _lines,
+                                      "span": round(_t, 3)}
+                else:
+                    warn(f"scene {i}: speakers were given but none could be "
+                         f"spoken; the scene falls back to its own text")
+            if apath is None and sc.audio:
                 try:
                     apath = media.resolve(sc.audio, work, f"scene{i}-audio")
                 except media.MediaError as exc:
                     warn(f"scene {i}: audio could not be fetched ({exc}); "
                          f"synthesising from text instead")
-            if apath is None and (sc.text or "").strip():
+            # audio_mix="clip" is "the clip's sound INSTEAD of narration", so
+            # there is nothing to synthesise -- and synthesising it anyway would
+            # bill a TTS call per scene for audio no one ever hears.
+            if apath is None and mix != "clip" and not sc.speakers and (sc.text or "").strip():
                 apath = _synth_scene(loop, sc.text, sc.voice or req.voice,
                                      os.path.join(work, f"scene{i}-voice.wav"))
             dur = 0.0
@@ -882,6 +1175,15 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 dur = dur + max(0.0, float(sc.padding or 0.0))
             else:
                 dur = float(sc.duration or 0.0)
+            # With the clip as the whole soundtrack, the clip's remaining length
+            # is the scene's -- cutting it at an arbitrary 3 s default, or at a
+            # narration's length, truncates the content itself. An explicit
+            # `duration` still wins: a caller who names one means it.
+            if mix == "clip" and not sc.duration:
+                _cd = float((clip_media.get(i) or {}).get("probe", {}).get("duration") or 0.0)
+                _cd -= float((clip_media.get(i) or {}).get("trim_start") or 0.0)
+                if _cd > 0:
+                    dur = round(_cd, 3)
             dur = max(dur, float(sc.min_duration or 0.0))
             if dur <= 0:
                 dur = 3.0
@@ -912,6 +1214,36 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
             words: List[dict] = []
             _no_words_warned: set = set()
             for i, sc in enumerate(req.scenes):
+                # ---- a dialogue: caption each line in its own window -------
+                # Better than captioning the scene as one block, not merely
+                # different: each line's text, speaker and time window are
+                # known exactly, so there is nothing to infer and no chance of
+                # a question and its answer landing in one caption.
+                info = scene_lines.get(i)
+                if info:
+                    for ln in info["lines"]:
+                        if not ln["text"]:
+                            continue
+                        _lstt: List[dict] = []
+                        if model:
+                            try:
+                                _lstt = _stt_words(
+                                    loop, ln["path"], model,
+                                    ((sc.speakers[ln["index"]].voice
+                                      or sc.voice or req.voice).language))
+                            except Exception as exc:
+                                warn(f"scene {i} line {ln['index']}: word "
+                                     f"timestamps failed ({exc}); estimated instead")
+                        _lstart = starts[i] + float(ln["start"])
+                        _lspan = max(0.2, float(ln["dur"]))
+                        _got = (cap.align_words(ln["text"], _lstt, _lstart, _lspan)
+                                if _lstt else
+                                cap.estimate_words(ln["text"], _lstart, _lspan))
+                        _who = ln.get("character") or ln["key"]
+                        for w in _got:
+                            w["speaker"] = _who
+                        words += _got
+                    continue
                 text = (sc.text or "").strip()
                 if not text:
                     continue
@@ -955,6 +1287,100 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
         # and because it is the GPU part: it should not wait behind ffmpeg.
         presenters: List[Optional[dict]] = [None] * n_scenes
         want_pres = [presenter_for(sc, req) for sc in req.scenes]
+
+        # ---- dialogue scenes: one presenter PER CHARACTER ------------------
+        # Built before the single-presenter pass and marked so that pass skips
+        # the scene: a scene is a monologue or a dialogue, not both.
+        for i, sc in enumerate(req.scenes):
+            info = scene_lines.get(i)
+            if not info:
+                continue
+            want_pres[i] = None          # the dialogue owns this scene
+            from codai.compose import presenter as _pres
+            order = _speaker_order(sc)
+            stage("presenter", 30.0 + 9.0 * i / max(1, n_scenes),
+                  f"scene {i + 1}/{n_scenes}: {len(order)} speakers")
+            base_spec = presenter_for(sc, req) or {}
+            per: List[dict] = []
+            try:
+                for col, (key, sp) in enumerate(order):
+                    mine = [ln for ln in info["lines"] if ln["key"] == key]
+                    if not mine:
+                        continue
+                    # This character's own track: their lines where they fall,
+                    # silence while the other one talks. One sync run for the
+                    # whole scene then gives a mouth that moves on their words
+                    # and a closed mouth while they listen.
+                    track = rnd.place_at(
+                        [(ln["path"], ln["start"]) for ln in mine],
+                        os.path.join(work, f"s{i}sp{col}-track.wav"),
+                        duration=scene_dur[i] + extra_t, cancel=cancel, log=log)
+                    spec = dict(base_spec)
+                    spec.pop("layout", None)
+                    if sp.character:
+                        spec["character"] = sp.character
+                    if sp.image:
+                        spec["image"] = sp.image
+                    spec.setdefault("motion", "still")
+                    built = _pres.build_scene_presenter(
+                        spec, narration=track, duration=scene_dur[i] + extra_t,
+                        width=(canvas.width // max(1, len(order))
+                               if info["layout"] == "row" else canvas.width),
+                        height=canvas.height, fps=canvas.fps, workdir=work,
+                        index=f"{i}s{col}", loop=loop, cancel=cancel, log=log,
+                        gpu_lease=lambda: _gpu_lease(loop, "lipsync"))
+                    built["key"] = key
+                    built["character"] = sp.character
+                    per.append(built)
+                if not per:
+                    raise rnd.RenderError("no speaker could be lip-synced")
+                if info["layout"] == "row" and len(per) > 1:
+                    path = rnd.composite_row(
+                        [b["path"] for b in per],
+                        os.path.join(work, f"s{i}-speakers.mp4"),
+                        width=canvas.width, height=canvas.height,
+                        fps=canvas.fps, cancel=cancel, log=log)
+                elif info["layout"] == "cut" and len(per) > 1:
+                    # The frame cuts to whoever is speaking: each line is that
+                    # character's own clip over that line's window, joined in
+                    # order. Taken from the already-synced full-scene clip, so
+                    # a character is still mid-expression when we cut to them
+                    # rather than starting from a cold still.
+                    by_key = {b["key"]: b["path"] for b in per}
+                    segs, segdurs = [], []
+                    _lines = info["lines"]
+                    for k, ln in enumerate(_lines):
+                        src = by_key.get(ln["key"])
+                        if not src:
+                            continue
+                        _next = (_lines[k + 1]["start"] if k + 1 < len(_lines)
+                                 else scene_dur[i] + extra_t)
+                        _len = max(0.08, float(_next) - float(ln["start"]))
+                        segs.append(rnd.cut_segment(
+                            src, os.path.join(work, f"s{i}cut{k}.mp4"),
+                            start=ln["start"], duration=_len, fps=canvas.fps,
+                            width=canvas.width, height=canvas.height,
+                            cancel=cancel, log=log))
+                        segdurs.append(_len)
+                    if not segs:
+                        raise rnd.RenderError("no dialogue line could be cut")
+                    path = os.path.join(work, f"s{i}-speakers.mp4")
+                    rnd.concat_clips(segs, path, work, cancel=cancel, log=log)
+                else:
+                    # A single character: this is just a presenter.
+                    path = per[0]["path"]
+                presenters[i] = {"path": path, "engine": per[0].get("engine"),
+                                 "layout": "full", "spec": base_spec,
+                                 "speakers": [b.get("character") or b["key"]
+                                              for b in per]}
+            except rnd.Cancelled:
+                raise
+            except Exception as exc:
+                warn(f"scene {i}: the dialogue could not be lip-synced ({exc}); "
+                     f"the scene's visuals are used and the lines are still heard")
+                if not sc.visuals:
+                    sc.visuals = [Visual(type="gradient")]
+
         if any(p is not None for p in want_pres):
             from codai.compose import presenter as _pres
             for i, sc in enumerate(req.scenes):
@@ -1011,9 +1437,18 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 vt = (spec.get("type") or "image").lower()
                 if vt in ("video", "image"):
                     try:
-                        spec["_path"] = media.resolve(spec.get("src") or "", work,
-                                                      f"s{i}v{j}")
-                        spec["_probe"] = media.probe(spec["_path"])
+                        # The narration pass already fetched and probed this
+                        # exact source when the scene keeps its audio; fetching
+                        # it again would download the same clip twice.
+                        _cached = clip_media.get(i) or {}
+                        if (_cached.get("src")
+                                and _cached["src"] == (spec.get("src") or "")):
+                            spec["_path"] = _cached["path"]
+                            spec["_probe"] = _cached["probe"]
+                        else:
+                            spec["_path"] = media.resolve(spec.get("src") or "", work,
+                                                          f"s{i}v{j}")
+                            spec["_probe"] = media.probe(spec["_path"])
                         if vt == "video" and not spec["_probe"].get("has_video"):
                             raise media.MediaError("no video stream")
                     except (media.MediaError, OSError) as exc:
@@ -1090,16 +1525,51 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
         # ---------------------------------------------------- 4. audio
         stage("music", 71.0, "building the soundtrack")
         parts = []
+        clip_used = False
         for i, sc in enumerate(req.scenes):
             p = os.path.join(work, f"narr-{i}.wav")
-            if scene_audio[i]:
-                rnd.pad_to(scene_audio[i], p, scene_dur[i], cancel=cancel, log=log)
+            mix = scene_mixes[i] if i < len(scene_mixes) else "voice"
+            cm = clip_media.get(i) if mix in ("clip", "both") else None
+            ctrack = None
+            if cm:
+                # Matched to what build_visual did with the picture: a clip
+                # shorter than its slot was looped there, so its sound is
+                # looped too or it would fall silent halfway through the shot
+                # it belongs to.
+                _cdur = float((cm.get("probe") or {}).get("duration") or 0.0)
+                _trim = float(cm.get("trim_start") or 0.0)
+                _loop = bool(_cdur and (_cdur - _trim) < scene_dur[i] - 0.02)
+                _vol = cm.get("volume")
+                if _vol is None:
+                    _vol = 1.0 if mix == "clip" else float(
+                        getattr(sc, "clip_volume", 0.35) or 0.35)
+                try:
+                    ctrack = rnd.clip_audio(
+                        cm["path"], os.path.join(work, f"clipaud-{i}.wav"),
+                        duration=scene_dur[i], trim_start=_trim,
+                        volume=float(_vol), loop=_loop, cancel=cancel, log=log)
+                    clip_used = True
+                except rnd.Cancelled:
+                    raise
+                except Exception as exc:
+                    warn(f"scene {i}: the clip's audio could not be extracted "
+                         f"({exc}); rendered without it")
+                    ctrack = None
+            _voice = scene_audio[i] if mix != "clip" else None
+            if ctrack:
+                rnd.mix_voice_clip(_voice, ctrack, p, duration=scene_dur[i],
+                                   duck=(mix == "both"), cancel=cancel, log=log)
+            elif _voice:
+                rnd.pad_to(_voice, p, scene_dur[i], cancel=cancel, log=log)
             else:
                 rnd.silence(p, scene_dur[i], cancel=cancel, log=log)
             parts.append(p)
         narration = rnd.concat_audio(parts, os.path.join(work, "narration.wav"), work,
                                     cancel=cancel, log=log)
-        if any(scene_audio):
+        # Levelled whenever the bed carries anything real -- a clip's own sound
+        # needs it at least as much as a synthesised voice, since it arrives at
+        # whatever level it was filmed at.
+        if any(scene_audio) or clip_used:
             try:
                 narration = rnd.loudnorm(narration, os.path.join(work, "narration-ln.wav"),
                                          cancel=cancel, log=log)

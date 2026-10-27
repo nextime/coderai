@@ -1954,6 +1954,10 @@ def _load_rife(model_name: str, device: str):
 # =============================================================================
 
 def _build_call_kwargs(request: VideoGenerationRequest) -> dict:
+    # NOTE: this populates steps/guidance ONLY when the REQUEST set them. The
+    # caller's accel and model-card defaults are layered on afterwards with
+    # setdefault, and both of those depend on an unset key meaning "the caller
+    # did not ask".
     kw = {}
     if request.prompt:
         kw['prompt'] = request.prompt
@@ -2032,10 +2036,29 @@ def _resolve_character_inputs(request) -> tuple[List[str], List[str]]:
         except Exception:
             pass
 
-    # 2. Named character slots [{name, images:[...]}, ...]
+    # 2. Named character slots [{name, images:[...]}, ...] -- or bare profile
+    #    names (["alice", "bob"]), which are resolved from the saved profiles.
+    #    A caller who has saved a character should not have to load its
+    #    reference images and send them back to name it.
     if request.characters:
         for slot in request.characters:
+            if isinstance(slot, str):
+                try:
+                    from codai.api.characters import resolve_character_profiles
+                    images += resolve_character_profiles([slot])
+                    names.append(slot)
+                except Exception:
+                    pass
+                continue
+            if not isinstance(slot, dict):
+                continue
             slot_imgs = slot.get('images') or []
+            if not slot_imgs and slot.get('name'):
+                try:
+                    from codai.api.characters import resolve_character_profiles
+                    slot_imgs = resolve_character_profiles([slot['name']])
+                except Exception:
+                    slot_imgs = []
             images += slot_imgs
             if slot.get('name'):
                 names.append(slot['name'])
@@ -2611,6 +2634,34 @@ def _generate_video(pipe, request: VideoGenerationRequest):
         print("  [video][accel] distill LoRA not fused — ignoring the preset's "
               "low step count and using safe defaults (25 steps) to avoid a "
               "collapsed/solid-colour result")
+    # The model card's own recommendation, below a fused distill preset and
+    # above the generic floor. Without it a client needs a table of per-model
+    # step counts keyed on the model NAME -- which breaks the moment a second
+    # quantization of the same model is added -- and a client without one runs
+    # an 8-step model for 25 steps: three times the cost for a worse clip.
+    try:
+        from codai.api.images import model_defaults
+        from codai.models.manager import multi_model_manager
+        _mcfg = multi_model_manager._config_for_model(
+            getattr(request, 'model', None) or '') or {}
+        # The manager keeps runtime kwargs flat and the original models.json
+        # entry under `_raw_cfg`; `defaults` lives in the entry.
+        if isinstance(_mcfg.get('_raw_cfg'), dict):
+            _mcfg = {**_mcfg['_raw_cfg'], **{k: v for k, v in _mcfg.items()
+                                             if k != '_raw_cfg'}}
+        _card = model_defaults(_mcfg)
+    except Exception:
+        _card = {}
+    _c_steps = _card.get('steps') or _card.get('num_inference_steps')
+    if _c_steps:
+        kw.setdefault('num_inference_steps', int(_c_steps))
+    _c_cfg = _card.get('guidance_scale')
+    if _c_cfg is None:
+        _c_cfg = _card.get('cfg_scale')
+    if _c_cfg is not None:
+        kw.setdefault('guidance_scale', float(_c_cfg))
+    if _card.get('num_frames'):
+        kw.setdefault('num_frames', int(_card['num_frames']))
     kw.setdefault('num_inference_steps', 25)
     kw.setdefault('guidance_scale', 7.5)
     kw.setdefault('num_frames', 16)
@@ -4132,8 +4183,27 @@ async def _generate_h3(request: VideoGenerationRequest, model_name: str,
         print(f"  [h3] character profile resolution failed: {e}")
     for img in (request.character_references or []):
         refs.append({"type": "image", "data": _as_b64(img)})
+    # `characters` holds either slots or bare profile names; a string has no
+    # .get(), so both shapes are handled here rather than crashing on one.
     for entry in (request.characters or []):
-        for img in (entry.get("images") or []):
+        if isinstance(entry, str):
+            try:
+                from codai.api.characters import resolve_character_profiles
+                for img in resolve_character_profiles([entry]):
+                    refs.append({"type": "image", "data": _as_b64(img)})
+            except Exception as e:
+                print(f"  [h3] character {entry!r} could not be resolved: {e}")
+            continue
+        if not isinstance(entry, dict):
+            continue
+        _imgs = entry.get("images") or []
+        if not _imgs and entry.get("name"):
+            try:
+                from codai.api.characters import resolve_character_profiles
+                _imgs = resolve_character_profiles([entry["name"]])
+            except Exception:
+                _imgs = []
+        for img in _imgs:
             refs.append({"type": "image", "data": _as_b64(img)})
     if refs:
         # The checkpoint takes at most 9 image references; keep the first ones,
@@ -4561,6 +4631,14 @@ async def _maybe_build_identity_keyframe(request: VideoGenerationRequest,
         payload["character_profiles"] = list(request.character_profiles)
     if request.character_references:
         payload["character_references"] = list(request.character_references)
+    # Forward `characters` as well, or a clip asking for two of the caller's
+    # characters would render its identity keyframe from neither. It also means
+    # the keyframe is built by the image path's multi-reference routing, so two
+    # characters arrive as two people in the frame the video is then driven
+    # from -- which is the only point in this pipeline where that can be
+    # decided.
+    if getattr(request, 'characters', None):
+        payload["characters"] = list(request.characters)
     if getattr(request, 'environment_profiles', None):
         payload["environment_profiles"] = list(request.environment_profiles)
     if getattr(request, 'keyframe_model', None):

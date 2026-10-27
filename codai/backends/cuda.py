@@ -74,6 +74,54 @@ def _make_thermal_criteria():
     return _ThermalPause()
 
 
+class GenerationFailed(RuntimeError):
+    """Every generation attempt raised; there is no text to return.
+
+    Distinct from a model that legitimately produced nothing. The three-step
+    ladder below (prefix cache -> no prefix cache -> no KV cache at all) is
+    real recovery and worth keeping, but when the last rung also raises, the
+    old code assigned ``generated_text = ""`` and returned normally. The
+    request then left the server as **200 OK, content "", finish_reason
+    "stop"** -- a successful answer in which the model chose silence.
+
+    Measured on zeiss 2026-10-27 with ``Qwen/Qwen3.5-9B``: all three attempts
+    failed with ``Pointer argument (at 0) cannot be accessed from Triton (cpu
+    tensor?)`` -- a bitsandbytes kernel handed a CPU-offloaded tensor -- and
+    the client got an empty script with no error, every time, for four weeks.
+    A client cannot retry, report or route around a failure it is not told
+    about.
+    """
+
+
+def _generation_failed(*errors) -> GenerationFailed:
+    """Collect the ladder's errors into one exception.
+
+    The FIRST error is the real one -- the later rungs usually fail the same
+    way for the same reason -- so it leads, with the rest appended for the
+    log. ``Pointer argument ... cannot be accessed from Triton`` in particular
+    means part of the model is on the CPU, so the hint names the cause rather
+    than leaving the operator with a Triton message.
+    """
+    msgs, seen = [], set()
+    for e in errors:
+        m = str(e).strip()
+        if m and m not in seen:
+            seen.add(m)
+            msgs.append(m)
+    detail = "; then ".join(msgs) or "unknown error"
+    blob = detail.lower()
+    hint = ""
+    if "triton" in blob and ("cpu tensor" in blob or "pointer argument" in blob):
+        hint = (" -- this means part of the model is resident on the CPU: a "
+                "quantized kernel cannot read offloaded weights. Give the "
+                "model enough VRAM to hold every layer (check its "
+                "used_vram_gb/measured_vram_gb and offload_strategy) or serve "
+                "it on a larger card.")
+    elif "out of memory" in blob:
+        hint = " -- the GPU ran out of memory mid-generation."
+    return GenerationFailed(f"generation failed: {detail}{hint}")
+
+
 def _apply_text_loras(model, config) -> None:
     """Load the LoRA adapters a text model's config asks for, via PEFT.
 
@@ -1055,8 +1103,34 @@ class NvidiaBackend(ModelBackend):
             if (model is None and self.device == "cuda"
                     and offload_strategy in ('auto', 'auto-borderline')):
                 _fits = False
+                # A quantized model has only two outcomes -- every layer on the
+                # GPU, or a model that loads and then fails every request (see
+                # _reject_offloaded_quantized). So the full-GPU attempt is made
+                # UNCONDITIONALLY for one, whatever the estimate says. The
+                # attempt is non-fatal here: a genuine OOM falls through to the
+                # ladder, so this costs nothing but one try.
+                #
+                # It also breaks a loop that could not otherwise be escaped.
+                # measured_vram_gb is recorded as GPU + CPU-offloaded + reserve,
+                # which is correct for an unquantized model (placement moves the
+                # weights, it does not change how many there are) but means that
+                # ONE offloaded load writes a number bigger than the card: the
+                # next load reads it, concludes the model cannot fit, offloads
+                # again, and re-records it. Qwen3.5-9B sat in exactly that state
+                # -- 4-bit, 7.8 GB of real weights, measured at 24.641 GB with
+                # 14.366 GB of it in host RAM, on a 24 GB card -- answering
+                # every request with "" for four weeks. One successful full-GPU
+                # load re-measures it honestly and the config heals itself.
+                _quantized = bool(load_kwargs.get("quantization_config"))
                 try:
-                    if torch.cuda.is_available() and expected_vram_gb > 0:
+                    if _quantized and torch.cuda.is_available():
+                        _free, _ = torch.cuda.mem_get_info(0)
+                        print(f"\n  Auto: {model_name} is quantized — trying "
+                              f"full-GPU regardless of the {expected_vram_gb:.1f} GB "
+                              f"estimate ({_free/1e9:.1f} GB free), because "
+                              f"quantized kernels cannot read offloaded weights")
+                        _fits = True
+                    elif torch.cuda.is_available() and expected_vram_gb > 0:
                         _free, _ = torch.cuda.mem_get_info(0)
                         _free_gb = _free / 1e9
                         # expected_vram_gb is already a PEAK estimate: the measured
@@ -1198,7 +1272,12 @@ class NvidiaBackend(ModelBackend):
         
         if model is None:
             raise RuntimeError("Failed to load model: Out of memory even with minimum GPU usage")
-        
+
+        # A bitsandbytes-quantized model whose weights landed on the CPU LOADS
+        # and then fails on every single request, so the failure has to be
+        # raised here, where it is still a load error.
+        self._reject_offloaded_quantized(model, model_name, load_kwargs)
+
         self.model = model
         _apply_text_loras(self.model, kwargs.get('model_config') or kwargs)
         self.model.eval()
@@ -1210,6 +1289,54 @@ class NvidiaBackend(ModelBackend):
         caps = detect_model_capabilities(model_name)
         print(f"Model capabilities: {caps}")
     
+    def _reject_offloaded_quantized(self, model, model_name: str,
+                                    load_kwargs: dict) -> None:
+        """Refuse a bitsandbytes model whose quantized weights went to CPU/disk.
+
+        ``llm_int8_enable_fp32_cpu_offload=True`` is set on every bnb config in
+        this backend, and it does what it says: it lets a quantized model load
+        with modules on the CPU instead of aborting. The load then SUCCEEDS and
+        every generation fails, because a bnb/Triton kernel cannot dereference
+        a CPU tensor:
+
+            Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+
+        Measured on zeiss 2026-10-27 with ``Qwen/Qwen3.5-9B``
+        (``load_in_4bit``, ``measured_vram_gb`` 24.641 against a 24 GB card):
+        the planner could never fit that, so it offloaded; the model reported
+        itself loaded and ready; and every request came back empty for four
+        weeks. A model that cannot answer must not be advertised as resident --
+        raising here lets eviction free more VRAM and the load be retried,
+        which an "it worked" cannot.
+
+        This is also the user's standing rule that there are no CPU fallbacks:
+        for a quantized model the CPU is not a slower path, it is a broken one.
+        Unquantized models offload perfectly well and are left alone.
+        """
+        quantized = bool(load_kwargs.get("quantization_config")) or bool(
+            getattr(getattr(model, "config", None), "quantization_config", None))
+        if not quantized:
+            return
+        device_map = getattr(model, "hf_device_map", None)
+        if not isinstance(device_map, dict):
+            return
+        stranded = sorted(
+            name for name, dev in device_map.items()
+            if str(dev).lower() in ("cpu", "disk") or str(dev).lower().startswith("disk")
+        )
+        if not stranded:
+            return
+        shown = ", ".join(stranded[:6]) + (" …" if len(stranded) > 6 else "")
+        raise RuntimeError(
+            f"{model_name} is quantized, and {len(stranded)} of its "
+            f"{len(device_map)} modules were placed on CPU/disk ({shown}). "
+            "Quantized kernels cannot read offloaded weights, so this model "
+            "would load and then fail on every request. Free enough VRAM for "
+            "all of its layers (check used_vram_gb / measured_vram_gb and "
+            "offload_strategy for this model), or serve it unquantized or on a "
+            "larger card."
+        )
+
     def _get_gpu_memory_map_with_limit(self, vram_fraction: float) -> Dict:
         """Get max_memory dict for device_map='auto'.
 
@@ -2267,9 +2394,9 @@ class NvidiaBackend(ModelBackend):
                         print("generate_chat: recovered with use_cache=False")
                     except Exception as e3:
                         print(f"Error: generate_chat no-cache fallback failed: {e3}")
-                        generated_text = ""
+                        raise _generation_failed(e, e2, e3) from e
                 else:
-                    generated_text = ""
+                    raise _generation_failed(e, e2) from e
 
         try:
             comp_len = len(self.tokenizer.encode(generated_text)) if generated_text else 0
@@ -2454,14 +2581,18 @@ class NvidiaBackend(ModelBackend):
         if gen_error[0]:
             print(f"Warning: stream generation error (after fallback): {gen_error[0]}")
             self.invalidate_kv_cache()
-            # If we produced nothing, the client would otherwise receive an empty
-            # but successful completion. Stream a visible error notice instead.
             if comp_tokens[0] == 0:
-                if "out of memory" in gen_error[0].lower():
-                    yield ("[error: GPU ran out of memory during generation — "
-                           "try a shorter prompt/context or a smaller model]")
-                else:
-                    yield "[error: text generation failed — see server logs]"
+                # Nothing was streamed, so nothing has to be preserved: raise,
+                # and the request fails as a request. Yielding a notice here
+                # instead -- which is what this did -- still answered 200, and
+                # the "[error: ...]" string landed in the caller's content, to
+                # be stored as the generated script. A client cannot
+                # distinguish that from a model that wrote about an error.
+                raise _generation_failed(gen_error[0])
+            # Tokens already went out and cannot be unsent. Append a visible
+            # notice so the truncation is not silent, and let the caller see a
+            # short completion rather than a plausible complete one.
+            yield "\n[error: text generation failed mid-stream — see server logs]"
 
     def get_model_name(self) -> str:
         return self.model_name or "unknown"

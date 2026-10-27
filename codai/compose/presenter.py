@@ -325,7 +325,7 @@ def _data_uri(path: str) -> str:
 # --------------------------------------------------------------- the scene
 def build_scene_presenter(spec: dict, *, narration: Optional[str], duration: float,
                           width: int, height: int, fps: int, workdir: str,
-                          index: int = 0, loop=None, cancel=None, log=None,
+                          index=0, loop=None, cancel=None, log=None,   # int, or any str tag (a dialogue needs scene+column)
                           gpu_lease=None) -> dict:
     """The presenter clip for one scene.
 

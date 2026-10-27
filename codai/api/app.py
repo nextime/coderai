@@ -271,6 +271,7 @@ from codai.api.loras import router as loras_router
 from codai.api.spatial import router as spatial_router
 from codai.api.environments import router as environments_router
 from codai.api.ocr import router as ocr_router
+from codai.api.moderation import router as moderation_router
 from codai.api.rerank import router as rerank_router
 from codai.admin.routes import router as admin_router
 
@@ -856,6 +857,7 @@ app.include_router(chunking_router, tags=["Chunking"])
 from codai.ocr.gateway import router as ocr_gateway_router      # noqa: E402
 app.include_router(ocr_gateway_router, include_in_schema=False)
 app.include_router(rerank_router, tags=["Rerank"])
+app.include_router(moderation_router, tags=["Moderation"])
 from codai.api.models_transfer import router as models_transfer_router
 app.include_router(models_transfer_router, tags=["Models"])
 from codai.api.model_test import router as model_test_router

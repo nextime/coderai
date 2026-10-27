@@ -3945,6 +3945,8 @@ class MultiModelManager:
         'I16': 2, 'I8': 1, 'U8': 1, 'BOOL': 1,
     }
     _storage_dtype_cache: Dict[str, float] = {}
+    # model key -> whether its weights are ALREADY quantized on disk.
+    _prequantized_cache: Dict[str, bool] = {}
 
     @classmethod
     def _safetensors_numel_bytes(cls, path: str):
@@ -4127,6 +4129,121 @@ class MultiModelManager:
 
         self._component_shares_cache[ck] = shares
         return shares
+
+    # Repo-name markers for a checkpoint published pre-quantized. Only used
+    # when config.json can't be read: the name is a hint, the file is proof.
+    _PREQUANT_NAME_MARKERS = (
+        "bnb-4bit", "bnb_4bit", "bnb-8bit", "bnb_8bit",
+        "-4bit", "_4bit", "-8bit", "_8bit",
+        "-awq", "_awq", "-gptq", "_gptq", "-nf4", "_nf4",
+        "-int4", "_int4", "-int8", "_int8", "-fp8", "_fp8",
+    )
+
+    def _is_prequantized_checkpoint(self, model_key: str, resolved_name: str,
+                                    cfg: dict) -> bool:
+        """Whether this checkpoint's weights are ALREADY quantized on disk.
+
+        The same situation as a GGUF, reached by a different route: a repo
+        published pre-quantized (``unsloth/...-bnb-4bit``, an AWQ or GPTQ
+        build, an fp8 release) stores a ``quantization_config`` in its
+        ``config.json``, and transformers/diffusers then load those weights AS
+        THEY ARE. Nothing dequantizes them.
+
+        That matters because the estimate normalises storage precision to load
+        precision, and ``_storage_bytes_per_elem`` correctly measures such a
+        checkpoint at ~1 byte/elem. Dividing the default 2-byte load precision
+        by that gives a factor of ~1.7 -- i.e. the estimate assumed the model
+        would expand to bf16 on the way in.
+
+        Measured on zeiss 2026-10-27: ``Z-Image-Turbo-unsloth-bnb-4bit``, a
+        16.3 GB 4-bit checkpoint, estimated **30.03 GB** against a 24 GB card.
+        Nothing could ever free that much, so every still was generated with
+        the pipeline partly on the CPU -- ~72 s for one 768x1344 image from a
+        few-step turbo model that should take seconds. The operator had no
+        ``load_in_4bit`` set, and correctly so: there is nothing to ask for
+        when the weights arrive quantized.
+
+        Decided from ``config.json`` where it can be read (that is the field
+        transformers itself dispatches on), falling back to the repo name.
+        Cached per model; never raises.
+        """
+        ck = resolved_name or model_key or ""
+        cached = self._prequantized_cache.get(ck)
+        if cached is not None:
+            return cached
+
+        import json as _json
+        import os
+
+        result = False
+        candidates = [v for v in (resolved_name, cfg.get("path"),
+                                  cfg.get("model_path"), cfg.get("model"),
+                                  model_key)
+                      if v and isinstance(v, str)]
+
+        # 1) config.json -- the authoritative answer. A diffusers pipeline keeps
+        #    the quantized component one level down (transformer/, text_encoder/),
+        #    so those are checked too.
+        conf_paths = []
+        for c in candidates:
+            base = c.split(":", 1)[1] if ":" in c and not os.path.exists(c) else c
+            if os.path.isdir(base):
+                conf_paths.append(os.path.join(base, "config.json"))
+                conf_paths.append(os.path.join(base, "model_index.json"))
+                for sub in ("transformer", "text_encoder", "unet"):
+                    conf_paths.append(os.path.join(base, sub, "config.json"))
+        if not conf_paths:
+            # HuggingFace hub cache: find the newest snapshot directory.
+            try:
+                from huggingface_hub import scan_cache_dir
+                from codai.models.cache import (get_all_cache_dirs,
+                                                is_huggingface_model_id)
+                hf_dir = get_all_cache_dirs().get("huggingface")
+                for c in candidates:
+                    repo_id = c.split(":", 1)[1] if ":" in c else c
+                    if not (hf_dir and is_huggingface_model_id(repo_id)):
+                        continue
+                    info = scan_cache_dir(hf_dir)
+                    for repo in info.repos:
+                        if repo.repo_id != repo_id:
+                            continue
+                        revs = sorted(repo.revisions,
+                                      key=lambda r: r.last_modified, reverse=True)
+                        for fobj in (revs[0].files if revs else []):
+                            fp = str(fobj.file_path)
+                            if os.path.basename(fp) == "config.json":
+                                conf_paths.append(fp)
+                    if conf_paths:
+                        break
+            except Exception:
+                pass
+
+        for cp in conf_paths[:24]:
+            try:
+                with open(cp) as fh:
+                    blob = _json.load(fh)
+            except Exception:
+                continue
+            if not isinstance(blob, dict):
+                continue
+            # Top level, or nested under a component entry.
+            if blob.get("quantization_config"):
+                result = True
+                break
+            for v in blob.values():
+                if isinstance(v, dict) and v.get("quantization_config"):
+                    result = True
+                    break
+            if result:
+                break
+
+        # 2) The repo name, when no config could be read.
+        if not result and not conf_paths:
+            blob = " ".join(candidates).lower()
+            result = any(m in blob for m in self._PREQUANT_NAME_MARKERS)
+
+        self._prequantized_cache[ck] = result
+        return result
 
     @staticmethod
     def _load_bytes_per_elem(cfg: dict) -> float:
@@ -4477,6 +4594,22 @@ class MultiModelManager:
         _gguf_path = str(cfg.get("path") or resolved_name or model_key or "")
         _is_gguf = (_gguf_path.endswith(".gguf") or "gguf" in _gguf_path.lower()
                     or cfg.get("model_type") == "gguf_models")
+        # An HF checkpoint published pre-quantized is the same case as a GGUF:
+        # the bytes on disk ARE the loaded footprint, so neither the fp16-
+        # relative quant divisor nor the storage->load precision normalization
+        # applies. Without this a 4-bit release was inflated by ~1.7x and the
+        # planner concluded it could not fit a card it fits comfortably.
+        _is_prequant = False
+        if not _is_gguf:
+            try:
+                _is_prequant = self._is_prequantized_checkpoint(
+                    model_key, resolved_name, cfg)
+            except Exception:
+                _is_prequant = False
+            if _is_prequant:
+                quant_mult = 1.0
+                prec_factor = 1.0
+
         if _is_gguf:
             quant_mult = 1.0
             prec_factor = 1.0
@@ -4502,6 +4635,7 @@ class MultiModelManager:
                           f"measured_cfg={cfg.get('measured_vram_gb')} "
                           f"component_quantization={cfg.get('component_quantization')} "
                           f"load_in_4bit={load_in_4bit} load_in_8bit={load_in_8bit} "
+                          f"prequantized={_is_prequant} "
                           f"quant_mult={quant_mult:.3f} "
                           f"prec(load{_load_bpe:.0f}/disk{_storage_bpe:.0f})={prec_factor:.2f}")
             except Exception:
@@ -6036,6 +6170,7 @@ class MultiModelManager:
             "audio_gen": "audio_generation",
             "embedding": "embeddings",
             "spatial":   "depth_estimation",
+            "moderation": "moderation",
         }
 
         def _add(model_id: str, model_type: str = None, meta: Dict[str, Any] = None):
@@ -6103,6 +6238,15 @@ class MultiModelManager:
                 supports_translation=meta.get("supports_translation"),
                 video=video_geom,
                 max_model_len=context_window_for(self, model_id, meta),
+                defaults=(meta.get("defaults") or None),
+                # `modes` may live in `defaults` (where a card's settings
+                # naturally go) or at the top level; both are read, because an
+                # operator should not have to remember which.
+                modes=((meta.get("defaults") or {}).get("modes")
+                       or meta.get("modes") or None),
+                license=((meta.get("defaults") or {}).get("license")
+                         or meta.get("license") or meta.get("licence") or None),
+                available=meta.get("available"),
             ))
 
         # --- Models from config (the authoritative source) ---
@@ -6182,6 +6326,24 @@ class MultiModelManager:
                     _ocr_engines.append("chandra")
                 for _eng in _ocr_engines:
                     _add(_eng, "ocr", {"capabilities": ["ocr"], "backend": "ocr"})
+        except Exception:
+            pass
+
+        # --- Moderation (served at /v1/moderation) — like OCR and diarization,
+        # built-in endpoints rather than model-manager models, so their models
+        # are surfaced here. Published even when a model is NOT loadable, with
+        # `available` saying so: a caller screening adult renders needs to know
+        # a check is unavailable BEFORE sending content for it, and an absent
+        # entry reads as "this server does no moderation" rather than "this
+        # check would fail". ---
+        try:
+            from codai.api.moderation import available_models as _mod_models
+            for _m in _mod_models():
+                _add(_m["id"], "moderation",
+                     {"capabilities": _m["capabilities"],
+                      "backend": "moderation",
+                      "role": _m["role"],
+                      "available": _m["available"]})
         except Exception:
             pass
 

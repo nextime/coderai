@@ -16,7 +16,7 @@
 
 """Pydantic models for image generation API."""
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -77,10 +77,22 @@ class ImageGenerationRequest(BaseModel):
         "in as many windows as it needs, so nothing is truncated at 77 tokens."))
 
     # Per-request component overrides
+    sampler: Optional[str] = Field(None, description=(
+        "Scheduler for this request (euler, euler_a, dpmpp_2m, ddim, unipc, "
+        "lcm, flow_euler, ...). Defaults to the model's own recommendation "
+        "where its card carries one, else the pipeline's. A sampler from the "
+        "wrong family for the model is a 400, not a silently worse picture."))
     vae_model: Optional[str] = Field(None, description="Override the VAE for this request.")
     loras: Optional[List[LoraConfig]] = Field(None, description="Additional LoRA adapters to apply for this request.")
 
     # Character consistency
+    characters: Optional[List[Any]] = Field(None, description=(
+        'The characters in the picture: profile names (["alice", "bob"]) or '
+        'slots ([{"name": "alice", "images": ["b64...", ...]}]). Several are '
+        'kept as SEPARATE reference sets, so two named characters appear as two '
+        'people on a model that takes multiple references (FLUX.2, '
+        'Qwen-Image-Edit); IP-Adapter averages its references and would blend '
+        'them into one.'))
     character_profiles: Optional[List[str]] = Field(None, description="Saved character profile names to apply (IP-Adapter).")
     character_references: Optional[List[str]] = Field(None, description="Inline base64 reference images for character consistency.")
     character_strength: Optional[float] = Field(0.6, description="IP-Adapter scale for character references.")

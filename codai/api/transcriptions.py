@@ -53,6 +53,7 @@ def _upload_name(file) -> str:
     return getattr(file, "filename", None) or ""
 
 # Import from codai modules
+from codai.api import lang_codes
 from codai.models.manager import multi_model_manager
 
 
@@ -170,8 +171,16 @@ def _validate_language(model, config: dict, language, target_language):
     no languages accept anything (pass-through). ``target_language`` additionally
     requires the model to advertise ``supports_translation``."""
     langs = config.get("languages") or []
-    norm = {str(x).strip().lower() for x in langs}
-    if language and norm and str(language).strip().lower() not in norm:
+    # Compared by MEANING, not by spelling. A config declares its languages in
+    # whatever form its backend uses -- "english" for a whisper model, "en" for
+    # Canary -- while the caller sends what they have, which for a compose
+    # render is the voice's regional tag ("en-gb"). Matching those literally
+    # refused every request that named a dialect, so both sides are expanded to
+    # their alias sets and the test is whether the sets intersect.
+    norm = set()
+    for x in langs:
+        norm |= lang_codes.aliases(x)
+    if language and norm and not (lang_codes.aliases(language) & norm):
         raise HTTPException(
             status_code=400,
             detail=f"Language '{language}' not supported by '{model}'. "
@@ -182,7 +191,7 @@ def _validate_language(model, config: dict, language, target_language):
                 status_code=400,
                 detail=f"Model '{model}' does not support translation "
                        "(target_language). Use a NeMo/Canary model that does.")
-        if norm and str(target_language).strip().lower() not in norm:
+        if norm and not (lang_codes.aliases(target_language) & norm):
             raise HTTPException(
                 status_code=400,
                 detail=f"Target language '{target_language}' not supported by "
@@ -534,9 +543,11 @@ async def _run_transcription_inner(
                 multi_model_manager.start_whisper_server, whisper_model_id or model)
         if not whisper_server.is_running():
             raise HTTPException(status_code=500, detail="whisper-server failed to start")
+        # whisper.cpp takes an ISO-639-1 code (or "auto"); a regional tag is
+        # rejected outright, so normalise and let an unmappable tag auto-detect.
         result = whisper_server.transcribe(
             file_content,
-            language=language,
+            language=lang_codes.normalize(language, "whisper-server"),
             prompt=prompt
         )
         if "error" in result:
@@ -664,7 +675,7 @@ async def _run_transcription_inner(
 
             raw_segments, _ = whisper_model.transcribe(
                 tmp_path,
-                language=language,
+                language=lang_codes.normalize(language, "faster_whisper"),
                 initial_prompt=prompt,
                 temperature=temperature,
                 word_timestamps=word_timestamps,

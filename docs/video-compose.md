@@ -39,8 +39,13 @@ and every artefact is served from `/v1/files/`.
       "audio": null,          // pre-rendered narration instead; overrides TTS
       "min_duration": 2.0,    // floor, seconds
       "padding": 0.15,        // silence after the narration
+      "audio_mix": "voice",   // voice | clip | both  (see "The clip's own sound")
+      "clip_volume": 0.35,    // the clip's level under the voice, for "both"
+      "speakers": [],         // two characters talking (see "A dialogue")
       "visuals": [            // split evenly across the scene, in order
-        {"type": "video", "src": "https://…/clip.mp4", "trim_start": 0.0},
+        {"type": "video", "src": "https://…/clip.mp4", "trim_start": 0.0,
+         "keep_audio": false,   // keep THIS clip's own sound (see below)
+         "volume": null},       // its level under the voice; else clip_volume
         {"type": "image", "src": "/v1/files/abc.png",
          "ken_burns": {"zoom_from": 1.0, "zoom_to": 1.2, "pan": "auto"}},
         {"type": "gradient", "colors": ["#6D28D9", "#DB2777"]},
@@ -68,8 +73,88 @@ and every artefact is served from `/v1/files/`.
 }
 ```
 
-A scene needs either narration (`text` and/or `audio`) or an explicit
-`"duration"`, and at least one visual. Anything else has a default.
+A scene needs either narration (`text`, `audio` or `speakers`) or an explicit
+`"duration"`, and at least one visual. Anything else has a default. A dialogue
+scene needs neither `text` nor visuals: its lines are the narration and its
+characters are the picture.
+
+## The clip's own sound
+
+Every visual is rendered silent, which is right for a stock shot under a
+voice-over and wrong for footage whose sound **is** the content — a crowd, a
+product demo, a piece to camera that was filmed with its audio. Two fields:
+
+```jsonc
+{
+  "audio_mix": "both",             // voice | clip | both
+  "clip_volume": 0.35,
+  "visuals": [{"type": "video", "src": "/v1/files/demo.mp4", "keep_audio": true}]
+}
+```
+
+* `"voice"` (the default) — the narration only. Unchanged from before; a
+  request written without these fields renders exactly as it did.
+* `"clip"` — the clip's sound **instead of** narration. No TTS call is made for
+  this scene, and the scene lasts as long as the clip: cutting it at a
+  narration's length would truncate the content itself. An explicit `duration`
+  still wins.
+* `"both"` — the narration over the clip, with the clip ducked while the voice
+  is speaking and brought back up between lines.
+
+The clip's sound is folded into the scene's narration track, so the music bed
+ducks under it exactly as it ducks under a voice. With one video visual in the
+scene, `keep_audio` is optional — asking for the clip's sound and not saying
+which clip can only mean the one clip. With two, mark the one you mean.
+
+Silent footage with `keep_audio: true` is a **warning, not a failure**: the
+scene renders with its narration (or in silence for `"clip"`) and the job says
+so. Only the first marked clip in a scene contributes; a second clip's sound
+belongs in its own scene, where it also gets its own duration.
+
+## A dialogue — two characters in one scene
+
+`presenter` is one character talking to camera, which is a monologue. For an
+exchange, give the scene `speakers`:
+
+```jsonc
+{
+  "speakers": [
+    {"character": "alice", "text": "Did you see the new build?",
+     "voice": {"model": "kokoro", "voice": "af_sarah", "language": "en-gb"},
+     "layout": "left", "gap": 0.25},
+    {"character": "bob", "text": "It shipped this morning.",
+     "voice": {"model": "kokoro", "voice": "am_adam"}, "layout": "right"}
+  ]
+}
+```
+
+The lines are spoken in order, each in its own voice, and each character is
+lip-synced in their own region of the frame. A character may speak several
+times; their lines group into one region in first-speaking order.
+
+* `layout: "left" | "right"` (the default) — every character stays on screen in
+  their own column for the whole scene. A listener's reaction is half of a
+  dialogue, so this is the default.
+* `layout: "full"` — the frame cuts to whoever is speaking.
+
+All the speakers in one scene must use columns or all must use `full`; mixing
+them is a 400, because a character cannot both hold a column and be off screen.
+
+Each character needs a `character` profile or an `image` (or a request-level
+`presenter` to inherit a portrait from). A profile name that does not exist is a
+400 **before** the render starts, so a typo does not cost you the narration.
+
+Captions follow the speaker: a caption never mixes two characters' words, and
+each event carries a `speaker` so the `.srt`/`.vtt` sidecars keep the
+attribution.
+
+One lip-sync run happens per **character**, not per line: each character is
+given a track holding only their own lines, so their mouth moves on their words
+and stays closed while the other one talks.
+
+A dialogue replaces `text`, `voice` and `presenter` for that scene. Keep an
+exchange to a beat — a longer conversation is several scenes, which is also how
+it gets its own visuals.
 
 ## What the server decides
 

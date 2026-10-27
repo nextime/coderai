@@ -399,6 +399,110 @@ def _apply_image_acceleration(pipeline, model_config):
     return pipeline
 
 
+#: Sampler name → diffusers scheduler class. The names are the ones model
+#: cards and UIs use; several map to the same class because the community
+#: spells them differently.
+SAMPLERS = {
+    "euler": "EulerDiscreteScheduler",
+    "euler_a": "EulerAncestralDiscreteScheduler",
+    "euler_ancestral": "EulerAncestralDiscreteScheduler",
+    "heun": "HeunDiscreteScheduler",
+    "dpm": "DPMSolverMultistepScheduler",
+    "dpmpp_2m": "DPMSolverMultistepScheduler",
+    "dpm_2m": "DPMSolverMultistepScheduler",
+    "dpmpp_sde": "DPMSolverSDEScheduler",
+    "dpmpp_2s": "DPMSolverSinglestepScheduler",
+    "ddim": "DDIMScheduler",
+    "ddpm": "DDPMScheduler",
+    "pndm": "PNDMScheduler",
+    "lms": "LMSDiscreteScheduler",
+    "deis": "DEISMultistepScheduler",
+    "unipc": "UniPCMultistepScheduler",
+    "lcm": "LCMScheduler",
+    "kdpm2": "KDPM2DiscreteScheduler",
+    "kdpm2_a": "KDPM2AncestralDiscreteScheduler",
+    # Flow-matching models (FLUX, SD3, Z-Image, LTX) have their own family;
+    # handing one a DDIM would produce noise, so they are named separately and
+    # the swap below refuses to cross between the families.
+    "flow_euler": "FlowMatchEulerDiscreteScheduler",
+    "flow_heun": "FlowMatchHeunDiscreteScheduler",
+    "flow_lcm": "FlowMatchLCMScheduler",
+}
+
+#: Schedulers for flow-matching models. A pipeline whose scheduler is one of
+#: these cannot be given a classic DDPM-family sampler, and vice versa.
+_FLOW_SCHEDULERS = {"FlowMatchEulerDiscreteScheduler",
+                    "FlowMatchHeunDiscreteScheduler",
+                    "FlowMatchLCMScheduler",
+                    "LTXEulerAncestralRFScheduler"}
+
+
+def _apply_sampler(pipeline, sampler: str) -> str:
+    """Swap the pipeline's scheduler for the named sampler.
+
+    Refuses to cross between the flow-matching and DDPM families. They
+    parameterise the trajectory differently, so giving a FLUX-family pipeline
+    a DDIM does not produce a worse picture -- it produces noise -- and a
+    silent swap would look like the model being broken.
+
+    Raises ``ValueError`` with the valid names; the caller decides whether
+    that is a 400 (the request asked) or a warning (a model card asked).
+    """
+    name = str(sampler or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not name:
+        return ""
+    cls_name = SAMPLERS.get(name)
+    if not cls_name:
+        raise ValueError(
+            f"unknown sampler {sampler!r}; expected one of "
+            f"{', '.join(sorted(SAMPLERS))}")
+    import diffusers
+    cls = getattr(diffusers, cls_name, None)
+    if cls is None:
+        raise ValueError(f"{cls_name} is not available in this diffusers")
+    current = type(getattr(pipeline, "scheduler", None)).__name__
+    if (current in _FLOW_SCHEDULERS) != (cls_name in _FLOW_SCHEDULERS):
+        raise ValueError(
+            f"{sampler!r} ({cls_name}) is not compatible with this model, "
+            f"whose scheduler is {current}: flow-matching and DDPM-family "
+            f"samplers parameterise the trajectory differently and cannot be "
+            f"substituted for one another")
+    if current == cls_name:
+        return cls_name
+    pipeline.scheduler = cls.from_config(pipeline.scheduler.config)
+    _log.info("sampler: %s -> %s", current, cls_name)
+    return cls_name
+
+
+def model_defaults(model_config) -> dict:
+    """A model card's own recommended settings, from its ``defaults`` entry.
+
+    Distinct from ``call_kwargs`` in one way that matters: these are DEFAULTS.
+    They fill in what the caller left out and never override what the caller
+    sent, while ``call_kwargs`` applies on every call because the card says the
+    model does not work without it.
+
+        "defaults": {"steps": 8, "guidance_scale": 1.0, "sampler": "euler",
+                     "modes": ["t2v", "i2v"], "license": "..."}
+
+    Why it exists: a distilled model wants 8 steps at CFG 1 and a
+    non-distilled sibling wants 30 at CFG 4, and there is nowhere else for
+    that to live. Without it every client maintains its own table of
+    per-model settings -- keyed on the model NAME, which breaks the moment a
+    model is renamed or a second quantization of it is added -- and a caller
+    who has not built that table gets 30 steps from an 8-step model and pays
+    four times over for a worse picture.
+
+    Published in ``/v1/models`` as ``defaults`` so a client can show them
+    rather than guess them.
+    """
+    try:
+        d = dict((model_config or {}).get("defaults") or {})
+    except Exception:
+        return {}
+    return d
+
+
 def _model_call_kwargs(pipeline, model_config) -> dict:
     """Extra ``__call__`` arguments this model's card specifies.
 
@@ -1419,12 +1523,40 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     _accel = getattr(pipeline, '_coderai_accel', None)
     _accel_steps = _accel.get('steps') if _accel else None
     _accel_cfg = _accel.get('guidance_scale') if _accel else None
+    # The model card's own recommendation, between the request and the generic
+    # fallback: it is better information than a 30-step default (a distilled
+    # model wants 8 at CFG 1) and worse information than what the caller
+    # explicitly asked for. A fused distill LoRA detected on the pipeline is
+    # more specific still, so it keeps precedence.
+    _dflt = model_defaults(model_config)
+    _d_steps = _dflt.get("steps") or _dflt.get("num_inference_steps")
+    _d_cfg = _dflt.get("guidance_scale")
+    if _d_cfg is None:
+        _d_cfg = _dflt.get("cfg_scale")
     num_steps = request.steps if request.steps else (
-        _accel_steps if _accel_steps else (30 if quality == "standard" else 50))
+        _accel_steps if _accel_steps else
+        (int(_d_steps) if _d_steps else (30 if quality == "standard" else 50)))
     cfg_scale = request.guidance_scale if request.guidance_scale else (
         _accel_cfg if _accel_cfg is not None else
-        (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
+        (float(_d_cfg) if _d_cfg is not None else
+         (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0))
     )
+    # The sampler: what the caller asked for, else what the card recommends.
+    # A bad name from the CALLER is a 400 -- they can fix it -- while a bad one
+    # from a model card is a warning, because refusing the generation over the
+    # operator's config would strand a request that is itself fine.
+    _want_sampler = getattr(request, 'sampler', None)
+    if _want_sampler:
+        try:
+            _apply_sampler(pipeline, _want_sampler)
+        except ValueError as _e:
+            raise HTTPException(status_code=400, detail=str(_e))
+    elif _dflt.get("sampler"):
+        try:
+            _apply_sampler(pipeline, _dflt["sampler"])
+        except Exception as _e:
+            _log.warning("this model's default sampler %r could not be applied: %s",
+                         _dflt.get("sampler"), _e)
 
     _progress_reset(num_steps)
 
@@ -1548,6 +1680,12 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     # Resolve character references (saved profiles + inline images)
     char_images = []
+    char_groups = []
+    try:
+        from codai.api.characters import character_groups
+        char_groups = character_groups(request)
+    except Exception:
+        char_groups = []
     try:
         profiles = getattr(request, 'character_profiles', None) or []
         if profiles:
@@ -1555,6 +1693,13 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             char_images += resolve_character_profiles(profiles)
         inline = getattr(request, 'character_references', None) or []
         char_images += list(inline)
+        # `characters` is the field that can name several people. Its images
+        # join the flat IP-Adapter list too, so a single-character request
+        # behaves identically however it was spelled.
+        for _g in char_groups:
+            for _img in _g["images"]:
+                if _img not in char_images:
+                    char_images.append(_img)
     except Exception:
         pass
 
@@ -1595,6 +1740,42 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     # Arguments this model's card specifies that no request field carries.
     call_kwargs.update(_model_call_kwargs(pipeline, model_config))
+
+    # --- two or more characters in one frame ------------------------------
+    # IP-Adapter conditions on the MEAN of its reference images, so appending a
+    # second character's pictures to the same list asks for one person who
+    # resembles both -- never two people. The only way to keep them apart is a
+    # pipeline that takes several references and treats them as several
+    # subjects: FLUX.2 accepts up to ten, Qwen-Image-Edit-2511 accepts
+    # several. Both expose that as a LIST in `image`, which is also how
+    # _edit_call_kwargs feeds a multi-reference edit, so the same convention
+    # serves generation.
+    #
+    # One reference per character, the first: a model given four pictures of
+    # Alice and four of Bob has no way to know that eight references are two
+    # people, and the count is what it keys identity on.
+    _multi = [g for g in char_groups if g.get("images")]
+    if len(_multi) > 1:
+        if _is_instruction_edit(pipeline):
+            _refs = [_decode_b64_image(g["images"][0], "characters")
+                     for g in _multi]
+            call_kwargs["image"] = _refs
+            # The references ARE the conditioning here; blending them through
+            # IP-Adapter as well would undo the separation.
+            char_images = []
+            _names = ", ".join(str(g.get("name") or "?") for g in _multi)
+            _log.info("Multi-character generation: %d references (%s) passed as "
+                      "a reference list", len(_refs), _names)
+        else:
+            _log.warning(
+                "%d characters were requested (%s) but %s takes a single "
+                "reference set: IP-Adapter averages its references, so they "
+                "will blend into one subject rather than appearing as %d "
+                "people. Use a multi-reference model (FLUX.2, "
+                "Qwen-Image-Edit-2511) for a scene with more than one of your "
+                "characters.",
+                len(_multi), ", ".join(str(g.get("name") or "?") for g in _multi),
+                type(pipeline).__name__, len(_multi))
 
     # Inject IP-Adapter images if character references provided.  The pipeline
     # must have IP-Adapter *weights* loaded first — _ensure_ip_adapter_loaded

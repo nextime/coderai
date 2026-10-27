@@ -16,7 +16,7 @@
 
 """Pydantic models for video generation API."""
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -126,7 +126,11 @@ class VideoGenerationRequest(BaseModel):
     camera_motion: Optional[str] = None     # zoom-in | zoom-out | pan-left | pan-right | tilt-up | tilt-down | rotate
 
     # ── Character consistency ─────────────────────────────────────────────
-    characters: Optional[List[dict]] = Field(None, description='Per-character references, each {"name": "Alice", "images": ["b64...", ...]}.')
+    characters: Optional[List[Any]] = Field(None, description=(
+        'The characters in the clip: profile names (["alice", "bob"]) or slots '
+        '({"name": "Alice", "images": ["b64...", ...]}). A bare name is '
+        'resolved from the saved profile, so naming two characters does not '
+        'mean loading and resending their reference images.'))
     character_references: Optional[List[str]] = Field(None, description="Legacy flat list of base64/URL reference images.")
     character_strength: Optional[float] = Field(0.8, description="IP-Adapter scale for character references.")
     character_names: Optional[List[str]] = Field(None, description="Optional names aligned with character_references.")

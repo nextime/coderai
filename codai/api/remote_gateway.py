@@ -72,6 +72,14 @@ _CAPABILITY_PREFIXES = (
     ("/v1/video", "video"),
     ("/v1/3d", "spatial"),
     ("/v1/embeddings", "embeddings"),
+    # Moderation runs where the models are. It rides the IMAGES capability
+    # rather than inventing one of its own: its models are an image
+    # classifier and a face detector, the images pod already carries that
+    # kind of weight, and a `moderation` capability would be one nothing
+    # advertises -- so every request would fall back to local anyway. Keeping
+    # it with images also means a pod that generated the picture can screen it
+    # without the bytes crossing the wire twice.
+    ("/v1/moderation", "images"),
     # Retrieval chunking rides the EMBEDDINGS capability rather than inventing
     # one of its own. Two reasons: chunks are on their way to be embedded, so
     # the machine that will embed them is the natural place to cut them; and the

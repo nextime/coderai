@@ -490,6 +490,187 @@ def build_music_bed(src: str, out_path: str, *, total: float, volume: float = 0.
     return out_path
 
 
+def place_at(placements: List[tuple], out_path: str, *, duration: float,
+             cancel=None, log=None) -> str:
+    """One track holding each clip at its own offset, silence in between.
+
+    ``placements`` is ``[(path, start_seconds), ...]``. Built for one speaker in
+    a dialogue: their lines where they fall in the scene, nothing where
+    somebody else is talking.
+
+    That shape is what lets a multi-speaker scene cost one lip-sync run per
+    SPEAKER rather than one per line. A sync engine drives the mouth from the
+    audio it is given, so a track that is silent while the other character
+    speaks produces a closed mouth there -- which is what a person listening
+    looks like, and what a per-line approach has to stitch together by hand.
+    """
+    if not placements:
+        return silence(out_path, duration, cancel=cancel, log=log)
+    inputs: List[str] = []
+    graph: List[str] = []
+    labels: List[str] = []
+    for i, (path, start) in enumerate(placements):
+        inputs += ["-i", path]
+        ms = max(0, int(round(float(start) * 1000)))
+        graph.append(f"[{i}:a]aresample=48000,adelay={ms}|{ms}[d{i}]")
+        labels.append(f"[d{i}]")
+    if len(labels) == 1:
+        graph.append(f"{labels[0]}apad,atrim=0:{max(0.02, float(duration)):.3f},"
+                     f"asetpts=N/SR/TB[aout]")
+    else:
+        graph.append("".join(labels)
+                     + f"amix=inputs={len(labels)}:duration=longest:"
+                       f"dropout_transition=0:normalize=0,"
+                       f"apad,atrim=0:{max(0.02, float(duration)):.3f},"
+                       f"asetpts=N/SR/TB[aout]")
+    run(inputs + ["-filter_complex", ";".join(graph), "-map", "[aout]",
+                  "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
+        cancel=cancel, log=log)
+    return out_path
+
+
+def cut_segment(src: str, out_path: str, *, start: float, duration: float,
+                fps: int, width: Optional[int] = None,
+                height: Optional[int] = None, cancel=None, log=None) -> str:
+    """``duration`` seconds of ``src`` from ``start``, at the canvas size.
+
+    Re-encoded rather than stream-copied: the cut has to land on the exact
+    frame, and a copy would snap to the nearest keyframe and drift the dialogue
+    against its own audio.
+    """
+    chain = [f"fps={fps}"]
+    if width and height:
+        chain.append(fit_filter(int(width), int(height), "cover"))
+    chain += [f"tpad=stop_mode=clone:stop_duration={max(0.05, duration):.3f}",
+              f"trim=0:{max(0.08, duration):.3f}", "setpts=PTS-STARTPTS",
+              "format=yuv420p"]
+    run(["-ss", f"{max(0.0, float(start)):.3f}", "-i", src,
+         "-vf", ",".join(chain), "-an", "-r", str(fps)]
+        + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    return out_path
+
+
+def composite_row(clips: List[str], out_path: str, *, width: int, height: int,
+                  fps: int, cancel=None, log=None) -> str:
+    """Several speakers side by side, each filling its own column.
+
+    Each column is cropped to fill rather than letterboxed, because these are
+    portraits: a face with black bars beside it reads as a mistake, and a face
+    cropped at the shoulders reads as framing.
+    """
+    n = max(1, len(clips))
+    if n == 1:
+        return hold_to(clips[0], out_path, duration=0.0, fps=fps,
+                       width=width, height=height, cancel=cancel, log=log)
+    col = int(width / n / 2) * 2
+    fill = (f"scale={col}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={col}:{height},setsar=1")
+    inputs: List[str] = []
+    graph: List[str] = []
+    labels: List[str] = []
+    for i, c in enumerate(clips):
+        inputs += ["-i", c]
+        graph.append(f"[{i}:v]{fill}[c{i}]")
+        labels.append(f"[c{i}]")
+    graph.append("".join(labels) + f"hstack=inputs={n},"
+                 f"pad={width}:{height}:0:0,format=yuv420p,fps={fps}[vout]")
+    run(inputs + ["-filter_complex", ";".join(graph), "-map", "[vout]", "-an"]
+        + _INTER_ARGS + [out_path], cancel=cancel, log=log)
+    return out_path
+
+
+def clip_audio(src: str, out_path: str, *, duration: float, trim_start: float = 0.0,
+               volume: float = 1.0, loop: bool = False, cancel=None,
+               log=None) -> str:
+    """One visual's OWN sound, cut to its slot in the scene.
+
+    The video track of a visual is already trimmed, looped and padded to the
+    scene's length by :func:`build_visual`; this does the same to its audio so
+    the two stay in step. ``loop`` must match what the video did, or the sound
+    drifts out of sync with the picture it belongs to.
+
+    Always 48 kHz stereo PCM, like every other audio part, so the scene parts
+    can be concatenated without a resample surprise in the middle.
+    """
+    pre = ["-stream_loop", "-1"] if loop else []
+    if trim_start > 0:
+        pre += ["-ss", f"{float(trim_start):.3f}"]
+    af = ["aresample=48000", "apad",
+          f"atrim=0:{max(0.02, float(duration)):.3f}", "asetpts=N/SR/TB"]
+    v = max(0.0, float(volume))
+    if abs(v - 1.0) > 1e-6:
+        af.append(f"volume={v:.4f}")
+    run(pre + ["-i", src, "-vn", "-af", ",".join(af),
+               "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
+        cancel=cancel, log=log)
+    return out_path
+
+
+def has_audio_stream(src: str) -> bool:
+    """Whether a file carries an audio stream at all.
+
+    Asked before extracting, because ``keep_audio`` on silent footage would
+    otherwise fail the render over something the caller cannot see from the
+    file name. A probe failure answers "no": the extraction would fail anyway.
+    """
+    try:
+        out = subprocess.run(
+            [media._ffprobe_bin(), "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", src],
+            capture_output=True, text=True, timeout=60)
+    except Exception:
+        return False
+    return bool((out.stdout or "").strip())
+
+
+def mix_voice_clip(voice: Optional[str], clip: Optional[str], out_path: str, *,
+                   duration: float, duck: bool = True, cancel=None,
+                   log=None) -> str:
+    """One scene's narration and its clip's sound, as a single track.
+
+    Mixed HERE, per scene, rather than as a third input to the final mix, for
+    two reasons: the clip's sound belongs to one scene and must not bleed into
+    the next, and folding it into the narration bed means the music ducking
+    downstream keys on it too -- which is what "treat clip sound like
+    narration" asks for, with no second sidechain.
+
+    With ``duck`` the clip is pushed down while the voice is speaking and comes
+    back up between lines, so narration stays intelligible over a noisy shot.
+    Without it the two are simply summed at their given levels.
+    """
+    if not clip:
+        if voice:
+            return pad_to(voice, out_path, duration, cancel=cancel, log=log)
+        return silence(out_path, duration, cancel=cancel, log=log)
+    if not voice:
+        run(["-i", clip, "-af",
+             f"aresample=48000,apad,atrim=0:{max(0.02, duration):.3f},asetpts=N/SR/TB",
+             "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
+            cancel=cancel, log=log)
+        return out_path
+    # The scene's exact length is held INSIDE the graph. It cannot be an `-af`
+    # on the output: ffmpeg refuses simple and complex filtering on the same
+    # stream ("Filtergraph ... was specified for a stream fed from a complex
+    # filtergraph"), and the mix would never be written at all.
+    fit = (f"apad,atrim=0:{max(0.02, float(duration)):.3f},asetpts=N/SR/TB")
+    if duck:
+        graph = ("[1:a]asplit=2[c1][c2];"
+                 "[0:a]asplit=2[v1][v2];"
+                 # v2 is only the sidechain key; c1 is what we hear.
+                 "[c1][v2]sidechaincompress=threshold=0.04:ratio=6:attack=20:"
+                 "release=350:makeup=1[cduck];"
+                 "[v1][cduck]amix=inputs=2:duration=longest:dropout_transition=0,"
+                 f"alimiter=limit=0.97,{fit}[aout];"
+                 "[c2]anullsink")
+    else:
+        graph = ("[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,"
+                 f"alimiter=limit=0.97,{fit}[aout]")
+    run(["-i", voice, "-i", clip, "-filter_complex", graph, "-map", "[aout]",
+         "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
+        cancel=cancel, log=log)
+    return out_path
+
+
 def mix_narration_music(narration: str, music: Optional[str], out_path: str, *,
                         duck: bool = True, cancel=None, log=None) -> str:
     """Narration over music, with the music ducked under speech when asked."""

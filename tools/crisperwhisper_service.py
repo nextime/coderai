@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import tempfile
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -92,11 +93,37 @@ class _Engine:
                           "end": (ts[1] or 0.0) + offset})
         return text.strip(), words
 
+    def _language_ok(self, language) -> bool:
+        """Whether this checkpoint's tokenizer knows ``language``.
+
+        Whisper carries its table as TO_LANGUAGE_CODE (name -> code) and
+        LANGUAGES (code -> name); a value in either, in either direction, is
+        accepted by generate(). When the table can't be read, assume yes and
+        let the model decide."""
+        try:
+            from transformers.models.whisper.tokenization_whisper import (
+                LANGUAGES, TO_LANGUAGE_CODE)
+        except Exception:
+            return True
+        want = str(language).strip().lower()
+        return want in TO_LANGUAGE_CODE or want in LANGUAGES
+
     def transcribe(self, wav_path: str, language: str = None, task: str = None) -> dict:
         import soundfile as sf
         gen = {"task": task or "transcribe"}
         if language:
             gen["language"] = language
+        # Belt and braces: the caller (codai.api.lang_codes) now sends the
+        # English name transformers wants, but this worker is reachable on its
+        # own and transformers RAISES on an unknown language rather than
+        # ignoring it -- which turned one odd tag into a 500 for the whole
+        # request. Probe the model's own table and drop the argument if it
+        # would be rejected, so the worst case is auto-detect.
+        if gen.get("language") and not self._language_ok(gen["language"]):
+            sys.stderr.write(
+                "crisperwhisper: language %r not recognised; auto-detecting\n"
+                % gen["language"])
+            gen.pop("language")
         data, sr = sf.read(wav_path, dtype="float32")
         if getattr(data, "ndim", 1) > 1:
             data = data.mean(axis=1)

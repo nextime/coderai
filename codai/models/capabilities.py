@@ -54,6 +54,15 @@ class ModelCapabilities:
     object_detection: bool = False      # YOLO, DETR
     style_transfer: bool = False        # Neural style transfer
 
+    # Content moderation (served at /v1/moderation). Split by what each model
+    # actually decides, because a caller's obligations differ: an explicitness
+    # score is a policy question, an age estimate is not.
+    moderation: bool = False            # any of the checks below
+    nsfw_detection: bool = False        # explicitness classifier
+    age_estimation: bool = False        # age per detected face
+    face_detection: bool = False        # where the faces are
+    face_embedding: bool = False        # identity vector, for performer match
+
     # Video generation & editing
     video_generation: bool = False      # Text-to-video (CogVideoX, LTX, …)
     image_to_video: bool = False        # Image-to-video (SVD, I2VGen, …)
@@ -227,8 +236,19 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     # ── Image: instruction editing ───────────────────────────────────────────
     # Before the inpaint/generation branches: these ids carry "edit", and
     # falling through to img2img would advertise a `strength` they do not have.
+    # FLUX.2 (dev / klein / pro) is a UNIFIED model: one checkpoint that makes a
+    # picture from text and edits one from an instruction plus up to ten
+    # reference images. Its name carries neither "edit" nor "kontext", so it
+    # fell through to the generation branch below and was advertised as plain
+    # img2img -- which told clients to show a `strength` slider for a pipeline
+    # that has no such argument. Confirmed against diffusers 0.37:
+    # Flux2Pipeline and Flux2KleinPipeline both take `image` and neither takes
+    # `strength`, which is exactly what images._is_instruction_edit decides on,
+    # so the runtime already treated it as an instruction edit and only the
+    # capability list disagreed.
     if (any(x in n for x in ['qwen-image-edit', 'qwen_image_edit',
                              'flux.1-kontext', 'flux-kontext', 'flux_kontext',
+                             'flux.2', 'flux-2', 'flux2',
                              'image-edit-rapid', 'firered-image-edit'])
             or re.search(r'\bstep1x-edit', n)):
         caps.instruction_edit = True

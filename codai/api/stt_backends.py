@@ -44,6 +44,8 @@ import tempfile
 import wave
 from typing import Optional
 
+from codai.api.lang_codes import normalize as _norm_lang
+
 
 # --------------------------------------------------------------------------- #
 # family detection
@@ -172,12 +174,19 @@ class _Wav2Vec2Backend:
         gen_kwargs = {}
         if self._is_whisper:
             # Whisper seq2seq: choose transcribe vs translate, pass source language.
+            # Whisper's `language` is an English NAME, so a regional tag from a
+            # TTS voice ("en-us") has to be mapped first -- handed through as is
+            # it raises "Unsupported language: en-us" and the whole request 500s.
+            # An unmappable tag becomes None, i.e. auto-detect.
             gen_kwargs["task"] = "translate" if target_language else "transcribe"
-            if language:
-                gen_kwargs["language"] = language
+            lang = _norm_lang(language, "whisper_hf")
+            if lang:
+                gen_kwargs["language"] = lang
         elif language and self.config.get("language_aware"):
             # MMS / Seamless accept a target language; plain wav2vec2 ignores it.
-            gen_kwargs["language"] = language
+            lang = _norm_lang(language, "wav2vec2")
+            if lang:
+                gen_kwargs["language"] = lang
         # return_timestamps: CTC uses "chunk" / "word". Whisper uses "word" or
         # True (segment) — but some checkpoints (e.g. CrisperWhisper) ship a custom
         # generation config whose timestamp postprocessing breaks on transformers
@@ -303,7 +312,11 @@ class _VoskBackend:
             wf.close()
             return {"text": " ".join(t for t in texts if t).strip(),
                     "segments": segments, "words": words,
-                    "language": language or self.config.get("language")}
+                    # Vosk chooses the language by model directory and ignores
+                    # the argument; report the normalised code so the response
+                    # doesn't echo a dialect tag Vosk never honoured.
+                    "language": (_norm_lang(language, "vosk")
+                                 or self.config.get("language"))}
         finally:
             try:
                 os.unlink(wav_path)
@@ -350,10 +363,16 @@ class _RemoteNemoBackend:
                    word_timestamps: bool = False) -> dict:
         import requests
         params = {}
-        if language:
-            params["language"] = language
+        # Canary names its languages by ISO-639-1 code, so a regional tag from a
+        # TTS voice ("pt-br") is reduced to "pt" first. Unmappable -> omitted,
+        # which the worker reads as auto-detect.
+        lang = _norm_lang(language, "nemo")
+        if lang:
+            params["language"] = lang
         if target_language:
-            params["target_language"] = target_language
+            tgt = _norm_lang(target_language, "nemo")
+            if tgt:
+                params["target_language"] = tgt
         if word_timestamps:
             params["word_timestamps"] = "1"
         with open(audio_path, "rb") as f:
@@ -411,8 +430,12 @@ class _RemoteCrisperWhisperBackend:
                    word_timestamps: bool = False) -> dict:
         import requests
         params = {"task": "translate" if target_language else "transcribe"}
-        if language:
-            params["language"] = language
+        # The worker hands `language` to transformers' Whisper generate(), which
+        # accepts only the English NAME: "en-us" raised "Unsupported language"
+        # and surfaced as a 500 on every captioned scene (2026-10-27).
+        lang = _norm_lang(language, "crisperwhisper")
+        if lang:
+            params["language"] = lang
         with open(audio_path, "rb") as f:
             audio = f.read()
 

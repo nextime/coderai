@@ -188,6 +188,25 @@ def break_lines(words: List[dict], max_words_per_line: int = 4,
     per_line = max(1, int(max_words_per_line or 4))
     lines_max = max(1, int(max_lines or 1))
     per_event = per_line * lines_max
+    # A caption must never put two characters' words in one event: in a
+    # dialogue that would render a question and its answer as a single line
+    # attributed to nobody. So the word list is first split wherever the
+    # speaker changes, and events are grouped inside each run.
+    runs: List[List[dict]] = []
+    for w in words:
+        spk = w.get("speaker")
+        if runs and runs[-1][0].get("speaker") == spk:
+            runs[-1].append(w)
+        else:
+            runs.append([w])
+    out = []
+    for run in runs:
+        out += _events_from_run(run, per_line, per_event)
+    return out
+
+
+def _events_from_run(words: List[dict], per_line: int,
+                     per_event: int) -> List[dict]:
     out = []
     for i in range(0, len(words), per_event):
         chunk = words[i:i + per_event]
@@ -206,6 +225,10 @@ def break_lines(words: List[dict], max_words_per_line: int = 4,
         mv = max((int(w.get("margin_v") or 0) for w in chunk), default=0)
         if mv:
             ev["margin_v"] = mv
+        # Who said it, carried through so a style can distinguish speakers and
+        # a caller reading the .srt/.vtt sidecar knows the attribution.
+        if chunk[0].get("speaker"):
+            ev["speaker"] = chunk[0]["speaker"]
         out.append(ev)
     return out
 

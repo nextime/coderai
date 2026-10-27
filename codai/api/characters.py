@@ -417,6 +417,73 @@ def resolve_character_profiles(profile_names: List[str]) -> List[str]:
     return out
 
 
+def character_groups(request) -> List[dict]:
+    """Every character this request names, each with its OWN references.
+
+    Returns ``[{"name": str|None, "images": [b64, ...]}, ...]`` in the order
+    the caller gave them, reading whichever of the four fields they used:
+
+    * ``characters`` — a list of profile NAMES (``["alice", "bob"]``) or of
+      slots (``[{"name": ..., "images": [...]}, ...]``). Both spellings, because
+      a caller who has saved profiles should not have to load and resend the
+      images to name two of them.
+    * ``character_profiles`` — saved profile names (the long-standing field).
+    * ``character_references`` + ``character_names`` — inline images, which
+      cannot be split per character unless names align with them, so they
+      become one group.
+
+    Grouping matters, and it is the whole point of this function. The flat list
+    that :func:`resolve_character_profiles` returns is what IP-Adapter wants,
+    and IP-Adapter AVERAGES its references: hand it four pictures of Alice and
+    four of Bob and it conditions on one person who looks like neither. Two
+    characters in one frame therefore cannot be done by appending to that list
+    -- they need a model that takes several references and keeps them distinct
+    (FLUX.2 takes up to ten; Qwen-Image-Edit-2511 takes several), one
+    reference per character. This returns the structure that makes that
+    possible; the caller decides what the pipeline can do with it.
+    """
+    groups: List[dict] = []
+    seen = set()
+
+    def _add(name, images):
+        imgs = [i for i in (images or []) if i]
+        if not imgs:
+            return
+        key = (name or "").strip().lower() or f"_inline{len(groups)}"
+        if key in seen:
+            return
+        seen.add(key)
+        groups.append({"name": name, "images": imgs})
+
+    for entry in (getattr(request, "characters", None) or []):
+        if isinstance(entry, str):
+            _add(entry, resolve_character_profiles([entry]))
+        elif isinstance(entry, dict):
+            nm = entry.get("name")
+            imgs = entry.get("images") or []
+            if not imgs and nm:
+                imgs = resolve_character_profiles([nm])
+            _add(nm, imgs)
+
+    for nm in (getattr(request, "character_profiles", None) or []):
+        _add(nm, resolve_character_profiles([nm]))
+
+    inline = list(getattr(request, "character_references", None) or [])
+    if inline:
+        nms = list(getattr(request, "character_names", None) or [])
+        if len(nms) == len(inline) and len(set(nms)) > 1:
+            # One name per image: they can be split properly.
+            per: dict = {}
+            for nm, img in zip(nms, inline):
+                per.setdefault(nm, []).append(img)
+            for nm, imgs in per.items():
+                _add(nm, imgs)
+        else:
+            _add(nms[0] if nms else None, inline)
+
+    return groups
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/v1/characters", summary="Create or replace a character profile")

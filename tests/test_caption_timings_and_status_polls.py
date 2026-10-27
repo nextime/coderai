@@ -410,14 +410,29 @@ def test_a_ctc_pipeline_is_not_handed_a_none_generate_kwargs(monkeypatch, tmp_pa
 
 
 def test_a_whisper_checkpoint_still_gets_its_generate_kwargs(monkeypatch, tmp_path):
-    """The seq2seq path needs language/task; only the EMPTY dict is dropped."""
+    """The seq2seq path needs language/task; only the EMPTY dict is dropped.
+
+    The language arrives as the English NAME, which is the only spelling
+    transformers' Whisper accepts. This test used to assert the code was
+    passed through verbatim; that pass-through is what made every captioned
+    render fail with ``Unsupported language: en-us``, so the expectation here
+    is now the normalised value (see codai.api.lang_codes). What this test is
+    really guarding is unchanged: the seq2seq path still BUILDS generate_kwargs
+    rather than dropping them.
+    """
     import codai.api.stt_backends as stt
     be, pipe, audio = _ctc_backend(monkeypatch, tmp_path)
     be._is_whisper = True
     out = be.transcribe(audio, language="it", word_timestamps=True)
     assert out["words"]
     assert pipe.calls[0]["generate_kwargs"] == {"task": "transcribe",
-                                                "language": "it"}
+                                                "language": "italian"}
+    # And the regional tag a TTS voice carries maps to the same place.
+    be2, pipe2, audio2 = _ctc_backend(monkeypatch, tmp_path)
+    be2._is_whisper = True
+    be2.transcribe(audio2, language="en-gb", word_timestamps=True)
+    assert pipe2.calls[0]["generate_kwargs"] == {"task": "transcribe",
+                                                 "language": "english"}
 
 
 def test_a_whisper_server_model_is_recognised_from_models_json(monkeypatch):
