@@ -723,9 +723,18 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
             # fails with "stable-diffusion-v1-5 does not appear to have a file
             # named config.json". The base pipeline's own component subfolder
             # is the right answer and is already at hand.
+            #
+            # It must come from the ENTRY'S `path`, not from model_name.
+            # model_name is whatever id resolution produced, and once sibling
+            # entries became reachable by alias that can be the alias itself --
+            # "LTX-2.3-10Eros", which is not a repo and which from_single_file
+            # rejects with "Invalid `pretrained_model_name_or_path` provided".
+            # The repo supplying the component configs is the one the entry
+            # names, every time.
+            _base = str((cfg or {}).get("path") or "").strip() or model_name
             model = cls.from_single_file(
                 path.strip(),
-                config=model_name,
+                config=_base,
                 subfolder=name,
                 quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
                 torch_dtype=dtype,

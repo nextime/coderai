@@ -2215,7 +2215,7 @@ class MultiModelManager:
         """Add an audio transcription model and download/cache it if needed."""
         if model_name not in self.audio_models:
             self.audio_models.append(model_name)
-        self.config[f"audio:{model_name}"] = config or {}
+        self._store_type_config("audio", model_name, config)
         self._remember_registered_type(model_name, "audio")
 
         _be = (config or {}).get("backend") if isinstance(config, dict) else None
@@ -2415,7 +2415,7 @@ class MultiModelManager:
     def set_tts_model(self, model_name: str, config: Dict = None):
         """Set the text-to-speech model and download/cache it if needed."""
         self.tts_model = model_name
-        self.config[f"tts:{model_name}"] = config or {}
+        self._store_type_config("tts", model_name, config)
         self._remember_registered_type(model_name, "tts")
 
         # Download/cache the model at startup if it's a URL or HF ID
@@ -2430,7 +2430,7 @@ class MultiModelManager:
         """Add an image generation model and download/cache it if needed."""
         if model_name not in self.image_models:
             self.image_models.append(model_name)
-        self.config[f"image:{model_name}"] = config or {}
+        self._store_type_config("image", model_name, config)
         self._remember_registered_type(model_name, "image")
 
         # For image models, we don't download at startup since they may be large
@@ -2442,7 +2442,7 @@ class MultiModelManager:
         """Add a vision model and download/cache it if needed."""
         if model_name not in self.vision_models:
             self.vision_models.append(model_name)
-        self.config[f"vision:{model_name}"] = config or {}
+        self._store_type_config("vision", model_name, config)
         self._remember_registered_type(model_name, "vision")
 
         resolved_model = self.load_model(model_name)
@@ -2456,7 +2456,7 @@ class MultiModelManager:
         """Add a video generation model (t2v / i2v / v2v)."""
         if model_name not in self.video_models:
             self.video_models.append(model_name)
-        self.config[f"video:{model_name}"] = config or {}
+        self._store_type_config("video", model_name, config)
         self._remember_registered_type(model_name, "video")
         print(f"Registered video model: {model_name}")
 
@@ -2464,7 +2464,7 @@ class MultiModelManager:
         """Add a music/audio generation model (MusicGen, AudioLDM2, …)."""
         if model_name not in self.audio_gen_models:
             self.audio_gen_models.append(model_name)
-        self.config[f"audio_gen:{model_name}"] = config or {}
+        self._store_type_config("audio_gen", model_name, config)
         self._remember_registered_type(model_name, "audio_gen")
         print(f"Registered audio-gen model: {model_name}")
 
@@ -2472,7 +2472,7 @@ class MultiModelManager:
         """Add a text/image embedding model."""
         if model_name not in self.embedding_models:
             self.embedding_models.append(model_name)
-        self.config[f"embedding:{model_name}"] = config or {}
+        self._store_type_config("embedding", model_name, config)
         self._remember_registered_type(model_name, "embedding")
         print(f"Registered embedding model: {model_name}")
 
@@ -2480,7 +2480,7 @@ class MultiModelManager:
         """Add a depth estimation / segmentation / object detection model."""
         if model_name not in self.spatial_models:
             self.spatial_models.append(model_name)
-        self.config[f"spatial:{model_name}"] = config or {}
+        self._store_type_config("spatial", model_name, config)
         self._remember_registered_type(model_name, "spatial")
         print(f"Registered spatial model: {model_name}")
 
@@ -2516,6 +2516,32 @@ class MultiModelManager:
                 if target and str(target).strip().lower() != want:
                     return str(target)
         return None
+
+    def _store_type_config(self, kind: str, model_name: str, config: Dict = None):
+        """Store a model's config under its type key, and under its ALIAS too.
+
+        ``self.config`` is keyed ``<kind>:<model_name>`` where model_name is the
+        weights path -- so two entries that share one path overwrite each
+        other and only the last survives. That is not a corner case: it is how
+        a base checkpoint is served under several configurations (lisa /
+        lisa-32k differ only in context; LTX-2.3-10Eros / -PinkCherry differ
+        only in which GGUF is their transformer).
+
+        Measured 2026-10-27: a request for LTX-2.3-10Eros loaded PinkCherry's
+        15.9 GB transformer, because PinkCherry comes second in models.json
+        and had clobbered the shared key -- while being DISABLED, which should
+        have kept it out of the registry altogether.
+
+        So an entry carrying an alias is stored under that alias as well. The
+        path key keeps its existing meaning (last writer wins, which is what
+        every caller that knows only a path expects) and the alias key makes
+        the sibling reachable by the only name that distinguishes it.
+        """
+        cfg = config or {}
+        self.config[f"{kind}:{model_name}"] = cfg
+        alias = str((cfg or {}).get("alias") or "").strip()
+        if alias and alias != model_name:
+            self.config[f"{kind}:{alias}"] = cfg
 
     def set_model_alias(self, alias: str, model_name: str):
         """Register an alias for a model."""
@@ -2840,8 +2866,27 @@ class MultiModelManager:
             return True
         return model_type == "text" and "vision" in types
 
-    def _config_for_model_key(self, model_key: str) -> Dict[str, Any]:
-        """Return config for a key, falling back to compatible multi-type keys."""
+    def _config_for_model_key(self, model_key: str,
+                              requested_id: str = None) -> Dict[str, Any]:
+        """Return config for a key, falling back to compatible multi-type keys.
+
+        ``requested_id`` is the id the caller actually asked for, before alias
+        resolution, and it is the ONLY thing that separates sibling entries
+        sharing one weights path. _get_model_used_vram_gb already disambiguates
+        this way (lisa vs lisa-32k, 178000 ctx vs 32768 of the same file); the
+        config used to LOAD the model did not, so it picked whichever sibling
+        happened to register the path.
+
+        Measured 2026-10-27: LTX-2.3-10Eros and LTX-2.3-PinkCherry both point
+        at diffusers/LTX-2.3-Diffusers, differing only in which GGUF is their
+        transformer. A request for 10Eros collapsed to the shared path and
+        loaded PinkCherry's 15.9 GB checkpoint -- the wrong model entirely,
+        and silently, since both are "valid" configs for that path.
+        """
+        if requested_id:
+            for _k, _c in (self.config or {}).items():
+                if isinstance(_c, dict) and _c.get("alias") == requested_id:
+                    return _c
         cfg = self.config.get(model_key, {})
         if cfg:
             return cfg
@@ -5708,7 +5753,7 @@ class MultiModelManager:
         # Per-model "load" = pre-loaded (treat as loadall for this model).
         # Per-model "on-request" = load when needed with VRAM management.
         # =====================================================================
-        per_model_cfg = self._config_for_model_key(model_key)
+        per_model_cfg = self._config_for_model_key(model_key, _requested_id)
         per_model_load_mode = per_model_cfg.get("load_mode")  # "load" | "on-request" | None
 
         if per_model_load_mode == "on-request":
