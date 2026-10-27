@@ -31,6 +31,8 @@ import re
 import shutil
 import subprocess
 import sys
+
+from codai.api.venv_env import clean_py_env
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -171,9 +173,12 @@ def run_wav2lip(video_path: str, audio_path: str, out_path: str,
            "--face", os.path.abspath(video_path),
            "--audio", os.path.abspath(audio_path),
            "--outfile", os.path.abspath(out_path)]
-    env = dict(os.environ)
+    # clean_py_env, not os.environ: this runs a python that is not this one,
+    # and the PYTHONHOME the engine processes export kills a foreign
+    # interpreter at startup ("No module named 'encodings'").
+    env = clean_py_env()
     # inference.py imports audio/hparams/face_detection as top-level modules.
-    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(root)
 
     proc = subprocess.run(cmd, cwd=str(root), env=env, capture_output=True,
                           text=True, timeout=timeout)

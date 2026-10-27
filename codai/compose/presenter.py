@@ -38,6 +38,7 @@ import subprocess
 import threading
 from typing import List, Optional
 
+from codai.api.venv_env import clean_py_env
 from codai.compose import media
 from codai.compose import render as rnd
 
@@ -261,10 +262,16 @@ def _run(cmd: List[str], cancel=None, timeout: int = 3600, log=None,
     """
     if log:
         log("presenter: " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
-    env = None
+    # Every lip-sync engine here is a python that is NOT this one -- the shims
+    # on PATH run the 3.10 venv the image bundles for wav2lip and SadTalker.
+    # The engine processes export PYTHONHOME (the standalone 3.13), and a 3.10
+    # inheriting it dies before running a byte:
+    #     init_fs_encoding: failed to get the Python codec of the filesystem
+    #     encoding / ModuleNotFoundError: No module named 'encodings'
+    # which is what every presenter request answered with until this line.
+    env = clean_py_env()
     if pythonpath:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = pythonpath + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = pythonpath
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             cwd=cwd, env=env)
     waited = 0.0
