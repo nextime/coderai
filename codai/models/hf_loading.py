@@ -232,6 +232,25 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
         for name, raw_mode in comp_q.items():
             mode = _normalize_quant_mode(raw_mode)  # GGUF/none → None here
             if mode is None:
+                # A value this map does not understand used to vanish here, and
+                # with it the whole quantization config: the component then
+                # loads from the base repo at FULL precision while the operator
+                # believes it comes from the file they named. Measured on
+                # LTX-2.5, whose text_encoder pointed at a bf16 Gemma-4 12B --
+                # the quantization map came back empty, the 12B loaded
+                # unquantized, and every generation died with the card full.
+                # Loading a component from another file is `component_models`;
+                # this map takes 4bit / 8bit / 2bit / a .gguf path.
+                if (isinstance(raw_mode, str) and raw_mode.strip()
+                        and not _is_gguf_value(raw_mode)
+                        and str(raw_mode).strip().lower() not in ("none", "no",
+                                                                 "off", "full")):
+                    print(f"  WARNING: component_quantization['{name}'] = "
+                          f"{raw_mode!r} is not a quantization mode, so '{name}' "
+                          f"loads at FULL PRECISION from the base repo. Use "
+                          f"'4bit'/'8bit'/'2bit' or a .gguf path here; to load "
+                          f"this component from that file, put it in "
+                          f"'component_models' instead.")
                 continue
             if _bnb_incompatible(name):
                 print(f"  Skipping {mode} for '{name}': it has no Linear layers "
