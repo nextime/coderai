@@ -668,17 +668,38 @@ def _missing_tensor_hint(exc, name: str, path: str, cfg) -> str:
 
 
 def _component_dir(cfg, name: str):
-    """The local directory of one component of the base pipeline, or None."""
+    """The local directory of one component of the base pipeline, or None.
+
+    Cache-first, then the hub for the ONE file callers actually read here --
+    the component's ``config.json``, a few hundred bytes. A cache-only answer
+    is wrong in exactly the case that matters: when a component's weights come
+    from a GGUF, the base repo's copy of that subfolder is never downloaded, so
+    the directory does not exist locally and every caller silently gives up.
+    That is how the LTX-2.5 key reconciliation came to do nothing at all -- it
+    needs the config to know which names the class expects, and it was asking
+    a cache that had no reason to hold it.
+    """
     import os
     base = (cfg or {}).get("path") or (cfg or {}).get("model") or ""
+    if not base:
+        return None
+    if os.path.isdir(base):
+        d = os.path.join(base, name)
+        return d if os.path.isdir(d) else None
     try:
         from huggingface_hub import snapshot_download
-        root = (base if os.path.isdir(base)
-                else snapshot_download(base, local_files_only=True))
+        root = snapshot_download(base, local_files_only=True)
+        d = os.path.join(root, name)
+        if os.path.isdir(d):
+            return d
+    except Exception:
+        pass
+    try:
+        from huggingface_hub import hf_hub_download
+        conf = hf_hub_download(base, f"{name}/config.json")
+        return os.path.dirname(conf)
     except Exception:
         return None
-    d = os.path.join(root, name)
-    return d if os.path.isdir(d) else None
 
 
 def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]], dtype):
