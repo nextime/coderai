@@ -494,6 +494,14 @@ def build_single_file_pipeline(model_name: str, cfg: Optional[Dict[str, Any]],
 #: checkpoint already contains -- never the invention of one it lacks.
 _KEY_ALIAS_SUFFIXES = ("_single",)
 
+#: Whole-segment renames, for the disagreements a suffix strip cannot express.
+#: LTX-2.5's GGUF names the attention norms `q_norm` / `k_norm`; diffusers'
+#: LTX2VideoTransformer3DModel expects `norm_q` / `norm_k`. 724 parameters, one
+#: to one, the same tensors -- and the load fails with "Cannot copy out of meta
+#: tensor" for weights the file carries under the other spelling.
+_KEY_ALIAS_SEGMENTS = {"q_norm": "norm_q", "k_norm": "norm_k",
+                       "norm_q": "q_norm", "norm_k": "k_norm"}
+
 
 def _rename_unexpected_keys(state, expected):
     """Rename converter keys the class does not want but would under an alias.
@@ -508,9 +516,9 @@ def _rename_unexpected_keys(state, expected):
     for key in list(out):
         if key in expected:
             continue
+        parts = key.split(".")
+        hit = None
         for suf in _KEY_ALIAS_SUFFIXES:
-            parts = key.split(".")
-            hit = None
             for i, seg in enumerate(parts):
                 if seg.endswith(suf) and len(seg) > len(suf):
                     cand = ".".join(parts[:i] + [seg[: -len(suf)]] + parts[i + 1:])
@@ -518,9 +526,19 @@ def _rename_unexpected_keys(state, expected):
                         hit = cand
                         break
             if hit:
-                out[hit] = out.pop(key)
-                moved.append((key, hit))
                 break
+        if hit is None:
+            for i, seg in enumerate(parts):
+                alias = _KEY_ALIAS_SEGMENTS.get(seg)
+                if not alias:
+                    continue
+                cand = ".".join(parts[:i] + [alias] + parts[i + 1:])
+                if cand in expected and cand not in out:
+                    hit = cand
+                    break
+        if hit:
+            out[hit] = out.pop(key)
+            moved.append((key, hit))
     return out, moved
 
 

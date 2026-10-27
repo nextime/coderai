@@ -149,3 +149,61 @@ def test_the_real_checkpoint_maps_exactly_after_the_rename(real_gguf):
     # And nothing was conjured: every key present afterwards came from the
     # converter, none were created.
     assert set(fixed) <= set(converted) | {n for _, n in moved}
+
+
+# --------------------------------------------------------------------------- #
+# LTX-2.5: the same disagreement, spelled the other way round
+# --------------------------------------------------------------------------- #
+
+def test_attention_norms_are_reconciled_both_ways():
+    """LTX-2.5's GGUF names the attention norms `q_norm` / `k_norm` while
+    LTX2VideoTransformer3DModel expects `norm_q` / `norm_k`: 724 parameters,
+    one to one, the same tensors. Unreconciled they stay on the meta device
+    and the load dies with "Cannot copy out of meta tensor" -- about weights
+    the file carries under the other spelling.
+
+    A suffix strip cannot express this one, so the repair also takes whole
+    segments, and it takes them in both directions: nothing says which
+    spelling the next exporter will pick."""
+    state = {"transformer_blocks.0.attn2.q_norm.weight": "a",
+             "transformer_blocks.0.attn2.k_norm.weight": "b",
+             "transformer_blocks.0.audio_attn1.q_norm.weight": "c"}
+    expected = {"transformer_blocks.0.attn2.norm_q.weight",
+                "transformer_blocks.0.attn2.norm_k.weight",
+                "transformer_blocks.0.audio_attn1.norm_q.weight"}
+    out, moved = _rename_unexpected_keys(state, expected)
+    assert len(moved) == 3
+    assert set(out) == expected
+    assert out["transformer_blocks.0.attn2.norm_q.weight"] == "a"
+
+    # And a checkpoint spelled the diffusers way, against a class wanting the
+    # other, is repaired too.
+    back, moved_back = _rename_unexpected_keys(
+        {"attn1.norm_q.weight": "x"}, {"attn1.q_norm.weight"})
+    assert moved_back == [("attn1.norm_q.weight", "attn1.q_norm.weight")]
+    assert back == {"attn1.q_norm.weight": "x"}
+
+
+def test_both_repairs_apply_in_one_pass():
+    """A checkpoint can need the suffix strip AND a segment rename; an
+    `elif` between them would fix one family and leave the other on meta."""
+    state = {"prompt_adaln_single.linear.weight": "p",
+             "transformer_blocks.0.attn2.q_norm.weight": "q"}
+    expected = {"prompt_adaln.linear.weight",
+                "transformer_blocks.0.attn2.norm_q.weight"}
+    out, moved = _rename_unexpected_keys(state, expected)
+    assert len(moved) == 2 and set(out) == expected
+
+
+def test_a_segment_rename_still_refuses_to_overwrite_or_invent():
+    """Same guard as the suffix path: only when the class does not want the
+    current name, does want the renamed one, and nothing holds the target."""
+    # Target already occupied by a real weight: leave both alone.
+    state = {"attn1.q_norm.weight": "new", "attn1.norm_q.weight": "real"}
+    expected = {"attn1.norm_q.weight"}
+    out, moved = _rename_unexpected_keys(state, expected)
+    assert moved == [] and out["attn1.norm_q.weight"] == "real"
+
+    # Class wants neither spelling: nothing is fabricated.
+    out2, moved2 = _rename_unexpected_keys({"attn1.q_norm.weight": "x"}, set())
+    assert moved2 == [] and out2 == {"attn1.q_norm.weight": "x"}
