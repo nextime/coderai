@@ -296,7 +296,7 @@ identity-locked video generation are here too.
   "presenter": {
     "character": "nova",            // a saved character profile (its front reference is used)
     "image": null,                  // or an explicit portrait (URL / /v1/files / data URI / base64)
-    "engine": "auto",               // auto | wav2lip | sadtalker | <any installed engine name>
+    "engine": "auto",               // auto | latentsync | musetalk | wav2lip | sadtalker | <any installed name>
     "motion": "generate",           // generate: a short identity-locked clip per scene
                                     // still: animate the portrait   src: use base_src
     "base_src": null,
@@ -320,8 +320,13 @@ identity-locked video generation are here too.
 * **Timing** is the scene's: the engine is driven by *that scene's* narration —
   synthesised or supplied — and the clip is held to narration + padding (or
   `min_duration`). Captions, music and ducking are unchanged.
-* **`engine: "auto"`** takes a video-driven engine (wav2lip) when there is a clip
-  to drive and a portrait engine (sadtalker) otherwise. Any other engine installed
+* **`engine: "auto"`** takes a video-driven engine when there is a clip to drive
+  and a portrait engine otherwise. The video-driven order is **latentsync,
+  musetalk, wav2lip**: wav2lip works at 96x96 and upscales, which is where the
+  soft, smeared mouth on a 1080p reel comes from, while LatentSync (Apache-2.0)
+  and MuseTalk (MIT) run at 256-512 px natively. For a still portrait
+  **sadtalker** still leads — it is the only one that invents head motion
+  instead of replacing a mouth. Any other engine installed
   under its own name can be named instead — no API change for a new one. Ask
   `GET /v1/video/presenter/engines` what this install has.
 * **`layout`**: `full` replaces the scene's visuals (a scene may then have none);
