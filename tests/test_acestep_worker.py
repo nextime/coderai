@@ -244,3 +244,38 @@ def test_longcat_shares_the_same_helper():
 
     from codai.api import longcat_worker
     assert "clean_py_env" in inspect.getsource(longcat_worker._clean_py_env)
+
+
+# --------------------------------------------------------------------------- #
+# the baked image variant
+# --------------------------------------------------------------------------- #
+
+_OVERLAY = Path(__file__).resolve().parents[1] / "packaging" / "linux" / \
+    "Dockerfile.acestep-overlay"
+
+
+def test_the_overlay_bakes_the_venv_where_the_worker_looks_for_it():
+    """The variant is only useful if the worker finds it without being told.
+    A path that disagrees with _BAKED_VENVS means a 6.4 GB layer the worker
+    ignores while it rebuilds the same venv on first use."""
+    baked = str(acestep_worker._BAKED_VENVS[0])
+    assert baked == "/opt/coderai/acestep_venv"
+    assert f"{baked}/" in _OVERLAY.read_text()
+
+
+def test_the_overlay_runs_the_venvs_python_with_pythonhome_cleared():
+    """The runtime image sets PYTHONHOME to the standalone 3.13, so the
+    overlay's own import check would die on the trap it is meant to catch --
+    and `exit 1` on a venv that is perfectly fine."""
+    src = _OVERLAY.read_text()
+    assert "env -u PYTHONHOME" in src
+    assert "import sys, acestep, torch, soundfile" in src
+
+
+def test_no_comment_lines_inside_the_overlays_run_continuation():
+    """Docker strips comment lines inside a continuation, splicing the shell
+    lines around them together. The comment belongs above the RUN."""
+    lines = _OVERLAY.read_text().splitlines()
+    for prev, cur in zip(lines, lines[1:]):
+        if prev.rstrip().endswith("\\"):
+            assert not cur.strip().startswith("#"), f"comment spliced after: {prev}"

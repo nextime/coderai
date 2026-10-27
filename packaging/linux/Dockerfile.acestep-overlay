@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bake the ACE-Step python-3.12 venv onto an image that was built without it.
+#
+# The two shipped variants are "the image" and "the image plus this venv", and
+# this file is what makes that literally true: the baked image is the slim one
+# with a single layer on top, so the two cannot drift apart between builds the
+# way two full builds of ~20 GB bundles can. It also costs one 6.4 GB copy
+# instead of a second 15-minute build.
+#
+# build_oci_image.sh --with-acestep bundles the same venv during a full build,
+# for installs that assemble the image in one pass.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG BASE_IMAGE=coderai:base
+FROM ${BASE_IMAGE}
+
+# A named build context, not a path in the repo: the venv lives in the
+# developer's home (~/.coderai/acestep_venv), nowhere near the build context.
+COPY --from=acestep_venv / /opt/coderai/acestep_venv/
+
+# The final check spawns the venv's python with PYTHONHOME unset, because this
+# image sets PYTHONHOME to the standalone 3.13 and a 3.12 inheriting it dies
+# before running a byte -- exactly the bug that made the worker report a missing
+# requirements file. codai/api/venv_env.clean_py_env() does this at runtime; the
+# build has to do it too, or the check tests the trap instead of the venv.
+# (Comments stay OUT of the RUN below: Docker strips comment lines inside a
+# continuation, which would splice the surrounding shell lines together.)
+RUN set -eux; \
+    cfg=/opt/coderai/acestep_venv/pyvenv.cfg; \
+    test -f "$cfg"; \
+    if [ -x /opt/coderai/py312/bin/python3.12 ]; then \
+      sed -i 's|^home *=.*|home = /opt/coderai/py312/bin|; s|^command *=.*|command = /opt/coderai/py312/bin/python3.12|' "$cfg"; \
+      for p in python python3 python3.12; do ln -sf /opt/coderai/py312/bin/python3.12 "/opt/coderai/acestep_venv/bin/$p"; done; \
+    elif [ -x /usr/bin/python3.12 ]; then \
+      for p in python python3 python3.12; do ln -sf /usr/bin/python3.12 "/opt/coderai/acestep_venv/bin/$p"; done; \
+    else \
+      echo "ERROR: no python3.12 in this image to run the ACE-Step venv on" >&2; exit 1; \
+    fi; \
+    find /opt/coderai/acestep_venv -type d -name __pycache__ -prune -exec rm -rf '{}' + || true; \
+    find /opt/coderai/acestep_venv -name '*.pyc' -delete || true; \
+    env -u PYTHONHOME -u PYTHONPATH -u PYTHONEXECUTABLE -u VIRTUAL_ENV \
+      /opt/coderai/acestep_venv/bin/python -c \
+      "import sys, acestep, torch, soundfile; print('acestep venv OK on', sys.version.split()[0])"

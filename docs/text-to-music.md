@@ -112,6 +112,18 @@ packaging/linux/build_oci_image.sh                  # default: no ACE-Step venv
 packaging/linux/build_oci_image.sh --with-acestep   # venv pre-built, baked in
 ```
 
+Or bake the venv onto an image that is already built, which is how the two
+published variants are made:
+
+```bash
+packaging/linux/bake_acestep_venv.sh coderai:full_all_0.5.10
+# -> coderai:full_all_0.5.10-acestep
+```
+
+That takes one layer and a couple of minutes instead of a second full build,
+and it makes the relationship literal: the baked image **is** the slim image
+plus this venv, so the two cannot drift apart between builds.
+
 `--with-acestep` **copies the development venv** when there is one
 (`$CODERAI_ACESTEP_VENV`, else `~/.coderai/acestep_venv`) — it is already built
 and already the thing that was tested. Only when there is none does it build one
