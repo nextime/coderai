@@ -209,12 +209,26 @@ def get_cfg_scale():
     return cfg_scale
 
 
+#: Spellings that mean "give me the bytes inline". ``b64_json`` is the
+#: OpenAI-API value and is what every SDK client sends; ``base64`` is this
+#: codebase's own older internal name. Both are accepted because the request
+#: model documents the first and this function used to test only the second --
+#: so a caller asking for base64 the standard way got a URL and no bytes, with
+#: nothing to say why. Measured 2026-10-27 against the live server.
+_B64_FORMATS = ("base64", "b64_json", "b64")
+
+
+def _wants_b64(request_format) -> bool:
+    return str(request_format or "").strip().lower() in _B64_FORMATS
+
+
 def save_image_response(img, request_format="base64", http_request=None):
     """
     Save image to file path if configured, return response dict.
-    
-    If --file-path is set and request_format is url (not base64), return only URL.
-    If --file-path is set and request_format is base64, return both URL and base64.
+
+    If --file-path is set and request_format is url, return only the URL/path.
+    If --file-path is set and base64 was asked for (``b64_json`` or
+    ``base64``), return the URL/path AND the bytes.
     If --file-path is not set, return base64 as usual.
     """
     global global_file_path, global_args
@@ -242,7 +256,7 @@ def save_image_response(img, request_format="base64", http_request=None):
         
         # If client explicitly requested base64, include it
         # Otherwise, only return URL when file-path is set
-        if request_format == "base64":
+        if _wants_b64(request_format):
             buffered = io.BytesIO()
             img.save(buffered, format="PNG")
             img_bytes = buffered.getvalue()
