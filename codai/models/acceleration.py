@@ -225,6 +225,17 @@ def _split_lora_ref(ref: str):
     return ref, None
 
 
+#: Schedulers that parameterise a flow-matching trajectory. Swapping one of
+#: these for a DDPM-family scheduler (or the reverse) does not make a worse
+#: picture, it makes noise -- so both the request path (images._apply_sampler)
+#: and the model-card path below refuse to cross the line. One set, so they
+#: cannot disagree about where it is.
+FLOW_SCHEDULERS = {"FlowMatchEulerDiscreteScheduler",
+                   "FlowMatchHeunDiscreteScheduler",
+                   "FlowMatchLCMScheduler",
+                   "LTXEulerAncestralRFScheduler"}
+
+
 def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
     """Fuse the distill LoRA into a diffusers pipeline and apply scheduler tweaks.
 
@@ -252,6 +263,21 @@ def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
             import diffusers as _diffusers
             sched_cls = getattr(_diffusers, sched_name, None)
             cur = getattr(pipe, "scheduler", None)
+            cur_name = type(cur).__name__ if cur is not None else ""
+            if (sched_cls is not None and cur is not None
+                    and (cur_name in FLOW_SCHEDULERS)
+                    != (sched_name in FLOW_SCHEDULERS)):
+                # The request path refuses this swap with an explanation; a
+                # model card could do it silently, and the model then fails at
+                # call time with something that names neither scheduler --
+                # Krea 2 with EulerDiscreteScheduler configured here answered
+                # "EulerDiscreteScheduler.set_timesteps() got an unexpected
+                # keyword argument 'mu'", which reads like a diffusers bug.
+                log.warning(
+                    "[accel] ignoring scheduler %s: this model's scheduler is "
+                    "%s, and flow-matching and DDPM-family samplers cannot be "
+                    "substituted for one another", sched_name, cur_name)
+                sched_cls = None
             if sched_cls is not None and cur is not None:
                 # `scheduler_config` carries the sampler's own settings, because
                 # the class name alone does not identify a sampler. The samplers

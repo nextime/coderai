@@ -445,10 +445,9 @@ SAMPLERS = {
 
 #: Schedulers for flow-matching models. A pipeline whose scheduler is one of
 #: these cannot be given a classic DDPM-family sampler, and vice versa.
-_FLOW_SCHEDULERS = {"FlowMatchEulerDiscreteScheduler",
-                    "FlowMatchHeunDiscreteScheduler",
-                    "FlowMatchLCMScheduler",
-                    "LTXEulerAncestralRFScheduler"}
+#: Shared with the model-card path, which applies a scheduler from the
+#: acceleration config and must draw the family line in the same place.
+from codai.models.acceleration import FLOW_SCHEDULERS as _FLOW_SCHEDULERS
 
 
 def _apply_sampler(pipeline, sampler: str) -> str:
