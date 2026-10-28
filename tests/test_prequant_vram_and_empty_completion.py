@@ -213,3 +213,94 @@ def test_an_unquantized_model_may_still_offload():
         hf_device_map={"layers.0": 0, "layers.1": "cpu"},
         config=types.SimpleNamespace(quantization_config=None))
     b._reject_offloaded_quantized(model, "m", {})
+
+
+# ============================== A5, second half: refuse before the long walk
+# _reject_offloaded_quantized catches a quantized model that ended up on the
+# CPU -- but it runs at the BOTTOM of the device_map ladder, after every rung
+# has been tried. For a 4-bit 9B that means loading 427 weight shards onto
+# GPU+CPU over many minutes before raising, with the host RAM and the card
+# churned for a result that was known to be useless when the ladder started:
+# the line above it says so in as many words ("quantized kernels cannot read
+# offloaded weights"). A shortage of VRAM is also not a reason to give up
+# before asking the other models on the card to move.
+
+def test_a_quantized_oom_evicts_and_retries_instead_of_walking_the_ladder():
+    """Asserted on the source, like the ladder guarantee above, so it survives
+    a refactor of the branch."""
+    import inspect
+    from codai.backends import cuda
+    src = inspect.getsource(cuda.NvidiaBackend.load_model)
+    head = src[src.index("Full-GPU load OOMed"):]
+    # The quantized branch comes first and never reaches the ladder message.
+    quant = head[:head.index("falling back to")]
+    assert "_evict_for_quantized" in quant
+    assert "raise RuntimeError" in quant
+    # And an unquantized model still has the ladder, which is real recovery.
+    assert "falling back to" in head
+
+
+def test_the_refusal_says_what_to_do_about_it():
+    import inspect
+    from codai.backends import cuda
+    src = inspect.getsource(cuda.NvidiaBackend.load_model)
+    msg = src[src.index("is quantized and needs about"):]
+    msg = msg[:msg.index('")') + 2]
+    for hint in ("empty completion", "n_ctx", "unquantized"):
+        assert hint in msg, hint
+
+
+class _FakeMem:
+    """Stands in for torch.cuda.mem_get_info: a list of successive free bytes."""
+
+    def __init__(self, *free_gb):
+        self.vals = [int(g * 1e9) for g in free_gb]
+
+    def __call__(self, _i=0):
+        v = self.vals[0] if len(self.vals) == 1 else self.vals.pop(0)
+        return (v, int(24 * 1e9))
+
+
+def _backend():
+    from codai.backends.cuda import NvidiaBackend
+    return object.__new__(NvidiaBackend)
+
+
+def test_eviction_that_freed_room_reports_success(monkeypatch):
+    import sys
+    import types
+    import torch
+    freed = []
+    mgr = types.SimpleNamespace(
+        _evict_models_for_vram=lambda gb: freed.append(gb))
+    mod = types.ModuleType("codai.models.manager")
+    mod.multi_model_manager = mgr
+    monkeypatch.setitem(sys.modules, "codai.models.manager", mod)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", _FakeMem(7.2, 19.0))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    assert _backend()._evict_for_quantized("m", 12.9) is True
+    assert freed == [12.9]
+
+
+def test_eviction_that_freed_nothing_reports_failure(monkeypatch):
+    import sys
+    import types
+    import torch
+    mod = types.ModuleType("codai.models.manager")
+    mod.multi_model_manager = types.SimpleNamespace(
+        _evict_models_for_vram=lambda gb: None)
+    monkeypatch.setitem(sys.modules, "codai.models.manager", mod)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", _FakeMem(7.2, 7.2))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    assert _backend()._evict_for_quantized("m", 12.9) is False
+
+
+def test_eviction_never_raises_when_the_manager_is_not_there(monkeypatch):
+    import sys
+    import types
+    import torch
+    broken = types.ModuleType("codai.models.manager")   # no multi_model_manager
+    monkeypatch.setitem(sys.modules, "codai.models.manager", broken)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", _FakeMem(7.2))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    assert _backend()._evict_for_quantized("m", 12.9) is False

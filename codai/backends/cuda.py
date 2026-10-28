@@ -813,6 +813,45 @@ class NvidiaBackend(ModelBackend):
         
         return self._get_vram_percentages_for_strategy(strategy, is_moe, total_vram_gb)
     
+    def _evict_for_quantized(self, model_name: str, need_gb: float) -> bool:
+        """Free VRAM for a model that has to be fully resident. True if it helped.
+
+        A quantized model has no offload path worth taking, so its first full-GPU
+        attempt running against whatever happened to be free on a shared card is
+        a lottery. Losing it is a reason to evict and try again, not a reason to
+        mis-place the model. Never raises: the caller reports the real failure.
+        """
+        import gc
+
+        import torch
+
+        def _free_gb() -> float:
+            try:
+                return torch.cuda.mem_get_info(0)[0] / 1e9
+            except Exception:
+                return 0.0
+
+        before = _free_gb()
+        try:
+            from codai.models.manager import multi_model_manager
+            # Same call ensure_vram_for makes, and it takes no lock of its own,
+            # so it is safe from inside a load the manager started. It skips a
+            # model that is busy serving rather than crashing its CUDA context.
+            multi_model_manager._evict_models_for_vram(float(need_gb or 0.0))
+        except Exception as exc:
+            print(f"  (could not evict for {model_name}: {exc})")
+            return False
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        after = _free_gb()
+        if after > before + 0.1:
+            print(f"  freed {after - before:.1f} GB — {after:.1f} GB now free")
+            return True
+        return False
+
     def _derive_cuda_device(self) -> str:
         """Derive the CUDA device string from global args.
         
@@ -1169,6 +1208,45 @@ class NvidiaBackend(ModelBackend):
                     model = self._try_load_model(model_name, _fg_kwargs, self.device)
                     if model is not None:
                         print(f"  ✓ Model loaded full-GPU on {cuda_device}")
+                    elif _quantized:
+                        # The ladder below is exactly what the message above says
+                        # cannot work: quantized kernels cannot read offloaded
+                        # weights, so a 4-bit model placed by device_map loads
+                        # happily and then answers every request with "" and
+                        # completion_tokens: 0. Falling through to it turns a
+                        # transient shortage of VRAM into a model that is broken
+                        # for as long as it stays resident, and says nothing.
+                        #
+                        # So: make room properly and try once more. The first
+                        # attempt ran against whatever happened to be free, which
+                        # on a shared card is a lottery — another model's
+                        # residency is a reason to evict, not to mis-place this
+                        # one.
+                        print("  ✗ Full-GPU load OOMed — evicting other models "
+                              "and retrying (a quantized model cannot be served "
+                              "from CPU offload)")
+                        if self._evict_for_quantized(model_name, expected_vram_gb):
+                            model = self._try_load_model(model_name, _fg_kwargs,
+                                                         self.device)
+                        if model is not None:
+                            print(f"  ✓ Model loaded full-GPU on {cuda_device} "
+                                  f"after eviction")
+                        else:
+                            _free_gb = 0.0
+                            try:
+                                _free_gb = torch.cuda.mem_get_info(0)[0] / 1e9
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                f"{model_name} is quantized and needs about "
+                                f"{expected_vram_gb:.1f} GB of VRAM to itself; "
+                                f"{_free_gb:.1f} GB is free after evicting what "
+                                f"could be evicted. Serving it from CPU offload "
+                                f"is not an option — quantized kernels cannot "
+                                f"read offloaded weights, and the model would "
+                                f"answer every request with an empty completion. "
+                                f"Free the card, lower n_ctx, or configure this "
+                                f"model unquantized.")
                     else:
                         print("  ✗ Full-GPU load OOMed — falling back to "
                               "device_map offload ladder")
