@@ -2933,6 +2933,14 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         entry["video_subtypes"] = data["video_subtypes"]
     for key in ("alias", "config_name", "backend", "load_mode", "n_gpu_layers", "n_ctx",
                 "max_gpu_percent", "manual_ram_gb", "load_in_4bit", "load_in_8bit",
+                # The dtype the model runs in, alongside the quantization flags
+                # it belongs with. Without it here the model page could set
+                # load_in_4bit but not the precision that 4-bit computes in, so
+                # the loader fell back to a default derived from GPU detection
+                # -- and when that detection had not run yet it chose fp32,
+                # doubling the VRAM of every unquantized tensor on the card.
+                # A card decides its own precision; the hardware does not.
+                "precision",
                 "flash_attention", "no_ram", "offload_strategy", "offload_dir",
                 "system_prompt", "parser", "tools_closer_prompt", "grammar_guided",
                 "max_instances", "preload_all_instances", "capabilities",

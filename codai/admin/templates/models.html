@@ -1471,6 +1471,17 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-noram"> No RAM fallback</label>
       </div>
 
+      <div class="form-group" style="margin-top:.75rem">
+        <label class="form-label" for="cfg-precision">Precision (compute dtype)</label>
+        <select id="cfg-precision" class="form-control">
+          <option value="">auto — fp16 on a GPU, fp32 on CPU</option>
+          <option value="bf16">bf16 — widest range, the dtype most models are trained in</option>
+          <option value="fp16">fp16 — half the memory of fp32, the usual GPU choice</option>
+          <option value="fp32">fp32 — full precision; twice the memory and no Flash Attention</option>
+        </select>
+        <span class="form-hint" style="font-size:11px">The dtype the model runs in. This is <b>not</b> replaced by the quantization boxes above: 4-bit and 8-bit quantize the <i>weights</i>, while the embeddings, <code>lm_head</code>, the norms, the activations and the KV cache all stay in this dtype — so a 4-bit model left in fp32 still pays fp32 for all of them. <code>fp32</code> also disables Flash Attention 2, which accepts only fp16 and bf16. Leave it on <i>auto</i> only if you want the loader to pick; set it explicitly when the card has to fit a known budget.</span>
+      </div>
+
       <!-- Fast-kernel 4-bit (GPTQ/AWQ via Marlin) — HF transformers models only -->
       <div id="cfg-fastquant-wrap" style="margin-top:1rem;padding:.75rem;border:1px solid var(--border);border-radius:6px;background:var(--raised)">
         <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
@@ -4391,6 +4402,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-quant-backend').value = s.quant_backend || 'auto';
   _refreshQuantStatus(m.path);
   _renderComponentQuant(s.component_quantization || {});
+  document.getElementById('cfg-precision').value = s.precision || '';
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
@@ -5480,6 +5492,9 @@ async function saveModelConfig(){
     load_in_8bit:      document.getElementById('cfg-8bit').checked,
     quant_backend:     document.getElementById('cfg-quant-backend').value || 'auto',
     component_quantization: _collectComponentQuant(),
+    // "" means "not configured" and is stored as null, so the loader's own
+    // default applies rather than an empty string reaching resolve_dtype.
+    precision:         document.getElementById('cfg-precision').value || null,
     flash_attention:   document.getElementById('cfg-flash').checked,
     no_ram:            document.getElementById('cfg-noram').checked,
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
