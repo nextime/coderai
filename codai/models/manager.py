@@ -2636,6 +2636,28 @@ class MultiModelManager:
         target = self.model_aliases.get(name)
         if target and target != name and self.config.get(target):
             return target
+        # Typed entries are keyed "<kind>:<name>" (see _store_type_config), so a
+        # plain lookup by alias or path misses every non-text model -- and the
+        # basename fallback below misses too, because "video:LTX-2.3-PinkCherry"
+        # has no slash and basename() returns the WHOLE prefixed string.
+        #
+        # Measured 2026-10-28: _config_for_model('LTX-2.3-PinkCherry') returned
+        # {} on a card that plainly had sequential_text_encoder=True, so the
+        # feature logged "not enabled" and no per-model video/image setting was
+        # reachable by the only name that distinguishes a multi-config sibling.
+        # The kinds this name is actually registered as come first, so a path
+        # registered under two types resolves to one of ITS types rather than
+        # whichever the fixed order happened to name.
+        _kinds = []
+        try:
+            _kinds = sorted(self._registered_types_for(name) or ())
+        except Exception:
+            _kinds = []
+        for _kind in _kinds + ["text", "image", "video", "audio", "tts",
+                               "vision", "audio_gen", "embedding", "spatial"]:
+            for _n in (name, target):
+                if _n and self.config.get(f"{_kind}:{_n}"):
+                    return f"{_kind}:{_n}"
         import os
         base = os.path.basename(str(name))
         base_noext = base[:-5] if base.endswith(".gguf") else base

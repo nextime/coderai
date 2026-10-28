@@ -287,3 +287,54 @@ def test_the_picture_path_is_never_replaced_by_the_audio_file():
     # The visual cache must hand back `path`, not the audio file.
     assert '_cached["path"]' in src, (
         "the visual no longer reuses the resolved picture path")
+
+
+# ------------------------- a clip-audio scene needs no explicit duration
+#
+# B1 says audio_mix="clip" means "the clip's sound only (no narration, scene
+# duration = the clip's)". Validation still demanded an explicit duration for
+# any scene with no text and no audio, so it refused exactly the request the
+# feature exists for -- a news moment played with its own sound. Found by
+# submitting one, not by the unit tests, which exercise _scene_mix and
+# _scene_clip_visual in isolation and never reach _validate.
+
+def test_a_clip_audio_scene_needs_no_explicit_duration():
+    from codai.api.compose import ComposeRequest, _validate
+    req = ComposeRequest(scenes=[Scene(
+        text="", audio_mix="clip",
+        visuals=[Visual(type="video", src="/v1/files/x.mp4", keep_audio=True)])])
+    _validate(req)          # must not raise
+
+
+def test_audio_mix_both_also_counts_as_carrying_sound():
+    from codai.api.compose import ComposeRequest, _validate
+    req = ComposeRequest(scenes=[Scene(
+        text="", audio_mix="both",
+        visuals=[Visual(type="video", src="/v1/files/x.mp4", keep_audio=True)])])
+    _validate(req)
+
+
+def test_a_silent_scene_still_needs_a_duration():
+    """The check is not simply removed: a scene with nothing to time by is
+    still a mistake worth catching before the render starts."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+    from codai.api.compose import ComposeRequest, _validate
+    req = ComposeRequest(scenes=[Scene(
+        text="", visuals=[Visual(type="color", color="#000000")])])
+    with _pytest.raises(HTTPException) as e:
+        _validate(req)
+    assert e.value.status_code == 400
+    assert "duration" in str(e.value.detail)
+
+
+def test_a_clip_with_no_keep_audio_still_needs_a_duration():
+    """audio_mix alone is not enough -- nothing is marked as the sound source."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+    from codai.api.compose import ComposeRequest, _validate
+    req = ComposeRequest(scenes=[Scene(
+        text="", audio_mix="clip",
+        visuals=[Visual(type="video", src="a.mp4"), Visual(type="video", src="b.mp4")])])
+    with _pytest.raises(HTTPException):
+        _validate(req)

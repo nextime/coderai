@@ -503,10 +503,21 @@ def _validate(req: ComposeRequest) -> None:
                                              f"scenes[{i}].speakers[{k}]")
         has_narration = (bool((sc.text or "").strip()) or bool(sc.audio)
                          or bool(sc.speakers))
-        if not has_narration and not (sc.duration and sc.duration > 0):
+        # A scene whose sound IS its clip needs no narration and no explicit
+        # duration: `audio_mix="clip"` means "the clip's sound only, and the
+        # scene lasts as long as the clip", which _run_job already derives from
+        # the resolved media. Requiring a duration here refused exactly the
+        # request the feature exists for -- a news moment played with its own
+        # sound -- and the caller cannot always know the clip's length anyway,
+        # which is the reason the server probes it.
+        _carries_clip_audio = (_scene_mix(sc) in ("clip", "both")
+                               and _scene_clip_visual(sc) is not None)
+        if (not has_narration and not _carries_clip_audio
+                and not (sc.duration and sc.duration > 0)):
             raise HTTPException(status_code=400, detail=(
                 f"scenes[{i}]: a scene with no text and no audio needs an explicit "
-                f"\"duration\""))
+                f"\"duration\" (or a visual whose own audio it keeps, with "
+                f"audio_mix=\"clip\")"))
         pres = presenter_for(sc, req)
         if pres is not None:
             _validate_presenter(pres, f"scenes[{i}].presenter" if sc.presenter else "presenter")

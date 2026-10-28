@@ -3058,6 +3058,12 @@ def _generate_video(pipe, request: VideoGenerationRequest):
                     getattr(request, 'model', None) or '') or {}
                 _teo_raw = _teo_cfg.get('_raw_cfg') \
                     if isinstance(_teo_cfg.get('_raw_cfg'), dict) else {}
+                # The flag is read from the top-level kwargs AND from the raw
+                # card. Both, because reading only one is what kept this inert:
+                # the kwargs lookup returned {} for an aliased model until
+                # _config_for_model learned the typed keys, and the flag itself
+                # lived only in _raw_cfg until it was promoted. Either half
+                # failing silently looks exactly like "the user did not set it".
                 if bool(_teo_cfg.get('sequential_text_encoder')
                         or (_teo_raw or {}).get('sequential_text_encoder')):
                     try:
@@ -3066,6 +3072,13 @@ def _generate_video(pipe, request: VideoGenerationRequest):
                     except Exception as _teo:
                         print(f"  [text-encoder-offload] skipped ({_teo})",
                               flush=True)
+                else:
+                    # Says which model, so "nothing happened" is distinguishable
+                    # from "the flag was not found on the card it was set on".
+                    print(f"  [text-encoder-offload] not enabled for "
+                          f"{getattr(request, 'model', '?')} "
+                          f"(set `sequential_text_encoder` on its card)",
+                          flush=True)
                 frames = _run_pipeline(pipe, kw, _gen_audio)
     except TaskCancelled:
         _vid_progress_done()

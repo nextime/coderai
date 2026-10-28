@@ -157,6 +157,12 @@ def build_runtime_kwargs(model_cfg, model_type):
         'tensor_split':    model_cfg.get('tensor_split'),
         'split_strategy':  model_cfg.get('split_strategy'),
         'split_secondary_cap_gb': model_cfg.get('split_secondary_cap_gb'),
+        # Promoted to a TOP-LEVEL kwarg for the same reason as gpu_split above:
+        # a consumer reading config['...'] never sees a key that only exists in
+        # _raw_cfg. Measured: the card said sequential_text_encoder=True and the
+        # video path still logged "not enabled", because it was looking at the
+        # runtime kwargs and the flag lived one level down.
+        'sequential_text_encoder': bool(model_cfg.get('sequential_text_encoder', False)),
         '_raw_cfg':        dict(model_cfg) if isinstance(model_cfg, dict) else {},
     }
     if model_type == "text":

@@ -2408,15 +2408,21 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if pipeline is not None:
             if is_sdcpp:
                 print(f"Using cached sd.cpp model for generation")
-                _sdcpp_cfg = (multi_model_manager.config.get(model_key)
-                              or multi_model_manager.config.get(model_name) or {})
+                # Resolved, not looked up raw: typed entries are keyed
+                # "image:<name>", so a bare config.get(alias) misses and every
+                # per-model setting is silently replaced by the global default.
+                _sdcpp_cfg = (multi_model_manager._config_for_model(model_key)
+                              or multi_model_manager._config_for_model(model_name)
+                              or {})
                 return await _generate_with_sdcpp(pipeline, request, global_args,
                                                   http_request, model_config=_sdcpp_cfg)
             else:
                 # Assume it's a diffusers pipeline
                 print(f"Using cached diffusers pipeline for generation")
-                _diff_cfg = (multi_model_manager.config.get(model_key)
-                             or multi_model_manager.config.get(model_name) or {})
+                # See the note above: resolved, not a raw config.get.
+                _diff_cfg = (multi_model_manager._config_for_model(model_key)
+                             or multi_model_manager._config_for_model(model_name)
+                             or {})
                 return await _generate_with_diffusers(pipeline, request, global_args,
                                                       http_request, model_config=_diff_cfg)
         
@@ -2438,8 +2444,10 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if not is_gguf:
             try:
                 print(f"Loading diffusers model: {model_name}")
-                _diff_cfg = (multi_model_manager.config.get(model_key)
-                             or multi_model_manager.config.get(model_name) or {})
+                # See the note above: resolved, not a raw config.get.
+                _diff_cfg = (multi_model_manager._config_for_model(model_key)
+                             or multi_model_manager._config_for_model(model_name)
+                             or {})
                 _vram_before = multi_model_manager.vram_before_load()
                 # Reserve the estimate for the whole load window, the way the
                 # video path does. Without it an image load is INVISIBLE to the
@@ -2498,7 +2506,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
 
             # Only use sd.cpp if we have a local file path
             if resolved_path and os.path.isfile(resolved_path):
-                cfg = multi_model_manager.config.get(model_key) or multi_model_manager.config.get(model_name) or {}
+                cfg = (multi_model_manager._config_for_model(model_key)
+                       or multi_model_manager._config_for_model(model_name) or {})
                 _vram_before = multi_model_manager.vram_before_load()
                 multi_model_manager.note_loading(model_key)
                 try:
@@ -2817,8 +2826,8 @@ async def _pipeline_for_task(model_info: dict, task: str):
     configured_error = None
     cfg = {}
     if base is None:
-        cfg = (multi_model_manager.config.get(model_key)
-               or multi_model_manager.config.get(model_name) or {})
+        cfg = (multi_model_manager._config_for_model(model_key)
+               or multi_model_manager._config_for_model(model_name) or {})
         try:
             base = await asyncio.to_thread(
                 _load_diffusers_pipeline, model_name, global_args, cfg)
@@ -3195,8 +3204,8 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
         quality = request.quality or "standard"
         num_steps = request.steps or (30 if quality == "standard" else 50)
         cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
-        _inp_cfg = (multi_model_manager.config.get(model_key)
-                    or multi_model_manager.config.get(model_name) or {})
+        _inp_cfg = (multi_model_manager._config_for_model(model_key)
+                    or multi_model_manager._config_for_model(model_name) or {})
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: pipe(

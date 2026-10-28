@@ -1026,6 +1026,13 @@ def test_a_character_profile_supplies_the_face(tmp_path, files_dir, monkeypatch)
 
 def test_engine_selection_prefers_video_engines_for_a_clip(monkeypatch):
     from codai.compose import presenter as pres
+    # shutil.which is patched alongside available_engines because pick_engine
+    # accepts a named engine that is merely ON PATH. The production image ships
+    # wav2lip and sadtalker shims in /usr/local/bin, so without this the
+    # "not installed" cases cannot be expressed and the test fails there while
+    # passing on a bare host -- it was asserting the absence of a binary that
+    # the real deployment has.
+    monkeypatch.setattr(pres.shutil, "which", lambda _n: None)
     monkeypatch.setattr(pres, "available_engines", lambda: ["wav2lip", "sadtalker"])
     assert pres.pick_engine("auto", has_base=True) == "wav2lip"
     assert pres.pick_engine("auto", has_base=False) == "sadtalker"

@@ -33,6 +33,20 @@ This is what the Motus requirements call "sequential text-encoder offload
 which is why offloaded pipelines worked at all, and why nobody noticed the
 resident path had no equivalent.
 
+Measured on LTX-2.3-PinkCherry (480x480, 25 frames, 8 steps, RTX 3090):
+
+    without the offload   369.4 s   peak 23718 MiB   91% util
+    with the offload      345.3 s   peak 24098 MiB   92% util
+                          encoder moved off the GPU: 7.3 GiB freed
+
+Read it as headroom, not as a speed-up: the card is 24 GiB and the denoiser
+fills whatever it is given either way, so peak VRAM sits at the ceiling in
+both runs and the 24 s is one sample, not a benchmark. What the 7.3 GiB buys
+is that the transformer no longer has to share the card with a dead encoder --
+which is what had been pushing these renders onto CPU offload, where the same
+job took tens of minutes. The encoder's cost moves to host RAM (availability
+fell to 11.3 GB on this box during the run), which is the intended trade.
+
 The embedding argument names differ per family and there is no common base
 class to ask, so they are discovered from the pipeline's own signature rather
 than hard-coded: Krea 2 takes ``prompt_embeds`` + ``prompt_embeds_mask``, LTX-2
@@ -73,37 +87,136 @@ def supported(pipe) -> bool:
     return "prompt_embeds" in _call_params(pipe)
 
 
-def _free(pipe, comp_names=("text_encoder", "text_encoder_2")) -> float:
-    """Move the named components off the GPU. Returns GiB freed (best effort).
+def _resident_on_gpu(comp) -> bool:
+    """Whether any of this component's parameters currently live on a GPU."""
+    try:
+        for p in comp.parameters():
+            return bool(getattr(getattr(p, "device", None), "type", "") == "cuda")
+    except Exception:
+        pass
+    try:
+        return bool(getattr(getattr(comp, "device", None), "type", "") == "cuda")
+    except Exception:
+        return False
+
+
+def _free(pipe, comp_names=("text_encoder", "text_encoder_2")) -> Tuple[float, list]:
+    """Move the named components off the GPU.
+
+    Returns ``(GiB freed, notes)``. The notes matter: these encoders are the
+    quantized ones (LTX-2.3's is a 4-bit Gemma-3-12B), and a bnb-quantized
+    module refuses ``.to('cpu')`` on some versions. Without distinguishing
+    "refused to move" from "was not resident" both arrive as 0.0 GiB freed and
+    the log blames the wrong thing -- so each component says which it was.
 
     Moved to CPU rather than deleted: the pipeline is cached and will serve the
     next request, which needs the encoder again. Re-encoding on CPU would be
     slow, and re-loading it from disk slower still -- so it waits in host RAM,
     which is the cheap resource here.
     """
-    freed = 0.0
+    notes = []
     try:
         import torch
         if not torch.cuda.is_available():
-            return 0.0
+            return 0.0, ["no CUDA device"]
         before = torch.cuda.memory_allocated()
         for name in comp_names:
             comp = getattr(pipe, name, None)
-            if comp is None or not hasattr(comp, "to"):
+            if comp is None:
+                continue
+            if not hasattr(comp, "to"):
+                notes.append(f"{name}: not movable")
+                continue
+            if not _resident_on_gpu(comp):
+                notes.append(f"{name}: already off the GPU")
                 continue
             try:
-                # A bnb-quantized module refuses .to('cpu') on some versions;
-                # that is not a failure worth aborting the request for.
                 comp.to("cpu")
-            except Exception:
+                notes.append(f"{name}: moved to CPU")
+            except Exception as exc:
+                notes.append(f"{name}: REFUSED the move ({type(exc).__name__}: "
+                             f"{str(exc)[:120]}) — still holding its VRAM")
                 continue
         import gc
         gc.collect()
         torch.cuda.empty_cache()
         freed = max(0.0, (before - torch.cuda.memory_allocated()) / (1024 ** 3))
-    except Exception:
-        return 0.0
-    return freed
+    except Exception as exc:
+        return 0.0, [f"freeing failed: {type(exc).__name__}: {exc}"]
+    return freed, notes
+
+
+def _assign_outputs(out, params: set, mask_arg: Optional[str]) -> Dict[str, Any]:
+    """Name the tensors ``encode_prompt`` returned.
+
+    The order is NOT the same across families and is not discoverable from the
+    signature, so it is read off the values themselves. Both families return
+    the positive pair first and the negative pair after it, mask immediately
+    following its embeddings:
+
+        Krea 2  -> (prompt_embeds, prompt_embeds_mask)
+        LTX-2   -> (prompt_embeds, prompt_attention_mask,
+                    negative_prompt_embeds, negative_prompt_attention_mask)
+
+    A mask is an integer/bool tensor and embeddings are floating point, so the
+    two are told apart rather than assumed by position -- a family that returns
+    embeddings with no mask, or only a positive pair, lands correctly too.
+
+    Guessing the position is what broke the first live run: the code assumed
+    (embeds, neg_embeds, mask, neg_mask), read the mask from slot 2 and handed
+    the pipeline a negative-embeddings tensor as the attention mask.
+    """
+    def _is_mask(t) -> bool:
+        dt = getattr(t, "dtype", None)
+        if dt is None:
+            return False
+        is_float = getattr(dt, "is_floating_point", None)
+        if is_float is None:
+            try:
+                import torch
+                is_float = dt.is_floating_point
+            except Exception:
+                return False
+        return not bool(is_float)
+
+    tensors = [t for t in out if t is not None]
+    assigned: Dict[str, Any] = {}
+    # Slot names in the order the families emit them. "pooled" covers the
+    # SDXL-shaped families, which return four float tensors and no mask.
+    slots = ["prompt_embeds", mask_arg, "negative_prompt_embeds",
+             ("negative_" + mask_arg) if mask_arg else None,
+             "pooled_prompt_embeds", "negative_pooled_prompt_embeds"]
+    i = 0
+    for name in slots:
+        if i >= len(tensors):
+            break
+        if name is None:
+            continue
+        t = tensors[i]
+        wants_mask = bool(mask_arg and name.endswith(mask_arg))
+        if wants_mask != _is_mask(t):
+            # This family did not emit this slot; leave it and try the next
+            # name against the same tensor.
+            continue
+        if name == "prompt_embeds" or name in params:
+            assigned[name] = t
+        i += 1
+
+    # Everything the encoder returned has to be named, or the optimisation is
+    # abandoned. A family whose extra tensors we silently dropped would not
+    # degrade quietly -- it would FAIL the request, because the pipeline
+    # validates that the embeddings it was handed are complete. SDXL is the
+    # worked example: it returns (embeds, neg_embeds, pooled, neg_pooled), and
+    # dropping the pooled pair raises "Must provide pooled_prompt_embeds".
+    #
+    # So an unrecognised shape costs nothing beyond a logged line and the
+    # ordinary generation path, and this module stays safe to enable on a
+    # family nobody has tried yet.
+    if i < len(tensors):
+        raise ValueError(
+            f"encode_prompt returned {len(tensors)} tensors and only {i} could "
+            f"be named; refusing to hand the pipeline partial embeddings")
+    return assigned
 
 
 def encode_then_free(pipe, kwargs: Dict[str, Any], *,
@@ -124,7 +237,15 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
                 pass
         print(msg, flush=True)
 
+    # Every bail-out says why. The first version returned silently, and when
+    # it did nothing on a real LTX render there was no way to tell "flag off"
+    # from "pipeline unsupported" from "no prompt in kwargs" -- the feature
+    # looked inert with no evidence either way.
     if not supported(pipe):
+        _say(f"  [text-encoder-offload] {type(pipe).__name__} cannot be driven "
+             f"from embeddings (encode_prompt={hasattr(pipe, 'encode_prompt')}, "
+             f"text_encoder={hasattr(pipe, 'text_encoder')}, "
+             f"prompt_embeds={'prompt_embeds' in _call_params(pipe)}) — skipped")
         return kwargs, 0.0
     params = _call_params(pipe)
     mask_arg = _mask_arg(params)
@@ -136,6 +257,8 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
 
     prompt = kwargs.get("prompt")
     if prompt is None:
+        _say("  [text-encoder-offload] no `prompt` in the call kwargs "
+             "(embeddings already supplied?) — skipped")
         return kwargs, 0.0
     negative = kwargs.get("negative_prompt")
 
@@ -169,41 +292,67 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
     new = dict(kwargs)
     new.pop("prompt", None)
     new.pop("negative_prompt", None)
-    new["prompt_embeds"] = out[0]
     try:
-        if both_in_one:
-            # (prompt_embeds, negative_prompt_embeds, prompt_mask, negative_mask)
-            if len(out) > 1 and out[1] is not None:
-                new["negative_prompt_embeds"] = out[1]
-            if mask_arg and len(out) > 2 and out[2] is not None:
-                new[mask_arg] = out[2]
-            neg_mask = "negative_" + mask_arg if mask_arg else None
-            if neg_mask and neg_mask in params and len(out) > 3 and out[3] is not None:
-                new[neg_mask] = out[3]
-        else:
-            # (prompt_embeds, prompt_mask) -- the negative needs its own call.
-            if mask_arg and len(out) > 1 and out[1] is not None:
-                new[mask_arg] = out[1]
-            if negative is not None and "negative_prompt_embeds" in params:
-                neg_kwargs = dict(enc_kwargs)
-                neg_kwargs["prompt"] = negative
-                with torch.no_grad():
-                    nout = pipe.encode_prompt(**neg_kwargs)
-                if isinstance(nout, (tuple, list)) and nout:
-                    new["negative_prompt_embeds"] = nout[0]
-                    neg_mask = "negative_" + mask_arg if mask_arg else None
-                    if neg_mask and neg_mask in params and len(nout) > 1:
-                        new[neg_mask] = nout[1]
+        assigned = _assign_outputs(out, params, mask_arg)
     except Exception as exc:
         _say(f"  [text-encoder-offload] could not assemble the embeddings "
              f"({exc}); generating the ordinary way")
         return kwargs, 0.0
+    if "prompt_embeds" not in assigned:
+        _say("  [text-encoder-offload] encode_prompt returned no embeddings; "
+             "generating the ordinary way")
+        return kwargs, 0.0
+    if mask_arg and mask_arg not in assigned:
+        # The pipeline rejects prompt_embeds without its mask, so handing back
+        # embeddings we could not pair with one would fail the request. This
+        # is exactly what happened on the first live LTX-2.3 run: the mask was
+        # read from the wrong tuple slot and the call raised "Must provide
+        # `prompt_attention_mask` when specifying `prompt_embeds`".
+        _say(f"  [text-encoder-offload] encode_prompt returned no {mask_arg}; "
+             f"generating the ordinary way")
+        return kwargs, 0.0
+    new.update(assigned)
 
-    freed = _free(pipe)
+    # A family that does not take `negative_prompt` in encode_prompt encodes the
+    # negative in a SECOND call -- and its __call__ will make that call itself if
+    # we hand it no negative embeddings, against an encoder this function is
+    # about to move to the CPU. Krea 2 is the worked example: with guidance on
+    # and no negative supplied it substitutes "" and encodes it at denoise time,
+    # which would run on the wrong device.
+    #
+    # So the negative is always encoded here for those families, "" included.
+    # Dropping it instead would be worse than the device error: the request
+    # would succeed with no negative guidance at all and nothing would say so.
+    if not both_in_one and "negative_prompt_embeds" in params:
+        try:
+            neg_kwargs = dict(enc_kwargs)
+            neg_kwargs["prompt"] = negative if negative is not None else ""
+            with torch.no_grad():
+                nout = pipe.encode_prompt(**neg_kwargs)
+            if isinstance(nout, (tuple, list)) and nout:
+                neg_assigned = _assign_outputs(nout, params, mask_arg)
+                remap = {"prompt_embeds": "negative_prompt_embeds"}
+                if mask_arg:
+                    remap[mask_arg] = "negative_" + mask_arg
+                if "pooled_prompt_embeds" in neg_assigned:
+                    remap["pooled_prompt_embeds"] = \
+                        "negative_pooled_prompt_embeds"
+                for src, dst in remap.items():
+                    if src in neg_assigned and dst in params:
+                        new[dst] = neg_assigned[src]
+                if "negative_prompt_embeds" not in new:
+                    raise ValueError("no negative embeddings came back")
+        except Exception as exc:
+            _say(f"  [text-encoder-offload] could not encode the negative "
+                 f"prompt ({exc}); generating the ordinary way")
+            return kwargs, 0.0
+
+    freed, notes = _free(pipe)
+    detail = "; ".join(notes) if notes else "no text encoder to move"
     if freed > 0.05:
         _say(f"  [text-encoder-offload] prompt encoded, encoder moved off the "
-             f"GPU — {freed:.1f} GiB back for the denoiser")
+             f"GPU — {freed:.1f} GiB back for the denoiser ({detail})")
     else:
-        _say("  [text-encoder-offload] prompt encoded; the encoder was not on "
-             "the GPU, so nothing was freed")
+        _say(f"  [text-encoder-offload] prompt encoded but no VRAM came back "
+             f"({detail})")
     return new, freed

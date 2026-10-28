@@ -39,6 +39,33 @@ import pytest
 from codai.models import text_encoder_offload as T
 
 
+class _T:
+    """A stand-in for a returned tensor.
+
+    It carries a dtype because that is how the embeddings are told apart from
+    the attention mask -- the ORDER differs per family and cannot be assumed.
+    A fake that returned bare strings could not exercise that at all, which is
+    how the real tuple order went unchecked: this file's _LtxLike used to
+    return (embeds, neg_embeds, mask, neg_mask), the live pipeline returns
+    (embeds, mask, neg_embeds, neg_mask), and the live render failed with
+    "Must provide `prompt_attention_mask` when specifying `prompt_embeds`".
+    """
+
+    class _D:
+        def __init__(self, f):
+            self.is_floating_point = f
+
+    def __init__(self, tag, mask=False):
+        self.tag = tag
+        self.dtype = _T._D(not mask)
+
+    def __eq__(self, other):
+        return isinstance(other, str) and other == self.tag or self is other
+
+    def __repr__(self):
+        return f"<{self.tag}>"
+
+
 class _KreaLike:
     """Two-call family: the negative prompt needs its own encode."""
     text_encoder = object()
@@ -49,7 +76,7 @@ class _KreaLike:
 
     def encode_prompt(self, prompt, device=None, max_sequence_length=512):
         self.calls.append(prompt)
-        return (f"E:{prompt}", f"M:{prompt}")
+        return (_T(f"E:{prompt}"), _T(f"M:{prompt}", mask=True))
 
     def __call__(self, prompt=None, negative_prompt=None, prompt_embeds=None,
                  prompt_embeds_mask=None, negative_prompt_embeds=None,
@@ -69,7 +96,11 @@ class _LtxLike:
                       num_videos_per_prompt=1):
         self.calls.append((prompt, negative_prompt,
                            do_classifier_free_guidance))
-        return ("E", "NE", "M", "NM")
+        # The real order, copied from diffusers' pipeline_ltx2.py:
+        #   prompt_embeds, prompt_attention_mask,
+        #   negative_prompt_embeds, negative_prompt_attention_mask
+        return (_T("E"), _T("M", mask=True),
+                _T("NE"), _T("NM", mask=True))
 
     def __call__(self, prompt=None, negative_prompt=None, prompt_embeds=None,
                  prompt_attention_mask=None, negative_prompt_embeds=None,

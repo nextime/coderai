@@ -182,8 +182,14 @@ async def create_speech(request: TTSRequest, http_request: Request = None):
                 if model_name.startswith(('http://', 'https://')):
                     from codai.models.cache import load_model
                     model_path = load_model(model_name) or model_name
-                cfg = multi_model_manager.config.get(model_key) or \
-                    multi_model_manager.config.get(f"tts:{model_name}") or {}
+                # Resolved rather than looked up raw: a typed entry is keyed
+                # "tts:<name>", and an ALIAS gets its own such key, so a bare
+                # get() on the request id misses and drops every per-model
+                # setting. The explicit tts: form below covers only the path.
+                cfg = (multi_model_manager._config_for_model(model_key)
+                       or multi_model_manager._config_for_model(model_name)
+                       or multi_model_manager.config.get(f"tts:{model_name}")
+                       or {})
                 with loading_task(model_name, model_type="tts"):
                     tts_backend = await asyncio.to_thread(
                         tts_backends.load_backend, model_name, model_path, cfg)
