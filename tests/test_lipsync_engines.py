@@ -277,3 +277,96 @@ def test_the_presenter_still_ranks_them_ahead_of_wav2lip():
         presenter._AUTO_WITH_BASE.index("wav2lip")
     assert presenter._AUTO_WITH_BASE.index("musetalk") < \
         presenter._AUTO_WITH_BASE.index("wav2lip")
+
+
+# ── the install environment ──────────────────────────────────────────────────
+
+def test_a_package_that_cannot_build_isolated_is_named_one_at_a_time(le):
+    """mmpose depends on chumpy, whose setup.py does `import pip` — which an
+    isolated build environment has not got. Disabling isolation wholesale would
+    let every other package build against a half-installed venv, so the
+    exception is per package."""
+    assert le.spec("musetalk").no_build_isolation == ("chumpy",)
+    assert le.spec("latentsync").no_build_isolation == ()
+
+
+def test_the_uv_install_seeds_build_tools_only_when_something_needs_them(le):
+    """A uv venv ships no pip, so a package building against it finds none."""
+    import inspect
+    src = inspect.getsource(le._install_requirements)
+    seed = src[src.index("if sp.no_build_isolation:"):]
+    assert '"pip", "setuptools", "wheel"' in seed
+    assert "--no-build-isolation-package" in seed
+
+
+def test_large_wheels_get_a_timeout_that_fits_them(le):
+    """uv's default aborts mid-unzip on a slow third-party index, and reports it
+    as a corrupt wheel rather than a timeout."""
+    import inspect
+    src = inspect.getsource(le._install_requirements)
+    assert "UV_HTTP_TIMEOUT" in src
+
+
+def test_musetalk_keeps_the_runtime_pins_that_look_like_cruft():
+    """Three pins in requirements-musetalk.txt invite a tidy-up and each one
+    breaks the engine at import time if it goes.
+
+    mmcv 2.1.0 (not 2.2.0) because mmdet asserts mmcv < 2.2.0 and openmmlab
+    publishes a cp311 2.1.0 wheel on exactly one index; torch 2.1.2 because that
+    index is cu121/torch2.1; setuptools < 81 because mmengine still imports
+    pkg_resources, which 81 removed.
+    """
+    req = (ROOT / "requirements-musetalk.txt").read_text(encoding="utf-8")
+    assert "mmcv==2.1.0" in req
+    assert "mmdet==3.3.0" in req
+    assert "torch==2.1.2+cu121" in req
+    assert "setuptools<81" in req
+    assert "cu121/torch2.1/index.html" in req
+
+
+def test_the_probe_imports_the_submodule_that_actually_fails(le):
+    """`import mmpose` succeeds without mmdet; `import mmpose.apis` is what
+    reaches rtmo_head and dies. Probing the package would call a venv that
+    cannot run the engine usable."""
+    assert "mmpose.apis" in le.spec("musetalk").probe_imports
+    assert "mmpose" not in le.spec("musetalk").probe_imports
+
+
+def test_the_venv_probe_runs_where_the_engine_runs(le):
+    """face_detection is vendored under musetalk/utils, not installed, so a
+    bare-interpreter probe reports a complete install as broken."""
+    import inspect
+    src = inspect.getsource(le._pip_ok)
+    assert "_engine_env" in src
+    assert "cwd=" in src
+
+
+def test_a_failed_run_keeps_its_evidence_but_not_for_ever(le, tmp_path):
+    """The frames and the task file are what you read to find out why a run
+    failed, so a failure leaves them; a day later they are only clutter in the
+    install root."""
+    import os
+    import time
+    parent = tmp_path / "coderai-runs"
+    old = parent / "old"
+    recent = parent / "recent"
+    for d in (old, recent):
+        d.mkdir(parents=True)
+    os.utime(old, (time.time() - 48 * 3600, time.time() - 48 * 3600))
+    assert le._sweep_run_dirs(parent) == 1
+    assert recent.is_dir() and not old.exists()
+
+
+def test_the_sweep_never_removes_the_run_being_set_up(le, tmp_path):
+    import os
+    import time
+    parent = tmp_path / "coderai-runs"
+    mine = parent / "mine"
+    mine.mkdir(parents=True)
+    os.utime(mine, (time.time() - 48 * 3600, time.time() - 48 * 3600))
+    assert le._sweep_run_dirs(parent, keep=mine) == 0
+    assert mine.is_dir()
+
+
+def test_the_sweep_is_silent_when_there_is_nothing_to_sweep(le, tmp_path):
+    assert le._sweep_run_dirs(tmp_path / "never-made") == 0

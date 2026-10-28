@@ -90,6 +90,10 @@ class EngineSpec:
     probe_imports: Tuple[str, ...]
     #: Extra directories (relative to the install root) to put on PYTHONPATH.
     pythonpath: Tuple[str, ...] = ()
+    #: Packages whose sdist cannot be built in an isolated environment. Named
+    #: one at a time rather than disabling isolation wholesale, which would let
+    #: every other package see this venv's half-installed state.
+    no_build_isolation: Tuple[str, ...] = ()
     #: Builds the argv tail and returns (argv, finish) where `finish` moves the
     #: engine's output to the requested path. Set below, after the builders.
     argv: Optional[Callable] = None
@@ -163,6 +167,27 @@ def _latentsync_argv(root: Path, video: str, audio: str, out: str,
     return argv, _finish
 
 
+def _sweep_run_dirs(parent: Path, keep: Path = None,
+                    max_age_s: float = 24 * 3600) -> int:
+    """Drop leftover per-run directories older than a day. Returns how many."""
+    import time
+    gone = 0
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return 0
+    for d in entries:
+        if keep is not None and d == keep:
+            continue
+        try:
+            if d.is_dir() and (time.time() - d.stat().st_mtime) > max_age_s:
+                shutil.rmtree(d, ignore_errors=True)
+                gone += 1
+        except OSError:
+            continue
+    return gone
+
+
 def _musetalk_argv(root: Path, video: str, audio: str, out: str,
                    options: dict) -> Tuple[List[str], Callable[[], str]]:
     """MuseTalk takes a YAML task list, not paths, and writes into a result dir.
@@ -183,6 +208,11 @@ def _musetalk_argv(root: Path, video: str, audio: str, out: str,
     run_id = uuid.uuid4().hex[:10]
     work = root / "coderai-runs" / run_id
     work.mkdir(parents=True, exist_ok=True)
+    # A successful run removes its own directory; a failed one is left behind on
+    # purpose, because the frames and the task file are what you look at to find
+    # out why. Sweep the stale ones rather than keeping them for ever, so a
+    # misconfigured engine cannot quietly fill the install root.
+    _sweep_run_dirs(work.parent, keep=work)
     task = work / "task.yaml"
     # The loader is OmegaConf, so a quoted scalar is enough; abspath keeps it
     # independent of the cwd the subprocess runs in.
@@ -279,10 +309,16 @@ ENGINES: Dict[str, EngineSpec] = {
                        "models/whisper/config.json",
                        "models/dwpose/dw-ll_ucoco_384.pth",
                        "models/face-parse-bisent/79999_iter.pth"),
-        probe_imports=("torch", "diffusers", "mmpose", "face_detection"),
+        probe_imports=("torch", "diffusers", "mmpose.apis", "mmdet",
+                        "face_detection"),
         # preprocessing.py does `from face_detection import …` — a top-level
         # import of a package that lives under musetalk/utils.
         pythonpath=(".", "musetalk/utils"),
+        # mmpose depends on chumpy, whose setup.py does `import pip` — which an
+        # isolated build environment has not got, so the sdist fails to build
+        # with "ModuleNotFoundError: No module named 'pip'". Building it against
+        # the venv (which is seeded with pip below) is the way through.
+        no_build_isolation=("chumpy",),
         argv=_musetalk_argv,
     ),
 }
@@ -403,16 +439,35 @@ def _venv_python(venv: Path) -> Path:
         "python.exe" if os.name == "nt" else "python")
 
 
-def _pip_ok(name: str, py: Path, quiet: bool = False) -> bool:
-    """Does this venv import what the engine needs?
+def _engine_env(sp: EngineSpec, root: Path) -> dict:
+    """The environment this engine's interpreter runs under.
 
-    clean_py_env() is load-bearing rather than hygiene — see the module docstring.
+    clean_py_env() is load-bearing rather than hygiene — see the module
+    docstring. PYTHONPATH carries the engine's own tree, because part of what
+    each one imports is vendored inside it rather than installed: MuseTalk's
+    preprocessing does `from face_detection import …`, a top-level import of a
+    package that lives under musetalk/utils.
+    """
+    env = clean_py_env()
+    paths = [str((root / p).resolve()) for p in (sp.pythonpath or (".",))]
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
+
+
+def _pip_ok(name: str, py: Path, quiet: bool = False) -> bool:
+    """Can this venv import everything the engine needs, vendored parts included?
+
+    Run against the install root, exactly as a real run is. Probing with a bare
+    interpreter instead reported a complete install as broken, because the
+    vendored modules are not on any default path.
     """
     sp = spec(name)
+    root = install_dir(name)
     code = "import " + ", ".join(sp.probe_imports)
     try:
         r = subprocess.run([str(py), "-c", code], capture_output=True,
-                           env=clean_py_env())
+                           cwd=str(root) if root.is_dir() else None,
+                           env=_engine_env(sp, root))
         if r.returncode != 0 and not quiet:
             why = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
             print(f"[{name}] venv at {py} is not usable: {why[-400:]}", flush=True)
@@ -501,9 +556,23 @@ def _install_requirements(name: str, py: Path, log=None) -> None:
         # uv's default is first-index-wins, so with the PyTorch index in these
         # requirements it resolves unrelated packages off it and pins the wrong
         # versions of things like requests.
-        subprocess.run([uv, "pip", "install", "--python", str(py),
-                        "--index-strategy", "unsafe-best-match", "-r", str(req)],
-                       check=True, env=clean_py_env())
+        env = clean_py_env()
+        # These are hundred-megabyte wheels off third-party indexes -- the
+        # PyTorch one, and openmmlab's for mmcv -- and uv's default timeout is
+        # short enough that a slow CDN aborts mid-unzip. The failure reads as a
+        # corrupt wheel ("Failed to unzip wheel … error decoding response body"),
+        # which sends you looking for a build problem that is not there.
+        env.setdefault("UV_HTTP_TIMEOUT", "900")
+        cmd = [uv, "pip", "install", "--python", str(py),
+               "--index-strategy", "unsafe-best-match"]
+        if sp.no_build_isolation:
+            # Those packages build against the venv, so it needs the build tools
+            # a uv venv does not ship.
+            subprocess.run([uv, "pip", "install", "--python", str(py),
+                            "pip", "setuptools", "wheel"], check=True, env=env)
+            for pkg in sp.no_build_isolation:
+                cmd += ["--no-build-isolation-package", pkg]
+        subprocess.run(cmd + ["-r", str(req)], check=True, env=env)
     if not _pip_ok(name, py):
         raise RuntimeError(
             f"the {name} venv installed but does not import "
@@ -615,9 +684,7 @@ def run(name: str, video_path: str, audio_path: str, out_path: str,
 
     tail, finish = sp.argv(root, video_path, audio_path, out_path, options)
     cmd = [str(py), "-m", sp.entrypoint] + tail
-    env = clean_py_env()
-    paths = [str((root / p).resolve()) for p in (sp.pythonpath or (".",))]
-    env["PYTHONPATH"] = os.pathsep.join(paths)
+    env = _engine_env(sp, root)
     if log:
         log(f"[{sp.name}] {' '.join(cmd[1:])}")
     try:

@@ -13,15 +13,16 @@
 # download_weights.sh to pull the BiSeNet face-parsing checkpoint off a Google
 # Drive id; coderai takes that file from a Hub mirror instead.
 #
-# mmcv is the fragile one. openmmlab publishes prebuilt wheels for a handful of
-# torch/CUDA pairs and torch 2.4.1+cu121 is one of them, which is why the torch
-# pin here is older than LatentSync's. If this host has no matching wheel, mmcv
-# builds from source and needs nvcc; ensure_installed() reports that rather than
-# leaving a half-built venv behind.
+# The torch pin is dictated by mmcv, not by MuseTalk. mmpose's RTMO head
+# imports mmdet unconditionally, mmdet asserts mmcv < 2.2.0 at import time, and
+# openmmlab publishes a cp311 wheel for mmcv 2.1.0 on exactly one index:
+# cu121/torch2.1. Every other index it publishes has 2.2.0 only. So torch 2.1.2
+# it is -- which diffusers 0.30 and transformers 4.39 are contemporaries of
+# anyway. Moving torch up here means building mmcv from source against nvcc.
 
 --extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.4.1+cu121
-torchvision==0.19.1+cu121
+torch==2.1.2+cu121
+torchvision==0.16.2+cu121
 
 diffusers==0.30.2
 transformers==4.39.2
@@ -40,8 +41,17 @@ ffmpeg-python
 requests
 
 # DWPose landmarks. preprocessing.py calls mmpose.apis at import time, so these
-# are not optional.
--f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
-mmcv==2.2.0
+# are not optional -- and neither is mmdet: mmpose lists it as optional but
+# models/heads/hybrid_heads/rtmo_head.py imports it unconditionally, so
+# `import mmpose.apis` dies with ModuleNotFoundError without it.
+-f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
+mmcv==2.1.0
 mmengine>=0.10.3
 mmpose==1.3.2
+mmdet==3.3.0
+
+# mmengine.utils.package_utils imports pkg_resources to locate mmpose's config
+# directory, and setuptools dropped pkg_resources in 81. It is a RUNTIME
+# dependency here, not a build one, so it has to be pinned rather than left to
+# whatever the venv was seeded with.
+setuptools<81
