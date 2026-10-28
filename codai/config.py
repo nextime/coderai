@@ -178,6 +178,15 @@ class ModelsConfig:
     default_load_mode: str = "ondemand"
     hf_cache_dir: Optional[str] = None
     gguf_cache_dir: Optional[str] = None
+    #: Where Civitai single-file checkpoints are kept. Configured like the two
+    #: above because they are the same KIND of thing -- multi-gigabyte weights
+    #: that belong on whichever disk holds the weights, not on the partition
+    #: the server runs from. Left unset they land beside the other coderai
+    #: caches, which on a host whose caches are a small volume fills it: seen
+    #: on 2026-10-28, a 13.5 GB checkpoint took the cache volume to 99% and the
+    #: next model could not even write its config fetch ("No space left on
+    #: device"). CODERAI_CIVITAI_CACHE still wins over this.
+    civitai_cache_dir: Optional[str] = None
     max_model_instances: int = 1  # max concurrent instances per model (global default; overridable per-model via "max_instances")
     # Per-engine overrides for max_model_instances, keyed by engine name
     # (e.g. {"nvidia": 2, "radeon": 1}). Applied per-engine process; blank = default.

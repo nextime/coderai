@@ -21,6 +21,12 @@ from pydantic import BaseModel, ConfigDict
 
 
 class AudioGenerationRequest(BaseModel):
+    #: The caller's own name for this request, so it can poll
+    #: ``/v1/audio/progress?request_id=...`` for its OWN steps instead of a
+    #: single global slot shared with everyone generating at the same time.
+    #: An ``X-Request-Id`` header does the same; the body wins when both are
+    #: given. Echoed back in the progress document.
+    request_id: Optional[str] = None
     model: str
     prompt: str
     duration: Optional[float] = 10.0       # seconds

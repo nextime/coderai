@@ -26,6 +26,7 @@ import io
 import os
 import time
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -448,8 +449,25 @@ def _decode_b64_or_url(data: str) -> bytes:
 
 
 @router.get("/v1/audio/progress", summary="Audio generation progress")
-async def get_audio_progress():
-    """Return current audio generation progress including speed."""
+async def get_audio_progress(request_id: Optional[str] = None):
+    """Audio generation progress — this request's own, or the global slot.
+
+    With ``request_id`` (the id the caller passed as ``request_id`` in the
+    generation body or an ``X-Request-Id`` header) this answers for THAT
+    request only, so two callers generating at once can each follow their own.
+    A 404 means that id is finished and pruned, or was never used.
+
+    Without it, the single global slot below, exactly as before.
+    """
+    if request_id:
+        from codai.api import request_progress as _rp
+        _rid = _rp.sanitize(request_id)
+        _view = _rp.view(_rid) if _rid else None
+        if _view is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no generation in progress for request_id {request_id!r}")
+        return _view
     elapsed = time.monotonic() - _aud_progress["started_at"] if _aud_progress["active"] else 0.0
     total = _aud_progress["total"]
     current = _aud_progress["current"]
@@ -471,7 +489,13 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
     """
     Generate music, sound effects, or ambient audio.
     Compatible models: MusicGen, AudioGen, AudioLDM2, StableAudio.
+
+    A caller may name this request (``request_id`` in the body, or an
+    ``X-Request-Id`` header) and then poll
+    ``GET /v1/audio/progress?request_id=...`` for its OWN progress.
     """
+    from codai.api import request_progress as _rp
+    _rp.set_current(_rp.from_request(request, http_request))
     _aud_progress_loading(request.model or "audio")
     model_info = await asyncio.to_thread(
         multi_model_manager.request_model, request.model, model_type="audio_gen")
@@ -513,8 +537,11 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
         multi_model_manager.models[model_key] = pipe
         multi_model_manager.current_model_key = model_key
 
+    # Claims the caller's own id when they named one, so
+    # /v1/audio/progress?request_id=... follows THIS request.
     _tid = task_registry.register(
-        "audio", title=(request.prompt or "")[:80], model=model_name or "")
+        "audio", title=(request.prompt or "")[:80], model=model_name or "",
+        task_id=_rp.take())
     task_registry.start(_tid)
     try:
         audio_bytes, ext = await asyncio.get_event_loop().run_in_executor(

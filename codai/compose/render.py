@@ -88,23 +88,65 @@ def _die_with_parent() -> None:
 
 
 def run(args: List[str], *, cancel: Optional[threading.Event] = None,
-        timeout: float = 7200.0, log: Optional[Callable[[str], None]] = None) -> None:
+        timeout: float = 7200.0, log: Optional[Callable[[str], None]] = None,
+        on_frame: Optional[Callable[[int], None]] = None) -> None:
     """Run one ffmpeg command, honouring cancellation while it runs.
 
     The default ``timeout`` is a backstop for a long video encode, not a
     sensible bound for every call -- an audio mix of a few seconds that is
     still running after a minute is wedged, not slow. Callers that know the
     shape of their work pass their own.
+
+    ``on_frame`` is called with the count of frames written so far, as ffmpeg
+    reports it. The final encode of a reel is minutes of work behind a single
+    unchanging stage, so without this a client's progress bar sits still
+    through the longest part of the job with nothing to say.
     """
     if cancel is not None and cancel.is_set():
         raise Cancelled()
     cmd = [media.ffmpeg_bin(), "-hide_banner", "-nostdin", "-y",
-           "-threads", _thread_cap()] + list(args)
+           "-threads", _thread_cap()]
+    if on_frame is not None:
+        # `-progress pipe:1` writes machine-readable key=value lines to stdout,
+        # which is parsed below. Asked for only when somebody is listening, so
+        # a command's stdout keeps its usual shape otherwise.
+        cmd += ["-progress", "pipe:1", "-nostats"]
+    cmd += list(args)
     if log:
         log("ffmpeg " + " ".join(shlex.quote(a) for a in args[:40])
             + (" …" if len(args) > 40 else ""))
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    _stdout = subprocess.PIPE if on_frame is not None else subprocess.DEVNULL
+    proc = subprocess.Popen(cmd, stdout=_stdout, stderr=subprocess.PIPE,
                             preexec_fn=_die_with_parent)
+
+    _reader = None
+    if on_frame is not None:
+        def _pump():
+            # A frame count that only ever goes up: ffmpeg repeats the key on
+            # every progress block, and a caller turning this into a
+            # percentage should never see it jump backwards.
+            seen = 0
+            try:
+                for raw in proc.stdout:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("frame="):
+                        continue
+                    try:
+                        n = int(line.split("=", 1)[1])
+                    except Exception:
+                        continue
+                    if n > seen:
+                        seen = n
+                        try:
+                            on_frame(n)
+                        except Exception:
+                            # A reporting callback must never break the encode.
+                            pass
+            except Exception:
+                pass
+        _reader = threading.Thread(target=_pump, daemon=True)
+        _reader.start()
+
     waited = 0.0
     while True:
         try:
@@ -122,6 +164,8 @@ def run(args: List[str], *, cancel: Optional[threading.Event] = None,
                 proc.kill()
                 proc.communicate()
                 raise RenderError(f"ffmpeg timed out after {timeout:.0f}s")
+    if _reader is not None:
+        _reader.join(timeout=2.0)
     if proc.returncode != 0:
         tail = (err or b"").decode(errors="replace").strip().splitlines()[-12:]
         raise RenderError("ffmpeg failed (rc=%d): %s" % (proc.returncode, " | ".join(tail)))
@@ -931,8 +975,14 @@ def final_render(video: str, audio: str, out_path: str, *, width: int, height: i
                  fps: int, total: float, ass_file: Optional[str] = None,
                  overlays: Optional[List[dict]] = None, crf: int = 20,
                  audio_bitrate: str = "192k", video_codec: str = "h264",
-                 fonts_dir: Optional[str] = None, cancel=None, log=None) -> None:
-    """Burn captions and overlays and encode the deliverable."""
+                 fonts_dir: Optional[str] = None, cancel=None, log=None,
+                 on_frame: Optional[Callable[[int], None]] = None) -> None:
+    """Burn captions and overlays and encode the deliverable.
+
+    ``on_frame`` reports frames written as the encode runs. This is the longest
+    single step of a render and it has no sub-stages, so a client polling
+    stage/message sees nothing change for minutes without it.
+    """
     inputs = ["-i", video, "-i", audio]
     img_overlays = [o for o in (overlays or [])
                     if (o.get("type") or "image").lower() == "image" and o.get("_path")]
@@ -1037,7 +1087,7 @@ def final_render(video: str, audio: str, out_path: str, *, width: int, height: i
     run(inputs + ["-filter_complex", ";".join(graph), "-map", "[vout]", "-map", "1:a"]
         + enc + ["-c:a", "aac", "-b:a", str(audio_bitrate or "192k"),
                  "-ar", "48000", "-ac", "2", "-shortest",
-                 "-t", f"{max(0.1, total):.3f}", out_path],
+                 "-t", f"{max(0.1, total):.3f}", out_path], on_frame=on_frame,
         cancel=cancel, log=log)
 
 

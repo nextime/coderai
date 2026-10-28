@@ -2731,9 +2731,13 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
     _vid_progress_reset(kw['num_inference_steps'])
 
+    # Claims the caller's own id when they named one, so
+    # /v1/video/progress?request_id=... follows THIS request.
+    from codai.api import request_progress as _rp
     _tid = task_registry.register(
         "video", title=(request.prompt or mode or "")[:80],
-        model=getattr(request, 'model', '') or '', total=kw['num_inference_steps'])
+        model=getattr(request, 'model', '') or '', total=kw['num_inference_steps'],
+        task_id=_rp.take())
     task_registry.start(_tid)
 
     def _vid_step_cb(pipe, step_index, timestep, callback_kwargs):
@@ -4000,8 +4004,25 @@ def _translate_srt(srt_path: str, target_lang: str, temps: list) -> str:
 # =============================================================================
 
 @router.get("/v1/video/progress", summary="Video generation progress")
-async def get_video_progress():
-    """Return current video generation step progress including speed."""
+async def get_video_progress(request_id: Optional[str] = None):
+    """Video generation progress — this request's own, or the global slot.
+
+    With ``request_id`` (the id the caller passed as ``request_id`` in the
+    generation body or an ``X-Request-Id`` header) this answers for THAT
+    request only, so two callers generating at once can each follow their own.
+    A 404 means that id is finished and pruned, or was never used.
+
+    Without it, the single global slot below, exactly as before.
+    """
+    if request_id:
+        from codai.api import request_progress as _rp
+        _rid = _rp.sanitize(request_id)
+        _view = _rp.view(_rid) if _rid else None
+        if _view is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no generation in progress for request_id {request_id!r}")
+        return _view
     elapsed = time.monotonic() - _vid_progress["started_at"] if _vid_progress["active"] else 0.0
     return {
         "current":  _vid_progress["current"],
@@ -4763,9 +4784,16 @@ async def video_generations(request: VideoGenerationRequest,
       v2v   – video-to-video (video required)
       ti2v  – text + image → video (prompt is primary driver)
       interp – frame interpolation (init_image + end_image required)
+
+    A caller may name this request (``request_id`` in the body, or an
+    ``X-Request-Id`` header) and then poll
+    ``GET /v1/video/progress?request_id=...`` for its OWN steps rather than a
+    slot shared with everyone else generating at the same time.
     """
     if not request.model:
         raise HTTPException(status_code=400, detail="model is required")
+    from codai.api import request_progress as _rp
+    _rp.set_current(_rp.from_request(request, http_request))
     _vid_progress_loading(request.model)
 
     # Infer mode from inputs if not set

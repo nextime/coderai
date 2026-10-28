@@ -344,12 +344,28 @@ def _get(job_id: str) -> Optional[dict]:
         return dict(rec) if rec else None
 
 
+#: How many of the job's own log lines the polled document carries. A client
+#: logs every change of stage/message and wants the detail behind a long step,
+#: but a growing log re-sent on every 2-3 s poll is waste; the tail covers what
+#: just happened and ``/log?since=N`` serves the whole thing incrementally.
+_LOG_TAIL = 40
+
+
 def _public(rec: dict) -> dict:
     """The document a client polls: the spec's fields, in the spec's order."""
+    _log = rec.get("log") or []
     return {"id": rec["id"], "status": rec["status"], "stage": rec.get("stage"),
             "progress": round(float(rec.get("progress") or 0.0), 1),
             "message": rec.get("message") or "", "warnings": rec.get("warnings") or [],
-            "error": rec.get("error"), "result": rec.get("result")}
+            "error": rec.get("error"), "result": rec.get("result"),
+            # The job's own log. Some steps are long with no change of stage at
+            # all (an encode, a presenter being generated, a model loading), so
+            # a client watching only stage/message has nothing to show for
+            # minutes. `log_total` is the full length, so a client can tell it
+            # is seeing a tail and fetch the rest from
+            # GET /v1/video/compose/{id}/log?since=N
+            "log": list(_log[-_LOG_TAIL:]),
+            "log_total": len(_log)}
 
 
 def cancel_job(job_id: str) -> bool:
@@ -1110,11 +1126,18 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
     tdur = float((req.transition or {}).get("duration") or 0.3)
     caps = req.captions
     log_lines: List[str] = []
+    # The SAME list object on the record, so a poll sees lines as they are
+    # appended rather than a copy taken at some earlier moment. Trimming
+    # below mutates it in place, which keeps that true.
+    _update(job_id, log=log_lines)
 
     def log(msg: str) -> None:
         log_lines.append(msg)
-        if len(log_lines) > 200:
-            del log_lines[:100]
+        if len(log_lines) > 2000:
+            # Deep enough to cover a whole render for a client reading
+            # incrementally; trimmed from the front so the tail is the recent
+            # work. `log_total` in the status document reports the real length.
+            del log_lines[:500]
 
     def stage(name: str, progress: float, message: str) -> None:
         if cancel.is_set():
@@ -1734,11 +1757,30 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
 
         fmt = (req.output.format or "mp4").lower()
         final = os.path.join(work, f"{job_id}.{fmt}")
+
+        # The encode is the longest single step and has no sub-stages, so its
+        # own frame counter drives progress across the band this stage owns
+        # (76 -> 95). Without it a client's bar sat still for minutes with the
+        # message unchanged, which reads as a stall.
+        _enc_frames = max(1, int(round(float(total) * float(canvas.fps or 30))))
+        _enc_last = [0.0]
+
+        def _on_frame(n: int) -> None:
+            pct = 76.0 + 19.0 * min(1.0, n / _enc_frames)
+            # Throttled: ffmpeg reports several times a second and each update
+            # takes the jobs lock, which every poll also needs.
+            if pct - _enc_last[0] < 0.5 and n < _enc_frames:
+                return
+            _enc_last[0] = pct
+            _update(job_id, stage="render", progress=round(pct, 1),
+                    message=f"encoding {n}/{_enc_frames} frames", status="running")
+
         rnd.final_render(silent, mixed, final, width=canvas.width, height=canvas.height,
                          fps=canvas.fps, total=total, ass_file=ass_path,
                          overlays=overlays, crf=req.output.crf,
                          audio_bitrate=req.output.audio_bitrate,
-                         video_codec=req.output.video_codec, cancel=cancel, log=log)
+                         video_codec=req.output.video_codec, cancel=cancel, log=log,
+                         on_frame=_on_frame)
 
         # ---------------------------------------------------- 6. artefacts
         stage("thumbnail", 95.0, "artefacts")
@@ -1887,6 +1929,34 @@ async def compose_status(job_id: str, _auth=Depends(_require_api_auth)):
     if rec is None:
         raise HTTPException(status_code=404, detail=f"unknown composition job {job_id!r}")
     return _public(rec)
+
+
+@router.get("/v1/video/compose/{job_id}/log", summary="A composition job's own log",
+            tags=["Video"])
+async def compose_log(job_id: str, since: int = 0, _auth=Depends(_require_api_auth)):
+    """The job's log from line ``since`` onwards.
+
+    Polled alongside the status document when a client wants the detail behind
+    a long step: an encode, a presenter being generated, a model loading. Pass
+    the ``next`` from the previous answer as ``since`` to get only what is new.
+
+    ``since`` beyond the end returns nothing rather than an error, so a client
+    that polls once more after the job finished gets an empty tail. A very old
+    ``since`` may have been trimmed away; ``dropped`` says so, and the lines
+    start from the oldest line still held.
+    """
+    rec = _get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"unknown composition job {job_id!r}")
+    lines = list(rec.get("log") or [])
+    total = len(lines)
+    start = max(0, int(since or 0))
+    dropped = start > total                  # asked past the end
+    if dropped:
+        start = total
+    return {"id": job_id, "status": rec["status"], "since": start,
+            "next": total, "total": total, "dropped": dropped,
+            "log": lines[start:]}
 
 
 @router.post("/v1/video/compose/{job_id}/cancel", summary="Cancel a composition job",

@@ -469,11 +469,36 @@ def civitai_cache_root() -> Path:
     explicit = (os.environ.get("CODERAI_CIVITAI_CACHE") or "").strip()
     if explicit:
         return Path(os.path.expanduser(explicit))
+    # `models.civitai_cache_dir`, read from config.json the same way
+    # `models.hf_cache_dir` is. An operator configuring where the weights live
+    # should not have to set a container environment variable to move these,
+    # and env is not somewhere a running server's settings page can reach.
+    configured = _configured_civitai_cache_dir()
+    if configured:
+        return Path(configured)
     try:
         from codai.platform_paths import legacy_style_cache_root
         return legacy_style_cache_root() / "civitai"
     except Exception:
         return Path(os.path.expanduser("~/.cache/coderai/civitai"))
+
+
+def _configured_civitai_cache_dir() -> str:
+    """``models.civitai_cache_dir`` from config.json, or "".
+
+    Read from the file rather than through the config object: this is called
+    from loader code that runs in engine processes and in isolated workers,
+    some of which never build a Config at all.
+    """
+    import json as _json
+    try:
+        _dir = os.path.join(
+            os.environ.get("CODERAI_CONFIG_DIR", "/config"), "coderai")
+        with open(os.path.join(_dir, "config.json")) as fh:
+            raw = (_json.load(fh).get("models") or {}).get("civitai_cache_dir")
+    except Exception:
+        return ""
+    return os.path.expanduser(str(raw).strip()) if raw and str(raw).strip() else ""
 
 
 def resolve_civitai(ref: str) -> str:

@@ -38,6 +38,12 @@ class LoraConfig(BaseModel):
 
 
 class ImageGenerationRequest(BaseModel):
+    #: The caller's own name for this request, so it can poll
+    #: ``/v1/images/progress?request_id=...`` for its OWN steps instead of a
+    #: single global slot shared with everyone generating at the same time.
+    #: An ``X-Request-Id`` header does the same; the body wins when both are
+    #: given. Echoed back in the progress document.
+    request_id: Optional[str] = None
     model: str = Field(..., description="Model id to generate with (must be a configured image model).")
     prompt: str = Field(..., description="Text prompt describing the image.")
     n: int = Field(1, description="Number of images to generate.")

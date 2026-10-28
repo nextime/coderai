@@ -1575,9 +1575,15 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     # Register this generation as a cancellable task (live view + cooperative
     # cancel via the step callback below).
+    # The caller's own id, when they named one, so /v1/images/progress can be
+    # asked about THIS request instead of a global slot shared with everyone
+    # else generating at the same time. Claimed once: the short "loading" task
+    # registered earlier keeps its own id (see codai.api.request_progress).
+    from codai.api import request_progress as _rp
     _tid = task_registry.register(
         "image", title=(request.prompt or "")[:80],
-        model=getattr(request, 'model', '') or '', total=num_steps)
+        model=getattr(request, 'model', '') or '', total=num_steps,
+        task_id=_rp.take())
     task_registry.start(_tid)
 
     # ------------------------------------------------------------------
@@ -2204,8 +2210,27 @@ router = APIRouter()
 
 
 @router.get("/v1/images/progress", summary="Image generation progress")
-async def get_image_progress():
-    """Return current image generation step progress including speed."""
+async def get_image_progress(request_id: Optional[str] = None):
+    """Image generation progress — this request's own, or the global slot.
+
+    With ``request_id`` (the id the caller passed as ``request_id`` in the
+    generation body or an ``X-Request-Id`` header) this answers for THAT
+    request only: `phase` is "queued" while it waits, "loading" while the model
+    loads and "generating" once steps are counted, and a 404 means the id is
+    finished and pruned or was never used. Two callers generating at once can
+    each follow their own.
+
+    Without it, the single global slot below, exactly as before.
+    """
+    if request_id:
+        from codai.api import request_progress as _rp
+        _rid = _rp.sanitize(request_id)
+        _view = _rp.view(_rid) if _rid else None
+        if _view is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no generation in progress for request_id {request_id!r}")
+        return _view
     elapsed = _time.monotonic() - _gen_progress["started_at"] if _gen_progress["active"] else 0.0
     return {
         "current":  _gen_progress["current"],
@@ -2228,8 +2253,15 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     Supports:
     - Stable Diffusion via stable-diffusion-cpp-python (sd.cpp)
     - Stable Diffusion XL (via local inference with diffusers)
+
+    A caller may name this request (``request_id`` in the body, or an
+    ``X-Request-Id`` header) and then poll
+    ``GET /v1/images/progress?request_id=...`` for its OWN steps rather than a
+    slot shared with everyone else generating at the same time.
     """
     global global_args, global_file_path, model_semaphores, queue_flags
+    from codai.api import request_progress as _rp
+    _rp_token = _rp.set_current(_rp.from_request(request, http_request))
     
     # Get or create semaphore for this model
     model_key = f"image:{request.model}" if request.model else "image"
