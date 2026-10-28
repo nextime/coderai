@@ -206,3 +206,70 @@ def test_the_cold_start_window_is_reserved_and_then_released(cw, mgr):
 def test_a_zero_reservation_is_not_recorded(cw, mgr):
     cw._note_loading(cw.model_key("m"), 0.0)
     assert mgr._loading_reservations == {}
+
+
+# ---------------------------------------------------------------------------
+# An image load must be visible to the eviction ladder while it runs
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-10-28: Krea-2-RealDream held 18.8 GiB of a 23.56 GiB card for
+# the 194 s of its load, and every captioned scene of a concurrent compose died
+# on "CUDA out of memory. Tried to allocate 86.00 MiB". The video path reserves
+# its estimate for the load window; the image path registered only a cosmetic
+# Tasks-page entry, so ensure_vram_for saw a card that was filling up as free.
+
+def test_the_image_load_path_reserves_vram_for_its_whole_load_window():
+    """`note_loading` must bracket the image load, not just decorate it."""
+    import ast, io, inspect
+    src = io.open("codai/api/images.py", encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    # Every call to a diffusers/sd.cpp loader must sit inside a Try whose
+    # finally clears the reservation, and be preceded by note_loading.
+    loaders = {"_load_diffusers_pipeline", "_load_sdcpp_model"}
+
+    def _names(node):
+        return {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)} | \
+               {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    # A loader may sit inside several nested tries (the backend's own
+    # except-and-fall-through wraps it too). At least ONE of them has to clear
+    # the reservation in its finally, or a failed load leaks it for ever.
+    guarded = set()
+    for tnode in ast.walk(tree):
+        if not isinstance(tnode, ast.Try):
+            continue
+        body_names = set()
+        for stmt in tnode.body:
+            body_names |= _names(stmt)
+        hit = loaders & body_names
+        if not hit:
+            continue
+        fin_names = set()
+        for stmt in tnode.finalbody:
+            fin_names |= _names(stmt)
+        if "clear_loading" in fin_names:
+            guarded |= hit
+
+    assert guarded == loaders, (
+        f"these image loaders are not inside any try whose finally clears the "
+        f"loading reservation: {sorted(loaders - guarded)}")
+    assert src.count("note_loading(model_key)") >= len(loaders), (
+        "each image backend load must reserve its estimate before loading")
+
+
+def test_note_loading_without_a_figure_takes_it_from_the_card():
+    """The image path passes no gb, so the card's own estimate must be used."""
+    from codai.models.manager import multi_model_manager as m
+    key = "test-image-model-xyz"
+    m._loading_reservations.pop(key, None)
+    orig = m._get_model_used_vram_gb
+    try:
+        m._get_model_used_vram_gb = lambda k: 19.0 if k == key else 0.0
+        m.note_loading(key)
+        assert m._loading_reservations.get(key) == 19.0, (
+            "note_loading(key) with no gb must look the figure up, or an image "
+            "load reserves nothing at all")
+    finally:
+        m._get_model_used_vram_gb = orig
+        m._loading_reservations.pop(key, None)

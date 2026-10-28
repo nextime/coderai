@@ -2366,8 +2366,22 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 _diff_cfg = (multi_model_manager.config.get(model_key)
                              or multi_model_manager.config.get(model_name) or {})
                 _vram_before = multi_model_manager.vram_before_load()
-                pipeline = await asyncio.to_thread(
-                    _load_diffusers_pipeline, model_name, global_args, _diff_cfg)
+                # Reserve the estimate for the whole load window, the way the
+                # video path does. Without it an image load is INVISIBLE to the
+                # eviction ladder for as long as it takes: ensure_vram_for sees
+                # a card that is actually filling up as free, grants somebody
+                # else's reservation, and both OOM. Measured 2026-10-28:
+                # Krea-2-RealDream held 18.8 GiB of a 23.56 GiB card for 194 s
+                # and every captioned scene of a concurrent compose died on
+                # "CUDA out of memory. Tried to allocate 86.00 MiB".
+                multi_model_manager.note_loading(model_key)
+                try:
+                    pipeline = await asyncio.to_thread(
+                        _load_diffusers_pipeline, model_name, global_args, _diff_cfg)
+                finally:
+                    # Cleared here, not after add_model: there is no await
+                    # between the two, so no other task can observe the gap.
+                    multi_model_manager.clear_loading(model_key)
 
                 if pipeline is not None:
                     # Cache the loaded pipeline in the manager
@@ -2411,7 +2425,11 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             if resolved_path and os.path.isfile(resolved_path):
                 cfg = multi_model_manager.config.get(model_key) or multi_model_manager.config.get(model_name) or {}
                 _vram_before = multi_model_manager.vram_before_load()
-                sd_model = await asyncio.to_thread(_load_sdcpp_model, resolved_path, global_args, model_config=cfg)
+                multi_model_manager.note_loading(model_key)
+                try:
+                    sd_model = await asyncio.to_thread(_load_sdcpp_model, resolved_path, global_args, model_config=cfg)
+                finally:
+                    multi_model_manager.clear_loading(model_key)
 
                 if sd_model is not None:
                     # Cache the loaded model in the manager
