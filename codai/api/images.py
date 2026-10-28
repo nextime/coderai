@@ -842,7 +842,12 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     if _k in _mmm.config:
                         _key = _k
                         break
-                _need_gb = _mmm._get_model_used_vram_gb(_key or model_name, model_name)
+                # requested_id: same-path siblings (one checkpoint, two cards
+                # with different settings) must be sized by the card that was
+                # ASKED for, not by whichever one registered the path.
+                _need_gb = _mmm._get_model_used_vram_gb(
+                    _key or model_name, model_name,
+                    requested_id=getattr(request, 'model', None))
                 if _need_gb > 0:
                     if _free_gb < _need_gb:
                         print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "

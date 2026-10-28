@@ -5103,8 +5103,21 @@ async def video_generations(request: VideoGenerationRequest,
                     # it already includes the runtime/activation reserve AND the
                     # fused acceleration LoRA (it's measured after fusion). So do
                     # NOT re-add those. Per-request LoRAs are extra.
+                    # `requested_id` is what disambiguates same-path siblings.
+                    # Two cards can share one weights path and differ only in
+                    # settings -- Wan2.2-I2V-A14B-Lightning and the plain
+                    # Wan2.2-I2V-A14B both point at
+                    # Wan-AI/Wan2.2-I2V-A14B-Diffusers, declaring 22 GB and
+                    # 151 GB. Without the id the lookup lands on whichever
+                    # sibling registered the path, so the Lightning variant was
+                    # sized at 151 GB, read as ~127 GB over free VRAM, and sent
+                    # straight to CPU offload -- it then computed on the CPU at
+                    # 0% GPU for 26 minutes. The manager has carried this
+                    # disambiguation since the lisa/lisa-32k case; this caller
+                    # simply never passed the id for it to use.
                     _base_gb = multi_model_manager._get_model_used_vram_gb(
-                        model_key, model_name)
+                        model_key, model_name,
+                        requested_id=getattr(request, 'model', None))
                     _need_gb = _base_gb + _lora_extra_gb
                     _BORDERLINE_GB = 3.0  # how far over free VRAM still counts as "borderline"
                     _over_gb = _need_gb - _free_gb

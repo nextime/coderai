@@ -105,12 +105,26 @@ def _load_in_progress() -> bool:
     A load streams multi-GB of weights into host RAM over many seconds, so RSS
     climbs monotonically — which the leak heuristic would otherwise mistake for a
     leak. The scheduler shows no active *request* lease during a load, so the
-    idle check alone doesn't catch this; we consult the manager's load event."""
+    idle check alone doesn't catch this; we consult the manager's load event.
+
+    TWO signals, because the event alone misses most of them. The ready event is
+    managed by the manager's own load_model path, and diffusers image/video
+    pipelines do not go through it — they load in codai/api/{images,video}.py.
+    So a 12-minute multi-shard load of a quantized video model looked idle, its
+    monotonically rising RSS looked exactly like a leak, and the watcher ran its
+    mitigation ladder against a load that was doing nothing wrong (measured on
+    Wan2.2-I2V-A14B-Lightning: "RSS 19.8/43.0 GB LEAK SUSPECTED" every poll).
+    The loading RESERVATIONS cover those paths: anything that reserved VRAM for
+    a load window is, by definition, loading."""
     try:
         from codai.models.manager import multi_model_manager
-        return not multi_model_manager._model_ready_event.is_set()
+        if not multi_model_manager._model_ready_event.is_set():
+            return True
+        if getattr(multi_model_manager, "_loading_reservations", None):
+            return True
     except Exception:
         return False
+    return False
 
 
 def _process_ram_gb() -> float:
