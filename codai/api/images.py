@@ -1876,6 +1876,30 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # video path — it sets its own explicit per-module 'flash', so it ignores the
     # global too. Image pipelines were never intentionally on flash, so pinning
     # native here is non-regressive. Cheap + idempotent; no-op if unsupported.
+    #
+    # This is also the floor on image generation speed, so it is worth stating
+    # rather than re-investigating. Measured 2026-10-28 on
+    # Z-Image-Turbo-IntoRealism, 768x1344, 10 steps, idle RTX 3090: 21.4 s warm,
+    # i.e. 2.1 s/step. Of the three things worth suspecting, two were ruled out
+    # -- the card's step count IS applied (the per-request progress endpoint
+    # reports total=10) and there is no bnb repack (the checkpoint is fp8 upcast
+    # to bf16) -- and the third was an unnecessary enable_model_cpu_offload from
+    # the model page's default offload_strategy, which cost 12 s a request on a
+    # model that fits the card whole (72 s -> 33 s -> 21.4 s).
+    #
+    # What is left is SDPA, and for THIS family that is not a choice: Z-Image
+    # and Krea 2 mask their text conditioning, and neither SageAttention nor
+    # flash-attn 2 accepts an attn_mask (see _ATTN_MASK_FAMILIES in
+    # codai/api/video.py -- measured on LTX-2.3-10Eros, which failed on sage and
+    # then identically on flash). So a few seconds per 1 Mpix still is the
+    # hardware, not a misconfiguration.
+    #
+    # The remaining opportunity, NOT taken here: this pins every image pipeline,
+    # including families that never pass a mask and could use a fast kernel. The
+    # video path already makes that distinction per pipeline class
+    # (_pipeline_uses_attn_mask); doing the same here would need the masking
+    # image families enumerated and each one measured, since getting it wrong
+    # is a 500 at the first denoising step rather than a slow render.
     for _cn in ("transformer", "unet"):
         _c = getattr(pipeline, _cn, None)
         if _c is not None and hasattr(_c, "set_attention_backend"):
