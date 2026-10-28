@@ -1929,16 +1929,28 @@ class MultiModelManager:
                 manual_ram = _cfg_or_global('manual_ram_gb', 'ram')
                 if manual_ram is not None:
                     kwargs['manual_ram_gb'] = manual_ram
-                # flash_attn comes from the per-model config (source of truth).
-                # build_kwargs_from_config populates it from the model's
-                # 'flash_attention' setting; CLI/global is NOT consulted here.
-                # Honour either per-model key (flash_attn / flash_attention) and the
-                # global default (global_args.flash_attn ← offload.flash_attention),
-                # matching hf_loading — so the standard config key isn't silently
-                # ignored on the nvidia text path.
-                kwargs['flash_attn'] = bool(
-                    config.get('flash_attn') or config.get('flash_attention')
-                    or getattr(_ga, 'flash_attn', False))
+                # flash_attn: the per-model config is the source of truth, and
+                # the global (global_args.flash_attn ← offload.flash_attention)
+                # is a default for models that say nothing.
+                #
+                # Resolved by PRESENCE, not truthiness. `config.get(k) or global`
+                # cannot express "off": False and "unset" are the same value to
+                # `or`, so a card that explicitly said `flash_attention: false`
+                # fell through to the global and FA2 stayed on. Measured
+                # 2026-10-28 on Qwen3.5-9B (flash_attention: false,
+                # load_in_4bit: true): every request died with "FlashAttention
+                # only support fp16 and bf16 data type", and before that error
+                # was surfaced at all, with an empty completion -- the model had
+                # been unusable since 2026-09-30 with its own off switch
+                # already set.
+                _fa = None
+                for _fa_key in ('flash_attn', 'flash_attention'):
+                    if _fa_key in config and config[_fa_key] is not None:
+                        _fa = bool(config[_fa_key])
+                        break
+                if _fa is None:
+                    _fa = bool(getattr(_ga, 'flash_attn', False))
+                kwargs['flash_attn'] = _fa
                 # Configured precision → torch dtype (parity with hf_loading); the
                 # nvidia backend defaults fp16/fp32 when unset.
                 kwargs['precision'] = config.get('precision')
@@ -2105,16 +2117,28 @@ class MultiModelManager:
                 manual_ram = _cfg_or_global('manual_ram_gb', 'ram')
                 if manual_ram is not None:
                     kwargs['manual_ram_gb'] = manual_ram
-                # flash_attn comes from the per-model config (source of truth).
-                # build_kwargs_from_config populates it from the model's
-                # 'flash_attention' setting; CLI/global is NOT consulted here.
-                # Honour either per-model key (flash_attn / flash_attention) and the
-                # global default (global_args.flash_attn ← offload.flash_attention),
-                # matching hf_loading — so the standard config key isn't silently
-                # ignored on the nvidia text path.
-                kwargs['flash_attn'] = bool(
-                    config.get('flash_attn') or config.get('flash_attention')
-                    or getattr(_ga, 'flash_attn', False))
+                # flash_attn: the per-model config is the source of truth, and
+                # the global (global_args.flash_attn ← offload.flash_attention)
+                # is a default for models that say nothing.
+                #
+                # Resolved by PRESENCE, not truthiness. `config.get(k) or global`
+                # cannot express "off": False and "unset" are the same value to
+                # `or`, so a card that explicitly said `flash_attention: false`
+                # fell through to the global and FA2 stayed on. Measured
+                # 2026-10-28 on Qwen3.5-9B (flash_attention: false,
+                # load_in_4bit: true): every request died with "FlashAttention
+                # only support fp16 and bf16 data type", and before that error
+                # was surfaced at all, with an empty completion -- the model had
+                # been unusable since 2026-09-30 with its own off switch
+                # already set.
+                _fa = None
+                for _fa_key in ('flash_attn', 'flash_attention'):
+                    if _fa_key in config and config[_fa_key] is not None:
+                        _fa = bool(config[_fa_key])
+                        break
+                if _fa is None:
+                    _fa = bool(getattr(_ga, 'flash_attn', False))
+                kwargs['flash_attn'] = _fa
                 # Configured precision → torch dtype (parity with hf_loading); the
                 # nvidia backend defaults fp16/fp32 when unset.
                 kwargs['precision'] = config.get('precision')

@@ -887,6 +887,21 @@ class NvidiaBackend(ModelBackend):
             offload_dir = _resolve_off(offload_dir) if offload_dir else offload_dir
         except Exception:
             pass
+        # The device has to be known BEFORE the dtype default is chosen from it.
+        # It used to be detected 130 lines further down, while __init__ leaves it
+        # None, so on the first load in a fresh engine process `self.device ==
+        # 'cuda'` was False and the default came out fp32: every HF text model
+        # with no explicit `precision` loaded in fp32 on a CUDA card. That is
+        # twice the VRAM on a 24 GB card, and FA2 refuses fp32 outright --
+        # measured 2026-10-28 on Qwen3.5-9B (load_in_4bit, precision unset),
+        # which transformers loaded as torch.float32 and which then answered
+        # every request with "FlashAttention only support fp16 and bf16 data
+        # type", and before that error was surfaced, with an empty completion.
+        #
+        # A SECOND load in the same process saw self.device still set to 'cuda'
+        # from the previous one and quietly got fp16, so the same model loaded
+        # at two different precisions depending on load order.
+        self.device = self._detect_device()
         # Resolve the model's configured `precision` → torch dtype (parity with
         # hf_loading, which non-text loaders use). Default fp16 on CUDA / fp32 on CPU
         # when unset, preserving this loader's historical behaviour.
@@ -1026,8 +1041,8 @@ class NvidiaBackend(ModelBackend):
                 self.use_flash_attn = False
                 print(f"  Flash Attention 2 disabled: {reason} → using SDPA instead.")
 
-        self.device = self._detect_device()
-        
+        # Already detected above, before the dtype default needed it; re-probing
+        # here would only repeat the log line.
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             trust_remote_code=True,
