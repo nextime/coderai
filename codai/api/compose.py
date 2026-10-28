@@ -840,10 +840,23 @@ def _generate_music(loop, spec: dict, total: float, out_path: str) -> str:
         duration=float(spec.get("duration") or max(10.0, min(total, 120.0))),
         response_format="b64_wav")
     res = _await(loop, audio_generate(req, None))
-    data = (res or {}).get("data") or []
+    # audio_generate answers with an AudioGenerationResponse -- a pydantic
+    # model, not a dict -- so reading it with .get() raised
+    # "'AudioGenerationResponse' object has no attribute 'get'" and every
+    # compose that asked for AI music rendered silently without any (measured in
+    # production 2026-10-28; the warning said "rendered without music" and the
+    # render succeeded, so nothing failed loudly enough to notice). Both shapes
+    # are accepted because the same call is reachable through paths that answer
+    # a plain dict.
+    data = getattr(res, "data", None)
+    if data is None and isinstance(res, dict):
+        data = res.get("data")
+    data = data or []
     if not data:
         raise rnd.RenderError("music generation returned nothing")
     item = data[0]
+    if not isinstance(item, dict) and hasattr(item, "model_dump"):
+        item = item.model_dump()
     blob = item.get("b64_wav") or item.get("b64_json")
     if blob:
         return _b64_to_file(blob, out_path)
