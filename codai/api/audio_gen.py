@@ -284,6 +284,39 @@ def _load_audioldm(model_name: str, device: str, model_config: dict = None):
     return pipe
 
 
+
+def _step_callback_kwargs(pipe, cb):
+    """``{callback_on_step_end: cb}`` only if this pipeline accepts it.
+
+    The step callback is how a generation reports progress and stays
+    cancellable, but diffusers added `callback_on_step_end` per pipeline rather
+    than across the board: StableAudioPipeline does not take it, and passing it
+    raised
+
+        StableAudioPipeline.__call__() got an unexpected keyword argument
+        'callback_on_step_end'
+
+    AFTER the model had loaded -- so the failure cost the whole load and looked
+    like a broken model rather than one unsupported argument. Asked of the
+    signature rather than kept as a list of pipeline names, because the list
+    would be wrong again at the next diffusers release.
+    """
+    try:
+        import inspect
+        params = inspect.signature(pipe.__call__).parameters
+        if "callback_on_step_end" in params:
+            return {"callback_on_step_end": cb}
+        # Some older pipelines expose the pre-0.25 spelling instead.
+        if "callback" in params:
+            return {"callback": lambda i, t, latents: cb(pipe, i, t, {})}
+    except (TypeError, ValueError):
+        pass
+    print("  [audio] this pipeline takes no step callback — progress will jump "
+          "from 0 to done, and the generation is not cancellable mid-run",
+          flush=True)
+    return {}
+
+
 def _detect_audio_gen_type(model_name: str) -> str:
     n = model_name.lower()
     # Stable Audio is NOT AudioLDM. It was mapped here to 'audioldm', which
@@ -395,7 +428,7 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
             audio_end_in_s=float(request.duration or 10.0),
             num_waveforms_per_prompt=1,
             generator=_gen,
-            callback_on_step_end=_sa_step_cb,
+            **_step_callback_kwargs(pipe, _sa_step_cb),
         )
         # (channels, samples) float32 at 44.1 kHz. Kept STEREO: this model's
         # point is that it produces a usable stereo bed, and folding it to mono
@@ -418,7 +451,7 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
             request.prompt,
             num_inference_steps=num_steps,
             audio_length_in_s=request.duration,
-            callback_on_step_end=_aud_step_cb,
+            **_step_callback_kwargs(pipe, _aud_step_cb),
         )
         audio_np = result.audios[0]
         sr = 16000
