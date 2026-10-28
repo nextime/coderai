@@ -219,6 +219,52 @@ def _assign_outputs(out, params: set, mask_arg: Optional[str]) -> Dict[str, Any]
     return assigned
 
 
+def _ensure_on_device(pipe, comp_names=("text_encoder", "text_encoder_2")) -> list:
+    """Bring the named components back to the pipeline's execution device.
+
+    REQUIRED, not an optimisation. The pipeline is cached and served again, so
+    a previous request's offload has left the encoder on the CPU. Encoding then
+    indexes cuda input ids against cpu weights:
+
+        RuntimeError: Expected all tensors to be on the same device, but got
+        index is on cuda:0, different from other tensors on cpu
+
+    and -- the part that made this a 500 rather than a slow path -- the damage
+    OUTLIVES this function. Falling back to "generate the ordinary way" hands
+    the request to a pipeline whose own encode_prompt hits the same mismatch,
+    so the request fails anyway. Measured in production 2026-10-28: the first
+    request succeeded and every one after it returned 500 until the model was
+    evicted.
+
+    So the offload is a per-request CYCLE -- bring the encoder on, encode, move
+    it off -- not a one-way move.
+    """
+    notes = []
+    try:
+        import torch
+    except Exception:
+        return notes
+    dev = getattr(pipe, "_execution_device", None)
+    if dev is None:
+        try:
+            dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        except Exception:
+            return notes
+    for name in comp_names:
+        comp = getattr(pipe, name, None)
+        if comp is None or not hasattr(comp, "to"):
+            continue
+        if _resident_on_gpu(comp):
+            continue
+        try:
+            comp.to(dev)
+            notes.append(f"{name}: brought back to {dev}")
+        except Exception as exc:
+            notes.append(f"{name}: could NOT be brought back to {dev} "
+                         f"({type(exc).__name__}: {str(exc)[:120]})")
+    return notes
+
+
 def encode_then_free(pipe, kwargs: Dict[str, Any], *,
                      log=None) -> Tuple[Dict[str, Any], float]:
     """Encode the prompt in ``kwargs``, free the encoder, return new kwargs.
@@ -277,11 +323,21 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
             enc_kwargs["do_classifier_free_guidance"] = bool(
                 gs is not None and float(gs) > 1.0)
 
+    # Put the encoder back before using it: a previous request on this cached
+    # pipeline may have left it on the CPU.
+    back = _ensure_on_device(pipe)
+    if back:
+        _say(f"  [text-encoder-offload] {'; '.join(back)}")
+
     try:
         import torch
         with torch.no_grad():
             out = pipe.encode_prompt(**enc_kwargs)
     except Exception as exc:
+        # Leave the pipeline able to generate on its own: the ordinary path
+        # calls this same encoder, so handing it back on the CPU would turn a
+        # skipped optimisation into a failed request.
+        _ensure_on_device(pipe)
         _say(f"  [text-encoder-offload] encoding failed ({exc}); "
              f"generating the ordinary way")
         return kwargs, 0.0
@@ -295,10 +351,12 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
     try:
         assigned = _assign_outputs(out, params, mask_arg)
     except Exception as exc:
+        _ensure_on_device(pipe)
         _say(f"  [text-encoder-offload] could not assemble the embeddings "
              f"({exc}); generating the ordinary way")
         return kwargs, 0.0
     if "prompt_embeds" not in assigned:
+        _ensure_on_device(pipe)
         _say("  [text-encoder-offload] encode_prompt returned no embeddings; "
              "generating the ordinary way")
         return kwargs, 0.0
@@ -308,6 +366,7 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
         # is exactly what happened on the first live LTX-2.3 run: the mask was
         # read from the wrong tuple slot and the call raised "Must provide
         # `prompt_attention_mask` when specifying `prompt_embeds`".
+        _ensure_on_device(pipe)
         _say(f"  [text-encoder-offload] encode_prompt returned no {mask_arg}; "
              f"generating the ordinary way")
         return kwargs, 0.0
@@ -343,6 +402,7 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
                 if "negative_prompt_embeds" not in new:
                     raise ValueError("no negative embeddings came back")
         except Exception as exc:
+            _ensure_on_device(pipe)
             _say(f"  [text-encoder-offload] could not encode the negative "
                  f"prompt ({exc}); generating the ordinary way")
             return kwargs, 0.0

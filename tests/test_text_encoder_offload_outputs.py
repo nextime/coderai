@@ -233,3 +233,86 @@ def test_both_in_one_family_is_not_called_twice():
                                                "guidance_scale": 3.0})
     assert calls == ["a cat"], f"encoded more than once: {calls}"
     assert out["negative_prompt_attention_mask"] is not None
+
+
+class _StatefulPipe:
+    """A cached pipeline that really refuses to encode off-device.
+
+    Models the production failure: the pipeline is cached between requests, so
+    the previous request's offload has left the encoder on the CPU, and
+    encode_prompt indexes cuda ids against cpu weights.
+    """
+
+    def __init__(self):
+        self.device = "cuda"          # where the encoder currently is
+        self._execution_device = "cuda"
+        self.encodes = 0
+
+        class _Enc:
+            def __init__(self, outer):
+                self._outer = outer
+
+            def parameters(self):
+                class _P:
+                    pass
+                p = _P()
+                p.device = type("D", (), {"type": self._outer.device})()
+                return iter([p])
+
+            def to(self, dev):
+                self._outer.device = "cuda" if "cuda" in str(dev) else "cpu"
+                return self
+
+        self.text_encoder = _Enc(self)
+
+    def __call__(self, prompt=None, prompt_embeds=None,
+                 prompt_attention_mask=None, negative_prompt_embeds=None,
+                 negative_prompt_attention_mask=None):
+        raise AssertionError("must not be called by the helper")
+
+    def encode_prompt(self, prompt=None, negative_prompt=None,
+                      do_classifier_free_guidance=True, device=None):
+        if self.device != "cuda":
+            raise RuntimeError(
+                "Expected all tensors to be on the same device, but got index "
+                "is on cuda:0, different from other tensors on cpu")
+        self.encodes += 1
+        return _embeds(), _mask(), _embeds(5), _mask(5)
+
+
+def test_a_second_request_on_a_cached_pipeline_still_works():
+    """The offload is a per-request CYCLE. Without bringing the encoder back,
+    request 2 raised a device mismatch, the helper fell back to "the ordinary
+    way", and the pipeline's OWN encode_prompt then hit the same mismatch --
+    so the fallback produced a 500 rather than a slow path."""
+    pipe = _StatefulPipe()
+
+    out1, freed1 = teo.encode_then_free(pipe, {"prompt": "first"})
+    assert "prompt_embeds" in out1, "request 1 should use the offload"
+    assert pipe.device == "cpu", "the encoder should have been moved off"
+
+    out2, _ = teo.encode_then_free(pipe, {"prompt": "second"})
+    assert "prompt_embeds" in out2, (
+        "request 2 fell back instead of bringing the encoder back")
+    assert pipe.encodes == 2, "the second request never encoded"
+
+
+def test_a_bail_out_leaves_the_encoder_where_the_pipeline_can_use_it():
+    """Whatever goes wrong, the ordinary path must still be able to generate:
+    it calls the same encoder."""
+
+    class _BadShape(_StatefulPipe):
+        def encode_prompt(self, prompt=None, negative_prompt=None,
+                          do_classifier_free_guidance=True, device=None):
+            if self.device != "cuda":
+                raise RuntimeError("Expected all tensors to be on the same device")
+            # More tensors than can be named -> the helper abandons the attempt.
+            return tuple(_embeds() for _ in range(7))
+
+    pipe = _BadShape()
+    pipe.device = "cpu"               # as a previous request left it
+    out, freed = teo.encode_then_free(pipe, {"prompt": "x"})
+    assert out == {"prompt": "x"}, "the ordinary path needs its prompt back"
+    assert freed == 0.0
+    assert pipe.device == "cuda", (
+        "the encoder was left on the CPU, so the ordinary path will 500 too")
