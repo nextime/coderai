@@ -96,6 +96,11 @@ timm>=0.9.0                    # vision model backbones (depth/segment endpoints
 # audiocraft is Meta's MusicGen/AudioGen library; install separately if desired:
 #   pip install audiocraft
 # AudioLDM2 is available via diffusers (already listed above)
+# Stable Audio Open's scheduler (CosineDPMSolverMultistepScheduler) is built on
+# torchsde, and diffusers imports it lazily — so without this the model
+# downloads its 3.8 GB in full and only then fails with "requires the torchsde
+# library", at request time, after the wait.
+torchsde>=0.2.6
 
 # Voice cloning (F5-TTS zero-shot voice cloning)
 f5-tts>=1.1.0

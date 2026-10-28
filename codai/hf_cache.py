@@ -121,6 +121,80 @@ def child_env(env: Optional[dict] = None, hf_cache_dir: Optional[str] = None) ->
     return out
 
 
+
+#: Names huggingface_hub / transformers accept for the Hub token, in the order
+#: the libraries themselves prefer.
+_TOKEN_VAR_NAMES = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+#: Every name a token may arrive under, and every file it may sit in. Kept the
+#: same as codai.api.pyannote_worker._resolve_hf_token, which has worked for
+#: gated pyannote repos for a long time -- two different answers to "where is
+#: the token" is how one path authenticates and another does not.
+_TOKEN_ENV_NAMES = ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+
+def _token_files(config_dir: Optional[str] = None) -> list:
+    out = []
+    env_file = os.environ.get("CODERAI_HF_TOKEN_FILE")
+    if env_file:
+        out.append(env_file)
+    if config_dir:
+        out.append(os.path.join(config_dir, "hf_token"))
+    out.append(os.path.expanduser("~/.coderai/hf_token"))
+    out.append("/config/coderai/hf_token")
+    return out
+
+
+def configured_hf_token(config_dir: Optional[str] = None) -> Optional[str]:
+    """The operator's HuggingFace token, or None.
+
+    The environment first, then the protected file in the coderai config dir --
+    the same resolution the diarization worker has always used for gated
+    pyannote repos, so a token that works for one path works for all of them.
+
+    It exists here because the MODEL LOADING path had no such resolution. The
+    host runner forwards HF_TOKEN from the host environment, which is only set
+    if whoever launched the container exported it; on an install where it was
+    not, huggingface_hub went out unauthenticated for every from_pretrained.
+    That is invisible until a repo is gated, and then it fails as 401 "must be
+    authenticated" -- which reads exactly like terms that have not been
+    accepted, even when they have. Measured 2026-10-28 on
+    stabilityai/stable-audio-open-1.0: the account had access and the token on
+    disk could fetch the weights, while the engine loading them could not.
+
+    Never logged: it is a credential, and it ends up in request headers.
+    """
+    for name in _TOKEN_ENV_NAMES:
+        tok = (os.environ.get(name) or "").strip()
+        if tok:
+            return tok
+    for path in _token_files(config_dir):
+        try:
+            if path and os.path.isfile(path):
+                with open(path) as fh:
+                    tok = fh.read().strip()
+                if tok:
+                    return tok
+        except Exception:
+            continue
+    return None
+
+
+def apply_hf_token(config_dir: Optional[str] = None) -> bool:
+    """Put the configured token in the environment. Idempotent.
+
+    Returns whether a token is now present. Both canonical names are set,
+    because library versions differ in which they read, and a token set only
+    in the one a given version ignores is the same as no token at all.
+    """
+    tok = configured_hf_token(config_dir)
+    if not tok:
+        return False
+    for name in _TOKEN_VAR_NAMES:
+        os.environ[name] = tok
+    return True
+
+
 def apply_hf_cache_env(hf_cache_dir: Optional[str] = None,
                        config_dir: Optional[str] = None) -> Optional[str]:
     """Point this process at the configured HuggingFace cache. Idempotent.
@@ -134,6 +208,14 @@ def apply_hf_cache_env(hf_cache_dir: Optional[str] = None,
     environment is then left exactly as it was: no directory is invented)."""
     if os.environ.get(OPT_OUT):
         return None
+    # The token travels with the cache settings: both answer "how does this
+    # process talk to the Hub", both are needed before huggingface_hub is
+    # imported, and an install that configured one has configured the other in
+    # the same directory.
+    try:
+        apply_hf_token(config_dir)
+    except Exception:
+        pass
     d = hf_cache_dir or configured_hf_cache_dir(config_dir)
     if not d:
         return None

@@ -131,20 +131,15 @@ def _resolve_hf_token(config: dict) -> str:
     tok = (config or {}).get("hf_token")
     if tok:
         return tok
-    for var in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
-        if os.environ.get(var):
-            return os.environ[var]
-    for path in (os.environ.get("CODERAI_HF_TOKEN_FILE"),
-                 os.path.expanduser("~/.coderai/hf_token"),
-                 "/config/coderai/hf_token"):
-        if path and os.path.isfile(path):
-            try:
-                t = open(path).read().strip()
-                if t:
-                    return t
-            except OSError:
-                pass
-    return ""
+    # The env/file resolution this function used to carry now lives in
+    # codai.hf_cache, so the model-loading path resolves the token the same way
+    # instead of going out unauthenticated. Only the per-request override above
+    # is specific to diarization.
+    try:
+        from codai.hf_cache import configured_hf_token
+        return configured_hf_token() or ""
+    except Exception:
+        return ""
 
 
 def ensure_service(model_name: str = None, config: dict = None,
