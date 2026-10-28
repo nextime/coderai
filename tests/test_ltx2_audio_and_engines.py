@@ -203,9 +203,12 @@ def test_a_failed_gguf_component_refuses_instead_of_downgrading():
     import inspect
 
     from codai.models import hf_loading
-    src = inspect.getsource(hf_loading)
-    i = src.index("gguf_entries = {n: v for n, v in comp_q.items()")
-    window = src[i:i + 4000]
+    # The FUNCTION's own source, not a 4000-character window from the module:
+    # the window silently stopped covering the raise as soon as an unrelated
+    # comment was added above it, so this failed for a reason that had nothing
+    # to do with what it checks.
+    window = inspect.getsource(hf_loading.build_gguf_pipeline_components)
+    assert "gguf_entries = {n: v for n, v in comp_q.items()" in window
     assert "problems" in window
     assert "raise RuntimeError" in window
     assert "silently substitute" in window

@@ -162,6 +162,11 @@ def test_music_dub_pipeline_returns_full_stage_outputs(monkeypatch, studio_clien
                 {"step": 3, "type": "voice_convert"},
                 {"step": 4, "type": "remix"},
             ],
+            # The endpoint reports whether every stage ran: `complete` when it
+            # did, `degraded` when the mix was produced but a stage was skipped
+            # or fell back. Both keys are part of the result it reads.
+            "complete": True,
+            "warnings": [],
         }
 
     monkeypatch.setattr(custom_pipelines, "run_full_music_dub", fake_run_full_music_dub)
@@ -179,7 +184,7 @@ def test_music_dub_pipeline_returns_full_stage_outputs(monkeypatch, studio_clien
     assert response.status_code == 200
     body = response.json()
     assert body["pipeline"] == "audio-music-dub"
-    assert body["status"] == "available"
+    assert body["status"] == "complete"
     assert body["transcript"] == "lyrics"
     assert body["translated_lyrics"] == "translated lyrics"
     assert body["final_mix"]["path"] == "mix.wav"
@@ -266,46 +271,83 @@ def test_audio_cleanup_returns_artifact_and_applied_operations(monkeypatch, stud
     assert body["limitations"] == ["not-ml-restoration"]
 
 
-def test_admin_status_includes_recent_activity(studio_client, monkeypatch):
-    from codai.admin import routes as admin_routes
+def test_recent_activity_records_a_well_formed_entry_per_tracked_request():
+    """The engine records activity; the FRONT serves it.
+
+    This used to go through /admin/api/status on the engine, which coerced
+    malformed entries on the way out (a bad timestamp to 0, a missing model to
+    an em dash). That endpoint was removed in def78c1 -- the front owns status
+    now and reads the engine's list as recorded -- so there is nothing left to
+    coerce ON THE WAY OUT, and testing it meant testing a deleted surface.
+
+    What still has to hold is that entries are well formed when they are
+    MADE: the middleware fills every field, so the list the front serves needs
+    no sanitising. That is the invariant worth pinning.
+    """
+    import asyncio
+    import json as _json
     from codai.api import log as api_log
 
     api_log._activity.clear()
-    api_log._activity.appendleft({
-        "time": 1715000000,
-        "model": "demo-model",
-        "type": "chat",
-        "status": 200,
-        "duration": 1.23,
-    })
-    api_log._activity.appendleft({
-        "time": "bad-time",
-        "model": None,
-        "type": None,
-        "status": "500",
-        "duration": "2.5",
-    })
 
-    monkeypatch.setattr(admin_routes, "config_manager", types.SimpleNamespace(models_data={}, pipelines_data=[]), raising=False)
+    class _Req:
+        method = "POST"
 
-    response = studio_client.get("/admin/api/status")
+        class url:
+            path = "/v1/chat/completions"
+        url = url()
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["recent_activity"][0] == {
-        "time": 0,
-        "model": "—",
-        "type": "unknown",
-        "status": 500,
-        "duration": 2.5,
-    }
-    assert payload["recent_activity"][1] == {
-        "time": 1715000000,
-        "model": "demo-model",
-        "type": "chat",
-        "status": 200,
-        "duration": 1.23,
-    }
+        async def body(self):
+            return _json.dumps({"model": "demo-model"}).encode()
+
+    class _Resp:
+        status_code = 200
+
+    async def _call_next(_req):
+        return _Resp()
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        api_log.log_requests(_Req(), _call_next)
+    ) if False else asyncio.run(api_log.log_requests(_Req(), _call_next))
+
+    entries = api_log.get_recent_activity()
+    assert len(entries) == 1, entries
+    e = entries[0]
+    assert set(e) == {"time", "model", "type", "status", "duration"}, e
+    assert isinstance(e["time"], int) and e["time"] > 0
+    assert e["model"] == "demo-model"
+    assert e["status"] == 200
+    assert isinstance(e["duration"], float)
+    assert e["type"], "a tracked path must record what kind of request it was"
+
+
+def test_a_request_with_no_model_still_records_a_printable_model():
+    """A body with no `model` must not record None into the activity list."""
+    import asyncio
+    from codai.api import log as api_log
+
+    api_log._activity.clear()
+
+    class _Req:
+        method = "POST"
+
+        class url:
+            path = "/v1/chat/completions"
+        url = url()
+
+        async def body(self):
+            return b"not json at all"
+
+    class _Resp:
+        status_code = 500
+
+    async def _call_next(_req):
+        return _Resp()
+
+    asyncio.run(api_log.log_requests(_Req(), _call_next))
+    e = api_log.get_recent_activity()[0]
+    assert e["model"] == "\u2014", e        # an em dash, not None
+    assert e["status"] == 500
 
 
 def test_chat_template_wires_preview_shells_for_new_runnable_panels():
@@ -394,7 +436,13 @@ def test_pipeline_tab_drops_split_selection_helpers():
 
     assert "renderPipelineList" not in text
     assert "pipelineState = {" not in text
-    assert "selectedId" not in text
+    # Was `"selectedId" not in text`, which used a generic identifier as a
+    # proxy for "the pipeline split-selection UI is gone". Unrelated code then
+    # took the same obvious name -- per-capability model selection reads a
+    # `selectedId` -- and the test began failing for a variable that has
+    # nothing to do with pipelines. Pinned to the pipeline state instead.
+    assert "pipelineState.selectedId" not in text
+    assert "pipelineSelectedId" not in text
 
 
 def test_pipeline_tab_keeps_inline_saved_pipeline_cards():
@@ -405,3 +453,35 @@ def test_pipeline_tab_keeps_inline_saved_pipeline_cards():
     assert '<details class="pipe-card"' in text
     assert "editCustomPipeline" in text
     assert "deleteCustomPipeline" in text
+
+
+def test_a_music_dub_that_skipped_a_stage_reports_degraded(monkeypatch, studio_client):
+    """`complete` vs `degraded` is the difference between a full run and a
+    mix that was produced with a stage skipped or fallen back -- a caller that
+    reads only `final_mix` would ship the second believing it was the first."""
+    from codai.api import custom_pipelines
+
+    async def fake_run(request, http_request):
+        return {
+            "vocals": {"path": "v.wav"},
+            "instrumental": {"path": "i.wav"},
+            "transcript": "lyrics",
+            "translated_lyrics": "",
+            "converted_vocals": None,
+            "final_mix": {"path": "mix.wav"},
+            "steps": [{"step": 0, "type": "stems"}],
+            "complete": False,
+            "warnings": ["translation unavailable; original lyrics kept"],
+        }
+
+    monkeypatch.setattr(custom_pipelines, "run_full_music_dub", fake_run)
+    response = studio_client.post(
+        "/v1/pipelines/audio-music-dub",
+        json={"audio_model": "whisper-small", "audio": "ZmFrZQ==",
+              "target_lang": "es"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded", body
+    assert body["warnings"] == ["translation unavailable; original lyrics kept"]
+    assert body["final_mix"]["path"] == "mix.wav"

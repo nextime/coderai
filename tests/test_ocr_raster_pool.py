@@ -303,13 +303,34 @@ def test_a_broken_pool_is_remembered_rather_than_retried_per_document(monkeypatc
 
 def test_a_busy_pool_falls_back_instead_of_queueing_forever(monkeypatch):
     """Waiting longer than WAIT_SECONDS just moves the queue somewhere less
-    visible; rasterising in-process makes progress."""
+    visible; rasterising in-process makes progress.
+
+    The worker is stubbed because what is under test is what a BUSY pool does,
+    not whether a worker can start: a real one needs pypdfium2, and without it
+    `acquire` correctly returns None straight away (the in-process fallback),
+    so the test passed or failed on whether that package happened to be
+    installed rather than on the behaviour it describes.
+    """
     rz.reset_pool()
+
+    class _StubWorker:
+        """The pool's whole contract with a worker: alive / close_doc / kill."""
+
+        def alive(self):
+            return True
+
+        def close_doc(self):
+            pass
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(rz, "_Worker", _StubWorker)
     # Built directly: get_pool(1) is "in-process", by design, so it returns None.
     pool = rz.RasterPool(1)
     monkeypatch.setattr(type(pool), "WAIT_SECONDS", 0.2)
     held = pool.acquire()
-    assert held is not None
+    assert held is not None, "the only worker was not handed out"
     try:
         import time
         t0 = time.time()

@@ -32,7 +32,42 @@ def test_a_gguf_path_stays_silent(capsys):
 
 
 def test_an_explicit_none_stays_silent(capsys):
-    """"none" is how a card says "leave this component alone"."""
+    """"none" is how a card says "leave this component alone".
+
+    Asserted on the COMPONENT, not on the phrase: the sibling asks for 4bit,
+    and on a build without bitsandbytes that legitimately reports its own
+    full-precision warning. Matching the bare phrase made this test depend on
+    whether bitsandbytes happened to be installed.
+    """
     cfg = {"component_quantization": {"vae": "none", "text_encoder": "4bit"}}
     hf_loading.build_pipeline_quant_config("m", cfg, "bfloat16")
-    assert "FULL PRECISION" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    offending = [ln for ln in out.splitlines()
+                 if "FULL PRECISION" in ln and "vae" in ln.lower()]
+    assert not offending, f"'none' was called out as a mistake: {offending}"
+
+
+def test_a_bnb_mode_without_bitsandbytes_is_reported_not_raised(capsys, monkeypatch):
+    """Constructing a BitsAndBytesConfig without the package raises.
+
+    The import succeeds either way; only construction consults
+    importlib.metadata, so a Vulkan-only or CPU install got
+    PackageNotFoundError("No package metadata was found for bitsandbytes") --
+    an error naming neither the model nor the setting that asked for it. It is
+    a configuration to report, and reported as loudly as an unrecognised mode,
+    because the consequence is the same: full precision.
+    """
+    import codai.models.hf_loading as H
+
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("No package metadata was found for bitsandbytes")
+
+    monkeypatch.setattr("diffusers.BitsAndBytesConfig", _Boom, raising=False)
+    monkeypatch.setattr("transformers.BitsAndBytesConfig", _Boom, raising=False)
+    qc, desc = H.build_pipeline_quant_config(
+        "m", {"component_quantization": {"text_encoder": "4bit"}}, "bfloat16")
+    out = capsys.readouterr().out
+    assert "bitsandbytes" in out and "FULL PRECISION" in out, out
+    # And it must not pretend the component was quantized.
+    assert "text_encoder" not in (desc or "")

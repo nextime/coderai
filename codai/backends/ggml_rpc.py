@@ -114,14 +114,23 @@ def _load_libs():
 
 def available() -> Tuple[bool, str]:
     """(True, "") when the bundled llama.cpp has the RPC backend; else why not."""
+    # Every refusal has to name the capability and the fix, not just the
+    # proximate error. A bare "No module named 'llama_cpp'" is true but says
+    # nothing about GGML_RPC or about the model that asked for remote servers,
+    # and this string is what the operator is shown when a model naming RPC
+    # servers refuses to load.
     try:
         base, _ = _load_libs()
     except Exception as exc:
-        return False, str(exc)
+        return False, (f"the GGML_RPC backend is unavailable: llama-cpp-python "
+                       f"could not be loaded ({exc}) — install it built with "
+                       f"CMAKE_ARGS including -DGGML_RPC=ON (build.sh does)")
     try:
         reg = base.ggml_backend_reg_by_name(b"RPC")
     except Exception as exc:
-        return False, str(exc)
+        return False, (f"the GGML_RPC backend could not be queried in the "
+                       f"bundled llama-cpp-python ({exc}) — rebuild it with "
+                       f"CMAKE_ARGS including -DGGML_RPC=ON (build.sh does)")
     if not reg:
         return False, ("the bundled llama-cpp-python was built without GGML_RPC — "
                        "rebuild it with CMAKE_ARGS including -DGGML_RPC=ON "

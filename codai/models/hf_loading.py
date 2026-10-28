@@ -213,10 +213,27 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
         if mode == '2bit':
             return _quanto_cfg(lib)
         BnB = TfBnb if lib == 'transformers' else DiffBnb
-        if mode == '4bit':
-            return BnB(load_in_4bit=True, bnb_4bit_quant_type='nf4',
-                       bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
-        return BnB(load_in_8bit=True)
+        # Importing BitsAndBytesConfig succeeds without bitsandbytes installed;
+        # CONSTRUCTING one does not. transformers/diffusers check the installed
+        # version through importlib.metadata, which raises
+        # PackageNotFoundError("No package metadata was found for
+        # bitsandbytes") -- an error that names neither the model nor the
+        # setting that asked for it. A Vulkan-only or CPU install legitimately
+        # has no bitsandbytes, so this is a configuration to report, not a
+        # crash. Said as loudly as an unrecognised mode, because the
+        # consequence is the same: the component loads at full precision.
+        try:
+            if mode == '4bit':
+                return BnB(load_in_4bit=True, bnb_4bit_quant_type='nf4',
+                           bnb_4bit_compute_dtype=dtype,
+                           bnb_4bit_use_double_quant=True)
+            return BnB(load_in_8bit=True)
+        except Exception as e:
+            print(f"  WARNING: {mode} requested but bitsandbytes is not usable "
+                  f"here ({e}), so this component loads at FULL PRECISION. "
+                  f"Install bitsandbytes, or use a .gguf path in "
+                  f"'component_quantization' for a build without it.")
+            return None
 
     def _bnb_incompatible(name: str) -> bool:
         # bitsandbytes (4/8-bit) and optimum-quanto (2-bit) only quantize

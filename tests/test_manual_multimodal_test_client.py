@@ -80,10 +80,22 @@ def test_resolve_mode_config_uses_mode_defaults_when_overrides_absent(tmp_path):
 
 
 def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
+    """main() must hand uvicorn the app OBJECT and put the config on its state.
+
+    Passing an import string instead would import the module a second time and
+    give the server a different app than the one carrying the state.
+
+    Run with engine_only: the default boot became the front/engine split, where
+    this process becomes the front proxy (`run_front(...); return`) and never
+    serves the app at all. The behaviour under test now lives in the ENGINE
+    path, which is the process that still runs the full app.
+    """
     import codai.main as main_module
     from codai.api import app as app_module
 
     fake_args = type("Args", (), {
+        "engine_only": True,
+        "system_only": False,
         "config": "/tmp/coderai-test",
         "dump": False,
         "debug": False,
@@ -97,7 +109,26 @@ def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
         "vulkan_list_devices": False,
         "download_gguf": None,
     })()
-    fake_server = type("ServerCfg", (), {
+    # Each stand-in section falls back to the REAL config's corresponding
+    # section for anything it does not name, so a field main() starts reading
+    # does not break this test over a value it has no opinion about --
+    # `archive`, then `broker`, then models.max_model_instances each did
+    # exactly that, one run at a time. The named values still win: they are
+    # what keeps main() on the narrow path the test wants. Handing it a wholly
+    # real Config instead lets it reach work the test does not want done (it
+    # blocks on the front/engine boot).
+    from codai.config import Config as _RealConfig
+    _real_defaults = _RealConfig()
+
+    def _section(real, **named):
+        class _S:
+            def __getattr__(self, n):
+                return getattr(real, n)
+        for _k, _v in named.items():
+            setattr(_S, _k, _v)
+        return _S()
+
+    fake_server = _section(_real_defaults.server, **{
         "host": "127.0.0.1",
         "port": 8765,
         "https": False,
@@ -105,17 +136,17 @@ def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
         "https_cert_path": None,
         "queue_max_size": 1,
         "max_parallel_requests": 1,
-    })()
-    fake_backend = type("BackendCfg", (), {"type": "vulkan"})()
-    fake_config = type("Config", (), {
+    })
+    fake_backend = _section(_real_defaults.backend, **{"type": "vulkan"})
+    fake_config = _section(_real_defaults, **{
         "server": fake_server,
         "backend": fake_backend,
         "system_prompt": "",
         "tools_closer_prompt": "",
         "grammar_guided": False,
         "file_path": "/tmp",
-        "models": type("ModelsCfg", (), {"load_mode": "ondemand", "default_load_mode": "ondemand", "hf_cache_dir": None, "gguf_cache_dir": None})(),
-        "offload": type("OffloadCfg", (), {
+        "models": _section(_real_defaults.models, load_mode="ondemand", default_load_mode="ondemand", hf_cache_dir=None, gguf_cache_dir=None),
+        "offload": _section(_real_defaults.offload, **{
             "directory": "/tmp",
             "manual_ram_gb": None,
             "strategy": "auto",
@@ -124,8 +155,8 @@ def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
             "load_in_8bit": False,
             "flash_attention": False,
             "max_gpu_percent": None,
-        })(),
-        "image": type("ImageCfg", (), {
+        }),
+        "image": _section(_real_defaults.image, **{
             "sample_method": "res_multistep",
             "steps": 4,
             "width": 512,
@@ -136,14 +167,14 @@ def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
             "seed": None,
             "vae_tiling": False,
             "clip_on_cpu": False,
-        })(),
+        }),
         "parser": None,
         "hf_chat_templates": None,
         "reasoning_options": None,
-        "whisper": type("WhisperCfg", (), {"server_path": None, "server_port": 8744})(),
-        "vulkan": type("VulkanCfg", (), {"n_gpu_layers": -1, "n_ctx": 2048, "device_id": 0, "single_gpu": False})(),
+        "whisper": _section(_real_defaults.whisper, server_path=None, server_port=8744),
+        "vulkan": _section(_real_defaults.vulkan, n_gpu_layers=-1, n_ctx=2048, device_id=0, single_gpu=False),
         "nvidia": type("NvidiaCfg", (), {})(),
-    })()
+    })
     fake_config_mgr = type("ConfigMgr", (), {
         "models_data": {},
         "pipelines_data": [],
@@ -195,10 +226,14 @@ def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
 
     captured = {}
 
-    def fake_run(target, host, port, ssl_context=None):
+    def fake_run(target, host=None, port=None, **kwargs):
+        # **kwargs, not a fixed signature: what this test is about is the app
+        # OBJECT reaching uvicorn, and pinning every other argument made it
+        # fail whenever an unrelated one was added (log_level, log_config).
         captured["target"] = target
         captured["host"] = host
         captured["port"] = port
+        captured["kwargs"] = kwargs
         raise _MainExit()
 
     monkeypatch.setattr("uvicorn.run", fake_run)

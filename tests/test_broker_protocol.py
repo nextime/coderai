@@ -78,7 +78,14 @@ class FakeWebSocket:
 
 
 @pytest.mark.anyio("asyncio")
-async def test_broker_client_waits_for_registered_before_register():
+async def test_broker_client_speaks_first_and_sends_register():
+    """The client sends op=register before reading anything.
+
+    It used to wait for an unsolicited event=registered and only then send its
+    register, which needed two reads and an ack frame. The protocol now has the
+    CLIENT speak first and the server answer with event=registered carrying the
+    session id, so there is one read and no separate ack.
+    """
     websocket = FakeWebSocket(
         [
             json.dumps(
@@ -114,10 +121,15 @@ async def test_broker_client_waits_for_registered_before_register():
         ):
             await client.connect_and_register()
 
+    # Keepalive pings are part of the connection now: a silent socket was
+    # being dropped by intermediaries, which showed up as episodic stalls.
+    _ping = runtime.websocket_ping_interval or 20
     connect_mock.assert_awaited_once_with(
         runtime.websocket_url,
         additional_headers=runtime.headers,
         open_timeout=runtime.connect_timeout_seconds,
+        ping_interval=_ping,
+        ping_timeout=max(_ping * 2, 60),
     )
     assert client.websocket is websocket
     assert client.session_id == "session-123"
@@ -125,7 +137,9 @@ async def test_broker_client_waits_for_registered_before_register():
 
     register_message = json.loads(websocket.sent_messages[0])
     assert register_message["op"] == "register"
-    assert register_message["request_id"] == "session-123"
+    # Its own id, minted before a session exists -- the session id is what the
+    # server answers WITH, so it cannot also be what the client asks under.
+    assert register_message["request_id"].startswith("reg-")
     assert register_message["capabilities"] == register_message["payload"]["capabilities"]
     assert register_message["payload"]["registration_token"] == "token"
     assert register_message["payload"]["hardware"]["gpu_count"] == 0
@@ -150,7 +164,10 @@ async def test_broker_client_rejects_registered_ack_without_session_id():
         with pytest.raises(ValueError, match="broker did not accept registration"):
             await client.connect_and_register()
 
-    assert websocket.sent_messages == []
+    # The register HAS been sent by then -- the client speaks first, so the
+    # rejection is of the answer, not a refusal to ask.
+    assert len(websocket.sent_messages) == 1
+    assert json.loads(websocket.sent_messages[0])["op"] == "register"
 
 
 @pytest.mark.anyio("asyncio")
@@ -172,10 +189,13 @@ async def test_broker_client_passes_connect_timeout_to_websocket_connection():
         client = BrokerClient(runtime)
         await client.connect_and_register()
 
+    _ping = runtime.websocket_ping_interval or 20
     connect_mock.assert_awaited_once_with(
         runtime.websocket_url,
         additional_headers=runtime.headers,
         open_timeout=runtime.connect_timeout_seconds,
+        ping_interval=_ping,
+        ping_timeout=max(_ping * 2, 60),
     )
 
 
@@ -200,23 +220,37 @@ async def test_broker_client_applies_request_timeout_to_socket_reads():
         client = BrokerClient(runtime)
         await client.connect_and_register()
 
-    assert timeout_calls == [runtime.request_timeout_seconds, runtime.request_timeout_seconds]
+    # ONE read: the client speaks first, so registration costs a single
+    # recv (the event=registered answer) instead of an event plus an ack.
+    assert timeout_calls == [runtime.request_timeout_seconds]
 
 
 @pytest.mark.anyio("asyncio")
-async def test_broker_client_rejects_failed_register_ack():
-    websocket = FakeWebSocket(
-        [
-            json.dumps({"event": "registered", "status": "ok", "session_id": "session-123"}),
-            json.dumps({"request_id": "session-123", "status": "error"}),
-        ]
-    )
+@pytest.mark.parametrize("answer,why", [
+    ({"event": "registered", "status": "error", "session_id": "s1"},
+     "a registered event that reports an error"),
+    ({"event": "rejected", "status": "ok", "session_id": "s1"},
+     "some other event in place of registered"),
+    ({"status": "ok", "session_id": "s1"},
+     "an answer with no event at all"),
+])
+async def test_broker_client_rejects_an_answer_that_is_not_an_accepted_registration(answer, why):
+    """There is no separate ack frame to reject any more.
+
+    Registration used to be a four-step exchange whose last step was an ack the
+    client validated on its own. The server now answers the register directly,
+    so everything that used to be "a failed ack" is one check on that answer --
+    and it has to reject every shape that is not an accepted registration, not
+    just a missing session id.
+    """
+    websocket = FakeWebSocket([json.dumps(answer)])
     runtime = BrokerRuntimeConfig(enabled=True, headers={"Authorization": "Bearer token"})
 
     with patch("codai.broker.client.websockets.connect", new=AsyncMock(return_value=websocket)):
         client = BrokerClient(runtime)
-        with pytest.raises(ValueError, match="broker did not acknowledge register message"):
+        with pytest.raises(ValueError, match="broker did not accept registration"):
             await client.connect_and_register()
+    assert client.session_id in (None, ""), f"a session was kept despite {why}"
 
 
 @pytest.mark.anyio("asyncio")
@@ -330,6 +364,23 @@ async def test_broker_client_replies_to_heartbeat():
     dispatcher.assert_not_awaited()
 
 
+def _pending_frame(request_id):
+    """The immediate keepalive the client sends before doing the work.
+
+    A request that takes minutes (a model download, a long generation) was
+    being timed out by the broker side, so the client acknowledges at once to
+    extend the deadline and then keeps sending these while it runs. It is
+    suppressed per model through `status_gate`; on by default.
+    """
+    return json.dumps({
+        "v": 1,
+        "event": "pending",
+        "status": "pending",
+        "request_id": request_id,
+        "payload": {"message": "processing", "estimated_timeout": 300},
+    })
+
+
 @pytest.mark.anyio("asyncio")
 async def test_broker_client_dispatches_non_heartbeat_messages():
     websocket = FakeWebSocket([])
@@ -359,7 +410,10 @@ async def test_broker_client_dispatches_non_heartbeat_messages():
         "status": "ok",
         "payload": {"status": "handled"},
     }
-    assert websocket.sent_messages == [json.dumps(response)]
+    assert websocket.sent_messages == [
+        _pending_frame("req-dispatch"),
+        json.dumps(response),
+    ]
 
 
 @pytest.mark.anyio("asyncio")
@@ -403,7 +457,10 @@ async def test_broker_client_dispatches_request_messages_through_fastapi_app():
     assert response["payload"]["status_code"] == 200
     assert response["payload"]["content_type"] == "application/json"
     assert response["payload"]["body"] == '{"received":{"message":"hello"},"route":"chat"}'
-    assert client.websocket.sent_messages == [json.dumps(response)]
+    assert client.websocket.sent_messages == [
+        _pending_frame("req-app"),
+        json.dumps(response),
+    ]
 
 
 @pytest.mark.anyio("asyncio")
@@ -767,3 +824,48 @@ async def test_fastapi_lifespan_stops_broker_service_before_model_cleanup():
         "multi-model-cleanup",
         "model-cleanup",
     ]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_the_pending_keepalive_is_suppressed_when_the_status_gate_says_no():
+    """`load_status_updates` off for a model means no out-of-band frames.
+
+    The gate exists so a model configured to stay quiet does not emit progress
+    chatter, matching the SSE side in the front proxy. Nothing covered it, so
+    the keepalive could have been made unconditional without a test noticing.
+    """
+    websocket = FakeWebSocket([])
+    runtime = BrokerRuntimeConfig(enabled=True)
+    dispatcher = AsyncMock(return_value={
+        "request_id": "req-quiet", "status": "ok", "payload": {"status": "handled"}})
+    client = BrokerClient(runtime, dispatcher=dispatcher)
+    client.websocket = websocket
+    client.status_gate = lambda model: False
+
+    raw = json.dumps({"op": "request", "request_id": "req-quiet",
+                      "payload": {"path": "/v1/models", "body": {"model": "quiet"}}})
+    response = await client.handle_message(raw)
+
+    assert websocket.sent_messages == [json.dumps(response)], (
+        "a pending keepalive was sent although the status gate refused it")
+
+
+@pytest.mark.anyio("asyncio")
+async def test_the_gate_defaults_to_sending_when_it_cannot_be_consulted():
+    """A broken gate must not cost the relay its deadline extension."""
+    websocket = FakeWebSocket([])
+    runtime = BrokerRuntimeConfig(enabled=True)
+    dispatcher = AsyncMock(return_value={
+        "request_id": "req-boom", "status": "ok", "payload": {}})
+    client = BrokerClient(runtime, dispatcher=dispatcher)
+    client.websocket = websocket
+
+    def _boom(model):
+        raise RuntimeError("gate unavailable")
+
+    client.status_gate = _boom
+    await client.handle_message(json.dumps(
+        {"op": "request", "request_id": "req-boom", "payload": {"path": "/v1/models"}}))
+
+    assert websocket.sent_messages[0] == _pending_frame("req-boom"), (
+        "a gate that raised suppressed the keepalive; it must fail open")

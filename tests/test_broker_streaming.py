@@ -27,24 +27,27 @@ async def test_stream_chunk_envelope_preserves_request_id_and_order():
         data={"delta": "lo"},
     )
 
+    # The wire names are `chunk` per piece and a terminal `done`, with the
+    # piece itself under payload.chunk -- see the stream relay in
+    # codai/broker/client.py, which the broker side is built against.
     assert chunk_one == {
         "v": 1,
         "request_id": "req-stream",
         "status": "ok",
-        "event": "stream",
+        "event": "chunk",
         "payload": {
             "sequence": 0,
-            "data": {"delta": "hel"},
+            "chunk": {"delta": "hel"},
         },
     }
     assert chunk_two == {
         "v": 1,
         "request_id": "req-stream",
         "status": "ok",
-        "event": "stream",
+        "event": "chunk",
         "payload": {
             "sequence": 1,
-            "data": {"delta": "lo"},
+            "chunk": {"delta": "lo"},
         },
     }
 
@@ -61,7 +64,7 @@ async def test_finalize_stream_attaches_metrics():
         "v": 1,
         "request_id": "req-stream",
         "status": "ok",
-        "event": "stream_end",
+        "event": "done",
         "payload": {
             "total_chunks": 2,
         },
