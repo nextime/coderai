@@ -1921,6 +1921,20 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     except Exception:
         pass
 
+    # Sequential text-encoder offload: encode the prompt, hand the encoder's
+    # VRAM back, then denoise from the embeddings. The encoder runs once per
+    # request and is dead weight for every step after, but it keeps its VRAM --
+    # 7.5 GiB of Z-Image's 19.2 GiB pipeline. Opt-in per model
+    # (`sequential_text_encoder`), because freeing it costs a host-RAM copy and
+    # only pays on models big enough to care.
+    if bool((model_config or {}).get('sequential_text_encoder')):
+        try:
+            from codai.models.text_encoder_offload import encode_then_free
+            call_kwargs, _ = await asyncio.to_thread(
+                encode_then_free, pipeline, call_kwargs)
+        except Exception as _teo:
+            print(f"  [text-encoder-offload] skipped ({_teo})", flush=True)
+
     try:
         result = await asyncio.to_thread(pipeline, **call_kwargs)
     except TaskCancelled:

@@ -3047,6 +3047,25 @@ def _generate_video(pipe, request: VideoGenerationRequest):
                 if _comp:
                     print(f"  [video][components] {type(pipe).__name__} cannot be split "
                           f"across machines; running here", flush=True)
+                # Sequential text-encoder offload (the Motus C5 ask): encode
+                # the prompt, hand the encoder's VRAM back, then denoise. On
+                # LTX-2.3 the 4-bit Gemma-3-12B encoder is ~6.5 GiB in front of
+                # a 15 GiB transformer, which is the sum that made PinkCherry
+                # declare 24.0 GB on a 24 GiB card and get pushed to CPU
+                # offload. Opt-in per model, since freeing it costs a host-RAM
+                # copy and only pays where the card is actually tight.
+                _teo_cfg = multi_model_manager._config_for_model(
+                    getattr(request, 'model', None) or '') or {}
+                _teo_raw = _teo_cfg.get('_raw_cfg') \
+                    if isinstance(_teo_cfg.get('_raw_cfg'), dict) else {}
+                if bool(_teo_cfg.get('sequential_text_encoder')
+                        or (_teo_raw or {}).get('sequential_text_encoder')):
+                    try:
+                        from codai.models.text_encoder_offload import encode_then_free
+                        kw, _ = encode_then_free(pipe, kw)
+                    except Exception as _teo:
+                        print(f"  [text-encoder-offload] skipped ({_teo})",
+                              flush=True)
                 frames = _run_pipeline(pipe, kw, _gen_audio)
     except TaskCancelled:
         _vid_progress_done()

@@ -2941,6 +2941,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # doubling the VRAM of every unquantized tensor on the card.
                 # A card decides its own precision; the hardware does not.
                 "precision",
+                # Encode the prompt, hand the text encoder's VRAM back, then
+                # denoise. The encoder runs once per request and is dead weight
+                # for every step after, but keeps its VRAM -- 7.5 GiB of
+                # Z-Image's 19.2 GiB, ~6.5 GiB of LTX-2.3's in front of a 15 GiB
+                # transformer. Per-model because freeing it costs a host-RAM
+                # copy and only pays where the card is tight.
+                "sequential_text_encoder",
                 "flash_attention", "no_ram", "offload_strategy", "offload_dir",
                 "system_prompt", "parser", "tools_closer_prompt", "grammar_guided",
                 "max_instances", "preload_all_instances", "capabilities",

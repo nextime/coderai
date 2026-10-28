@@ -1469,7 +1469,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-8bit"> 8-bit quantization</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-flash"> Flash Attention 2</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-noram"> No RAM fallback</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-seqtext"> Free the text encoder after encoding</label>
       </div>
+      <span class="form-hint" style="font-size:11px">A text encoder runs <b>once</b> per request, before the first denoising step, and then keeps its VRAM for the whole generation doing nothing. Freeing it hands that back to the denoiser: 7.5&nbsp;GiB of Z-Image&rsquo;s 19.2&nbsp;GiB pipeline, or the ~6.5&nbsp;GiB 4-bit encoder sitting in front of an LTX-2.3 transformer. Worth it when the model is close to the card&rsquo;s limit — it can be the difference between staying resident and being pushed to CPU offload. It costs a host-RAM copy of the encoder, so leave it off for models that already fit comfortably.</span>
 
       <div class="form-group" style="margin-top:.75rem">
         <label class="form-label" for="cfg-precision">Precision (compute dtype)</label>
@@ -4403,6 +4405,7 @@ function openCfgModal(idx, cfgIdx){
   _refreshQuantStatus(m.path);
   _renderComponentQuant(s.component_quantization || {});
   document.getElementById('cfg-precision').value = s.precision || '';
+  document.getElementById('cfg-seqtext').checked = !!s.sequential_text_encoder;
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   // Falls back to the VRAM-preferring strategy, not plain 'auto': 'auto'
@@ -5498,6 +5501,7 @@ async function saveModelConfig(){
     // "" means "not configured" and is stored as null, so the loader's own
     // default applies rather than an empty string reaching resolve_dtype.
     precision:         document.getElementById('cfg-precision').value || null,
+    sequential_text_encoder: document.getElementById('cfg-seqtext').checked,
     flash_attention:   document.getElementById('cfg-flash').checked,
     no_ram:            document.getElementById('cfg-noram').checked,
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
