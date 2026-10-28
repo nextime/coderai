@@ -1523,9 +1523,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
           <select id="cfg-offload-strategy" class="form-input">
-            <option value="auto">Auto (over-VRAM → straight to model offload)</option>
-            <option value="auto-borderline">Auto borderline-aware (try full-GPU if marginally over)</option>
-            <option value="none">None (GPU only)</option>
+            <option value="auto-borderline">Prefer VRAM — try the card, offload only if it really will not fit (recommended)</option>
+            <option value="auto">Auto — offload as soon as the estimate exceeds free VRAM (never tries)</option>
+            <option value="none">None (GPU only, fails instead of offloading)</option>
             <option value="model">CPU offload (model — active component on GPU)</option>
             <option value="group">Group offload + stream (block-level, prefetched)</option>
             <option value="balanced">Balanced (fill GPU, spill to CPU → disk)</option>
@@ -4405,7 +4405,10 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-precision').value = s.precision || '';
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
-  document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
+  // Falls back to the VRAM-preferring strategy, not plain 'auto': 'auto'
+  // offloads on the ESTIMATE alone, which on a conservative or hand-entered
+  // used_vram_gb permanently exiles a model that would have fit.
+  document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto-borderline';
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
   _applyBackendCfgVisibility(m);
   // gpu_split → "Split — <lead engine> first" (lead = the pinned engine, or the

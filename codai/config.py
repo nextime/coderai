@@ -254,7 +254,24 @@ class ModelsConfig:
 class OffloadConfig:
     """Offload configuration."""
     directory: str = "./offload"
-    strategy: str = "auto"
+    # Prefer VRAM; offload only when there is genuinely no other choice.
+    #
+    # `auto` condemns a model on its ESTIMATE: if used_vram_gb exceeds free
+    # VRAM it goes straight to CPU offload without ever trying. That estimate
+    # is a measurement from an earlier load in some cards and a hand-entered
+    # round number in others -- LTX-2.3-PinkCherry declares exactly 24.0 on a
+    # 24 GiB card -- so a conservative figure permanently exiles a model that
+    # would have fit. `auto-borderline` tries the card first when the overshoot
+    # is within _BORDERLINE_GB and falls back on a real OOM, which is the same
+    # outcome when it does not fit and a resident model when it does.
+    #
+    # The cost of being wrong is asymmetric, which is what makes this the right
+    # default: guessing "fits" wrongly costs one failed attempt and a fallback,
+    # while guessing "does not fit" wrongly costs a CPU copy of every component
+    # and a PCIe trip per request, for the life of the install. On the host that
+    # prompted this, video renders were holding 28-37 GB of host RAM each that
+    # way, on a box with 54 GB and no cgroup limit.
+    strategy: str = "auto-borderline"
     max_gpu_percent: Optional[float] = None
     no_ram: bool = False
     load_in_4bit: bool = False

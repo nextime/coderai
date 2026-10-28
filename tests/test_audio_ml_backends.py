@@ -1,7 +1,7 @@
 from pathlib import Path
 import sys
 
-sys.path.insert(0, '/storage/coderai')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codai.api.audio_backends import detect_audio_backends, reset_audio_backend_cache
 
@@ -41,6 +41,6 @@ def test_detect_audio_backends_prefers_deepfilter_for_restoration(monkeypatch):
 
 
 def test_requirements_include_audio_ml_dependencies():
-    req = Path('/storage/coderai/requirements.txt').read_text().lower()
+    req = (Path(__file__).resolve().parents[1] / 'requirements.txt').read_text().lower()
     assert 'demucs' in req
     assert 'deepfilternet' in req or 'df[' in req

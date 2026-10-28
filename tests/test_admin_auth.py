@@ -4,7 +4,13 @@ import json
 import sys
 
 
-AUTH_MODULE_PATH = "/storage/coderai/codai/admin/auth.py"
+# Relative to this file, not an absolute host path: the repo is mounted at a
+# different place when the suite runs inside the production image (/src), and a
+# hardcoded /storage/coderai made collection fail there outright -- so every
+# test in this file was only ever exercised against the host's dependency set.
+from pathlib import Path as _Path
+AUTH_MODULE_PATH = str(_Path(__file__).resolve().parents[1]
+                       / "codai" / "admin" / "auth.py")
 spec = importlib.util.spec_from_file_location("test_admin_auth_module", AUTH_MODULE_PATH)
 auth_module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = auth_module

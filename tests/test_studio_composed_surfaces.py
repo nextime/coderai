@@ -351,7 +351,8 @@ def test_a_request_with_no_model_still_records_a_printable_model():
 
 
 def test_chat_template_wires_preview_shells_for_new_runnable_panels():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "id=\"at-preview\"" in text
@@ -371,7 +372,8 @@ def test_chat_template_wires_preview_shells_for_new_runnable_panels():
 
 
 def test_chat_template_marks_full_quality_audio_panels_with_runtime_backend_metadata():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "audioBackendHealth" in text
@@ -382,7 +384,8 @@ def test_chat_template_marks_full_quality_audio_panels_with_runtime_backend_meta
 
 
 def test_chat_template_exposes_ml_preview_and_artifact_markers():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "buildStemPreviewData" in text
@@ -394,7 +397,8 @@ def test_chat_template_exposes_ml_preview_and_artifact_markers():
 
 
 def test_studio_generation_panel_uses_wider_control_column():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert ".gen-ctrl { width:min(380px,36vw); min-width:340px; max-width:420px;" in text
@@ -402,7 +406,8 @@ def test_studio_generation_panel_uses_wider_control_column():
 
 
 def test_studio_output_surfaces_capability_warnings():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "cap-output-note" in text
@@ -411,7 +416,8 @@ def test_studio_output_surfaces_capability_warnings():
 
 
 def test_pipeline_tab_renders_builder_before_saved_custom_cards():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     builder_index = text.index('id="pipe-builder-card"')
@@ -421,7 +427,8 @@ def test_pipeline_tab_renders_builder_before_saved_custom_cards():
 
 
 def test_pipeline_tab_drops_split_shell_layout():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert 'class="pipe-shell"' not in text
@@ -431,7 +438,8 @@ def test_pipeline_tab_drops_split_shell_layout():
 
 
 def test_pipeline_tab_drops_split_selection_helpers():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "renderPipelineList" not in text
@@ -446,7 +454,8 @@ def test_pipeline_tab_drops_split_selection_helpers():
 
 
 def test_pipeline_tab_keeps_inline_saved_pipeline_cards():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = str(Path(__file__).resolve().parents[1]
+                        / "codai" / "admin" / "templates" / "chat.html")
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "renderCustomPipelineCards" in text
