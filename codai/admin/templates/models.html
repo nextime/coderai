@@ -45,6 +45,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 <div class="tabs">
   <button class="tab active" onclick="switchTab('local', this)">Local models</button>
   <button class="tab" onclick="switchTab('search', this)">Find on HuggingFace</button>
+  <button class="tab" onclick="switchTab('lipsync', this); loadLipsyncEngines()">Lip-sync engines</button>
 </div>
 
 <!-- active downloads strip (all tabs) -->
@@ -1841,6 +1842,21 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
   </div>
   <div id="info-body" style="padding:1.25rem 1.5rem"></div>
 </div>
+
+<!-- LIP-SYNC ENGINES -->
+<div id="tab-lipsync" class="tab-panel">
+  <div class="card">
+    <div class="card-title">Lip-sync engines</div>
+    <p style="color:var(--text-2);font-size:13px;margin:.25rem 0 1rem">
+      Video-driven presenter engines. They are not models.json entries: each runs in
+      its own interpreter as a subprocess, so the model manager cannot load one into
+      VRAM and they carry no row in the VRAM ledger. The inference code ships in the
+      repo; installing fetches the weights and builds the engine's venv, which takes
+      minutes and several GB.
+    </p>
+    <div id="lipsync-list">Loading…</div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -1887,6 +1903,90 @@ function switchTab(name,btn){
   document.getElementById('tab-'+name).classList.add('active');
   btn.classList.add('active');
 }
+
+/* ── Lip-sync engines ────────────────────────────────── */
+let _lipsyncPoll = null;
+
+function _lipsyncBadge(e){
+  if (e.state === 'running') return '<span class="badge" style="background:#8a6d1f22;color:#8a6d1f">installing…</span>';
+  if (e.state === 'failed')  return '<span class="badge" style="background:#a3321f22;color:#a3321f">install failed</span>';
+  if (e.available)           return '<span class="badge" style="background:#1f6f4322;color:#1f6f43">ready</span>';
+  if (e.installed)           return '<span class="badge" style="background:#8a6d1f22;color:#8a6d1f">weights present, venv not usable</span>';
+  return '<span class="badge" style="background:#5c616922;color:var(--text-2)">not installed</span>';
+}
+
+function renderLipsyncEngines(engines){
+  const el = document.getElementById('lipsync-list');
+  if (!engines || !engines.length){ el.innerHTML = '<div style="color:var(--text-2)">No managed engines.</div>'; return; }
+  el.innerHTML = engines.map(e => {
+    const busy = e.state === 'running';
+    const missing = (e.missing || []).length
+      ? `<div style="font-size:12px;color:var(--text-2);margin-top:.35rem">Missing: ${e.missing.map(m=>`<code>${m}</code>`).join(', ')}</div>` : '';
+    const err = e.error
+      ? `<div style="font-size:12px;color:#a3321f;margin-top:.35rem">${e.error}</div>` : '';
+    const log = (e.log && e.log.length && (busy || e.state === 'failed'))
+      ? `<pre style="margin:.5rem 0 0;padding:.5rem;background:var(--raised);border-radius:6px;font-size:11px;max-height:9rem;overflow:auto">${e.log.join('\n').replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;')}</pre>` : '';
+    return `
+    <div style="border:1px solid var(--border);border-radius:8px;padding:.875rem;margin-bottom:.75rem">
+      <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+        <strong style="font-size:15px">${e.name}</strong>
+        ${_lipsyncBadge(e)}
+        <span style="margin-left:auto;display:flex;gap:.4rem">
+          <button class="btn btn-sm btn-secondary" ${busy?'disabled':''} onclick="installLipsync('${e.name}')">
+            ${e.installed ? 'Reinstall' : 'Install'}</button>
+          <button class="btn btn-sm btn-ghost" ${busy||!e.installed?'disabled':''} onclick="removeLipsync('${e.name}', true)">Rebuild venv</button>
+          <button class="btn btn-sm btn-ghost" ${busy||!e.installed?'disabled':''} onclick="removeLipsync('${e.name}', false)">Remove</button>
+        </span>
+      </div>
+      <div style="font-size:12px;color:var(--text-2);margin-top:.4rem">
+        python ${e.python} · <code>${e.install_dir}</code> · venv <code>${e.venv}</code>
+      </div>
+      <div style="font-size:12px;color:var(--text-2);margin-top:.2rem">
+        weights: ${(e.weights||[]).map(w=>`<code>${w}</code>`).join(', ')}
+      </div>
+      ${missing}${err}${log}
+    </div>`;
+  }).join('');
+}
+
+async function loadLipsyncEngines(){
+  try {
+    const r = await fetch('/admin/api/lipsync-engines');
+    const j = await r.json();
+    renderLipsyncEngines(j.engines || []);
+    // Poll only while something is installing, so an idle page is quiet.
+    const busy = (j.engines || []).some(e => e.state === 'running');
+    if (busy && !_lipsyncPoll) _lipsyncPoll = setInterval(loadLipsyncEngines, 3000);
+    if (!busy && _lipsyncPoll){ clearInterval(_lipsyncPoll); _lipsyncPoll = null; }
+  } catch (err) {
+    document.getElementById('lipsync-list').innerHTML =
+      '<div style="color:#a3321f">Could not read engine status: ' + err + '</div>';
+  }
+}
+
+async function installLipsync(name){
+  const ok = await showConfirm('Install ' + name + '?',
+    'This downloads several GB of weights and builds a dedicated venv. It runs in the background; you can leave this page.');
+  if (!ok) return;
+  await fetch('/admin/api/lipsync-engine-install', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({engine:name})});
+  loadLipsyncEngines();
+}
+
+async function removeLipsync(name, keepWeights){
+  const what = keepWeights
+    ? 'Delete the venv and the engine code, keeping the downloaded weights?'
+    : 'Delete the venv, the code AND the downloaded weights?';
+  const ok = await showConfirm('Remove ' + name, what);
+  if (!ok) return;
+  const r = await fetch('/admin/api/lipsync-engine-remove', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({engine:name, keep_weights:!!keepWeights})});
+  if (!r.ok){ const j = await r.json().catch(()=>({})); showAlert('Could not remove', j.detail || r.statusText); }
+  loadLipsyncEngines();
+}
+
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 

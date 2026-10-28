@@ -160,3 +160,112 @@ def test_resolve_single_file_routes_civitai_without_touching_hf(monkeypatch, tmp
     monkeypatch.setattr(H, "resolve_civitai", _fake)
     assert H.resolve_single_file("civitai:4242") == "/tmp/x.safetensors"
     assert called["ref"] == "civitai:4242"
+
+
+# ===================================== choosing WHICH file of a version to get
+# A Civitai version is not one checkpoint. Real Dream's Krea 2 V3 publishes the
+# same weights three times -- fp8 13.46 GB, int8 13.18 GB, nvfp4 8.12 GB -- and
+# they are not interchangeable: nvfp4 needs Blackwell, so on an Ampere card it
+# is 8 GB downloaded to produce a load error. Taking the largest, as this used
+# to, lands on fp8 by a 0.28 GB margin nobody chose.
+
+REAL_DREAM = [
+    {"id": 3286566, "name": "fp8.safetensors", "sizeKB": 13.46e6,
+     "metadata": {"fp": "fp8"}},
+    {"id": 3289346, "name": "nvfp4.safetensors", "sizeKB": 8.12e6,
+     "metadata": {"fp": "nvfp4"}},
+    {"id": 3304483, "name": "int8.safetensors", "sizeKB": 13.18e6,
+     "metadata": {"fp": "int8"}},
+]
+
+
+@pytest.fixture
+def ampere(monkeypatch):
+    """A card that is not Blackwell — which is every card this runs on today."""
+    import codai.models.hf_loading as H
+    monkeypatch.setattr(H, "_fp_is_runnable_here",
+                        lambda fp: (fp or "").lower() not in ("nvfp4", "fp4"))
+
+
+def test_an_explicit_file_id_is_obeyed(ampere):
+    from codai.models.hf_loading import _pick_civitai_file
+    got = _pick_civitai_file(REAL_DREAM, "3396368", "3286566")
+    assert got["name"] == "fp8.safetensors"
+
+
+def test_without_a_file_id_precision_decides_rather_than_size(ampere):
+    from codai.models.hf_loading import _pick_civitai_file
+    got = _pick_civitai_file(REAL_DREAM, "3396368", None)
+    assert got["name"] == "int8.safetensors"
+
+
+def test_a_build_this_gpu_cannot_run_is_never_chosen(ampere):
+    from codai.models.hf_loading import _pick_civitai_file
+    only_nvfp4 = [f for f in REAL_DREAM if f["metadata"]["fp"] == "nvfp4"]
+    with pytest.raises(RuntimeError) as e:
+        _pick_civitai_file(only_nvfp4, "3396368", None)
+    assert "nvfp4" in str(e.value)
+    # ...but naming it explicitly still works, for the operator who knows better.
+    assert _pick_civitai_file(only_nvfp4, "3396368", "3289346")["name"] \
+        == "nvfp4.safetensors"
+
+
+def test_a_file_id_that_is_not_there_lists_what_is(ampere):
+    from codai.models.hf_loading import _pick_civitai_file
+    with pytest.raises(RuntimeError) as e:
+        _pick_civitai_file(REAL_DREAM, "3396368", "123")
+    msg = str(e.value)
+    assert "3304483" in msg and "int8" in msg
+
+
+def test_an_unlabelled_file_is_not_rejected(ampere):
+    from codai.models.hf_loading import _pick_civitai_file
+    plain = [{"id": 1, "name": "x.safetensors", "sizeKB": 1e6, "metadata": {}}]
+    assert _pick_civitai_file(plain, "1", None)["name"] == "x.safetensors"
+
+
+@pytest.mark.parametrize("ref,vid,fid", [
+    ("civitai:3396368", "3396368", None),
+    ("civitai:3396368:3304483", "3396368", "3304483"),
+])
+def test_a_reference_may_name_the_file_as_well_as_the_version(ref, vid, fid):
+    from codai.models.hf_loading import is_single_file_ref
+    assert is_single_file_ref(ref) is True
+
+
+def test_a_non_numeric_file_id_is_refused():
+    with pytest.raises(ValueError) as e:
+        resolve_civitai("civitai:3396368:abc")
+    assert "fileId" in str(e.value)
+
+
+def test_two_precisions_of_one_version_cache_side_by_side(monkeypatch, tmp_path):
+    """Without a per-file directory the "already downloaded?" check answers with
+    whichever build happens to be biggest — the bug one level down."""
+    import codai.models.hf_loading as H
+    monkeypatch.setattr(H, "civitai_cache_root", lambda: tmp_path)
+    for fid, name, size in (("3304483", "int8.safetensors", 2_000_000),
+                            ("3286566", "fp8.safetensors", 3_000_000)):
+        d = tmp_path / "3396368" / fid
+        d.mkdir(parents=True)
+        (d / name).write_bytes(b"x" * size)
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("re-downloaded a cached file"))
+    assert resolve_civitai("civitai:3396368:3304483").endswith("int8.safetensors")
+    assert resolve_civitai("civitai:3396368:3286566").endswith("fp8.safetensors")
+
+
+def test_the_cache_root_can_be_pointed_at_the_weights_disk(monkeypatch):
+    from codai.models.hf_loading import civitai_cache_root
+    monkeypatch.setenv("CODERAI_CIVITAI_CACHE", "/AI/civitaicache")
+    assert str(civitai_cache_root()) == "/AI/civitaicache"
+
+
+def test_the_cache_root_is_not_derived_from_the_hf_cache(monkeypatch):
+    """Putting multi-GB checkpoints under the HF cache root is how a second GGUF
+    directory grew inside one."""
+    from codai.models.hf_loading import civitai_cache_root
+    monkeypatch.delenv("CODERAI_CIVITAI_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", "/AI/hfcache/huggingface")
+    assert "hfcache" not in str(civitai_cache_root())

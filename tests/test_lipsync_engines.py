@@ -370,3 +370,145 @@ def test_the_sweep_never_removes_the_run_being_set_up(le, tmp_path):
 
 def test_the_sweep_is_silent_when_there_is_nothing_to_sweep(le, tmp_path):
     assert le._sweep_run_dirs(tmp_path / "never-made") == 0
+
+
+# ── management: an operator's surface, not a python -c ───────────────────────
+
+def test_an_engine_reports_everything_the_ui_needs_without_the_network(le,
+                                                                       monkeypatch,
+                                                                       tmp_path):
+    monkeypatch.setattr(le, "install_dir", lambda n: tmp_path / n)
+    monkeypatch.setattr(le, "venv_dir", lambda n: tmp_path / (n + "_venv"))
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("status touched the network"))
+    s = le.install_state("latentsync")
+    assert s["name"] == "latentsync"
+    assert s["installed"] is False and s["available"] is False
+    assert s["state"] == "idle"
+    assert s["python"] == "3.11"
+    assert any("LatentSync" in w for w in s["weights"])
+    assert "checkpoints/latentsync_unet.pt" in s["missing"]
+
+
+def test_every_managed_engine_has_a_state(le):
+    assert {s["name"] for s in le.all_states()} == set(le.MANAGED)
+
+
+def test_an_install_runs_in_the_background_and_reports_as_it_goes(le, monkeypatch):
+    import threading
+    released = threading.Event()
+
+    def _slow(name, log=None):
+        log("working")
+        released.wait(5)
+        log("finished")
+        return ("root", "py")
+
+    monkeypatch.setattr(le, "ensure_installed", _slow)
+    monkeypatch.setattr(le, "_installs", {}, raising=False)
+    st = le.start_install("latentsync")
+    assert st["state"] == "running"
+    # Asking again joins the running job rather than starting a second.
+    assert le.start_install("latentsync")["state"] == "running"
+    released.set()
+    for _ in range(100):
+        if le.install_state("latentsync")["state"] == "done":
+            break
+        import time as _t
+        _t.sleep(0.05)
+    done = le.install_state("latentsync")
+    assert done["state"] == "done"
+    assert "working" in done["log"] and "finished" in done["log"]
+
+
+def test_a_failed_install_keeps_the_reason_where_it_can_be_read(le, monkeypatch):
+    def _boom(name, log=None):
+        log("fetching")
+        raise RuntimeError("no wheel for this host")
+
+    monkeypatch.setattr(le, "ensure_installed", _boom)
+    monkeypatch.setattr(le, "_installs", {}, raising=False)
+    le.start_install("musetalk")
+    for _ in range(100):
+        if le.install_state("musetalk")["state"] in ("failed", "done"):
+            break
+        import time as _t
+        _t.sleep(0.05)
+    s = le.install_state("musetalk")
+    assert s["state"] == "failed"
+    assert "no wheel for this host" in s["error"]
+    assert any("fetching" in line for line in s["log"])
+
+
+def test_the_state_never_carries_a_thread_object(le, monkeypatch):
+    """It is serialised to JSON for the admin page."""
+    import json
+    monkeypatch.setattr(le, "ensure_installed", lambda name, log=None: ("r", "p"))
+    monkeypatch.setattr(le, "_installs", {}, raising=False)
+    le.start_install("latentsync")
+    json.dumps(le.install_state("latentsync"))      # must not raise
+
+
+def test_removing_an_engine_takes_the_venv_and_the_weights(le, monkeypatch,
+                                                            tmp_path):
+    root, venv = tmp_path / "latentsync", tmp_path / "latentsync_venv"
+    (root / "checkpoints").mkdir(parents=True)
+    (root / "checkpoints" / "latentsync_unet.pt").write_bytes(b"w")
+    venv.mkdir()
+    monkeypatch.setattr(le, "install_dir", lambda n: root)
+    monkeypatch.setattr(le, "venv_dir", lambda n: venv)
+    monkeypatch.setattr(le, "_installs", {}, raising=False)
+    le.uninstall("latentsync")
+    assert not root.exists() and not venv.exists()
+
+
+def test_rebuilding_a_venv_keeps_the_gigabytes(le, monkeypatch, tmp_path):
+    """The weights are the slow part and a dependency change does not alter
+    them, so a venv rebuild must not re-download 6 GB."""
+    root, venv = tmp_path / "latentsync", tmp_path / "latentsync_venv"
+    (root / "checkpoints").mkdir(parents=True)
+    kept = root / "checkpoints" / "latentsync_unet.pt"
+    kept.write_bytes(b"w")
+    (root / "scripts").mkdir()
+    (root / "scripts" / "inference.py").write_text("x")
+    le._seed_stamp(root).write_text("stamp")
+    venv.mkdir()
+    monkeypatch.setattr(le, "install_dir", lambda n: root)
+    monkeypatch.setattr(le, "venv_dir", lambda n: venv)
+    monkeypatch.setattr(le, "_installs", {}, raising=False)
+    le.uninstall("latentsync", keep_weights=True)
+    assert kept.exists(), "the weights were deleted on a venv rebuild"
+    assert not venv.exists()
+    assert not (root / "scripts").exists(), "the code should be re-seeded"
+    assert not le._seed_stamp(root).exists()
+
+
+def test_an_engine_cannot_be_removed_while_it_installs(le, monkeypatch):
+    monkeypatch.setattr(le, "_installs", {"latentsync": {"state": "running"}},
+                        raising=False)
+    with pytest.raises(RuntimeError) as e:
+        le.uninstall("latentsync")
+    assert "being installed" in str(e.value)
+
+
+def test_the_admin_routes_exist_and_are_admin_only():
+    import inspect
+    from codai.admin import routes
+    src = inspect.getsource(routes)
+    for path in ("/admin/api/lipsync-engines",
+                 "/admin/api/lipsync-engine-install",
+                 "/admin/api/lipsync-engine-remove"):
+        assert path in src, path
+    # Each one behind require_admin, like every other model action.
+    tail = src[src.index("/admin/api/lipsync-engines"):]
+    assert tail.count("Depends(require_admin)") >= 3
+
+
+def test_the_models_page_offers_the_engines():
+    page = (ROOT / "codai" / "admin" / "templates" / "models.html").read_text(
+        encoding="utf-8")
+    assert 'id="tab-lipsync"' in page
+    assert "loadLipsyncEngines" in page
+    assert "lipsync-engine-install" in page
+    assert "lipsync-engine-remove" in page

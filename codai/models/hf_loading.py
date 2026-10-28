@@ -22,6 +22,7 @@ The configuration is the single source of truth — nothing here reads CLI args.
 """
 
 import os
+import urllib.request as _urlreq
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -331,8 +332,127 @@ def civitai_token() -> Optional[str]:
     return None
 
 
+#: Checkpoint precisions a Civitai version may be published in, best first for
+#: a card that can run them all. nvfp4 is deliberately absent: it needs
+#: Blackwell (compute capability 10.0), and on anything older the file is
+#: unusable — 8 GB downloaded to produce a load error.
+_CIVITAI_FP_PREFERENCE = ("int8", "fp8", "bf16", "fp16", "fp32")
+_CIVITAI_FP_BLACKWELL_ONLY = ("nvfp4", "fp4")
+
+
+def _fp_is_runnable_here(fp: str) -> bool:
+    """Whether this machine can run a checkpoint published in precision ``fp``."""
+    if not fp:
+        return True                       # unlabelled: let the loader decide
+    if fp.lower() not in _CIVITAI_FP_BLACKWELL_ONLY:
+        return True
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        return torch.cuda.get_device_capability(0)[0] >= 10
+    except Exception:
+        return False
+
+
+def _pick_civitai_file(files: list, vid: str, fid: Optional[str]) -> dict:
+    """Choose which file of a Civitai version to download.
+
+    A version is not one checkpoint. Real Dream's Krea 2 V3 publishes the same
+    weights three times — fp8 at 13.46 GB, int8 at 13.18 GB and nvfp4 at
+    8.12 GB — and they are not interchangeable: nvfp4 needs Blackwell, so on an
+    Ampere card it is a 8 GB download that cannot load. Picking the largest, as
+    this used to, lands on fp8 here purely because it is 0.28 GB bigger than the
+    int8 build, which is not a decision anybody made.
+
+    So: an explicit file id wins, and without one the choice is made among the
+    files this machine can actually run, by precision rather than by size.
+    """
+    if fid:
+        for f in files:
+            if str(f.get("id")) == str(fid):
+                return f
+        have = ", ".join(f"{f.get('id')} ({(f.get('metadata') or {}).get('fp') or '?'}, "
+                         f"{(f.get('sizeKB') or 0)/1e6:.1f} GB)" for f in files)
+        raise RuntimeError(
+            f"Civitai version {vid} has no file {fid}. It has: {have or 'none'}")
+    runnable = [f for f in files
+                if _fp_is_runnable_here((f.get("metadata") or {}).get("fp") or "")]
+    if not runnable:
+        kinds = ", ".join(sorted({(f.get("metadata") or {}).get("fp") or "?"
+                                  for f in files}))
+        raise RuntimeError(
+            f"Civitai version {vid} is published only as {kinds}, which this "
+            f"GPU cannot run. Name a file explicitly with "
+            f"civitai:{vid}:<fileId> if that is wrong.")
+
+    def _rank(f):
+        fp = ((f.get("metadata") or {}).get("fp") or "").lower()
+        order = (_CIVITAI_FP_PREFERENCE.index(fp)
+                 if fp in _CIVITAI_FP_PREFERENCE else len(_CIVITAI_FP_PREFERENCE))
+        return (order, -(f.get("sizeKB") or 0))
+
+    return sorted(runnable, key=_rank)[0]
+
+
+class _DropAuthOnCrossHostRedirect(_urlreq.HTTPRedirectHandler):
+    """Strip ``Authorization`` when a redirect leaves the host it was meant for.
+
+    Civitai answers a download with a 307 to its Cloudflare R2 bucket, and that
+    URL is already signed. urllib replays every header on the redirect, so the
+    bucket receives a request carrying BOTH a bearer token and its own
+    signature, and answers 400 — which looks exactly like a bad token. curl
+    strips the header on a cross-host redirect, which is why fetching the same
+    URL by hand works and this did not. Adding a token to the config was enough
+    to break downloads that had been working without one.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        try:
+            from urllib.parse import urlsplit
+            if urlsplit(newurl).netloc.lower() != urlsplit(req.full_url).netloc.lower():
+                for h in list(new.headers):
+                    if h.lower() == "authorization":
+                        del new.headers[h]
+                new.unredirected_hdrs.pop("Authorization", None)
+        except Exception:
+            pass
+        return new
+
+
+def _civitai_opener():
+    return _urlreq.build_opener(_DropAuthOnCrossHostRedirect)
+
+
+def civitai_cache_root() -> Path:
+    """Where Civitai checkpoints are kept.
+
+    ``CODERAI_CIVITAI_CACHE`` when set, otherwise beside the other coderai
+    caches. These are multi-gigabyte single-file checkpoints in nobody's cache
+    format, so on a host where the weights live on their own disk this wants
+    pointing at it — ``CODERAI_CIVITAI_CACHE=/AI/civitaicache`` next to the GGUF
+    and HF caches, rather than filling the home partition the server runs from.
+
+    Deliberately not derived from HF_HOME: putting these under the HF cache root
+    is how a second GGUF directory grew inside one, holding files the Hub's own
+    bookkeeping then treated as a partial download. A guess that silently moves
+    an existing install's cache on upgrade would be the same mistake again.
+    """
+    explicit = (os.environ.get("CODERAI_CIVITAI_CACHE") or "").strip()
+    if explicit:
+        return Path(os.path.expanduser(explicit))
+    try:
+        from codai.platform_paths import legacy_style_cache_root
+        return legacy_style_cache_root() / "civitai"
+    except Exception:
+        return Path(os.path.expanduser("~/.cache/coderai/civitai"))
+
+
 def resolve_civitai(ref: str) -> str:
-    """``civitai:<modelVersionId>`` -> a local checkpoint path, downloading once.
+    """``civitai:<modelVersionId>[:<fileId>]`` -> a local checkpoint, fetched once.
 
     Civitai is where a large part of the community's fine-tunes actually live,
     and they are published as ONE ComfyUI-style checkpoint file -- exactly the
@@ -354,16 +474,19 @@ def resolve_civitai(ref: str) -> str:
     import urllib.error
     import urllib.request
 
-    vid = str(ref).split(":", 1)[1].strip()
-    if not vid.isdigit():
+    _parts = str(ref).split(":")
+    vid = _parts[1].strip() if len(_parts) > 1 else ""
+    fid = _parts[2].strip() if len(_parts) > 2 and _parts[2].strip() else None
+    if not vid.isdigit() or (fid is not None and not fid.isdigit()):
         raise ValueError(
-            f"civitai reference must be civitai:<modelVersionId> (a number), "
-            f"got {ref!r}")
-    try:
-        from codai.platform_paths import legacy_style_cache_root
-        base = legacy_style_cache_root() / "civitai" / vid
-    except Exception:
-        base = Path(os.path.expanduser(f"~/.cache/coderai/civitai/{vid}"))
+            f"civitai reference must be civitai:<modelVersionId> or "
+            f"civitai:<modelVersionId>:<fileId> (numbers), got {ref!r}")
+    base = civitai_cache_root() / vid
+    # A named file gets its own directory, so two precisions of one version can
+    # be cached side by side and the "already downloaded?" check below cannot
+    # answer with the other one.
+    if fid:
+        base = base / fid
     base.mkdir(parents=True, exist_ok=True)
     existing = [p for p in base.iterdir()
                 if p.suffix.lower() in _SINGLE_FILE_SUFFIXES]
@@ -386,17 +509,28 @@ def resolve_civitai(ref: str) -> str:
         files = [f for f in (meta.get("files") or [])
                  if str(f.get("name", "")).lower().endswith(_SINGLE_FILE_SUFFIXES)]
         if files:
-            files.sort(key=lambda f: -(f.get("sizeKB") or 0))
-            name = files[0]["name"]
+            chosen = _pick_civitai_file(files, vid, fid)
+            name = chosen["name"]
+            # Pin the choice even when the caller did not: otherwise the URL
+            # below asks Civitai for "the version", and its idea of the default
+            # file is not necessarily the one just chosen.
+            fid = str(chosen.get("id") or "") or fid
+            _fp = (chosen.get("metadata") or {}).get("fp") or "?"
+            print(f"  civitai: version {vid} -> {name} "
+                  f"({_fp}, {(chosen.get('sizeKB') or 0)/1e6:.1f} GB)")
+    except RuntimeError:
+        raise       # a file that does not exist, or none this GPU can run
     except Exception:
         pass        # the download below still works; only the name is a guess
 
     url = f"https://civitai.com/api/download/models/{vid}"
+    if fid:
+        url += f"?fileId={fid}"
     dest = base / name
     tmp = base / (name + ".part")
     req = urllib.request.Request(url, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with _civitai_opener().open(req, timeout=120) as r:
             ctype = (r.headers.get("Content-Type") or "").lower()
             if "text/html" in ctype or "application/json" in ctype:
                 # The 401/403 page. Saving it would produce a file with a
@@ -893,7 +1027,17 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
         try:
             print(f"  Loading component '{name}' from {source}"
                   f"{' (' + mode + ')' if mode else ''}")
-            components[name] = cls.from_pretrained(source, **kwargs)
+            if is_single_file_ref(source):
+                # A community fine-tune is very often ONE file -- a retrained
+                # transformer with no repo around it, the base supplying the
+                # VAE, the text encoder and the scheduler. from_pretrained
+                # cannot open one, so without this a `civitai:` or
+                # `.safetensors` component could only be named if somebody had
+                # published a converted directory tree for it.
+                _path = resolve_single_file(source)
+                components[name] = cls.from_single_file(_path, **kwargs)
+            else:
+                components[name] = cls.from_pretrained(source, **kwargs)
             descs.append(f"{name}:{source.split('/')[-1]}{'/' + mode if mode else ''}")
         except Exception as e:
             # RAISE. A component named here IS the model: `component_models`

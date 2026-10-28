@@ -5925,3 +5925,68 @@ async def api_hf_model_info(model_id: str, username: str = Depends(require_admin
         "gguf_files": gguf_files,
         "file_count": len(all_files),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Lip-sync engines (LatentSync / MuseTalk)
+# --------------------------------------------------------------------------- #
+# These are not models.json entries -- they are subprocess engines with their
+# own interpreter, so giving them a row in a model section would put them in
+# the VRAM ledger as something the manager can load, which it cannot. They do
+# need the rest of what every other engine gets: see what is installed, install
+# it, take it away again. Without these three the only way to bring one up was
+# a python -c, which is not a way to run a server.
+
+def _lipsync_engines():
+    from codai.api import lipsync_engines
+    return lipsync_engines
+
+
+@router.get("/admin/api/lipsync-engines", summary="Lip-sync engine status")
+async def api_lipsync_engines(username: str = Depends(require_admin)):
+    """Every managed lip-sync engine, whether it is installed, and what it is
+    short of when it is not."""
+    try:
+        return {"success": True, "engines": _lipsync_engines().all_states()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/admin/api/lipsync-engine-install", summary="Install a lip-sync engine")
+async def api_lipsync_engine_install(request: Request,
+                                     username: str = Depends(require_admin)):
+    """Start the install and return at once.
+
+    It is minutes of downloading and a pip resolve, so the caller polls
+    /admin/api/lipsync-engines for the state and the tail of the log. Asking
+    twice joins the running job rather than starting a second one.
+    """
+    data = await request.json()
+    name = (data.get("engine") or data.get("name") or "").strip().lower()
+    try:
+        return {"success": True, "state": _lipsync_engines().start_install(name)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/admin/api/lipsync-engine-remove", summary="Remove a lip-sync engine")
+async def api_lipsync_engine_remove(request: Request,
+                                    username: str = Depends(require_admin)):
+    """Delete an engine's venv, and its weights unless `keep_weights` is set.
+
+    Keeping them is the useful default for rebuilding a venv after a dependency
+    change: the weights are gigabytes and have not changed.
+    """
+    data = await request.json()
+    name = (data.get("engine") or data.get("name") or "").strip().lower()
+    keep = bool(data.get("keep_weights"))
+    try:
+        return {"success": True, **_lipsync_engines().uninstall(name, keep_weights=keep)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

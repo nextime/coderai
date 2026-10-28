@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -701,3 +702,122 @@ def run(name: str, video_path: str, audio_path: str, out_path: str,
         why = (proc.stdout or proc.stderr or "").strip()[-600:]
         raise RuntimeError(
             f"{sp.name} exited 0 but produced no video. Last output: {why}") from None
+
+
+# --------------------------------------------------------------------------- #
+# Management: install as something an operator does, not a Python call
+# --------------------------------------------------------------------------- #
+# An engine coderai can install but has not is neither installed nor absent, and
+# until there was somewhere to act on that distinction the only way to bring one
+# up was `python -c "from codai.api import lipsync_engines; ..."`. Everything
+# else coderai serves is configurable from the models page; these were not.
+
+#: name -> {"state","started","finished","error","log":[...]}. An install is
+#: minutes of downloading and a pip resolve, so it runs in a thread and the
+#: caller polls; the log is kept because when one fails, WHERE it failed is the
+#: whole answer (a wheel that would not build reads nothing like a 401).
+_installs: Dict[str, dict] = {}
+_install_lock = threading.RLock()
+_INSTALL_LOG_LINES = 200
+
+
+def install_state(name: str) -> dict:
+    """Everything the UI needs for one engine, without touching the network."""
+    sp = spec(name)
+    with _install_lock:
+        job = dict(_installs.get(sp.name) or {})
+    job.pop("thread", None)
+    installed = is_installed(sp.name)
+    return {
+        "name": sp.name,
+        "installed": installed,
+        "available": is_available(sp.name) if installed else False,
+        "missing": missing_pieces(sp.name),
+        "install_dir": str(install_dir(sp.name)),
+        "venv": str(venv_dir(sp.name)),
+        "python": sp.py_version,
+        "weights": [ws.repo_id for ws in sp.weights],
+        "state": job.get("state", "idle"),
+        "error": job.get("error"),
+        "log": job.get("log", [])[-20:],
+    }
+
+
+def all_states() -> List[dict]:
+    return [install_state(n) for n in MANAGED]
+
+
+def start_install(name: str) -> dict:
+    """Begin (or re-join) an install. Returns the state immediately."""
+    sp = spec(name)
+    with _install_lock:
+        job = _installs.get(sp.name)
+        if job and job.get("state") == "running":
+            return install_state(sp.name)
+        job = {"state": "running", "started": time.time(), "error": None,
+               "log": []}
+        _installs[sp.name] = job
+
+        def _log(line: str) -> None:
+            with _install_lock:
+                job["log"].append(str(line))
+                del job["log"][:-_INSTALL_LOG_LINES]
+            print(line, flush=True)
+
+        def _run():
+            try:
+                ensure_installed(sp.name, log=_log)
+                with _install_lock:
+                    job["state"] = "done"
+            except Exception as exc:
+                _log(f"[{sp.name}] install failed: {type(exc).__name__}: {exc}")
+                with _install_lock:
+                    job["state"] = "failed"
+                    job["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                with _install_lock:
+                    job["finished"] = time.time()
+
+        t = threading.Thread(target=_run, name=f"install-{sp.name}", daemon=True)
+        job["thread"] = t
+        t.start()
+    return install_state(sp.name)
+
+
+def uninstall(name: str, keep_weights: bool = False) -> dict:
+    """Remove an engine's venv, and its install directory unless asked not to.
+
+    ``keep_weights`` exists because the weights are the slow part: an operator
+    rebuilding a venv after a dependency change should not have to fetch 6 GB
+    again. The vendored code is re-seeded from the repo either way.
+    """
+    sp = spec(name)
+    with _install_lock:
+        job = _installs.get(sp.name)
+        if job and job.get("state") == "running":
+            raise RuntimeError(
+                f"{sp.name} is being installed right now; wait for it to finish")
+        _installs.pop(sp.name, None)
+        _ready.pop(sp.name, None)
+    removed = []
+    venv = venv_dir(sp.name)
+    if venv.is_dir():
+        shutil.rmtree(venv, ignore_errors=True)
+        removed.append(str(venv))
+    root = install_dir(sp.name)
+    if root.is_dir():
+        if keep_weights:
+            # The code only: everything the vendored tree put there.
+            for item in sorted(vendor_dir(sp.name).iterdir()):
+                target = root / item.name
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                elif target.exists():
+                    target.unlink()
+            _seed_stamp(root).unlink(missing_ok=True)
+            removed.append(f"{root} (code only)")
+        else:
+            shutil.rmtree(root, ignore_errors=True)
+            removed.append(str(root))
+    return {"name": sp.name, "removed": removed,
+            "state": install_state(sp.name)}
