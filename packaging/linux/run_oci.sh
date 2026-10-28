@@ -485,6 +485,71 @@ else
   args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
 fi
 
+# A ceiling on the container, so a runaway engine dies instead of the machine.
+#
+# oom-score-adj below only decides WHO the kernel reaches for once the host is
+# already out of memory. It does not stop a container from getting there, and on
+# 2026-10-28 nothing did: an engine grew to 46.3 GB of a 54.8 GB host, pushed
+# 20.4 GB into swap, and the OOM killer never fired at all (oomkill 0) — the box
+# just thrashed through 108 million page-ins until it was reset by hand. A
+# livelock is worse than a kill: a killed engine restarts, a thrashing host
+# serves nobody and cannot even be logged into.
+#
+# Two parts, and the second is the one that matters. --memory alone still lets
+# the container swap, which is the thrash; --memory-swap set to the SAME value
+# means no swap for this cgroup, so exceeding the limit is a kill rather than a
+# slow death. coderai has its own softer ceiling inside this one
+# (offload.max_ram_gb, which drops caches and evicts idle models at 90% of it),
+# so this limit should sit ABOVE that: the app gets to tidy up first and this is
+# only reached when something is genuinely wrong.
+#
+# Default: the host's RAM less a reserve for everything that is not coderai
+# (the kernel, sshd, the shell you fix it from). Set CODERAI_MEMORY_LIMIT to a
+# docker size string to choose your own, or to 0/none to not set a limit.
+MEM_LIMIT="${CODERAI_MEMORY_LIMIT:-}"
+if [[ -z "$MEM_LIMIT" ]]; then
+  _mem_total_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  _mem_reserve_gb="${CODERAI_MEMORY_RESERVE_GB:-6}"
+  if [[ "${_mem_total_kb:-0}" -gt 0 ]]; then
+    _mem_limit_gb=$(( _mem_total_kb / 1024 / 1024 - _mem_reserve_gb ))
+    # Never below 8 GB: a limit under what one model needs would make every
+    # load fail, which is a worse failure than the one this prevents.
+    if [[ "$_mem_limit_gb" -ge 8 ]]; then
+      MEM_LIMIT="${_mem_limit_gb}g"
+    fi
+  fi
+fi
+# Whether the host can enforce one at all. A limit the kernel cannot apply is
+# worse than none: the engine discards it with a warning on every start, and an
+# operator reading "memory limit: 48g" would reasonably believe they are
+# protected. Checked rather than assumed, because this very host turned out not
+# to have the memory controller mounted (cgroup v1, no `memory` in
+# /sys/fs/cgroup) — which is also why its OOM killer never fired while it
+# thrashed: with no accounting there is no limit to reach.
+_mem_cgroup_ok=0
+if [[ -e /sys/fs/cgroup/memory.max ]]; then
+  _mem_cgroup_ok=1            # cgroup v2 unified
+elif [[ -e /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+  _mem_cgroup_ok=1            # cgroup v1 with the memory controller mounted
+fi
+
+case "$MEM_LIMIT" in
+  ""|0|none|off|unlimited) ;;
+  *)
+    if [[ "$_mem_cgroup_ok" == "1" ]]; then
+      args+=(--memory "$MEM_LIMIT" --memory-swap "$MEM_LIMIT")
+      echo "[coderai] container memory limit: $MEM_LIMIT (swap disabled inside it)" >&2
+    else
+      echo "[coderai] NOT limiting container memory: this host has no memory" >&2
+      echo "[coderai]   cgroup controller, so the kernel cannot enforce one." >&2
+      echo "[coderai]   Without it a runaway engine can thrash the whole box" >&2
+      echo "[coderai]   instead of being killed. To enable it, boot with" >&2
+      echo "[coderai]   cgroup v2 (systemd.unified_cgroup_hierarchy=1) or" >&2
+      echo "[coderai]   cgroup v1 + cgroup_enable=memory swapaccount=1." >&2
+    fi
+    ;;
+esac
+
 # Who the kernel kills when the HOST runs out of memory. oom_score is essentially
 # "how much memory does this task hold", so an orchestrator with a model loaded is
 # always near the top of that list and gets reached for first — even when the leak
