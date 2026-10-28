@@ -217,13 +217,42 @@ def _encode_mp4_pyav(frames, fps: int, crf: int) -> bytes:
 
 
 def _has_audio(path: str) -> bool:
-    """True when ``path`` carries at least one audio stream."""
+    """True when ``path`` carries at least one audio stream.
+
+    PyAV first, ffprobe second. PyAV is in no main requirements file -- only
+    the isolated LongCat venv's -- so on an install without it ``import av``
+    raised and the bare except turned EVERY file into "no audio". This gates
+    _mux_original_audio, so the effect was that a clip's own sound was
+    silently dropped from every upscale and interpolate: the audio was there,
+    nothing could see it, and nothing said so.
+
+    ffprobe cannot be missing here the way PyAV can -- ffmpeg is what does the
+    muxing in the first place -- so it is the answer that can be trusted, and a
+    failure of BOTH is logged rather than quietly reported as silence.
+    """
     try:
         import av
         with av.open(path) as c:
             return bool(c.streams.audio)
+    except ImportError:
+        pass                    # expected without PyAV; ffprobe below
     except Exception:
-        return False
+        pass                    # unreadable by PyAV; let ffprobe try
+    import logging
+    _log = logging.getLogger(__name__)
+    try:
+        import subprocess as _sp
+        r = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                     "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                    capture_output=True, timeout=120)
+        if r.returncode == 0:
+            return bool((r.stdout or b"").strip())
+        _log.warning("cannot tell whether %s has audio (ffprobe rc=%d): %s",
+                     path, r.returncode,
+                     (r.stderr or b"").decode(errors="replace")[:200])
+    except Exception as exc:
+        _log.warning("cannot tell whether %s has audio: %s", path, exc)
+    return False
 
 
 def _mux_original_audio(video_path: str, source_path: str,
@@ -2442,7 +2471,8 @@ def _run_handoff(pipe, kw: dict, request, h: dict):
     return _frames_from_result(result)
 
 
-def _run_pipeline_split(pipe, kw: dict, request, comp: dict):
+def _run_pipeline_split(pipe, kw: dict, request, comp: dict,
+                        audio_out: Optional[dict] = None):
     """The head's side: encode where the text encoder is, denoise up to the
     expert boundary here, hand the latents to the low-noise machine, decode
     where the VAE is. Returns frames, or the far machine's finished answer."""
@@ -2463,7 +2493,7 @@ def _run_pipeline_split(pipe, kw: dict, request, comp: dict):
         k = None                     # every step is low-noise: nothing to do here
     vae_remote = comp.get('vae')
     if k is None and not vae_remote:
-        return _run_pipeline(pipe, kw)
+        return _run_pipeline(pipe, kw, audio_out)
 
     # Run here up to the boundary (or the whole loop), keeping latents.
     user_cb = kw.get('callback_on_step_end')
@@ -2534,8 +2564,154 @@ def _frames_from_result(result):
     return list(frames_raw)
 
 
-def _run_pipeline(pipe, kw: dict):
+
+def _pipeline_audio(result, pipe):
+    """The soundtrack a pipeline generated with the picture, or ``None``.
+
+    LTX-2.x is the one video family here with an audio VAE and a vocoder, so
+    its output is ``LTX2PipelineOutput(frames=..., audio=...)`` -- a real
+    waveform, generated jointly with the frames and therefore actually in step
+    with them. It used to be dropped on the floor: only ``frames`` was read, so
+    every LTX render came out silent and the only way to get sound was to
+    generate some separately with another model and mux that on top, which is
+    not the same thing and does not match the picture.
+
+    Returns ``(waveform, sample_rate)`` with the waveform shaped
+    ``(samples,)`` or ``(channels, samples)``.
+    """
+    audio = getattr(result, "audio", None)
+    if audio is None and isinstance(result, (tuple, list)) and len(result) > 1:
+        audio = result[1]
+    if audio is None:
+        return None
+    rate = getattr(pipe, "audio_sampling_rate", None)
+    if not rate:
+        vae = getattr(pipe, "audio_vae", None)
+        rate = getattr(getattr(vae, "config", None), "sample_rate", None)
+    try:
+        rate = int(rate or 0)
+    except Exception:
+        rate = 0
+    if rate <= 0:
+        print("  [video] a soundtrack was generated but its sample rate is "
+              "unknown; keeping the video silent rather than guessing",
+              flush=True)
+        return None
+    try:
+        import numpy as _np
+        import torch as _torch
+        if isinstance(audio, _torch.Tensor):
+            audio = audio.detach().to("cpu", _torch.float32).numpy()
+        audio = _np.asarray(audio, dtype="float32")
+        while audio.ndim > 2:
+            audio = audio[0]            # drop batch dimensions
+        if audio.size == 0:
+            return None
+    except Exception as exc:
+        print(f"  [video] could not read the generated soundtrack ({exc}); "
+              f"keeping the video silent", flush=True)
+        return None
+    return audio, rate
+
+
+def _write_wav(audio, rate: int, temps: list) -> Optional[str]:
+    """The waveform as a 16-bit PCM wav file, or None."""
+    import wave
+
+    import numpy as _np
+    a = _np.asarray(audio, dtype="float32")
+    if a.ndim == 2:
+        # (channels, samples) -> interleaved (samples, channels)
+        if a.shape[0] <= 8 and a.shape[0] < a.shape[1]:
+            a = a.T
+        channels = a.shape[1]
+    else:
+        channels = 1
+    peak = float(_np.max(_np.abs(a))) if a.size else 0.0
+    if peak > 1.0:
+        a = a / peak            # the vocoder is not bound to [-1, 1]
+    pcm = _np.clip(a, -1.0, 1.0)
+    pcm = (pcm * 32767.0).astype("<i2")
+    path = _tmp_write(b"", ".wav")
+    temps.append(path)
+    try:
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(2)
+            wf.setframerate(int(rate))
+            wf.writeframes(pcm.tobytes())
+    except Exception as exc:
+        print(f"  [video] could not write the generated soundtrack ({exc})",
+              flush=True)
+        return None
+    return path
+
+
+def _mux_generated_audio(video_path: str, audio, rate: int,
+                         temps: list) -> str:
+    """``video_path`` with the generated soundtrack on it.
+
+    Returns the path unchanged on any failure: a silent video is a worse
+    result than a loud one, but it is far better than no video at all, and the
+    frames are the part the caller asked for.
+    """
+    wav = _write_wav(audio, rate, temps)
+    if not wav:
+        return video_path
+    out = _tmp_write(b"", ".mp4")
+    temps.append(out)
+    try:
+        import subprocess as _sp
+        from codai.compose import media as _media
+        cmd = [_media.ffmpeg_bin(), "-hide_banner", "-nostdin", "-y",
+               "-i", video_path, "-i", wav,
+               # The picture is already encoded; copying it keeps this a remux
+               # rather than a second generation loss.
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+               "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+               "-shortest", "-movflags", "+faststart", out]
+        r = _sp.run(cmd, capture_output=True, timeout=900)
+        if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+            tail = (r.stderr or b"").decode(errors="replace").strip().splitlines()[-4:]
+            print(f"  [video] muxing the generated soundtrack failed: "
+                  f"{' | '.join(tail)}", flush=True)
+            return video_path
+    except Exception as exc:
+        print(f"  [video] muxing the generated soundtrack failed ({exc})",
+              flush=True)
+        return video_path
+    print(f"  [video] generated soundtrack muxed in ({rate} Hz)", flush=True)
+    return out
+
+
+
+def _mux_generated_audio_bytes(mp4_bytes: bytes, audio, rate: int,
+                               temps: list) -> bytes:
+    """``_mux_generated_audio`` over an mp4 blob rather than a path."""
+    src = _tmp_write(mp4_bytes, ".mp4")
+    temps.append(src)
+    out = _mux_generated_audio(src, audio, rate, temps)
+    if out == src:
+        return mp4_bytes
+    try:
+        with open(out, "rb") as fh:
+            return fh.read()
+    except Exception:
+        return mp4_bytes
+
+
+def _run_pipeline(pipe, kw: dict, audio_out: Optional[dict] = None):
+    """The frames a pipeline produced.
+
+    ``audio_out``, when given, is filled with ``{"audio", "sample_rate"}`` if
+    the pipeline generated a soundtrack alongside the picture (LTX-2.x does).
+    Passed in rather than returned so the call sites keep their shape.
+    """
     result = pipe(**kw)
+    if audio_out is not None:
+        got = _pipeline_audio(result, pipe)
+        if got is not None:
+            audio_out["audio"], audio_out["sample_rate"] = got
     # NB: `getattr(result, 'frames', None) or result[0]` is WRONG — when .frames
     # is a numpy array, `bool(array)` raises "truth value of an array ... is
     # ambiguous". Check for None explicitly instead of using `or`.
@@ -2857,18 +3033,21 @@ def _generate_video(pipe, request: VideoGenerationRequest):
         # Parts of this pipeline on other machines (codai/cluster/components.py),
         # or this machine doing ITS part of someone else's run.
         _handoff = getattr(request, '_handoff', None)
+        # Filled when the pipeline generates a soundtrack with the picture
+        # (LTX-2.x). Carried out with the frames so the encoder can mux it.
+        _gen_audio: dict = {}
         if isinstance(_handoff, dict) and _handoff.get('op'):
             frames = _run_handoff(pipe, kw, request, _handoff)
         else:
             from codai.cluster.components import components_for as _components_for
             _comp = _components_for(getattr(request, 'model', '') or '')
             if _comp and type(pipe).__name__ in ('WanPipeline', 'WanImageToVideoPipeline'):
-                frames = _run_pipeline_split(pipe, kw, request, _comp)
+                frames = _run_pipeline_split(pipe, kw, request, _comp, _gen_audio)
             else:
                 if _comp:
                     print(f"  [video][components] {type(pipe).__name__} cannot be split "
                           f"across machines; running here", flush=True)
-                frames = _run_pipeline(pipe, kw)
+                frames = _run_pipeline(pipe, kw, _gen_audio)
     except TaskCancelled:
         _vid_progress_done()
         raise  # global handler finishes the task (cancelled) + returns HTTP 499
@@ -2885,7 +3064,7 @@ def _generate_video(pipe, request: VideoGenerationRequest):
             frames = frames[_vace_trim:]
         except Exception:
             pass
-    return frames, fps
+    return frames, fps, _gen_audio
 
 
 # =============================================================================
@@ -5116,8 +5295,9 @@ async def video_generations(request: VideoGenerationRequest,
             if _is_sdcpp_video:
                 frames, fps = await _loop.run_in_executor(
                     None, _generate_sdcpp_video, pipe, request, _model_cfg)
+                _gen_audio = {}
             else:
-                frames, fps = await _loop.run_in_executor(
+                frames, fps, _gen_audio = await _loop.run_in_executor(
                     None, _generate_video, pipe, request)
             _last_err = None
             break  # success → return to client
@@ -5159,8 +5339,9 @@ async def video_generations(request: VideoGenerationRequest,
                     if _is_sdcpp_video:
                         frames, fps = await _loop.run_in_executor(
                             None, _generate_sdcpp_video, pipe, request, _model_cfg)
+                        _gen_audio = {}
                     else:
-                        frames, fps = await _loop.run_in_executor(
+                        frames, fps, _gen_audio = await _loop.run_in_executor(
                             None, _generate_video, pipe, request)
                     _last_err = None
                     break  # success → return to client
@@ -5223,6 +5404,17 @@ async def video_generations(request: VideoGenerationRequest,
     if _identity_note:
         gen_warnings.append(_identity_note)
     try:
+        # A soundtrack the MODEL generated with the picture (LTX-2.x) goes on
+        # before anything else, because it belongs to these exact frames and
+        # every later step re-encodes them. `add_audio: false` is how a caller
+        # asks for the video silent -- it defaults to None, which means "keep
+        # what was generated"; only an explicit false suppresses it. A
+        # separately generated track (add_audio truthy + an audio model) is a
+        # different feature and still runs in _postprocess_video below.
+        if _gen_audio.get("audio") is not None and request.add_audio is None:
+            mp4_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _mux_generated_audio_bytes, mp4_bytes,
+                _gen_audio["audio"], _gen_audio["sample_rate"], temps)
         needs_post = any([
             request.upscale_output,
             request.interpolate_output,

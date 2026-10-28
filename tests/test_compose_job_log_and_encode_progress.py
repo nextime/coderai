@@ -122,7 +122,12 @@ def test_run_reports_frames_written(tmp_path):
             on_frame=seen.append, timeout=120)
     assert seen, "ffmpeg wrote frames but none were reported"
     assert seen == sorted(seen), f"the frame count went backwards: {seen}"
-    assert seen[-1] >= 10, f"only reached {seen[-1]} frames of ~20"
+    # Only that frames were counted, and counted upward. NOT how many reports
+    # arrive or how far they get: `-progress` emits on a time interval, so a
+    # small encode can finish having emitted a single block, and asserting a
+    # minimum made this pass alone and fail under the full suite -- a flake in
+    # the test, not in the hook.
+    assert seen[-1] >= 1, f"the reported frame count never advanced: {seen}"
 
 
 @needs_ffmpeg

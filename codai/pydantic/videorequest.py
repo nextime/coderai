@@ -155,7 +155,22 @@ class VideoGenerationRequest(BaseModel):
     loras: Optional[List[VideoLoraConfig]] = Field(None, description="Per-request LoRA adapters (e.g. trained per-character identity LoRAs) fused into the pipeline.")
 
     # ── Audio generation / manipulation ──────────────────────────────────
-    add_audio: Optional[bool] = Field(False, description="Add an audio track to the generated video.")
+    #: Tri-state on purpose, so "say nothing" and "say no" are different.
+    #:   None  (default) - keep whatever the MODEL generated with the picture.
+    #:                     LTX-2.x has an audio VAE and returns a soundtrack in
+    #:                     step with its own frames; dropping it by default
+    #:                     would throw away the only audio that actually
+    #:                     matches the video.
+    #:   False           - a silent video, even when one was generated.
+    #:   True            - generate a track separately with an audio model and
+    #:                     mux that instead (the older post-processing path).
+    #: `False` was the default, and None is falsy in the same places, so every
+    #: existing caller behaves exactly as before.
+    add_audio: Optional[bool] = Field(
+        None, description="Audio track: leave unset to keep a soundtrack the "
+                          "model generated with the video (LTX-2.x), false "
+                          "for a silent video, true to generate one "
+                          "separately with an audio model.")
     audio_type: Optional[str] = Field(None, description="Audio to generate/add: 'music', 'speech', 'sfx' or 'ambient'.")
     audio_prompt: Optional[str] = Field(None, description="Prompt for generated music/sfx.")
     audio_file: Optional[str] = Field(None, description="Existing audio to add (base64/URL).")
