@@ -111,6 +111,14 @@ class Visual(BaseModel):
     # have none, and for a visual that is not the one carrying the scene (only
     # the first audible video in a scene is taken; see _scene_clip_audio).
     keep_audio: bool = False
+    # This visual's sound, when it lives in a SEPARATE file. YouTube and other
+    # DASH sites serve picture and sound as separate streams, so the best
+    # available video of a clip often has no audio track at all; a caller that
+    # does not run ffmpeg itself cannot mux them and would have to skip the
+    # clip. Given here, this file supplies the sound wherever `keep_audio`
+    # applies, cut with the same `trim_start`, and `src` is left to carry only
+    # the picture (it is not required to have an audio stream).
+    audio_src: Optional[str] = None
     # How loud this clip sits when it is mixed UNDER the narration
     # (``audio_mix: "both"``). A per-visual override of the scene's
     # ``clip_volume``.
@@ -216,6 +224,12 @@ class CaptionSpec(BaseModel):
     max_words_per_line: int = 4
     max_lines: int = 2
     uppercase: bool = False
+    # What happens to a row wider than the frame. "shrink" (the default, and
+    # what callers already get) reduces that event's size until it fits;
+    # "wrap" keeps the size and folds the row's trailing words onto a new one,
+    # which may use more rows than max_lines. On a vertical video shrinking can
+    # take a caption below readable, so wrap is the better repair there.
+    fit: str = "shrink"                     # shrink | wrap
     model_config = ConfigDict(extra="allow")
 
 
@@ -229,6 +243,12 @@ class Overlay(BaseModel):
     width: float = 0.15                     # image width as a fraction of the canvas
     color: str = "#FFFFFF"
     font: Optional[str] = None
+    # What happens to a text wider than the frame. "none" (the default, and
+    # what callers already get) draws one line at the size asked for, off the
+    # edge if it is too long; "wrap" keeps the size and adds lines; "shrink"
+    # keeps one line and reduces the size. A newline in `text` always breaks,
+    # whatever this is set to.
+    fit: str = "none"                       # none | wrap | shrink
     model_config = ConfigDict(extra="allow")
 
 
@@ -1134,9 +1154,28 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 try:
                     _cp = media.resolve(getattr(cv, "src", None) or "", work,
                                         f"s{i}-clipaudio")
-                    if not rnd.has_audio_stream(_cp):
-                        raise media.MediaError("the clip has no audio stream")
+                    # `path` stays the PICTURE, because stage 3 reuses it as
+                    # this visual's video and an audio-only file there would
+                    # render no image at all. The sound is tracked separately
+                    # so `audio_src` can point somewhere else entirely.
+                    _asrc = str(getattr(cv, "audio_src", None) or "").strip()
+                    if _asrc:
+                        _ap = media.resolve(_asrc, work, f"s{i}-clipaudio-a")
+                    else:
+                        _ap = _cp
+                    if not rnd.has_audio_stream(_ap):
+                        raise media.MediaError(
+                            "the separate audio file has no audio stream" if _asrc
+                            else "the clip has no audio stream")
                     clip_media[i] = {"path": _cp, "probe": media.probe(_cp),
+                                     "audio_path": _ap,
+                                     # Timed from whatever carries the SOUND:
+                                     # with audio_mix="clip" the scene is as
+                                     # long as what you can hear, and a
+                                     # video-only stream may differ in length
+                                     # from its audio sibling.
+                                     "audio_probe": (media.probe(_ap) if _asrc
+                                                     else None),
                                      "src": getattr(cv, "src", None) or "",
                                      "trim_start": max(0.0, float(
                                          getattr(cv, "trim_start", 0.0) or 0.0)),
@@ -1230,7 +1269,11 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
             # narration's length, truncates the content itself. An explicit
             # `duration` still wins: a caller who names one means it.
             if mix == "clip" and not sc.duration:
-                _cd = float((clip_media.get(i) or {}).get("probe", {}).get("duration") or 0.0)
+                _cm = clip_media.get(i) or {}
+                # The SOUND decides the length here, and with a separate
+                # audio_src that is a different file from the picture.
+                _cdp = _cm.get("audio_probe") or _cm.get("probe") or {}
+                _cd = float(_cdp.get("duration") or 0.0)
                 _cd -= float((clip_media.get(i) or {}).get("trim_start") or 0.0)
                 if _cd > 0:
                     dur = round(_cd, 3)
@@ -1592,7 +1635,7 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 # shorter than its slot was looped there, so its sound is
                 # looped too or it would fall silent halfway through the shot
                 # it belongs to.
-                _cdur = float((cm.get("probe") or {}).get("duration") or 0.0)
+                _cdur = float((cm.get("audio_probe") or cm.get("probe") or {}).get("duration") or 0.0)
                 _trim = float(cm.get("trim_start") or 0.0)
                 _loop = bool(_cdur and (_cdur - _trim) < scene_dur[i] - 0.02)
                 _vol = cm.get("volume")
@@ -1601,7 +1644,8 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                         getattr(sc, "clip_volume", 0.35) or 0.35)
                 try:
                     ctrack = rnd.clip_audio(
-                        cm["path"], os.path.join(work, f"clipaud-{i}.wav"),
+                        cm.get("audio_path") or cm["path"],
+                        os.path.join(work, f"clipaud-{i}.wav"),
                         duration=scene_dur[i], trim_start=_trim,
                         volume=float(_vol), loop=_loop, cancel=cancel, log=log)
                     clip_used = True
@@ -1676,7 +1720,7 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                     font=caps.font, font_scale=caps.font_scale, colour=caps.color,
                     highlight=caps.highlight_color, outline_colour=caps.outline_color,
                     position=caps.position, preset=caps.preset,
-                    uppercase=caps.uppercase))
+                    uppercase=caps.uppercase, fit=caps.fit))
         overlays = []
         for k, o in enumerate(req.overlays or []):
             spec = o.model_dump()

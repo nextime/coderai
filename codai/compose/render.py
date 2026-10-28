@@ -808,6 +808,125 @@ def _esc_text(text: str) -> str:
             .replace("]", "\\]").replace(";", "\\;"))
 
 
+#: Where a long word may be split when it alone is wider than a line. A URL is
+#: the case that actually turns up in an overlay, and breaking it before a
+#: separator keeps it readable instead of chopping it mid-token.
+_BREAK_BEFORE = "?&/#=-_."
+
+
+def _measure(text: str, size: int, font: str, bold: bool):
+    """Width of ``text`` in px, or None when the font cannot be measured."""
+    try:
+        from codai.compose.captions import _text_width
+        return _text_width(text, size, font, bold, 0.0)
+    except Exception:
+        return None
+
+
+def _split_long_word(word: str, size: int, font: str, bold: bool,
+                     usable: float) -> List[str]:
+    """One word that does not fit on a line of its own, cut into pieces."""
+    out, cur = [], ""
+    for i, ch in enumerate(word):
+        # Prefer to start a new piece BEFORE a separator, so a URL breaks at a
+        # boundary a reader recognises rather than mid-token.
+        if cur and ch in _BREAK_BEFORE:
+            w = _measure(cur + ch, size, font, bold)
+            if w is not None and w > usable:
+                out.append(cur)
+                cur = ch
+                continue
+        w = _measure(cur + ch, size, font, bold)
+        if cur and w is not None and w > usable:
+            out.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        out.append(cur)
+    return out or [word]
+
+
+def wrap_text(text: str, size: int, font: str, bold: bool,
+              usable: float) -> List[str]:
+    """``text`` broken into lines that each fit ``usable`` px at ``size``.
+
+    An explicit newline in ``text`` is always a line break -- a caller that has
+    already decided where the breaks go is not second-guessed, whatever fit was
+    asked for. Within a paragraph, words are moved to the next line as needed,
+    and a single word wider than a line is cut (see ``_split_long_word``)
+    rather than drawn off the frame.
+
+    When the font cannot be measured the text is returned as its own lines
+    unchanged: a guess from character counts is wrong in exactly the case this
+    exists to catch, so the honest answer is to leave it alone.
+    """
+    paragraphs = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if usable <= 0:
+        return paragraphs
+    lines: List[str] = []
+    for para in paragraphs:
+        words = para.split()
+        if not words:
+            lines.append("")
+            continue
+        cur = ""
+        for word in words:
+            cand = f"{cur} {word}".strip()
+            w = _measure(cand, size, font, bold)
+            if w is None:
+                return paragraphs            # cannot measure -> do not guess
+            if cur and w > usable:
+                lines.append(cur)
+                cur = word
+                ww = _measure(cur, size, font, bold)
+                if ww is not None and ww > usable:
+                    pieces = _split_long_word(cur, size, font, bold, usable)
+                    lines.extend(pieces[:-1])
+                    cur = pieces[-1]
+            else:
+                cur = cand
+                if not cur:
+                    continue
+        if cur:
+            ww = _measure(cur, size, font, bold)
+            if ww is not None and ww > usable:
+                lines.extend(_split_long_word(cur, size, font, bold, usable))
+            else:
+                lines.append(cur)
+    return lines or [""]
+
+
+def shrink_to_fit(text: str, size: int, font: str, bold: bool,
+                  usable: float, floor: int = 8) -> int:
+    """The largest size <= ``size`` at which ``text`` fits on one line.
+
+    Found by measuring, not by scaling the size by the width ratio. Advance is
+    very nearly linear in size at caption sizes, which is why that shortcut
+    looks right, but hinting rounds each glyph's advance to whole pixels, and
+    the rounding error compounds over a long string: a 95-character line
+    computed to fit at size 8 measured 440 px against a 300 px budget. Below
+    the floor nothing fits, and the floor is returned as the best available.
+    """
+    if usable <= 0 or not text:
+        return size
+    w = _measure(text, size, font, bold)
+    if w is None or w <= usable:
+        return size
+    lo, hi, best = floor, int(size), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        m = _measure(text, mid, font, bold)
+        if m is None:
+            return size
+        if m <= usable:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best if best is not None else floor
+
+
 def final_render(video: str, audio: str, out_path: str, *, width: int, height: int,
                  fps: int, total: float, ass_file: Optional[str] = None,
                  overlays: Optional[List[dict]] = None, crf: int = 20,
@@ -841,21 +960,72 @@ def final_render(video: str, audio: str, out_path: str, *, width: int, height: i
     for n, o in enumerate(overlays or []):
         if (o.get("type") or "image").lower() != "text":
             continue
-        text = _esc_text(o.get("text") or "")
-        if not text:
+        raw = str(o.get("text") or "")
+        if not raw:
             continue
         size = max(8, int(height * max(0.008, min(0.2, float(o.get("size") or 0.025)))))
         alpha = max(0.0, min(1.0, float(o.get("opacity") if o.get("opacity") is not None else 1.0)))
         colour = (o.get("color") or "#FFFFFF").lstrip("#")
-        x, y = _pos_expr(o.get("position"), f"{int(width * 0.05)}", f"{int(height * 0.04)}")
-        ff = media.font_file(o.get("font") or "", bold=True)
-        parts = [f"text='{text}'", f"fontsize={size}",
-                 f"fontcolor=0x{colour}@{alpha:.3f}", f"x={x}", f"y={y}",
-                 "borderw=%d" % max(1, size // 14), "bordercolor=black@0.6"]
-        if ff:
-            parts.insert(0, f"fontfile={ff}")
-        graph.append(f"[{cur}]drawtext={':'.join(parts)}[txt{n}]")
-        cur = f"txt{n}"
+        pad_x, pad_y = int(width * 0.05), int(height * 0.04)
+        family = o.get("font") or ""
+        ff = media.font_file(family, bold=True)
+        # `fit` decides what happens to a text wider than the frame. The
+        # default stays "none" -- one line at the size asked for, drawn off the
+        # edge if it is too long -- because that is what callers already get.
+        # "wrap" keeps the size and adds lines; "shrink" keeps one line and
+        # reduces the size. An explicit newline always breaks, whatever is set,
+        # so a caller that pre-wrapped its own text is honoured either way
+        # (before this, such a text was drawn as a single line).
+        fit = str(o.get("fit") or "none").strip().lower()
+        usable = max(1.0, float(width - 2 * pad_x))
+        if fit == "shrink":
+            size = shrink_to_fit(raw.replace("\n", " "), size, family, True, usable)
+            lines = [raw.replace("\n", " ")]
+        elif fit == "wrap":
+            lines = wrap_text(raw, size, family, True, usable)
+        else:
+            lines = str(raw).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        lines = [ln for ln in lines if ln != ""] or [""]
+
+        # One drawtext per line, placed as a single left-aligned block. Letting
+        # each line position itself would centre them independently and ragged;
+        # the block's own edge is measured from the widest line instead.
+        line_h = max(1, int(round(size * 1.25)))
+        block_h = line_h * len(lines)
+        widths = [_measure(ln, size, family, True) for ln in lines]
+        widest = max([w for w in widths if w is not None] or [0.0])
+        p = (o.get("position") or "bottom-right").lower().replace("_", "-")
+        if "-" in p:
+            v_side, _, h_side = p.partition("-")
+        else:
+            v_side, h_side = ("center", p) if p in ("left", "center", "centre", "right") \
+                else (p, "center")
+        for li, line in enumerate(lines):
+            text = _esc_text(line)
+            if widest and len(lines) > 1:
+                # A measured block: x is a number, identical for every line.
+                if h_side == "left":
+                    x = f"{pad_x}"
+                elif h_side in ("center", "centre"):
+                    x = f"(W-{widest:.0f})/2"
+                else:
+                    x = f"W-{widest:.0f}-{pad_x}"
+            else:
+                x, _ = _pos_expr(o.get("position"), f"{pad_x}", f"{pad_y}")
+            if v_side == "top":
+                y = f"{pad_y}+{li * line_h}"
+            elif v_side in ("center", "centre", "middle"):
+                y = f"(H-{block_h})/2+{li * line_h}"
+            else:
+                y = f"H-{block_h}-{pad_y}+{li * line_h}"
+            parts = [f"text='{text}'", f"fontsize={size}",
+                     f"fontcolor=0x{colour}@{alpha:.3f}", f"x={x}", f"y={y}",
+                     "borderw=%d" % max(1, size // 14), "bordercolor=black@0.6"]
+            if ff:
+                parts.insert(0, f"fontfile={ff}")
+            lbl = f"txt{n}_{li}"
+            graph.append(f"[{cur}]drawtext={':'.join(parts)}[{lbl}]")
+            cur = lbl
     graph.append(f"[{cur}]null[vout]")
 
     codec = {"h264": "libx264", "avc": "libx264", "h265": "libx265",

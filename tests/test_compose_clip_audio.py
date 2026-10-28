@@ -229,3 +229,61 @@ def test_mp3_is_actually_encoded_not_a_wav_under_an_mp3_key(monkeypatch):
     import base64 as _b64
     assert set(out) == {"b64_mp3"}
     assert _b64.b64decode(out["b64_mp3"]) == b"ID3fake-mp3"
+
+
+# ------------------------------------- 14d: the sound in a separate file
+#
+# YouTube and other DASH sites serve picture and sound as separate streams, so
+# the best available video of a clip often carries no audio track at all. A
+# caller that does not run ffmpeg itself cannot mux them, and had to skip such
+# a clip entirely. `Visual.audio_src` names the sound's own file.
+
+def test_audio_src_defaults_to_nothing():
+    """A request written before this existed must behave exactly as it did."""
+    v = Visual(type="video", src="a.mp4")
+    assert v.audio_src is None
+
+
+def test_a_visual_with_a_separate_audio_file_is_still_the_clip_visual():
+    sc = Scene(audio_mix="clip", visuals=[
+        Visual(type="video", src="v.mp4", audio_src="a.m4a", keep_audio=True)])
+    v = _scene_clip_visual(sc)
+    assert v is not None and v.src == "v.mp4" and v.audio_src == "a.m4a"
+
+
+@needs_ffmpeg
+def test_a_video_with_no_audio_track_is_usable_when_audio_src_supplies_the_sound():
+    """The whole point: `src` is not required to have an audio stream."""
+    from codai.compose import render as rnd
+    with tempfile.TemporaryDirectory() as d:
+        vid = os.path.join(d, "video-only.mp4")
+        aud = os.path.join(d, "audio-only.m4a")
+        _make_clip(vid, seconds=2.0, with_audio=False)
+        subprocess.run([_ffmpeg(), "-y", "-f", "lavfi", "-i",
+                        "sine=frequency=330:duration=2.0", "-t", "2.0", aud],
+                       capture_output=True, check=True, timeout=120)
+        assert not rnd.has_audio_stream(vid), "fixture is wrong: video has audio"
+        assert rnd.has_audio_stream(aud), "fixture is wrong: audio file has none"
+        # The sound is taken from the companion file, cut the same way.
+        out = os.path.join(d, "track.wav")
+        rnd.clip_audio(aud, out, duration=1.0, trim_start=0.5,
+                       loop=False, volume=1.0)
+        assert os.path.getsize(out) > 44, "no PCM was written from audio_src"
+
+
+def test_the_picture_path_is_never_replaced_by_the_audio_file():
+    """Stage 3 reuses the resolved clip as this visual's VIDEO.
+
+    Putting the audio-only file in that slot would render a scene with no
+    image at all, so the two paths are tracked separately.
+    """
+    import inspect
+    from codai.api import compose as C
+    src = inspect.getsource(C._run_job) if hasattr(C, "_run_job") else ""
+    if not src:
+        pytest.skip("cannot read the job source")
+    assert '"audio_path"' in src, (
+        "the clip's sound is not tracked apart from its picture")
+    # The visual cache must hand back `path`, not the audio file.
+    assert '_cached["path"]' in src, (
+        "the visual no longer reuses the resolved picture path")

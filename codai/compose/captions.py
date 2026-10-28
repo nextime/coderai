@@ -323,10 +323,75 @@ def _fit_size(rows, size: int, usable: float, font: str, bold: bool,
         widest = max(widest, w)
     if widest <= usable:
         return size
-    # Advance scales linearly with size, so one ratio gets there; floor() and a
-    # 1px margin keep a rounding error from leaving it a hair too wide.
-    scaled = int(size * usable / widest)
-    return max(12, min(size, scaled))
+
+    def _widest_at(sz: int):
+        w = 0.0
+        for row in rows:
+            t = " ".join(row)
+            if upper:
+                t = t.upper()
+            m = _text_width(t, sz, font, bold, spacing)
+            if m is None:
+                return None
+            w = max(w, m)
+        return w
+
+    # Found by measuring, not by scaling the size by the width ratio. Advance is
+    # very nearly linear in size, which is why that shortcut looks right, but
+    # hinting rounds each glyph's advance to whole pixels and the error
+    # compounds over a long line -- measured on a 95-character line, the size
+    # the ratio chose was still 47% over its budget. A shrunk caption that
+    # still overflows is the one outcome this function exists to prevent.
+    lo, hi, best = 12, int(size), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        m = _widest_at(mid)
+        if m is None:
+            return size                      # cannot measure -> do not guess
+        if m <= usable:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best if best is not None else 12
+
+
+def _wrap_rows(rows, size: int, usable: float, font: str, bold: bool,
+               spacing: float, upper: bool):
+    """Re-flow ``rows`` so every row fits ``usable`` px at ``size``.
+
+    The alternative repair is ``_fit_size``, which keeps the caller's rows and
+    shrinks the text. On a vertical video that can take a caption below the
+    size anyone wants to read, so ``captions.fit="wrap"`` moves a too-wide
+    row's trailing words onto a new row instead and leaves the size alone. The
+    event may end up with more rows than ``max_lines`` asked for: being one row
+    taller is a smaller harm than being unreadable, which is the whole point of
+    asking for wrap.
+
+    Word order is never changed, so the karaoke highlight still walks the words
+    in the order they are spoken.
+    """
+    if usable <= 0 or not rows:
+        return rows
+    out = []
+    for row in rows:
+        cur = []
+        for word in row:
+            cand = cur + [word]
+            text = " ".join(cand)
+            if upper:
+                text = text.upper()
+            w = _text_width(text, size, font, bold, spacing)
+            if w is None:
+                return rows                  # cannot measure -> do not guess
+            if cur and w > usable:
+                out.append(cur)
+                cur = [word]
+            else:
+                cur = cand
+        if cur:
+            out.append(cur)
+    return out or rows
 
 
 def _ass_escape(text: str) -> str:
@@ -337,7 +402,7 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
               font_scale: float = 1.0, colour: str = "#FFFFFF",
               highlight: str = "#FFE14D", outline_colour: str = "#000000",
               position: str = "center", preset: str = "karaoke",
-              uppercase: bool = False) -> str:
+              uppercase: bool = False, fit: str = "shrink") -> str:
     """The ASS subtitle file the renderer burns in.
 
     Sizes are derived from the canvas height so the same request looks the same
@@ -388,11 +453,19 @@ def build_ass(events: List[dict], *, width: int, height: int, font: str = "Monts
         # A scene with a presenter bubble at the bottom pushes its captions up:
         # ASS takes a per-event MarginV, so only those events move.
         mv = int(ev.get("margin_v") or 0)
-        # Does this event's widest line actually fit? If not, it gets its own
-        # smaller size through an inline \fs override -- per event, so one long
-        # line never shrinks the whole video.
-        ev_size = _fit_size(rows, size, usable_w, font or "DejaVu Sans",
-                            bool(p["bold"]), p["spacing"], upper)
+        # Does this event's widest line actually fit? If not, `fit` decides the
+        # repair: "shrink" (the default, and what callers already get) gives
+        # this event its own smaller size through an inline \fs override, per
+        # event so one long line never shrinks the whole video; "wrap" keeps the
+        # size and folds the row instead, which is what a vertical video wants
+        # when shrinking would take the text below readable.
+        if str(fit or "shrink").strip().lower() == "wrap":
+            rows = _wrap_rows(rows, size, usable_w, font or "DejaVu Sans",
+                              bool(p["bold"]), p["spacing"], upper)
+            ev_size = size
+        else:
+            ev_size = _fit_size(rows, size, usable_w, font or "DejaVu Sans",
+                                bool(p["bold"]), p["spacing"], upper)
         fs = f"{{\\fs{ev_size}}}" if ev_size != size else ""
         if not p["karaoke"]:
             text = "\\N".join(" ".join(_ass_escape(w.upper() if upper else w) for w in row)

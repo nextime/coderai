@@ -20,6 +20,28 @@ def _sp(**kw):
     return SpeakerLine(**kw)
 
 
+@pytest.fixture(autouse=True)
+def _a_tts_model_exists(monkeypatch):
+    """Pretend a TTS model is installed, for every test in this module.
+
+    These tests are about how a dialogue scene is VALIDATED, and say so: the
+    portraits are given inline "so the test does not depend on what is saved on
+    this install". The TTS check is the same kind of install dependency and was
+    missed -- `_validate` refuses a request whose lines need narration when no
+    TTS model is configured, so on a bare checkout three of these failed with
+    501 "narration needs a TTS model" without ever reaching the validation they
+    exercise.
+
+    Only the INVENTORY is faked, not the check: `_has_model` still does its own
+    name matching, and `test_a_line_whose_voice_model_is_not_installed_is_refused`
+    (if it ever exists) would still see a real miss for a name not listed here.
+    """
+    import codai.api.compose as C
+    monkeypatch.setattr(C, "_model_ids",
+                        lambda mtype: (["hexgrad/Kokoro-82M"]
+                                       if mtype == "tts" else []))
+
+
 # ----------------------------------------------------------------- identity
 def test_a_character_is_identified_by_profile_then_portrait_then_position():
     assert _speaker_key(_sp(character="Alice"), 0) == "alice"
