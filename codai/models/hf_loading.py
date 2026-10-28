@@ -1043,7 +1043,19 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
                 # `.safetensors` component could only be named if somebody had
                 # published a converted directory tree for it.
                 _path = resolve_single_file(source)
-                components[name] = cls.from_single_file(_path, **kwargs)
+                # `config` names the architecture these tensors belong to, for
+                # the same reason the GGUF branch above passes it: left to
+                # itself from_single_file INFERS a base repo out of the
+                # checkpoint's own metadata, and a community fine-tune carries
+                # whatever its author trained from. Measured on Krea-2-RealDream
+                # (a Civitai Krea 2 checkpoint): it inferred `krea/Krea-2-Raw`
+                # and the load died with "is not a local folder and is not a
+                # valid model identifier" -- a missing-repo error for a repo
+                # nobody had named. The entry's own `path` is the repo supplying
+                # every other component, so it is the right config here too.
+                _base = str((c or {}).get('path') or '').strip() or model_name
+                components[name] = cls.from_single_file(
+                    _path, config=_base, subfolder=name, **kwargs)
             else:
                 components[name] = cls.from_pretrained(source, **kwargs)
             descs.append(f"{name}:{source.split('/')[-1]}{'/' + mode if mode else ''}")

@@ -473,9 +473,21 @@ def silence(path: str, duration: float, cancel=None, log=None) -> str:
 
 
 def pad_to(src: str, out_path: str, duration: float, cancel=None, log=None) -> str:
-    """One scene's narration, padded (or trimmed) to the scene's exact length."""
+    """One scene's narration, padded (or trimmed) to the scene's exact length.
+
+    The pad is bounded with ``whole_dur`` rather than left to ``atrim`` to stop.
+    A bare ``apad`` generates silence for ever and relies on something
+    downstream ending the stream; with more than one input feeding the pad
+    through ``amix`` that termination is a race, and when it is lost ffmpeg
+    never reaches EOF and spins at 100% CPU with the output half-written.
+    Measured on this exact graph (two 1 s inputs, ``amix``, 4 s trim): 4 hangs
+    in 10 runs, and two orphans on the host had burned 14 h and 10 h of CPU
+    before anyone noticed. ``-threads 1`` and ``-filter_threads 1`` do NOT fix
+    it (3/12 and 7/12); bounding the pad does (0/12).
+    """
     run(["-i", src, "-af",
-         f"aresample=48000,apad,atrim=0:{max(0.02, duration):.3f},asetpts=N/SR/TB",
+         f"aresample=48000,apad=whole_dur={max(0.02, duration):.3f},"
+         f"atrim=0:{max(0.02, duration):.3f},asetpts=N/SR/TB",
          "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
         cancel=cancel, log=log)
     return out_path
@@ -536,23 +548,33 @@ def place_at(placements: List[tuple], out_path: str, *, duration: float,
     """
     if not placements:
         return silence(out_path, duration, cancel=cancel, log=log)
-    inputs: List[str] = []
+    dur = max(0.02, float(duration))
+    # The track's length comes from a silent base input of exactly `dur`, mixed
+    # under the placements, and `amix=duration=first` ends the mix with it.
+    #
+    # It is NOT padded up to length with `apad`. A pad has to be ended by
+    # something downstream, and when it is fed through `amix` that handoff is a
+    # race: a bare `apad` loses it by generating silence for ever, so ffmpeg
+    # never reaches EOF and spins at 100% CPU with the output half-written (two
+    # orphans on a dev host had burned 14 h and 10 h of CPU before anyone
+    # noticed; 4 hangs in 10 runs of this graph). `apad=whole_dur` stops the
+    # hang but loses the same race the other way, silently emitting a track one
+    # clip short -- 3 s where 4 s was asked for, in 3 of 14 runs, with no error
+    # anywhere. Neither `-threads 1` nor `-filter_threads 1` helps (3/12, 7/12).
+    # A base input that is already the right length has no handoff to lose.
+    inputs: List[str] = ["-f", "lavfi", "-t", f"{dur:.3f}",
+                         "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
     graph: List[str] = []
-    labels: List[str] = []
-    for i, (path, start) in enumerate(placements):
+    labels: List[str] = ["[0:a]"]
+    for i, (path, start) in enumerate(placements, start=1):
         inputs += ["-i", path]
         ms = max(0, int(round(float(start) * 1000)))
         graph.append(f"[{i}:a]aresample=48000,adelay={ms}|{ms}[d{i}]")
         labels.append(f"[d{i}]")
-    if len(labels) == 1:
-        graph.append(f"{labels[0]}apad,atrim=0:{max(0.02, float(duration)):.3f},"
-                     f"asetpts=N/SR/TB[aout]")
-    else:
-        graph.append("".join(labels)
-                     + f"amix=inputs={len(labels)}:duration=longest:"
-                       f"dropout_transition=0:normalize=0,"
-                       f"apad,atrim=0:{max(0.02, float(duration)):.3f},"
-                       f"asetpts=N/SR/TB[aout]")
+    graph.append("".join(labels)
+                 + f"amix=inputs={len(labels)}:duration=first:"
+                   f"dropout_transition=0:normalize=0,"
+                   f"atrim=0:{dur:.3f},asetpts=N/SR/TB[aout]")
     run(inputs + ["-filter_complex", ";".join(graph), "-map", "[aout]",
                   "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
         cancel=cancel, log=log)
@@ -625,7 +647,8 @@ def clip_audio(src: str, out_path: str, *, duration: float, trim_start: float = 
     pre = ["-stream_loop", "-1"] if loop else []
     if trim_start > 0:
         pre += ["-ss", f"{float(trim_start):.3f}"]
-    af = ["aresample=48000", "apad",
+    af = ["aresample=48000",
+          f"apad=whole_dur={max(0.02, float(duration)):.3f}",
           f"atrim=0:{max(0.02, float(duration)):.3f}", "asetpts=N/SR/TB"]
     v = max(0.0, float(volume))
     if abs(v - 1.0) > 1e-6:
@@ -674,7 +697,8 @@ def mix_voice_clip(voice: Optional[str], clip: Optional[str], out_path: str, *,
         return silence(out_path, duration, cancel=cancel, log=log)
     if not voice:
         run(["-i", clip, "-af",
-             f"aresample=48000,apad,atrim=0:{max(0.02, duration):.3f},asetpts=N/SR/TB",
+             f"aresample=48000,apad=whole_dur={max(0.02, duration):.3f},"
+             f"atrim=0:{max(0.02, duration):.3f},asetpts=N/SR/TB",
              "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
             cancel=cancel, log=log)
         return out_path
@@ -682,7 +706,8 @@ def mix_voice_clip(voice: Optional[str], clip: Optional[str], out_path: str, *,
     # on the output: ffmpeg refuses simple and complex filtering on the same
     # stream ("Filtergraph ... was specified for a stream fed from a complex
     # filtergraph"), and the mix would never be written at all.
-    fit = (f"apad,atrim=0:{max(0.02, float(duration)):.3f},asetpts=N/SR/TB")
+    fit = (f"apad=whole_dur={max(0.02, float(duration)):.3f},"
+           f"atrim=0:{max(0.02, float(duration)):.3f},asetpts=N/SR/TB")
     if duck:
         graph = ("[1:a]asplit=2[c1][c2];"
                  "[0:a]asplit=2[v1][v2];"
