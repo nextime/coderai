@@ -83,7 +83,10 @@ def _managed_engine_ready(name: str) -> bool:
     try:
         from codai.api import lipsync_engines
         if name in lipsync_engines.MANAGED:
-            return lipsync_engines.is_installed(name)
+            # An engine disabled on the models page is not offered, the same as
+            # any other model: it has a card, and the card is what decides.
+            return (lipsync_engines.is_enabled(name)
+                    and lipsync_engines.is_installed(name))
     except Exception:
         pass
     d = _managed_engine_dir(name)

@@ -688,11 +688,12 @@ def run(name: str, video_path: str, audio_path: str, out_path: str,
     env = _engine_env(sp, root)
     if log:
         log(f"[{sp.name}] {' '.join(cmd[1:])}")
-    try:
-        proc = subprocess.run(cmd, cwd=str(root), env=env, capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"{sp.name} did not finish within {timeout}s") from exc
+    # The engine is a subprocess holding gigabytes of the card, so it is
+    # registered with the model manager for the length of the run: eviction
+    # makes room for it before it starts, and can take the card BACK from it
+    # while it runs, because the handle's cleanup() kills the process. An
+    # unregistered subprocess is VRAM the ledger cannot see and cannot reclaim.
+    proc = _run_managed(sp, cmd, root, env, timeout, log=log)
     if proc.returncode != 0:
         why = (proc.stderr or proc.stdout or "").strip()[-900:]
         raise RuntimeError(f"{sp.name} failed (rc={proc.returncode}): {why}")
@@ -821,3 +822,223 @@ def uninstall(name: str, keep_weights: bool = False) -> dict:
             removed.append(str(root))
     return {"name": sp.name, "removed": removed,
             "state": install_state(sp.name)}
+
+
+# --------------------------------------------------------------------------- #
+# VRAM: these engines are models, and the ledger has to say so
+# --------------------------------------------------------------------------- #
+# A lip-sync run is gigabytes on the card for minutes at a time, in a process
+# the manager did not start. Left unregistered it is VRAM nothing can see and
+# nothing can reclaim: the next model to load reads the card as emptier than it
+# is, takes what it finds, and one of the two dies. Everything else out of band
+# -- LongCat, MiniMax H3, the STT workers -- goes through acquire_stt_backend,
+# the manager's generic "register an out-of-band backend as an evictable,
+# VRAM-tracked model" entry point. So do these.
+#
+# What is different here is that an engine is one-shot rather than a resident
+# service: when the subprocess exits its VRAM is genuinely gone. So it is
+# registered for the length of the run and dropped afterwards, instead of
+# sitting in the ledger claiming memory nobody holds.
+
+#: What a run costs before anything has been measured. Overridden by the card's
+#: used_vram_gb, then by what the run actually peaked at.
+DEFAULT_ENGINE_VRAM_GB = {"latentsync": 18.0, "musetalk": 6.0}
+
+_vram_lock = threading.RLock()
+_inflight_runs: Dict[str, int] = {}
+
+
+def model_key(name: str) -> str:
+    """The key the manager tracks this engine under — its models.json alias."""
+    return f"video:{spec(name).name}"
+
+
+def card(name: str) -> dict:
+    """This engine's models.json entry, or {} when it has none."""
+    try:
+        from codai.models.manager import multi_model_manager as _m
+        for sec in ("video_models",):
+            for entry in (_m.models_data.get(sec) or []):
+                if isinstance(entry, dict) and entry.get("alias") == spec(name).name:
+                    return entry
+    except Exception:
+        pass
+    try:
+        import json as _json
+        from codai.platform_paths import legacy_style_config_dir
+        p = legacy_style_config_dir() / "models.json"
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        for entry in (data.get("video_models") or []):
+            if isinstance(entry, dict) and entry.get("alias") == spec(name).name:
+                return entry
+    except Exception:
+        pass
+    return {}
+
+
+def is_enabled(name: str) -> bool:
+    """False only when the card says so — an engine with no card is not disabled."""
+    c = card(name)
+    return bool(c.get("enabled", True)) if c else True
+
+
+def reserved_vram_gb(name: str) -> float:
+    """What to make room for before starting this engine.
+
+    The operator's figure first, then the peak a previous run measured, then the
+    default. Measured beats the default because the default cannot know the
+    resolution, the clip length or the config in play.
+    """
+    sp = spec(name)
+    explicit = float((card(name).get("used_vram_gb") or 0) or 0)
+    if explicit > 0:
+        return explicit
+    try:
+        from codai.models.manager import multi_model_manager as _m
+        measured = float(_m._measured_vram_gb.get(model_key(sp.name)) or 0.0)
+    except Exception:
+        measured = 0.0
+    return measured or DEFAULT_ENGINE_VRAM_GB.get(sp.name, 8.0)
+
+
+def record_measurement(name: str, gb: float) -> None:
+    """Keep the high-water mark: a 2s clip is not what a 30s one costs."""
+    if not gb or gb <= 0:
+        return
+    key = model_key(name)
+    try:
+        from codai.models.manager import multi_model_manager as _m
+        prev = float(_m._measured_vram_gb.get(key) or 0.0)
+        if gb > prev + 0.05:
+            _m._measured_vram_gb[key] = float(gb)
+            print(f"[{name}] measured {gb:.2f} GB"
+                  + (f" (was {prev:.2f})" if prev else ""), flush=True)
+    except Exception:
+        pass
+
+
+class _EngineHandle:
+    """What the manager holds while a run is in flight.
+
+    ``cleanup()`` does NOT kill the render. A half-finished lip-sync is worth
+    nothing to anybody, and the request that triggered the eviction is not more
+    important than the one already running -- it queues, like every other
+    request on this card. The run is marked busy through
+    ``multi_model_manager.external_busy`` for its whole length, so eviction
+    skips it and a load needing its VRAM waits; this only waits for the exit it
+    is already guaranteed, and frees nothing of its own, because when the
+    subprocess ends its VRAM is gone with it.
+    """
+
+    #: How long cleanup() will wait for a render it should never have been
+    #: called on anyway. Generous: a 30s clip at 512px is minutes of work.
+    DRAIN_S = 1800.0
+
+    def __init__(self, name: str, proc):
+        self.name = name
+        self.proc = proc
+
+    def cleanup(self):
+        p = self.proc
+        if p is None or p.poll() is not None:
+            return
+        print(f"[{self.name}] the card was wanted elsewhere — waiting for this "
+              f"render to finish first", flush=True)
+        try:
+            p.wait(timeout=self.DRAIN_S)
+        except Exception:
+            print(f"[{self.name}] still running after {self.DRAIN_S:.0f}s; "
+                  f"leaving it alone rather than losing the render", flush=True)
+
+    def to(self, *a, **k):      # the manager probes this on loaded models
+        return self
+
+
+def _free_vram_gb() -> float:
+    try:
+        import torch
+        return torch.cuda.mem_get_info(0)[0] / 1e9
+    except Exception:
+        return 0.0
+
+
+def _run_managed(sp: EngineSpec, cmd: List[str], root: Path, env: dict,
+                 timeout: int, log=None):
+    """Run the engine as a registered, evictable, VRAM-tracked model."""
+    key = model_key(sp.name)
+    needed = reserved_vram_gb(sp.name)
+    handle = None
+    started = None
+
+    def _loader():
+        nonlocal started
+        started = subprocess.Popen(cmd, cwd=str(root), env=env,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+        return _EngineHandle(sp.name, started)
+
+    try:
+        from codai.models.manager import multi_model_manager as _m
+        # Evicts other models for `needed` BEFORE the process starts, then
+        # registers it so the normal eviction path can free it in turn.
+        handle = _m.acquire_stt_backend(key, needed, True, _loader,
+                                        keep_resident=False)
+    except Exception as exc:
+        print(f"[{sp.name}] could not register with the model manager ({exc}); "
+              f"running unmanaged", flush=True)
+        handle = _loader()
+
+    proc = handle.proc
+    with _vram_lock:
+        _inflight_runs[sp.name] = _inflight_runs.get(sp.name, 0) + 1
+    base_free = _free_vram_gb()
+    peak = 0.0
+    # Busy for the length of the render, so eviction queues behind it instead of
+    # treating it as a candidate. Without this the manager cannot tell a loaded
+    # engine from a rendering one: acquire_stt_backend pops the instance pool,
+    # which is where _is_key_busy looks.
+    try:
+        from codai.models.manager import multi_model_manager as _m
+        _busy = _m.external_busy(key)
+    except Exception:
+        import contextlib as _c
+        _busy = _c.nullcontext()
+    try:
+        with _busy:
+            # Sampling the card is the only honest reading available: these
+            # engines are third-party scripts that report nothing about their
+            # own footprint.
+            deadline = time.time() + timeout
+            out_lines: List[str] = []
+            while True:
+                try:
+                    stdout, _ = proc.communicate(timeout=5)
+                    if stdout:
+                        out_lines.append(stdout)
+                    break
+                except subprocess.TimeoutExpired:
+                    used = base_free - _free_vram_gb()
+                    peak = max(peak, used)
+                    if time.time() > deadline:
+                        proc.kill()
+                        raise RuntimeError(
+                            f"{sp.name} did not finish within {timeout}s")
+            text = "".join(out_lines)
+
+            class _Done:
+                returncode = proc.returncode
+                stdout = text
+                stderr = ""
+            record_measurement(sp.name, peak)
+            return _Done
+    finally:
+        with _vram_lock:
+            _inflight_runs[sp.name] = max(0, _inflight_runs.get(sp.name, 1) - 1)
+        # One-shot: once the process is gone so is its VRAM, so the ledger must
+        # stop claiming it. Leaving the registration behind would make the card
+        # look permanently fuller than it is.
+        try:
+            from codai.models.manager import multi_model_manager as _m
+            _m.unload_model(key)
+        except Exception:
+            pass

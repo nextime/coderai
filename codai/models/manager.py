@@ -23,6 +23,7 @@ import subprocess
 import signal
 import requests
 import time
+import contextlib
 import threading
 import gc
 
@@ -1640,6 +1641,13 @@ class MultiModelManager:
         # LoRA trainer caches its SD/SDXL base model between jobs). Each returns
         # the GB it freed (or None). Invoked as a last resort during eviction.
         self._external_vram_releasers: List[Any] = []
+        # Out-of-band work that is NOT visible as a busy instance pool: a
+        # lip-sync render, a LongCat generation, a transcription. acquire_stt_backend
+        # pops the model pool, so _is_key_busy is permanently False for everything
+        # registered through it — which makes eviction reach for a model that is
+        # mid-generation. key -> depth (it nests).
+        self._external_busy: Dict[str, int] = {}
+        self._external_busy_lock = threading.RLock()
 
     @property
     def active_in_vram(self) -> Optional[str]:
@@ -5041,11 +5049,37 @@ class MultiModelManager:
         which triggers a CUDA device-side assert in the in-flight request and
         corrupts the whole context.  Such models must NOT be evicted until idle.
         """
+        with self._external_busy_lock:
+            if self._external_busy.get(key, 0) > 0:
+                return True
         pool = self.model_pools.get(key)
         if pool is not None:
             with pool._lock:
                 return any(r > 0 for r in pool.ref_counts)
         return False
+
+    @contextlib.contextmanager
+    def external_busy(self, key: str):
+        """Mark `key` as serving a request for the length of this block.
+
+        For work the instance pool cannot see — a subprocess engine's render, a
+        generation on a remote worker. While it is held, eviction treats the model
+        exactly like any other busy one: it is skipped, and a load that needs its
+        VRAM waits for it to finish rather than pulling the card out from under
+        it. That is the whole point — an in-flight render is not a candidate, it
+        is something to queue behind.
+        """
+        with self._external_busy_lock:
+            self._external_busy[key] = self._external_busy.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            with self._external_busy_lock:
+                n = self._external_busy.get(key, 1) - 1
+                if n > 0:
+                    self._external_busy[key] = n
+                else:
+                    self._external_busy.pop(key, None)
 
     def _wait_until_idle(self, key: str, timeout: float = 120.0) -> bool:
         """Block until no instance of `key` is busy, or until timeout. Returns idle?"""

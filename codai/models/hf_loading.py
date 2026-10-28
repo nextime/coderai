@@ -423,8 +423,16 @@ class _DropAuthOnCrossHostRedirect(_urlreq.HTTPRedirectHandler):
         return new
 
 
-def _civitai_opener():
-    return _urlreq.build_opener(_DropAuthOnCrossHostRedirect)
+def _civitai_open(req, timeout: float = 60):
+    """The ONE place a Civitai request leaves this process.
+
+    Both the metadata lookup and the download go through here, so a test has a
+    single seam to patch and cannot reach the network by accident. Making the
+    download bypass urlopen for the redirect handler is exactly what silently
+    un-patched two tests that had been asserting on 401 and 403 pages, and sent
+    them to the real site instead.
+    """
+    return _urlreq.build_opener(_DropAuthOnCrossHostRedirect).open(req, timeout=timeout)
 
 
 def civitai_cache_root() -> Path:
@@ -504,7 +512,7 @@ def resolve_civitai(ref: str) -> str:
     try:
         req = urllib.request.Request(
             f"https://civitai.com/api/v1/model-versions/{vid}", headers=hdrs)
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with _civitai_open(req, timeout=60) as r:
             meta = _json.loads(r.read().decode("utf-8", "replace"))
         files = [f for f in (meta.get("files") or [])
                  if str(f.get("name", "")).lower().endswith(_SINGLE_FILE_SUFFIXES)]
@@ -530,7 +538,7 @@ def resolve_civitai(ref: str) -> str:
     tmp = base / (name + ".part")
     req = urllib.request.Request(url, headers=hdrs)
     try:
-        with _civitai_opener().open(req, timeout=120) as r:
+        with _civitai_open(req, timeout=120) as r:
             ctype = (r.headers.get("Content-Type") or "").lower()
             if "text/html" in ctype or "application/json" in ctype:
                 # The 401/403 page. Saving it would produce a file with a

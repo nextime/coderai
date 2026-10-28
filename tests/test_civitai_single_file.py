@@ -51,7 +51,7 @@ def test_a_cached_checkpoint_is_not_downloaded_again(monkeypatch, tmp_path):
     # Nothing may reach the network: a cached file is returned before any
     # request is made, so a urlopen call here is a bug.
     import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(H, "_civitai_open",
                         lambda *a, **k: pytest.fail("re-downloaded a cached file"))
     assert resolve_civitai("civitai:999") == str(f)
 
@@ -68,6 +68,7 @@ def test_the_largest_cached_file_wins(monkeypatch, tmp_path):
 
 
 def test_an_html_error_page_is_not_saved_as_a_checkpoint(monkeypatch, tmp_path):
+    import codai.models.hf_loading as H
     """The failure this guards against.
 
     Civitai answers an unauthenticated download with a web page, HTTP 200. A
@@ -85,7 +86,7 @@ def test_an_html_error_page_is_not_saved_as_a_checkpoint(monkeypatch, tmp_path):
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(H, "_civitai_open",
                         lambda *a, **k: _Resp(b"<html>login</html>"))
     with pytest.raises(RuntimeError) as e:
         resolve_civitai("civitai:777")
@@ -98,6 +99,7 @@ def test_an_html_error_page_is_not_saved_as_a_checkpoint(monkeypatch, tmp_path):
 
 
 def test_a_truncated_download_is_rejected(monkeypatch, tmp_path):
+    import codai.models.hf_loading as H
     import io
     import urllib.request
 
@@ -109,7 +111,7 @@ def test_a_truncated_download_is_rejected(monkeypatch, tmp_path):
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(H, "_civitai_open",
                         lambda *a, **k: _Resp(b"tiny"))
     with pytest.raises(RuntimeError) as e:
         resolve_civitai("civitai:666")
@@ -129,7 +131,7 @@ def test_the_missing_token_is_named_in_the_error(monkeypatch, tmp_path):
     def _boom(*a, **k):
         raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    monkeypatch.setattr(H, "_civitai_open", _boom)
     with pytest.raises(RuntimeError) as e:
         resolve_civitai("civitai:555")
     msg = str(e.value)
@@ -250,7 +252,7 @@ def test_two_precisions_of_one_version_cache_side_by_side(monkeypatch, tmp_path)
         d.mkdir(parents=True)
         (d / name).write_bytes(b"x" * size)
     import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(H, "_civitai_open",
                         lambda *a, **k: pytest.fail("re-downloaded a cached file"))
     assert resolve_civitai("civitai:3396368:3304483").endswith("int8.safetensors")
     assert resolve_civitai("civitai:3396368:3286566").endswith("fp8.safetensors")

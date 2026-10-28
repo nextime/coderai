@@ -512,3 +512,138 @@ def test_the_models_page_offers_the_engines():
     assert "loadLipsyncEngines" in page
     assert "lipsync-engine-install" in page
     assert "lipsync-engine-remove" in page
+
+
+# ── VRAM: an engine is a model, and the ledger has to say so ─────────────────
+
+def test_both_engines_are_carded_like_any_other_model():
+    """Not a special case: a row in video_models, so the models page configures
+    them and the manager accounts for them."""
+    import json
+    import pathlib
+    p = pathlib.Path.home() / ".coderai" / "models.json"
+    if not p.is_file():
+        pytest.skip("no local models.json")
+    d = json.loads(p.read_text(encoding="utf-8"))
+    by = {m.get("alias"): m for m in d.get("video_models", [])
+          if isinstance(m, dict)}
+    for name in ("latentsync", "musetalk"):
+        c = by.get(name)
+        assert c, f"{name} has no card"
+        assert c["backend"] == "lipsync"
+        assert "lip_sync" in c["capabilities"]
+        assert float(c["used_vram_gb"]) > 0
+
+
+def test_the_reservation_prefers_the_card_then_the_measurement(le, monkeypatch):
+    monkeypatch.setattr(le, "card", lambda n: {"used_vram_gb": 12.5})
+    assert le.reserved_vram_gb("latentsync") == 12.5
+    monkeypatch.setattr(le, "card", lambda n: {})
+    import sys
+    import types
+    mod = types.ModuleType("codai.models.manager")
+    mod.multi_model_manager = types.SimpleNamespace(
+        _measured_vram_gb={"video:latentsync": 21.0})
+    monkeypatch.setitem(sys.modules, "codai.models.manager", mod)
+    assert le.reserved_vram_gb("latentsync") == 21.0
+
+
+def test_an_unmeasured_engine_falls_back_to_its_own_default(le, monkeypatch):
+    import sys
+    import types
+    monkeypatch.setattr(le, "card", lambda n: {})
+    mod = types.ModuleType("codai.models.manager")
+    mod.multi_model_manager = types.SimpleNamespace(_measured_vram_gb={})
+    monkeypatch.setitem(sys.modules, "codai.models.manager", mod)
+    assert le.reserved_vram_gb("latentsync") == le.DEFAULT_ENGINE_VRAM_GB["latentsync"]
+    assert le.reserved_vram_gb("musetalk") == le.DEFAULT_ENGINE_VRAM_GB["musetalk"]
+
+
+def test_a_measurement_is_a_high_water_mark(le, monkeypatch):
+    import sys
+    import types
+    m = types.SimpleNamespace(_measured_vram_gb={})
+    mod = types.ModuleType("codai.models.manager")
+    mod.multi_model_manager = m
+    monkeypatch.setitem(sys.modules, "codai.models.manager", mod)
+    le.record_measurement("latentsync", 17.0)
+    le.record_measurement("latentsync", 9.0)       # a 2s clip is not a 30s one
+    assert m._measured_vram_gb["video:latentsync"] == 17.0
+
+
+def test_an_engine_disabled_on_the_models_page_is_not_offered(monkeypatch):
+    from codai.api import lipsync_engines as le
+    from codai.compose import presenter
+    monkeypatch.setattr(le, "is_installed", lambda n: True)
+    monkeypatch.setattr(le, "is_enabled", lambda n: False)
+    assert presenter._managed_engine_ready("latentsync") is False
+    monkeypatch.setattr(le, "is_enabled", lambda n: True)
+    assert presenter._managed_engine_ready("latentsync") is True
+
+
+def test_an_engine_with_no_card_is_not_treated_as_disabled(le, monkeypatch):
+    monkeypatch.setattr(le, "card", lambda n: {})
+    assert le.is_enabled("latentsync") is True
+
+
+# ── an in-flight render is queued behind, never killed ───────────────────────
+
+def test_cleanup_waits_for_the_render_rather_than_killing_it(le):
+    """A half-finished lip-sync is worth nothing, and the request that triggered
+    the eviction is not more important than the one already running."""
+    import types
+    killed = []
+    waited = []
+    proc = types.SimpleNamespace(
+        poll=lambda: None,
+        wait=lambda timeout=None: waited.append(timeout),
+        terminate=lambda: killed.append("terminate"),
+        kill=lambda: killed.append("kill"))
+    h = le._EngineHandle("latentsync", proc)
+    h.cleanup()
+    assert killed == [], "an in-flight render was killed"
+    assert waited and waited[0] >= 600
+
+
+def test_cleanup_on_a_finished_render_does_nothing(le):
+    import types
+    calls = []
+    proc = types.SimpleNamespace(poll=lambda: 0,
+                                 wait=lambda timeout=None: calls.append(1),
+                                 terminate=lambda: calls.append(2),
+                                 kill=lambda: calls.append(3))
+    le._EngineHandle("latentsync", proc).cleanup()
+    assert calls == []
+
+
+def test_a_render_marks_the_model_busy_so_eviction_queues_behind_it():
+    """acquire_stt_backend pops the instance pool, which is where _is_key_busy
+    looks — so without this an engine mid-render reads as idle and eviction
+    takes the card out from under it."""
+    from codai.models.manager import multi_model_manager as m
+    key = "video:latentsync"
+    assert m._is_key_busy(key) is False
+    with m.external_busy(key):
+        assert m._is_key_busy(key) is True
+        with m.external_busy(key):            # nests
+            assert m._is_key_busy(key) is True
+        assert m._is_key_busy(key) is True
+    assert m._is_key_busy(key) is False
+
+
+def test_busy_is_cleared_even_when_the_render_raises():
+    from codai.models.manager import multi_model_manager as m
+    key = "video:musetalk"
+    with pytest.raises(ValueError):
+        with m.external_busy(key):
+            raise ValueError("render failed")
+    assert m._is_key_busy(key) is False
+
+
+def test_the_run_drops_the_registration_when_it_is_over(le):
+    """One-shot: when the subprocess exits its VRAM is gone, so the ledger must
+    stop claiming it or the card looks permanently fuller than it is."""
+    import inspect
+    src = inspect.getsource(le._run_managed)
+    assert "unload_model" in src
+    assert "finally:" in src
