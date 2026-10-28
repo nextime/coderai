@@ -1,0 +1,14 @@
+LatentSync (ByteDance) — vendored inference source.
+
+Upstream:  https://github.com/bytedance/LatentSync
+Commit:    a229c3948406bc2cf6eaf4873e662e70c6a04746  (2025-06-20)
+Licence:   Apache-2.0 — see LATENTSYNC-LICENSE
+
+What is here and why: `latentsync/` (the UNet, the lip-sync pipeline, the vendored
+OpenAI Whisper audio encoder and their utilities), `scripts/inference.py` and the
+`configs/` the entrypoint reads at runtime. Training scripts, the SyncNet configs,
+the Gradio app, the demo assets and the evaluation corpus are not here.
+
+Not cloned at install time, for the same reason the LongCat source is vendored: an
+image someone else pulls has to run without network access to a third party. The
+WEIGHTS are a separate matter and are fetched from the Hub on first use.

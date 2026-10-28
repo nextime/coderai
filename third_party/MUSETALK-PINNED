@@ -1,0 +1,15 @@
+MuseTalk (Tencent Music Entertainment Lyra Lab) — vendored inference source.
+
+Upstream:  https://github.com/TMElyralab/MuseTalk
+Commit:    0a89dec45a0192b824e3cf4daf96c239440c5ed8  (2025-09-26)
+Licence:   MIT — see MUSETALK-LICENSE
+
+What is here and why: `musetalk/` (the UNet wrapper, the VAE, face parsing, the
+DWPose preprocessing and the vendored OpenAI Whisper audio encoder),
+`scripts/inference.py` and `configs/` (the task-list templates). Training, the
+realtime demo, the Gradio app and the sample media are not here.
+
+Not cloned at install time — see LATENTSYNC-PINNED for the reasoning. The WEIGHTS
+are fetched from the Hub on first use; upstream's download_weights.sh takes the
+BiSeNet face-parsing checkpoint off a Google Drive id, which coderai does not use:
+it comes from a Hub mirror so the whole set has one provenance.

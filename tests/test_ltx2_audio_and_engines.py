@@ -134,19 +134,27 @@ def test_the_new_engines_are_video_driven_and_preferred():
 
 
 def test_an_engine_is_only_available_when_its_assets_are_here(monkeypatch, tmp_path):
+    """The directory heuristic, on an engine coderai does not manage.
+
+    It used to answer for latentsync and musetalk too, and "an entrypoint plus
+    any .pt anywhere" read an interrupted download as a working install. Those
+    two now answer from codai.api.lipsync_engines, which knows the file list —
+    see tests/test_lipsync_engines.py. The heuristic still covers an engine an
+    operator installed by hand under its own name, which is what is checked here.
+    """
     from codai.compose import presenter as P
     monkeypatch.setattr(P.shutil, "which", lambda n: None)
     monkeypatch.setattr(P, "_managed_engine_dir", lambda n: tmp_path / n)
     # Nothing installed.
-    assert P._managed_engine_ready("latentsync") is False
+    assert P._managed_engine_ready("hallo") is False
     # An entrypoint but no weights is NOT ready: a compose job is the wrong
     # place to discover a 5 GB download is missing.
-    d = tmp_path / "latentsync"
+    d = tmp_path / "hallo"
     (d / "scripts").mkdir(parents=True)
     (d / "scripts" / "inference.py").write_text("x")
-    assert P._managed_engine_ready("latentsync") is False
+    assert P._managed_engine_ready("hallo") is False
     (d / "unet.pt").write_text("w")
-    assert P._managed_engine_ready("latentsync") is True
+    assert P._managed_engine_ready("hallo") is True
 
 
 def test_available_engines_is_reported_in_preference_order(monkeypatch):

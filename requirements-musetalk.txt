@@ -1,0 +1,47 @@
+# Isolated venv for MuseTalk (Tencent Music Entertainment Lyra Lab).
+#
+# Separate for the same reason as LatentSync: it pins diffusers 0.30 and numpy
+# 1.x, and it needs mmpose, whose mmcv extension is built against one exact torch
+# build. coderai drives scripts.inference as a subprocess
+# (codai/api/lipsync_engines.py). Do NOT merge these into requirements.txt.
+#
+# python 3.11 — mmcv publishes no wheel for 3.13, and numpy 1.23 none either.
+#
+# Two notes on what is NOT here. Upstream's requirements.txt lists
+# tensorflow==2.12.0 and tensorboard: nothing reachable from scripts.inference
+# imports either, and they are ~600 MB. It also lists gdown, only used by
+# download_weights.sh to pull the BiSeNet face-parsing checkpoint off a Google
+# Drive id; coderai takes that file from a Hub mirror instead.
+#
+# mmcv is the fragile one. openmmlab publishes prebuilt wheels for a handful of
+# torch/CUDA pairs and torch 2.4.1+cu121 is one of them, which is why the torch
+# pin here is older than LatentSync's. If this host has no matching wheel, mmcv
+# builds from source and needs nvcc; ensure_installed() reports that rather than
+# leaving a half-built venv behind.
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+
+diffusers==0.30.2
+transformers==4.39.2
+accelerate==0.28.0
+huggingface-hub==0.30.2
+
+numpy==1.23.5
+opencv-python==4.9.0.80
+soundfile==0.12.1
+librosa==0.11.0
+einops==0.8.1
+omegaconf
+tqdm>=4.66.0
+imageio[ffmpeg]
+ffmpeg-python
+requests
+
+# DWPose landmarks. preprocessing.py calls mmpose.apis at import time, so these
+# are not optional.
+-f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
+mmcv==2.2.0
+mmengine>=0.10.3
+mmpose==1.3.2

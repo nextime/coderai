@@ -1,0 +1,49 @@
+# Isolated venv for LatentSync (ByteDance), the video-driven lip-sync engine.
+#
+# It cannot share the server's environment: it pins diffusers 0.32 and numpy 1.x
+# against the server's diffusers 0.42 and numpy 2.x, and its UNet3DConditionModel
+# is written against that diffusers. So it runs in its own venv on its own python
+# and coderai drives scripts.inference as a subprocess
+# (codai/api/lipsync_engines.py). Do NOT merge these into requirements.txt.
+#
+# python 3.11: decord publishes nothing for 3.13 and the pinned torch is a cp311
+# build. 3.11 is the newest interpreter the whole set agrees on.
+#
+# Trimmed against what the inference path actually imports. Upstream's
+# requirements.txt also lists gradio (its demo app), mediapipe, face-alignment,
+# lpips, python_speech_features and scenedetect — none of which any module
+# reached from scripts.inference imports.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+
+diffusers==0.32.2
+transformers==4.48.0
+accelerate==0.26.1
+huggingface-hub==0.30.2
+
+# The lip-sync pipeline and the vendored Whisper audio encoder.
+einops==0.7.0
+omegaconf==2.3.0
+numpy==1.26.4
+opencv-python==4.9.0.80
+librosa==0.10.1
+soundfile>=0.12.1
+decord==0.6.0
+kornia==0.8.0
+tqdm>=4.66.0
+
+# Face detection for the mouth region. onnxruntime is not in any import line in
+# the tree -- insightface loads it lazily from inside model_zoo, so dropping it
+# as "unused" leaves an install that passes every file-level check and then
+# raises ImportError on the first frame.
+insightface==0.7.3
+onnxruntime-gpu==1.21.0
+
+# The sampling speed-up scripts.inference enables with --enable_deepcache.
+DeepCache==0.1.1
+
+ffmpeg-python==0.2.0
+imageio==2.31.1
+imageio-ffmpeg==0.5.1

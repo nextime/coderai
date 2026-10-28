@@ -71,10 +71,21 @@ def _managed_engine_dir(name: str):
 def _managed_engine_ready(name: str) -> bool:
     """Whether a managed install of this engine is usable WITHOUT downloading.
 
-    An inference entrypoint and at least one checkpoint. Deliberately not
-    "could be downloaded": a compose job is the wrong place to fetch several
-    GB, which is the same rule wav2lip follows above.
+    Deliberately not "could be downloaded": a compose job is the wrong place to
+    fetch several GB, which is the same rule wav2lip follows above.
+
+    :mod:`codai.api.lipsync_engines` owns the real answer, because it knows which
+    files each engine needs rather than guessing from "an entrypoint and at least
+    one checkpoint". The guess counted an interrupted download as a working
+    install. The fallback below keeps an operator's hand-rolled install
+    selectable for an engine this build does not manage.
     """
+    try:
+        from codai.api import lipsync_engines
+        if name in lipsync_engines.MANAGED:
+            return lipsync_engines.is_installed(name)
+    except Exception:
+        pass
     d = _managed_engine_dir(name)
     if not d:
         return False
@@ -180,10 +191,9 @@ def run_engine(engine: str, face_path: str, audio_path: str, out_path: str,
 
     if eng in ("latentsync", "musetalk"):
         # Both are video-driven: they replace the mouth in a clip, so `face`
-        # here is a base clip rather than a still. Both also take the same
-        # three arguments under their own CLI, and both upstream repos drive
-        # them through a scripts/inference.py, so a shim on PATH is tried
-        # first and the managed checkout second.
+        # here is a base clip rather than a still. A shim on PATH is tried
+        # first, because an operator who put one there meant it to be used;
+        # the managed install is the fallback.
         binary = shutil.which(eng)
         if binary:
             cmd = [binary, "--video_path", face_path, "--audio_path", audio_path,
@@ -198,26 +208,21 @@ def run_engine(engine: str, face_path: str, audio_path: str, out_path: str,
             if os.path.isfile(out_path):
                 return out_path
             raise PresenterError(f"{eng} produced no output")
-        d = _managed_engine_dir(eng)
-        script = None
-        for cand in ("scripts/inference.py", "inference.py", "run.py"):
-            if d and (d / cand).exists():
-                script = d / cand
-                break
-        if script is None:
-            raise PresenterError(
-                f"{eng} is neither on PATH nor installed under {d} "
-                f"(expected scripts/inference.py and its checkpoints)")
-        import sys as _sys
-        env_extra = str(d)
-        cmd = [_sys.executable, str(script),
-               "--video_path", os.path.abspath(face_path),
-               "--audio_path", os.path.abspath(audio_path),
-               "--video_out_path", os.path.abspath(out_path)]
-        _run(cmd, cancel=cancel, timeout=timeout, log=log, cwd=str(d),
-             pythonpath=env_extra)
-        if not os.path.isfile(out_path):
-            raise PresenterError(f"{eng} produced no output")
+        # The managed install. Neither engine actually takes those three flags
+        # alone -- LatentSync requires its checkpoint and UNet config too, and
+        # MuseTalk takes a YAML task list rather than paths and writes into a
+        # result directory -- and neither runs on this interpreter. So the module
+        # that installs them also knows how to call them.
+        try:
+            from codai.api import lipsync_engines
+        except Exception as exc:
+            raise PresenterError(f"{eng} support is unavailable: {exc}") from exc
+        try:
+            return lipsync_engines.run(
+                eng, os.path.abspath(face_path), os.path.abspath(audio_path),
+                os.path.abspath(out_path), timeout=timeout, log=log)
+        except Exception as exc:
+            raise PresenterError(str(exc)) from exc
         return out_path
 
     if eng == "sadtalker":

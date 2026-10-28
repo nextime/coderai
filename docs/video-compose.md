@@ -329,6 +329,24 @@ identity-locked video generation are here too.
   instead of replacing a mouth. Any other engine installed
   under its own name can be named instead — no API change for a new one. Ask
   `GET /v1/video/presenter/engines` what this install has.
+* **Installing latentsync / musetalk.** Coderai manages both: the inference source
+  is vendored in the repo under `third_party/` and pinned to a commit, the weights
+  come from the Hub on first use, and each engine gets its own venv on its own
+  python (both pin stacks the server cannot host — diffusers 0.32/0.30 against the
+  server's 0.42, and MuseTalk needs mmpose). A render never installs them, because
+  a compose job is the wrong place to fetch several GB, so they are reported as
+  unavailable until installed:
+
+  ```python
+  from codai.api import lipsync_engines
+  lipsync_engines.ensure_installed("latentsync", log=print)   # code + weights + venv
+  lipsync_engines.is_available("latentsync")
+  lipsync_engines.missing_pieces("musetalk")                  # what an install is short of
+  ```
+
+  `CODERAI_LATENTSYNC_DIR` / `CODERAI_MUSETALK_DIR` point at an existing install,
+  and `CODERAI_LATENTSYNC_VENV` / `CODERAI_MUSETALK_VENV` at an existing venv.
+  An engine put on PATH by hand still wins over the managed install.
 * **`layout`**: `full` replaces the scene's visuals (a scene may then have none);
   `pip` composites a bubble over them inside the caption safe area — and captions
   at the bottom move above it automatically; `split` stacks presenter and B-roll,

@@ -1957,9 +1957,22 @@ async def presenter_engines(_auth=Depends(_require_api_auth)):
         matte = matting.engine_name()
     except Exception:
         matte = None
+    # An engine coderai can install but has not is neither "installed" nor
+    # permanently absent, and a client that cannot tell the two apart greys the
+    # feature out for good. Say which ones an operator can still bring up, and
+    # what each is short of.
+    installable = {}
+    try:
+        from codai.api import lipsync_engines as _le
+        for _name in _le.MANAGED:
+            if _name not in have:
+                installable[_name] = _le.missing_pieces(_name)
+    except Exception:
+        pass
     return {"engines": have, "available": bool(have),
             "video_engines": [e for e in have if e in _pres.VIDEO_ENGINES],
             "portrait_engines": [e for e in have if e in _pres.PORTRAIT_ENGINES],
+            "installable": installable,
             "layouts": ["full", "pip", "split"],
             # remove_background is a separate model from the lip-sync engine, so
             # a client greys out that toggle on its own.
