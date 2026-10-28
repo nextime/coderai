@@ -62,9 +62,40 @@ def _thread_cap() -> str:
     return str(max(1, min(8, n // 2 or 1)))
 
 
+def _die_with_parent() -> None:
+    """Ask the kernel to kill this child when its parent dies (Linux only).
+
+    Nothing else does. ``run`` kills the child on cancel and on timeout, but
+    both of those need this process to still be alive to act: if it is killed
+    (SIGKILL, an OOM, a container stop, a test run interrupted), no finally
+    block runs and ffmpeg is simply reparented to init and left going. An
+    abandoned ffmpeg is not idle either -- a filter graph that never reaches
+    EOF spins at 100% CPU for ever. Measured 2026-10-28: two orphans from
+    interrupted test runs the day before had burned 15 h and 11 h of CPU
+    between them, on a host whose owner had no idea what they were.
+
+    PR_SET_PDEATHSIG makes that unrepresentable rather than merely unlikely.
+    Best effort: it is a no-op where prctl is unavailable.
+    """
+    try:
+        import ctypes
+        import signal as _signal
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, _signal.SIGKILL, 0, 0, 0)
+    except Exception:
+        pass
+
+
 def run(args: List[str], *, cancel: Optional[threading.Event] = None,
         timeout: float = 7200.0, log: Optional[Callable[[str], None]] = None) -> None:
-    """Run one ffmpeg command, honouring cancellation while it runs."""
+    """Run one ffmpeg command, honouring cancellation while it runs.
+
+    The default ``timeout`` is a backstop for a long video encode, not a
+    sensible bound for every call -- an audio mix of a few seconds that is
+    still running after a minute is wedged, not slow. Callers that know the
+    shape of their work pass their own.
+    """
     if cancel is not None and cancel.is_set():
         raise Cancelled()
     cmd = [media.ffmpeg_bin(), "-hide_banner", "-nostdin", "-y",
@@ -72,7 +103,8 @@ def run(args: List[str], *, cancel: Optional[threading.Event] = None,
     if log:
         log("ffmpeg " + " ".join(shlex.quote(a) for a in args[:40])
             + (" …" if len(args) > 40 else ""))
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            preexec_fn=_die_with_parent)
     waited = 0.0
     while True:
         try:
@@ -575,9 +607,12 @@ def place_at(placements: List[tuple], out_path: str, *, duration: float,
                  + f"amix=inputs={len(labels)}:duration=first:"
                    f"dropout_transition=0:normalize=0,"
                    f"atrim=0:{dur:.3f},asetpts=N/SR/TB[aout]")
+    # Mixing a few seconds of PCM runs in milliseconds, so a minute of it means
+    # wedged, not slow -- no reason to sit under the two-hour video backstop.
+    # Generous even so: 20x the track plus a two-minute floor.
     run(inputs + ["-filter_complex", ";".join(graph), "-map", "[aout]",
                   "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_path],
-        cancel=cancel, log=log)
+        cancel=cancel, log=log, timeout=max(120.0, 20.0 * dur))
     return out_path
 
 
