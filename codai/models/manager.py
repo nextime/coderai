@@ -2303,6 +2303,12 @@ class MultiModelManager:
         mp = model_path or getattr(wsm, "_model_path", None)
         gd = gpu_device if gpu_device is not None else getattr(wsm, "_gpu_device", 0)
         needed = self._estimate_gguf_vram_gb(mp)
+        if needed > 0:
+            # whisper.cpp puts its encoder/decoder compute buffers on the card
+            # beside the weights, and the file-size estimate accounts for neither.
+            # Reserving the weights alone leaves a start that fits and a
+            # transcription that does not.
+            needed = round(needed + 0.6, 2)
         if needed > 0 and self._get_free_vram_gb() < needed:
             print(f"Whisper start: need ~{needed:.1f} GB VRAM for '{model_id}' — evicting")
             self._evict_models_for_vram(needed)

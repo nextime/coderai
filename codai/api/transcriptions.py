@@ -626,9 +626,14 @@ async def _run_transcription_inner(
                 uses_gpu = True
                 needed_gb = float(stt_cfg.get('used_vram_gb') or 6.0)
             elif family == 'crisperwhisper':
-                # Isolated-venv worker on the 3090 (whisper-large FP16).
+                # Isolated-venv worker on the GPU (whisper-large FP16). The worker
+                # module owns the figure: it knows the peak its own last run
+                # measured, which is several times the checkpoint's weight.
                 uses_gpu = True
-                needed_gb = float(stt_cfg.get('used_vram_gb') or 3.0)
+                from codai.api import crisperwhisper_worker as _cw
+                needed_gb = _cw.reserved_vram_gb(
+                    stt_cfg.get('model_path') or stt_cfg.get('path') or model_name,
+                    stt_cfg)
             elif family in ('wav2vec2', 'whisper_hf'):
                 try:
                     import torch

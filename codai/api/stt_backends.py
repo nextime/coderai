@@ -439,24 +439,35 @@ class _RemoteCrisperWhisperBackend:
         with open(audio_path, "rb") as f:
             audio = f.read()
 
+        from codai.api import crisperwhisper_worker
+
         def _post():
             return requests.post(f"{self.service_url}/transcribe", params=params,
                                  data=audio, timeout=1800,
                                  headers={"Content-Type": "application/octet-stream"})
-        try:
-            resp = _post()
-        except requests.exceptions.ConnectionError:
-            # Worker died/restarted since this handle was cached — re-ensure it and
-            # retry once (self-heal, so a stale service_url doesn't stick).
-            from codai.api import crisperwhisper_worker
-            self.service_url = crisperwhisper_worker.ensure_service(
-                self.model_name, self.config).rstrip("/")
-            resp = _post()
+        # Busy for the length of the pass: the worker is a separate process, so the
+        # manager cannot tell a loaded-and-idle one from a loaded-and-transcribing
+        # one, and the VRAM releaser must not tear this down between the two lines
+        # below.
+        with crisperwhisper_worker.inflight(self.model_name):
+            try:
+                resp = _post()
+            except requests.exceptions.ConnectionError:
+                # Worker died/restarted since this handle was cached — re-ensure it
+                # and retry once (self-heal, so a stale service_url doesn't stick).
+                self.service_url = crisperwhisper_worker.ensure_service(
+                    self.model_name, self.config).rstrip("/")
+                resp = _post()
         if resp.status_code != 200:
             raise RuntimeError(f"CrisperWhisper worker error {resp.status_code}: {resp.text[:300]}")
         j = resp.json()
         if j.get("error"):
             raise RuntimeError(j["error"])
+        # The worker reports its own peak, which is the only honest number for a
+        # footprint that lives in another process. Feed it back so the next
+        # reservation is measured instead of guessed.
+        crisperwhisper_worker.record_measurement(
+            self.model_name, float(j.get("vram_gb") or 0.0))
         return {"text": (j.get("text") or "").strip(),
                 "segments": j.get("segments") or [],
                 "words": j.get("words") or [],

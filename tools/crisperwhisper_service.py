@@ -70,6 +70,24 @@ class _Engine:
         self._pipe = pipeline(
             "automatic-speech-recognition", model=model_name,
             torch_dtype=dtype, device=dev)
+        self.device = dev
+        # Weights are only part of the footprint: a verbatim word-timestamp pass
+        # keeps the encoder's attention matrices for a whole 30s window, which is
+        # several times the model's own size. Report the PEAK so coderai reserves
+        # what a transcription really takes rather than what the checkpoint weighs.
+        if dev == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
+    def peak_vram_gb(self) -> float:
+        """Peak CUDA memory this worker has touched, in GB (0.0 on CPU)."""
+        if getattr(self, "device", "cpu") != "cuda":
+            return 0.0
+        try:
+            import torch
+            return max(torch.cuda.max_memory_allocated(),
+                       torch.cuda.max_memory_reserved()) / (1024.0 ** 3)
+        except Exception:
+            return 0.0
 
     # Whisper's receptive field is 30s; stay a touch under so each window is a
     # single, non-chunked pass. Advance by HOP_S (< WINDOW_S) so consecutive
@@ -157,7 +175,7 @@ class _Engine:
             segments = [{"start": words[0]["start"], "end": words[-1]["end"],
                          "text": text}]
         return {"text": text, "words": words, "segments": segments,
-                "language": language}
+                "language": language, "vram_gb": self.peak_vram_gb()}
 
 
 ENGINE = None
@@ -177,7 +195,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if urlparse(self.path).path == "/health":
-            self._send(200, json.dumps({"ok": True, "model": ENGINE.model_name}).encode())
+            self._send(200, json.dumps({"ok": True, "model": ENGINE.model_name,
+                                        "vram_gb": ENGINE.peak_vram_gb()}).encode())
         else:
             self._send(404, b'{"error":"not found"}')
 
