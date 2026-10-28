@@ -887,3 +887,72 @@ These come from live testing on a real account, not from the docs:
   fails the download, and dies at `load_timeout_s`.
 - `container_disk_gb` must fit the image *plus* the weights. Under-sizing it is a
   common cause of a pod that boots and then never answers.
+
+---
+
+## 11. Other GPU cloud providers — not built yet
+
+RunPod is the only rentable-GPU provider CoderAI implements. The intent is for it
+to be **one** of several: Scaleway, Exoscale, OVHcloud and Hyperstack all rent GPUs
+by the hour or the second, and the same shape of integration should work for any of
+them, as well as for providers not named here.
+
+Nothing below is implemented. It is recorded so the next person does not have to
+re-derive where the seam is.
+
+### Where the seam already is
+
+Most of what makes a rented GPU useful is **not** RunPod-specific. The pool logic —
+demand-based growth, the stale-pod reaper, budgets and the ledger, spillover, shared
+pools, LoRA fan-out, region selection — lives above the provider and asks it for a
+small number of things. `RunpodClient` is effectively that interface already:
+
+| Operation | What a second provider would have to answer |
+|---|---|
+| `ping` | credentials are valid |
+| `list_gpu_types` / `pick_gpu` | catalogue with VRAM and $/hr, so price and size caps mean something |
+| `create_pod` | run this image, expose this port, this much disk, these env vars |
+| `get_pod` / `list_pods` | state, and the address once there is one |
+| `wait_ready` | when the port answers — and *why* it never did |
+| `stop_pod` / `terminate_pod` | stop billing, idempotently |
+| `get_pod_logs` | the corpse's own log, for a pod that died before answering |
+| `list_network_volumes` | per-region persistent storage, where offered |
+
+A provider that can do those eight things can in principle be driven by the existing
+fleet code. The work is a second client plus a way to choose one per pool — not a
+second orchestrator.
+
+### What is genuinely provider-specific
+
+The traps in §10 were nearly all discovered live, and most of them are *categories*
+of problem that any provider will have its own version of:
+
+- **An image size ceiling.** RunPod refuses images above a line that is not
+  documented (measured: 10.1 GB boots, 14.5 GB is killed two seconds after rent with
+  no reason given). Every provider will have some limit; none of them will tell you
+  what it is until an image stops booting.
+- **What the boot budget has to cover.** The port appears only after the image is
+  pulled, so a budget sized for "container already present" fails on cold machines
+  and rents a fresh one on each retry.
+- **How the port is reached.** RunPod offers both a proxy hostname and direct TCP,
+  and they behave differently under TLS and keep-alive. Another provider may offer
+  only one, or a load balancer with its own idle timeout.
+- **Rate limits with their own units.** RunPod meters GraphQL per day and REST v2
+  separately; coderai budgets calls against both. A provider metering per minute, or
+  per account rather than per key, needs different accounting.
+- **Terminal states that are not obviously terminal.** `EXITED` at uptime 0s is a
+  dead pod, not a slow pull. Each provider words this differently, and guessing
+  wrong means waiting out the whole budget on a container that died immediately.
+- **Regional storage.** Volumes tend to be region-scoped, console-only, or both.
+
+### Worth deciding early
+
+- **Cost comparison is the point of multi-provider**, and it only works if the
+  catalogue normalises: $/hr for a card of a given VRAM, in a given region, including
+  whatever the provider charges for disk and egress. A pool that can rent from two
+  providers should be able to prefer on price without the caller knowing which.
+- **Credentials are per provider**, and the existing rules hold: the key is used from
+  a variable, never printed, never committed, and never baked into an image.
+- **A failed provider should degrade, not block.** The reaper reconciles from the
+  account listing rather than probing, because a provider that is up but lying is the
+  normal failure. That reasoning has to be re-done per provider, not inherited.

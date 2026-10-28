@@ -17,7 +17,7 @@ reference; these are the deep dives.
 | [glm-colibri.md](glm-colibri.md) | GLM-5.2 (and DeepSeek-V4 / Kimi-K3) via the colibri C engine |
 | [kimi-k3.md](kimi-k3.md) | Kimi-K3 on CPU via kimi-k3-in-c |
 | [ktransformers.md](ktransformers.md) | ktransformers / SGLang CPU+GPU heterogeneous MoE |
-| [runpod.md](runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper, spillover |
+| [runpod.md](runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper, spillover. §11 records the **not-yet-built** plan for other providers (Scaleway, Exoscale, OVHcloud, Hyperstack) |
 | [remote-execution.md](remote-execution.md) | Serving any model from another machine: worker `service_url`, the mux service, remote text models, the capability gateway |
 
 ## Subsystems
