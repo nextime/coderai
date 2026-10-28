@@ -2689,6 +2689,37 @@ def _task_view(base, task: str):
     family is not one diffusers maps, and None when a conversion was needed
     and failed.
     """
+    # Krea 2 first: diffusers maps no img2img/inpaint class for the family, so
+    # _task_of returns None and an edit request would fall through to
+    # text-to-image and silently ignore the image it was given. CoderAI
+    # provides the edit pipeline (codai/pipelines/krea2_edit.py), built from
+    # the loaded components rather than loaded again -- a Krea 2 transformer is
+    # 12B and a second copy would mean an eviction on every alternation.
+    if task in ("img2img", "inpaint"):
+        try:
+            from codai.pipelines.krea2_edit import build_edit_view, is_krea2_pipeline
+            if is_krea2_pipeline(base):
+                views = getattr(base, _VIEWS_ATTR, None)
+                if views is not None and task in views:
+                    return views[task]
+                view = build_edit_view(base)
+                if view is not None:
+                    if views is None:
+                        views = {}
+                        try:
+                            setattr(base, _VIEWS_ATTR, views)
+                        except Exception:
+                            pass
+                    views[task] = view
+                    _log.info("%s also serving %s as %s (same weights, "
+                              "in-context edit)", type(base).__name__, task,
+                              type(view).__name__)
+                    return view
+                _log.warning("Krea 2 editing is unavailable on this build")
+                return None
+        except Exception as exc:
+            _log.warning("Krea 2 edit view failed: %s", exc)
+
     current = _task_of(base)
     if current == task or current is None:
         return base
