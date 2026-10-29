@@ -138,3 +138,55 @@ def test_both_directions_are_refused_with_400():
     forty-second load for nothing."""
     assert "is text-only; image embedding needs a" in _SRC
     assert "this embedding model is image-only" in _SRC
+
+
+# --------------------------------------------------------------------------
+# A validation must not cost what it is protecting against
+# --------------------------------------------------------------------------
+
+def test_the_precheck_does_not_touch_the_network_or_run_repo_code():
+    """Measured while building this: AutoConfig took 20 s on the first call
+    (network) and 2.7-5.6 s after that, because `trust_remote_code` executes
+    the repo's own config code — to read two plain JSON fields. A validation
+    that can hang is not a validation."""
+    src = _SRC.split("def _may_embed_images", 1)[1].split("\ndef ", 1)[0]
+    # Code only: the comment above the call explains why AutoConfig is NOT
+    # used, and naming it there must not fail this.
+    code = "\n".join(l for l in src.splitlines()
+                     if not l.lstrip().startswith("#"))
+    assert "AutoConfig" not in code, (
+        "the pre-check builds an AutoConfig, which reaches the network and "
+        "runs remote code")
+    assert "_local_config_json(" in code
+
+
+def test_the_config_is_read_from_local_files_only():
+    src = _SRC.split("def _local_config_json", 1)[1].split("\ndef ", 1)[0]
+    assert "try_to_load_from_cache" in src, "it can fetch from the Hub"
+    assert "hf_hub_download" not in src and "snapshot_download" not in src
+
+
+def test_a_config_that_is_not_here_is_not_judged(monkeypatch):
+    monkeypatch.setattr(E, "_local_config_json", lambda name: None)
+    assert E._may_embed_images("some/model-we-have-never-seen", {}) is True
+
+
+def test_a_vision_tower_in_the_config_is_enough(monkeypatch):
+    monkeypatch.setattr(E, "_local_config_json",
+                        lambda name: {"model_type": "qwen2_vl",
+                                      "vision_config": {"depth": 32}})
+    assert E._may_embed_images("any/model", {}) is True
+
+
+def test_a_text_config_is_refused(monkeypatch):
+    monkeypatch.setattr(E, "_local_config_json",
+                        lambda name: {"model_type": "qwen3",
+                                      "architectures": ["Qwen3Model"]})
+    assert E._may_embed_images("any/model", {}) is False
+
+
+def test_a_clip_architecture_without_a_vision_config_still_counts(monkeypatch):
+    monkeypatch.setattr(E, "_local_config_json",
+                        lambda name: {"model_type": "clip_text_model",
+                                      "architectures": ["CLIPModel"]})
+    assert E._may_embed_images("any/model", {}) is True

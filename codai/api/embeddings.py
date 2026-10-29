@@ -1094,6 +1094,35 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
         raise RuntimeError(f"Cannot load embedding model '{model_name}': {e}")
 
 
+def _local_config_json(model_name: str):
+    """The repo's ``config.json`` as a dict, from local files only, or None.
+
+    Deliberately not ``AutoConfig``: on a validation path a network round trip
+    can hang the request it is meant to protect, and ``trust_remote_code``
+    would execute the repo's own code to tell us two plain JSON fields.
+    """
+    import json as _json
+    import os as _os
+    try:
+        if _os.path.isdir(model_name):
+            path = _os.path.join(model_name, 'config.json')
+            if not _os.path.isfile(path):
+                return None
+            with open(path, encoding='utf-8') as fh:
+                return _json.load(fh)
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(model_name, 'config.json')
+    except Exception:
+        return None
+    if not isinstance(hit, str) or not _os.path.isfile(hit):
+        return None
+    try:
+        with open(hit, encoding='utf-8') as fh:
+            return _json.load(fh)
+    except Exception:
+        return None
+
+
 def _may_embed_images(model_name: str, model_config: dict = None) -> bool:
     """Whether this model COULD embed images, decided before it is loaded.
 
@@ -1129,19 +1158,25 @@ def _may_embed_images(model_name: str, model_config: dict = None) -> bool:
     if low in ('geoclip', 'geoclip-location'):
         return low == 'geoclip'
 
-    trust = bool(cfg.get('trust_remote_code', raw.get('trust_remote_code', True)))
-    try:
-        if _is_dual_encoder(name, trust) or _is_vision_only(name, trust):
-            return True
-    except Exception:
-        return True          # unreadable config: let the load decide
-    # The config was readable and describes neither an image tower nor an
+    # The repo's config.json, read as JSON from what is already on disk. Not
+    # AutoConfig: this runs on a validation path, before any work has been
+    # committed, and AutoConfig would reach the network (20 s measured against
+    # 0.8 s once local) and, with trust_remote_code, EXECUTE the repo's own
+    # config code (another 2.7-5.6 s). The two fields that answer the question
+    # are plain JSON keys.
+    hf = _local_config_json(name)
+    if hf is None:
+        return True          # not here yet: the load will fetch it and decide
+    if hf.get('vision_config') is not None:
+        return True
+    mt = str(hf.get('model_type') or '')
+    if mt in _DUAL_ENCODER_TYPES or mt in _VISION_ONLY_TYPES:
+        return True
+    arch = " ".join(str(a) for a in (hf.get('architectures') or []))
+    if any(w in arch.lower() for w in ('clip', 'vision', 'siglip')):
+        return True
+    # The config is here, and describes neither an image tower nor an
     # image-only encoder.
-    try:
-        from transformers import AutoConfig
-        AutoConfig.from_pretrained(name, trust_remote_code=trust)
-    except Exception:
-        return True          # cannot be read at all: not our call to make
     return False
 
 
