@@ -607,6 +607,7 @@ built on demand from the admin UI:
 | `requirements-nemo.txt` | NVIDIA NeMo Canary/Parakeet STT | yes |
 | `requirements-crisperwhisper.txt` | CrisperWhisper verbatim STT | yes |
 | `requirements-pyannote.txt` | Speaker diarization | yes |
+| `requirements-parler.txt` | Parler-TTS expressive speech | yes |
 
 ---
 

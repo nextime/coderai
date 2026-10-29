@@ -28,6 +28,7 @@ from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "parler_tts_service.py"
+_REQUIREMENTS = _REPO_ROOT / "requirements-parler.txt"
 
 # Dedicated venv for the (incompatible) parler-tts stack. Created with access to
 # the base interpreter's packages so torch/numpy aren't re-downloaded; parler's
@@ -53,6 +54,43 @@ def _pip_ok(py: Path) -> bool:
         return False
 
 
+#: The op that failed. Parler's audio decoder (DAC) is convolutional, so a
+#: venv whose CUDA stack cannot run one convolution cannot synthesize anything
+#: -- however importable its packages are.
+_GPU_PROBE = (
+    "import torch, torch.nn.functional as F\n"
+    "if not torch.cuda.is_available():\n"
+    "    raise SystemExit(0)\n"
+    "x = torch.zeros(1, 1, 16, device='cuda')\n"
+    "w = torch.zeros(1, 1, 3, device='cuda')\n"
+    "F.conv1d(x, w).sum().item()\n")
+
+
+def _gpu_ok(py: Path) -> tuple:
+    """``(ok, detail)`` — whether this venv can actually run on the GPU.
+
+    "Are the packages importable" is not the same question, and the difference
+    cost a whole bring-up. Measured on zeiss, 2026-10-29: the venv imported
+    parler_tts and soundfile perfectly, the service started, the model loaded,
+    and the first synthesis died in the decoder's conv1d with
+    ``CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`` — a CUDA-13 torch that pip had
+    resolved on its own. ``_pip_ok`` answered True for that venv for ever, so
+    nothing ever rebuilt it.
+
+    A CPU-only host passes: it exits before the convolution, because there is
+    no GPU stack to be broken.
+    """
+    try:
+        r = venv_env.run([str(py), "-c", _GPU_PROBE],
+                         capture_output=True, text=True, timeout=600)
+    except Exception as exc:
+        return False, f"the probe could not be run ({exc})"
+    if r.returncode == 0:
+        return True, ""
+    tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
+    return False, (tail[-1][:300] if tail else f"exit {r.returncode}")
+
+
 def _bootstrap_venv() -> Path:
     """Create a fully-isolated venv and install parler-tts (idempotent).
 
@@ -69,14 +107,37 @@ def _bootstrap_venv() -> Path:
     # decision, taken in venv_env.create_venv. None of them can be repaired
     # in place: `python -m venv` over the top dies on the thing that broke it.
     py = venv_env.create_venv(_VENV_DIR)
-    if not _pip_ok(py):
-        print("[parler] installing parler-tts + torch into the isolated venv "
-              "(first run, downloads several GB, this can take a while) …", flush=True)
-        venv_env.run([str(py), "-m", "pip", "install",
-                        "git+https://github.com/huggingface/parler-tts.git",
-                        "soundfile"], check=True)
+    _ok = _pip_ok(py)
+    if _ok:
+        # Importable is not enough: a venv whose CUDA stack cannot run a
+        # convolution synthesizes nothing, and the old check called it healthy
+        # for ever. Rebuilt from the pinned requirements, not from whatever
+        # pip resolves today -- that resolution is what broke it.
+        _ok, _why = _gpu_ok(py)
+        if not _ok:
+            import shutil
+            print(f"[parler] the venv imports but cannot run on the GPU "
+                  f"({_why}); rebuilding it from {_REQUIREMENTS.name}", flush=True)
+            shutil.rmtree(_VENV_DIR, ignore_errors=True)
+            py = venv_env.create_venv(_VENV_DIR)
+    if not _ok:
+        if not _REQUIREMENTS.exists():
+            raise RuntimeError(f"Parler requirements file missing: {_REQUIREMENTS}")
+        print("[parler] installing parler-tts + a pinned torch into the isolated "
+              "venv (first run, downloads several GB, this can take a while) …",
+              flush=True)
+        venv_env.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
+        venv_env.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+                     check=True)
         if not _pip_ok(py):
             raise RuntimeError("parler-tts install did not yield an importable package")
+        _gpu, _why = _gpu_ok(py)
+        if not _gpu:
+            # Loud, and not fatal: a synthesis will fail with the real error
+            # from the real op, which is more useful than a bootstrap that
+            # refuses to finish on a machine whose CUDA this cannot judge.
+            print(f"[parler] warning: the rebuilt venv still cannot run a "
+                  f"convolution on the GPU ({_why})", flush=True)
     _bootstrapped = True
     return py
 

@@ -76,9 +76,29 @@ class _Engine:
         self.sr = int(self._model.config.sampling_rate)
 
     def speak(self, text: str, description: str) -> np.ndarray:
+        import torch
         ids = self._tok(description, return_tensors="pt").input_ids.to(self._device)
         prompt = self._tok(text, return_tensors="pt").input_ids.to(self._device)
-        gen = self._model.generate(input_ids=ids, prompt_input_ids=prompt)
+        try:
+            gen = self._model.generate(input_ids=ids, prompt_input_ids=prompt)
+        except RuntimeError as exc:
+            # The audio decoder (DAC) is convolutional, and on a venv whose
+            # cudnn cannot load its sublibraries every synthesis dies in that
+            # one conv1d:
+            #
+            #   CUDNN_BACKEND_TENSOR_DESCRIPTOR cudnnFinalize failed …
+            #   cudnn_status: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+            #
+            # torch has native kernels for these convolutions, so turning cudnn
+            # off costs a little speed on a decoder that is a fraction of the
+            # work -- and the alternative is no speech at all. Latched, so one
+            # failure does not mean a failed attempt on every later request.
+            if "cudnn" not in str(exc).lower() or not torch.backends.cudnn.enabled:
+                raise
+            print(f"[parler] cudnn failed in the decoder ({str(exc)[:160]}); "
+                  f"disabling cudnn for this worker and retrying", flush=True)
+            torch.backends.cudnn.enabled = False
+            gen = self._model.generate(input_ids=ids, prompt_input_ids=prompt)
         return np.asarray(gen.cpu().numpy().squeeze(), dtype=np.float32)
 
 

@@ -197,3 +197,63 @@ def test_no_isolated_worker_launches_its_venv_with_a_bare_subprocess():
     assert not offenders, (
         "these calls into a venv inherit the engine's environment: "
         + ", ".join(offenders))
+
+
+# --------------------------------------------------------------------------
+# Importable is not the same as working
+# --------------------------------------------------------------------------
+#
+# Measured on zeiss, 2026-10-29, right after the environment fix above: the
+# parler venv built, the service started, the model loaded, and the first
+# synthesis died in the decoder's conv1d with
+# CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED -- a CUDA-13 torch that pip had
+# resolved on its own, with every cudnn sublibrary present and unloadable.
+# `import parler_tts, soundfile` answered True for that venv for ever, so
+# nothing ever rebuilt it.
+
+
+def test_the_parler_venv_is_probed_on_the_gpu_not_just_imported():
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "codai/api/parler_worker.py"),
+               encoding="utf-8").read()
+    assert "_gpu_ok(" in src, "the venv is trusted on an import alone"
+    assert "conv1d" in src, (
+        "the probe does not run the op that fails (the decoder is convolutional)")
+    boot = src.split("def _bootstrap_venv", 1)[1]
+    assert boot.index("_gpu_ok(py)") < boot.index("rmtree"), (
+        "the probe does not drive the rebuild")
+    assert "requirements-parler.txt" in src or "_REQUIREMENTS" in boot, (
+        "the rebuild installs whatever pip resolves today, which is the bug")
+
+
+def test_a_cpu_only_host_passes_the_probe():
+    """There is no GPU stack to be broken, so the probe must not fail the
+    bootstrap on a CPU-only machine."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "codai/api/parler_worker.py"),
+               encoding="utf-8").read()
+    probe = src.split("_GPU_PROBE = (", 1)[1].split(")\n", 1)[0]
+    assert "is_available" in probe and "SystemExit(0)" in probe
+
+
+def test_the_parler_requirements_pin_torch():
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    req = open(os.path.join(root, "requirements-parler.txt"), encoding="utf-8").read()
+    assert "torch==" in req, "torch is unpinned, so pip picks the stack again"
+    assert "parler-tts" in req
+
+
+def test_the_service_survives_a_cudnn_that_cannot_load():
+    """Turning cudnn off costs a little speed on a decoder that is a fraction
+    of the work. The alternative is no speech at all."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "tools/parler_tts_service.py"),
+               encoding="utf-8").read()
+    body = src.split("def speak", 1)[1]
+    assert "cudnn.enabled = False" in body
+    assert "not torch.backends.cudnn.enabled" in body, (
+        "a second failure would retry for ever instead of raising")

@@ -1,0 +1,30 @@
+# Isolated venv for Parler-TTS (parler-tts/parler-tts-*).
+#
+# parler-tts pins an old transformers/tokenizers/huggingface-hub that conflict
+# with the coderai server's 5.x stack, so it runs in its own venv and coderai
+# talks to it over HTTP (codai/api/parler_worker.py +
+# tools/parler_tts_service.py). Do NOT merge these into requirements.txt.
+#
+# torch is PINNED here, which is the point of the file. Installing parler-tts
+# with a bare `pip install` resolved whatever was newest — measured on zeiss,
+# 2026-10-29: torch 2.15 with the CUDA-13 wheels (nvidia_cudnn_cu13 9.26). The
+# venv built, the service started, the model loaded, and the first synthesis
+# died inside the DAC audio decoder's conv1d:
+#
+#   RuntimeError: CUDNN_BACKEND_TENSOR_DESCRIPTOR cudnnFinalize failed
+#   ptrDesc->finalize() cudnn_status: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+#
+# — every cudnn sublibrary present in the venv, and the stack unable to load
+# them. Pinning to the same CUDA build that is proven on this fleet (the
+# server runs 2.10+cu128, the CrisperWhisper venv 2.5.1+cu124) takes that
+# resolution out of pip's hands. An operator on a newer CUDA can raise it.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+
+# parler-tts has no release on PyPI that carries the multilingual models, so it
+# comes from the repo. It brings its own transformers pin with it; nothing here
+# overrides that, because that pin is the reason this venv exists.
+git+https://github.com/huggingface/parler-tts.git
+
+soundfile>=0.12.0

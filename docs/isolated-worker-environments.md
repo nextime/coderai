@@ -89,6 +89,41 @@ venv is never repaired in place. `venv_env.create_venv` rebuilds it, and
   MiniMax-H3 overlay inherits the server's torch *on purpose*, so an isolated
   venv found where an overlay is wanted is also rebuilt.
 
+## Importable is not working
+
+With the environment fixed, Parler got further: the venv built, the service
+started, the model loaded — and the first synthesis died in the audio
+decoder's `conv1d`:
+
+```
+RuntimeError: CUDNN_BACKEND_TENSOR_DESCRIPTOR cudnnFinalize failed
+ptrDesc->finalize() cudnn_status: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+```
+
+Every cudnn sublibrary was present in the venv. The stack was a torch 2.15
+with the CUDA-13 wheels, which `pip install git+…parler-tts` had resolved on
+its own, because nothing pinned it. And `import parler_tts, soundfile` — the
+only health check — answered True for that venv for ever, so nothing ever
+rebuilt it.
+
+Two changes:
+
+* **the stack is pinned.** `requirements-parler.txt` names the torch build,
+  the way every other isolated worker's file does. Pip resolving a CUDA stack
+  on its own is how a venv ends up newer than the fleet it runs on.
+* **the health check runs the op that fails.** The decoder is convolutional,
+  so the probe is one `conv1d` on the GPU. A venv that imports but cannot run
+  it is rebuilt from the pinned file; a CPU-only host passes, because there is
+  no GPU stack to be broken.
+
+And the service itself latches cudnn off if it still fails there: torch has
+native kernels for those convolutions, the decoder is a fraction of the work,
+and the alternative is no speech at all.
+
+The general rule, which cost two bring-ups here: **a venv's health check must
+exercise what the worker actually does.** An import proves the files are in
+the right directory and nothing else.
+
 ## Knowing before you ask
 
 A venv is built on first use, and that build downloads several GB. Discovering
