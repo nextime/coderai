@@ -487,6 +487,32 @@ def _apply_sampler(pipeline, sampler: str) -> str:
     return cls_name
 
 
+def card_view(model_config) -> dict:
+    """The model's card as one dict: its models.json entry under the runtime kwargs.
+
+    The manager keeps runtime kwargs FLAT and the original models.json entry
+    under ``_raw_cfg``, so a key that was never promoted to a top-level kwarg
+    is invisible to anything reading the config directly. ``defaults`` is one
+    of those, and reading it from the flat dict is how a card's steps and
+    guidance were silently ignored on the image path: ``/v1/models`` published
+    them (it reads the entry) while generation used the generic 30 at CFG 7.5.
+    The video path had already hit this and merged by hand at its call site;
+    doing it here fixes every caller, and is the same lesson as the
+    ``gpu_split`` and ``sequential_text_encoder`` promotions in
+    ``build_runtime_kwargs``.
+
+    The flat kwargs win on a collision: they are what the loader was actually
+    given.
+    """
+    cfg = model_config or {}
+    raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else None
+    if not raw:
+        return dict(cfg) if isinstance(cfg, dict) else {}
+    merged = dict(raw)
+    merged.update({k: v for k, v in cfg.items() if k != '_raw_cfg'})
+    return merged
+
+
 def model_defaults(model_config) -> dict:
     """A model card's own recommended settings, from its ``defaults`` entry.
 
@@ -510,7 +536,7 @@ def model_defaults(model_config) -> dict:
     rather than guess them.
     """
     try:
-        d = dict((model_config or {}).get("defaults") or {})
+        d = dict(card_view(model_config).get("defaults") or {})
     except Exception:
         return {}
     return d
@@ -534,7 +560,11 @@ def _model_call_kwargs(pipeline, model_config) -> dict:
     """
     extra = {}
     try:
-        extra = dict((model_config or {}).get("call_kwargs") or {})
+        # Through the card view, for the same reason as model_defaults: a key
+        # that was never promoted to a top-level runtime kwarg lives only in
+        # `_raw_cfg`, and `call_kwargs` is one of those -- MOSS-Image's
+        # `uncond_skip_layers` would never have been applied.
+        extra = dict(card_view(model_config).get("call_kwargs") or {})
     except Exception:
         return {}
     if not extra:

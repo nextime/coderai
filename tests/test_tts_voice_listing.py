@@ -171,7 +171,7 @@ def test_a_venv_without_the_package_is_not_ready(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "_family_venv_dir", lambda fam: venv)
     got = T.environment_report("coqui/XTTS-v2")
     assert got["env_ready"] is False
-    assert "TTS is not installed" in got["env_detail"]
+    assert "TTS" in got["env_detail"] and "not" in got["env_detail"]
 
 
 def test_a_populated_venv_is_ready_without_importing_anything(tmp_path, monkeypatch):
@@ -179,7 +179,8 @@ def test_a_populated_venv_is_ready_without_importing_anything(tmp_path, monkeypa
     venv = tmp_path / "xtts_venv"
     venv_env.create_venv(venv)
     site = next(iter(venv.glob("lib/python*/site-packages")))
-    (site / "TTS").mkdir()
+    for pkg in T._VENV_FAMILIES["coqui"]:
+        (site / pkg).mkdir()
     monkeypatch.setattr(T, "_family_venv_dir", lambda fam: venv)
 
     def _no_imports(*a, **k):
@@ -196,3 +197,27 @@ def test_the_capabilities_route_reports_it():
     src = open(os.path.join(root, "codai/api/tts.py"), encoding="utf-8").read()
     route = src.split("async def speech_capabilities", 1)[1].split("@router", 1)[0]
     assert "environment_report" in route
+
+
+def test_the_engine_package_alone_is_not_evidence(tmp_path, monkeypatch):
+    """`pip install coqui-tts` brought the engine and its ninety dependencies
+    and NO torch, so the venv looked complete, this route said ready, and the
+    first synthesis failed on `import TTS` (zeiss, 2026-10-29)."""
+    from codai.api import venv_env
+    venv = tmp_path / "xtts_venv"
+    venv_env.create_venv(venv)
+    site = next(iter(venv.glob("lib/python*/site-packages")))
+    (site / "TTS").mkdir()
+    monkeypatch.setattr(T, "_family_venv_dir", lambda fam: venv)
+
+    got = T.environment_report("coqui/XTTS-v2")
+    assert got["env_ready"] is False
+    assert "torch" in got["env_detail"], got["env_detail"]
+
+    (site / "torch").mkdir()
+    assert T.environment_report("coqui/XTTS-v2")["env_ready"] is True
+
+
+def test_every_venv_family_requires_torch():
+    for fam, modules in T._VENV_FAMILIES.items():
+        assert "torch" in modules, f"{fam} can report ready without torch"

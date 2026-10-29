@@ -679,11 +679,17 @@ def encode_audio(samples: np.ndarray, sample_rate: int, fmt: str) -> Tuple[bytes
 # interpreter costs seconds, and a catalogue call that costs seconds is how a
 # listing route becomes a loader.
 
-#: family -> (module that proves the venv works, venv locator)
+#: family -> the packages whose presence makes the venv usable.
+#:
+#: `torch` is in every list on purpose. A `pip install coqui-tts` brought the
+#: engine and its ninety dependencies and NO torch, so the venv looked
+#: complete, this route reported `env_ready: true`, and the first synthesis
+#: failed on `import TTS` — measured on zeiss, 2026-10-29. The engine package
+#: alone is not evidence that the venv can run.
 _VENV_FAMILIES = {
-    "coqui": "TTS",
-    "parler": "parler_tts",
-    "melo": "melo",
+    "coqui": ("TTS", "torch"),
+    "parler": ("parler_tts", "torch"),
+    "melo": ("melo", "torch"),
 }
 
 
@@ -714,8 +720,8 @@ def environment_report(model_name: str) -> dict:
     from pathlib import Path
 
     fam = _family(model_name)
-    module = _VENV_FAMILIES.get(fam)
-    if not module:
+    modules = _VENV_FAMILIES.get(fam)
+    if not modules:
         return {"needs_venv": False, "env_ready": True, "env_detail": ""}
     d = _family_venv_dir(fam)
     if d is None:
@@ -731,10 +737,13 @@ def environment_report(model_name: str) -> dict:
     if not ok:
         return {"needs_venv": True, "env_ready": False,
                 "env_detail": f"{d}: {why or 'it is not there yet'}"}
-    # The package directory, not an import: a populated venv is the evidence,
-    # and importing into it would cost seconds on a catalogue call.
-    found = any(Path(d).glob(f"lib/python*/site-packages/{module}"))
-    if not found:
+    # The package directories, not an import: a populated venv is the
+    # evidence, and importing into it would cost seconds on a catalogue call.
+    missing = [m for m in modules
+               if not any(Path(d).glob(f"lib/python*/site-packages/{m}"))]
+    if missing:
         return {"needs_venv": True, "env_ready": False,
-                "env_detail": f"{d} exists but {module} is not installed in it"}
+                "env_detail": (f"{d} exists but {', '.join(missing)} "
+                               f"{'is' if len(missing) == 1 else 'are'} not "
+                               f"installed in it")}
     return {"needs_venv": True, "env_ready": True, "env_detail": str(d)}

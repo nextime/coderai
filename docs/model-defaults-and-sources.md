@@ -39,6 +39,24 @@ Precedence, highest first:
 4. **what the model's own name says**, when nothing above answered (images);
 5. the generic floor (30 steps / CFG 7.5 for images, 25 / 7.5 for video).
 
+### Where the card is read from
+
+`defaults` lives in the models.json **entry**. The manager keeps runtime kwargs
+flat and that entry under `_raw_cfg`, so only keys promoted by
+`build_runtime_kwargs` exist at the top level — and `defaults` is not one of
+them. Reading the flat config therefore finds nothing, which is exactly what
+the image path did until 2026-10-29: `/v1/models` published a card's steps and
+guidance while generation used the generic floor, so a client that read the
+listing and trusted the server was wrong twice. `Z-Image-Turbo-IntoRealism`
+(10 steps) and `Krea-2-RealDream` (8) had never had their cards applied, and
+`call_kwargs` — MOSS-Image's `uncond_skip_layers` — sits in the same place.
+
+`images.card_view()` merges the entry under the flat kwargs (the flat ones win
+on a collision: they are what the loader was given), and both `model_defaults`
+and `_model_call_kwargs` read through it. A test walks the installed catalogue
+and asserts, for every card carrying `defaults`, that what `/v1/models`
+publishes is what generation would use.
+
 ### 4: the name, when the card says nothing
 
 A card with no `defaults` and no `acceleration` block used to fall straight to
