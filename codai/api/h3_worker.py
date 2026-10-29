@@ -41,11 +41,12 @@ import collections
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "h3_service.py"
@@ -168,7 +169,7 @@ def _venv_python(venv: Path) -> Path:
 def _diffusers_ok(py: Path) -> bool:
     """The venv is usable only if its diffusers actually carries the H3 blocks."""
     try:
-        return subprocess.run(
+        return venv_env.run(
             [str(py), "-c", "from diffusers import MiniMaxH3ModularPipeline"],
             capture_output=True).returncode == 0
     except Exception:
@@ -199,15 +200,13 @@ def _bootstrap_venv(config: dict = None) -> Path:
         _bootstrapped = True
         return py
     standalone = os.environ.get("CODERAI_H3_STANDALONE_VENV", "") in ("1", "true", "yes")
+    kind = "standalone" if standalone else "overlay"
     if not py.exists():
-        kind = "standalone" if standalone else "overlay"
         print(f"[h3] creating {kind} venv at {venv} …", flush=True)
-        venv.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, "-m", "venv"]
-        if not standalone:
-            cmd.append("--system-site-packages")
-        subprocess.run(cmd + [str(venv)], check=True)
-        py = _venv_python(venv)
+    # The overlay inherits the server's torch on purpose, so system_site is
+    # part of what "usable" means here -- an isolated venv found where an
+    # overlay is wanted is rebuilt, and the other way round.
+    py = venv_env.create_venv(venv, system_site=not standalone)
     if not _diffusers_ok(py):
         # NOTE: always `python -m pip`, never the venv's pip script — a venv that
         # was copied carries a stale shebang and would install into the ORIGINAL
@@ -217,13 +216,13 @@ def _bootstrap_venv(config: dict = None) -> Path:
                 raise RuntimeError(f"H3 requirements file missing: {_REQUIREMENTS}")
             print("[h3] installing diffusers>=0.40 + torch into a standalone venv "
                   "(first run downloads several GB, this takes a while) …", flush=True)
-            subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
-            subprocess.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
-                           check=True)
+            venv_env.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
+            venv_env.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+                         check=True)
         else:
             print("[h3] adding diffusers>=0.40 to the overlay (torch and the rest "
                   "are inherited from the server's venv) …", flush=True)
-            subprocess.run([str(py), "-m", "pip", "install", "-q",
+            venv_env.run([str(py), "-m", "pip", "install", "-q",
                             "diffusers>=0.40.0", "huggingface_hub>=1.23"], check=True)
         if not _diffusers_ok(py):
             raise RuntimeError(
@@ -297,16 +296,14 @@ def ensure_service(model_path: str, config: dict = None,
         py = _bootstrap_venv(config)
         port = _free_port()
         url = f"http://127.0.0.1:{port}"
-        env = dict(os.environ)
-        try:
-            # All four HF variables, not just the hub pair: this worker runs in
-            # its own venv and never imports codai, so HF_HOME and
-            # TRANSFORMERS_CACHE would stay as the image set them and the model
-            # would be fetched a second time into that directory.
-            from codai.hf_cache import child_env as _hf_child_env
-            env = _hf_child_env(env)
-        except Exception:
-            pass
+        # One call for all three halves: coderai's HF cache variables (this
+        # worker never imports codai, so without them it downloads a second
+        # copy of every model); a clean interpreter environment -- the engine
+        # exports PYTHONHOME, under which this venv's python would take its
+        # stdlib and site-packages from the SERVER's installation; and the
+        # library path this particular venv needs, which depends on whose
+        # interpreter it holds (see venv_env.env_for_venv).
+        env = venv_env.env_for_python(py)
         gpu = config.get("gpu_device")
         if gpu is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)

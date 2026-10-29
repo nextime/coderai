@@ -658,3 +658,79 @@ def encode_audio(samples: np.ndarray, sample_rate: int, fmt: str) -> Tuple[bytes
         except Exception as exc:
             print(f"  ffmpeg transcode to {fmt} failed ({exc}); returning WAV")
     return wav_bytes, "wav"
+
+
+# --------------------------------------------------------------------------- #
+# Whether an engine can run at all, before anything is loaded
+# --------------------------------------------------------------------------- #
+#
+# coqui-tts and parler-tts each need a transformers the server cannot have, so
+# each runs in a venv of its own, built on first use. That build downloads
+# several GB, which is a surprising thing for a client to discover inside its
+# first synthesis request -- reported from production as "speech engines listed
+# but not installed", with a 501 and a 500 as the only explanation.
+#
+# This answers the question before a user picks a voice, and it answers it
+# WITHOUT importing anything from the venv: an import probe into a foreign
+# interpreter costs seconds, and a catalogue call that costs seconds is how a
+# listing route becomes a loader.
+
+#: family -> (module that proves the venv works, venv locator)
+_VENV_FAMILIES = {
+    "coqui": "TTS",
+    "parler": "parler_tts",
+    "melo": "melo",
+}
+
+
+def _family_venv_dir(fam: str):
+    """Where this family's isolated venv lives, or None if it needs none."""
+    try:
+        if fam == "coqui":
+            from codai.api.xtts_worker import venv_dir
+            return venv_dir()
+        if fam == "parler":
+            from codai.api.parler_worker import _VENV_DIR
+            return _VENV_DIR
+        if fam == "melo":
+            from codai.api.melotts_worker import _VENV_DIR
+            return _VENV_DIR
+    except Exception:
+        return None
+    return None
+
+
+def environment_report(model_name: str) -> dict:
+    """``{needs_venv, env_ready, env_detail}`` for this model's engine.
+
+    ``env_ready`` false does not mean the engine is unusable: the venv is built
+    on first use. It means the first request will spend minutes building it,
+    which is exactly what a client wants to know before offering the voice.
+    """
+    from pathlib import Path
+
+    fam = _family(model_name)
+    module = _VENV_FAMILIES.get(fam)
+    if not module:
+        return {"needs_venv": False, "env_ready": True, "env_detail": ""}
+    d = _family_venv_dir(fam)
+    if d is None:
+        return {"needs_venv": True, "env_ready": False,
+                "env_detail": "this engine's venv location is not resolvable here"}
+    try:
+        from codai.api import venv_env
+        # probe=False: filesystem only. This route is a catalogue call.
+        ok, why = venv_env.venv_usable(d, probe=False)
+    except Exception as exc:
+        return {"needs_venv": True, "env_ready": False,
+                "env_detail": f"the venv could not be inspected ({exc})"}
+    if not ok:
+        return {"needs_venv": True, "env_ready": False,
+                "env_detail": f"{d}: {why or 'it is not there yet'}"}
+    # The package directory, not an import: a populated venv is the evidence,
+    # and importing into it would cost seconds on a catalogue call.
+    found = any(Path(d).glob(f"lib/python*/site-packages/{module}"))
+    if not found:
+        return {"needs_venv": True, "env_ready": False,
+                "env_detail": f"{d} exists but {module} is not installed in it"}
+    return {"needs_venv": True, "env_ready": True, "env_detail": str(d)}

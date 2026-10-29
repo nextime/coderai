@@ -14,11 +14,11 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""A venv built by a different interpreter has to be rebuilt, not reused.
+"""A venv that cannot be used has to be rebuilt, not reused.
 
 An isolated-worker venv keeps ``bin/python`` as a symlink to the interpreter
-that created it. Create it with one python and run with another -- built on the
-host and used from the container, or built before the image moved its
+that created it. Create it with one python and run it with another -- built on
+the host and used from the container, or built before the image moved its
 interpreter -- and that link dangles.
 
 The failure is not a clean "missing": ``Path.exists()`` follows symlinks and
@@ -29,6 +29,15 @@ venv`` over the top, which trips on the very same dangling ``bin/python3``:
 
 Reported from production as "the venv can't be created", on a host where the
 venv was fully populated and 7 GB of packages were sitting in it.
+
+A second shape of the same thing, measured on zeiss 2026-10-29: an
+``xtts_venv`` whose ``bin/python3`` pointed at ``/usr/bin/python3``. In the
+container that is 3.12, while the venv's 875 MB of packages were installed
+under ``lib/python3.13/site-packages``. The interpreter runs perfectly and
+imports none of them, so "does it run" is not the whole question.
+
+Both decisions live in one place now -- :mod:`codai.api.venv_env` -- because
+every isolated worker had its own copy and they did not agree.
 """
 
 import os
@@ -39,11 +48,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
+from codai.api import venv_env
 
-def _make_foreign_venv(root):
+
+def _make_foreign_venv(root, pkg_version="3.13"):
     """A venv whose interpreter symlink points at a path that is not there."""
     (root / "bin").mkdir(parents=True)
-    (root / "lib" / "python3.13" / "site-packages").mkdir(parents=True)
+    (root / "lib" / f"python{pkg_version}" / "site-packages").mkdir(parents=True)
     os.symlink("python3.13", root / "bin" / "python")
     os.symlink("/nonexistent/python3.13", root / "bin" / "python3.13")
     (root / "pyvenv.cfg").write_text(
@@ -52,58 +63,137 @@ def _make_foreign_venv(root):
 
 
 def test_the_dangling_interpreter_is_not_mistaken_for_a_working_one(tmp_path):
-    from codai.api import parler_worker as P
     v = _make_foreign_venv(tmp_path / "parler_venv")
-    py = v / "bin" / "python"
+    py = venv_env.venv_python(v)
     assert py.is_symlink()
     assert not py.exists(), "precondition: the link dangles"
-    assert P._venv_runs(py) is False
+    ok, why = venv_env.venv_usable(v)
+    assert ok is False and "does not run" in why
 
 
-def test_a_real_interpreter_is_accepted():
-    from codai.api import parler_worker as P
-    assert P._venv_runs(sys.executable) is True
+def test_a_real_venv_is_accepted(tmp_path):
+    """Built here with the running interpreter, so it is the real thing."""
+    v = tmp_path / "ok_venv"
+    venv_env.create_venv(v)
+    ok, why = venv_env.venv_usable(v)
+    assert ok is True, why
 
 
-def test_a_foreign_venv_is_cleared_before_recreating(tmp_path, monkeypatch):
+def test_a_version_mismatch_is_rejected_even_though_python_runs(tmp_path):
+    """The xtts_venv case: the interpreter works and its packages are
+    invisible to it, which no "does it run" check can see."""
+    v = tmp_path / "mixed_venv"
+    venv_env.create_venv(v)
+    import shutil
+    real = [p for p in (v / "lib").glob("python*")][0]
+    shutil.move(str(real), str(v / "lib" / "python2.7"))
+    ok, why = venv_env.venv_usable(v)
+    assert ok is False
+    assert "packages are installed for" in why, why
+
+
+def test_a_system_site_venv_is_rejected(tmp_path):
+    """It defeats the only reason these venvs exist: the server's
+    incompatible stack leaks straight back in."""
+    v = tmp_path / "shared_venv"
+    venv_env.create_venv(v, system_site=True)
+    ok, why = venv_env.venv_usable(v)
+    assert ok is False and "system-site-packages" in why
+
+
+def test_a_foreign_venv_is_cleared_before_recreating(tmp_path):
     """Without the clear, `python -m venv` dies on the dangling link and the
     engine reports "venv can't be created" on every request, for ever."""
-    from codai.api import parler_worker as P
-
     v = _make_foreign_venv(tmp_path / "parler_venv")
-    monkeypatch.setattr(P, "_VENV_DIR", v)
-    monkeypatch.setattr(P, "_bootstrapped", False)
-    monkeypatch.setattr(P, "_pip_ok", lambda py: True)
-
-    created = []
-
-    def _fake_run(cmd, **kw):
-        cmd = [str(c) for c in cmd]
-        # The dangling interpreter cannot run anything -- without this the
-        # stub would answer "it works" and the clear would never be reached.
-        if cmd[0].endswith(("bin/python", "bin/python3.13")) \
-                and not os.path.exists(os.path.realpath(cmd[0])):
-            return subprocess.CompletedProcess(cmd, 1)
-        if "venv" in cmd:
-            # Mimic the real failure when the target still holds a dangling
-            # bin/python3, and success once it has been cleared.
-            if (v / "bin").exists():
-                raise subprocess.CalledProcessError(1, cmd)
-            created.append(cmd)
-            (v / "bin").mkdir(parents=True, exist_ok=True)
-            (v / "bin" / "python").write_text("#!/bin/sh\n")
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(P.subprocess, "run", _fake_run)
-    P._bootstrap_venv()
-    assert created, "the venv was never recreated after the foreign one"
+    py = venv_env.create_venv(v)
+    assert py.is_file() and py.exists()
+    ok, why = venv_env.venv_usable(v)
+    assert ok is True, why
 
 
-def test_both_workers_check_that_the_interpreter_runs():
-    """The trap is identical in each isolated worker, so neither may rely on
-    a bare exists()/is_file() to decide a venv is usable."""
+def test_the_child_environment_drops_what_redirects_an_interpreter(monkeypatch):
+    """PYTHONHOME is exported by the engine process. Inherited by a venv
+    python it takes stdlib and site-packages from the SERVER's installation,
+    so the venv's own packages are not on sys.path at all."""
+    monkeypatch.setenv("PYTHONHOME", "/opt/coderai/python")
+    monkeypatch.setenv("PYTHONPATH", "/opt/coderai/app")
+    monkeypatch.setenv("VIRTUAL_ENV", "/somewhere/else")
+    monkeypatch.setenv("KEEP_ME", "yes")
+    env = venv_env.clean_py_env()
+    assert "PYTHONHOME" not in env
+    assert "PYTHONPATH" not in env
+    assert "VIRTUAL_ENV" not in env
+    assert env["KEEP_ME"] == "yes", "unrelated variables must survive"
+
+
+def test_the_servers_own_libraries_come_off_the_library_path(monkeypatch):
+    """A worker resolving libraries through the server's directories picks up
+    the wrong torch/cudnn — the CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED shape."""
+    monkeypatch.setenv("LD_LIBRARY_PATH",
+                       "/opt/coderai/local-libs:/opt/nvidia/lib:/opt/coderai/python/lib")
+    env = venv_env.clean_py_env()
+    assert env["LD_LIBRARY_PATH"] == "/opt/nvidia/lib", (
+        "the driver's path must stay and coderai's must go")
+
+
+def test_a_system_prefix_does_not_make_the_whole_system_ours(monkeypatch):
+    """Running from a distribution python (a pip install rather than the
+    image) puts sys.prefix at /usr. Treating that as the server's install
+    strips /usr/local/nvidia/lib from every worker and takes the GPU away."""
+    monkeypatch.setattr(venv_env.sys, "prefix", "/usr")
+    monkeypatch.setattr(venv_env.sys, "base_prefix", "/usr")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/nvidia/lib:/opt/coderai/local-libs")
+    assert venv_env.clean_py_env()["LD_LIBRARY_PATH"] == "/usr/local/nvidia/lib"
+
+
+def test_a_caller_can_still_set_what_it_needs(monkeypatch):
+    monkeypatch.setenv("PYTHONHOME", "/opt/coderai/python")
+    env = venv_env.clean_py_env_with({"PYTHONUNBUFFERED": "1",
+                                      "CUDA_VISIBLE_DEVICES": 1})
+    assert env["PYTHONUNBUFFERED"] == "1"
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert "PYTHONHOME" not in env
+
+
+def test_every_isolated_worker_goes_through_the_shared_helper():
+    """The trap is identical in each one, and each had its own copy of the
+    decision. A worker that builds its own environment dict is a worker that
+    will inherit PYTHONHOME again."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for rel in ("codai/api/parler_worker.py", "codai/api/xtts_worker.py"):
-        src = open(os.path.join(root, rel), encoding="utf-8").read()
-        assert "_venv_runs(" in src, f"{rel} does not verify the interpreter runs"
-        assert "rmtree" in src, f"{rel} cannot clear a foreign venv"
+    workers = ("xtts_worker", "parler_worker", "crisperwhisper_worker",
+               "melotts_worker", "canary_worker", "pyannote_worker",
+               "h3_worker", "audiocraft_worker")
+    for name in workers:
+        src = open(os.path.join(root, "codai/api", name + ".py"),
+                   encoding="utf-8").read()
+        assert "venv_env" in src, f"{name} does not use the shared helper"
+        assert "dict(os.environ)" not in src, (
+            f"{name} builds its own environment, so it inherits PYTHONHOME")
+        assert "{**os.environ" not in src, (
+            f"{name} builds its own environment, so it inherits PYTHONHOME")
+
+
+def test_no_isolated_worker_launches_its_venv_with_a_bare_subprocess():
+    """Every call INTO a venv needs the clean environment: the import probe,
+    `python -m venv`, each pip install and the service itself. A clean service
+    with a poisoned probe still reports the venv as broken, and a poisoned pip
+    installs into the wrong tree."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    workers = ("xtts_worker", "parler_worker", "crisperwhisper_worker",
+               "melotts_worker", "canary_worker", "pyannote_worker",
+               "h3_worker", "audiocraft_worker")
+    offenders = []
+    for name in workers:
+        path = os.path.join(root, "codai/api", name + ".py")
+        src = open(path, encoding="utf-8").read()
+        for m in re.finditer(r"subprocess\.(run|Popen)\(", src):
+            # Find the call's argument text, up to the matching blank line, and
+            # require that an env was passed.
+            chunk = src[m.start():m.start() + 900]
+            if "env=" not in chunk.split("\n\n")[0]:
+                line = src[:m.start()].count("\n") + 1
+                offenders.append(f"{name}.py:{line}")
+    assert not offenders, (
+        "these calls into a venv inherit the engine's environment: "
+        + ", ".join(offenders))

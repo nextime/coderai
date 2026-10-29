@@ -17,10 +17,11 @@ as a remote STT backend. Mirrors codai.api.canary_worker / pyannote_worker.
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
+
+from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "crisperwhisper_service.py"
@@ -65,7 +66,7 @@ def _venv_python(venv: Path) -> Path:
 
 def _pip_ok(py: Path) -> bool:
     try:
-        return subprocess.run(
+        return venv_env.run(
             [str(py), "-c", "import transformers, torch, soundfile"],
             capture_output=True).returncode == 0
     except Exception:
@@ -81,19 +82,20 @@ def _bootstrap_venv() -> Path:
     if py.exists() and _pip_ok(py):
         _bootstrapped = True
         return py
-    if not py.exists():
-        print(f"[crisperwhisper] creating isolated venv at {venv} …", flush=True)
-        venv.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
-    py = _venv_python(venv)
+    # create_venv also REBUILDS what cannot be used: a dangling
+    # bin/python from a venv built by another interpreter, or one whose
+    # packages live under a different minor version's site-packages. Both
+    # run `python -m venv` over the top in the old code, which dies on the
+    # very thing that broke them.
+    py = venv_env.create_venv(venv)
     if not _pip_ok(py):
         if not _REQUIREMENTS.exists():
             raise RuntimeError(f"CrisperWhisper requirements missing: {_REQUIREMENTS}")
         print("[crisperwhisper] installing pinned transformers+torch into the isolated "
               "venv (first run downloads several GB) …", flush=True)
-        subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
-        subprocess.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
-                       check=True)
+        venv_env.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
+        venv_env.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+                     check=True)
         if not _pip_ok(py):
             raise RuntimeError("CrisperWhisper venv install did not yield importable deps")
     _bootstrapped = True
@@ -164,16 +166,14 @@ def ensure_service(model_name: str, config: dict = None,
         py = _bootstrap_venv()
         port = _free_port()
         url = f"http://127.0.0.1:{port}"
-        env = dict(os.environ)
-        try:
-            # All four HF variables, not just the hub pair: this worker runs in
-            # its own venv and never imports codai, so HF_HOME and
-            # TRANSFORMERS_CACHE would stay as the image set them and the model
-            # would be fetched a second time into that directory.
-            from codai.hf_cache import child_env as _hf_child_env
-            env = _hf_child_env(env)
-        except Exception:
-            pass
+        # One call for all three halves: coderai's HF cache variables (this
+        # worker never imports codai, so without them it downloads a second
+        # copy of every model); a clean interpreter environment -- the engine
+        # exports PYTHONHOME, under which this venv's python would take its
+        # stdlib and site-packages from the SERVER's installation; and the
+        # library path this particular venv needs, which depends on whose
+        # interpreter it holds (see venv_env.env_for_venv).
+        env = venv_env.env_for_python(py)
         gpu = config.get("gpu_device")
         if gpu is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -265,8 +265,19 @@ def reserved_vram_gb(model_name: str, config: dict = None) -> float:
     here (3 GB) is about a third of what a verbatim pass actually peaks at, so
     eviction freed a third of the room needed and the pass OOMed with the card
     full of models nobody had asked it to keep."""
+    # One source of truth, shared with the in-process path: the same
+    # checkpoint is served both ways and the two must not disagree about how
+    # big it is. DEFAULT_VRAM_GB stays the family default over there.
+    try:
+        from codai.api import stt_backends
+        return stt_backends.reserve_gb(model_name, config, "crisperwhisper")
+    except Exception:
+        pass
     cfg = config or {}
-    explicit = float(cfg.get("used_vram_gb") or 0.0)
+    try:
+        explicit = float(cfg.get("used_vram_gb") or 0.0)
+    except (TypeError, ValueError):
+        explicit = 0.0
     if explicit > 0:
         return explicit
     try:

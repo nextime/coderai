@@ -30,6 +30,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+from codai.api import venv_env
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE = _REPO_ROOT / "tools" / "audiocraft_service.py"
 
@@ -55,8 +57,8 @@ def available() -> bool:
     if not py.is_file() or not _SERVICE.is_file():
         return False
     try:
-        return subprocess.run([str(py), "-c", "import audiocraft"],
-                              capture_output=True, timeout=120).returncode == 0
+        return venv_env.run([str(py), "-c", "import audiocraft"],
+                            capture_output=True, timeout=120).returncode == 0
     except Exception:
         return False
 
@@ -69,7 +71,7 @@ class AudiocraftModel:
             [str(venv_python()), str(_SERVICE)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True, bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            env=venv_env.env_for_python(venv_python(), {"PYTHONUNBUFFERED": "1"}))
         self._params: dict = {"duration": 30.0}
         reply = self._call({"op": "load", "model": model_name})
         if not reply.get("ok"):

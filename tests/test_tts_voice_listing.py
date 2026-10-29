@@ -136,3 +136,63 @@ def test_the_capabilities_route_does_not_collide_with_voiceprints():
         f"the TTS voice list is being served from the speaker-recognition "
         f"path; routes declared here: {routes}")
     assert "/v1/audio/speech/capabilities" in routes
+
+
+# --------------------------------------------------------------------------
+# Whether the engine can answer at all
+# --------------------------------------------------------------------------
+#
+# "Speech engines listed but not installed": XTTS answered 501 and parler 500,
+# and a client had no way to know before it asked. Both build their venv on
+# first use now, so the honest answer is not "unavailable" but "the first
+# request will spend minutes building it" -- which a client can act on.
+
+
+def test_an_engine_that_needs_no_venv_is_always_ready():
+    for name in ("hexgrad/Kokoro-82M", "suno/bark"):
+        got = T.environment_report(name)
+        assert got == {"needs_venv": False, "env_ready": True, "env_detail": ""}, name
+
+
+def test_a_missing_venv_is_reported_as_not_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "_family_venv_dir", lambda fam: tmp_path / "nothing_here")
+    got = T.environment_report("coqui/XTTS-v2")
+    assert got["needs_venv"] is True
+    assert got["env_ready"] is False
+    assert "does not exist" in got["env_detail"]
+
+
+def test_a_venv_without_the_package_is_not_ready(tmp_path, monkeypatch):
+    """The venv builds fine and the install is what failed -- the state a
+    half-finished first request leaves behind."""
+    from codai.api import venv_env
+    venv = tmp_path / "xtts_venv"
+    venv_env.create_venv(venv)
+    monkeypatch.setattr(T, "_family_venv_dir", lambda fam: venv)
+    got = T.environment_report("coqui/XTTS-v2")
+    assert got["env_ready"] is False
+    assert "TTS is not installed" in got["env_detail"]
+
+
+def test_a_populated_venv_is_ready_without_importing_anything(tmp_path, monkeypatch):
+    from codai.api import venv_env
+    venv = tmp_path / "xtts_venv"
+    venv_env.create_venv(venv)
+    site = next(iter(venv.glob("lib/python*/site-packages")))
+    (site / "TTS").mkdir()
+    monkeypatch.setattr(T, "_family_venv_dir", lambda fam: venv)
+
+    def _no_imports(*a, **k):
+        raise AssertionError("the readiness check imported into the venv")
+
+    monkeypatch.setattr(venv_env, "run", _no_imports)
+    got = T.environment_report("coqui/XTTS-v2")
+    assert got["env_ready"] is True
+
+
+def test_the_capabilities_route_reports_it():
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "codai/api/tts.py"), encoding="utf-8").read()
+    route = src.split("async def speech_capabilities", 1)[1].split("@router", 1)[0]
+    assert "environment_report" in route

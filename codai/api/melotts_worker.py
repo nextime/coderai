@@ -24,10 +24,11 @@ the process; the synthesis lives in tools/melotts_service.py.
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
+
+from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "melotts_service.py"
@@ -50,17 +51,8 @@ def _venv_python() -> Path:
 
 def _pip_ok(py: Path) -> bool:
     try:
-        return subprocess.run([str(py), "-c", "import melo, soundfile"],
-                              capture_output=True).returncode == 0
-    except Exception:
-        return False
-
-
-def _venv_is_system_site() -> bool:
-    """True if the venv was built with --system-site-packages (can't isolate)."""
-    try:
-        return "include-system-site-packages = true" in \
-            (_VENV_DIR / "pyvenv.cfg").read_text().lower()
+        return venv_env.run([str(py), "-c", "import melo, soundfile"],
+                            capture_output=True).returncode == 0
     except Exception:
         return False
 
@@ -75,21 +67,15 @@ def _bootstrap_venv() -> Path:
     py = _venv_python()
     if _bootstrapped and py.exists():
         return py
-    # A previously-created shared-site venv leaks the server's transformers in;
-    # rebuild it isolated.
-    if py.exists() and _venv_is_system_site():
-        import shutil
-        print("[melotts] rebuilding venv as fully isolated …", flush=True)
-        shutil.rmtree(_VENV_DIR, ignore_errors=True)
-    if not _venv_python().exists():
-        print(f"[melotts] creating isolated venv at {_VENV_DIR} …", flush=True)
-        _VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([sys.executable, "-m", "venv", str(_VENV_DIR)], check=True)
-    py = _venv_python()
+    # One rebuild decision for every way a venv can be unusable: a shared-site
+    # build that leaks the server's transformers back in, a dangling
+    # bin/python from another interpreter, or packages installed for a
+    # different minor version. See venv_env.venv_usable.
+    py = venv_env.create_venv(_VENV_DIR)
     if not _pip_ok(py):
         print("[melotts] installing melotts + torch into the isolated venv "
               "(first run, downloads several GB, this can take a while) …", flush=True)
-        subprocess.run([str(py), "-m", "pip", "install",
+        venv_env.run([str(py), "-m", "pip", "install",
                         "git+https://github.com/huggingface/melotts.git",
                         "soundfile"], check=True)
         if not _pip_ok(py):
@@ -155,20 +141,14 @@ def ensure_service(model_name: str, ready_timeout: float = 1800.0,
         py = _bootstrap_venv()
         port = _free_port()
         url = f"http://127.0.0.1:{port}"
-        env = dict(os.environ)
-        # The worker must use the model already pulled via coderai's HF download
-        # interface — it never downloads anything itself. Point it at coderai's
-        # cache and force offline mode, so a missing model fails fast instead of
-        # silently fetching.
-        try:
-            # All four HF variables, not just the hub pair: this worker runs in
-            # its own venv and never imports codai, so HF_HOME and
-            # TRANSFORMERS_CACHE would stay as the image set them and the model
-            # would be fetched a second time into that directory.
-            from codai.hf_cache import child_env as _hf_child_env
-            env = _hf_child_env(env)
-        except Exception:
-            pass
+        # One call for all three halves: coderai's HF cache variables (this
+        # worker never imports codai, so without them it downloads a second
+        # copy of every model); a clean interpreter environment -- the engine
+        # exports PYTHONHOME, under which this venv's python would take its
+        # stdlib and site-packages from the SERVER's installation; and the
+        # library path this particular venv needs, which depends on whose
+        # interpreter it holds (see venv_env.env_for_venv).
+        env = venv_env.env_for_python(py)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         proc = subprocess.Popen(

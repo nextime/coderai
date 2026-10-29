@@ -110,12 +110,23 @@ async def speech_capabilities(model: str = ""):
         voices = tts_backends.family_voices(name, backend)
     except Exception as exc:
         print(f"  [tts] could not list voices for {name!r}: {exc}", flush=True)
+    # Whether the engine can answer now, or whether the first request will
+    # spend minutes building its isolated venv. Checked from the filesystem,
+    # never by importing into that venv -- a catalogue call must not cost
+    # seconds, and must not load a model.
+    env = {"needs_venv": False, "env_ready": True, "env_detail": ""}
+    try:
+        env = tts_backends.environment_report(name)
+    except Exception as exc:
+        print(f"  [tts] could not check the environment for {name!r}: {exc}",
+              flush=True)
     return {
         "model": name,
         "family": tts_backends._family(name),
         "emotions": tts_backends.family_emotions(name),
         "styles": tts_backends.family_styles(name),
         **voices,
+        **env,
     }
 
 

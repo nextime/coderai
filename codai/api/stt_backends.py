@@ -117,6 +117,116 @@ def _to_wav_16k_mono(src_path: str) -> str:
 # Wav2Vec2 / HF transformers ASR
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# What a speech model actually needs on the card
+# --------------------------------------------------------------------------- #
+#
+# A transcription pass peaks well above the weights it loaded: the encoder runs
+# over a 30 s window, and for a verbatim model (CrisperWhisper) the timestamp
+# head runs over it again. The number that used to be reserved was 3 GB for
+# every whisper-family model, which the isolated worker's own comment had
+# already measured as about a third of the real peak -- so eviction freed a
+# third of the room needed, the load "succeeded", and the pass OOMed with the
+# card full of models nobody had asked to keep.
+#
+# Three numbers per model, all of them measured after the first pass:
+#
+#   weights    what the load put on the card
+#   peak       the high-water mark of a pass
+#   activation peak - weights: what a RESIDENT model still needs per pass
+#
+# Until a model has run once, `_FIRST_PASS_ACTIVATION_GB` stands in for the
+# third one. It is deliberately modest: the failure it prevents was an 86 MiB
+# allocation, and asking for a gigabyte on a card this model is already
+# resident on is cheap, where asking for eight would evict a working set for
+# nothing.
+
+#: Family defaults for the whole footprint, used only until a real measurement
+#: exists. whisper_hf matches crisperwhisper_worker.DEFAULT_VRAM_GB, which was
+#: measured rather than guessed.
+_FAMILY_RESERVE_GB = {"whisper_hf": 8.0, "crisperwhisper": 8.0, "wav2vec2": 3.0}
+_DEFAULT_RESERVE_GB = 2.0
+_FIRST_PASS_ACTIVATION_GB = 1.0
+
+#: model key -> measured activation (peak - weights), high-water mark.
+_activation_gb: dict = {}
+
+
+def model_key(model_name: str) -> str:
+    """The key the model manager tracks a speech model's residency under."""
+    return f"audio:{model_name}"
+
+
+def _manager():
+    from codai.models.manager import multi_model_manager
+    return multi_model_manager
+
+
+def reserve_gb(model_name: str, config: Optional[dict] = None,
+               family: Optional[str] = None) -> float:
+    """What to free before LOADING ``model_name``.
+
+    Order of trust: the operator's ``used_vram_gb`` from the model page, then
+    the peak this very model measured on an earlier run, then the family
+    default. Same order as the isolated worker uses, because they are the same
+    model loaded two ways and they must not disagree about its size.
+    """
+    cfg = config or {}
+    explicit = 0.0
+    try:
+        explicit = float(cfg.get("used_vram_gb") or 0.0)
+    except (TypeError, ValueError):
+        explicit = 0.0
+    if explicit > 0:
+        return explicit
+    try:
+        measured = float(_manager()._measured_vram_gb.get(model_key(model_name)) or 0.0)
+    except Exception:
+        measured = 0.0
+    if measured > 0:
+        return measured
+    fam = (family or "").strip().lower()
+    return _FAMILY_RESERVE_GB.get(fam, _DEFAULT_RESERVE_GB)
+
+
+def activation_gb(model_name: str) -> float:
+    """What a RESIDENT model still needs for one pass (measured, else the floor)."""
+    got = _activation_gb.get(model_key(model_name)) or 0.0
+    return got if got > 0 else _FIRST_PASS_ACTIVATION_GB
+
+
+def record_pass(model_name: str, weights_gb: float, activation: float) -> None:
+    """Remember what a pass cost: its weights and what it needed on top.
+
+    ``activation`` is the DELTA over what was already allocated when the pass
+    started, not the process's absolute peak. The absolute peak would charge
+    this model for every other model resident in the same process -- a 16 GB
+    image model sitting on the card while a transcription runs would be
+    recorded as part of the speech model's footprint, and every later load of
+    it would evict the world.
+
+    High-water marks, never averages: a one-word clip touches a fraction of
+    what a full 30 s window does, and an average would under-reserve for the
+    longer audio that follows.
+    """
+    key = model_key(model_name)
+    try:
+        act = max(0.0, float(activation or 0.0))
+        if act > (_activation_gb.get(key) or 0.0):
+            _activation_gb[key] = act
+        reserve = max(0.0, float(weights_gb or 0.0)) + act
+        if reserve > 0:
+            mgr = _manager()
+            prev = float(mgr._measured_vram_gb.get(key) or 0.0)
+            if reserve > prev + 0.05:
+                mgr._measured_vram_gb[key] = reserve
+                print(f"[stt] measured {reserve:.2f} GB for {model_name} "
+                      f"({weights_gb:.2f} weights + {act:.2f} per pass)"
+                      + (f", was {prev:.2f}" if prev else ""), flush=True)
+    except Exception as exc:
+        print(f"[stt] could not record the measurement: {exc}", flush=True)
+
+
 class _Wav2Vec2Backend:
     """HF ``transformers`` automatic-speech-recognition pipeline.
 
@@ -131,6 +241,7 @@ class _Wav2Vec2Backend:
         self.model_name = model_name
         self.config = config or {}
         self._pipe = None
+        self._weights_gb = 0.0
         # Whisper HF checkpoints (e.g. CrisperWhisper) are seq2seq and take
         # generate kwargs (language/task); CTC models (wav2vec2) don't.
         self._is_whisper = bool(self.config.get("_is_whisper")) or \
@@ -142,6 +253,7 @@ class _Wav2Vec2Backend:
         import torch
         from transformers import pipeline
         use_cuda = torch.cuda.is_available()
+        _before = torch.cuda.memory_allocated() / 1e9 if use_cuda else 0.0
         device = 0 if use_cuda else -1
         target = self.config.get("model_path") or self.model_name
         # Load in FP16 on GPU to roughly halve VRAM (~3GB→~1.5GB) — CTC inference is
@@ -165,6 +277,11 @@ class _Wav2Vec2Backend:
             # Some checkpoints/ops reject half precision — fall back to FP32.
             pipe_kwargs.pop("torch_dtype", None)
             self._pipe = pipeline("automatic-speech-recognition", **pipe_kwargs)
+        # What the weights cost, so a pass can report what IT cost on top (see
+        # record_pass). Measured rather than assumed: the reserve that used to
+        # be hard-coded here was about a third of the real peak.
+        if use_cuda:
+            self._weights_gb = max(0.0, torch.cuda.memory_allocated() / 1e9 - _before)
 
     def transcribe(self, audio_path: str, language: Optional[str] = None,
                    prompt: Optional[str] = None, temperature: float = 0.0,
@@ -221,8 +338,55 @@ class _Wav2Vec2Backend:
                 kw["return_timestamps"] = ts
             return self._pipe(src, **kw)
 
+        # Room for THIS pass, on a card the model is already resident on. A
+        # resident model is invisible to the load-time reservation: the TTS and
+        # visual models of the same job load around it, fill the card to the
+        # edge, and the next 30 s window dies on an 86 MiB allocation -- once
+        # per scene, with every caption losing its word timings (measured on a
+        # production render, 2026-10-29).
+        _need = activation_gb(self.model_name)
+        _cuda = False
+        _held = 0.0
         try:
-            out = _run(mode)
+            import torch as _t
+            _cuda = _t.cuda.is_available()
+            if _cuda:
+                _manager().ensure_free_vram(
+                    _need, reason=f"a transcription pass on {self.model_name}")
+                # What is allocated BEFORE the pass, so what the pass itself
+                # needs can be measured as a delta rather than as the whole
+                # process's peak -- which would include every other model
+                # resident beside this one.
+                _t.cuda.reset_peak_memory_stats()
+                _held = _t.cuda.memory_allocated() / 1e9
+        except Exception as _exc:
+            print(f"[stt] could not reserve room for the pass ({_exc})", flush=True)
+
+        def _run_or_make_room(ts):
+            """One pass; on an OOM, free the card and try once more.
+
+            A transcription is seconds of work on audio that already exists, so
+            the second attempt is the cheap outcome -- the expensive one is a
+            render whose captions have no timings."""
+            try:
+                return _run(ts)
+            except Exception as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                print(f"[stt] {self.model_name}: out of VRAM mid-pass — "
+                      f"freeing {_need:.2f} GB and retrying once", flush=True)
+                try:
+                    import torch as _t2
+                    _manager()._evict_models_for_vram(
+                        max(_need, reserve_gb(self.model_name, self.config,
+                                              getattr(self, "family", None))))
+                    _t2.cuda.empty_cache()
+                except Exception:
+                    pass
+                return _run(ts)
+
+        try:
+            out = _run_or_make_room(mode)
         except Exception as e:
             if mode is None:
                 raise
@@ -231,10 +395,17 @@ class _Wav2Vec2Backend:
             print(f"[stt] {self.model_name}: return_timestamps={mode!r} failed "
                   f"({type(e).__name__}); retrying text-only")
             try:
-                out = _run(None)
+                out = _run_or_make_room(None)
             except Exception:
                 out = self._pipe(src)
         finally:
+            if _cuda:
+                try:
+                    import torch as _t3
+                    record_pass(self.model_name, self._weights_gb,
+                                _t3.cuda.max_memory_allocated() / 1e9 - _held)
+                except Exception:
+                    pass
             if wav:
                 try:
                     os.unlink(wav)
@@ -445,6 +616,23 @@ class _RemoteCrisperWhisperBackend:
             return requests.post(f"{self.service_url}/transcribe", params=params,
                                  data=audio, timeout=1800,
                                  headers={"Content-Type": "application/octet-stream"})
+        # Room for the pass before asking for it. The worker is resident and
+        # idle between scenes, which is invisible to the load-time reservation:
+        # the TTS and visual models of the same job load around it and fill the
+        # card, and then every scene came back
+        #
+        #   CrisperWhisper worker error 500: CUDA out of memory. Tried to
+        #   allocate 86.00 MiB
+        #
+        # (measured on a production render, 2026-10-29). 86 MiB is what a
+        # resident model still needs, and nothing was keeping it.
+        _need = activation_gb(self.model_name)
+        try:
+            _manager().ensure_free_vram(
+                _need, reason=f"a transcription pass on {self.model_name}")
+        except Exception as _exc:
+            print(f"[stt] could not reserve room for the pass ({_exc})", flush=True)
+
         # Busy for the length of the pass: the worker is a separate process, so the
         # manager cannot tell a loaded-and-idle one from a loaded-and-transcribing
         # one, and the VRAM releaser must not tear this down between the two lines
@@ -457,6 +645,20 @@ class _RemoteCrisperWhisperBackend:
                 # and retry once (self-heal, so a stale service_url doesn't stick).
                 self.service_url = crisperwhisper_worker.ensure_service(
                     self.model_name, self.config).rstrip("/")
+                resp = _post()
+            if resp.status_code == 500 and "out of memory" in (resp.text or "").lower():
+                # The worker's own OOM, in another process: free the card from
+                # this side and ask again. A pass is seconds of work on audio
+                # that already exists; the expensive outcome is a render whose
+                # captions have no timings at all.
+                _want = max(_need, crisperwhisper_worker.reserved_vram_gb(
+                    self.model_name, self.config))
+                print(f"[stt] {self.model_name}: the worker ran out of VRAM — "
+                      f"freeing {_want:.2f} GB and retrying once", flush=True)
+                try:
+                    _manager()._evict_models_for_vram(_want)
+                except Exception:
+                    pass
                 resp = _post()
         if resp.status_code != 200:
             raise RuntimeError(f"CrisperWhisper worker error {resp.status_code}: {resp.text[:300]}")

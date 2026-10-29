@@ -181,10 +181,21 @@ def test_current_dir_is_derived_from_the_hub_path(monkeypatch):
 ])
 def test_no_worker_sets_only_the_hub_pair(worker):
     """The regression this guards: two of four variables set, model downloaded
-    twice. Any worker that spawns a venv must go through child_env."""
+    twice. Any worker that spawns a venv must build its environment with a
+    helper that applies all four -- never by hand.
+
+    The helper moved: the workers now call ``venv_env.env_for_python``, which
+    applies ``hf_cache.child_env`` AND decides the library path from whose
+    interpreter the venv holds. What is asserted is that the environment comes
+    from one of those helpers, not which one."""
     src = open(f"codai/api/{worker}_worker.py").read()
     assert 'env["HF_HUB_CACHE"]' not in src, f"{worker}: sets the hub pair by hand"
-    assert "child_env" in src
+    assert any(h in src for h in ("child_env", "env_for_python", "env_for_venv")), (
+        f"{worker}: builds its environment without a helper that applies all "
+        f"four HF variables")
+    assert "dict(os.environ)" not in src and "{**os.environ" not in src, (
+        f"{worker}: builds its own environment dict, so it inherits both the "
+        f"image's HF variables and the engine's PYTHONHOME")
 
 
 def test_the_ocr_supervisor_uses_the_configured_dir(image_env):

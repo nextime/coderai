@@ -27,9 +27,10 @@ import io
 import json
 import os
 import subprocess
-import sys
 import threading
 from pathlib import Path
+
+from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE = _REPO_ROOT / "tools" / "xtts_service.py"
@@ -56,8 +57,11 @@ def available() -> bool:
     if not py.is_file() or not _SERVICE.is_file():
         return False
     try:
-        return subprocess.run([str(py), "-c", "import TTS"],
-                              capture_output=True, timeout=120).returncode == 0
+        # Clean environment: the server exports PYTHONHOME, and under it this
+        # probe imports the SERVER's site-packages, so a populated venv
+        # answered "coqui-tts is not installed" for ever (see venv_env).
+        return venv_env.run([str(py), "-c", "import TTS"],
+                            capture_output=True, timeout=120).returncode == 0
     except Exception:
         return False
 
@@ -66,13 +70,15 @@ _bootstrap_lock = threading.Lock()
 _bootstrapped = False
 
 
-def _venv_runs(py: Path) -> bool:
-    """Whether this venv's interpreter actually RUNS (see parler_worker)."""
-    try:
-        return subprocess.run([str(py), "-c", "import sys"],
-                              capture_output=True, timeout=120).returncode == 0
-    except Exception:
-        return False
+def _venv_ok() -> bool:
+    """Whether the venv on disk is one this process can use at all.
+
+    Not just "its python runs": a venv built by another 3.13 whose packages
+    live in a different minor version's directory runs and imports nothing.
+    See :func:`codai.api.venv_env.venv_usable`.
+    """
+    ok, _why = venv_env.venv_usable(venv_dir())
+    return ok
 
 
 def bootstrap(timeout: int = 3600) -> bool:
@@ -101,28 +107,20 @@ def bootstrap(timeout: int = 3600) -> bool:
             return True
         d = venv_dir()
         try:
-            py = venv_python()
-            # A venv built by a different interpreter leaves a dangling
-            # bin/python: is_file() says no, and `python -m venv` over the top
-            # then dies on that same dangling link, so the engine is stuck for
-            # good with a populated venv sitting right there. Clear it first.
-            if d.exists() and not _venv_runs(py):
-                import shutil
-                print(f"[xtts] {d} was built by a different interpreter "
-                      f"(its python does not run here); rebuilding …",
-                      flush=True)
-                shutil.rmtree(d, ignore_errors=True)
-            if not py.is_file():
-                print(f"[xtts] creating isolated venv at {d} …", flush=True)
-                d.parent.mkdir(parents=True, exist_ok=True)
-                subprocess.run([sys.executable, "-m", "venv", str(d)],
-                               check=True, timeout=600)
-            py = venv_python()
+            # create_venv rebuilds what cannot be used -- a dangling
+            # bin/python, a minor-version mismatch against its own
+            # site-packages, or a --system-site-packages build -- because
+            # `python -m venv` over any of those dies on the thing that broke
+            # it, leaving the engine stuck for good with a populated venv
+            # sitting right there.
+            if not venv_python().is_file() or not _venv_ok():
+                print(f"[xtts] preparing the isolated venv at {d} …", flush=True)
+            py = venv_env.create_venv(d)
             print("[xtts] installing coqui-tts into the isolated venv "
                   "(first run, downloads several GB) …", flush=True)
-            subprocess.run([str(py), "-m", "pip", "install", "--no-input",
+            venv_env.run([str(py), "-m", "pip", "install", "--no-input",
                             "coqui-tts", "soundfile", "requests"],
-                           check=True, timeout=timeout)
+                         check=True, timeout=timeout)
         except Exception as exc:
             # A partially built venv is worse than none: `available()` stays
             # False, and the next attempt resumes rather than reporting a venv
@@ -153,10 +151,11 @@ class XttsSubprocess:
         self._proc = subprocess.Popen(
             [str(venv_python()), str(_SERVICE)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1",
-                 # CPML acceptance: configuring an XTTS model IS the decision,
-                 # and the alternative is an interactive prompt on a pipe.
-                 "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED", "1")})
+            env=venv_env.env_for_python(venv_python(), {
+                "PYTHONUNBUFFERED": "1",
+                # CPML acceptance: configuring an XTTS model IS the decision,
+                # and the alternative is an interactive prompt on a pipe.
+                "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED", "1")}))
         reply = self._call({"op": "load", "model": model_name})
         if not reply.get("ok"):
             self.close()

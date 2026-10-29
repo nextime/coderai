@@ -29,6 +29,7 @@ reference; these are the deep dives.
 | [chunking.md](chunking.md) | `POST /v1/chunk`: splitting a document for a retrieval index, with the structure decided per request by a template |
 | [moderation.md](moderation.md) | `POST /v1/moderation`: screening generated images and video before release (explicitness, faces, age, performer match) — and why it fails closed |
 | [expressive-tts.md](expressive-tts.md) | Expressive text-to-speech |
+| [isolated-worker-environments.md](isolated-worker-environments.md) | Engines that need an interpreter of their own: the inherited `PYTHONHOME` that made three different failures, when a venv that is there cannot be used, and `env_ready` before the first request |
 | [image-prompts.md](image-prompts.md) | Image prompts: the `(tag:1.3)` / `[tag]` / `BREAK` grammar, prompts past CLIP's 77 tokens, `clip_skip`, negative prompts, textual-inversion embeddings, size validation |
 | [zimage-lora-training.md](zimage-lora-training.md) | LoRA training for image models |
 | [text-to-music.md](text-to-music.md) | `POST /v1/audio/generate` with ACE-Step: style prompt + sung lyrics → a 48 kHz stereo track, the python-3.12 worker it needs, and the two image variants (`--with-acestep`) |

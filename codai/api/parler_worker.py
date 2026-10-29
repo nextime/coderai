@@ -20,10 +20,11 @@ manager's normal eviction tears the process down — no manual setup or config.
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
+
+from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "parler_tts_service.py"
@@ -44,43 +45,10 @@ def _venv_python() -> Path:
         "python.exe" if os.name == "nt" else "python")
 
 
-def _venv_runs(py: Path) -> bool:
-    """Whether this venv's interpreter actually RUNS.
-
-    ``Path.exists()`` is not enough and its failure mode is nasty. A venv's
-    ``bin/python`` is a symlink to the interpreter that built it, so a venv
-    created by a DIFFERENT python -- on the host rather than in the container,
-    or before the image moved its interpreter -- leaves a dangling link.
-    ``exists()`` follows symlinks and answers False, so the code concludes the
-    venv is missing and tries to create one over the top; ``python -m venv``
-    then trips over the same dangling ``bin/python3`` and dies:
-
-        Error: [Errno 2] No such file or directory: '.../parler_venv/bin/python3'
-
-    which surfaced as "Command '[... -m venv ...]' returned non-zero exit
-    status 1" on every request, for ever, with a fully populated venv sitting
-    right there. Measured 2026-10-28.
-    """
-    try:
-        return subprocess.run([str(py), "-c", "import sys"],
-                              capture_output=True, timeout=120).returncode == 0
-    except Exception:
-        return False
-
-
 def _pip_ok(py: Path) -> bool:
     try:
-        return subprocess.run([str(py), "-c", "import parler_tts, soundfile"],
-                              capture_output=True).returncode == 0
-    except Exception:
-        return False
-
-
-def _venv_is_system_site() -> bool:
-    """True if the venv was built with --system-site-packages (can't isolate)."""
-    try:
-        return "include-system-site-packages = true" in \
-            (_VENV_DIR / "pyvenv.cfg").read_text().lower()
+        return venv_env.run([str(py), "-c", "import parler_tts, soundfile"],
+                            capture_output=True).returncode == 0
     except Exception:
         return False
 
@@ -95,28 +63,16 @@ def _bootstrap_venv() -> Path:
     py = _venv_python()
     if _bootstrapped and py.exists():
         return py
-    # A previously-created shared-site venv leaks the server's transformers in;
-    # rebuild it isolated.
-    if py.exists() and _venv_is_system_site():
-        import shutil
-        print("[parler] rebuilding venv as fully isolated …", flush=True)
-        shutil.rmtree(_VENV_DIR, ignore_errors=True)
-    # A venv built by another interpreter cannot be repaired in place -- see
-    # _venv_runs. Clear it out so the creation below starts from nothing.
-    if _VENV_DIR.exists() and not _venv_runs(_venv_python()):
-        import shutil
-        print(f"[parler] {_VENV_DIR} was built by a different interpreter "
-              f"(its python does not run here); rebuilding …", flush=True)
-        shutil.rmtree(_VENV_DIR, ignore_errors=True)
-    if not _venv_python().exists():
-        print(f"[parler] creating isolated venv at {_VENV_DIR} …", flush=True)
-        _VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([sys.executable, "-m", "venv", str(_VENV_DIR)], check=True)
-    py = _venv_python()
+    # Everything that makes a venv unusable -- a shared-site build that leaks
+    # the server's transformers in, an interpreter that no longer runs, a
+    # minor-version mismatch against its own site-packages -- is one rebuild
+    # decision, taken in venv_env.create_venv. None of them can be repaired
+    # in place: `python -m venv` over the top dies on the thing that broke it.
+    py = venv_env.create_venv(_VENV_DIR)
     if not _pip_ok(py):
         print("[parler] installing parler-tts + torch into the isolated venv "
               "(first run, downloads several GB, this can take a while) …", flush=True)
-        subprocess.run([str(py), "-m", "pip", "install",
+        venv_env.run([str(py), "-m", "pip", "install",
                         "git+https://github.com/huggingface/parler-tts.git",
                         "soundfile"], check=True)
         if not _pip_ok(py):
@@ -178,22 +134,18 @@ def ensure_service(model_name: str, ready_timeout: float = 1800.0) -> str:
         py = _bootstrap_venv()
         port = _free_port()
         url = f"http://127.0.0.1:{port}"
-        env = dict(os.environ)
         # The worker must use the model already pulled via coderai's HF download
         # interface — it never downloads anything itself. Point it at coderai's
-        # cache and force offline mode, so a missing model fails fast instead of
-        # silently fetching.
-        try:
-            # All four HF variables, not just the hub pair: this worker runs in
-            # its own venv and never imports codai, so HF_HOME and
-            # TRANSFORMERS_CACHE would stay as the image set them and the model
-            # would be fetched a second time into that directory.
-            from codai.hf_cache import child_env as _hf_child_env
-            env = _hf_child_env(env)
-        except Exception:
-            pass
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
+        # cache (all four HF variables, since it never imports codai) and force
+        # offline mode, so a missing model fails fast instead of silently
+        # fetching. env_for_python also drops PYTHONHOME -- under it this
+        # venv's python took its stdlib and site-packages from the SERVER's
+        # installation, which is how a populated venv reported itself broken --
+        # and decides the library path from whose interpreter the venv holds:
+        # a foreign python loading this one's extension modules is the
+        # CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED shape.
+        env = venv_env.env_for_python(py, {"HF_HUB_OFFLINE": "1",
+                                           "TRANSFORMERS_OFFLINE": "1"})
         proc = subprocess.Popen(
             [str(py), str(_SERVICE_SCRIPT), "--model", model_name,
              "--host", "127.0.0.1", "--port", str(port)],

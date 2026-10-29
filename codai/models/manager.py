@@ -5763,6 +5763,31 @@ class MultiModelManager:
                 print(f"  Idle unload of '{key}' failed: {e}")
         return freed
 
+    def ensure_free_vram(self, gb: float, reason: str = "") -> float:
+        """Make sure ``gb`` is free right now, evicting others if it is not.
+
+        Different question from :meth:`ensure_vram_for`, which asks "can this
+        model be LOADED": a model that is already resident still needs room for
+        the pass it is about to run. Measured on a production render,
+        2026-10-29: an in-process CrisperWhisper sat resident while the TTS and
+        visual models for the same job loaded around it, filling the card to
+        the edge; its next window then failed on an 86 MiB allocation, once per
+        scene, and every caption lost its word timings.
+
+        Returns the free VRAM afterwards, so a caller can log what it got
+        rather than what it asked for.
+        """
+        if not gb or gb <= 0:
+            return self._get_free_vram_gb()
+        free = self._get_free_vram_gb()
+        if free >= gb:
+            return free
+        print(f"Need {gb:.2f} GB free VRAM"
+              + (f" for {reason}" if reason else "")
+              + f", have {free:.2f} GB — evicting to make room")
+        self._evict_models_for_vram(gb)
+        return self._get_free_vram_gb()
+
     def _evict_models_for_vram(self, needed_gb: float):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 

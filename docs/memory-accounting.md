@@ -112,6 +112,53 @@ cache that the kernel reclaims by itself and that evicting a model cannot free.
 The cap can only be met by releasing memory something actually holds, so the
 metric has to be one that releasing memory moves.
 
+## A resident model still needs room to run
+
+Every reservation above is taken when a model LOADS. A model that is already
+loaded asks for nothing — and a pass still costs more than the weights.
+
+Measured on a production render, 2026-10-29: a speech model sat resident
+between scenes while the TTS and visual models of the same job loaded around
+it and filled the card. Then every scene logged
+
+```
+word timestamps failed (500: … CUDA out of memory. Tried to allocate 86.00 MiB)
+```
+
+and every caption in the render lost its word timings. 86 MiB is what a
+resident model needs to run one window, and nothing in the system was keeping
+it.
+
+Three numbers per speech model, all measured after its first pass:
+
+| | |
+|---|---|
+| `weights` | what the load put on the card |
+| `activation` | what one pass needed **on top of what was already allocated** |
+| reserve | `weights + activation`: what to free before loading it |
+
+`activation` is what is now ensured free before each pass
+(`ensure_free_vram`), and the reserve is what is freed before a load.
+
+It is a delta on purpose. The process's absolute peak would charge a speech
+model for every other model resident beside it — a 16 GB image model sitting
+on the card during a transcription would be recorded as part of the speech
+model's footprint, and every later load of it would evict the world. Both are
+high-water marks, never averages: a one-word clip touches a fraction of what a
+full 30 s window does, and an average under-reserves for the longer audio that
+follows. Until a model has run once, a 1 GB floor stands in for `activation` —
+deliberately modest, because the model is already resident and the failure
+being prevented was 86 MiB.
+
+The same checkpoint can be served in-process or by an isolated worker, and the
+two used to disagree about its size: 3 GB in one path against 8 GB in the
+other, where 8 GB was the measured one. They now share one function, so
+eviction frees the same amount whichever way the model is running.
+
+An OOM that still happens mid-pass frees the card and retries once. A pass is
+seconds of work on audio that already exists; the expensive outcome is a
+render whose captions have no timings.
+
 ## Idle unload
 
 Eviction frees a model when something else needs the memory.

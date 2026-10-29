@@ -640,10 +640,16 @@ async def _run_transcription_inner(
                     uses_gpu = bool(torch.cuda.is_available())
                 except Exception:
                     uses_gpu = False
-                # whisper HF (e.g. CrisperWhisper large) is a bit bigger than
-                # wav2vec2; reserve a touch more by default.
-                _dflt = 3.0 if family == 'whisper_hf' else 2.0
-                needed_gb = float(stt_cfg.get('used_vram_gb') or _dflt) if uses_gpu else 0.0
+                # One source of truth for how big a speech model is, shared
+                # with the isolated worker that serves the same checkpoint the
+                # other way: the operator's number, else what this model
+                # measured on an earlier pass, else the family default. The 3.0
+                # that used to be hard-coded here was about a third of what a
+                # verbatim pass peaks at, so eviction freed a third of the room
+                # and the pass OOMed on a card full of models nobody had asked
+                # to keep.
+                needed_gb = (stt_backends.reserve_gb(model_name, stt_cfg, family)
+                             if uses_gpu else 0.0)
 
             def _run_backend():
                 def _loader():
