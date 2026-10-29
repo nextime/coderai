@@ -3567,6 +3567,19 @@ class MultiModelManager:
         except Exception:
             pass
 
+    def _quant_signature(self, resolved_name: str, cfg: dict) -> str:
+        """Hash of the settings that decide how big the built weights are.
+
+        Reuses the pipeline cache's signature, which already covers exactly
+        this: model id, precision, load_in_4bit / load_in_8bit and
+        component_quantization.
+        """
+        try:
+            from codai.models import pipeline_cache
+            return pipeline_cache._signature(resolved_name, cfg)
+        except Exception:
+            return ""
+
     def _total_vram_gb(self) -> float:
         """Total VRAM (GB) of the largest visible NVIDIA GPU — used to size a vLLM
         instance's gpu_memory_utilization footprint. Falls back to 24 GB."""
@@ -3810,6 +3823,11 @@ class MultiModelManager:
 
         _persist("measured_vram_gb", measured_vram, vram_guard=True)
         _persist("measured_ram_gb", measured_ram)
+        # Stamp WHICH quantization this measurement describes, so a later
+        # config change invalidates it instead of silently outliving it.
+        if measured_vram:
+            _persist("measured_quant_sig",
+                     self._quant_signature(resolved_name, cfgd))
 
         # --- Anti-ratchet guard for the learned GPU-layer split -------------
         # Never let a VRAM-CONTENDED (offloaded-to-CPU) load overwrite a HIGHER
@@ -4912,6 +4930,25 @@ class MultiModelManager:
         measured = self._measured_vram_gb.get(model_key)
         if not measured:
             _cm = cfg.get("measured_vram_gb")
+            # A measurement is only valid for the quantization it was taken
+            # under. Change the map and the stored number describes a model
+            # that no longer exists -- and because force_vram_update makes the
+            # measurement WIN, the stale figure keeps deciding placement.
+            #
+            # Measured 2026-10-29: Wan2.2-TI2V-5B carried measured_vram_gb=40.0
+            # from a load where only its text encoder was quantized (its map
+            # named text_encoder and vae; vae is conv-only, so bitsandbytes
+            # skipped it and an fp32 18.63 GB transformer loaded whole). Once
+            # the transformer is quantized the same pipeline is about 10 GB,
+            # but 40.0 would have gone on forcing CPU offload on a 25.3 GB card
+            # until some unlucky load happened to re-measure it.
+            _sig_now = self._quant_signature(resolved_name, cfg)
+            _sig_then = cfg.get("measured_quant_sig")
+            if _cm and _sig_now and _sig_then and _sig_then != _sig_now:
+                print(f"  Ignoring measured_vram_gb={_cm} for '{model_key}': "
+                      f"recorded under different quantization settings "
+                      f"({_sig_then} != {_sig_now}); re-measuring this load.")
+                _cm = None
             if _cm:
                 try:
                     measured = float(_cm)
