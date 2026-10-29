@@ -85,3 +85,31 @@ def test_the_helper_parses_at_the_right_scope():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             names.add(node.name)
     assert "_release_injected_to_cpu" in names
+
+
+def test_the_release_happens_BEFORE_the_teardown():
+    """Ordering is the whole fix.
+
+    _free_pipeline_vram ends in the teardown-leak breaker, which walks live
+    CUDA tensors and nulls whatever still references them. Release after that
+    and the components are already stripped: the release reports nothing and
+    the breaker has done the work the hard way.
+
+    Measured 2026-10-29 with the call placed after the teardown -- the release
+    printed nothing at all and the breaker still reported "16.9 GB of this
+    pipeline's tensors survived teardown; nulled 7581 external reference(s)".
+    """
+    body = _SRC.split("if offload == 'resident':", 1)[1][:4000]
+    rel = body.index("_release_injected_to_cpu('a partial resident fit')")
+    free = body.index("_free_pipeline_vram(pipe)", 0)
+    assert rel < free, (
+        "the injected components are released AFTER _free_pipeline_vram, so "
+        "the leak breaker strips them first and the release is a no-op")
+
+
+def test_the_oom_exit_releases_before_clearing_too():
+    body = _SRC.split("if offload == 'resident':", 1)[1][:4000]
+    rel = body.index("_release_injected_to_cpu('a resident OOM')")
+    clear = body.index("_clear_mem()", rel - 400 if rel > 400 else 0)
+    assert rel < body.index("offload = 'model'  # fall through"), (
+        "the OOM exit falls through before releasing the components")

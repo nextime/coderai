@@ -1955,10 +1955,18 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     print(f"  [resident] components left off-GPU: {', '.join(_kept)} "
                           f"— resident can't fit this model; freeing partial pipe and "
                           f"falling back to model CPU offload…")
+                    # BEFORE the teardown, not after. _free_pipeline_vram
+                    # ends in the leak breaker, which walks live CUDA
+                    # tensors and nulls whatever still references them --
+                    # so releasing afterwards finds the components already
+                    # stripped and reports nothing, while the breaker has
+                    # done the work the hard way. Measured 2026-10-29: the
+                    # release printed nothing and the breaker still said
+                    # "16.9 GB survived teardown; nulled 7581 reference(s)".
+                    _release_injected_to_cpu('a partial resident fit')
                     _free_pipeline_vram(pipe)
                     pipe = None
                     _clear_mem()
-                    _release_injected_to_cpu('a partial resident fit')
                     offload = 'model'
                 else:
                     _record_resident_fits(model_name, True)
@@ -1970,8 +1978,8 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 print(f"  Video: resident all-GPU OOM ({e}) — "
                       f"falling back to model CPU offload…")
                 e.__traceback__ = None  # release frames pinning the partial model
-            _clear_mem()
             _release_injected_to_cpu('a resident OOM')
+            _clear_mem()
             offload = 'model'  # fall through to Attempt 1 (model CPU offload)
 
         # ── Attempt 0: full GPU ──────────────────────────────────────────────
