@@ -4457,6 +4457,12 @@ def _run_h3_in_engine(request, model_key: str, model_path: str, model_cfg: dict,
         _ram_before = multi_model_manager._get_own_ram_gb()
         pipe = _load_h3_pipeline(model_path, model_cfg, workflow, device)
         multi_model_manager.models[model_key] = pipe
+        # Stamp the LRU clock through the active_in_vram chokepoint: a raw
+        # models[key] assignment leaves _last_used unset, so the key sorts
+        # first in _lru_order() (default 0.0) and is evicted before genuinely
+        # older models -- and the first-pass 'key == active_in_vram' guard
+        # never protects it either.
+        multi_model_manager.active_in_vram = model_key
         multi_model_manager.current_model_key = model_key
         try:
             multi_model_manager.clear_loading(model_key)
@@ -5382,6 +5388,7 @@ async def video_generations(request: VideoGenerationRequest,
         except Exception as _e:
             print(f"  [video][accel] skipped: {_e}")
         multi_model_manager.models[model_key] = pipe
+        multi_model_manager.active_in_vram = model_key
         multi_model_manager.current_model_key = model_key
         # Registered — normal tracking takes over from the load reservation.
         multi_model_manager.clear_loading(model_key)
@@ -5452,6 +5459,7 @@ async def video_generations(request: VideoGenerationRequest,
                         None, _load_video_pipeline, model_name, device, request.mode,
                         _strat, _model_cfg, _incr)
                 multi_model_manager.models[model_key] = pipe
+                multi_model_manager.active_in_vram = model_key
                 multi_model_manager.current_model_key = model_key
                 multi_model_manager.clear_loading(model_key)
             except Exception as _le:

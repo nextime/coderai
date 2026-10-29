@@ -3605,6 +3605,12 @@ async def create_image_depth(request: ImageDepthRequest, http_request: Request =
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load depth model: {e}")
         multi_model_manager.models[model_key] = depth_model
+        # Stamp the LRU clock through the active_in_vram chokepoint: a raw
+        # models[key] assignment leaves _last_used unset, so the key sorts
+        # first in _lru_order() (default 0.0) and is evicted before genuinely
+        # older models -- and the first-pass 'key == active_in_vram' guard
+        # never protects it either.
+        multi_model_manager.active_in_vram = model_key
     raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
     try:
         depth_img = await asyncio.get_event_loop().run_in_executor(
@@ -3711,6 +3717,7 @@ async def create_image_segment(request: ImageSegmentRequest, http_request: Reque
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load segmentation model: {e}")
         multi_model_manager.models[model_key] = seg_model
+        multi_model_manager.active_in_vram = model_key
     raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
     try:
         seg_img = await asyncio.get_event_loop().run_in_executor(
@@ -3922,6 +3929,7 @@ async def create_image_outfit(request: ImageOutfitRequest, http_request: Request
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load inpaint model: {e}")
         multi_model_manager.models[model_key] = pipeline
+        multi_model_manager.active_in_vram = model_key
 
     # Run inpaint
     import torch
@@ -3991,6 +3999,7 @@ async def _outfit_video(request: ImageOutfitRequest, http_request):
             pipeline = await asyncio.get_event_loop().run_in_executor(
                 None, _load_inpaint_pipeline, request.model, global_args)
             multi_model_manager.models[model_key] = pipeline
+            multi_model_manager.active_in_vram = model_key
 
         import torch
         from PIL import Image as PILImage

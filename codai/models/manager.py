@@ -5316,11 +5316,26 @@ class MultiModelManager:
         try:
             from codai.api.state import get_global_debug
             if get_global_debug():
-                _be = getattr(model_obj, 'backend', '∅')
-                _has_model = (getattr(_be, 'model', None) is not None) if _be not in ('∅', None) else False
+                _absent = object()           # identity sentinel: never == anything
+                _be = getattr(model_obj, 'backend', _absent)
+                _has_model = (getattr(_be, 'model', None) is not None
+                              if (_be is not _absent and _be is not None) else False)
                 _pool = self.model_pools.get(key)
+                # Only ModelManager-wrapped models carry `.backend`; a diffusers
+                # pipeline / sd.cpp model legitimately has none, so "no attr" is
+                # NOT a fault here -- while model_obj being None means the key was
+                # already gone from self.models and nothing was freed. Those two
+                # read identically through getattr's default, so name them apart.
+                if model_obj is None:
+                    _bk = 'NO-ENTRY (key absent from self.models)'
+                elif _be is _absent:
+                    _bk = 'n/a (not a ModelManager)'
+                elif _be is None:
+                    _bk = 'None (detached -- VRAM may be stranded)'
+                else:
+                    _bk = 'set'
                 print(f"  evict-debug '{key}': obj_id={id(model_obj)} "
-                      f"backend={'None' if _be is None else ('missing' if _be=='∅' else 'set')} "
+                      f"obj_type={type(model_obj).__name__} backend={_bk} "
                       f"backend.model={'set' if _has_model else 'None'} "
                       f"pool_instances={_pool.count if _pool else 0}")
         except Exception:
