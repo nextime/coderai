@@ -221,10 +221,15 @@ def test_an_image_to_a_blind_model_is_refused_before_it_is_flattened():
     assert guard < flatten, (
         "the placeholder is built before the refusal, so a blind model can "
         "still answer a picture")
-    body = src[guard:guard + 1400]
+    # The whole guard block, not a fixed slice: a slice breaks the moment the
+    # message grows, which says nothing about the behaviour under test.
+    body = src[guard:src.index("# Inject system prompt", guard)]
     assert "status_code=400" in body
     assert "_release_instance()" in body, (
         "refusing without releasing the instance slot leaks it")
+    assert "vision_report(" in body, (
+        "the refusal does not say what was actually found, which is how a "
+        "broken vision loader looked like a misconfigured model")
 
 
 def test_a_gguf_without_an_mmproj_does_not_advertise_vision():
@@ -234,3 +239,83 @@ def test_a_gguf_without_an_mmproj_does_not_advertise_vision():
     assert '.gguf' in block and 'mmproj' in block
     # a remote/pod-served model is the remote's business, not this listing's
     assert "vllm" in block and "runpod" in block
+
+
+# --------------------------------------------------------------------------
+# The mapping call itself
+# --------------------------------------------------------------------------
+#
+# Shipped broken and found in production the same day: transformers'
+# `_LazyAutoMapping.get` is NOT dict.get — its signature is
+# `get(self, key, default)` with `default` REQUIRED. Called with one argument
+# it raises
+#
+#   TypeError: _LazyAutoMapping.get() missing 1 required positional argument
+#
+# which this module caught and reported as "no vision class" — for every
+# checkpoint, always. So every vision model loaded as text and then had its
+# pictures refused by the guard added for exactly that case.
+#
+# The probe that "verified" it passed two arguments, so it tested a call the
+# code does not make. These tests call what the code calls.
+
+
+def test_the_mapping_is_queried_the_way_transformers_defines_it():
+    """A stub whose `get` mirrors _LazyAutoMapping's required `default`."""
+    import transformers
+    from codai.backends import hf_vision
+
+    class _Cfg:
+        vision_config = {"depth": 2}
+        image_token_id = 7
+
+    class _Cls:
+        pass
+
+    class _StrictMapping:
+        def get(self, key, default):          # default is REQUIRED, as upstream
+            return {_Cfg: _Cls}.get(key, default)
+
+    class _Auto:
+        _model_mapping = _StrictMapping()
+
+    real = transformers.AutoModelForImageTextToText
+    try:
+        transformers.AutoModelForImageTextToText = _Auto
+        report = hf_vision.vision_report("x/y", config=_Cfg())
+    finally:
+        transformers.AutoModelForImageTextToText = real
+    assert report["cls"] is _Cls, report["reason"]
+
+
+def test_a_real_installed_vision_config_resolves_to_a_class():
+    """No stub, no network, no weights: a config class this transformers
+    actually ships, through the real mapping."""
+    import transformers
+    from codai.backends import hf_vision
+
+    cfg = None
+    for name in ("LlavaConfig", "Qwen2VLConfig", "Blip2Config", "PaliGemmaConfig"):
+        klass = getattr(transformers, name, None)
+        if klass is None:
+            continue
+        try:
+            cfg = klass()
+        except Exception:
+            continue
+        break
+    if cfg is None:
+        pytest.skip("this transformers ships none of the probe configs")
+    report = hf_vision.vision_report("x/y", config=cfg)
+    assert report["cls"] is not None, report["reason"]
+
+
+def test_a_failure_to_decide_is_never_silent():
+    """The 400 that refuses a picture was the only trace of this. A decision
+    that consequential has to leave one of its own."""
+    src = _src("codai/backends/hf_vision.py")
+    rep = src.split("def vision_report", 1)[1].split("\ndef ", 1)[0]
+    assert '"reason"' in rep
+    auto = src.split("def auto_model_class", 1)[1].split("\ndef ", 1)[0]
+    assert "print(" in auto, (
+        "a vision checkpoint loaded as text says nothing in the log")

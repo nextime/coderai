@@ -73,8 +73,75 @@ def _config_for(model_name: str):
     try:
         from transformers import AutoConfig
         return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    except Exception:
+    except Exception as exc:
+        print(f"[vision] {model_name}: its config could not be read "
+              f"({type(exc).__name__}: {str(exc)[:160]})", flush=True)
         return None
+
+
+def vision_report(model_name: str, config=None) -> dict:
+    """Why this checkpoint is, or is not, loaded with a vision tower.
+
+    Every step is reported because every one of them used to fail silently.
+    Measured on zeiss, 2026-10-29: after the vision loading shipped, an image
+    sent to ``Qwen3.5-9B`` was refused with "served without a vision tower" —
+    and the engine logged nothing at all about why, because
+    :func:`is_vision_checkpoint` answered False and said nothing. A decision
+    this consequential has to leave a trace.
+
+    Keys: ``config`` (read or not), ``vision_config``, ``image_token_id``,
+    ``cls`` (the class that would load it, or None), ``reason``.
+    """
+    out = {"config": False, "vision_config": False, "image_token_id": False,
+           "cls": None, "reason": ""}
+    cfg = config if config is not None else _config_for(model_name)
+    if cfg is None:
+        out["reason"] = "its config could not be read"
+        return out
+    out["config"] = True
+    out["cfg_class"] = type(cfg).__name__
+    out["vision_config"] = getattr(cfg, "vision_config", None) is not None
+    out["image_token_id"] = getattr(cfg, "image_token_id", None) is not None
+    if not out["vision_config"] and not out["image_token_id"]:
+        out["reason"] = ("its config has neither a vision_config nor an "
+                         "image_token_id — it is a text checkpoint")
+        return out
+    # The config says there is a tower; the installed transformers must also
+    # have a class that loads it. Without this check a brand-new family would
+    # pick the vision class and fail the load outright, which is worse than
+    # serving it as text.
+    try:
+        from transformers import AutoModelForImageTextToText
+        # BOTH arguments. transformers' `_LazyAutoMapping.get` is not dict.get:
+        # its signature is `get(self, key, default)` and `default` is
+        # REQUIRED. Calling it with one argument raises
+        #
+        #   TypeError: _LazyAutoMapping.get() missing 1 required positional
+        #   argument: 'default'
+        #
+        # which this function caught and reported as "no vision class" — for
+        # every checkpoint, always. So every vision model loaded as text and
+        # then had its pictures refused by the guard added for exactly that
+        # case. Measured on zeiss, 2026-10-29, against Qwen3.5-9B.
+        cls = AutoModelForImageTextToText._model_mapping.get(type(cfg), None)
+    except Exception as exc:
+        out["reason"] = (f"the image-text-to-text mapping could not be read "
+                         f"({type(exc).__name__}: {str(exc)[:120]})")
+        return out
+    if cls is None:
+        out["reason"] = (f"this transformers has no image-text-to-text class "
+                         f"for {type(cfg).__name__} ({_tf_version()})")
+        return out
+    out["cls"] = cls
+    return out
+
+
+def _tf_version() -> str:
+    try:
+        import transformers
+        return f"transformers {transformers.__version__}"
+    except Exception:
+        return "transformers version unknown"
 
 
 def is_vision_checkpoint(model_name: str, config=None) -> bool:
@@ -85,22 +152,10 @@ def is_vision_checkpoint(model_name: str, config=None) -> bool:
     with "vision" in the name are not image-text-to-text at all. The two
     signals are a nested ``vision_config`` and an ``image_token_id`` -- a
     decoder that has somewhere to put an image.
+
+    See :func:`vision_report` for the same decision with its reasons.
     """
-    cfg = config if config is not None else _config_for(model_name)
-    if cfg is None:
-        return False
-    if getattr(cfg, "vision_config", None) is None and \
-            getattr(cfg, "image_token_id", None) is None:
-        return False
-    # The config says there is a tower; the installed transformers must also
-    # have a class that loads it. Without this check a brand-new family would
-    # pick the vision class and fail the load outright, which is worse than
-    # serving it as text.
-    try:
-        from transformers import AutoModelForImageTextToText
-        return AutoModelForImageTextToText._model_mapping.get(type(cfg)) is not None
-    except Exception:
-        return False
+    return vision_report(model_name, config)["cls"] is not None
 
 
 def auto_model_class(model_name: str):
@@ -112,11 +167,23 @@ def auto_model_class(model_name: str):
     """
     from transformers import AutoModelForCausalLM
     try:
-        if is_vision_checkpoint(model_name):
+        report = vision_report(model_name)
+        if report["cls"] is not None:
             from transformers import AutoModelForImageTextToText
             return AutoModelForImageTextToText, True
-    except Exception:
-        pass
+        # Only worth a line when the checkpoint LOOKS like a vision model and
+        # is not being loaded as one: that is the case an operator has to be
+        # able to see, and the one that used to be silent.
+        if report.get("vision_config") or report.get("image_token_id"):
+            print(f"[vision] {model_name} looks like a vision checkpoint "
+                  f"(vision_config={report['vision_config']}, "
+                  f"image_token_id={report['image_token_id']}, "
+                  f"config={report.get('cfg_class')}) but "
+                  f"{report['reason']} — loading it as text", flush=True)
+    except Exception as exc:
+        print(f"[vision] {model_name}: could not decide on a model class "
+              f"({type(exc).__name__}: {str(exc)[:160]}) — loading it as text",
+              flush=True)
     return AutoModelForCausalLM, False
 
 

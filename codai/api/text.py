@@ -1638,12 +1638,34 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             if any(isinstance(_it, dict) and _it.get('type') in ('image_url', 'input_image')
                    for _it in _c):
                 _release_instance()
+                # Say what was found, not just what is missing. The first
+                # version of this message named three possible causes and the
+                # engine logged nothing, so when the vision loading itself was
+                # broken (a one-argument call to transformers' mapping, which
+                # raises) the only symptom was this refusal -- and it pointed
+                # at the model's configuration, which was fine.
+                _why = ""
+                try:
+                    from codai.backends import hf_vision as _hv
+                    _r = _hv.vision_report(
+                        getattr(current_manager, 'model_name', None)
+                        or requested_model)
+                    _why = _r.get("reason") or ""
+                    if _r.get("cls") is not None:
+                        _why = ("this checkpoint HAS a vision class "
+                                f"({_r['cls'].__name__ if hasattr(_r['cls'], '__name__') else _r['cls']}) "
+                                "but the loaded model is not using it — the "
+                                "engine log says why")
+                except Exception:
+                    _why = ""
                 raise HTTPException(status_code=400, detail=(
                     f"Model '{requested_model}' cannot read images: it is served "
-                    f"without a vision tower (an HF checkpoint with no "
-                    f"vision_config or processor, or a GGUF with no mmproj). "
-                    f"Send the image to a model whose capabilities list "
-                    f"image_to_text, or configure an mmproj for this one."))
+                    f"without a vision tower"
+                    + (f" ({_why})" if _why else
+                       " (an HF checkpoint with no vision_config or processor, "
+                       "or a GGUF with no mmproj)")
+                    + f". Send the image to a model whose capabilities list "
+                      f"image_to_text, or configure an mmproj for this one."))
 
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
