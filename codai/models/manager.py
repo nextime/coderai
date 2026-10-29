@@ -3863,10 +3863,20 @@ class MultiModelManager:
             self.config[canon] = working
             from codai.admin.routes import config_manager
             if config_manager is not None:
+                # persist_model_field, NOT save_models(): the latter writes the
+                # config manager's own view and never saw this change, so the
+                # value lived in memory only and every restart paid the
+                # discovery again. It also targets the entry by config_id, so
+                # two configs sharing one checkpoint path do not overwrite each
+                # other's measurement -- the same reason record_vram_delta uses
+                # it for measured_vram_gb.
                 try:
-                    config_manager.save_models()
-                except Exception:
-                    pass
+                    config_manager.persist_model_field(
+                        canon, "measured_resident_fits", bool(fits),
+                        config_id=cfg.get("config_id"))
+                except Exception as _pe:
+                    print(f"  Warning: could not persist "
+                          f"measured_resident_fits: {_pe}")
             print(f"  Learned: '{model_key}' "
                   f"{'fits' if fits else 'does NOT fit'} fully on the GPU "
                   f"(measured_resident_fits={bool(fits)})")

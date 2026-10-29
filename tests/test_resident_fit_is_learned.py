@@ -106,3 +106,45 @@ def test_the_loader_consults_and_records():
         "both outcomes must be recorded: writing only the failure means a "
         "model that fits is re-proven every time, and writing only the success "
         "never stops the expensive retry")
+
+
+def test_the_verdict_reaches_disk_not_just_memory(monkeypatch):
+    """It must survive a restart.
+
+    Written with save_models() the value never reached models.json at all --
+    that writes the config manager's own view, which never saw the change --
+    so the flag lived in memory only and every restart paid the ~16 minute
+    discovery again. Measured 2026-10-29: after a run that learned the model
+    does not fit, models.json still read measured_resident_fits = None.
+
+    persist_model_field also targets the entry by config_id, so two configs
+    sharing one checkpoint path cannot overwrite each other's measurement.
+    """
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "codai/models/manager.py"), encoding="utf-8").read()
+    after = src.split("def record_resident_fits", 1)[1]
+    # Stop at the next method, or the window spills into neighbouring code and
+    # the assertions below test the wrong function.
+    block = after.split("\n    def ", 1)[0]
+    assert "persist_model_field(" in block, (
+        "the learned verdict is not written to models.json, so it is forgotten "
+        "on every restart")
+    assert "config_id=" in block, (
+        "without config_id, two configs sharing a checkpoint path overwrite "
+        "each other's measurement")
+    # Ignore comment lines: the code explains WHY save_models is wrong, so a
+    # naive substring search matches that explanation.
+    code = "\n".join(l for l in block.splitlines()
+                     if not l.strip().startswith("#"))
+    assert "save_models()" not in code, (
+        "save_models() writes a stale whole-file view and can revert UI edits")
+
+
+def test_it_is_recorded_through_the_manager_api():
+    """The loader must not reach into models.json itself."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "codai/api/video.py"), encoding="utf-8").read()
+    block = src.split("def _record_resident_fits", 1)[1][:600]
+    assert "multi_model_manager.record_resident_fits" in block
