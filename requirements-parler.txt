@@ -20,12 +20,16 @@
 # resolution out of pip's hands. An operator on a newer CUDA can raise it.
 
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.5.1+cu124
+# 2.6.0, not the 2.5.1 the CrisperWhisper venv uses: torchaudio's first
+# python-3.13 wheel is 2.6.0 (`No matching distribution found for
+# torchaudio==2.5.1+cu124 (from versions: 2.6.0, 2.6.0+cu124, …)`), and these
+# two have to be the same version.
+torch==2.6.0+cu124
 # torchaudio has to be pinned WITH torch, not left to pip. parler-tts pulls in
 # descript-audiotools, which requires an unpinned torchaudio: pip resolved
 # 2.11.0 against torch 2.5.1, the install reported success, and `import
-# parler_tts` then failed on the mismatch (measured on zeiss, 2026-10-29).
-torchaudio==2.5.1+cu124
+# parler_tts` then failed (measured on zeiss, 2026-10-29).
+torchaudio==2.6.0+cu124
 
 # parler-tts has no release on PyPI that carries the multilingual models, so it
 # comes from the repo. It brings its own transformers pin with it; nothing here

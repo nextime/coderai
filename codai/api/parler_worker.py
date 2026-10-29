@@ -35,8 +35,8 @@ _REQUIREMENTS = _REPO_ROOT / "requirements-parler.txt"
 #: the image, so a repo-root file added since the image was built is absent
 #: until the container is recreated). A test keeps the two in step.
 _PINS = ("--extra-index-url", "https://download.pytorch.org/whl/cu124",
-         "torch==2.5.1+cu124",
-         "torchaudio==2.5.1+cu124",
+         "torch==2.6.0+cu124",
+         "torchaudio==2.6.0+cu124",
          "git+https://github.com/huggingface/parler-tts.git",
          "soundfile>=0.12.0")
 
