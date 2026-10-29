@@ -44,6 +44,30 @@ def _venv_python() -> Path:
         "python.exe" if os.name == "nt" else "python")
 
 
+def _venv_runs(py: Path) -> bool:
+    """Whether this venv's interpreter actually RUNS.
+
+    ``Path.exists()`` is not enough and its failure mode is nasty. A venv's
+    ``bin/python`` is a symlink to the interpreter that built it, so a venv
+    created by a DIFFERENT python -- on the host rather than in the container,
+    or before the image moved its interpreter -- leaves a dangling link.
+    ``exists()`` follows symlinks and answers False, so the code concludes the
+    venv is missing and tries to create one over the top; ``python -m venv``
+    then trips over the same dangling ``bin/python3`` and dies:
+
+        Error: [Errno 2] No such file or directory: '.../parler_venv/bin/python3'
+
+    which surfaced as "Command '[... -m venv ...]' returned non-zero exit
+    status 1" on every request, for ever, with a fully populated venv sitting
+    right there. Measured 2026-10-28.
+    """
+    try:
+        return subprocess.run([str(py), "-c", "import sys"],
+                              capture_output=True, timeout=120).returncode == 0
+    except Exception:
+        return False
+
+
 def _pip_ok(py: Path) -> bool:
     try:
         return subprocess.run([str(py), "-c", "import parler_tts, soundfile"],
@@ -76,6 +100,13 @@ def _bootstrap_venv() -> Path:
     if py.exists() and _venv_is_system_site():
         import shutil
         print("[parler] rebuilding venv as fully isolated …", flush=True)
+        shutil.rmtree(_VENV_DIR, ignore_errors=True)
+    # A venv built by another interpreter cannot be repaired in place -- see
+    # _venv_runs. Clear it out so the creation below starts from nothing.
+    if _VENV_DIR.exists() and not _venv_runs(_venv_python()):
+        import shutil
+        print(f"[parler] {_VENV_DIR} was built by a different interpreter "
+              f"(its python does not run here); rebuilding …", flush=True)
         shutil.rmtree(_VENV_DIR, ignore_errors=True)
     if not _venv_python().exists():
         print(f"[parler] creating isolated venv at {_VENV_DIR} …", flush=True)

@@ -79,14 +79,31 @@ def configured_hf_cache_dir(config_dir: Optional[str] = None) -> Optional[str]:
 
 
 def hf_cache_env(hf_cache_dir: str) -> Dict[str, str]:
-    """The four variables a child process needs to use ``hf_cache_dir``."""
+    """The four variables a child process needs to use ``hf_cache_dir``.
+
+    All four name the SAME hub directory. ``TRANSFORMERS_CACHE`` is deprecated
+    but transformers 4.x still honours it, and it honours it as the cache_dir
+    handed to ``hf_hub_download`` -- i.e. as a hub-layout cache, not as a
+    second kind of store. Pointing it at ``<dir>/transformers`` therefore does
+    not give transformers its own corner of one cache; it gives the machine
+    TWO hub caches, and which one a process uses depends on the transformers
+    version in its venv.
+
+    Measured 2026-10-28: ``<dir>/hub`` held 122 models and
+    ``<dir>/transformers`` held 2, both in ``models--org--name`` layout. An
+    isolated worker running transformers 4.x looked only in the second, found
+    nothing, and -- being forced offline so a missing model fails fast --
+    reported "We couldn't connect to https://huggingface.co" for a model that
+    was sitting in the other directory all along. The same split is what makes
+    a worker re-download a model the server already has.
+    """
     hf_cache_dir = os.path.expanduser(str(hf_cache_dir))
     hub = os.path.join(hf_cache_dir, "hub")
     return {
         "HF_HOME": hf_cache_dir,
         "HF_HUB_CACHE": hub,
         "HUGGINGFACE_HUB_CACHE": hub,
-        "TRANSFORMERS_CACHE": os.path.join(hf_cache_dir, "transformers"),
+        "TRANSFORMERS_CACHE": hub,
     }
 
 

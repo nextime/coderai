@@ -90,11 +90,32 @@ async def speech_capabilities(model: str = ""):
     """
     from codai.api import tts_backends
     name = (model or "").strip()
+    # The built-in voices belong with the other "what can this model do"
+    # answers rather than on a route of their own -- and NOT on
+    # /v1/audio/speakers, which already means something else entirely:
+    # enrolled speaker voiceprints for recognition.
+    #
+    # Answered without loading anything. An already-loaded model is asked
+    # directly; otherwise the list is whatever was remembered the last time it
+    # was loaded, and `voices_source` says which.
+    voices = {"voices": [], "voices_source": "none", "voice_selection": "builtin"}
+    try:
+        backend = None
+        try:
+            from codai.models.manager import multi_model_manager
+            backend = (multi_model_manager.models.get(f"tts:{name}")
+                       or multi_model_manager.models.get(name))
+        except Exception:
+            backend = None
+        voices = tts_backends.family_voices(name, backend)
+    except Exception as exc:
+        print(f"  [tts] could not list voices for {name!r}: {exc}", flush=True)
     return {
         "model": name,
         "family": tts_backends._family(name),
         "emotions": tts_backends.family_emotions(name),
         "styles": tts_backends.family_styles(name),
+        **voices,
     }
 
 

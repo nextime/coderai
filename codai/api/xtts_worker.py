@@ -27,6 +27,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -59,6 +60,84 @@ def available() -> bool:
                               capture_output=True, timeout=120).returncode == 0
     except Exception:
         return False
+
+
+_bootstrap_lock = threading.Lock()
+_bootstrapped = False
+
+
+def _venv_runs(py: Path) -> bool:
+    """Whether this venv's interpreter actually RUNS (see parler_worker)."""
+    try:
+        return subprocess.run([str(py), "-c", "import sys"],
+                              capture_output=True, timeout=120).returncode == 0
+    except Exception:
+        return False
+
+
+def bootstrap(timeout: int = 3600) -> bool:
+    """Create the venv and install coqui-tts into it (idempotent).
+
+    parler-tts builds its own venv on first use and XTTS did not, so the same
+    "needs an isolated venv" situation produced a self-healing engine in one
+    case and a 501 telling the operator to go and build one in the other. This
+    closes that gap.
+
+    Fully isolated for the reason in the module docstring: coqui-tts needs a
+    transformers the server cannot have, so sharing site-packages would either
+    break coqui or break the server.
+
+    Returns True when coqui-tts is importable afterwards. Never raises -- the
+    caller's fallback is the same 501 it would have raised anyway, and a
+    failure here must not take down a synthesis request for another engine.
+    """
+    global _bootstrapped
+    if available():
+        _bootstrapped = True
+        return True
+    with _bootstrap_lock:
+        if available():                      # another thread got there first
+            _bootstrapped = True
+            return True
+        d = venv_dir()
+        try:
+            py = venv_python()
+            # A venv built by a different interpreter leaves a dangling
+            # bin/python: is_file() says no, and `python -m venv` over the top
+            # then dies on that same dangling link, so the engine is stuck for
+            # good with a populated venv sitting right there. Clear it first.
+            if d.exists() and not _venv_runs(py):
+                import shutil
+                print(f"[xtts] {d} was built by a different interpreter "
+                      f"(its python does not run here); rebuilding …",
+                      flush=True)
+                shutil.rmtree(d, ignore_errors=True)
+            if not py.is_file():
+                print(f"[xtts] creating isolated venv at {d} …", flush=True)
+                d.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run([sys.executable, "-m", "venv", str(d)],
+                               check=True, timeout=600)
+            py = venv_python()
+            print("[xtts] installing coqui-tts into the isolated venv "
+                  "(first run, downloads several GB) …", flush=True)
+            subprocess.run([str(py), "-m", "pip", "install", "--no-input",
+                            "coqui-tts", "soundfile", "requests"],
+                           check=True, timeout=timeout)
+        except Exception as exc:
+            # A partially built venv is worse than none: `available()` stays
+            # False, and the next attempt resumes rather than reporting a venv
+            # that cannot import. Measured on a sibling worker: an install
+            # interrupted by a full disk left 42 packages and no torch, and
+            # the engine reported "venv can't be created" ever after.
+            print(f"[xtts] bootstrap failed ({type(exc).__name__}: "
+                  f"{str(exc)[:200]}); XTTS stays unavailable", flush=True)
+            return False
+        ok = available()
+        _bootstrapped = ok
+        if not ok:
+            print("[xtts] coqui-tts installed but still not importable",
+                  flush=True)
+        return ok
 
 
 class XttsSubprocess:

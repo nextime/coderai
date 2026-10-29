@@ -209,6 +209,12 @@ class _CoquiBackend:
             # verified TTS venv used to answer "pip install coqui-tts" at this
             # exact line: the venv was there and nothing knew to use it.
             from codai.api import xtts_worker
+            # Build the venv on first use, the way parler does. Opt out with
+            # CODERAI_XTTS_AUTOINSTALL=0 on a host that manages its own venvs
+            # or has no network.
+            if not xtts_worker.available() and \
+                    os.environ.get("CODERAI_XTTS_AUTOINSTALL", "1") != "0":
+                xtts_worker.bootstrap()
             if xtts_worker.available():
                 print(f"[tts] coqui-tts from {xtts_worker.venv_dir()}", flush=True)
                 self._tts = xtts_worker.XttsSubprocess(model_name)
@@ -435,8 +441,155 @@ class _RemoteSpeechBackend:
                 pass
 
 
+# --------------------------------------------------------------------------- #
+# Built-in voices
+# --------------------------------------------------------------------------- #
+#
+# Clients need to offer a voice picker BEFORE the model is loaded, and a listing
+# endpoint must never load one to answer -- a cheap availability check that
+# loads is how a catalogue route turns into a several-hundred-MB loader.
+#
+# So each backend's own `voices` property stays authoritative, and what it
+# returns is remembered the first time that model is loaded. A later listing is
+# served from that memory, and says which it was.
+
+#: How a family picks a voice at all. Not every engine HAS a voice list: parler
+#: is steered by a natural-language description, which is why its `voices` is
+#: empty and a client that only looks at the list concludes, wrongly, that it
+#: cannot be directed.
+_FAMILY_VOICE_SELECTION: dict[str, str] = {
+    "kokoro": "builtin",
+    "coqui": "builtin+clone",   # a named speaker, or speaker_wav to clone
+    "bark": "builtin",
+    "parler": "described",      # free-text description, no speaker names
+    "melo": "builtin",
+}
+
+#: Kokoro encodes the accent and the gender in the id itself (``af_sarah`` =
+#: American female). Derived, never guessed -- a family whose ids carry nothing
+#: reports null rather than an invented gender.
+_KOKORO_ACCENTS = {
+    "a": ("en-us", "American English"), "b": ("en-gb", "British English"),
+    "e": ("es", "Spanish"), "f": ("fr", "French"), "h": ("hi", "Hindi"),
+    "i": ("it", "Italian"), "j": ("ja", "Japanese"), "p": ("pt-br", "Portuguese"),
+    "z": ("zh", "Chinese"),
+}
+
+
+def _voice_meta(family: str, voice_id: str) -> dict:
+    """What is genuinely known about one voice id.
+
+    Unknown fields are ``None``, not a plausible-looking default: a gender shown
+    against the wrong voice is worse than no gender at all.
+    """
+    vid = str(voice_id or "")
+    out = {"id": vid, "name": vid, "gender": None, "languages": []}
+    if family == "kokoro" and len(vid) >= 2 and vid[1] in ("f", "m"):
+        acc = _KOKORO_ACCENTS.get(vid[0])
+        out["gender"] = "female" if vid[1] == "f" else "male"
+        if acc:
+            out["languages"] = [acc[0]]
+        if "_" in vid:
+            out["name"] = vid.split("_", 1)[1].replace("-", " ").title()
+    elif family == "bark":
+        # v2/en_speaker_3 -> the language is in the id, the speaker is a number.
+        tail = vid.split("/")[-1]
+        if "_speaker_" in tail:
+            out["languages"] = [tail.split("_speaker_")[0]]
+            out["name"] = tail.replace("_", " ")
+    return out
+
+
+def _voices_cache_file() -> Path:
+    return _cache_dir() / "tts_voices.json"
+
+
+def remember_voices(model_name: str, backend) -> None:
+    """Record a loaded backend's voice list so it can be listed without loading.
+
+    Best effort in every direction: a backend that cannot enumerate, an
+    unwritable cache or a malformed existing file must not affect synthesis,
+    which is what the caller is actually doing.
+    """
+    try:
+        voices = [str(v) for v in (getattr(backend, "voices", None) or [])]
+    except Exception:
+        return
+    if not voices:
+        return
+    try:
+        import json
+        f = _voices_cache_file()
+        try:
+            cur = json.loads(f.read_text()) if f.is_file() else {}
+            if not isinstance(cur, dict):
+                cur = {}
+        except Exception:
+            cur = {}
+        if cur.get(model_name) == voices:
+            return
+        cur[model_name] = voices
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cur, indent=2))
+        tmp.replace(f)
+    except Exception:
+        pass
+
+
+def _remembered_voices(model_name: str) -> list:
+    try:
+        import json
+        f = _voices_cache_file()
+        if not f.is_file():
+            return []
+        cur = json.loads(f.read_text())
+        return [str(v) for v in (cur.get(model_name) or [])]
+    except Exception:
+        return []
+
+
+def family_voices(model_name: str, backend=None) -> dict:
+    """The model's built-in voices, and where the list came from.
+
+    ``source`` is part of the answer on purpose: "none" means nothing is known
+    yet, which a caller should show differently from an engine that genuinely
+    has no voice list (``selection: "described"``).
+    """
+    fam = _family(model_name)
+    ids, source = [], "none"
+    if backend is not None:
+        try:
+            ids = [str(v) for v in (getattr(backend, "voices", None) or [])]
+            if ids:
+                source = "loaded"
+        except Exception:
+            ids = []
+    if not ids:
+        ids = _remembered_voices(model_name)
+        if ids:
+            source = "remembered"
+    if not ids and fam == "bark":
+        # Deterministic ids, so they can be named without loading anything.
+        ids = [f"v2/en_speaker_{i}" for i in range(10)]
+        source = "static"
+    return {
+        "voices": [_voice_meta(fam, v) for v in ids],
+        "voices_source": source,
+        "voice_selection": _FAMILY_VOICE_SELECTION.get(fam, "builtin"),
+    }
+
+
 def load_backend(model_name: str, model_path: Optional[str], config: Optional[dict]):
     """Instantiate the TTS backend for ``model_name`` (cached by the caller)."""
+    backend = _load_backend(model_name, model_path, config)
+    # Remember what it can say in, so a voice picker can be offered later
+    # without loading the model just to ask.
+    remember_voices(model_name, backend)
+    return backend
+
+
+def _load_backend(model_name: str, model_path: Optional[str], config: Optional[dict]):
     fam = _family(model_name)
     config = config or {}
     if fam == "kokoro":
