@@ -35,7 +35,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from codai.models import pipeline_cache
+from codai.models.manager import MultiModelManager
 
 
 BASE = {"precision": "bf16", "load_in_4bit": True,
@@ -43,7 +43,7 @@ BASE = {"precision": "bf16", "load_in_4bit": True,
 
 
 def _sig(cfg):
-    return pipeline_cache._signature("Wan-AI/Wan2.2-TI2V-5B-Diffusers", cfg)
+    return MultiModelManager._quant_signature(None, cfg)
 
 
 def test_adding_a_component_changes_the_signature():
@@ -88,3 +88,52 @@ def test_a_measurement_with_no_signature_is_still_trusted():
     block = src.split("_sig_then = cfg.get(\"measured_quant_sig\")", 1)[1][:400]
     assert "_sig_then and" in block, (
         "an entry without a recorded signature would be invalidated too")
+
+
+def test_the_signature_does_not_depend_on_a_model_name():
+    """The two call sites do not have the same name to hand -- the reader has
+    a resolved path, the writer only a config key. Hashing a name they derive
+    differently would make every comparison a mismatch and throw away every
+    measurement."""
+    import inspect
+    sig = inspect.signature(MultiModelManager._quant_signature)
+    assert list(sig.parameters) == ["self", "cfg"], (
+        f"_quant_signature takes {list(sig.parameters)}; a model-name "
+        f"parameter reintroduces the mismatch")
+
+
+def test_both_call_sites_bind_what_they_pass():
+    """record_vram_delta has no `resolved_name`. Passing it there raised
+    NameError inside an enclosing try, so the signature silently never
+    persisted and the invalidation could never fire -- verified live
+    2026-10-29, measured_quant_sig was None after a real load."""
+    import ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "codai/models/manager.py"),
+               encoding="utf-8").read()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    checked = 0
+    for i, line in enumerate(lines, 1):
+        if "_quant_signature(" not in line or "def _quant_signature" in line:
+            continue
+        passed = [v for v in ("cfg", "cfgd") if f"({v})" in line]
+        if not passed:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not (node.lineno < i <= (node.end_lineno or 0)):
+                continue
+            if node.name.startswith("_persist"):
+                continue
+            bound = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                     and isinstance(n.ctx, ast.Store)}
+            bound |= {a.arg for a in node.args.args}
+            for v in passed:
+                assert v in bound, (
+                    f"{node.name}() passes '{v}' to _quant_signature but never "
+                    f"binds it — NameError, swallowed, signature never written")
+            checked += 1
+            break
+    assert checked >= 2, f"expected both call sites, checked {checked}"

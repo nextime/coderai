@@ -3567,16 +3567,31 @@ class MultiModelManager:
         except Exception:
             pass
 
-    def _quant_signature(self, resolved_name: str, cfg: dict) -> str:
+    def _quant_signature(self, cfg: dict) -> str:
         """Hash of the settings that decide how big the built weights are.
 
-        Reuses the pipeline cache's signature, which already covers exactly
-        this: model id, precision, load_in_4bit / load_in_8bit and
-        component_quantization.
+        Deliberately does NOT include the model name. The signature is stored
+        on one model's own entry, so identity is already implied -- and the
+        two call sites do not have the same name to hand: the reader has a
+        resolved path, the writer has only a config key. Hashing a name they
+        derive differently would make every comparison a mismatch and discard
+        every measurement.
+
+        Not pipeline_cache._signature for the same reason, plus its cache
+        version would invalidate measurements on an unrelated cache bump.
         """
         try:
-            from codai.models import pipeline_cache
-            return pipeline_cache._signature(resolved_name, cfg)
+            import hashlib
+            import json as _json
+            c = cfg or {}
+            payload = {
+                "precision": c.get("precision") or "bf16",
+                "load_in_4bit": bool(c.get("load_in_4bit", False)),
+                "load_in_8bit": bool(c.get("load_in_8bit", False)),
+                "component_quantization": c.get("component_quantization") or {},
+            }
+            blob = _json.dumps(payload, sort_keys=True, default=str)
+            return hashlib.sha256(blob.encode()).hexdigest()[:16]
         except Exception:
             return ""
 
@@ -3826,8 +3841,7 @@ class MultiModelManager:
         # Stamp WHICH quantization this measurement describes, so a later
         # config change invalidates it instead of silently outliving it.
         if measured_vram:
-            _persist("measured_quant_sig",
-                     self._quant_signature(resolved_name, cfgd))
+            _persist("measured_quant_sig", self._quant_signature(cfgd))
 
         # --- Anti-ratchet guard for the learned GPU-layer split -------------
         # Never let a VRAM-CONTENDED (offloaded-to-CPU) load overwrite a HIGHER
@@ -4942,7 +4956,7 @@ class MultiModelManager:
             # the transformer is quantized the same pipeline is about 10 GB,
             # but 40.0 would have gone on forcing CPU offload on a 25.3 GB card
             # until some unlucky load happened to re-measure it.
-            _sig_now = self._quant_signature(resolved_name, cfg)
+            _sig_now = self._quant_signature(cfg)
             _sig_then = cfg.get("measured_quant_sig")
             if _cm and _sig_now and _sig_then and _sig_then != _sig_now:
                 print(f"  Ignoring measured_vram_gb={_cm} for '{model_key}': "
