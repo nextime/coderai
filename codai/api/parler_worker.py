@@ -36,6 +36,7 @@ _REQUIREMENTS = _REPO_ROOT / "requirements-parler.txt"
 #: until the container is recreated). A test keeps the two in step.
 _PINS = ("--extra-index-url", "https://download.pytorch.org/whl/cu124",
          "torch==2.5.1+cu124",
+         "torchaudio==2.5.1+cu124",
          "git+https://github.com/huggingface/parler-tts.git",
          "soundfile>=0.12.0")
 
@@ -55,12 +56,28 @@ def _venv_python() -> Path:
         "python.exe" if os.name == "nt" else "python")
 
 
-def _pip_ok(py: Path) -> bool:
+def _import_check(py: Path) -> tuple:
+    """``(ok, detail)`` for "are this venv's packages importable".
+
+    The detail matters. "install did not yield an importable package" is what
+    this used to say, which names neither the package nor the reason --
+    measured on zeiss, 2026-10-29, where the install had in fact succeeded and
+    the import was failing on a torchaudio that did not match the pinned
+    torch.
+    """
     try:
-        return venv_env.run([str(py), "-c", "import parler_tts, soundfile"],
-                            capture_output=True).returncode == 0
-    except Exception:
-        return False
+        r = venv_env.run([str(py), "-c", "import parler_tts, soundfile"],
+                         capture_output=True, text=True, timeout=600)
+    except Exception as exc:
+        return False, f"the import could not be run ({exc})"
+    if r.returncode == 0:
+        return True, ""
+    tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
+    return False, (tail[-1][:300] if tail else f"exit {r.returncode}")
+
+
+def _pip_ok(py: Path) -> bool:
+    return _import_check(py)[0]
 
 
 #: The op that failed. Parler's audio decoder (DAC) is convolutional, so a
@@ -137,8 +154,11 @@ def _bootstrap_venv() -> Path:
         venv_env.run([str(py), "-m", "pip", "install"]
                      + venv_env.pip_install_args(_REQUIREMENTS, _PINS),
                      check=True)
-        if not _pip_ok(py):
-            raise RuntimeError("parler-tts install did not yield an importable package")
+        _imp, _why = _import_check(py)
+        if not _imp:
+            raise RuntimeError(
+                f"the parler-tts install finished but its packages do not "
+                f"import: {_why}")
         _gpu, _why = _gpu_ok(py)
         if not _gpu:
             # Loud, and not fatal: a synthesis will fail with the real error
