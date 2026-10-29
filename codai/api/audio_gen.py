@@ -278,6 +278,13 @@ def _load_audioldm(model_name: str, device: str, model_config: dict = None):
     # CPU offload when configured; otherwise place on device (skip for quantized).
     _off = _mc.get('offload_strategy')
     if _off in ('cpu', 'sequential', 'model', 'disk') and hasattr(pipe, 'enable_model_cpu_offload'):
+        # A fully 4-bit module has no floating-point parameters, so
+        # transformers' .dtype property raises StopIteration and diffusers
+        # reads it unguarded in to(). In a worker thread that becomes
+        # "StopIteration interacts badly with generators" and fails the
+        # load. Idempotent and cached after the first call.
+        from codai.models.peft_compat import ensure_quantized_dtype_compat
+        ensure_quantized_dtype_compat()
         pipe.enable_model_cpu_offload()
     elif 'quantization_config' not in _xtra:
         pipe = pipe.to(device)
@@ -350,6 +357,13 @@ def _load_stable_audio(model_name: str, device: str, model_config: dict = None):
     _off = (model_config or {}).get('offload_strategy')
     if _off in ('cpu', 'sequential', 'model', 'disk') and hasattr(
             pipe, 'enable_model_cpu_offload'):
+        # A fully 4-bit module has no floating-point parameters, so
+        # transformers' .dtype property raises StopIteration and diffusers
+        # reads it unguarded in to(). In a worker thread that becomes
+        # "StopIteration interacts badly with generators" and fails the
+        # load. Idempotent and cached after the first call.
+        from codai.models.peft_compat import ensure_quantized_dtype_compat
+        ensure_quantized_dtype_compat()
         pipe.enable_model_cpu_offload()
     else:
         pipe = pipe.to(device)

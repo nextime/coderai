@@ -1722,6 +1722,13 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 pipe = PClass.from_pretrained(**_with_quant(dict(
                     pretrained_model_name_or_path=model_name,
                     torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+                # A fully 4-bit module has no floating-point parameters, so
+                # transformers' .dtype property raises StopIteration and diffusers
+                # reads it unguarded in to(). In a worker thread that becomes
+                # "StopIteration interacts badly with generators" and fails the
+                # load. Idempotent and cached after the first call.
+                from codai.models.peft_compat import ensure_quantized_dtype_compat
+                ensure_quantized_dtype_compat()
                 pipe.enable_model_cpu_offload()
             _report_loaded(pipe, f"balanced {gpu_pct:.0f}%GPU+CPU")
             return pipe
@@ -1862,6 +1869,55 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 return pipe
             # Even sequential OOM'd → continue to the disk-offload attempts.
 
+        def _release_injected_to_cpu(reason: str) -> None:
+            """Move the INJECTED components off the GPU between load attempts.
+
+            They are pre-built objects held in a local dict and handed to every
+            attempt through _with_quant, so freeing the pipeline does not free them:
+            the dict is still a strong reference, and whatever the failed attempt
+            moved onto the card stays there.
+
+            Measured 2026-10-29 after a resident attempt on LTX-2.5 failed:
+
+                [video] teardown-leak breaker: 16.9 GB of this pipeline's tensors
+                survived teardown; nulled 7581 external reference(s);
+                holders: ["2.01 GB dict['weight', 'bias']", ...]
+
+            Those holders are the modules' own _parameters dicts -- the modules
+            outlived the pipeline. The breaker then strips them field by field to get
+            the VRAM back, which works, but it guts components the very next attempt
+            is about to reuse.
+
+            Moved to the CPU rather than dropped, because the next attempt needs these
+            same components: that is the whole point of injecting them.
+            """
+            if not _gguf_components:
+                return
+            _freed = []
+            for _n, _c in list(_gguf_components.items()):
+                try:
+                    if _c is None or not hasattr(_c, 'to'):
+                        continue
+                    _on_gpu = True
+                    try:
+                        _on_gpu = any(getattr(p_, 'device', None) is not None
+                                      and p_.device.type == 'cuda'
+                                      for p_ in _c.parameters())
+                    except Exception:
+                        pass
+                    if not _on_gpu:
+                        continue
+                    _c.to('cpu')
+                    _freed.append(_n)
+                except Exception:
+                    # A bnb-quantized component can refuse .to('cpu'); the
+                    # teardown-leak breaker stays the backstop for those.
+                    continue
+            if _freed:
+                print(f"  [video] released injected components to CPU after "
+                      f"{reason}: {', '.join(_freed)}")
+                _clear_mem()
+
         # ── Attempt 0a: resident — all components on GPU (no offload hooks) ────
         # Chosen for injected bnb-4bit components when video_resident_experts is on.
         # Builds the pipeline (re-using the injected pre-quantized experts/encoder)
@@ -1902,6 +1958,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     _free_pipeline_vram(pipe)
                     pipe = None
                     _clear_mem()
+                    _release_injected_to_cpu('a partial resident fit')
                     offload = 'model'
                 else:
                     _record_resident_fits(model_name, True)
@@ -1914,6 +1971,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                       f"falling back to model CPU offload…")
                 e.__traceback__ = None  # release frames pinning the partial model
             _clear_mem()
+            _release_injected_to_cpu('a resident OOM')
             offload = 'model'  # fall through to Attempt 1 (model CPU offload)
 
         # ── Attempt 0: full GPU ──────────────────────────────────────────────
@@ -1959,6 +2017,13 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 pipe = PClass.from_pretrained(**_with_quant(dict(
                     pretrained_model_name_or_path=model_name,
                     torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+                # A fully 4-bit module has no floating-point parameters, so
+                # transformers' .dtype property raises StopIteration and diffusers
+                # reads it unguarded in to(). In a worker thread that becomes
+                # "StopIteration interacts badly with generators" and fails the
+                # load. Idempotent and cached after the first call.
+                from codai.models.peft_compat import ensure_quantized_dtype_compat
+                ensure_quantized_dtype_compat()
                 pipe.enable_model_cpu_offload()
                 _report_loaded(pipe, "model CPU offload")
                 return pipe

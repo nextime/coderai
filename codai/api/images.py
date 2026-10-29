@@ -965,6 +965,13 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     _strategy = (_offload_strategy or '').strip().lower()
                     if _strategy == 'model' and hasattr(pipeline, 'enable_model_cpu_offload'):
                         print("Enabling MODEL CPU offload (active component on GPU)...")
+                        # A fully 4-bit module has no floating-point parameters, so
+                        # transformers' .dtype property raises StopIteration and diffusers
+                        # reads it unguarded in to(). In a worker thread that becomes
+                        # "StopIteration interacts badly with generators" and fails the
+                        # load. Idempotent and cached after the first call.
+                        from codai.models.peft_compat import ensure_quantized_dtype_compat
+                        ensure_quantized_dtype_compat()
                         pipeline.enable_model_cpu_offload()
                     elif hasattr(pipeline, 'enable_sequential_cpu_offload'):
                         print("Enabling sequential CPU offload for lower VRAM usage...")

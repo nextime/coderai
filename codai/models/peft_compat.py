@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Compatibility shims for peft <-> gptqmodel version skew."""
+"""Compatibility shims for third-party version skew."""
 
 _awq_aliased = False
 
@@ -40,4 +40,65 @@ def ensure_peft_awq_compat():
     except Exception:
         # gptqmodel not installed, or import failed — nothing to alias. Don't
         # cache so a later call can retry once gptqmodel is importable.
+        pass
+
+
+_dtype_guarded = False
+
+
+def ensure_quantized_dtype_compat():
+    """Stop a fully-quantized module raising StopIteration from ``.dtype``.
+
+    transformers defines the property as::
+
+        return next(param.dtype for param in self.parameters()
+                    if param.is_floating_point())
+
+    A bnb 4-bit module has NO floating-point parameters -- Params4bit are uint8
+    -- so the generator is empty and ``next()`` raises StopIteration. diffusers'
+    ``DiffusionPipeline.to()`` reads ``module.dtype`` unguarded while deciding
+    whether to warn about fp16-on-cpu, so the exception escapes
+    ``enable_model_cpu_offload()``.
+
+    Run in a worker thread, as model loads are, Python turns that into::
+
+        RuntimeError: StopIteration interacts badly with generators and
+        cannot be raised into a Future
+
+    which fails the whole load. Measured 2026-10-29 on LTX-2.5, whose text
+    encoder is 4-bit: the resident attempt did not fit, the fallback to model
+    CPU offload hit this, and the load restarted from scratch -- so the
+    *recovery* path was broken exactly when it was needed.
+
+    The property answers "what dtype is this module" and a quantized module has
+    a perfectly good answer: the dtype of its storage. Fall back to the first
+    parameter of any kind, then to float32, and only when there is nothing at
+    all. Never changes the answer for a module that HAS floating-point
+    parameters, so an unquantized model behaves exactly as before.
+    """
+    global _dtype_guarded
+    if _dtype_guarded:
+        return
+    try:
+        import torch
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:
+        return
+    try:
+        original = PreTrainedModel.dtype
+        if not isinstance(original, property):
+            return
+
+        def _dtype(self):
+            try:
+                return original.fget(self)
+            except StopIteration:
+                try:
+                    return next(p.dtype for p in self.parameters())
+                except StopIteration:
+                    return torch.float32
+
+        PreTrainedModel.dtype = property(_dtype)
+        _dtype_guarded = True
+    except Exception:
         pass
