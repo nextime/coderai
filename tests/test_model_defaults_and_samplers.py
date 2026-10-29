@@ -39,12 +39,20 @@ def test_the_request_beats_the_card_and_the_card_beats_the_floor():
 
     from codai.api import images
     src = inspect.getsource(images._generate_with_diffusers)
+    # The window is the step/guidance decision itself -- from where the card is
+    # read to where the guidance ends -- not a fixed slice. A fixed slice fails
+    # the moment another layer is inserted between the two, which says nothing
+    # about the precedence this test is here to protect.
     i = src.index("_dflt = model_defaults(model_config)")
-    window = src[i:i + 900]
+    window = src[i:src.index("_progress_reset(", i)]
     # request.steps first, then the fused-accel preset, then the card, then 30.
     assert "request.steps if request.steps" in window
     assert "_accel_steps if _accel_steps" in window
     assert "int(_d_steps) if _d_steps" in window
+    assert window.index("request.steps if request.steps") < \
+        window.index("_accel_steps if _accel_steps") < \
+        window.index("int(_d_steps) if _d_steps") < \
+        window.index("30 if quality")
 
 
 def test_video_layers_the_card_under_the_accel_preset_and_over_the_floor():

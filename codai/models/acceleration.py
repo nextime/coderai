@@ -423,3 +423,60 @@ def accel_call_defaults(accel: Optional[dict]) -> dict:
     if accel.get("guidance_scale") is not None:
         out["guidance_scale"] = float(accel["guidance_scale"])
     return out
+
+
+# A distilled checkpoint says so in its own name. These are the families whose
+# whole point is a low step count, with the step/guidance pair each one was
+# distilled for. The numbers are the conservative end of each family's
+# published range: an 8-step model given 8 steps is right, and a 4-step model
+# given 8 is slower than it needs to be but still correct, while the generic
+# 30-step default is wrong for both.
+#
+# `boundary` marks the tokens that are words rather than fragments, so
+# "turbovision" or "lcmx" cannot match on a substring.
+_DISTILLED_NAMES = (
+    # (token, boundary, steps, guidance_scale)
+    ("turbo",     True,  8, 1.0),
+    ("lightning", False, 8, 1.0),
+    ("lightx2v",  False, 8, 1.0),
+    ("hyper-sd",  False, 8, 1.0),
+    ("hyper_sd",  False, 8, 1.0),
+    ("schnell",   False, 4, 1.0),
+    ("lcm",       True,  6, 1.5),
+    ("tcd",       True,  8, 1.0),
+    ("dmd2",      False, 4, 1.0),
+    ("distill",   False, 8, 1.0),
+    ("sdxs",      True,  2, 1.0),
+)
+
+
+def distilled_defaults_for(model_id: str) -> Optional[dict]:
+    """``{steps, guidance_scale, token}`` when this id names a distilled model.
+
+    The last resort before the generic 30-step / CFG-7.5 fallback, and only
+    reached when the operator's card carries neither ``defaults`` nor an
+    ``acceleration`` block.
+
+    Measured on zeiss, 2026-10-29: ``Z-Image-Turbo`` -- a model distilled for 8
+    steps at CFG 1 -- was served at 30 steps and CFG 7.5 because its card had
+    no defaults, which is roughly four times the work for a picture that also
+    comes out over-guided. Both halves matter: a distilled model at CFG 7.5
+    looks burnt, so this is not only a speed fix.
+
+    A card's own `defaults` still win, because an operator who wrote a number
+    knows something this does not.
+    """
+    n = (model_id or "").lower().replace("\\", "/").rsplit("/", 1)[-1]
+    if not n:
+        return None
+    for token, boundary, steps, cfg in _DISTILLED_NAMES:
+        at = n.find(token)
+        while at != -1:
+            if not boundary:
+                return {"steps": steps, "guidance_scale": cfg, "token": token}
+            before = n[at - 1] if at > 0 else ""
+            after = n[at + len(token):at + len(token) + 1]
+            if not before.isalnum() and not after.isalnum():
+                return {"steps": steps, "guidance_scale": cfg, "token": token}
+            at = n.find(token, at + 1)
+    return None

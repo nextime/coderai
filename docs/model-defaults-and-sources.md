@@ -36,7 +36,36 @@ Precedence, highest first:
 2. a **fused** distillation preset detected on the pipeline (`acceleration`),
    because it knows the LoRA actually baked in;
 3. `defaults` from the model entry;
-4. the generic floor (30 steps / CFG 7.5 for images, 25 / 7.5 for video).
+4. **what the model's own name says**, when nothing above answered (images);
+5. the generic floor (30 steps / CFG 7.5 for images, 25 / 7.5 for video).
+
+### 4: the name, when the card says nothing
+
+A card with no `defaults` and no `acceleration` block used to fall straight to
+the floor. Measured on a production fleet, 2026-10-29: `Z-Image-Turbo` — a
+checkpoint distilled for 8 steps at CFG 1 — was served at 30 steps and CFG
+7.5, about four times the work for a picture that also comes out over-guided,
+because a distilled model given real classifier-free guidance looks burnt.
+Roughly 72 s per 768×1344 still, for a model whose whole point is to take
+seconds.
+
+So when nothing better is available, the id itself is read:
+
+| in the id | steps | CFG |
+|---|---|---|
+| `turbo`, `lightning`, `lightx2v`, `hyper-sd`, `tcd`, `distill` | 8 | 1.0 |
+| `lcm` | 6 | 1.5 |
+| `schnell`, `dmd2` | 4 | 1.0 |
+| `sdxs` | 2 | 1.0 |
+
+Only the last path segment is read, so an org named `turbo-labs` proves
+nothing, and the word must stand on its own: `turbovision-xl` and `lcmx` do
+not match. The choice is logged with the number it replaced, because an
+unexplained step count is indistinguishable from a bug when a picture comes
+out wrong.
+
+This is a floor, not a recommendation: writing `defaults` on the card is still
+the right thing to do, and it wins.
 
 `/v1/models` publishes `defaults`, `modes` and `license` so a UI can show them
 instead of inventing them. `modes` is read from `defaults.modes`, a top-level

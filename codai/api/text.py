@@ -1620,6 +1620,31 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # flattened to a text placeholder, so the multimodal handler can see it.
     _vision_ok = bool(getattr(getattr(current_manager, 'backend', None), 'supports_vision', False))
 
+    # A picture sent to a model that cannot see it must not be answered.
+    #
+    # Measured 2026-10-29: Qwen3.5-9B is listed with `image_to_text`, was
+    # loaded without its vision tower, and answered every photo with "a blank
+    # white image with no visible content" -- because the image had been
+    # replaced, below, by the literal text "[image_url content]". The model was
+    # answering the prompt it got. A caller cannot tell that answer from a real
+    # one, so it indexed nine photographs as blank. Refusing is the only honest
+    # outcome: a client can fall back to a model that can see, and cannot fall
+    # back from a confident wrong answer.
+    if not _vision_ok:
+        for _m in (request.messages or []):
+            _c = getattr(_m, 'content', None)
+            if not isinstance(_c, list):
+                continue
+            if any(isinstance(_it, dict) and _it.get('type') in ('image_url', 'input_image')
+                   for _it in _c):
+                _release_instance()
+                raise HTTPException(status_code=400, detail=(
+                    f"Model '{requested_model}' cannot read images: it is served "
+                    f"without a vision tower (an HF checkpoint with no "
+                    f"vision_config or processor, or a GGUF with no mmproj). "
+                    f"Send the image to a model whose capabilities list "
+                    f"image_to_text, or configure an mmproj for this one."))
+
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
     global_system_prompt = get_global_system_prompt()

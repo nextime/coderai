@@ -33,6 +33,7 @@ reference; these are the deep dives.
 | [zimage-lora-training.md](zimage-lora-training.md) | LoRA training for image models |
 | [text-to-music.md](text-to-music.md) | `POST /v1/audio/generate` with ACE-Step: style prompt + sung lyrics → a 48 kHz stereo track, the python-3.12 worker it needs, and the two image variants (`--with-acestep`) |
 | [dtype-auto-selection.md](dtype-auto-selection.md) | How model dtype is chosen automatically |
+| [vision-chat.md](vision-chat.md) | Images in a chat request: loading the vision tower the checkpoint's config asks for, the processor that makes a picture promptable, and why a model that cannot see refuses instead of answering blind |
 | [memory-accounting.md](memory-accounting.md) | Where `measured_vram_gb` comes from: walking the loaded model (quantization needs no factor), costing the KV cache from the real GQA/sliding-window geometry, refusing a measurement from a failed load, the PSS-based host-RAM cap, idle unload, and `GET /v1/models/history` |
 | [model-defaults-and-sources.md](model-defaults-and-sources.md) | A model's own `defaults` (steps/guidance/sampler/modes/licence), the sampler names and the flow-matching boundary, and where weights come from: repo, single file, `org/repo:file` or `civitai:<versionId>` |
 

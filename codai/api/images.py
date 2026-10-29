@@ -647,6 +647,12 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
 
     _mc = model_config or {}
 
+    # The id the CALLER asked for, kept before `model_name` is rewritten to the
+    # checkpoint path below. Sizing needs it: two cards can share one
+    # checkpoint with different quantization and offload, and the one that was
+    # asked for is the one whose footprint applies.
+    _requested_id = model_name
+
     # A multi-config sibling is registered under its alias, so `model_name` may
     # BE that alias rather than something from_pretrained can open. The config
     # carries the checkpoint it is a config of; prefer it when present. For a
@@ -845,9 +851,15 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 # requested_id: same-path siblings (one checkpoint, two cards
                 # with different settings) must be sized by the card that was
                 # ASKED for, not by whichever one registered the path.
+                # `request` does not exist in this function. Reading it raised
+                # NameError on EVERY image load, and the except below swallowed
+                # it as "Proactive eviction skipped: name 'request' is not
+                # defined" -- so the whole minimum-eviction block never ran and
+                # every image load fell through to the blunt eviction further
+                # down, which unloads a model that would have fitted alongside.
                 _need_gb = _mmm._get_model_used_vram_gb(
                     _key or model_name, model_name,
-                    requested_id=getattr(request, 'model', None))
+                    requested_id=_requested_id)
                 if _need_gb > 0:
                     if _free_gb < _need_gb:
                         print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
@@ -1558,13 +1570,36 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     _d_cfg = _dflt.get("guidance_scale")
     if _d_cfg is None:
         _d_cfg = _dflt.get("cfg_scale")
+    # A distilled checkpoint whose card says nothing. 30 steps at CFG 7.5 is
+    # the wrong answer for a model distilled for 8 at CFG 1 -- four times the
+    # work AND an over-guided, burnt-looking picture. Below the card's own
+    # defaults and below a fused distill LoRA, because both know more; above
+    # the generic fallback, because the model's own name knows more than that.
+    _distilled = None
+    if not _d_steps and _accel_steps is None:
+        try:
+            from codai.models.acceleration import distilled_defaults_for
+            _distilled = distilled_defaults_for(
+                str((model_config or {}).get('path') or '')
+                or str(getattr(request, 'model', '') or ''))
+        except Exception:
+            _distilled = None
+        if _distilled and not (request.steps and request.guidance_scale):
+            print(f"  '{_distilled['token']}' in the model id: this checkpoint is "
+                  f"distilled, so {_distilled['steps']} steps at CFG "
+                  f"{_distilled['guidance_scale']} (its card carries no defaults; "
+                  f"the generic fallback would be 30 at CFG 7.5)")
+
     num_steps = request.steps if request.steps else (
         _accel_steps if _accel_steps else
-        (int(_d_steps) if _d_steps else (30 if quality == "standard" else 50)))
+        (int(_d_steps) if _d_steps else
+         (int(_distilled["steps"]) if _distilled else
+          (30 if quality == "standard" else 50))))
     cfg_scale = request.guidance_scale if request.guidance_scale else (
         _accel_cfg if _accel_cfg is not None else
         (float(_d_cfg) if _d_cfg is not None else
-         (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0))
+         (float(_distilled["guidance_scale"]) if _distilled else
+          (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)))
     )
     # The sampler: what the caller asked for, else what the card recommends.
     # A bad name from the CALLER is a 400 -- they can fix it -- while a bad one

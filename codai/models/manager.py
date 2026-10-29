@@ -6860,6 +6860,21 @@ class MultiModelManager:
                     caps = ModelCapabilities()      # drop the wrong guess
                 setattr(caps, TYPE_MIN_CAP[model_type], True)
             resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
+            # A GGUF text model with no projector cannot read an image, whatever
+            # its card says. llama.cpp needs an mmproj file to turn pixels into
+            # embeddings; without one the request reaches the model as a text
+            # placeholder and the answer describes nothing. Advertising
+            # `image_to_text` there sends clients to a model that will now
+            # (correctly) refuse them, so the listing has to agree with the
+            # runtime. Only local GGUF entries are judged here: an HF checkpoint
+            # loads its own vision tower when it has one, and a remote/pod-served
+            # model is the remote's business.
+            if caps.image_to_text and resolved_type == "text":
+                _p = str(meta.get("path") or meta.get("model_path") or "")
+                _backend = str(meta.get("backend") or "").lower()
+                if (_p.lower().endswith(".gguf") and not meta.get("mmproj")
+                        and _backend not in ("vllm", "runpod", "remote", "colibri")):
+                    caps.image_to_text = False
             # A video model carries its geometry: the frame rate it was trained at,
             # the frame counts its VAE can decode, how much one render holds and
             # whether it continues natively. Without it every client plans video by

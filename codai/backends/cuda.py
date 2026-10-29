@@ -175,6 +175,13 @@ class NvidiaBackend(ModelBackend):
         self.tokenizer = None
         self.model_name = None
         self.device = None
+        # A vision-language checkpoint also loads its processor, and only then
+        # is it able to answer about a picture. Both are set by
+        # _init_vision() after the weights are in; `supports_vision` is what
+        # the chat path reads to decide whether an image may be passed through
+        # instead of flattened to a text placeholder.
+        self.processor = None
+        self.supports_vision = False
         self.use_flash_attn = False
         self.flash_attn_available = False
         # Multi-slot KV prefix cache. Each slot keeps a pristine prefill cache for
@@ -583,14 +590,73 @@ class NvidiaBackend(ModelBackend):
         
         return max_memory
     
+    def _auto_model_class(self, model_name: str):
+        """The transformers auto-class this checkpoint should be loaded with.
+
+        A vision-language checkpoint loaded with ``AutoModelForCausalLM`` gets
+        its text decoder and nothing else -- no vision tower, no projector --
+        and then answers every picture as though it were blank, because the
+        chat path has nowhere to put an image and sends a text placeholder
+        instead. Asking the config which class fits is what makes a model
+        advertised as ``image_to_text`` actually able to see.
+
+        Falls back to the text class for anything it cannot determine, so a
+        checkpoint that is not a vision model loads exactly as before.
+        """
+        try:
+            from codai.backends import hf_vision
+            cls, is_vision = hf_vision.auto_model_class(model_name)
+            if is_vision:
+                print(f"  Vision checkpoint: loading with {cls.__name__} "
+                      f"(text-only classes drop the vision tower)")
+            return cls
+        except Exception as exc:
+            print(f"  Warning: could not resolve a model class for {model_name} "
+                  f"({exc}); using AutoModelForCausalLM")
+            from transformers import AutoModelForCausalLM
+            return AutoModelForCausalLM
+
+    def _init_vision(self, model_name: str) -> None:
+        """Load the processor for a vision model, after the weights are in.
+
+        ``supports_vision`` is only set when BOTH halves are present: a model
+        whose class holds a vision tower and a processor that can preprocess a
+        picture for it. Either one missing means the model cannot answer about
+        an image, and the chat path must say so rather than answer blind.
+        """
+        self.processor = None
+        self.supports_vision = False
+        try:
+            from codai.backends import hf_vision
+            if not hf_vision.is_vision_checkpoint(model_name):
+                return
+            # The loaded class decides, not the config: a vision config that
+            # fell back to the text class (unknown family, failed load) is a
+            # text model at runtime whatever the card says.
+            if "ForConditionalGeneration" not in type(self.model).__name__ and \
+                    not hasattr(self.model, "get_image_features"):
+                print(f"  Vision: {model_name} was loaded as "
+                      f"{type(self.model).__name__}, which has no vision tower "
+                      f"— images will be refused")
+                return
+            proc = hf_vision.load_processor(model_name)
+            if proc is None:
+                return
+            self.processor = proc
+            self.supports_vision = True
+            print(f"  Vision: processor loaded — this model can read images")
+        except Exception as exc:
+            print(f"  Warning: vision init failed for {model_name} ({exc}); "
+                  f"images will be refused")
+
     def _try_load_model(self, model_name: str, load_kwargs: dict, device: str):
         """Try to load model with given settings."""
         import torch
-        from transformers import AutoModelForCausalLM
+        _auto = self._auto_model_class(model_name)
         
         try:
             load_kwargs = self._strip_invalid_native_quant_config(model_name, load_kwargs)
-            model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+            model = _auto.from_pretrained(model_name, **load_kwargs)
             if device == "cpu" and load_kwargs.get('device_map') is None:
                 model = model.to(device)
             return model
@@ -609,7 +675,7 @@ class NvidiaBackend(ModelBackend):
                     retry_kwargs.pop('load_in_4bit', None)
                     retry_kwargs.pop('load_in_8bit', None)
                     try:
-                        model = AutoModelForCausalLM.from_pretrained(model_name, **retry_kwargs)
+                        model = _auto.from_pretrained(model_name, **retry_kwargs)
                         if device == "cpu" and retry_kwargs.get('device_map') is None:
                             model = model.to(device)
                         print("Model loaded successfully without quantization")
@@ -873,7 +939,7 @@ class NvidiaBackend(ModelBackend):
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load the model using HuggingFace Transformers with automatic OOM handling."""
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         # Re-evaluate KV-prefix support for the model about to be loaded.
         self._kv_prefix_ok = None
@@ -1079,10 +1145,12 @@ class NvidiaBackend(ModelBackend):
             
             try:
                 load_kwargs = self._strip_invalid_native_quant_config(model_name, load_kwargs)
-                model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+                model = self._auto_model_class(model_name).from_pretrained(
+                    model_name, **load_kwargs)
                 self.model = model
                 self.model.eval()
                 self.model_name = model_name
+                self._init_vision(model_name)
                 
                 print(f"\n--no-ram: Model loaded successfully on {cuda_device}")
                 print(f"Model device: {next(self.model.parameters()).device}")
@@ -1138,7 +1206,8 @@ class NvidiaBackend(ModelBackend):
             
             try:
                 load_kwargs = self._strip_invalid_native_quant_config(model_name, load_kwargs)
-                model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+                model = self._auto_model_class(model_name).from_pretrained(
+                    model_name, **load_kwargs)
             except Exception as e:
                 raise RuntimeError(
                     f"--offload-strategy none: Failed to load model entirely on GPU ({cuda_device}). "
@@ -1375,6 +1444,7 @@ class NvidiaBackend(ModelBackend):
         _apply_text_loras(self.model, kwargs.get('model_config') or kwargs)
         self.model.eval()
         self.model_name = model_name
+        self._init_vision(model_name)
 
         print(f"\nModel loaded successfully")
         print(f"Model device: {next(self.model.parameters()).device}")
@@ -2366,6 +2436,123 @@ class NvidiaBackend(ModelBackend):
                 pass
         return self._format_messages_to_str(messages)
 
+    def _vision_request(self, messages) -> bool:
+        """Whether this request needs the vision path.
+
+        Both halves have to be true: the request carries a picture, and this
+        model loaded a tower and a processor for one. A picture sent to a model
+        without them is refused by the API layer, not answered blind.
+        """
+        if not (self.supports_vision and self.processor is not None):
+            return False
+        try:
+            from codai.backends import hf_vision
+            return hf_vision.has_images(messages)
+        except Exception:
+            return False
+
+    def _vision_inputs(self, messages):
+        """Processor inputs for a chat with pictures, on the model's device."""
+        from codai.backends import hf_vision
+        inputs, images = hf_vision.build_inputs(self.processor, messages)
+        inputs = inputs.to(self.model.device)
+        return inputs, images
+
+    def _vision_gen_kwargs(self, max_tokens, temperature, top_p):
+        temperature, top_p, do_sample = self._validate_params(temperature, top_p)
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        gen_kwargs = dict(
+            max_new_tokens=max_tokens,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            do_sample=do_sample,
+            pad_token_id=getattr(tok, "pad_token_id", None),
+            eos_token_id=self._eos_token_ids(),
+            use_cache=True,
+        )
+        _therm = _make_thermal_criteria()
+        if _therm is not None:
+            from transformers import StoppingCriteriaList
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([_therm])
+        return gen_kwargs
+
+    def _generate_vision_chat(self, messages, max_tokens, temperature, top_p) -> str:
+        """Answer a chat that contains pictures.
+
+        Deliberately separate from the text path: the KV prefix cache keys on a
+        token prefix, and image tokens are expanded by the processor from the
+        pictures themselves, so a cached prefix from another request would be
+        reused against the wrong pixels. An image request is also rare enough
+        that the cache buys nothing.
+        """
+        import torch
+        inputs, images = self._vision_inputs(messages)
+        prompt_len = int(inputs["input_ids"].shape[1])
+        gen_kwargs = self._vision_gen_kwargs(max_tokens, temperature, top_p)
+        with self._gen_lock, torch.no_grad():
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+        new_tokens = outputs[0][prompt_len:]
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        text = tok.decode(new_tokens, skip_special_tokens=True)
+        self._last_usage = {
+            'prompt_tokens': prompt_len,
+            'completion_tokens': int(new_tokens.shape[0]),
+            'cached_tokens': 0,
+            'images': len(images),
+        }
+        return text
+
+    async def _generate_vision_chat_stream(self, messages, max_tokens,
+                                           temperature, top_p):
+        """The streaming form of :meth:`_generate_vision_chat`."""
+        import asyncio
+        import torch
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+
+        inputs, images = self._vision_inputs(messages)
+        prompt_len = int(inputs["input_ids"].shape[1])
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+        gen_kwargs = self._vision_gen_kwargs(max_tokens, temperature, top_p)
+        gen_kwargs["streamer"] = streamer
+        err = [None]
+
+        def _run():
+            try:
+                with self._gen_lock, torch.no_grad():
+                    self.model.generate(**inputs, **gen_kwargs)
+            except Exception as exc:
+                err[0] = str(exc)
+                print(f"Error during vision stream generation: {exc}")
+            finally:
+                # generate() only ends the streamer when it finished; ending it
+                # here too means a failure cannot deadlock the consumer.
+                try:
+                    streamer.end()
+                except Exception:
+                    pass
+
+        Thread(target=_run, daemon=True).start()
+        loop = asyncio.get_event_loop()
+        _SENT = object()
+        produced = 0
+        while True:
+            chunk = await loop.run_in_executor(
+                None, lambda: next(iter(streamer), _SENT))
+            if chunk is _SENT:
+                break
+            produced += 1
+            yield chunk
+        if err[0] and produced == 0:
+            raise GenerationFailed(f"vision generation failed: {err[0]}")
+        self._last_usage = {
+            'prompt_tokens': prompt_len,
+            'completion_tokens': produced,
+            'cached_tokens': 0,
+            'images': len(images),
+        }
+
     def generate_chat(self, messages, max_tokens=None, temperature=0.7,
                       top_p=1.0, stop=None, tools=None, response_format=None,
                       enable_thinking=False) -> str:
@@ -2379,6 +2566,9 @@ class NvidiaBackend(ModelBackend):
         import torch
         if max_tokens is None:
             max_tokens = 512
+
+        if self._vision_request(messages):
+            return self._generate_vision_chat(messages, max_tokens, temperature, top_p)
 
         full_prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking,
                                               add_generation_prompt=True, tools=tools)
@@ -2517,6 +2707,12 @@ class NvidiaBackend(ModelBackend):
 
         if max_tokens is None:
             max_tokens = 512
+
+        if self._vision_request(messages):
+            async for _chunk in self._generate_vision_chat_stream(
+                    messages, max_tokens, temperature, top_p):
+                yield _chunk
+            return
 
         full_prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking,
                                               add_generation_prompt=True, tools=tools)
@@ -2825,6 +3021,10 @@ class NvidiaBackend(ModelBackend):
         if self.tokenizer is not None:
             del self.tokenizer
             self.tokenizer = None
+        if self.processor is not None:
+            del self.processor
+        self.processor = None
+        self.supports_vision = False
         # Force Python GC before emptying the CUDA allocator pool so that all
         # Python-held tensor references (closures, local vars, etc.) are dropped.
         for _ in range(3):
