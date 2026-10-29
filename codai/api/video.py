@@ -1270,7 +1270,7 @@ def _apply_attention_backend(pipe, model_cfg: dict) -> None:
               f"{', '.join(applied)}")
 
 
-def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None, use_incremental_cache: bool = True):
+def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None, use_incremental_cache: bool = True, full_gpu_viable: bool = False):
     # Wait if the GPU is reserved for an exclusive op (LoRA training here or on a
     # co-located sibling) so this load doesn't contend with it.
     try:
@@ -1419,6 +1419,23 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
         if _video_cfg_bool(model_cfg, 'video_resident_experts', False):
             print(f"  [pipeline-cache] injected cached components → RESIDENT all-GPU "
                   f"load (video_resident_experts=on; falls back to model offload on OOM)")
+            offload = 'resident'
+        elif full_gpu_viable:
+            # The caller already SIZED this load against free VRAM and found it
+            # fits. Discarding that verdict and applying the dual-expert default
+            # below is how a model ends up on the CPU beside an empty card:
+            # measured 2026-10-28, LTX-2.5 was sized as "22.1 GB peak need,
+            # 24.9 GB free — using full GPU", then loaded here with 20.47 GB of
+            # 22.11 GB on host RAM while the GPU sat at 0.4/25.3 GB.
+            #
+            # It stayed invisible because `offload=None` meant two different
+            # things -- "nobody chose" and "we chose full GPU" -- and only the
+            # first reading survived this far. The verdict now travels with the
+            # request instead of being re-derived from a default written for a
+            # dual-expert model that genuinely does not fit.
+            print(f"  [pipeline-cache] injected cached components → RESIDENT "
+                  f"all-GPU load (sized to fit; falls back to model offload "
+                  f"on OOM)")
             offload = 'resident'
         else:
             print(f"  [pipeline-cache] injected cached components → forcing hook-based "
@@ -5125,6 +5142,9 @@ async def video_generations(request: VideoGenerationRequest,
         #     back anyway, and we do NOT jump to the slow balanced+disk path.
         #     `_load_video_pipeline`'s ladder still escalates model → group →
         #     sequential → disk if even model offload can't fit (truly huge model).
+        # Defined on every path: the sizing below is conditional, and this
+        # travels to the loader unconditionally.
+        _full_gpu_viable = False
         if _offload is None:
             try:
                 import torch as _t
@@ -5159,6 +5179,7 @@ async def video_generations(request: VideoGenerationRequest,
                             # full-GPU first (keeps both experts resident, uses the
                             # free VRAM). Leaving _offload=None routes to the loader's
                             # full-GPU attempt, which falls back to model offload on OOM.
+                            _full_gpu_viable = True
                             print(f"  Peak VRAM need {_need_gb:.1f} GB marginally over "
                                   f"{_free_gb:.1f} GB free (+{_over_gb:.1f} GB, borderline) "
                                   f"— trying full GPU first (falls back to model offload on OOM)")
@@ -5168,6 +5189,12 @@ async def video_generations(request: VideoGenerationRequest,
                                   f"(active component on GPU, near full-GPU speed)")
                             _offload = 'model'
                     elif _base_gb > 0:
+                        # Remembered, not just printed. Leaving this as
+                        # `_offload = None` made it indistinguishable from
+                        # "no opinion", and the cached-components path then
+                        # applied its own default and ran the model on the CPU
+                        # next to an idle card.
+                        _full_gpu_viable = True
                         print(f"  Full-GPU load looks viable "
                               f"({_need_gb:.1f} GB peak need, {_free_gb:.1f} GB "
                               f"free) — using full GPU (it falls back to offload on OOM)")
@@ -5188,7 +5215,8 @@ async def video_generations(request: VideoGenerationRequest,
         try:
             with loading_task(model_name, model_type="video"):
                 pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_video_pipeline, model_name, device, request.mode, _offload, _model_cfg)
+                    None, _load_video_pipeline, model_name, device, request.mode,
+                    _offload, _model_cfg, True, _full_gpu_viable)
         except Exception as e:
             # Log the FULL traceback — otherwise the only trace of a post-load
             # failure (e.g. enable_sequential_cpu_offload rejecting a bnb-4bit pipe,
