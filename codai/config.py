@@ -292,6 +292,17 @@ class OffloadConfig:
     ram_watch_poll_seconds: float = 15.0    # how often the watcher samples RSS
     ram_watch_soft_fraction: float = 0.90   # mitigate at/above this fraction of the cap
     ram_watch_cuda: bool = True             # allow mitigation to call CUDA empty_cache()
+    # Unload a model that has gone untouched for this long, in seconds (0 = never).
+    #
+    # Eviction already frees a model when something else needs the memory, so this
+    # is for the case where nothing does: a 3.5B music model sat on 7.9 GB of a
+    # 3090 and 2.1 GB of host RAM for hours after its last request, because the
+    # on-demand path keeps a model resident whenever there is room for it.
+    #
+    # Kept generous on purpose. Reloads are the expensive event -- one production
+    # day spent 2h04m of 21h30m inside model loads -- so a short timeout trades a
+    # VRAM saving nobody asked for against a reload everybody waits on.
+    idle_unload_seconds: float = 1800.0
     # Cross-backend GPU pooling. OFF by default: each engine uses only its own
     # backend's GPUs (CUDA for an NVIDIA engine, Vulkan for a Radeon engine) and a
     # model still splits across multiple SAME-backend cards (e.g. 2× 3090). When ON,

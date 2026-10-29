@@ -3100,6 +3100,33 @@ def build_app(config, config_dir=None) -> FastAPI:
                             media_type=val.headers.get("content-type"))
         return JSONResponse(val)
 
+    # /v1/models/history is the MERGE across engines, newest first: a swap is a
+    # cross-engine event (one engine evicts so a co-located one can load), so
+    # reading a single engine's copy tells only half the story. Registered before
+    # the catch-all so it is aggregated rather than proxied to one engine.
+    @app.get("/v1/models/history", include_in_schema=False)
+    async def _models_history(request: Request):
+        headers = front._filter_headers(request.headers, _DROP_REQ)
+        merged = []
+        for e in front.registry.all():
+            try:
+                r = await front._short.get(e.url + "/v1/models/history",
+                                           headers=headers,
+                                           params=request.query_params)
+                if r.status_code == 200:
+                    rows = (r.json() or {}).get("history") or []
+                    for row in rows:
+                        row.setdefault("engine", getattr(e, "name", "") or "")
+                    merged.extend(rows)
+            except Exception:
+                continue          # an engine that is busy or down just contributes nothing
+        merged.sort(key=lambda r: r.get("time") or 0, reverse=True)
+        try:
+            limit = max(1, min(500, int(request.query_params.get("limit") or 200)))
+        except (TypeError, ValueError):
+            limit = 200
+        return JSONResponse({"history": merged[:limit]})
+
     # Engine management (front-owned: it runs the supervisor). Registered before
     # the catch-all so they aren't proxied to an engine.
     @app.get("/admin/api/engines", include_in_schema=False)

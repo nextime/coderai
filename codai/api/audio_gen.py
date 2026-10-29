@@ -407,9 +407,23 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
         # for. A field left out falls back to ACE-Step's own default; a field
         # explicitly set to 10 still means 10.
         _sent = getattr(request, 'model_fields_set', set())
+        # ACE-Step is a SONG model: the prompt carries comma-separated tags and
+        # the lyrics carry the words. Handing it empty lyrics does not mean
+        # "instrumental" -- the pipeline then conditions on a single padding
+        # token (lyric_token_idx = [0], lyric_mask = [0]) and the model still
+        # tries to sing, which comes out as babbling over the backing track.
+        # Its own UI documents the way to ask: "Use [instrumental] or [inst] to
+        # generate instrumental music", and every genre preset it ships ends in
+        # either "male vocals, raw vocals" or "instrumental".
+        _lyrics = (getattr(request, 'lyrics', None) or "").strip()
+        _prompt = request.prompt or ""
+        if not _lyrics:
+            _lyrics = "[instrumental]"
+            if "instrumental" not in _prompt.lower():
+                _prompt = (_prompt + ", instrumental") if _prompt else "instrumental"
         wav = pipe.generate(
-            prompt=request.prompt,
-            lyrics=getattr(request, 'lyrics', None) or "",
+            prompt=_prompt,
+            lyrics=_lyrics,
             duration=(float(request.duration) if 'duration' in _sent
                       and request.duration else 60.0),
             steps=int(getattr(request, 'steps', None) or 60),

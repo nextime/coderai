@@ -48,6 +48,17 @@ def get_status() -> Dict[str, Any]:
         return dict(_state)
 
 
+def _idle_unload_seconds() -> float:
+    """``offload.idle_unload_seconds`` (0 = never), via the global args."""
+    try:
+        from codai.api.state import get_global_args
+        ga = get_global_args()
+        v = getattr(ga, "idle_unload_seconds", None) if ga else None
+        return float(v) if v else 0.0
+    except Exception:
+        return 0.0
+
+
 def _cap_gb() -> Optional[float]:
     try:
         from codai.api.state import get_global_args
@@ -211,6 +222,19 @@ def _loop():
     while True:
         try:
             time.sleep(_poll_seconds())
+            # Idle unload is independent of the leak watch and of the RAM cap: a
+            # model nobody has used for half an hour is not holding its memory
+            # for any reason, and waiting for pressure is how a 3.5B music model
+            # came to sit on 7.9 GB of a 3090 with the card otherwise idle. Run
+            # it BEFORE the _watch_enabled() gate so turning the leak watch off
+            # does not silently disable it too.
+            try:
+                _idle_limit = _idle_unload_seconds()
+                if _idle_limit > 0:
+                    from codai.models.manager import multi_model_manager as _mmm
+                    _mmm.unload_idle_models(_idle_limit)
+            except Exception as _iue:
+                _log.debug("idle unload sweep failed: %s", _iue)
             if not _watch_enabled():
                 continue
             cap = _cap_gb()

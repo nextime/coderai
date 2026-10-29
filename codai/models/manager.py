@@ -26,6 +26,7 @@ import time
 import contextlib
 import threading
 import gc
+from collections import deque
 
 # Import needed classes from other codai modules
 from codai.models.parser import ModelParserAdapter
@@ -1595,6 +1596,14 @@ class MultiModelManager:
         self._last_used: Dict[str, float] = {}  # model_key -> last-served monotonic ts (LRU)
         self._active_in_vram: Optional[str] = None  # backing field for active_in_vram property
         self.models_in_vram: set = set()  # all models currently in VRAM
+        # Why models came and went, newest last. Load and eviction decisions were
+        # previously only inferable from the log, and the log rotates: on one
+        # production host 78% of it was per-request debug and the 2,000-line view
+        # covered about four minutes, so by the time anyone looked at a slow render
+        # the swaps behind it were gone. Bounded, in-memory, and cheap enough to
+        # record unconditionally.
+        self._history: deque = deque(maxlen=500)
+        self._load_started: Dict[str, float] = {}
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None  # legacy single-instance compat
         self.whisper_servers: Dict[str, WhisperServerManager] = {}  # id -> manager
@@ -3525,6 +3534,10 @@ class MultiModelManager:
                 gb = self._get_model_used_vram_gb(model_key)
             if gb and gb > 0:
                 self._loading_reservations[model_key] = float(gb)
+            # Remember when this load began. Load time is the number everyone
+            # actually waits on -- one production day spent 2h04m of 21h30m
+            # inside loads -- and it cannot be recovered after the fact.
+            self._load_started[model_key] = time.monotonic()
         except Exception:
             pass
 
@@ -3711,17 +3724,36 @@ class MultiModelManager:
         """Call immediately before loading a model; returns a snapshot for delta measurement."""
         return self._free_vram_snapshot()
 
+    @staticmethod
+    def _fp_extra_gb(ref) -> float:
+        """Size of a companion weight file (an mmproj projector), 0.0 if absent."""
+        try:
+            from codai.models.footprint import extra_file_gb
+            return extra_file_gb(ref)
+        except Exception:
+            return 0.0
+
     def record_vram_delta(self, model_key: str, free_before: float,
                           offloaded: bool = False, ram_before: float = -1.0,
-                          n_gpu_layers=None) -> None:
+                          n_gpu_layers=None, model_obj=None) -> None:
         """Call immediately after a model finishes loading to record its REAL memory
         footprint on this hardware, so the next load reuses it instead of repeating
         the OOM→move-layers-to-RAM retry dance.
 
         Records up to three SYSTEM-OWNED fields (never the user's ``used_vram_gb``):
-          * ``measured_vram_gb``      — GPU VRAM delta + runtime reserve (the GPU
-                                        portion; eviction frees against this).
-          * ``measured_ram_gb``       — host-RAM delta (the CPU-offloaded layers).
+          * ``measured_vram_gb``      — the model's FULL footprint: the bytes its
+                                        tensors occupy (wherever they sit) plus
+                                        the KV cache for the configured context
+                                        plus a runtime reserve. Measured by
+                                        walking the loaded object, which needs no
+                                        quantization factor because a 4-bit
+                                        parameter is literally a uint8 tensor.
+                                        Falls back to the old process-memory
+                                        delta when the object cannot be walked
+                                        (a GGUF, an isolated subprocess worker)
+                                        and no file size is available. Eviction
+                                        frees against this.
+          * ``measured_ram_gb``       — the part of those weights held on the host.
           * ``measured_n_gpu_layers`` — the layer split llama.cpp actually settled
                                         on (after any progressive CPU-offload retry).
         The TOTAL memory the model needs is ``measured_vram_gb + measured_ram_gb``.
@@ -3753,9 +3785,71 @@ class MultiModelManager:
         force_update = bool(cfgd.get("force_vram_update"))
         user_pinned = cfgd.get("used_vram_gb") is not None
 
+        # --- Measure the MODEL, not the process ---------------------------------
+        # Preferred path: walk the loaded object and add up the bytes its tensors
+        # really occupy, then add the KV cache for the configured context and a
+        # runtime reserve. See codai/models/footprint.py for why the RSS delta
+        # below is kept only as a fallback: it counts mmap'd weight-file pages and,
+        # summed over a process tree, pages shared between those processes, and as
+        # a delta it absorbs anything else that moved in the window. On one
+        # production host the same unchanged LTX-2.5 config measured 22.11, 22.11,
+        # 23.28, 4.50, 19.02 and 29.80 GB across six loads, and a 5.37 GB GGUF
+        # measured 30.81 GB.
+        fp = None
+        _obj = model_obj if model_obj is not None else self.models.get(model_key)
+        # A GGUF is not a torch object -- llama.cpp owns its memory and the
+        # registry holds a ModelManager wrapper with no parameters() to walk. Its
+        # weights ARE the file, byte for byte: it is loaded as stored, with no
+        # dtype conversion. Pass that size so the walk has something to fall back
+        # to; without it a 5.37 GB Q4_K_M measured 30.81 GB from the RSS delta.
+        _file_gb = 0.0
+        try:
+            for _cand in (cfgd.get("model_path"), cfgd.get("path"),
+                          model_key.split(":", 1)[-1]):
+                if _cand and os.path.isfile(os.path.expanduser(str(_cand))):
+                    _file_gb = os.path.getsize(os.path.expanduser(str(_cand))) / 1e9
+                    break
+            if _file_gb:
+                _mmproj = cfgd.get("mmproj")
+                if _mmproj:
+                    _file_gb += self._fp_extra_gb(_mmproj)
+        except Exception:
+            _file_gb = 0.0
+        try:
+            from codai.models import footprint as _fpmod
+            fp = _fpmod.measure(
+                _obj, cfgd, self._model_type_of(model_key),
+                file_size_gb=_file_gb,
+                measured_kv_gb=cfgd.get("measured_kv_gb"),
+                swa_full=bool(cfgd.get("swa_full", True)))
+            if fp is not None and fp.empty_load:
+                # We walked the model and it holds no weights. There is nothing
+                # to fall back TO: a size taken from process memory would be
+                # measuring everything except this model, which is how a load
+                # that placed one layer came to be recorded as its footprint.
+                print(f"  footprint: {'; '.join(fp.notes)} — recording NOTHING "
+                      f"for this load")
+                try:
+                    self.record_history("load", model_key, reason="failed: "
+                                        "the loaded model holds no weights")
+                    self._load_started.pop(model_key, None)
+                except Exception:
+                    pass
+                return
+            if not fp.complete:
+                print(f"  footprint: not accounted for ({'; '.join(fp.notes)}) — "
+                      f"falling back to the process delta, and NOT persisting it")
+                fp = None
+        except Exception as e:
+            print(f"  footprint: direct measurement unavailable ({e}); "
+                  f"falling back to the process delta")
+            fp = None
+
         # --- Host-RAM footprint (the portion of weights offloaded to CPU) -------
         measured_ram = None
-        if ram_before is not None and ram_before >= 0:
+        if fp is not None:
+            measured_ram = round(fp.weights_cpu_gb, 3) or None
+        elif ram_before is not None and ram_before >= 0:
             try:
                 rd = round(self._get_own_ram_gb() - ram_before, 3)
                 if rd > 0:
@@ -3774,11 +3868,54 @@ class MultiModelManager:
         delta_gb = (free_before - free_after) / 1e9
         gpu_gb = max(0.0, delta_gb)
         measured_vram = None
-        if gpu_gb > 0 or (measured_ram and measured_ram > 0):
+        if fp is not None:
+            measured_vram = fp.total_gb
+            gpu_gb = fp.weights_gpu_gb
+            self._measured_vram_gb[model_key] = measured_vram  # in-memory truth
+            print(f"  footprint: {fp.describe()}")
+        elif gpu_gb > 0 or (measured_ram and measured_ram > 0):
             reserve_gb = self._runtime_reserve_gb(
                 cfgd, model_key, gpu_gb + (measured_ram or 0.0))
             measured_vram = round(gpu_gb + (measured_ram or 0.0) + reserve_gb, 3)
             self._measured_vram_gb[model_key] = measured_vram  # in-memory truth
+
+        # --- Reject a partial load before it becomes authoritative --------------
+        # A load that places a handful of modules and then raises still reaches
+        # here, and force_vram_update would write its figure to disk as truth.
+        # That is how 'Full-GPU load looks viable (4.5 GB peak need)' came to be
+        # planned four seconds after a load that mapped ONE layer and crashed.
+        # Guard by self-comparison rather than a disk walk: a collapse to under
+        # half of what the SAME quantization previously measured is a partial
+        # load, whereas a real drop (Wan2.2's 40.04 -> 11.73 GB) arrives together
+        # with a quantization-signature change and is let through.
+        if measured_vram is not None:
+            try:
+                _prev = float(cfgd.get("measured_vram_gb") or 0.0)
+            except (TypeError, ValueError):
+                _prev = 0.0
+            _same_quant = (cfgd.get("measured_quant_sig")
+                           and cfgd.get("measured_quant_sig") == self._quant_signature(cfgd))
+            # A real model is never ~0 GB, so treat that as a failed measurement
+            # whatever came before -- this is the case where the guard matters
+            # most, and gating it on "> 0" skipped exactly it.
+            _why = ""
+            if measured_vram < 0.01:
+                _why = "not a plausible size for a loaded model"
+            elif _prev > 0 and _same_quant and measured_vram < 0.5 * _prev:
+                _why = (f"less than half the {_prev:.2f} GB previously measured "
+                        f"under the same quantization "
+                        f"({cfgd.get('measured_quant_sig')})")
+            _collapsed = bool(_why)
+            if _collapsed:
+                print(f"  footprint: {measured_vram:.3f} GB is {_why} — treating "
+                      f"this as a PARTIAL load; keeping the previous figure and "
+                      f"NOT persisting this one")
+                if _prev > 0:
+                    self._measured_vram_gb[model_key] = _prev
+                else:
+                    self._measured_vram_gb.pop(model_key, None)
+                measured_vram = None
+                measured_ram = None
 
         # --- Settled GPU-layer split (the value the retry loop landed on) -------
         measured_layers = None
@@ -3835,6 +3972,18 @@ class MultiModelManager:
                       f"({'force_vram_update' if force_update else 'no used_vram_gb'})")
             except Exception as e:
                 print(f"  Warning: could not persist {field}: {e}")
+
+        try:
+            _t0 = self._load_started.pop(model_key, None)
+            self.record_history(
+                "load", model_key,
+                seconds=(time.monotonic() - _t0) if _t0 else None,
+                vram_gb=measured_vram or self._measured_vram_gb.get(model_key),
+                offloaded_gb=measured_ram,
+                strategy=self.model_devices.get(model_key),
+                measured=("model" if fp is not None else "process-delta"))
+        except Exception:
+            pass
 
         _persist("measured_vram_gb", measured_vram, vram_guard=True)
         _persist("measured_ram_gb", measured_ram)
@@ -5295,11 +5444,14 @@ class MultiModelManager:
         _trim_cpu_ram()
         return True
 
-    def _evict_one(self, key):
+    def _evict_one(self, key, reason: str = ""):
         """Fully unload ONE model by key and free its VRAM + host RAM.
 
         Shared by VRAM- and RAM-driven eviction. Never pulls a model that is still
         mid-request; waits briefly first and skips it if it stays busy.
+
+        ``reason`` is recorded in the history so a swap can be explained after
+        the fact rather than reconstructed from the log.
         """
         # Make absolutely sure nothing is mid-request on this model before we
         # pull its tensors off the GPU.
@@ -5307,6 +5459,8 @@ class MultiModelManager:
             if not self._wait_until_idle(key):
                 print(f"  Skipping eviction of '{key}' — still busy after wait")
                 return
+        _free0 = self._get_free_vram_gb()
+        _known = self._measured_vram_gb.get(key)
         model_obj = self.models.pop(key, None)
         self.models_in_vram.discard(key)
         self._last_used.pop(key, None)
@@ -5382,19 +5536,45 @@ class MultiModelManager:
         # otherwise RSS stays high across evict/load cycles and the machine
         # slowly fills RAM + swap.
         _trim_cpu_ram()
+        try:
+            _freed = self._get_free_vram_gb() - _free0
+            self.record_history("evict", key, reason=reason or "unspecified",
+                                freed_gb=max(0.0, _freed),
+                                expected_gb=_known)
+        except Exception:
+            pass
 
     @staticmethod
     def _get_process_ram_gb() -> float:
-        """Resident-set size of the server process TREE, in GB (0.0 on failure).
+        """Host memory the server process TREE holds, in GB (0.0 on failure).
 
         Offloaded weights and worker subprocesses count against the global cap, so
-        sum the root process plus all children (mirrors thermal.read_process_tree_cpu).
+        this covers the root process plus all children.
 
         Under the front/engine split the host-RAM cap is SHARED, not split: when the
         front spawned this engine it set CODERAI_FRONT_PID, so the root is the
         *front* — every engine then measures the same fleet-wide total (front + all
         engines + their workers) and enforces the single cap against it. In
-        single-process mode the root is just this process, as before."""
+        single-process mode the root is just this process, as before.
+
+        Measured as proportional set size (``Pss_Anon + Pss_Shmem``), not summed
+        RSS. Summing RSS over a tree counts pages SHARED between those processes
+        once per process -- the interpreter, torch and the CUDA runtime are mapped
+        into every engine -- and counts file-backed pages, which are page cache the
+        kernel reclaims by itself and which evicting a model cannot free. PSS has
+        already divided each shared page by its sharers, so summing it across the
+        tree counts every page exactly once. On a 5-engine production host the two
+        readings were 40.06 GB (RSS) against 37.91 GB (PSS), so the correction is
+        modest -- but a cap should chase memory that freeing an allocation can
+        actually release. See codai/models/proc_mem.py."""
+        try:
+            import os
+            from codai.models import proc_mem
+            return proc_mem.tree_held_gb(os.environ.get("CODERAI_FRONT_PID"))
+        except Exception:
+            pass
+        # Fall back to the old summed-RSS reading rather than returning 0.0, which
+        # would read as "no memory in use" and disable the cap entirely.
         try:
             import os
             import psutil
@@ -5506,6 +5686,83 @@ class MultiModelManager:
         """Loaded model keys, least-recently-used first (for eviction)."""
         return sorted(self.models.keys(), key=lambda k: self._last_used.get(k, 0.0))
 
+    def record_history(self, event: str, key: str, **fields) -> None:
+        """Note that a model was loaded, evicted or swapped, and why.
+
+        ``event`` is 'load', 'evict' or 'swap'. ``fields`` carries whatever the
+        caller knows -- ``reason``, ``seconds``, ``vram_gb``, ``freed_gb``,
+        ``strategy`` -- and is passed through as-is so a new call site can add
+        detail without a schema change here.
+        """
+        try:
+            rec = {"time": time.time(), "event": str(event), "model": key,
+                   "engine": os.environ.get("CODERAI_ENGINE_NAME", "")}
+            for k, v in fields.items():
+                if v is not None:
+                    rec[k] = round(v, 3) if isinstance(v, float) else v
+            self._history.append(rec)
+        except Exception:
+            pass
+
+    def get_history(self, limit: int = 200, event: str = None) -> list:
+        """Most recent history entries first."""
+        try:
+            items = list(self._history)
+        except Exception:
+            return []
+        if event:
+            items = [r for r in items if r.get("event") == event]
+        items.reverse()
+        try:
+            limit = max(1, min(500, int(limit)))
+        except (TypeError, ValueError):
+            limit = 200
+        return items[:limit]
+
+    def unload_idle_models(self, idle_seconds: float) -> list:
+        """Unload models untouched for ``idle_seconds``; returns the keys freed.
+
+        Eviction already frees a model when something else needs the memory.
+        This covers the case where nothing does: a 3.5B music model held 7.9 GB
+        of a 3090 and 2.1 GB of host RAM for hours after its last request,
+        because the on-demand path keeps a model resident whenever there is
+        room ("Ondemand mode - keeping 'audio_gen:ACE-Step' in VRAM alongside
+        new model").
+
+        Recency comes from ``_last_used``, which is stamped by the
+        ``active_in_vram`` setter. A key that has never been stamped is left
+        alone rather than assumed idle -- that is indistinguishable from a
+        model loaded seconds ago by a path that forgot to stamp it, and
+        unloading it would be the opposite of what is wanted.
+        """
+        try:
+            idle_seconds = float(idle_seconds or 0)
+        except (TypeError, ValueError):
+            return []
+        if idle_seconds <= 0:
+            return []
+        now = time.monotonic()
+        freed = []
+        for key in list(self._lru_order()):
+            if key in self._keep_resident:
+                continue
+            last = self._last_used.get(key)
+            if last is None or last <= 0:
+                continue                      # never stamped — don't guess
+            age = now - last
+            if age < idle_seconds:
+                continue
+            if self._is_key_busy(key):
+                continue
+            print(f"Idle unload: '{key}' has been untouched for {age / 60.0:.0f} min "
+                  f"(limit {idle_seconds / 60.0:.0f} min) — freeing it")
+            try:
+                self._evict_one(key, reason=f"idle for {age / 60.0:.0f} min")
+                freed.append(key)
+            except Exception as e:
+                print(f"  Idle unload of '{key}' failed: {e}")
+        return freed
+
     def _evict_models_for_vram(self, needed_gb: float):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 
@@ -5543,7 +5800,7 @@ class MultiModelManager:
                 print(f"  '{key}' is busy serving a request — not evicting it")
                 continue
             print(f"On-request VRAM eviction: unloading '{key}' ({_size_label(key)}) to free VRAM")
-            _evict_key(key)
+            _evict_key(key, reason=f"vram: another load needed {needed_gb:.1f} GB")
 
         # Second pass: evict the active model if still not enough AND it is idle
         # (unless it's keep-resident — that's handled by the last-resort pass).
@@ -5557,7 +5814,8 @@ class MultiModelManager:
             if self._wait_until_idle(_active):
                 print(f"On-request VRAM eviction: unloading active model '{_active}' "
                       f"({_size_label(_active)}) to free VRAM")
-                _evict_key(_active)
+                _evict_key(_active, reason=f"vram: another load needed {needed_gb:.1f} GB "
+                                          f"(was the active model)")
                 self.active_in_vram = None
             else:
                 print(f"  Active model '{_active}' still busy after wait — leaving it loaded")
@@ -5662,7 +5920,7 @@ class MultiModelManager:
                 continue
             try:
                 print(f"  [cosite-evict] releasing '{key}' for a co-located engine")
-                self._evict_one(key)
+                self._evict_one(key, reason="cosite: a co-located engine needed the GPU")
                 if key == self.active_in_vram:
                     self.active_in_vram = None
             except Exception as e:

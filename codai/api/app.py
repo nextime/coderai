@@ -937,6 +937,24 @@ async def list_models():
     return ModelList(data=models)
 
 
+@app.get("/v1/models/history", summary="Model load / eviction history", tags=["Core"])
+async def models_history(limit: int = 200, event: str = None):
+    """When models were loaded and evicted on this engine, and why.
+
+    Answers the question a slow render actually raises -- which swaps happened,
+    what they cost, what triggered them -- without having to reconstruct it from
+    the log, which rotates: on one production host 78% of the log was
+    per-request debug and the 2,000-line view covered about four minutes.
+
+    Each entry carries ``time``, ``event`` ('load' | 'evict'), ``model`` and
+    ``engine``, plus whatever the call site knew: ``seconds`` (how long the load
+    took), ``vram_gb`` (measured footprint), ``offloaded_gb``, ``strategy``, and
+    for an eviction ``reason`` and ``freed_gb``. Newest first, in-memory and
+    bounded, so it is empty after a restart.
+    """
+    return JSONResponse({"history": multi_model_manager.get_history(limit, event)})
+
+
 def _admin_scoped_token(request) -> str:
     """The caller's bearer token when it carries the admin scope, else "".
 

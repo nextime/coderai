@@ -940,6 +940,21 @@ def _free_pipeline_vram(pipe) -> None:
                         continue
         except Exception:
             pass
+    # The pointer pass above is CUDA-only, by design and by necessity: a freed
+    # HOST address is readily handed back out by malloc, so matching host tensors
+    # by storage pointer could null a live tensor that by then belongs to another
+    # model. Track the host-resident ones by weak reference instead, so a referent
+    # still alive after teardown IS this pipeline's leaked tensor. Without this,
+    # a 'model CPU offload' pipeline -- 17 of 21 video loads on one production day
+    # -- had NONE of its weights tracked, and the engine sat on 33 GB of anonymous
+    # host RAM with an empty GPU. See codai/models/teardown.py.
+    _host_refs = []
+    try:
+        from codai.models import teardown as _td
+        _host_refs = _td.track_host_tensors(pipe)
+    except Exception:
+        _host_refs = []
+
     try:
         if pipe is not None:
             _comps = getattr(pipe, 'components', {}) or {}
@@ -1083,6 +1098,22 @@ def _free_pipeline_vram(pipe) -> None:
                           f"{_vram_used0:.1f} → {_vram_used1:.1f} GB")
         except Exception as _lbe:
             print(f"  [video] teardown-leak breaker failed: {_lbe}")
+    # Host-side arm of the same breaker. Runs BEFORE the allocator trim: trimming
+    # while the weights are still referenced returns nothing, which is what the
+    # RAM mitigation ladder was doing every 15 s for hours without the figure
+    # moving.
+    if _host_refs:
+        try:
+            from codai.models import teardown as _td
+            _hr = _td.break_host_leaks(_host_refs)
+            if _hr["broken"] or _hr["survived_gb"] > 0.5:
+                print(f"  [video] host teardown-leak breaker: "
+                      f"{_hr['survived_gb']:.1f} GB of this pipeline's host-resident "
+                      f"tensors survived teardown; nulled {_hr['broken']} external "
+                      f"reference(s)"
+                      + (f"; holders: {_hr['holders']}" if _hr["holders"] else ""))
+        except Exception as _he:
+            print(f"  [video] host teardown-leak breaker failed: {_he}")
     try:
         from codai.models.manager import _trim_cpu_ram
         _trim_cpu_ram()

@@ -80,7 +80,11 @@ def test_stable_audio_and_ace_step_each_have_their_own_loader():
     assert "_load_musicgen" not in load
     # ...and the generate branch returns the worker's wav rather than falling
     # through to the array-to-int16 writer, which would see no audio_np at all.
-    gen = src[src.index("elif model_type == 'ace_step':"):][:1400]
+    # Slice to the NEXT branch rather than a character count: a fixed window
+    # silently stops covering the branch as soon as anything is added to it.
+    _start = src.index("elif model_type == 'ace_step':")
+    _end = src.index("elif model_type ==", _start + 10)
+    gen = src[_start:_end]
     assert "return wav, 'wav'" in gen
 
 

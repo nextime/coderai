@@ -17,7 +17,7 @@ curl -s http://localhost:8000/v1/audio/generate \
 | field | ACE-Step default | notes |
 |---|---|---|
 | `prompt` | — | the *style*, not the words: genre, instruments, tempo, mood |
-| `lyrics` | `""` | supports its `[verse]` / `[chorus]` tags; `[inst]` for an instrumental |
+| `lyrics` | `[instrumental]` | supports its `[verse]` / `[chorus]` tags; send words to get vocals |
 | `duration` | 60 s | the whole track is generated at once, not stitched |
 | `steps` | 60 | diffusion steps |
 | `cfg_coef` | 15.0 | guidance; ACE-Step wants far more of it than MusicGen |
@@ -30,6 +30,23 @@ their field defaults are MusicGen's (10 s, 3.0). An ACE-Step call that leaves
 them out gets **ACE-Step's** defaults instead, because a 10-second song at a
 guidance it was not tuned for is not a useful reading of "unspecified". A value
 you actually send is always used, including `duration: 10`.
+
+## No lyrics means instrumental, and it has to be said
+
+ACE-Step is a *song* model: the prompt carries the style and the lyrics carry
+the words. Leaving `lyrics` empty does **not** ask for an instrumental — the
+pipeline then conditions on a single padding token (`lyric_token_idx = [0]`,
+`lyric_mask = [0]`) and the model still tries to sing, which comes out as
+babbling over an otherwise reasonable backing track. ACE-Step's own interface
+says how to ask: *"Use `[instrumental]` or `[inst]` to generate instrumental
+music"*, and every genre preset it ships ends in either `male vocals, raw
+vocals` or `instrumental`.
+
+So a request with no `lyrics` is sent as `[instrumental]`, and `instrumental`
+is appended to the style prompt when it is not already there. Background music
+for a video — the common case, where the caller has a mood to describe and no
+words — therefore comes out instrumental by default. To get vocals, send
+lyrics.
 
 ## Why it runs in its own interpreter
 

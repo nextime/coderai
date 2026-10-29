@@ -1216,6 +1216,7 @@ def main():
     # Global host-RAM cap + leak watch (read live by hf_loading, manager, ram_monitor).
     global_args.max_ram_gb = config.offload.max_ram_gb
     global_args.evict_idle_on_ram = config.offload.evict_idle_on_ram
+    global_args.idle_unload_seconds = config.offload.idle_unload_seconds
     global_args.ram_leak_watch = config.offload.ram_leak_watch
     global_args.ram_watch_poll_seconds = config.offload.ram_watch_poll_seconds
     global_args.ram_watch_soft_fraction = config.offload.ram_watch_soft_fraction

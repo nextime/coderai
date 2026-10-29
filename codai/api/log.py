@@ -54,6 +54,32 @@ def _redact_blobs(obj):
     return obj
 
 
+def _summarise(parsed) -> str:
+    """One line describing a request, for the high-volume paths.
+
+    Says what is needed to follow what the server was asked to do -- the model,
+    how many items, the shape -- without reproducing the caller's content.
+    """
+    if not isinstance(parsed, dict):
+        return "(no JSON body)"
+    bits = []
+    model = parsed.get("model")
+    if model:
+        bits.append(f"model={model}")
+    inp = parsed.get("input")
+    if isinstance(inp, list):
+        bits.append(f"inputs={len(inp)}")
+        chars = sum(len(x) for x in inp if isinstance(x, str))
+        if chars:
+            bits.append(f"chars={chars}")
+    elif isinstance(inp, str):
+        bits.append(f"inputs=1 chars={len(inp)}")
+    for key in ("dimensions", "encoding_format"):
+        if parsed.get(key) is not None:
+            bits.append(f"{key}={parsed[key]}")
+    return " ".join(bits) or "(empty body)"
+
+
 def get_recent_activity():
     return list(_activity)
 
@@ -119,6 +145,25 @@ def _durable_request_debug(method, url, parsed):
         pass
 
 
+# NOTE: long free text is deliberately NOT truncated here. A prompt is the most
+# useful thing in the log -- a 4,000-character script prompt was what identified
+# a music defect -- and capping it would trade the diagnosis for bytes. The
+# volume problem was one endpoint called per item rather than per user action,
+# which _SUMMARY_ONLY_PATHS addresses without touching anything else.
+
+#: Paths whose bodies are SUMMARISED rather than dumped, even under debug.
+#:
+#: These are called per item, not per user action, so a full dump is the log
+#: rather than a part of it. One production day: 32,633 embedding requests out
+#: of 33,009 total, and the radeon engine alone produced 426,682 of the log's
+#: 548,687 lines -- about 78% -- which filled the 2,000-line view in roughly
+#: four minutes and left no record of the model loads and evictions anyone was
+#: trying to diagnose. The activity tracking below is unaffected: it is one
+#: dict entry per request and is what the admin page reads.
+_SUMMARY_ONLY_PATHS = {
+    "/v1/embeddings",
+}
+
 _TRACKED_PATHS = {
     "/v1/chat/completions": "chat",
     "/v1/completions": "completion",
@@ -175,7 +220,9 @@ async def log_requests(request: Request, call_next):
                 parsed = json.loads(body_str)
                 model = parsed.get("model", "—")
 
-                if global_debug:
+                if global_debug and path in _SUMMARY_ONLY_PATHS:
+                    print(f"[req] {request.method} {path} {_summarise(parsed)}")
+                elif global_debug:
                     print(f"\n{'='*80}")
                     print(f"=== FULL REQUEST DEBUG ===")
                     print(f"Method: {request.method}  URL: {request.url}")
