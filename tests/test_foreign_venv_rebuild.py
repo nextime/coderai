@@ -257,3 +257,52 @@ def test_the_service_survives_a_cudnn_that_cannot_load():
     assert "cudnn.enabled = False" in body
     assert "not torch.backends.cudnn.enabled" in body, (
         "a second failure would retry for ever instead of raising")
+
+
+def test_the_inline_pins_match_the_requirements_file():
+    """Two copies of a pin drift. The file is the source of truth; the inline
+    list exists only for an install where that file is not present, and it has
+    to say the same thing."""
+    import os
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    from codai.api import parler_worker as P
+
+    wanted = []
+    for line in open(os.path.join(root, "requirements-parler.txt"),
+                     encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        wanted.extend(line.split(" ", 1) if line.startswith("--") else [line])
+    assert list(P._PINS) == wanted, (
+        f"the inline pins and requirements-parler.txt disagree:\n"
+        f"  file:   {wanted}\n  inline: {list(P._PINS)}")
+
+
+def test_a_missing_requirements_file_does_not_block_a_rebuild():
+    """The container mounts only codai/, tools/ and third_party/ over the
+    image, so a repo-root file added since the image was built is absent until
+    the container is recreated. A self-healing rebuild must not stop for a
+    reason that has nothing to do with the venv -- which is exactly what
+    happened on the first live run, and what ACE-Step's "requirements missing"
+    report turned out to be."""
+    from pathlib import Path
+    from codai.api import parler_worker as P
+
+    args = venv_env.pip_install_args(Path("/nope/requirements-parler.txt"), P._PINS)
+    assert "-r" not in args
+    assert any(a.startswith("torch==") for a in args)
+
+    here = Path(__file__).resolve().parents[1] / "requirements-parler.txt"
+    assert venv_env.pip_install_args(here, P._PINS) == ["-r", str(here)], (
+        "the file must be preferred whenever it is there")
+
+
+def test_the_worker_no_longer_refuses_without_the_file():
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "codai/api/parler_worker.py"),
+               encoding="utf-8").read()
+    assert "requirements file missing" not in src
+    assert "pip_install_args(" in src

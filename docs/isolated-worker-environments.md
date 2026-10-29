@@ -110,7 +110,12 @@ Two changes:
 
 * **the stack is pinned.** `requirements-parler.txt` names the torch build,
   the way every other isolated worker's file does. Pip resolving a CUDA stack
-  on its own is how a venv ends up newer than the fleet it runs on.
+  on its own is how a venv ends up newer than the fleet it runs on. The same
+  pins also live in the worker, because the container mounts only `codai/`,
+  `tools/` and `third_party/` over the image: a repo-ROOT file added since the
+  running image was built is simply absent, and the first live rebuild stopped
+  with `Parler requirements file missing` for a venv that was the only thing
+  wrong. The file wins whenever it is there, and a test keeps the two in step.
 * **the health check runs the op that fails.** The decoder is convolutional,
   so the probe is one `conv1d` on the GPU. A venv that imports but cannot run
   it is rebuilt from the pinned file; a CPU-only host passes, because there is

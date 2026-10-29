@@ -376,3 +376,28 @@ def create_venv(venv_dir, system_site: bool = False,
             cmd.append("--system-site-packages")
         run(cmd + [str(d)], check=True, timeout=timeout)
     return venv_python(d)
+
+def pip_install_args(requirements, fallback_pins) -> list:
+    """Pip arguments for a worker's install: the requirements file, or its pins.
+
+    The file is the source of truth and is preferred whenever it is there. It
+    is not always there: the container bind-mounts ``codai/``, ``tools/`` and
+    ``third_party/`` over the image, so a repo-ROOT file added after the
+    running image was built is simply absent until the container is recreated
+    — and a self-healing rebuild that stops with "requirements file missing"
+    is a worker that stays broken for a reason that has nothing to do with it.
+    Measured twice on zeiss: once as ACE-Step reporting a missing
+    ``requirements-acestep.txt`` for a venv that was fine, and once as a
+    Parler rebuild refusing to run.
+
+    ``fallback_pins`` must mirror the file. Each worker that uses this keeps a
+    test that parses its file and compares, because two copies of a pin drift.
+    """
+    from pathlib import Path as _P
+    req = _P(requirements)
+    if req.is_file():
+        return ["-r", str(req)]
+    print(f"[worker-env] {req} is not in this install (the container mounts "
+          f"only codai/, tools/ and third_party/ over the image); installing "
+          f"the same pins inline", flush=True)
+    return list(fallback_pins)

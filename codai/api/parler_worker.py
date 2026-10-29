@@ -30,6 +30,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE_SCRIPT = _REPO_ROOT / "tools" / "parler_tts_service.py"
 _REQUIREMENTS = _REPO_ROOT / "requirements-parler.txt"
 
+#: The same pins as requirements-parler.txt, for an install where that file is
+#: not present (the container mounts only codai/, tools/ and third_party/ over
+#: the image, so a repo-root file added since the image was built is absent
+#: until the container is recreated). A test keeps the two in step.
+_PINS = ("--extra-index-url", "https://download.pytorch.org/whl/cu124",
+         "torch==2.5.1+cu124",
+         "git+https://github.com/huggingface/parler-tts.git",
+         "soundfile>=0.12.0")
+
 # Dedicated venv for the (incompatible) parler-tts stack. Created with access to
 # the base interpreter's packages so torch/numpy aren't re-downloaded; parler's
 # pinned transformers installs into the venv and shadows the system one.
@@ -121,13 +130,12 @@ def _bootstrap_venv() -> Path:
             shutil.rmtree(_VENV_DIR, ignore_errors=True)
             py = venv_env.create_venv(_VENV_DIR)
     if not _ok:
-        if not _REQUIREMENTS.exists():
-            raise RuntimeError(f"Parler requirements file missing: {_REQUIREMENTS}")
         print("[parler] installing parler-tts + a pinned torch into the isolated "
               "venv (first run, downloads several GB, this can take a while) …",
               flush=True)
         venv_env.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
-        venv_env.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+        venv_env.run([str(py), "-m", "pip", "install"]
+                     + venv_env.pip_install_args(_REQUIREMENTS, _PINS),
                      check=True)
         if not _pip_ok(py):
             raise RuntimeError("parler-tts install did not yield an importable package")
