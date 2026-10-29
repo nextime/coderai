@@ -62,9 +62,9 @@ def test_the_loader_accepts_the_sizing_verdict():
 def test_a_sized_to_fit_cache_hit_stays_resident():
     branch = _SRC.split("injected cached components", 1)[1]
     head = branch[:2500]
-    assert "elif full_gpu_viable:" in head, (
+    assert "elif full_gpu_viable" in head, (
         "a cache hit that was sized to fit still falls through to CPU offload")
-    viable_at = head.index("elif full_gpu_viable:")
+    viable_at = head.index("elif full_gpu_viable")
     resident_at = head.index("offload = 'resident'", viable_at)
     model_at = head.index("offload = 'model'", viable_at)
     assert resident_at < model_at, "the sized-to-fit branch does not choose resident"

@@ -3836,6 +3836,57 @@ class MultiModelManager:
                 pass
         _persist("measured_n_gpu_layers", measured_layers)
 
+    def record_resident_fits(self, model_key: str, fits: bool) -> None:
+        """Remember whether this model could be held entirely on the GPU.
+
+        A system-owned learned field, like measured_n_gpu_layers: the estimate
+        says what the weights weigh, and only an attempt says whether every
+        component plus its activation peak fits at once.
+
+        Measured 2026-10-29: LTX-2.5 was sized at 22.1 GB against 25.0 GB free
+        and the resident attempt still OOMed on transformer, vocoder and
+        prompt_enhancer -- its real footprint is 23.28 GB and resident needs
+        all of it simultaneously. Without remembering that, every load pays the
+        same failed attempt and teardown (measured: ~16 minutes to reach the
+        same CPU-offload placement it would have chosen immediately).
+        """
+        try:
+            cfg = self._config_for_model_key(model_key)
+            if not isinstance(cfg, dict):
+                return
+            if bool(cfg.get("measured_resident_fits")) == bool(fits) and \
+                    "measured_resident_fits" in cfg:
+                return
+            working = dict(cfg)
+            working["measured_resident_fits"] = bool(fits)
+            canon = self._resolve_config_key(model_key) or model_key
+            self.config[canon] = working
+            from codai.admin.routes import config_manager
+            if config_manager is not None:
+                try:
+                    config_manager.save_models()
+                except Exception:
+                    pass
+            print(f"  Learned: '{model_key}' "
+                  f"{'fits' if fits else 'does NOT fit'} fully on the GPU "
+                  f"(measured_resident_fits={bool(fits)})")
+        except Exception:
+            pass
+
+    def resident_known_not_to_fit(self, model_key: str) -> bool:
+        """True only when an attempt has PROVEN it does not fit.
+
+        Unknown means try: a model that has never been attempted, or one whose
+        card has since changed, should still get its chance at the GPU.
+        """
+        try:
+            cfg = self._config_for_model_key(model_key)
+            if isinstance(cfg, dict) and "measured_resident_fits" in cfg:
+                return not bool(cfg.get("measured_resident_fits"))
+        except Exception:
+            pass
+        return False
+
     def _learned_n_gpu_layers(self, model_key: str, configured):
         """Prefer a previously-learned stable GPU-layer split over an auto guess.
 

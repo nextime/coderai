@@ -1270,6 +1270,34 @@ def _apply_attention_backend(pipe, model_cfg: dict) -> None:
               f"{', '.join(applied)}")
 
 
+def _record_resident_fits(model_name: str, fits: bool) -> None:
+    try:
+        from codai.models.manager import multi_model_manager
+        multi_model_manager.record_resident_fits(model_name, fits)
+    except Exception:
+        pass
+
+
+def _resident_known_bad(model_name: str) -> bool:
+    """Whether an earlier attempt proved this model cannot be held on the GPU.
+
+    The estimate only knows what the weights weigh. Whether every component
+    plus the activation peak fits AT ONCE is only answered by trying, and a
+    failed try is expensive: the attempt, the OOM and the teardown cost about
+    16 minutes on LTX-2.5 before falling back to exactly the placement that
+    would have been chosen immediately. So the answer is learned once and
+    remembered, rather than rediscovered on every load.
+
+    Unknown still means try -- a model never attempted, or a card that has
+    since changed, should get its chance at the GPU.
+    """
+    try:
+        from codai.models.manager import multi_model_manager
+        return multi_model_manager.resident_known_not_to_fit(model_name)
+    except Exception:
+        return False
+
+
 def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None, use_incremental_cache: bool = True, full_gpu_viable: bool = False):
     # Wait if the GPU is reserved for an exclusive op (LoRA training here or on a
     # co-located sibling) so this load doesn't contend with it.
@@ -1420,7 +1448,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             print(f"  [pipeline-cache] injected cached components → RESIDENT all-GPU "
                   f"load (video_resident_experts=on; falls back to model offload on OOM)")
             offload = 'resident'
-        elif full_gpu_viable:
+        elif full_gpu_viable and not _resident_known_bad(model_name):
             # The caller already SIZED this load against free VRAM and found it
             # fits. Discarding that verdict and applying the dual-expert default
             # below is how a model ends up on the CPU beside an empty card:
@@ -1867,6 +1895,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     # is a FAILED load, not a success. Tear the partial pipe down
                     # thoroughly (its on-GPU components would otherwise stay pinned and
                     # leak ~10 GB) and fall through to 'model' CPU offload.
+                    _record_resident_fits(model_name, False)
                     print(f"  [resident] components left off-GPU: {', '.join(_kept)} "
                           f"— resident can't fit this model; freeing partial pipe and "
                           f"falling back to model CPU offload…")
@@ -1875,6 +1904,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     _clear_mem()
                     offload = 'model'
                 else:
+                    _record_resident_fits(model_name, True)
                     _report_loaded(pipe, "resident (all components on GPU)")
                     return pipe
             except (RuntimeError, MemoryError) as e:
