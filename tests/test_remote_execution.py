@@ -1769,18 +1769,26 @@ def test_xtts_falls_through_to_its_own_venv_when_not_importable(monkeypatch):
             assert kw["speaker"] == "Ana Florence" and kw["language"] == "en"
             return np.zeros(2400, dtype=np.float32)
     monkeypatch.setattr(xtts_worker, "available", lambda: True)
+    monkeypatch.setattr(xtts_worker, "health", lambda: (True, ""))
     monkeypatch.setattr(xtts_worker, "XttsSubprocess", _FakeSub)
 
     b = tts_backends._CoquiBackend("coqui/XTTS-v2", {})
     wav, sr = b.synthesize("hello", voice="", speed=1.0, lang="en")
     assert sr == 24000 and len(wav) == 2400
 
-    # and with no venv either, the error says where it looked
+    # and with an unusable venv, the error says WHICH venv and WHY. It used to
+    # say only that no venv had been found, over a venv that was there and
+    # populated with the wrong stack.
     monkeypatch.setattr(xtts_worker, "available", lambda: False)
+    monkeypatch.setattr(xtts_worker, "health",
+                        lambda: (False, "ModuleNotFoundError: No module named 'torch'"))
+    monkeypatch.setattr(xtts_worker, "bootstrap", lambda *a, **k: False)
     try:
         tts_backends._CoquiBackend("coqui/XTTS-v2", {})
     except tts_backends.MissingEngineError as e:
-        assert "/opt/coderai/venvs/TTS" in str(e)
+        msg = str(e)
+        assert str(xtts_worker.venv_dir()) in msg, msg
+        assert "No module named 'torch'" in msg, msg
     else:
         raise AssertionError("expected MissingEngineError")
 

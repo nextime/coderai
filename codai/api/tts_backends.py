@@ -212,18 +212,22 @@ class _CoquiBackend:
             # Build the venv on first use, the way parler does. Opt out with
             # CODERAI_XTTS_AUTOINSTALL=0 on a host that manages its own venvs
             # or has no network.
-            if not xtts_worker.available() and \
-                    os.environ.get("CODERAI_XTTS_AUTOINSTALL", "1") != "0":
+            _ok, _why = xtts_worker.health()
+            if not _ok and os.environ.get("CODERAI_XTTS_AUTOINSTALL", "1") != "0":
                 xtts_worker.bootstrap()
-            if xtts_worker.available():
+                _ok, _why = xtts_worker.health()
+            if _ok:
                 print(f"[tts] coqui-tts from {xtts_worker.venv_dir()}", flush=True)
                 self._tts = xtts_worker.XttsSubprocess(model_name)
                 return
+            # Say what is actually wrong with the venv. This used to report
+            # that no venv had been found, over a venv that was there and
+            # populated, which sent the operator looking in the wrong place.
             raise MissingEngineError(
-                "Coqui/XTTS models need the coqui-tts package, and no venv "
-                "containing it was found (CODERAI_XTTS_VENV, /opt/coderai/venvs/TTS, "
-                "~/.coderai/xtts_venv). It cannot be installed beside "
-                "transformers 5.x: build it in its own venv."
+                f"Coqui/XTTS models need their own venv ({xtts_worker.venv_dir()}), "
+                f"and this one is not usable: {_why}. It cannot be installed "
+                f"beside the server's transformers; coderai builds it on first "
+                f"use unless CODERAI_XTTS_AUTOINSTALL=0."
             ) from e
         import torch
         self._tts = TTS(model_name).to("cuda" if torch.cuda.is_available() else "cpu")

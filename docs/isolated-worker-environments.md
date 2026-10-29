@@ -125,9 +125,24 @@ And the service itself latches cudnn off if it still fails there: torch has
 native kernels for those convolutions, the decoder is a fraction of the work,
 and the alternative is no speech at all.
 
+XTTS had the same shape one layer along: `pip install coqui-tts soundfile
+requests` installed coqui-tts 0.28.0 and its ninety dependencies and **no
+torch at all**, so the install reported success and `import TTS` failed. It
+has a pinned `requirements-xtts.txt` now too, with the same torch/torchaudio
+pair.
+
+Both engines also stopped hiding the reason. "coqui-tts installed but still
+not importable" and "parler-tts install did not yield an importable package"
+name neither the module nor the fault; `venv_env.import_ok` and
+`venv_env.gpu_conv_ok` carry the real message out, and
+`GET /v1/audio/speech/capabilities` serves it as `env_detail`. The XTTS 501
+used to say "no venv containing it was found" over a venv that was there and
+populated, which sent the operator looking in the wrong place.
+
 The general rule, which cost two bring-ups here: **a venv's health check must
-exercise what the worker actually does.** An import proves the files are in
-the right directory and nothing else.
+exercise what the worker actually does, and say what failed.** An import
+proves the files are in the right directory and nothing else; a check that
+answers only true/false turns every layer below it into a mystery.
 
 ## Knowing before you ask
 

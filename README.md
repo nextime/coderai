@@ -269,6 +269,13 @@ Request extras: `image` (URL, data URI, path or base64), `embedding_types` to pi
 dense/sparse/colbert, `dimensions` to truncate, and `quantization` (TurboQuant `turbo8` …
 `turbo2`) for packed low-bit vectors.
 
+The backend comes from what the model's entry POINTS AT, not from the id the request
+used: a GGUF embedder is registered under its path, its basename and the basename
+without the extension, and only the entry says which file to open and which `mmproj`
+goes with it. Sending `image` to a model that has no image tower is a `400` before
+anything is loaded — the same answer in both directions, since text to an image-only
+model has always been one.
+
 **`POST /v1/rerank`** adds cross-encoder reranking (e.g. `bge-reranker-v2-m3`) — query +
 documents in, `relevance_score` per document out. No extra dependency; rerankers are
 registered in the embedding model category.
@@ -608,6 +615,7 @@ built on demand from the admin UI:
 | `requirements-crisperwhisper.txt` | CrisperWhisper verbatim STT | yes |
 | `requirements-pyannote.txt` | Speaker diarization | yes |
 | `requirements-parler.txt` | Parler-TTS expressive speech | yes |
+| `requirements-xtts.txt` | coqui XTTS voice cloning | yes |
 
 ---
 

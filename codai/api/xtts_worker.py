@@ -34,6 +34,17 @@ from codai.api import venv_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVICE = _REPO_ROOT / "tools" / "xtts_service.py"
+_REQUIREMENTS = _REPO_ROOT / "requirements-xtts.txt"
+
+#: The same pins as requirements-xtts.txt, for an install where that file is
+#: not present (the container mounts only codai/, tools/ and third_party/ over
+#: the image). A test keeps the two in step.
+_PINS = ("--extra-index-url", "https://download.pytorch.org/whl/cu124",
+         "torch==2.6.0+cu124",
+         "torchaudio==2.6.0+cu124",
+         "coqui-tts",
+         "soundfile>=0.12.0",
+         "requests>=2.28.0")
 
 
 def venv_dir() -> Path:
@@ -51,19 +62,34 @@ def venv_python() -> Path:
         "python.exe" if os.name == "nt" else "python")
 
 
-def available() -> bool:
-    """True when there is a venv with coqui-tts in it to talk to."""
+def health() -> tuple:
+    """``(ok, detail)`` for the venv behind XTTS.
+
+    Two questions, because either one failing means no speech: are the
+    packages importable, and can the stack run a convolution on the GPU (a
+    vocoder is convolutional, and a venv with a mismatched CUDA stack imports
+    perfectly and dies on the first one). The detail is carried out so the
+    caller can say WHY -- "coqui-tts installed but still not importable" is
+    what this used to report, and it named neither the module nor the reason.
+
+    Both run in a clean environment: the server exports PYTHONHOME, and under
+    it the probe imports the SERVER's site-packages, so a populated venv
+    answered "coqui-tts is not installed" for ever (see venv_env).
+    """
     py = venv_python()
-    if not py.is_file() or not _SERVICE.is_file():
-        return False
-    try:
-        # Clean environment: the server exports PYTHONHOME, and under it this
-        # probe imports the SERVER's site-packages, so a populated venv
-        # answered "coqui-tts is not installed" for ever (see venv_env).
-        return venv_env.run([str(py), "-c", "import TTS"],
-                            capture_output=True, timeout=120).returncode == 0
-    except Exception:
-        return False
+    if not py.is_file():
+        return False, f"there is no interpreter at {py}"
+    if not _SERVICE.is_file():
+        return False, f"the worker script is missing: {_SERVICE}"
+    ok, why = venv_env.import_ok(py, ("TTS",))
+    if not ok:
+        return False, why
+    return venv_env.gpu_conv_ok(py)
+
+
+def available() -> bool:
+    """True when there is a venv with a working coqui-tts in it to talk to."""
+    return health()[0]
 
 
 _bootstrap_lock = threading.Lock()
@@ -116,10 +142,13 @@ def bootstrap(timeout: int = 3600) -> bool:
             if not venv_python().is_file() or not _venv_ok():
                 print(f"[xtts] preparing the isolated venv at {d} …", flush=True)
             py = venv_env.create_venv(d)
-            print("[xtts] installing coqui-tts into the isolated venv "
-                  "(first run, downloads several GB) …", flush=True)
-            venv_env.run([str(py), "-m", "pip", "install", "--no-input",
-                            "coqui-tts", "soundfile", "requests"],
+            print("[xtts] installing coqui-tts + a pinned torch into the "
+                  "isolated venv (first run, downloads several GB) …", flush=True)
+            # From the pinned file, not `pip install coqui-tts`: that installed
+            # coqui-tts and its ninety dependencies with NO torch at all, so
+            # the install reported success and `import TTS` failed.
+            venv_env.run([str(py), "-m", "pip", "install", "--no-input"]
+                         + venv_env.pip_install_args(_REQUIREMENTS, _PINS),
                          check=True, timeout=timeout)
         except Exception as exc:
             # A partially built venv is worse than none: `available()` stays
@@ -130,11 +159,11 @@ def bootstrap(timeout: int = 3600) -> bool:
             print(f"[xtts] bootstrap failed ({type(exc).__name__}: "
                   f"{str(exc)[:200]}); XTTS stays unavailable", flush=True)
             return False
-        ok = available()
+        ok, why = health()
         _bootstrapped = ok
         if not ok:
-            print("[xtts] coqui-tts installed but still not importable",
-                  flush=True)
+            print(f"[xtts] the install finished but the venv is not usable: "
+                  f"{why}", flush=True)
         return ok
 
 

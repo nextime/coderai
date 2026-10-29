@@ -57,64 +57,17 @@ def _venv_python() -> Path:
 
 
 def _import_check(py: Path) -> tuple:
-    """``(ok, detail)`` for "are this venv's packages importable".
-
-    The detail matters. "install did not yield an importable package" is what
-    this used to say, which names neither the package nor the reason --
-    measured on zeiss, 2026-10-29, where the install had in fact succeeded and
-    the import was failing on a torchaudio that did not match the pinned
-    torch.
-    """
-    try:
-        r = venv_env.run([str(py), "-c", "import parler_tts, soundfile"],
-                         capture_output=True, text=True, timeout=600)
-    except Exception as exc:
-        return False, f"the import could not be run ({exc})"
-    if r.returncode == 0:
-        return True, ""
-    tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
-    return False, (tail[-1][:300] if tail else f"exit {r.returncode}")
+    """Whether this venv's packages import. See venv_env.import_ok."""
+    return venv_env.import_ok(py, ("parler_tts", "soundfile"))
 
 
 def _pip_ok(py: Path) -> bool:
     return _import_check(py)[0]
 
 
-#: The op that failed. Parler's audio decoder (DAC) is convolutional, so a
-#: venv whose CUDA stack cannot run one convolution cannot synthesize anything
-#: -- however importable its packages are.
-_GPU_PROBE = (
-    "import torch, torch.nn.functional as F\n"
-    "if not torch.cuda.is_available():\n"
-    "    raise SystemExit(0)\n"
-    "x = torch.zeros(1, 1, 16, device='cuda')\n"
-    "w = torch.zeros(1, 1, 3, device='cuda')\n"
-    "F.conv1d(x, w).sum().item()\n")
-
-
 def _gpu_ok(py: Path) -> tuple:
-    """``(ok, detail)`` — whether this venv can actually run on the GPU.
-
-    "Are the packages importable" is not the same question, and the difference
-    cost a whole bring-up. Measured on zeiss, 2026-10-29: the venv imported
-    parler_tts and soundfile perfectly, the service started, the model loaded,
-    and the first synthesis died in the decoder's conv1d with
-    ``CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`` — a CUDA-13 torch that pip had
-    resolved on its own. ``_pip_ok`` answered True for that venv for ever, so
-    nothing ever rebuilt it.
-
-    A CPU-only host passes: it exits before the convolution, because there is
-    no GPU stack to be broken.
-    """
-    try:
-        r = venv_env.run([str(py), "-c", _GPU_PROBE],
-                         capture_output=True, text=True, timeout=600)
-    except Exception as exc:
-        return False, f"the probe could not be run ({exc})"
-    if r.returncode == 0:
-        return True, ""
-    tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
-    return False, (tail[-1][:300] if tail else f"exit {r.returncode}")
+    """Whether this venv can run the decoder's convolution on the GPU."""
+    return venv_env.gpu_conv_ok(py)
 
 
 def _bootstrap_venv() -> Path:

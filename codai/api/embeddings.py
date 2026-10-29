@@ -1094,6 +1094,57 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
         raise RuntimeError(f"Cannot load embedding model '{model_name}': {e}")
 
 
+def _may_embed_images(model_name: str, model_config: dict = None) -> bool:
+    """Whether this model COULD embed images, decided before it is loaded.
+
+    :func:`_supports_images` asks the loaded object, which is the right answer
+    and an expensive one: an image request to a text-only model spent the whole
+    load before being refused. Measured on zeiss, 2026-10-29 -- four texts and
+    four images sent to a text-only 8 GB embedder, forty seconds of loading,
+    and then the 400 it could have had immediately.
+
+    Conservative on purpose. It answers False only when something positively
+    says "no image tower": a special backend that is text-only, or an HF config
+    with neither a vision tower nor a vision-only architecture. Anything it
+    cannot determine comes back True and the loaded-object check decides, so a
+    model this does not recognise is never refused by mistake.
+    """
+    cfg = model_config or {}
+    raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
+    name = str(model_name or '')
+    low = name.lower()
+
+    # A GGUF embedder sees images only through a configured projector, which is
+    # exactly what the mmproj field is.
+    if low.endswith('.gguf'):
+        return bool(cfg.get('mmproj') or raw.get('mmproj')) or 'dinov2' in _os_basename(low)
+
+    # The logical ids: their own encoders, not an HF config between them.
+    for probe, answer in ((_is_vpr, True), (_is_salad, True)):
+        try:
+            if probe(name):
+                return answer
+        except Exception:
+            pass
+    if low in ('geoclip', 'geoclip-location'):
+        return low == 'geoclip'
+
+    trust = bool(cfg.get('trust_remote_code', raw.get('trust_remote_code', True)))
+    try:
+        if _is_dual_encoder(name, trust) or _is_vision_only(name, trust):
+            return True
+    except Exception:
+        return True          # unreadable config: let the load decide
+    # The config was readable and describes neither an image tower nor an
+    # image-only encoder.
+    try:
+        from transformers import AutoConfig
+        AutoConfig.from_pretrained(name, trust_remote_code=trust)
+    except Exception:
+        return True          # cannot be read at all: not our call to make
+    return False
+
+
 def _supports_images(model_obj) -> bool:
     """True if this loaded model can embed images (shared space for clip/ST
     multimodal; image-only space for the 'vision' backend)."""
@@ -2229,7 +2280,53 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     model_obj = model_info.get('model_object')
 
     _emb_cfg = (multi_model_manager.config.get(f"embedding:{model_name}")
-                or multi_model_manager.config.get(model_name) or {})
+                or multi_model_manager.config.get(model_name)
+                # …and through the alias/basename resolver, because
+                # `self.config` is keyed by the registration id (for a local
+                # file, its full path) while a request usually arrives as the
+                # basename. A miss here is not harmless: it drops every
+                # per-model setting, `mmproj` included, so a vision GGUF
+                # embedder loses its image tower.
+                or multi_model_manager._config_for_model(model_name) or {})
+
+    # Load what the entry actually points at. A GGUF embedder is registered
+    # under three ids -- its path, its basename, and the basename without the
+    # extension -- and `request_model` can hand back any of them. The loader
+    # dispatches on the NAME: `.gguf` goes to llama.cpp (or, for a ViT, to
+    # dinov2-embed), and anything else goes to sentence-transformers, which
+    # prepends `sentence-transformers/` to a name with no slash and asks the
+    # Hub for it. Measured on zeiss, 2026-10-29:
+    #
+    #   gme-Qwen2-VL-2B-Instruct-Q4_K_M → 500 "Failed to load embedding model:
+    #   404 … huggingface.co/sentence-transformers/<id>/resolve/main/"
+    #
+    # for a file sitting in /AI/guffcache. The entry's own path settles it.
+    _cfg_path = str(_emb_cfg.get('path') or _emb_cfg.get('model_path') or '').strip()
+    if _cfg_path and _cfg_path != model_name:
+        print(f"[embeddings] '{model_name}' is a config of '{_cfg_path}'", flush=True)
+        model_name = _cfg_path
+
+    texts: List[str] = []
+    if request.input is not None:
+        texts = [request.input] if isinstance(request.input, str) else list(request.input)
+    images: List[str] = []
+    if request.image is not None:
+        images = [request.image] if isinstance(request.image, str) else list(request.image)
+    if not texts and not images:
+        raise HTTPException(
+            status_code=400, detail="Provide 'input' (text) and/or 'image'.")
+
+    # Refuse an impossible request BEFORE loading anything. The same refusal
+    # used to come after the load: images sent to a text-only 8 GB embedder
+    # spent forty seconds loading it and then answered 400. A caller cannot
+    # tell that from a hang, and the work was wasted either way.
+    if images and model_obj is None and not _may_embed_images(model_name, _emb_cfg):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model_name}' is text-only; image embedding needs a "
+                   "multimodal model (CLIP/SigLIP family, e.g. "
+                   "sentence-transformers/clip-ViT-B-32 or jinaai/jina-clip-v2), "
+                   "or a GGUF embedder with an `mmproj` configured.")
 
     if model_obj is None:
         # Serialize loads per model: a burst of first-requests (a bulk indexer)
@@ -2241,16 +2338,6 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
         async with _lock:
             model_obj = await _load_embedding_locked(
                 request, model_key, model_name, _emb_cfg)
-
-    texts: List[str] = []
-    if request.input is not None:
-        texts = [request.input] if isinstance(request.input, str) else list(request.input)
-    images: List[str] = []
-    if request.image is not None:
-        images = [request.image] if isinstance(request.image, str) else list(request.image)
-    if not texts and not images:
-        raise HTTPException(
-            status_code=400, detail="Provide 'input' (text) and/or 'image'.")
 
     if images and not _supports_images(model_obj):
         raise HTTPException(

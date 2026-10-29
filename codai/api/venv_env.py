@@ -401,3 +401,59 @@ def pip_install_args(requirements, fallback_pins) -> list:
           f"only codai/, tools/ and third_party/ over the image); installing "
           f"the same pins inline", flush=True)
     return list(fallback_pins)
+
+def import_ok(py, modules) -> Tuple[bool, str]:
+    """``(ok, detail)`` for "can this venv import these modules".
+
+    The detail is the point. "installed but still not importable" and
+    "install did not yield an importable package" are what two workers used to
+    say, and neither names the module or the reason -- measured on zeiss,
+    2026-10-29, where one install had in fact succeeded and the import was
+    failing on a mismatched torchaudio, and another had no torch at all.
+    """
+    mods = ", ".join(modules)
+    try:
+        r = run([str(py), "-c", f"import {mods}"],
+                capture_output=True, text=True, timeout=600)
+    except Exception as exc:
+        return False, f"the import could not be run ({exc})"
+    if r.returncode == 0:
+        return True, ""
+    tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
+    return False, (tail[-1][:300] if tail else f"exit {r.returncode}")
+
+
+#: One convolution on the GPU. Speech models are convolutional (a vocoder, a
+#: DAC decoder), so a venv whose CUDA stack cannot run this cannot synthesize
+#: anything -- however importable its packages are.
+_GPU_PROBE = (
+    "import torch, torch.nn.functional as F\n"
+    "if not torch.cuda.is_available():\n"
+    "    raise SystemExit(0)\n"
+    "x = torch.zeros(1, 1, 16, device='cuda')\n"
+    "w = torch.zeros(1, 1, 3, device='cuda')\n"
+    "F.conv1d(x, w).sum().item()\n")
+
+
+def gpu_conv_ok(py) -> Tuple[bool, str]:
+    """``(ok, detail)`` — whether this venv can actually run on the GPU.
+
+    "Are the packages importable" is a different question, and the difference
+    cost a bring-up: a venv imported parler_tts and soundfile perfectly, the
+    service started, the model loaded, and the first synthesis died in the
+    decoder's conv1d with ``CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`` -- a
+    CUDA-13 torch pip had resolved on its own. The import check answered True
+    for that venv for ever, so nothing ever rebuilt it.
+
+    A CPU-only host passes: it exits before the convolution, because there is
+    no GPU stack there to be broken.
+    """
+    try:
+        r = run([str(py), "-c", _GPU_PROBE],
+                capture_output=True, text=True, timeout=600)
+    except Exception as exc:
+        return False, f"the probe could not be run ({exc})"
+    if r.returncode == 0:
+        return True, ""
+    tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
+    return False, (tail[-1][:300] if tail else f"exit {r.returncode}")

@@ -218,8 +218,6 @@ def test_the_parler_venv_is_probed_on_the_gpu_not_just_imported():
     src = open(os.path.join(root, "codai/api/parler_worker.py"),
                encoding="utf-8").read()
     assert "_gpu_ok(" in src, "the venv is trusted on an import alone"
-    assert "conv1d" in src, (
-        "the probe does not run the op that fails (the decoder is convolutional)")
     boot = src.split("def _bootstrap_venv", 1)[1]
     assert boot.index("_gpu_ok(py)") < boot.index("rmtree"), (
         "the probe does not drive the rebuild")
@@ -227,15 +225,31 @@ def test_the_parler_venv_is_probed_on_the_gpu_not_just_imported():
         "the rebuild installs whatever pip resolves today, which is the bug")
 
 
+def test_the_probe_runs_the_op_that_fails():
+    """The decoder is convolutional, and a conv1d is what died with
+    CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED. A probe that only imports torch
+    would have passed on that venv."""
+    probe = venv_env._GPU_PROBE
+    assert "conv1d" in probe
+
+
 def test_a_cpu_only_host_passes_the_probe():
     """There is no GPU stack to be broken, so the probe must not fail the
     bootstrap on a CPU-only machine."""
+    probe = venv_env._GPU_PROBE
+    assert "is_available" in probe and "SystemExit(0)" in probe
+
+
+def test_the_checks_are_shared_not_copied():
+    """Two workers had their own "is this venv healthy" and they did not agree
+    -- which is how one of them trusted an import alone."""
     import os
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(root, "codai/api/parler_worker.py"),
-               encoding="utf-8").read()
-    probe = src.split("_GPU_PROBE = (", 1)[1].split(")\n", 1)[0]
-    assert "is_available" in probe and "SystemExit(0)" in probe
+    for name in ("parler_worker", "xtts_worker"):
+        src = open(os.path.join(root, "codai/api", name + ".py"),
+                   encoding="utf-8").read()
+        assert "venv_env.import_ok(" in src, f"{name} has its own import check"
+        assert "venv_env.gpu_conv_ok(" in src, f"{name} has no GPU probe"
 
 
 def test_the_parler_requirements_pin_torch():

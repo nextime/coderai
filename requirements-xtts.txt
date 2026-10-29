@@ -1,0 +1,23 @@
+# Isolated venv for coqui XTTS (coqui/XTTS-v2).
+#
+# coqui-tts needs a transformers the coderai server cannot have, so it runs in
+# its own venv and coderai talks to it over a pipe (codai/api/xtts_worker.py +
+# tools/xtts_service.py). Do NOT merge these into requirements.txt.
+#
+# torch is PINNED here, which is the point of the file. `pip install coqui-tts
+# soundfile requests` — what this used to do — installed coqui-tts 0.28.0 and
+# its 90 dependencies and NO torch at all, so the venv built, the install
+# reported success, and `import TTS` failed. Measured on zeiss, 2026-10-29.
+#
+# The pair has to be pinned together: parler's venv got a torchaudio pip had
+# resolved against a different torch, the install succeeded, and the import
+# failed on the mismatch. 2.6.0 because torchaudio has no python-3.13 wheel
+# before it. An operator on a newer CUDA can raise both.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+
+coqui-tts
+soundfile>=0.12.0
+requests>=2.28.0
