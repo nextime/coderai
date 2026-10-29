@@ -5533,10 +5533,37 @@ class MultiModelManager:
         # Report what we actually freed so a failure to free is visible.
         _free_after = self._get_free_vram_gb()
         if _free_after < needed_gb:
+            # Say WHICH of the three it was. The old wording blamed "busy
+            # models or VRAM held elsewhere" unconditionally, and that was
+            # usually false: measured over one production day, 10 of 12 of
+            # these were a model asking for more than the entire card (25.4 to
+            # 40.0 GB against 25.3 GB usable) and FOUR of them printed
+            # "freed 0.0 GB (now 25.3 GB free)" -- i.e. the card was already
+            # completely empty. Not one was blocked by a busy model.
+            #
+            # That matters because the message is the first thing anyone reads
+            # when a model lands on the CPU, and it pointed at the scheduler
+            # when the real causes were an under-declared size and a model
+            # larger than the GPU.
+            _total_gb = 0.0
+            try:
+                _total_gb = self._total_vram_gb()
+            except Exception:
+                _total_gb = 0.0
+            if _total_gb and needed_gb > _total_gb:
+                _why = (f"this model needs more than the whole card "
+                        f"({needed_gb:.1f} GB needed, {_total_gb:.1f} GB "
+                        f"total) — eviction cannot help; quantize it further "
+                        f"or correct used_vram_gb if that figure is wrong")
+            elif _free_after >= _free_before + 0.1:
+                _why = (f"freed what it could; {needed_gb - _free_after:.1f} GB "
+                        f"short, held by a busy model or another process")
+            else:
+                _why = ("nothing could be freed; either the card is already "
+                        "empty or every other owner is outside this engine")
             print(f"  ⚠ Eviction freed {_free_after - _free_before:.1f} GB "
-                  f"(now {_free_after:.1f} GB free, needed {needed_gb:.1f} GB). "
-                  f"Remaining models are busy or VRAM is held elsewhere — the new "
-                  f"model will load with CPU/disk offload.")
+                  f"(now {_free_after:.1f} GB free, needed {needed_gb:.1f} GB): "
+                  f"{_why} — the new model will load with CPU/disk offload.")
 
     def release_idle_vram(self, needed_gb: float = 0.0,
                           wait_for_busy: bool = False,

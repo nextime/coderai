@@ -150,6 +150,28 @@ def _discover_components(model_name: str) -> Dict[str, Any]:
     return out
 
 
+#: Components worth quantizing beyond the unet/SD-era shortlist.
+#: A modern video pipeline carries several multi-GB, Linear-heavy parts whose
+#: names start with neither "transformer" nor "text_encoder", so they were
+#: never candidates. Measured 2026-10-29 on LTX-2.5: connectors (11.82 GB) and
+#: prompt_enhancer (9.51 GB) between them outweigh its quantized transformer,
+#: and both loaded at full precision -- 21.3 GB of a 25.3 GB card before the
+#: transformer arrived.
+_ALSO_QUANTIZABLE = ('connectors', 'prompt_enhancer', 'image_encoder',
+                     'text_encoder_2', 'text_encoder_3')
+
+
+def _is_quantizable_component(name: str) -> bool:
+    """Whether this component is a candidate for the GLOBAL quantization flag.
+
+    An explicit entry in ``component_quantization`` always wins over this; the
+    list only decides what ``load_in_4bit`` reaches on its own.
+    """
+    n = (name or '').lower()
+    return (n.startswith('transformer') or n == 'unet'
+            or n.startswith('text_encoder') or n in _ALSO_QUANTIZABLE)
+
+
 def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], dtype):
     """Build a diffusers PipelineQuantizationConfig from a per-model config.
 
@@ -279,11 +301,20 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
             if cfg_obj is not None:
                 quant_mapping[name] = cfg_obj
                 descs.append(f"{name}:{mode}")
-    else:
+    # The map REFINES the global flag; it does not replace it. Listing one
+    # component used to silence load_in_4bit for every OTHER component, which
+    # is the opposite of what setting both plainly means. Measured 2026-10-29
+    # on LTX-2.5 (load_in_4bit=True, map naming transformer + text_encoder):
+    # ten of its twelve components loaded at full precision, among them
+    # connectors at 11.82 GB and prompt_enhancer at 9.51 GB. An explicit
+    # "none"/"full" in the map still opts a component out.
+    if global_4 or global_8:
         mode = '4bit' if global_4 else '8bit'
-        targets = [n for n in comp_lib if _is_heavy(n)] or \
+        targets = [n for n in comp_lib if _is_quantizable_component(n)] or \
             ['transformer', 'transformer_2', 'text_encoder', 'unet']
         for name in targets:
+            if name in quant_mapping or name in comp_q:
+                continue          # the map already had its say for this one
             if _bnb_incompatible(name):
                 continue
             cfg_obj = _mk(comp_lib.get(name, 'diffusers'), mode)
@@ -1190,10 +1221,15 @@ def build_cached_components(model_name: str, cfg: Optional[Dict[str, Any]], dtyp
             mode = _normalize_quant_mode(raw)  # gguf/none/2bit -> not bnb here
             if mode in ('4bit', '8bit') and not _bnb_incompatible(name) and name in specs:
                 targets[name] = mode
-    else:
+    # Same rule as build_pipeline_quant_config: the map refines the global
+    # flag rather than replacing it, so a cached build quantizes exactly what
+    # a direct load would.
+    if global_4 or global_8:
         mode = '4bit' if global_4 else '8bit'
         for name in specs:
-            if _is_heavy(name) and not _bnb_incompatible(name):
+            if name in targets or name in comp_q:
+                continue
+            if _is_quantizable_component(name) and not _bnb_incompatible(name):
                 targets[name] = mode
     if not targets:
         return {}, ''
