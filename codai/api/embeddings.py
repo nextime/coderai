@@ -2381,84 +2381,71 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
                    "multimodal model (CLIP/SigLIP family, e.g. "
                    "sentence-transformers/clip-ViT-B-32 or jinaai/jina-clip-v2).")
 
-    # bge-m3 multi-vector path: returns dense + sparse (+ colbert) in one response,
-    # bypassing the dense-only vector pipeline below.
-    if getattr(model_obj, 'backend', None) == 'bge-m3':
-        return await _bge_m3_response(request, model_obj, texts, _emb_cfg)
-
-    # SPARSE/COLBERT ASKED OF A DENSE-ONLY BACKEND. Until 0.3.73 the
-    # `embedding_types` field was simply ignored here: a caller asking for
-    # sparse got a normal-looking response with only `embedding` in it and no
-    # indication that half of what it asked for does not exist on this path.
-    # Silence is the worst answer -- the caller's hybrid retrieval then runs on
-    # dense alone and merely scores worse, which reads as a model problem.
+    # Mark the model busy for the whole of the work below. Eviction consults
+    # multi_model_manager._is_key_busy() before unloading, and that reads two
+    # sources: the instance pool's ref counts, and external_busy. An embedding
+    # request appears in NEITHER -- it takes no pool ref, and until now nothing
+    # on this path called external_busy, whose only caller in the whole
+    # codebase was the lipsync engine.
     #
-    # vLLM is the case that matters in practice: it serves embeddings DENSE
-    # ONLY. bge-m3's sparse and colbert come from extra linear heads
-    # (sparse_linear.pt / colbert_linear.pt) applied to the last hidden state,
-    # which is a transformers forward pass this backend does not do. And a
-    # `coderai-vllm` pod cannot fall back to the native path either: it is a
-    # LIGHT-core image with no torch in its main venv by design, so
-    # _load_bge_m3 could not even import. The image that serves multi-vector is
-    # `coderai-embeddings` (full core, torch + transformers), where
-    # _is_bge_m3() detects the head and picks the path automatically.
-    _want_types = [str(t).strip().lower()
-                   for t in (getattr(request, 'embedding_types', None) or [])
-                   if str(t).strip()]
-    _extra = [t for t in _want_types if t and t != 'dense']
-    if _extra:
-        _b = getattr(model_obj, 'backend', None) or 'this backend'
-        raise HTTPException(
-            status_code=400,
-            detail=(f"Model '{model_name}' is being served by {_b}, which produces "
-                    f"DENSE vectors only — {', '.join(sorted(set(_extra)))} is not "
-                    f"available on this path. bge-m3's sparse/colbert come from "
-                    f"extra linear heads over the last hidden state, which needs "
-                    f"the native transformers backend. Serve the model on the "
-                    f"coderai-embeddings image (full core: torch + transformers), "
-                    f"where the multi-vector backend is selected automatically "
-                    f"from the repo's sparse_linear.pt. A coderai-vllm pod cannot "
-                    f"do it: no torch in its main venv, by design."))
+    # So an embedding model was, to the evictor, permanently idle. Measured on
+    # zeiss 2026-10-30, mid-sweep: a 9.3 GB load needed room, eviction picked
+    # the "idle" active embedder, _wait_until_idle agreed, the native model was
+    # freed under a request that was still running, and the engine took SIGSEGV
+    # (code -11) -- killing every other model resident on it. The 502s on
+    # /v1/embeddings that had been appearing for hours were this.
+    #
+    # Wrapped around the whole region rather than each inference call: there are
+    # seven call sites and several early returns, and the window that must be
+    # protected is "from having the model to being finished with it", not any
+    # one call.
+    with multi_model_manager.external_busy(model_key):
+        # bge-m3 multi-vector path: returns dense + sparse (+ colbert) in one
+        # response, bypassing the dense-only vector pipeline below.
+        if getattr(model_obj, 'backend', None) == 'bge-m3':
+            return await _bge_m3_response(request, model_obj, texts, _emb_cfg)
 
-    # Text vectors first, then image vectors — indices follow that order.
-    vectors: List[List[float]] = []
-    # How many windows each input needed. Reported when any was more than one:
-    # replacing a SILENT truncation with a silent pooling would be the same bug
-    # with a better answer.
-    _chunks: List[int] = []
-    try:
-        if texts:
-            vectors += await asyncio.get_event_loop().run_in_executor(
-                None, _embed_texts, model_obj, texts, request.dimensions,
-                _chunks, model_key)
-        if images:
-            vectors += await asyncio.get_event_loop().run_in_executor(
-                None, _embed_images, model_obj, images, request.dimensions)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        # Encode-time CUDA OOM: another workload grabbed the card's remaining
-        # VRAM mid-flight (no room left for the forward pass's scratch buffers).
-        # Behave like any other model — evict idle models / wait on busy ones —
-        # then retry the encode once.
-        s = str(e)
-        if not ('CUDA' in s or 'CUBLAS' in s or 'out of memory' in s.lower()):
-            raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
-        print(f"[embeddings] encode OOM ({s[:100]}) — evicting to make room and retrying")
+        # SPARSE/COLBERT ASKED OF A DENSE-ONLY BACKEND. Until 0.3.73 the
+        # `embedding_types` field was simply ignored here: a caller asking for
+        # sparse got a normal-looking response with only `embedding` in it and no
+        # indication that half of what it asked for does not exist on this path.
+        # Silence is the worst answer -- the caller's hybrid retrieval then runs on
+        # dense alone and merely scores worse, which reads as a model problem.
+        #
+        # vLLM is the case that matters in practice: it serves embeddings DENSE
+        # ONLY. bge-m3's sparse and colbert come from extra linear heads
+        # (sparse_linear.pt / colbert_linear.pt) applied to the last hidden state,
+        # which is a transformers forward pass this backend does not do. And a
+        # `coderai-vllm` pod cannot fall back to the native path either: it is a
+        # LIGHT-core image with no torch in its main venv by design, so
+        # _load_bge_m3 could not even import. The image that serves multi-vector is
+        # `coderai-embeddings` (full core, torch + transformers), where
+        # _is_bge_m3() detects the head and picks the path automatically.
+        _want_types = [str(t).strip().lower()
+                       for t in (getattr(request, 'embedding_types', None) or [])
+                       if str(t).strip()]
+        _extra = [t for t in _want_types if t and t != 'dense']
+        if _extra:
+            _b = getattr(model_obj, 'backend', None) or 'this backend'
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Model '{model_name}' is being served by {_b}, which produces "
+                        f"DENSE vectors only — {', '.join(sorted(set(_extra)))} is not "
+                        f"available on this path. bge-m3's sparse/colbert come from "
+                        f"extra linear heads over the last hidden state, which needs "
+                        f"the native transformers backend. Serve the model on the "
+                        f"coderai-embeddings image (full core: torch + transformers), "
+                        f"where the multi-vector backend is selected automatically "
+                        f"from the repo's sparse_linear.pt. A coderai-vllm pod cannot "
+                        f"do it: no torch in its main venv, by design."))
+
+        # Text vectors first, then image vectors — indices follow that order.
+        vectors: List[List[float]] = []
+        # How many windows each input needed. Reported when any was more than one:
+        # replacing a SILENT truncation with a silent pooling would be the same bug
+        # with a better answer.
+        _chunks: List[int] = []
         try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        try:
-            # Only scratch room is needed (the model is already resident) — and
-            # marking it active first keeps the eviction pass off the embedding
-            # model itself while it frees other idle models.
-            multi_model_manager.active_in_vram = model_key
-            await asyncio.get_event_loop().run_in_executor(
-                None, multi_model_manager._evict_models_for_vram, 2.0)
-            vectors = []
-            _chunks = []
             if texts:
                 vectors += await asyncio.get_event_loop().run_in_executor(
                     None, _embed_texts, model_obj, texts, request.dimensions,
@@ -2466,89 +2453,121 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
             if images:
                 vectors += await asyncio.get_event_loop().run_in_executor(
                     None, _embed_images, model_obj, images, request.dimensions)
-        except ValueError as e2:
-            raise HTTPException(status_code=400, detail=str(e2))
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=f"Embedding failed: {e2}")
-
-    # Optional TurboQuant vector quantization (data-free, inner-product preserving).
-    # The per-model config block (turboquant: {enabled, backend, bits}) is the
-    # source of truth for enable/disable + which implementation to use; the
-    # per-request `quantization` field triggers it and can override the bit width.
-    from codai.models import turboquant as _tq
-    _raw = _emb_cfg.get('_raw_cfg') if isinstance(_emb_cfg.get('_raw_cfg'), dict) else {}
-    tq_cfg = _emb_cfg.get('turboquant') or _raw.get('turboquant') or {}
-    tq_enabled = tq_cfg.get('enabled', None)         # None = no explicit model setting
-    tq_backend = (tq_cfg.get('backend') or 'builtin')
-
-    quant_meta = None
-    quant_bits = None
-    req_spec = getattr(request, 'quantization', None)
-    if not req_spec and tq_enabled and tq_cfg.get('bits'):
-        req_spec = f"turbo{tq_cfg.get('bits')}"   # model-configured default
-    if req_spec:
-        if tq_enabled is False:
-            raise HTTPException(
-                status_code=400,
-                detail="TurboQuant is disabled for this model (enable it in the "
-                       "model configuration).")
-        quant_bits = _tq._parse_quant_spec(req_spec)
-        if quant_bits is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported quantization '{req_spec}' "
-                       "(use 'turbo'/'turbo8'/'turbo6'/'turbo4'/'turbo2')")
-
-    if quant_bits is not None and request.encoding_format == 'base64':
-        # Compact wire form: each embedding is base64 of [f16 norm][packed codes].
-        # The compact packing is the built-in wire format regardless of backend
-        # (the upstream library exposes its own opaque store, not per-vector blobs).
-        blobs, meta = await asyncio.get_event_loop().run_in_executor(
-            None, _tq.quantize_base64, vectors, quant_bits)
-        data = [EmbeddingObject(index=i, embedding=b) for i, b in enumerate(blobs)]
-        quant_meta = {
-            "method": meta.method, "bits": meta.bits, "seed": meta.seed,
-            "dim": meta.dim, "dim_padded": meta.dim_padded, "radius": meta.radius,
-            "bytes_per_vector": meta.bytes_per_vector, "backend": "builtin",
-            "layout": "base64([float16 norm][packbits(rotated b-bit codes, MSB-first per numpy.packbits)])",
-        }
-    elif quant_bits is not None:
-        # Lossy reconstruction returned as plain floats (quantized-store fidelity).
-        try:
-            vectors = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _tq.reconstruct(vectors, quant_bits, backend=tq_backend))
-        except RuntimeError as e:
+        except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        data = [EmbeddingObject(index=i, embedding=v) for i, v in enumerate(vectors)]
-        eff_backend = tq_backend if tq_backend != 'auto' else _tq.backend_name()
-        quant_meta = {"method": "turboquant", "bits": quant_bits,
-                      "encoding": "float-reconstruction", "backend": eff_backend}
-    elif request.encoding_format == 'base64':
-        import struct
-        data = [EmbeddingObject(
-            index=i,
-            embedding=base64.b64encode(struct.pack(f'{len(v)}f', *v)).decode()
-        ) for i, v in enumerate(vectors)]
-    else:
-        data = [EmbeddingObject(index=i, embedding=v) for i, v in enumerate(vectors)]
+        except Exception as e:
+            # Encode-time CUDA OOM: another workload grabbed the card's remaining
+            # VRAM mid-flight (no room left for the forward pass's scratch buffers).
+            # Behave like any other model — evict idle models / wait on busy ones —
+            # then retry the encode once.
+            s = str(e)
+            if not ('CUDA' in s or 'CUBLAS' in s or 'out of memory' in s.lower()):
+                raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+            print(f"[embeddings] encode OOM ({s[:100]}) — evicting to make room and retrying")
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                # Only scratch room is needed (the model is already resident) — and
+                # marking it active first keeps the eviction pass off the embedding
+                # model itself while it frees other idle models.
+                multi_model_manager.active_in_vram = model_key
+                await asyncio.get_event_loop().run_in_executor(
+                    None, multi_model_manager._evict_models_for_vram, 2.0)
+                vectors = []
+                _chunks = []
+                if texts:
+                    vectors += await asyncio.get_event_loop().run_in_executor(
+                        None, _embed_texts, model_obj, texts, request.dimensions,
+                        _chunks, model_key)
+                if images:
+                    vectors += await asyncio.get_event_loop().run_in_executor(
+                        None, _embed_images, model_obj, images, request.dimensions)
+            except ValueError as e2:
+                raise HTTPException(status_code=400, detail=str(e2))
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"Embedding failed: {e2}")
 
-    total_tokens = sum(len(t.split()) for t in texts)
-    resp = EmbeddingsResponse(
-        data=data,
-        model=request.model,
-        usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens},
-    )
-    if quant_meta is not None:
-        resp.quantization = quant_meta
-    # SAY SO when an input did not fit. Before 0.3.72 a long document was
-    # truncated and the response looked identical to one that fit -- a caller
-    # had no way to tell an embedding of a document from an embedding of its
-    # first page. Chunking without reporting would keep that blindness.
-    if any(c > 1 for c in (_chunks or [])):
-        _m, _p = _embed_chunk_cfg(model_key)
-        resp.chunked = {"windows": list(_chunks), "pool": _p}
-        _n = sum(1 for c in _chunks if c > 1)
-        print(f"[embeddings] {_n} of {len(_chunks)} input(s) exceeded the model's "
-              f"window and were embedded in {max(_chunks)} window(s) at most, "
-              f"pooled by {_p}", flush=True)
-    return resp
+        # Optional TurboQuant vector quantization (data-free, inner-product preserving).
+        # The per-model config block (turboquant: {enabled, backend, bits}) is the
+        # source of truth for enable/disable + which implementation to use; the
+        # per-request `quantization` field triggers it and can override the bit width.
+        from codai.models import turboquant as _tq
+        _raw = _emb_cfg.get('_raw_cfg') if isinstance(_emb_cfg.get('_raw_cfg'), dict) else {}
+        tq_cfg = _emb_cfg.get('turboquant') or _raw.get('turboquant') or {}
+        tq_enabled = tq_cfg.get('enabled', None)         # None = no explicit model setting
+        tq_backend = (tq_cfg.get('backend') or 'builtin')
+
+        quant_meta = None
+        quant_bits = None
+        req_spec = getattr(request, 'quantization', None)
+        if not req_spec and tq_enabled and tq_cfg.get('bits'):
+            req_spec = f"turbo{tq_cfg.get('bits')}"   # model-configured default
+        if req_spec:
+            if tq_enabled is False:
+                raise HTTPException(
+                    status_code=400,
+                    detail="TurboQuant is disabled for this model (enable it in the "
+                           "model configuration).")
+            quant_bits = _tq._parse_quant_spec(req_spec)
+            if quant_bits is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported quantization '{req_spec}' "
+                           "(use 'turbo'/'turbo8'/'turbo6'/'turbo4'/'turbo2')")
+
+        if quant_bits is not None and request.encoding_format == 'base64':
+            # Compact wire form: each embedding is base64 of [f16 norm][packed codes].
+            # The compact packing is the built-in wire format regardless of backend
+            # (the upstream library exposes its own opaque store, not per-vector blobs).
+            blobs, meta = await asyncio.get_event_loop().run_in_executor(
+                None, _tq.quantize_base64, vectors, quant_bits)
+            data = [EmbeddingObject(index=i, embedding=b) for i, b in enumerate(blobs)]
+            quant_meta = {
+                "method": meta.method, "bits": meta.bits, "seed": meta.seed,
+                "dim": meta.dim, "dim_padded": meta.dim_padded, "radius": meta.radius,
+                "bytes_per_vector": meta.bytes_per_vector, "backend": "builtin",
+                "layout": "base64([float16 norm][packbits(rotated b-bit codes, MSB-first per numpy.packbits)])",
+            }
+        elif quant_bits is not None:
+            # Lossy reconstruction returned as plain floats (quantized-store fidelity).
+            try:
+                vectors = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _tq.reconstruct(vectors, quant_bits, backend=tq_backend))
+            except RuntimeError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            data = [EmbeddingObject(index=i, embedding=v) for i, v in enumerate(vectors)]
+            eff_backend = tq_backend if tq_backend != 'auto' else _tq.backend_name()
+            quant_meta = {"method": "turboquant", "bits": quant_bits,
+                          "encoding": "float-reconstruction", "backend": eff_backend}
+        elif request.encoding_format == 'base64':
+            import struct
+            data = [EmbeddingObject(
+                index=i,
+                embedding=base64.b64encode(struct.pack(f'{len(v)}f', *v)).decode()
+            ) for i, v in enumerate(vectors)]
+        else:
+            data = [EmbeddingObject(index=i, embedding=v) for i, v in enumerate(vectors)]
+
+        total_tokens = sum(len(t.split()) for t in texts)
+        resp = EmbeddingsResponse(
+            data=data,
+            model=request.model,
+            usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+        )
+        if quant_meta is not None:
+            resp.quantization = quant_meta
+        # SAY SO when an input did not fit. Before 0.3.72 a long document was
+        # truncated and the response looked identical to one that fit -- a caller
+        # had no way to tell an embedding of a document from an embedding of its
+        # first page. Chunking without reporting would keep that blindness.
+        if any(c > 1 for c in (_chunks or [])):
+            _m, _p = _embed_chunk_cfg(model_key)
+            resp.chunked = {"windows": list(_chunks), "pool": _p}
+            _n = sum(1 for c in _chunks if c > 1)
+            print(f"[embeddings] {_n} of {len(_chunks)} input(s) exceeded the model's "
+                  f"window and were embedded in {max(_chunks)} window(s) at most, "
+                  f"pooled by {_p}", flush=True)
+        return resp
