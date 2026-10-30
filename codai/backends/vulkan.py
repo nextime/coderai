@@ -661,6 +661,15 @@ def _install_layer_log_callback():
         'offload', 'layer', 'buffer size', 'buffer type',
         'GPU', 'CUDA', 'Vulkan', 'Metal', 'ROCm', 'SYCL',
         'CPU', 'VRAM', 'n_layer', 'n_gpu_layers',
+        # The multimodal path, which was invisible here. Measured on a GGUF
+        # model with a configured mmproj: two completely different pictures
+        # produced byte-identical descriptions, while the same prompt with NO
+        # image answered differently -- so the images reached the model and
+        # their content did not. Everything mtmd does to get a bitmap into the
+        # prompt (projector init, marker substitution, bitmap decode, chunk
+        # eval) logs under these names and none of them appear above, so there
+        # was nothing in the log to read either way.
+        'mtmd', 'clip', 'bitmap', 'media', 'vision', 'projector', 'n_embd',
     )
 
     @_llama_cpp.llama_log_callback

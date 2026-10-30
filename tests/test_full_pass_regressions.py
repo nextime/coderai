@@ -316,3 +316,16 @@ def test_the_xtts_worker_recognises_an_org_less_alias():
     # Already coqui's own four-part naming, and an unrelated model: untouched.
     assert mod._coqui_name(four) == four
     assert mod._coqui_name("some/other-model") == "some/other-model"
+
+
+def test_the_multimodal_path_is_visible_in_the_log():
+    """Two different pictures produced byte-identical descriptions from a GGUF
+    model with a configured mmproj, while the same prompt with no image
+    answered differently — the images reached the model and their content did
+    not. Nothing mtmd does was printed: projector init, marker substitution,
+    bitmap decode and chunk eval all log under names the filter did not have."""
+    src = _src("codai/backends/vulkan.py")
+    head = src.index("_KEEP = (")
+    keep = src[head:src.index("\n    )", head)]
+    for word in ("mtmd", "clip", "bitmap", "media", "projector"):
+        assert f"'{word}'" in keep, word
