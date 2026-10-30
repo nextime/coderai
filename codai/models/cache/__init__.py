@@ -358,10 +358,22 @@ def download_model(model_path: str, cache_dir: Optional[str] = None, file_patter
         cached_filename = f"{url_hash}_{filename}"
         cached_path = os.path.join(cache_dir, cached_filename)
 
-        # Check if already cached (double-check)
+        # Check if already cached. Size matters, not just existence: a download
+        # that died left a ZERO-BYTE file here, and an existence-only check
+        # returned it for ever as a valid hit -- so that URL could never be
+        # fetched again and whatever loaded it got an empty file. Measured on
+        # zeiss 2026-10-30: 188 such entries, accruing about 14 a day since
+        # 2026-10-16, against 2 real models in the same directory.
         if os.path.exists(cached_path):
-            print(f"Using cached model: {cached_path}")
-            return cached_path
+            if os.path.getsize(cached_path) > 0:
+                print(f"Using cached model: {cached_path}")
+                return cached_path
+            print(f"Discarding a zero-byte cache entry from a failed download: "
+                  f"{cached_path}")
+            try:
+                os.remove(cached_path)
+            except OSError:
+                pass
 
         # Download
         print(f"Downloading model: {url}")
@@ -374,11 +386,17 @@ def download_model(model_path: str, cache_dir: Optional[str] = None, file_patter
         downloaded = 0
         start_time = time.time()
 
-        with open(cached_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192*1024):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
+        # Write to a .partial and rename only once the bytes are all here, so an
+        # interrupted download cannot be mistaken for a cached model. open(...,
+        # 'wb') on the final path created the file before a single byte arrived,
+        # which is where the zero-byte entries came from.
+        partial_path = cached_path + '.partial'
+        try:
+            with open(partial_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192*1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
                     if total_size > 0:
                         percent = (downloaded / total_size) * 100
                         elapsed = time.time() - start_time
@@ -386,6 +404,22 @@ def download_model(model_path: str, cache_dir: Optional[str] = None, file_patter
                         speed_mb = speed / (1024 * 1024)
                         dl_mb = downloaded / (1024 * 1024)
                         print(f"Downloaded: {percent:.1f}% ({dl_mb:.1f}/{total_mb:.1f} MB) at {speed_mb:.1f} MB/s", end='\r')
+            if downloaded == 0:
+                raise IOError(f"the server sent no data for {url}")
+            if total_size > 0 and downloaded < total_size:
+                raise IOError(f"truncated download for {url}: got {downloaded} "
+                              f"of {total_size} bytes")
+            os.replace(partial_path, cached_path)
+        except BaseException:
+            # Leave nothing behind that a later run could read as a cache hit.
+            # BaseException, not Exception: a KeyboardInterrupt or a SystemExit
+            # mid-download is exactly how several of these were created.
+            try:
+                if os.path.exists(partial_path):
+                    os.remove(partial_path)
+            except OSError:
+                pass
+            raise
 
         print()  # New line after progress
         print(f"Downloaded and cached to: {cached_path}")
