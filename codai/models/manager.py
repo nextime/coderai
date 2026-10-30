@@ -3736,7 +3736,11 @@ class MultiModelManager:
             pass
 
     def _quant_signature(self, cfg: dict) -> str:
-        """Hash of the settings that decide how big the built weights are.
+        """Hash of the settings that decide how much of the card a load needs.
+
+        Weights-and-KV, not weights alone: a measurement taken under one KV
+        configuration says nothing about another, and a stale one is worse than
+        none because the learned GPU-layer split is reused as a cap.
 
         Deliberately does NOT include the model name. The signature is stored
         on one model's own entry, so identity is already implied -- and the
@@ -3757,6 +3761,23 @@ class MultiModelManager:
                 "load_in_4bit": bool(c.get("load_in_4bit", False)),
                 "load_in_8bit": bool(c.get("load_in_8bit", False)),
                 "component_quantization": c.get("component_quantization") or {},
+                # How the KV cache is sized and placed. It is not "how big the
+                # weights are", but it decides how much of the card is left for
+                # them, and therefore how many layers fit -- which is what
+                # measured_n_gpu_layers records.
+                #
+                # Measured 2026-10-30: setting swa_full=False on a gemma card cut
+                # its KV reservation by about 19 GB (the 25 sliding layers stop
+                # reserving the full 178k context), so the learned split of 18
+                # layers became far too conservative -- and without this it would
+                # have survived the change and pinned the model to CPU anyway.
+                # That is the layer-ratchet bug again, arriving through a
+                # setting the signature did not watch.
+                "n_ctx": c.get("n_ctx"),
+                "swa_full": c.get("swa_full"),
+                "cache_type_k": c.get("cache_type_k"),
+                "cache_type_v": c.get("cache_type_v"),
+                "kv_offload": c.get("kv_offload", c.get("offload_kqv")),
             }
             blob = _json.dumps(payload, sort_keys=True, default=str)
             return hashlib.sha256(blob.encode()).hexdigest()[:16]
