@@ -52,12 +52,19 @@ def _read_val(f, vt):
 
 
 def read_layout(path) -> dict:
-    """Declared vs. present block layout of a GGUF.
+    """Declared vs. present block layout of a GGUF, and its tensor types.
 
-    Returns ``{arch, block_count, nextn, blocks_present, contiguous}``, or ``{}``
-    when the header cannot be read. Unlike the other GGUF probes in this package
-    this one walks the tensor *index* as well — the whole question is which
-    blocks the file actually carries — but it still reads no tensor data.
+    Returns ``{arch, block_count, nextn, blocks_present, contiguous,
+    tensor_types}``, or ``{}`` when the header cannot be read. Unlike the other
+    GGUF probes in this package this one walks the tensor *index* as well — the
+    whole question is which blocks the file actually carries — but it still reads
+    no tensor data.
+
+    ``tensor_types`` is the ggml type id histogram, ``{type_id: count}``. It is
+    collected here because this walk already passes every type field, and
+    :mod:`codai.backends.gguf_preflight` needs it to answer whether the loaded
+    llama.cpp can read the file at all. Four GGUF header parsers in one package
+    is three too many, so this one is shared rather than copied.
     """
     if not path:
         return {}
@@ -83,12 +90,14 @@ def read_layout(path) -> dict:
                 elif key.endswith('.nextn_predict_layers'):
                     nextn = int(val)
             blocks = set()
+            types: dict = {}
             for _ in range(n_tensors):
                 name = _read_str(f)
                 n_dims = struct.unpack('<I', f.read(4))[0]
                 f.read(8 * n_dims)                              # dims
-                f.read(4)                                       # ggml type
+                ttype = struct.unpack('<I', f.read(4))[0]       # ggml type
                 f.read(8)                                       # offset
+                types[ttype] = types.get(ttype, 0) + 1
                 if name.startswith('blk.'):
                     part = name.split('.', 2)[1]
                     if part.isdigit():
@@ -99,6 +108,7 @@ def read_layout(path) -> dict:
                 'nextn': nextn,
                 'blocks_present': len(blocks),
                 'contiguous': bool(blocks) and blocks == set(range(len(blocks))),
+                'tensor_types': types,
             }
     except Exception:
         out = {}

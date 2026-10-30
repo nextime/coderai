@@ -960,6 +960,34 @@ async def host_ram_exhausted_handler(request: Request, exc: HostRamExhausted):
     )
 
 
+from codai.backends.gguf_preflight import GgufUnreadable
+
+
+@app.exception_handler(GgufUnreadable)
+async def gguf_unreadable_handler(request: Request, exc: GgufUnreadable):
+    """A load was refused because this build cannot read the file.
+
+    501, not 503: unlike the host-RAM refusal this is not transient and no
+    amount of evicting or retrying changes it. The file stores weights in a
+    quantization format the installed llama.cpp has no implementation for, so
+    the honest answer is that the server will not be able to serve this model
+    until it is replaced or the engine is upgraded — and a client that retries a
+    503 forever should not be invited to.
+
+    The type ids are carried out because they are the actionable part and
+    nothing else reports them: they live in the GGUF tensor index, which no
+    error message reads back to you.
+    """
+    return JSONResponse(
+        status_code=501,
+        content={"error": {"message": str(exc),
+                           "type": "unsupported_model_format",
+                           "param": exc.path,
+                           "code": "gguf_unreadable",
+                           "tensor_types": {str(k): v for k, v in exc.types.items()}}},
+    )
+
+
 @app.get("/v1/models", response_model=ModelList, summary="List available models", tags=["Core"])
 async def list_models():
     """List available models."""

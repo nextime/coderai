@@ -1716,6 +1716,19 @@ class VulkanBackend(ModelBackend):
         # — indistinguishable, from the outside, from a truncated download. When
         # the file's shape proves that is what happened, correct the count here;
         # see codai/backends/gguf_mtp.py for the conditions.
+        # Say which architecture is being attempted. llama.cpp reports an
+        # architecture it does not implement as "unknown model architecture:
+        # '<name>'", which names the thing but not the file; printing it here
+        # means the two are already side by side in the log instead of needing
+        # the GGUF header read by hand to connect them.
+        try:
+            from codai.backends import gguf_preflight as _pf
+            _arch = _pf.architecture(model_path)
+            if _arch:
+                print(f"  arch         : {_arch}")
+        except Exception:
+            pass
+
         _kv_over = dict(_raw_cfg.get('kv_overrides') or {})
         if bool(_raw_cfg.get('mtp_block_fix', True)):
             from codai.backends import gguf_mtp

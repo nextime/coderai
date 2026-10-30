@@ -311,6 +311,45 @@ _SEED_CACHE = None
 _REMOTE_BACKENDS = ("runpod", "remote", "node", "cluster")
 
 
+def _gguf_unreadable_reason(*names):
+    """``(why, path, types)`` when llama.cpp cannot read this GGUF, else None.
+
+    Called before eviction, because a model that cannot possibly load has no
+    business turning other models out of the card first. Measured on zeiss: a
+    27B quant that looked perfect — right architecture, every block present, an
+    mmproj beside it — stored 402 of its 866 tensors in ggml type 143, a format
+    from a fork. Nothing in the metadata says so, and the failure arrived after
+    the eviction, six load attempts and a full read of the weights.
+
+    Returns '' for anything it cannot decide, which is most things: a non-GGUF
+    model, a path that is not local, a header it cannot parse, or a process
+    without llama_cpp (the front has no CUDA libraries, so the import fails
+    there and the check simply does not run — the engine, which is where this
+    is reached before a GGUF load, has it).
+    """
+    import os as _os
+    for name in names:
+        entry = _model_entry_for(name) if name else None
+        path = (entry or {}).get('path') or (name if isinstance(name, str) else '')
+        if not isinstance(path, str) or not path.lower().endswith('.gguf'):
+            continue
+        if not _os.path.isfile(path):
+            continue
+        try:
+            import llama_cpp as _lc
+            from codai.backends import gguf_preflight as _pf
+            bound = getattr(_lc, 'GGML_TYPE_COUNT', None)
+            if not bound:
+                return ''
+            bad = _pf.unsupported_tensor_types(path, bound)
+            if bad:
+                return (_pf.explain_tensor_types(path, bad, bound), path, bad)
+        except Exception:
+            return None
+        return None
+    return None
+
+
 def _model_entry_for(model_name: str):
     """The models.json entry (dict) matching ``model_name`` by path / basename /
     alias / id, or None."""
@@ -2320,8 +2359,15 @@ class MultiModelManager:
                 # direct on-demand path, which otherwise loads on top of the
                 # current model and OOMs (e.g. switching to a larger model).
                 if inst_num == 1:
+                    from codai.backends.gguf_preflight import GgufUnreadable
                     try:
                         self.ensure_vram_for(model_name, requested_id=requested_id)
+                    except GgufUnreadable:
+                        # A verdict, not a reservation failure: this build cannot
+                        # read the file at all, so the load below would fail a
+                        # minute later with llama.cpp's own wording after evicting
+                        # whatever was resident. Let it reach the caller.
+                        raise
                     except Exception as _ev_e:
                         print(f"  (ensure_vram_for warning: {_ev_e})")
                     # Outside that except on purpose: a VRAM reservation failing
@@ -6116,6 +6162,14 @@ class MultiModelManager:
         for _k in (model_key, resolved_name, requested_id):
             if _k and _k in self.models:
                 return
+        # Before anything is turned out of the card: can this file be read at
+        # all? Cheap (header + tensor index, no weights) and it keeps a load
+        # that was never going to work from costing every other resident model.
+        _verdict = _gguf_unreadable_reason(model_key, resolved_name, requested_id)
+        if _verdict:
+            from codai.backends.gguf_preflight import GgufUnreadable
+            _why, _path, _types = _verdict
+            raise GgufUnreadable(f"{model_key}: {_why}", path=_path, types=_types)
         needed_gb = self._get_model_used_vram_gb(model_key, resolved_name, requested_id)
         if extra_vram_gb and extra_vram_gb > 0:
             needed_gb += extra_vram_gb
