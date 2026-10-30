@@ -2219,6 +2219,10 @@ class MultiModelManager:
                         self.ensure_vram_for(model_name, requested_id=requested_id)
                     except Exception as _ev_e:
                         print(f"  (ensure_vram_for warning: {_ev_e})")
+                    # Outside that except on purpose: a VRAM reservation failing
+                    # is a warning (the load can still work), while a host-RAM
+                    # refusal is the decision itself and must reach the caller.
+                    self.ensure_host_ram_for(model_name, requested_id=requested_id)
                 _snap = self.vram_before_load()
                 _ram_snap = self._get_own_ram_gb()
                 # Tell the backend how much VRAM this model is expected to need so
@@ -6019,6 +6023,130 @@ class MultiModelManager:
                   f"have {free_gb:.1f} GB free — evicting models to make room")
             self._evict_models_for_vram(needed_gb)
 
+    @staticmethod
+    def _ram_admission_enabled() -> bool:
+        """Whether a load may be refused for want of host RAM (default True)."""
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            return bool(getattr(ga, 'ram_admission', True)) if ga else True
+        except Exception:
+            return True
+
+    @staticmethod
+    def _ram_admission_floor_gb() -> float:
+        """Host RAM never promised to a load, in GB."""
+        from codai.models import host_ram
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            val = getattr(ga, 'ram_admission_floor_gb', None) if ga else None
+            return float(val) if val is not None else host_ram.DEFAULT_FLOOR_GB
+        except Exception:
+            return host_ram.DEFAULT_FLOOR_GB
+
+    def _host_ram_budget(self):
+        """The host-RAM budget a load may take right now."""
+        from codai.models import host_ram, proc_mem
+        return host_ram.budget(
+            kernel_available_gb=proc_mem.host_available_gb(),
+            cap_gb=self._ram_cap_gb(),
+            fleet_held_gb=self._get_process_ram_gb(),
+            floor_gb=self._ram_admission_floor_gb(),
+        )
+
+    def ensure_host_ram_for(self, model_key: str, resolved_name: str = None,
+                            requested_id: str = None, cfg: dict = None) -> None:
+        """Refuse a load that cannot fit in host RAM, before it starts.
+
+        The counterpart of :meth:`ensure_vram_for`, and the reason it exists is
+        that it had none. VRAM pressure is answered by eviction and, failing
+        that, by a CUDA OOM the server catches and reports. Host-RAM pressure is
+        answered by the kernel's OOM killer, which takes the whole engine with
+        it: four times in five hours on a 54 GB host the night this was written,
+        each time while an unquantized card staged its weights, each time
+        reported to the client as "crashes the engine" (see
+        :mod:`codai.models.host_ram`).
+
+        So the ladder here ends differently. Make room first -- trim, then evict
+        idle models, exactly as RAM pressure is handled elsewhere -- and if the
+        load still does not fit, raise :class:`~codai.models.host_ram.HostRamExhausted`.
+        One model then fails with its size, the budget and the fix, while every
+        other model keeps serving.
+
+        Never refuses a model that is already resident (it is not about to
+        allocate anything), and never refuses on a footprint it could not
+        determine.
+        """
+        from codai.models import host_ram
+        if not self._ram_admission_enabled():
+            return
+        for _k in (model_key, resolved_name, requested_id):
+            if _k and _k in self.models:
+                return
+
+        if cfg is None:
+            cfg = {}
+            for _k in (model_key, resolved_name, requested_id):
+                if _k and _k in self.config:
+                    cfg = self.config.get(_k) or {}
+                    break
+
+        try:
+            _measured = cfg.get("measured_ram_gb")
+            _measured = float(_measured) if _measured else None
+        except (TypeError, ValueError):
+            _measured = None
+
+        need = host_ram.estimate_need(
+            total_need_gb=self._get_model_used_vram_gb(
+                model_key, resolved_name, requested_id),
+            free_vram_gb=self._get_free_vram_gb(),
+            measured_ram_gb=_measured,
+            offload_strategy=cfg.get("offload_strategy"),
+            no_ram=bool(cfg.get("no_ram")),
+        )
+        bud = self._host_ram_budget()
+        if host_ram.verdict(need, bud).ok:
+            return
+        if need.basis == "unknown":
+            # Nothing was ever measured or configured for this model, so the
+            # only figure on the table is the load buffer — a guess about every
+            # model rather than a fact about this one. Refusing on it would
+            # block a 300 MB embedder on a tight host for no reason. Say that
+            # the protection does not cover this load, and let it proceed.
+            print(f"Loading '{model_key}': host-RAM admission has no footprint "
+                  f"for this model, so it cannot be checked — proceeding "
+                  f"unguarded (budget {bud.gb:.1f} GB; {bud.detail})")
+            return
+
+        print(f"Loading '{model_key}': needs ~{need.gb:.1f} GB host RAM "
+              f"({need.detail}), budget is {bud.gb:.1f} GB ({bud.detail}) — "
+              f"freeing host RAM before deciding")
+        try:
+            _trim_cpu_ram()
+        except Exception:
+            pass
+        if self._evict_idle_on_ram_enabled():
+            _cap = self._ram_cap_gb()
+            if _cap:
+                self._evict_models_for_ram(_cap * 0.85)
+            else:
+                # No cap configured, so there is no target to evict towards --
+                # free what has gone quiet and re-measure against the kernel's
+                # figure. 30 s rather than "any idle model": a model being used
+                # in a request loop is idle between its own requests, and pulling
+                # it to admit another load just trades one reload for another.
+                self.unload_idle_models(30.0)
+
+        bud = self._host_ram_budget()
+        if host_ram.verdict(need, bud).ok:
+            print(f"  host RAM freed — {bud.gb:.1f} GB now available, load admitted")
+            return
+        raise host_ram.HostRamExhausted(
+            str(requested_id or resolved_name or model_key), need, bud,
+            host_ram.remedy_for(cfg, need.basis))
+
     def request_model(self, requested_model: str, model_type: str = None,
                       extra_vram_gb: float = 0.0) -> Dict[str, Any]:
         """
@@ -6343,6 +6471,7 @@ class MultiModelManager:
             # Not loaded — make room in VRAM (evict other models as needed).
             self.ensure_vram_for(model_key, resolved_name, extra_vram_gb,
                                  requested_id=_requested_id)
+            self.ensure_host_ram_for(model_key, resolved_name, _requested_id)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -6368,6 +6497,7 @@ class MultiModelManager:
             # model).  Make room again so it returns to VRAM instead of CPU.
             self.ensure_vram_for(model_key, resolved_name, extra_vram_gb,
                                  requested_id=_requested_id)
+            self.ensure_host_ram_for(model_key, resolved_name, _requested_id)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -6395,6 +6525,7 @@ class MultiModelManager:
             print(f"Loadall mode: Model '{model_key}' not pre-loaded, will load now")
             self.ensure_vram_for(model_key, resolved_name, extra_vram_gb,
                                  requested_id=_requested_id)
+            self.ensure_host_ram_for(model_key, resolved_name, _requested_id)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,

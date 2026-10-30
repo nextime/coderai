@@ -292,6 +292,14 @@ class OffloadConfig:
     ram_watch_poll_seconds: float = 15.0    # how often the watcher samples RSS
     ram_watch_soft_fraction: float = 0.90   # mitigate at/above this fraction of the cap
     ram_watch_cuda: bool = True             # allow mitigation to call CUDA empty_cache()
+    # Host-RAM ADMISSION: refuse a load whose estimated host-RAM cost does not
+    # fit, instead of letting it run the host out of memory. The watcher above
+    # can only release memory already held, so it cannot stop an unquantized
+    # card mid-load -- on a 54 GB host that cost four OOM-killed engines in five
+    # hours, each reported to clients as "crashes the engine". See
+    # codai/models/host_ram.py. Off means loads proceed as they did before.
+    ram_admission: bool = True
+    ram_admission_floor_gb: float = 4.0     # host RAM kept free for OS + engines
     # Unload a model that has gone untouched for this long, in seconds (0 = never).
     #
     # Eviction already frees a model when something else needs the memory, so this
@@ -2213,6 +2221,8 @@ class ConfigManager:
                 "ram_watch_poll_seconds": self.config.offload.ram_watch_poll_seconds,
                 "ram_watch_soft_fraction": self.config.offload.ram_watch_soft_fraction,
                 "ram_watch_cuda": self.config.offload.ram_watch_cuda,
+                "ram_admission": self.config.offload.ram_admission,
+                "ram_admission_floor_gb": self.config.offload.ram_admission_floor_gb,
                 "gpu_split": self.config.offload.gpu_split,
                 "tensor_split": self.config.offload.tensor_split,
                 "split_strategy": self.config.offload.split_strategy,

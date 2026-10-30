@@ -784,9 +784,21 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
         from codai.admin.routes import config_manager as _cm
         _img_remote = remote_code.kwargs_for(
             getattr(_cm, "config", None), model_name, _cfg('custom_pipeline'))
+        if not _img_remote:
+            # No card named a custom_pipeline — ask the repository itself. A
+            # checkpoint whose model_index.json declares a class diffusers does
+            # not have is telling us it ships its own, and letting that load
+            # proceed produced "module diffusers has no attribute
+            # MOSSImagePipeline": a true statement that names neither the cause
+            # nor the fix, and reads as a broken model.
+            _img_remote = remote_code.kwargs_for_declared_class(
+                getattr(_cm, "config", None), model_name)
         if _img_remote:
+            _declared = _img_remote.pop("_declared_class", None)
             print(f"  Custom pipeline from the repository: "
-                  f"{_img_remote['custom_pipeline']} (allow-listed)")
+                  f"{_img_remote['custom_pipeline']} (allow-listed)"
+                  + (f" — it declares {_declared}, which is not in diffusers"
+                     if _declared else ""))
     except PermissionError:
         raise
     except Exception as e:
@@ -906,6 +918,28 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     _mmm._evict_models_for_vram(_total * 0.25 / 1e9)
         except Exception as _ee:
             print(f"  Proactive eviction skipped: {_ee}")
+
+    # =====================================================================
+    # Host-RAM admission
+    # =====================================================================
+    # VRAM is handled above by eviction; host RAM has to be handled by refusal,
+    # because the kernel's answer to running out of it is to kill the engine. The
+    # image path is where it bit hardest: the cards that quantize only their text
+    # encoder stage a bf16 transformer into host RAM, and on a full card nearly
+    # all of it spills. Raised, not caught — the caller turns it into a 503 that
+    # names the model, the size and the fix. See codai/models/host_ram.py.
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+    except Exception:
+        _mmm = None
+    if _mmm is not None:
+        _hkey = None
+        for _k in (f"image:{model_name}", model_name):
+            if _k in _mmm.config:
+                _hkey = _k
+                break
+        _mmm.ensure_host_ram_for(_hkey or f"image:{model_name}", model_name,
+                                 _requested_id)
 
     # =====================================================================
     # Standard loading path (with OOM fallback)

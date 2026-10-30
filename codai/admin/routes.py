@@ -4032,6 +4032,8 @@ def build_settings_dict(c, gpu_cards):
             "ram_watch_poll_seconds": c.offload.ram_watch_poll_seconds,
             "ram_watch_soft_fraction": c.offload.ram_watch_soft_fraction,
             "ram_watch_cuda": c.offload.ram_watch_cuda,
+            "ram_admission": c.offload.ram_admission,
+            "ram_admission_floor_gb": c.offload.ram_admission_floor_gb,
             "gpu_split": c.offload.gpu_split,
             "tensor_split": c.offload.tensor_split,
             "split_strategy": c.offload.split_strategy,
@@ -4517,6 +4519,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "ram_watch_soft_fraction" in off:
             c.offload.ram_watch_soft_fraction = float(off["ram_watch_soft_fraction"] or c.offload.ram_watch_soft_fraction)
         c.offload.ram_watch_cuda = bool(off.get("ram_watch_cuda", c.offload.ram_watch_cuda))
+        c.offload.ram_admission = bool(off.get("ram_admission", c.offload.ram_admission))
+        if "ram_admission_floor_gb" in off:
+            c.offload.ram_admission_floor_gb = float(
+                off["ram_admission_floor_gb"] or c.offload.ram_admission_floor_gb)
         c.offload.gpu_split = bool(off.get("gpu_split", c.offload.gpu_split))
         if "tensor_split" in off:
             c.offload.tensor_split = off["tensor_split"] or None
@@ -4552,6 +4558,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.ram_watch_poll_seconds = c.offload.ram_watch_poll_seconds
                 ga.ram_watch_soft_fraction = c.offload.ram_watch_soft_fraction
                 ga.ram_watch_cuda = c.offload.ram_watch_cuda
+                ga.ram_admission = c.offload.ram_admission
+                ga.ram_admission_floor_gb = c.offload.ram_admission_floor_gb
                 ga.gpu_split = c.offload.gpu_split
                 ga.tensor_split = c.offload.tensor_split
                 ga.split_strategy = c.offload.split_strategy

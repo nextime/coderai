@@ -90,3 +90,65 @@ def kwargs_for(cfg, repo: str, custom_pipeline: Optional[str]) -> dict:
         return {}
     require(cfg, repo, f"its own pipeline module {name!r}")
     return {"custom_pipeline": name, "trust_remote_code": True}
+
+
+def declared_pipeline_class(repo: str) -> Optional[str]:
+    """The ``_class_name`` the repo's ``model_index.json`` declares, or None.
+
+    Read rather than guessed, because the name is the only thing that says a
+    repository means to supply its own pipeline: MOSS-Image declares
+    ``MOSSImagePipeline``, which exists in the repo and nowhere in diffusers.
+    """
+    import json
+    import os
+    try:
+        if os.path.isdir(repo):
+            path = os.path.join(repo, "model_index.json")
+            if not os.path.isfile(path):
+                return None
+        else:
+            from huggingface_hub import hf_hub_download
+            # Fetched, not read cache-only: a repo being loaded for the first
+            # time has no cache yet, and a cache-only answer to "what class does
+            # this declare" is permanently wrong on a freshly-rented pod. The
+            # file is a few hundred bytes and the weights are about to follow.
+            path = hf_hub_download(repo, "model_index.json")
+        with open(path) as fh:
+            name = (json.load(fh) or {}).get("_class_name")
+        return str(name) if name else None
+    except Exception:
+        # Not a diffusers repo, not reachable, or no index. Either way there is
+        # nothing to declare, and the ordinary load must be left alone.
+        return None
+
+
+def kwargs_for_declared_class(cfg, repo: str) -> dict:
+    """``from_pretrained`` kwargs for a repo whose pipeline class is its own.
+
+    The companion to :func:`kwargs_for`, which only fires when a card already
+    names a ``custom_pipeline``. Nothing filled that field in for MOSS-Image or
+    Kromoss, so the load went ahead as an ordinary repo load and diffusers
+    reported ``module diffusers has no attribute MOSSImagePipeline`` -- true,
+    and no help at all: it names neither the cause (the class lives in the
+    repository) nor the remedy (allow-list it). The operator reads it as a
+    broken model.
+
+    So detect the case from the repo's own declaration. Allow-listed, it loads
+    with its code; not allow-listed, it is refused by name with the setting to
+    change, which is this module's whole policy.
+
+    Empty dict when the declared class is available locally -- the overwhelming
+    majority -- so an ordinary load never pays for this.
+    """
+    cls = declared_pipeline_class(repo)
+    if not cls:
+        return {}
+    try:
+        import diffusers
+        if getattr(diffusers, cls, None) is not None:
+            return {}
+    except Exception:
+        return {}
+    require(cfg, repo, f"its own pipeline class {cls!r}")
+    return {"custom_pipeline": repo, "trust_remote_code": True,
+            "_declared_class": cls}

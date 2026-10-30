@@ -112,6 +112,84 @@ cache that the kernel reclaims by itself and that evicting a model cannot free.
 The cap can only be met by releasing memory something actually holds, so the
 metric has to be one that releasing memory moves.
 
+## A load that cannot fit in host RAM is refused
+
+The cap above is a *pressure* mechanism: a watcher samples the fleet's memory
+and, past `offload.ram_watch_soft_fraction` of the cap, runs a ladder — collect,
+trim, drop the upscaler cache, drop prefix caches, evict idle models. Every rung
+releases memory that is already held. None of them can decline a load that is at
+that moment streaming weights into the host.
+
+That gap has a cost, measured on a 54 GB host running four engines:
+
+```
+Oct 29 23:03  Killed coderai-nvidia-gguf   anon-rss 46.3 GB
+Oct 30 03:10  Killed coderai-nvidia        anon-rss 47.7 GB
+Oct 30 03:36  Killed coderai-nvidia        anon-rss 31.6 GB
+Oct 30 03:49  Killed coderai-nvidia        anon-rss 32.7 GB
+front: engine#0 exited (code -9); respawning (1/5 in 120s)
+```
+
+The watcher was awake throughout and logged
+`RSS 50.6/43.0 GB (118%) — mitigation [gc+trim+evict_idle] → 53.7 GB`: it ran
+its ladder and the number went up anyway. The kernel settled it, and SIGKILL
+takes the engine, not the request — so the client that asked for the oversized
+model saw a dropped connection, and so did every unrelated request in flight,
+plus everything that arrived during the 120-second respawn. One bad load is
+reported as the whole server being unreliable.
+
+So `offload.ram_admission` (default on) adds the missing half: before a load
+starts, estimate what it will cost the host and refuse it if it does not fit.
+`codai/models/host_ram.py` holds the arithmetic, `ensure_host_ram_for()` the
+decision, and it sits beside `ensure_vram_for()` on every load path.
+
+The estimate follows what actually determines the cost:
+
+| situation | host-RAM cost |
+| --- | --- |
+| the model loaded before | `measured_ram_gb` — what it really parked on the host |
+| `offload_strategy` `model` / `sequential` / `cpu` | the whole footprint; that is what was asked for |
+| `offload_strategy: none`, or `no_ram` | the load buffer only — it fails on VRAM instead |
+| anything else | the **spill**: footprint minus free VRAM |
+| footprint unknown | the load buffer only, and the load proceeds unguarded |
+
+plus a 2 GB staging allowance for the shard buffer, the safetensors read window
+and dequantisation scratch.
+
+The budget is the tighter of what the kernel says is available (`MemAvailable`,
+which already counts reclaimable cache) and what is left under `max_ram_gb`,
+less `offload.ram_admission_floor_gb` (default 4 GB) kept free for the OS and
+the sibling engines.
+
+Refusal is the last step, never the first: the ladder runs, the budget is
+re-measured, and a load that fits afterwards is admitted. Only then does the
+request fail — as a 503 naming the model, the estimate, the budget, the
+shortfall, and what to change on the card. A model whose footprint could not be
+determined is never refused on a number nobody has; it loses the protection and
+says so in the log.
+
+### Sizing that skips itself is worse than no sizing
+
+The same night, the GGUF path printed this before loading a 35B:
+
+```
+(auto-offload sizing skipped: cannot access local variable '_ck'
+ where it is not associated with a value)
+```
+
+The auto-offload step reads the configured KV-cache types to decide how much
+headroom to reserve, and it read them from a binding made a hundred lines
+further down, where `llama_kwargs` is assembled. Every load that reached the
+branch raised `UnboundLocalError`, the handler reported it as *skipped*, and
+nothing reduced `n_gpu_layers`. llama.cpp was then asked to keep every layer on
+a card that could not hold them and answered with a **43,562 MiB CPU KV
+buffer** — which is what took the host down.
+
+Two things follow. The read is hoisted above its use, with a test asserting the
+source order rather than a line number. And the handler no longer says
+*skipped*: a step that did not run leaves the load UNSIZED, and the message says
+that, because "skipped" invites the reader to assume nothing needed doing.
+
 ## A resident model still needs room to run
 
 Every reservation above is taken when a model LOADS. A model that is already

@@ -930,6 +930,36 @@ async def task_cancelled_handler(request: Request, exc: TaskCancelled):
     return JSONResponse(status_code=499, content={"detail": "Task cancelled", "task_id": tid})
 
 
+from codai.models.host_ram import HostRamExhausted
+
+
+@app.exception_handler(HostRamExhausted)
+async def host_ram_exhausted_handler(request: Request, exc: HostRamExhausted):
+    """A load was refused for want of host RAM.
+
+    503, because this is the server declining to start work it cannot finish,
+    and the condition is transient: the same request succeeds once a resident
+    model is evicted or a smaller build is asked for. Registered once here
+    rather than caught per route — the refusal can come from any path that
+    loads a model (chat, images, video, audio), and every one of them should
+    report the numbers instead of a bare 500.
+
+    Before this existed the request did not fail at all: the host ran out of
+    memory, the kernel killed the engine, and the client saw a dropped
+    connection while every other model's requests died with it.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": exc.message(),
+                           "type": "insufficient_host_memory",
+                           "param": exc.model,
+                           "code": "host_ram_exhausted",
+                           "needed_gb": exc.need.gb,
+                           "available_gb": exc.budget.gb,
+                           "shortfall_gb": exc.shortfall_gb}},
+    )
+
+
 @app.get("/v1/models", response_model=ModelList, summary="List available models", tags=["Core"])
 async def list_models():
     """List available models."""

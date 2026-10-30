@@ -1240,6 +1240,19 @@ class VulkanBackend(ModelBackend):
             try:
                 _exp = kwargs.get('expected_vram_gb')
                 _nlayers = _gguf_block_count(model_path)
+                # Read the KV-cache types HERE, not from the binding made further
+                # down when llama_kwargs is assembled. That binding happens after
+                # this block, so reading it here raised UnboundLocalError on every
+                # load that reached the offload branch -- caught below and printed
+                # as "(auto-offload sizing skipped: cannot access local variable
+                # '_ck' …)". Nothing then reduced n_gpu_layers, so a 35B that did
+                # not fit kept every layer on the GPU and llama.cpp answered with a
+                # 43,562 MiB CPU KV buffer: the host ran out of memory and the
+                # kernel killed the engine (code -9), three times in five hours.
+                # A skipped sizing step must not read as a sized one.
+                _kv_raw_cfg = kwargs.get('_raw_cfg') or {}
+                _ck = kwargs.get('cache_type_k', _kv_raw_cfg.get('cache_type_k'))
+                _cv = kwargs.get('cache_type_v', _kv_raw_cfg.get('cache_type_v'))
                 # Usable VRAM is the POOL across the cards this engine can use, not
                 # just main_gpu: all same-backend cards always (e.g. both 3090s), plus
                 # the other backend's cards when cross-split is on (3090 + RX 580).
@@ -1316,7 +1329,17 @@ class VulkanBackend(ModelBackend):
                           f"GPU, {_nlayers - _fit} on CPU (slower). Lower n_ctx or use a "
                           f"smaller model to keep it fully on GPU.", flush=True)
             except Exception as _off_e:
-                print(f"  (auto-offload sizing skipped: {_off_e})", flush=True)
+                # Loud on purpose, and it says what the consequence is. This
+                # printed "(auto-offload sizing skipped: …)" for an
+                # UnboundLocalError in its own code, which reads like a decision
+                # not to offload rather than a failure to decide -- and the model
+                # that was not sized then took the host down with a 43 GB CPU KV
+                # buffer. A sizing step that did not run leaves the load UNSIZED,
+                # so say that, with the error.
+                print(f"  WARNING: auto-offload sizing FAILED ({type(_off_e).__name__}: "
+                      f"{_off_e}) — this load is UNSIZED: every layer stays on the "
+                      f"GPU and llama.cpp may put the KV cache in host RAM. Check "
+                      f"n_gpu_layers / n_ctx for this model.", flush=True)
 
         # Configure context size
         if no_ram:

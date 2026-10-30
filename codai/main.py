@@ -1221,6 +1221,10 @@ def main():
     global_args.ram_watch_poll_seconds = config.offload.ram_watch_poll_seconds
     global_args.ram_watch_soft_fraction = config.offload.ram_watch_soft_fraction
     global_args.ram_watch_cuda = config.offload.ram_watch_cuda
+    # Host-RAM admission: refuse a load that cannot fit rather than let the
+    # kernel's OOM killer take the engine (codai/models/host_ram.py).
+    global_args.ram_admission = config.offload.ram_admission
+    global_args.ram_admission_floor_gb = config.offload.ram_admission_floor_gb
     # Cross-backend GPU pooling defaults (per-model config can override). Read by
     # the GGUF loader to set llama.cpp split_mode/tensor_split.
     global_args.gpu_split = getattr(config.offload, "gpu_split", False)

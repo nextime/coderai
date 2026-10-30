@@ -129,7 +129,11 @@ def test_a_permission_error_is_not_swallowed_by_the_loader():
     a refusal must not be one of them."""
     src = open("codai/api/images.py").read()
     head = src.index("_img_remote = {}")
-    body = src[head:head + 900]
+    # Bounded by the next statement after the block, not by a character count:
+    # a fixed window silently stops covering the code it was written for the
+    # moment anything is added inside it, which is how this test broke when the
+    # declared-class check went in.
+    body = src[head:src.index("_img_comp_models", head)]
     assert "except PermissionError:" in body and "raise" in body
 
 
@@ -147,3 +151,64 @@ def test_such_a_model_is_not_tried_as_sdxl_first():
 
 def test_the_field_is_savable_from_the_admin_page():
     assert '"custom_pipeline",' in open("codai/admin/routes.py").read()
+
+
+# ---------------------------------------------------------------------------
+# A repo that declares its own class without any card saying so
+# ---------------------------------------------------------------------------
+
+def test_a_repo_declaring_an_unavailable_class_is_detected(monkeypatch):
+    """MOSS-Image and Kromoss, exactly as they failed: no card named a
+    custom_pipeline, so nothing fired, and the load died on
+    'module diffusers has no attribute MOSSImagePipeline'."""
+    from codai.models import remote_code as R
+    monkeypatch.setattr(R, "declared_pipeline_class",
+                        lambda repo: "MOSSImagePipeline")
+    kw = R.kwargs_for_declared_class(_cfg(["openmoss-team/*"]),
+                                     "OpenMOSS-Team/MOSS-Image-SFT")
+    assert kw["trust_remote_code"] is True
+    assert kw["custom_pipeline"] == "OpenMOSS-Team/MOSS-Image-SFT"
+    assert kw["_declared_class"] == "MOSSImagePipeline"
+
+
+def test_such_a_repo_is_refused_by_name_when_not_allow_listed(monkeypatch):
+    """The refusal has to name the setting — that is the whole reason the
+    allow-list is spelled out rather than implied."""
+    from codai.models import remote_code as R
+    monkeypatch.setattr(R, "declared_pipeline_class",
+                        lambda repo: "MOSSImagePipeline")
+    with pytest.raises(PermissionError) as ei:
+        R.kwargs_for_declared_class(_cfg([]), "lodestones/Kromoss")
+    msg = str(ei.value)
+    assert "models.trust_remote_code" in msg
+    assert "lodestones/*" in msg
+    assert "MOSSImagePipeline" in msg
+
+
+def test_an_ordinary_repo_pays_nothing(monkeypatch):
+    """The class diffusers already has must not trigger any of this: every
+    normal image model goes through this code path."""
+    from codai.models import remote_code as R
+    monkeypatch.setattr(R, "declared_pipeline_class",
+                        lambda repo: "StableDiffusionXLPipeline")
+    assert R.kwargs_for_declared_class(_cfg([]), "any/sdxl") == {}
+
+
+def test_a_repo_that_declares_nothing_is_left_alone(monkeypatch):
+    from codai.models import remote_code as R
+    monkeypatch.setattr(R, "declared_pipeline_class", lambda repo: None)
+    assert R.kwargs_for_declared_class(_cfg([]), "any/model") == {}
+
+
+def test_the_marker_never_reaches_from_pretrained():
+    """_declared_class is ours, for the log line. Passing it on would be a
+    TypeError from diffusers at the worst possible moment."""
+    src = open("codai/api/images.py").read()
+    head = src.index("_img_remote = {}")
+    body = src[head:src.index("_img_comp_models", head)]
+    assert '_img_remote.pop("_declared_class"' in body
+
+
+def test_the_loader_asks_the_repository_when_no_card_did():
+    src = open("codai/api/images.py").read()
+    assert "kwargs_for_declared_class(" in src
