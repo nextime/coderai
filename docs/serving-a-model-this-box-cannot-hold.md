@@ -149,10 +149,47 @@ wrong for this model, or both converters mislabel it — the base is `qwen3_5` /
 `Qwen3_5ForConditionalGeneration` while the projector declares
 `qwen3vl_merger`, so llama.cpp may simply be running the wrong graph.
 
-## What was done about it
+## The fault is narrow, and there are working alternatives
 
 `mmproj` is removed from the `qwen38` cards, which stops them advertising
 `image_to_text` they cannot deliver — a model that answers confidently and
-wrongly is worse than one that declines. Vision goes to **gemma-4-14b-8k**
-(verified correct above) or Qwen3.5-9B. Revisit when llama.cpp gains real
-Qwen3.5 vision support, or a corrected conversion appears.
+wrongly is worse than one that declines.
+
+The capability is not lost. Measured on the same two images, same prompt:
+
+| model | path | vision |
+|---|---|---|
+| gemma-4-31B-heretic | GGUF + `gemma4v` mmproj | `'Red square.'` / `'Blue circle.'` |
+| gemma-4-14b-8k | GGUF + `gemma4v` mmproj | `'Red square.'` / `'Blue circle.'` |
+| Qwen3.5-9B | transformers, built-in vision tower, no mmproj | `'red square'` / `'Blue Circle'` |
+| qwen38, qwen38-128k | GGUF + `qwen3vl_merger` mmproj | the same sentence for both |
+
+**gemma-4-31B-heretic is the one to reach for**: it is larger than the broken
+27B, already on disk with its own projector, and exact on both images.
+
+That table also narrows the fault to the `qwen3vl_merger` graph alone. `gemma4v`
+is correct at two different model sizes, and Qwen3.5's OWN vision tower is
+correct when transformers runs it instead of llama.cpp — so it is not the model,
+not the family, and not our pipeline.
+
+## If you try a newer llama.cpp, do NOT pip install it
+
+Six versions of llama-cpp-python have shipped since the one we run (0.3.30 vs
+0.3.36), and a vendored-llama.cpp fix for this graph is plausible. But the wheel
+here is a LOCAL SOURCE BUILD, and that is the whole point of it:
+
+```
+CMAKE_ARGS="-DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_RPC=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS} -DGGML_NATIVE=OFF -DGGML_AVX2=ON"
+```
+(`packaging/linux/Dockerfile.update-llama`)
+
+A PyPI wheel carries at most one backend. Installing one would take out the
+nvidia engine, the radeon/Vulkan engine and the cluster's GGUF-over-RPC path
+together — three capabilities, to chase one projector. The upgrade is a bump to
+`LLAMA_CPP_PYTHON_VERSION` in that Dockerfile plus
+`update_oci_image.sh REBUILD_LLAMA=1`, it changes the engine under every GGUF
+model, and it wants the docker disk checked first (it has run to 90-98% before).
+
+Given gemma-4-31B already answers correctly, that rebuild is worth doing when it
+is wanted for its own sake, not as a fix for this.
