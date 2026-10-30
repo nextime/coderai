@@ -4021,8 +4021,22 @@ class MultiModelManager:
                   f"falling back to the process delta")
             fp = None
 
-        # --- Host-RAM footprint (the portion of weights offloaded to CPU) -------
+        # --- Host-RAM footprint -------------------------------------------------
+        # Two very different numbers, and only the first is "weights offloaded to
+        # CPU": `fp.weights_cpu_gb` is measured per module, while the fallback is
+        # the process's RSS growth across the load. For a GGUF those are not the
+        # same thing even approximately, because llama.cpp MMAPS the whole file:
+        # host RSS grows by roughly the file size whatever the layer split, so
+        # pages for layers that were then copied to the GPU are counted as if
+        # they had been offloaded.
+        #
+        # Measured on zeiss 2026-10-30: Artemis-31B with 46 of 60 layers on the
+        # GPU and ~15 GB resident on the card reported "19.52 GB was offloaded to
+        # host RAM" -- the whole 18.2 GB file, near enough. The TOTAL stays
+        # usable (and the sizing that consumed it was right), but the split is
+        # not, so the line below says which of the two it is holding.
         measured_ram = None
+        ram_is_process_delta = False
         if fp is not None:
             measured_ram = round(fp.weights_cpu_gb, 3) or None
         elif ram_before is not None and ram_before >= 0:
@@ -4030,6 +4044,7 @@ class MultiModelManager:
                 rd = round(self._get_own_ram_gb() - ram_before, 3)
                 if rd > 0:
                     measured_ram = rd
+                    ram_is_process_delta = True
             except Exception:
                 measured_ram = None
 
@@ -4104,17 +4119,30 @@ class MultiModelManager:
         # Record the compute device + offload state for the Tasks page.
         _dev = self.engine_device_desc()
         if offloaded or (measured_ram and measured_ram > 0.3):
-            _dev += (f" · CPU offload {measured_ram:.1f} GB"
-                     if measured_ram else " · CPU offload")
+            # Only state a SIZE when the number means offloaded weights. A
+            # process delta would put the whole mmap'd file on the Tasks page as
+            # "CPU offload", which is how a fully-GPU-resident GGUF came to look
+            # like a wholly offloaded one.
+            if measured_ram and not ram_is_process_delta:
+                _dev += f" · CPU offload {measured_ram:.1f} GB"
+            elif offloaded:
+                _dev += " · CPU offload"
         self.model_devices[model_key] = _dev
 
         # measured_vram already INCLUDES the offloaded RAM portion (full footprint),
         # so don't add measured_ram again here — that would double-count.
+        if measured_ram is None:
+            _host = "0.00 GB was offloaded to host RAM this load"
+        elif ram_is_process_delta:
+            _host = (f"host RSS grew {measured_ram:.2f} GB during this load "
+                     f"(process delta, NOT the offloaded weights: a memory-mapped "
+                     f"GGUF grows RSS by about its file size whatever the layer "
+                     f"split)")
+        else:
+            _host = f"{measured_ram:.2f} GB was offloaded to host RAM this load"
         print(f"Measured footprint for '{model_key}': "
               f"{'%.2f' % measured_vram if measured_vram is not None else 'n/a'} GB total "
-              f"(full model footprint, placement-independent; of which "
-              f"{'%.2f' % measured_ram if measured_ram is not None else '0.00'} GB was "
-              f"offloaded to host RAM this load; "
+              f"(full model footprint, placement-independent; of which {_host}; "
               f"n_gpu_layers={measured_layers if measured_layers is not None else 'n/a'})")
 
         # Persist each system-owned field, accumulating into the in-memory config so

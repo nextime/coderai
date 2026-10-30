@@ -37,6 +37,7 @@ from typing import Dict, List, Optional
 from codai.api.thread_pool import (run_on_lease_pool, run_on_pdfium_pool,
                                    run_on_pod_pool)
 from codai.ocr.base import (OcrEngine, OcrPage, OcrError, ink_coverage,
+                            page_from_dict,
                             PAGE_OPTIONS, page_estimate, render_pages,
                             iter_pdf_page_pdfs, pdf_page_count, split_pdf_page,
                             unreadable_report)
@@ -672,23 +673,19 @@ def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
 def _page_from_pod(d: dict, index: int) -> OcrPage:
     """One page of a pod's /v1/ocr response as an OcrPage.
 
-    Carries the DIAGNOSTICS across, not just the text: `repeat_detected` and the
-    rest are the whole reason a caller can tell a looping page from a blank one,
-    and dropping them at this boundary would make a pod-read page less
-    explicable than a locally-read one for no reason.
+    The reassembly itself is shared with the worker-subprocess boundary
+    (:func:`codai.ocr.base.page_from_dict`), because this function used to do it
+    key by key and dropped every box on the floor: `lines`, `regions` and
+    `tables` were simply not copied, so a page read on a pod came back with no
+    geometry whatever the engine produced, and nothing in the request could
+    change that. `confidence` survived only by being one of the names in the
+    list. The pod puts all of it on the wire -- it runs the same
+    ``OcrPage.to_dict`` -- so this boundary was the only place it was lost.
+
+    Diagnostics now ride across by exclusion rather than by name, which is what
+    the other boundary already learned to do after losing one twice.
     """
-    page = OcrPage(index=index, text=str(d.get("text") or ""),
-                   width=int(d.get("width") or 0),
-                   height=int(d.get("height") or 0))
-    meta = dict(d.get("meta") or {})
-    for k in ("repeat_detected", "repeat_chars", "model_attempts", "confidence",
-              "confidence_measured", "unreadable", "blank", "ink",
-              "finish_reason", "continuations"):
-        if k in d:
-            meta[k] = d[k]
-    if meta:
-        page.meta = meta
-    return page
+    return page_from_dict(d, index=index)
 
 
 #: How long a pool stays marked as unable to run the pipeline on its own pods

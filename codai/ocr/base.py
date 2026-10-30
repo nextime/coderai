@@ -692,6 +692,80 @@ def _rasterize_pdf(data: bytes, dpi: int, policy=None) -> List["Any"]:
         raise OcrError(f"failed to rasterise PDF (pdf2image): {e}", status=400)
 
 
+#: Fields of OcrPage itself. Everything else in a page dict is a diagnostic and
+#: is forwarded to ``meta`` by EXCLUSION -- see :func:`page_from_dict`.
+PAGE_FIELDS = ("index", "text", "width", "height", "lines", "regions", "tables")
+
+
+def _bbox4(value) -> List[float]:
+    """Exactly four floats, whatever arrived.
+
+    Clients unpack a box as ``x0, y0, x1, y1``; a short or non-numeric one would
+    raise there instead of here, on the far side of an HTTP boundary where the
+    page it belonged to is already gone. A degenerate box is recoverable
+    information, a traceback in the caller is not.
+    """
+    out = []
+    for v in (value or [])[:4]:
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    while len(out) < 4:
+        out.append(0.0)
+    return out
+
+
+def page_from_dict(d: dict, index: Optional[int] = None) -> "OcrPage":
+    """Rebuild an OcrPage from a page dict produced by :meth:`OcrPage.to_dict`.
+
+    One implementation, because there are two boundaries that reassemble a page
+    -- a worker subprocess's JSON and a pod's ``/v1/ocr`` reply -- and they had
+    drifted. The pod one copied index/text/width/height plus a fixed list of
+    diagnostic keys, and so silently dropped ``lines``, ``regions`` and
+    ``tables``: every page read on a pod arrived with no geometry at all, for
+    every engine, with no parameter able to change it. A client probing for the
+    boxes saw ``lines=0`` and reasonably concluded line detection was switched
+    off somewhere, while ``confidence`` came through because it happened to be
+    one of the named keys.
+
+    ``index`` overrides the dict's own, for callers that number pages
+    themselves (a per-page dispatch knows the document position; the pod
+    answering one page does not).
+
+    Meta is forwarded by exclusion, never key by key. The subprocess boundary
+    lost a diagnostic twice doing it by name -- ``accents_repaired``, so a
+    working repair reported null, and ``model_attempts``, noticed only while it
+    was being hunted in a live batch -- and the geometry loss here is the same
+    mistake with a bigger blast radius. By exclusion, a new diagnostic arrives
+    without anyone having to remember this function exists.
+    """
+    page = OcrPage(index=int(d.get("index", 0) if index is None else index),
+                   text=str(d.get("text") or ""),
+                   width=int(d.get("width") or 0),
+                   height=int(d.get("height") or 0))
+    page.lines = [OcrLine(text=l.get("text", ""), bbox=_bbox4(l.get("bbox")),
+                          conf=float(l.get("conf") or 0.0))
+                  for l in (d.get("lines") or []) if isinstance(l, dict)]
+    # `order` is the engine's own reading-order index where it reports one
+    # (surya's LayoutBox.position); -1 where it does not. Dropping it would
+    # reduce the model's reading order to our list order, which is the same
+    # thing only until a page has two columns.
+    page.regions = [OcrRegion(label=r.get("label", ""), bbox=_bbox4(r.get("bbox")),
+                              conf=float(r.get("conf") or 0.0),
+                              order=int(r.get("order", -1)))
+                    for r in (d.get("regions") or []) if isinstance(r, dict)]
+    page.tables = list(d.get("tables") or [])
+    nested = d.get("meta")
+    if isinstance(nested, dict):
+        page.meta.update(nested)
+    for k, v in d.items():
+        if k in PAGE_FIELDS or k == "meta" or k in page.meta or v in (None, "", [], {}):
+            continue
+        page.meta[k] = v
+    return page
+
+
 def mean_token_prob(logprobs) -> Optional[float]:
     """Mean ``exp(logprob)`` over a reply's tokens, or None if none were reported.
 

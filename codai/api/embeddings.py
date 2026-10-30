@@ -29,6 +29,7 @@ from typing import List
 
 from fastapi import APIRouter, HTTPException, Request
 
+from codai.models import deps as models_deps
 from codai.models.manager import multi_model_manager
 from codai.pydantic.embedrequest import EmbeddingsRequest, EmbeddingsResponse, EmbeddingObject
 
@@ -1224,7 +1225,14 @@ def _takes_image_in_input(model_name) -> bool:
     after the load rather than before it.
     """
     n = str(model_name or '').strip().lower().replace('_', '-')
-    return n in _VPR_IDS or n in _SALAD_IDS
+    # geoclip's IMAGE half belongs here for the same reason: the HomeHunter
+    # contract puts the image data URI in `input`, so a text `input` is not a
+    # text request it could serve -- it is an image reference that is not one.
+    # Without this it loaded 1.9 GB and then answered
+    #   500 Embedding failed: cannot identify image file <_io.BytesIO ...>
+    # on a live sweep. Its LOCATION half is NOT image-only: it takes coordinates
+    # in `input` and already refuses prose with a 400 naming the format.
+    return n in _VPR_IDS or n in _SALAD_IDS or n in _GEOCLIP_IDS_IMAGE
 
 
 def _looks_like_image_ref(src) -> bool:
@@ -1292,7 +1300,23 @@ def _decode_image(src: str):
     except Exception as e:
         raise ValueError(
             f"image is not a URL, data URI, file path or base64 blob: {e}")
-    return Image.open(io.BytesIO(raw)).convert('RGB')
+    # PIL raises UnidentifiedImageError, which is NOT a ValueError, so it used to
+    # escape the caller's `except ValueError -> 400` and surface as
+    #
+    #   500 Embedding failed: cannot identify image file <_io.BytesIO object ...>
+    #
+    # A short word reaches here intact: "una frase" loses its space, and
+    # "unafrase" is eight characters of the base64 alphabet, so it decodes to
+    # six bytes and only PIL can tell it is not a picture. The caller sent bad
+    # input and deserves to be told so, with the input quoted -- a 500 says the
+    # server broke, and four texts to the image half of geoclip did exactly this
+    # on a live sweep.
+    try:
+        return Image.open(io.BytesIO(raw)).convert('RGB')
+    except Exception as e:
+        raise ValueError(
+            f"{src[:40]!r} decodes as base64 but is not an image ({e}); send a "
+            f"data URI, an http(s) URL, a file path, or base64 image bytes")
 
 
 def _truncate_dims(results, dimensions):
@@ -2415,6 +2439,18 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     if not texts and not images:
         raise HTTPException(
             status_code=400, detail="Provide 'input' (text) and/or 'image'.")
+
+    # A model whose python package is absent cannot load, and said so from
+    # three frames down inside the loader: `geoclip` and `geoclip-location`
+    # answered `500 Failed to load embedding model: No module named 'geoclip'`
+    # -- a detail that reached the client and not the log -- while /v1/models
+    # went on advertising both. Named here instead, as a 503 (the model is
+    # configured and the deployment is incomplete; the request was fine).
+    _missing = models_deps.unavailable_reason(model_name) or \
+        models_deps.unavailable_reason(request.model)
+    if _missing:
+        raise HTTPException(status_code=503,
+                            detail=f"model '{request.model}': {_missing}")
 
     # Refuse an impossible request BEFORE loading anything. The same refusal
     # used to come after the load: images sent to a text-only 8 GB embedder

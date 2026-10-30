@@ -94,25 +94,36 @@ def test_one_missing_import_is_what_took_out_both_ids():
 
 def test_a_500_is_logged_with_its_reason():
     """The detail existed and went only to the client. In a sweep that is a row
-    in somebody else's report, so the cause had to be found by running the
-    import against the image by hand."""
+    in somebody else's report, so the cause had to be found by replaying the
+    request by hand.
+
+    The handler is registered on the EXCEPTION CLASS. The first version of this
+    fix registered it for status `500`, and Starlette moves such a handler into
+    ServerErrorMiddleware, which fires only for an UNHANDLED exception -- so
+    `raise HTTPException(status_code=500, ...)`, which is how nearly every 500
+    here is raised, went past it. Confirmed live: two geoclip 500s and no
+    `[http] 500` line. See test_geoclip_text_input_and_5xx_logging.py, which
+    exercises the registration instead of reading it.
+    """
     src = open(APP).read()
-    assert '@app.exception_handler(500)' in src, (
-        '400s are logged with their reason and 500s are not, which is the '
+    assert '@app.exception_handler(StarletteHTTPException)' in src, (
+        '400s are logged with their reason and 5xx are not, which is the '
         'wrong way round'
     )
-    i = src.index('@app.exception_handler(500)')
-    body = src[i:i + 2000]
-    assert '[http] 500 on' in body
+    assert '@app.exception_handler(500)' not in src, (
+        'a status-500 registration does not catch HTTPException(500)')
+    i = src.index('@app.exception_handler(StarletteHTTPException)')
+    body = src[i:i + 2600]
+    assert '[http] ' in body
     assert 'detail' in body and 'request.url.path' in body
 
 
-def test_it_answers_the_same_500_it_was_given():
+def test_it_answers_the_same_status_it_was_given():
     """A diagnostic that changes the response is not a diagnostic."""
     src = open(APP).read()
-    i = src.index('@app.exception_handler(500)')
-    body = src[i:i + 2000]
-    assert 'status_code=500' in body
+    i = src.index('@app.exception_handler(StarletteHTTPException)')
+    body = src[i:i + 2600]
+    assert 'status_code=status' in body
 
 
 def test_the_400_handler_is_untouched():

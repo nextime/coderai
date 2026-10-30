@@ -106,12 +106,24 @@ def test_a_false_measured_flag_is_not_swallowed_as_empty():
 
 
 def test_the_keys_cross_the_pod_boundary():
-    """A page read on a rented pod must report the same shape as a local one."""
-    import inspect
+    """A page read on a rented pod must report the same shape as a local one.
 
+    Asserted by running the boundary, not by reading it. Reading it is what let
+    the real defect sit here unnoticed: the names `confidence` and
+    `confidence_measured` appeared in the source -- in a key-by-key copy list --
+    and the same function dropped `lines`, `regions` and `tables` entirely, so
+    every pod-read page arrived with no geometry at all while this test passed.
+    """
     from codai.ocr import manager
-    src = inspect.getsource(manager._page_from_pod)
-    assert "confidence" in src and "confidence_measured" in src
+    page = manager._page_from_pod({
+        "index": 0, "text": "x", "width": 1700, "height": 2200,
+        "lines": [{"text": "x", "bbox": [1.0, 2.0, 3.0, 4.0], "conf": 0.5}],
+        "confidence": 0.0, "confidence_measured": False,
+    }, 0)
+    assert page.meta.get("confidence") == 0.0
+    assert page.meta.get("confidence_measured") is False
+    # The geometry this function used to discard.
+    assert len(page.lines) == 1 and page.lines[0].bbox == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_all_three_engines_now_report_the_same_shape():

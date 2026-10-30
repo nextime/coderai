@@ -252,10 +252,26 @@ def test_a_region_from_an_engine_with_no_order_says_so_rather_than_guessing():
 
 
 def test_the_order_survives_the_worker_protocol():
-    """It crosses as JSON and is mapped back by hand; a field left out of that
-    mapping reduces the model's reading order to our list order."""
-    src = open("codai/ocr/subprocess_engine.py").read()
-    assert 'order=int(r.get("order", -1))' in src
+    """It crosses as JSON and is mapped back; a field left out of that mapping
+    reduces the model's reading order to our list order.
+
+    Tested by round-tripping a region rather than by grepping for the mapping
+    expression: the reassembly moved into codai.ocr.base.page_from_dict when
+    the pod boundary was found to share this job, and a source-text assertion
+    failed on correct code the moment it did.
+    """
+    from codai.ocr.subprocess_engine import SubprocessOcrEngine
+    page = SubprocessOcrEngine._page_from_dict({
+        "index": 0, "text": "x", "width": 10, "height": 20,
+        "regions": [{"label": "Text", "bbox": [0, 0, 1, 1], "conf": 0.9,
+                     "order": 3}],
+    })
+    assert page.regions[0].order == 3
+    # And an engine that states no order still says so rather than implying one.
+    page2 = SubprocessOcrEngine._page_from_dict({
+        "index": 0, "text": "x",
+        "regions": [{"label": "Text", "bbox": [0, 0, 1, 1]}]})
+    assert page2.regions[0].order == -1
 
 
 def test_the_surya_worker_runs_the_predictors_instead_of_returning_empty():

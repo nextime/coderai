@@ -20,7 +20,8 @@ import subprocess
 import sys
 import threading
 
-from codai.ocr.base import page_options, OcrEngine, OcrPage, OcrLine, OcrRegion, OcrError
+from codai.ocr.base import (page_options, OcrEngine, OcrPage, OcrLine, OcrRegion,
+                            OcrError, page_from_dict, PAGE_FIELDS)
 
 _WORKER = os.path.join(os.path.dirname(__file__), "workers", "ocr_worker.py")
 
@@ -57,7 +58,8 @@ def _resolve_venv_dir(configured: str, name: str, baked_aliases: tuple = ()) -> 
 
 #: Keys of the worker's page dict that are OcrPage FIELDS. Everything else it
 #: sends is a diagnostic and is forwarded onto `page.meta` untouched.
-_PAGE_FIELDS = ("index", "text", "width", "height", "lines", "regions", "tables")
+#: Kept as an alias: the set now lives with the reassembly it belongs to.
+_PAGE_FIELDS = PAGE_FIELDS
 
 
 class SubprocessOcrEngine(OcrEngine):
@@ -364,42 +366,10 @@ class SubprocessOcrEngine(OcrEngine):
 
     @staticmethod
     def _page_from_dict(d: dict) -> OcrPage:
-        """Rebuild an OcrPage from the worker's JSON."""
-        page = OcrPage(index=int(d.get("index", 0)), text=d.get("text", ""),
-                       width=int(d.get("width", 0)), height=int(d.get("height", 0)))
-        page.lines = [OcrLine(text=l.get("text", ""), bbox=list(l.get("bbox", [0, 0, 0, 0])),
-                              conf=float(l.get("conf", 0.0))) for l in d.get("lines", [])]
-        # `order` is the engine's own reading-order index where it reports one
-        # (surya's LayoutBox.position); -1 where it does not. Dropping it here
-        # would reduce the model's reading order to our list order, which is
-        # the same thing only until a page has two columns.
-        page.regions = [OcrRegion(label=r.get("label", ""), bbox=list(r.get("bbox", [0, 0, 0, 0])),
-                                  conf=float(r.get("conf", 0.0)),
-                                  order=int(r.get("order", -1)))
-                        for r in d.get("regions", [])]
-        page.tables = list(d.get("tables", []))
-        # The worker's byte-level diagnosis of an unreadable page, when it made one.
-        # Carried on meta rather than a field of its own so engines that cannot
-        # produce it change nothing about the response shape.
-        trace = d.get("unreadable_trace")
-        if trace:
-            page.meta["unreadable_trace"] = trace
-        # What the worker had to rebuild. Carried for the same reason the trace is:
-        # the text is no longer byte-for-byte what the server sent, and a caller
-        # comparing the two needs to know why. Missing this is why the first
-        # successful repair reported `accents_repaired: null` while visibly having
-        # fixed the page -- the fix worked and only its receipt was dropped.
-        repaired = d.get("accents_repaired")
-        if repaired:
-            page.meta["accents_repaired"] = repaired
-        # Everything else the worker chose to say. Forwarded by exclusion, not by
-        # name: this reassembly has now dropped a diagnostic TWICE for the same
-        # reason -- `accents_repaired` once, so a working repair reported null,
-        # and `model_attempts` again, which was being hunted for in a live batch
-        # at the moment it was noticed. A key-by-key copy means every future
-        # diagnostic is born broken and nobody finds out until they need it.
-        for k, v in d.items():
-            if k in _PAGE_FIELDS or k in page.meta or v in (None, "", [], {}):
-                continue
-            page.meta[k] = v
-        return page
+        """Rebuild an OcrPage from the worker's JSON.
+
+        The reassembly lives in :func:`codai.ocr.base.page_from_dict` and is
+        shared with the pod boundary, which had the same job and a different,
+        lossier implementation of it.
+        """
+        return page_from_dict(d)

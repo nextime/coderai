@@ -156,6 +156,12 @@ class ModelInfo(BaseModel):
     port: Optional[int] = None
     gpu_device: Optional[int] = None
     load_mode: Optional[str] = None
+    #: Why this model cannot currently serve, when that is knowable without
+    #: loading it -- today only a missing python package. Two models were listed
+    #: here as available for as long as they existed and answered every request
+    #: with an import error, because the catalogue never asked. None means
+    #: nothing known to be wrong, which includes "not checked".
+    unavailable_reason: Optional[str] = None
     # Languages this model handles (empty/None = unknown, or accepts any):
     # for speech-to-text the ones it transcribes, for text-to-speech the ones it
     # can speak. `supports_translation` is STT-only (source→target_language,

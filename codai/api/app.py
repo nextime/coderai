@@ -29,6 +29,7 @@ from typing import List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from codai.broker.client import BrokerClient
@@ -903,9 +904,9 @@ async def bad_request_says_why(request: Request, exc: HTTPException):
     return JSONResponse(status_code=400, content={"detail": detail or "bad request"})
 
 
-@app.exception_handler(500)
-async def server_error_says_why(request: Request, exc: HTTPException):
-    """Same as the 400 handler, for the status where it matters more.
+@app.exception_handler(StarletteHTTPException)
+async def http_error_says_why(request: Request, exc: StarletteHTTPException):
+    """Log the reason for a 5xx raised as an HTTPException, then answer it unchanged.
 
     A 400 is a statement about the request; a 500 is a statement about us, and
     this side logged the first and not the second. A capability sweep recorded
@@ -915,19 +916,35 @@ async def server_error_says_why(request: Request, exc: HTTPException):
 
     and the engine log held the thermal check, the VRAM estimate and then
     `DEBUG: Response status: 500` -- no detail, no traceback, no mention of a
-    model. The detail existed ("Failed to load embedding model: No module named
-    'geoclip'") and went only to the client, which in a sweep is a row in
-    somebody else's report. Finding it meant running the import by hand against
-    the image.
+    model. The detail existed ("Embedding failed: cannot identify image file
+    <_io.BytesIO object ...>") and went only to the client, which in a sweep is
+    a row in somebody else's report. Finding it meant replaying the request by
+    hand against the running server.
+
+    Registered on the EXCEPTION CLASS, not on status 500. Starlette pulls a
+    handler registered for `500` (or `Exception`) out of the status table and
+    gives it to ServerErrorMiddleware, which fires only for an UNHANDLED
+    exception -- so `raise HTTPException(status_code=500, ...)`, which is how
+    nearly every 500 in this codebase is raised, went straight past the first
+    version of this handler and logged nothing. The 400 handler above works
+    because 400 gets no such special treatment.
+
+    A status-keyed handler still wins over this one, so that 400 handler keeps
+    its own richer line.
 
     Behaviour is unchanged; this only makes the class diagnosable.
     """
+    status = int(getattr(exc, "status_code", 500) or 500)
     detail = getattr(exc, "detail", "") or ""
-    print(f"[http] 500 on {request.method} {request.url.path}: {detail!r} "
-          f"(peer {getattr(getattr(request, 'client', None), 'host', '-')})",
-          flush=True)
-    return JSONResponse(status_code=500,
-                        content={"detail": detail or "internal server error"})
+    if status >= 500:
+        print(f"[http] {status} on {request.method} {request.url.path}: "
+              f"{detail!r} (peer "
+              f"{getattr(getattr(request, 'client', None), 'host', '-')})",
+              flush=True)
+    headers = getattr(exc, "headers", None)
+    return JSONResponse(status_code=status,
+                        content={"detail": detail or "error"},
+                        headers=headers)
 
 
 @app.exception_handler(401)

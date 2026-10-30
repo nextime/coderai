@@ -106,6 +106,20 @@ def build_system_app(config, config_dir, internal_port: int = 0) -> FastAPI:
                     out.append(dataclasses.asdict(m))
                 except Exception:
                     out.append({"id": str(getattr(m, "id", m))})
+        # Say which of these cannot actually load. Cheap (a memoised find_spec,
+        # never an import, never a model load) and advisory: the model stays
+        # listed, because hiding one that works is the worse mistake.
+        try:
+            from codai.models import deps as _deps
+            for entry in out:
+                if not isinstance(entry, dict) or entry.get("unavailable_reason"):
+                    continue
+                why = _deps.unavailable_reason(entry.get("id")) or \
+                    _deps.unavailable_reason(entry.get("alias"))
+                if why:
+                    entry["unavailable_reason"] = why
+        except Exception as exc:
+            print(f"[system] dependency check skipped: {exc}", flush=True)
         return JSONResponse({"object": "list", "data": out})
 
     @app.on_event("startup")
