@@ -266,3 +266,45 @@ It is in-memory and bounded (500 entries), so it is empty after a restart. It
 exists because the alternative was reconstructing swaps from the log, and the
 log rotates: on one host 78% of it was per-request debug, which filled the
 2,000-line view in about four minutes.
+
+## A pin is a choice of format, not a budget
+
+The KV placement plan reads `cache_type_k` / `cache_type_v` / `kv_offload` from a
+model as instructions it must not override: the format and the location are the
+operator's call. For a while it read them as something more than that — as a
+statement that whatever size resulted was acceptable — and skipped itself
+entirely when any of them was set.
+
+One model set `cache_type_k/v: q8_0` with `n_ctx: 128000`. Quantized KV at a long
+context is exactly the configuration someone writes *because* they are worried
+about size, and it is the configuration that most needs checking: 128k of q8_0 KV
+measured 47.7 GB, llama.cpp placed it in host RAM because no GPU could hold it,
+and the OOM killer took the engine — and every other model resident on it —
+while the pages were still being faulted in.
+
+The plan now honours a pin and still checks the result. A pinned type is never
+requantized and a pinned placement is never moved; what changes is that when the
+remaining levers cannot make it fit, the load is refused with a message naming
+the pin, instead of being handed to the OOM killer. Refusing one model beats
+losing the engine.
+
+## Write the measurement down before the thing you measured kills you
+
+Predicting a KV cache from GGUF metadata does not work — per-layer KV-head
+arrays, sliding-window layers and shared KV put the estimate off by 5x in both
+directions on the model above — so the plan acts only on a measured size, read
+from llama.cpp's own `KV buffer size` log lines.
+
+That measurement used to be taken after a successful load and printed as advice:
+*record as measured_kv_gb: {...}*. But a KV cache large enough to need the plan is
+large enough to kill the process before the load finishes, and there is no "after
+the load" then, and nobody is reading the log either. The engine died, the front
+respawned it, the next request repeated the same load, and the number that would
+have prevented it was lost every single time.
+
+It is now journalled the moment llama.cpp names the size, which is before the
+allocation is faulted in and therefore before the kill. `measured_kv_gb` on the
+model still wins; the journal (`~/.coderai/cache/kv_sizes.json`, keyed by model
+path and context length) only answers when the config said nothing. A load that
+dies now teaches the next one, so the second attempt refuses cleanly instead of
+dying again.

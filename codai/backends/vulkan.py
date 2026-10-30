@@ -31,6 +31,7 @@ from pathlib import Path
 from codai.api.fastlog import fast_print as print  # noqa: A004
 
 from codai.backends.base import ModelBackend
+from codai.backends import kv_journal
 from codai.models.utils import (
     check_hf_chat_template,
     get_model_family,
@@ -640,7 +641,7 @@ def llama_log_tail(limit: int = 6, trouble_only: bool = True) -> str:
     return " | ".join(lines[-max(1, int(limit)):])
 
 
-def _install_layer_log_callback():
+def _install_layer_log_callback(model_path=None, n_ctx=0):
     """Replace llama.cpp's log callback with one that prints load-time layer/buffer
     messages directly to stdout.  Returns the callback object — keep a reference
     alive for the duration of the load so ctypes doesn't garbage-collect it.
@@ -648,7 +649,13 @@ def _install_layer_log_callback():
     It also records the KV buffer sizes llama.cpp reports, which is the only
     trustworthy number for how big a KV cache really is: predicting it from GGUF
     metadata is architecture-specific (per-layer KV-head arrays, sliding-window
-    layers, shared KV) and was off by 5x on Gemma-4 in both directions."""
+    layers, shared KV) and was off by 5x on Gemma-4 in both directions.
+
+    A host-resident KV cache is also journalled the moment llama.cpp names its
+    size, because that is the last moment that is guaranteed to happen: a KV
+    cache large enough to matter is large enough to get the engine SIGKILLed as
+    its pages are faulted in, and nothing after the load runs then. See
+    :mod:`codai.backends.kv_journal`."""
     if _llama_cpp is None:
         return None
     _KV_OBSERVED["gpu"] = 0.0
@@ -680,6 +687,13 @@ def _install_layer_log_callback():
             if _m:
                 _where = "cpu" if _m.group(1).upper().startswith("CPU") else "gpu"
                 _KV_OBSERVED[_where] += float(_m.group(2)) / 1024.0
+                # Written down HERE, not after the load: this allocation is about
+                # to be faulted in, and if it doesn't fit the process is gone
+                # before any later code could record it.
+                if model_path and n_ctx:
+                    _total = _KV_OBSERVED["gpu"] + _KV_OBSERVED["cpu"]
+                    if _KV_OBSERVED["cpu"] > 1.0:
+                        kv_journal.record(model_path, n_ctx, _total)
             if msg:
                 # EVERY line is kept, so a failure can be explained afterwards
                 # even when the line said nothing this filter was looking for.
@@ -1545,7 +1559,16 @@ class VulkanBackend(ModelBackend):
         if not no_ram and bool(_raw_cfg.get('kv_autoplan', True)):
             try:
                 _ctx = int(self.n_ctx or 0)
-                _explicit = (_ck is not None or _cv is not None or _kv_off is not None)
+                # Pinning a KV *type* says which format to use; pinning
+                # kv_offload says where to put it. Neither is a statement that the
+                # result fits: this model was configured cache_type_k/v=q8_0 at
+                # n_ctx=128000, and reading that as consent let llama.cpp put
+                # 47.7 GB of KV in host RAM and lose the engine to the OOM killer.
+                # So a pin is honoured — the plan never overrides a chosen type or
+                # placement — but it no longer switches the fits-check off.
+                _type_pinned = (_ck is not None or _cv is not None)
+                _place_pinned = (_kv_off is not None)
+                _explicit = (_type_pinned or _place_pinned)
                 _free_vram = _pooled_free_vram_gb(cross=bool(kwargs.get('gpu_split')))
                 _exp_w = float(kwargs.get('expected_vram_gb') or 0)
                 _nl = int(_gguf_block_count(model_path) or 0)
@@ -1567,19 +1590,38 @@ class VulkanBackend(ModelBackend):
                 if isinstance(_meas, dict):
                     _meas = _meas.get(str(_ctx)) or _meas.get(_ctx)
                 _meas = float(_meas) if _meas not in (None, '', 0) else 0.0
+                if _meas <= 0:
+                    _meas = kv_journal.lookup(model_path, _ctx)
+                    if _meas > 0:
+                        print(f"  KV plan: {_meas:.1f} GB journalled for this model at "
+                              f"n_ctx={_ctx} by an earlier load")
 
-                if _meas > 0 and _ctx > 0 and not _explicit:
-                    print(f"  KV plan: measured {_meas:.1f} GB at n_ctx={_ctx}")
+                if _meas > 0 and _ctx > 0:
+                    print(f"  KV plan: measured {_meas:.1f} GB at n_ctx={_ctx}"
+                          + ("  (type pinned in the config — placement only)"
+                             if _type_pinned else "")
+                          + ("  (placement pinned in the config — check only)"
+                             if _place_pinned else ""))
                     if _meas <= _vram_head:
                         pass                                    # fits on the GPU
                     elif _meas <= _ram_head:
-                        llama_kwargs['offload_kqv'] = False
-                        print(f"  KV plan: too big for VRAM ({_vram_head:.1f} GB free) — "
-                              f"holding the KV cache in host RAM. Decode crosses PCIe, "
-                              f"so slower, but it fits and the context is kept.")
+                        if _place_pinned:
+                            print(f"  KV plan: too big for VRAM ({_vram_head:.1f} GB free) "
+                                  f"but it fits in RAM ({_ram_head:.1f} GB) — leaving the "
+                                  f"pinned kv_offload alone.")
+                        else:
+                            llama_kwargs['offload_kqv'] = False
+                            print(f"  KV plan: too big for VRAM ({_vram_head:.1f} GB free) — "
+                                  f"holding the KV cache in host RAM. Decode crosses PCIe, "
+                                  f"so slower, but it fits and the context is kept.")
                     else:
                         # Neither fits at full precision. Try the lossless lever
                         # first, then quantize — least quality cost first.
+                        # A pinned type was already in force when _meas was
+                        # measured, so re-quantizing would override the pin — the
+                        # one thing the plan must not do. swa_full and placement
+                        # stay available; if they aren't enough, the load is
+                        # refused below rather than left to the OOM killer.
                         _placed = False
                         if (_geom.get('sliding_window') and _swa_full is None
                                 and _llama_accepts('swa_full')):
@@ -1591,10 +1633,12 @@ class VulkanBackend(ModelBackend):
                                   f"reserving the full context. No quality cost. The next "
                                   f"load re-measures; if it still doesn't fit, the KV gets "
                                   f"quantized.")
-                            llama_kwargs['offload_kqv'] = False
+                            if not _place_pinned:
+                                llama_kwargs['offload_kqv'] = False
                             _placed = True
                         _base_bpt = _kv_bytes_per_token(_geom, _ck, _cv) or 1.0
-                        for _tk_name, _tv_name in (() if _placed else _KV_FALLBACK_TYPES):
+                        _ladder = () if (_placed or _type_pinned) else _KV_FALLBACK_TYPES
+                        for _tk_name, _tv_name in _ladder:
                             _ratio = (_kv_bytes_per_token(_geom, _tk_name, _tv_name) / _base_bpt) if _geom else 0.5
                             _q_gb = _meas * _ratio
                             _where = ('VRAM' if _q_gb <= _vram_head else
@@ -1608,7 +1652,7 @@ class VulkanBackend(ModelBackend):
                             llama_kwargs['type_v'] = _tvq
                             if _tk_name in _KV_NEEDS_FLASH or _tv_name in _KV_NEEDS_FLASH:
                                 llama_kwargs['flash_attn'] = True
-                            if _where == 'RAM':
+                            if _where == 'RAM' and not _place_pinned:
                                 llama_kwargs['offload_kqv'] = False
                             print(f"  KV plan: {_meas:.1f} GB fits neither VRAM nor RAM — "
                                   f"quantizing the KV cache to type_k={_tk_name}/"
@@ -1617,6 +1661,16 @@ class VulkanBackend(ModelBackend):
                             _placed = True
                             break
                         if not _placed:
+                            if _type_pinned:
+                                raise RuntimeError(
+                                    f"KV cache for n_ctx={_ctx} measured {_meas:.1f} GB with the "
+                                    f"cache_type_k/v pinned to {_ck or 'f16'}/{_cv or 'f16'} in the "
+                                    f"model config, and only {_vram_head:.1f} GB VRAM and "
+                                    f"{_ram_head:.1f} GB RAM are free. Quantizing it further would "
+                                    f"override that pin, so this load is refused instead of being "
+                                    f"left to the OOM killer. Lower n_ctx, unpin cache_type_k/v so "
+                                    f"the KV can be quantized automatically, free memory, or serve "
+                                    f"this model elsewhere (kv_autoplan=false bypasses this check).")
                             raise RuntimeError(
                                 f"KV cache for n_ctx={_ctx} measured {_meas:.1f} GB — even at "
                                 f"q4_0 (llama.cpp's floor for a KV cache) that is "
@@ -1628,7 +1682,8 @@ class VulkanBackend(ModelBackend):
                                 f"(kv_autoplan=false bypasses this check).")
                 elif _explicit:
                     print("  KV plan: cache_type_k/v or kv_offload pinned in the model "
-                          "config — honouring it as-is")
+                          "config and no measured size for this n_ctx yet — honouring "
+                          "the pin as-is; this load records the size for the next one")
             except RuntimeError:
                 raise
             except Exception as _kv_e:
@@ -1653,6 +1708,28 @@ class VulkanBackend(ModelBackend):
                 llama_kwargs['n_ubatch'] = int(_n_ubatch)
             except (TypeError, ValueError):
                 pass
+
+        # Metadata overrides (llama.cpp --override-kv). A quantizer that drops a
+        # checkpoint's NextN / multi-token-prediction blocks without lowering the
+        # declared block_count leaves llama.cpp asking for a block the file does
+        # not contain, which it reports as "missing tensor 'blk.N.attn_norm.weight'"
+        # — indistinguishable, from the outside, from a truncated download. When
+        # the file's shape proves that is what happened, correct the count here;
+        # see codai/backends/gguf_mtp.py for the conditions.
+        _kv_over = dict(_raw_cfg.get('kv_overrides') or {})
+        if bool(_raw_cfg.get('mtp_block_fix', True)):
+            from codai.backends import gguf_mtp
+            _mtp_over = gguf_mtp.block_count_override(model_path)
+            if _mtp_over and not (set(_mtp_over) & set(_kv_over)):
+                _kv_over.update(_mtp_over)
+                print(f"  blocks       : {gguf_mtp.explain(model_path)}")
+        if _kv_over:
+            if _llama_accepts('kv_overrides'):
+                llama_kwargs['kv_overrides'] = _kv_over
+            else:
+                print(f"  blocks       : metadata overrides {_kv_over} requested but "
+                      f"llama-cpp-python {getattr(_llama_cpp, '__version__', '?')} "
+                      f"doesn't expose kv_overrides — ignoring")
 
         # Parallel sequence slots (llama.cpp -np / n_seq_max). Each slot reserves its
         # own share of KV + compute VRAM; keeping it at 1 avoids reserving VRAM for
@@ -1928,7 +2005,7 @@ class VulkanBackend(ModelBackend):
             gpu_supported = _llama_cpp.llama_supports_gpu_offload()
             print(f"  GPU offload  : {'supported' if gpu_supported else 'NOT supported by this build'}")
 
-        _log_cb = _install_layer_log_callback()
+        _log_cb = _install_layer_log_callback(model_path, int(self.n_ctx or 0))
         # Progress feedback during the (otherwise silent) tensor load. llama.cpp's
         # progress_callback isn't exposed by the Llama wrapper, so inject it by
         # patching the default model-params factory for the duration of construction.
@@ -1988,13 +2065,13 @@ class VulkanBackend(ModelBackend):
                         if (_kv_gpu + _kv_cpu) > 0:
                             self.last_kv_gb = round(_kv_gpu + _kv_cpu, 2)
                             self.last_kv_ctx = int(self.n_ctx or 0)
-                            _hint = ""
-                            if _kv_cpu > 1.0:
-                                _hint = (f' — record as measured_kv_gb: '
-                                         f'{{"{self.last_kv_ctx}": {self.last_kv_gb}}}')
+                            _kept = kv_journal.record(model_path, self.last_kv_ctx,
+                                                      self.last_kv_gb)
                             print(f"  KV measured: {self.last_kv_gb:.1f} GB at "
                                   f"n_ctx={self.last_kv_ctx} ({_kv_gpu:.1f} GB VRAM + "
-                                  f"{_kv_cpu:.1f} GB host RAM){_hint}", flush=True)
+                                  f"{_kv_cpu:.1f} GB host RAM)"
+                                  f"{' — journalled for the next load' if _kept else ''}",
+                                  flush=True)
                     except Exception:
                         pass
                     break
