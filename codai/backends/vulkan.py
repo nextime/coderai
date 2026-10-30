@@ -1884,14 +1884,32 @@ class VulkanBackend(ModelBackend):
                     _mmproj_path = _cand
             if os.path.isfile(_mmproj_path):
                 try:
-                    from llama_cpp.llama_chat_format import MTMDChatHandler
-                    llama_kwargs['chat_handler'] = MTMDChatHandler(
-                        clip_model_path=_mmproj_path,
+                    from codai.backends import mtmd_vision
+                    # How many tokens a picture is allowed to become. Left
+                    # unset, mtmd takes it from the image's size alone, and for
+                    # a Qwen-VL merger that is nowhere near enough: a 448x448
+                    # image became 16 tokens, two different pictures produced
+                    # identical descriptions, and the model answered fluently
+                    # from the prompt. llama.cpp prints the requirement on every
+                    # load ("requires at minimum 1024 image tokens"); this reads
+                    # it from the projector instead of hoping someone saw it.
+                    _min_tok, _why = mtmd_vision.min_image_tokens(
+                        _mmproj_path, kwargs.get('image_min_tokens',
+                                                 _raw_cfg.get('image_min_tokens')))
+                    _max_tok = kwargs.get('image_max_tokens',
+                                          _raw_cfg.get('image_max_tokens')) or 0
+                    llama_kwargs['chat_handler'] = mtmd_vision.handler(
+                        _mmproj_path,
                         verbose=False,
                         use_gpu=(self.n_gpu_layers != 0),
+                        image_min_tokens=_min_tok,
+                        image_max_tokens=int(_max_tok or 0),
                     )
                     self.supports_vision = True
                     print(f"  mmproj       : {os.path.basename(_mmproj_path)} (vision enabled)")
+                    if _min_tok:
+                        print(f"  image tokens : at least {_min_tok} per image"
+                              + (f" — {_why}" if _why else ""))
                 except Exception as _e:
                     print(f"  mmproj       : failed to load projector ({_e}); continuing text-only")
             else:

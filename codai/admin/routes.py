@@ -2985,6 +2985,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "gpu_split", "tensor_split", "split_strategy", "split_secondary_cap_gb",
                 "turboquant", "engine", "engine_fallback",
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
+                # How many tokens a picture may become through the mmproj. Left
+                # unset, it is taken from the projector's own requirement.
+                "image_min_tokens", "image_max_tokens",
                 "auto_compact", "auto_compact_pct", "auto_compact_strategy",
                 "auto_compact_model", "auto_compact_target_pct",
                 "auto_compact_head_messages", "auto_compact_head_tokens",
