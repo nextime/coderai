@@ -92,3 +92,67 @@ Three different things get called "MTP support":
 
 The preflight in requirement 2 runs by itself and will say if the quant is
 unreadable, before it costs an eviction.
+
+# A projector that loads, injects, and says nothing
+
+`Qwen3.8-27B` served images for months and described every one of them
+identically. Worth recording in full, because four plausible explanations were
+wrong and only an experiment settled it.
+
+The symptom, at temperature 0 with two images that could not differ more:
+
+```
+red square   -> "…I see a red circle on a white background…"
+blue circle  -> "…I see a red circle on a white background…"   byte-identical
+no image     -> "But no image provided in prompt?"
+```
+
+That last line matters: the model **notices** when no image is present. So with
+an image it receives something in the image slot, and the content of that
+something never varies.
+
+## What it was not
+
+Each of these was checked and cleared:
+
+| hypothesis | evidence against |
+|---|---|
+| mmproj/model mismatch | `clip.vision.projection_dim` 5120 = the model's `hidden_size` 5120; `mm.2.weight [4608, 5120]` |
+| missing deepstack tensors | unsloth's reference mmproj is the same shape — 334 tensors, `is_deepstack_layers` all false, zero deepstack tensors — so this family does not use them |
+| projector not implemented | `clip_graph_qwen3vl` is present in `libmtmd` |
+| base model is text-only | `Qwen3_5ForConditionalGeneration`, has `vision_config`, `image_token_id: 248056` |
+| vision markers absent | the GGUF tokenizer carries `<\|vision_start\|>` 248053, `<\|vision_end\|>` 248054, `<\|image_pad\|>` 248056, matching the base config exactly |
+| the mmproj never loaded | `mmproj … (vision enabled)` plus 341 `clip_model_loader` lines |
+| coderai's fast path dropping images | the guard in vulkan.py explicitly refuses the render path for vision requests, and it fires |
+| the 1024-token floor | llama.cpp's own stated requirement, and the symptom predates applying it |
+
+Two inferences made along the way were also wrong, and both came from reading
+code and headers rather than running anything. "No mtmd output at request time,
+so the handler is bypassed" ignored that the llama.cpp log callback is swapped to
+a quiet one after the load, by design — runtime silence proves nothing.
+
+## What settled it
+
+Two experiments, not another reading of the headers.
+
+**gemma-4-14b-8k, its own projector, the same two images:** `'Red square.'` and
+`'Blue circle.'`, and `'Square, blue.'` with no image at all. So the pipeline —
+fast-path guard, `create_chat_completion`, the mtmd chat handler, mmproj
+loading, image injection — is sound end to end.
+
+**The same Qwen model with a DIFFERENT publisher's projector** (unsloth's F16
+rather than HauhauCS's BF16): identical constant answer. Two independent
+conversions, one failure.
+
+So the fault is upstream of coderai. Either llama.cpp's `qwen3vl_merger` graph is
+wrong for this model, or both converters mislabel it — the base is `qwen3_5` /
+`Qwen3_5ForConditionalGeneration` while the projector declares
+`qwen3vl_merger`, so llama.cpp may simply be running the wrong graph.
+
+## What was done about it
+
+`mmproj` is removed from the `qwen38` cards, which stops them advertising
+`image_to_text` they cannot deliver — a model that answers confidently and
+wrongly is worse than one that declines. Vision goes to **gemma-4-14b-8k**
+(verified correct above) or Qwen3.5-9B. Revisit when llama.cpp gains real
+Qwen3.5 vision support, or a corrected conversion appears.
