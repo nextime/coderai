@@ -4500,6 +4500,40 @@ class MultiModelManager:
             return 2.67
         return 1.0
 
+    def _disk_weights_gb(self, model_key: str, resolved_name: str,
+                         cfg: dict) -> float:
+        """GB of weights actually on disk for this model, or 0.0 when unknown.
+
+        The same two sources the size-estimate passes use further down -- a local
+        weights file, else the HF hub cache for the repo id -- read here so the
+        `used_vram_gb` branch can sanity-check itself against them instead of
+        short-circuiting past them. Pure and cheap: a stat, or the memoised hub
+        cache scan. Never raises; 0.0 means "no opinion", which leaves the
+        configured value untouched.
+        """
+        try:
+            import os as _os
+            for cand in (cfg.get("path"), resolved_name, model_key):
+                p = str(cand or "")
+                if not p:
+                    continue
+                _, ext = _os.path.splitext(p)
+                if ext.lower() in (".safetensors", ".bin", ".pt", ".pth",
+                                   ".ckpt", ".gguf") and _os.path.isfile(p):
+                    return _os.path.getsize(p) / 1e9
+            from codai.models.cache import is_huggingface_model_id
+            for cand in (cfg.get("path"), resolved_name, model_key):
+                p = str(cand or "")
+                repo = p.split(":", 1)[1] if ":" in p else p
+                if not repo or not is_huggingface_model_id(repo):
+                    continue
+                n = self._hf_cached_model_size_bytes(repo)
+                if n and n > 0:
+                    return n / 1e9
+        except Exception:
+            return 0.0
+        return 0.0
+
     def _effective_quant_multiplier(self, cfg: dict,
                                     load_in_4bit: bool, load_in_8bit: bool,
                                     model_key: str = None,
@@ -5369,6 +5403,39 @@ class MultiModelManager:
         except (TypeError, ValueError):
             _explicit_val = None
         if _explicit_val is not None and _explicit_val > 0:
+            # `used_vram_gb` is a STORAGE-size baseline: the quant/precision
+            # factors are applied ON TOP of it. So a value below the weights
+            # actually on disk is scaled DOWN again, and the error compounds in
+            # the one direction that is dangerous -- the load proceeds and then
+            # fails, instead of being refused or making room.
+            #
+            # It is not always a number anyone checked. The post-download
+            # backfill writes `cached_size * 1.2`, and it runs from the download
+            # thread, so an interrupted or still-running fetch leaves a figure
+            # for a fraction of the checkpoint. Measured on zeiss 2026-10-30:
+            # Qwen/Qwen3.5-9B carried used_vram_gb=7.795 for a 19 GB bf16
+            # checkpoint (6.5 GB downloaded x 1.2), and with load_in_4bit the
+            # estimate came out 7.795 x 0.300 + reserve = 3.13 GB. The loader
+            # read 5.6 GB free, concluded it fitted three times over, tried a
+            # full-GPU load of a model needing ~6.5 GB, and failed -- reporting
+            # "needs about 3.1 GB ... 5.6 GB is free", which reads like a bug in
+            # the eviction rather than in the number.
+            #
+            # The checkpoint on disk is measurable fact, available right here,
+            # so it is used as a floor. Only ever upward: a configured value
+            # that is already larger is the operator's, and this must not
+            # quietly shrink it (the whole point of the field is that a
+            # configured number stays put).
+            _floor = self._disk_weights_gb(model_key, resolved_name, cfg)
+            if _floor and _floor > _explicit_val * 1.25:
+                print(f"  used_vram_gb={_explicit_val:.3f} GB for '{model_key}' is "
+                      f"well under the {_floor:.2f} GB of weights on disk — sizing "
+                      f"against the disk instead (a value written before the "
+                      f"download finished scales DOWN under quantization)",
+                      flush=True)
+                return _dbg_est("used_vram_gb(disk-floor)",
+                                _apply_factors(_floor)
+                                + self._config_lora_vram_gb(cfg))
             return _dbg_est("used_vram_gb",
                             _apply_factors(_explicit_val) + self._config_lora_vram_gb(cfg))
         if _explicit_val is not None and _explicit_val <= 0 and (measured or 0) > 0:
