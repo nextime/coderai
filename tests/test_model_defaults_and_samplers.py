@@ -183,10 +183,24 @@ def test_modes_and_licence_are_read_from_either_place():
     src = inspect.getsource(manager)
     anchor = 'defaults=(meta.get("defaults") or None)'
     i = src.index(anchor)
-    # The enclosing ModelInfo(...) call: from the nearest preceding
-    # `models.append(ModelInfo(` to the `))` that closes it.
+    # The enclosing ModelInfo(...) call, delimited by BALANCED parentheses
+    # rather than by the first "))" after the anchor. Scanning for "))" found
+    # the end of any nested call that happened to sit inside the block -- a
+    # mode-inference fallback written as
+    # `or _modes_from_caps(caps, resolved_type))` closed two parens and
+    # truncated the slice, so fields further down went missing and this test
+    # failed for a field it was not about.
     start = src.rindex("models.append(ModelInfo(", 0, i)
-    end = src.index("))", i)
+    depth, end = 0, None
+    for pos in range(start, len(src)):
+        if src[pos] == "(":
+            depth += 1
+        elif src[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                end = pos
+                break
+    assert end is not None, "unbalanced ModelInfo(...) call"
     block = src[start:end]
     for spelling in ('meta.get("modes")', 'meta.get("video_subtypes")',
                      'meta.get("license")', 'meta.get("licence")',

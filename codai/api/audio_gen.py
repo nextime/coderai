@@ -31,6 +31,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 
 from codai.models.manager import multi_model_manager
+from codai.models import utils as model_utils
 from codai.pydantic.audiogenrequest import AudioGenerationRequest, AudioGenerationResponse
 from codai.tasks import task_registry, TaskCancelled
 
@@ -448,7 +449,8 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task
         import torch
         _gen = None
         if getattr(request, 'seed', None) is not None:
-            _gen = torch.Generator(pipe.device).manual_seed(int(request.seed))
+            _gen = torch.Generator(
+                model_utils.generator_device(pipe)).manual_seed(int(request.seed))
         result = pipe(
             request.prompt,
             negative_prompt=getattr(request, 'negative_prompt', None),

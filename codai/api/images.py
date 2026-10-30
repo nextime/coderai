@@ -32,6 +32,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 _log = logging.getLogger(__name__)
 from PIL import Image
+from codai.models import utils as model_utils
 from pydantic import BaseModel, ConfigDict
 
 # Import from codai modules
@@ -1641,7 +1642,8 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
     generator = None
     if seed is not None:
-        generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+        generator = torch.Generator(
+            device=model_utils.generator_device(pipeline)).manual_seed(seed)
 
     quality = request.quality or "standard"
     # Acceleration/distillation defaults (Lightning / Turbo / LCM / Hyper-SD): when
@@ -3182,7 +3184,8 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
                        for im in sources]
 
         seed = request.seed or getattr(global_args, 'image_seed', None)
-        generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
+        generator = (torch.Generator(device=model_utils.generator_device(pipe))
+                     .manual_seed(seed) if seed else None)
         quality = request.quality or "standard"
         _instruction = _is_instruction_edit(pipe)
         # A distilled instruction model is tuned for 4 steps at CFG 1.0;
@@ -3332,7 +3335,8 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
                 source_img = source_img.resize((w, h))
                 mask_img = mask_img.resize((w, h))
         seed = request.seed or getattr(global_args, 'image_seed', None)
-        generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
+        generator = (torch.Generator(device=model_utils.generator_device(pipe))
+                     .manual_seed(seed) if seed else None)
         quality = request.quality or "standard"
         num_steps = request.steps or (30 if quality == "standard" else 50)
         cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)

@@ -246,14 +246,31 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     # `strength`, which is exactly what images._is_instruction_edit decides on,
     # so the runtime already treated it as an instruction edit and only the
     # capability list disagreed.
-    if (any(x in n for x in ['qwen-image-edit', 'qwen_image_edit',
-                             'flux.1-kontext', 'flux-kontext', 'flux_kontext',
-                             'flux.2', 'flux-2', 'flux2',
-                             'image-edit-rapid', 'firered-image-edit'])
+    #
+    # Two kinds of model land here and they do NOT have the same directions.
+    # FLUX.2 is unified: one checkpoint makes a picture from text and edits one
+    # from an instruction. Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit and the
+    # Rapid-AIO fine-tunes are edit-ONLY -- diffusers maps no text-to-image
+    # class for those families, and the request path says so outright:
+    #
+    #   501 QwenImageEditPlusPipeline cannot generate from a prompt alone:
+    #       diffusers offers no text-to-image pipeline for this family.
+    #
+    # Advertising image_generation for them anyway is what sent clients down
+    # that path: a capability sweep read "image_generation", posted a prompt,
+    # and filed the model as broken. The runtime was right and the capability
+    # list was wrong, which is the wrong way round -- the listing has to agree
+    # with what the model will actually do.
+    _UNIFIED_EDIT = ['flux.2', 'flux-2', 'flux2']
+    _EDIT_ONLY = ['qwen-image-edit', 'qwen_image_edit',
+                  'flux.1-kontext', 'flux-kontext', 'flux_kontext',
+                  'image-edit-rapid', 'firered-image-edit']
+    if (any(x in n for x in _UNIFIED_EDIT + _EDIT_ONLY)
             or re.search(r'\bstep1x-edit', n)):
         caps.instruction_edit = True
         caps.image_to_image = True      # it is still an image-in, image-out edit
-        caps.image_generation = True
+        # Only a unified family can start from a prompt alone.
+        caps.image_generation = any(x in n for x in _UNIFIED_EDIT)
         return caps
 
     # ── Image: generation ────────────────────────────────────────────────────

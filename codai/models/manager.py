@@ -1581,6 +1581,41 @@ class ModelInstancePool:
 _TASK_NAMESPACES = ("img2img:", "inpaint:", "depth:", "segment:")
 
 
+def _modes_from_caps(caps, model_type: str = "") -> Optional[list]:
+    """Which directions a model generates in, inferred from its capabilities.
+
+    A fallback for cards that say nothing. ``modes`` is how a client learns that
+    a model has no text-to-image path WITHOUT sending one and reading a 501, and
+    most cards never set it -- four Qwen-Image-Edit siblings published
+    ``modes: null`` while advertising image_generation, so a capability sweep
+    posted a prompt to an edit-only model and filed it as broken.
+
+    Inferred, never invented: each mode here is backed by a capability flag the
+    model already publishes, so this adds no new claim. A card that states its
+    own modes always wins.
+    """
+    try:
+        flags = set(caps.to_list() if hasattr(caps, "to_list") else (caps or []))
+    except Exception:
+        return None
+    out = []
+    if model_type == "image" or flags & {"image_generation", "image_to_image",
+                                         "instruction_edit", "inpainting"}:
+        if "image_generation" in flags:
+            out.append("t2i")
+        if flags & {"image_to_image", "instruction_edit"}:
+            out.append("i2i")
+    if model_type == "video" or flags & {"video_generation", "image_to_video",
+                                         "video_to_video"}:
+        if "video_generation" in flags:
+            out.append("t2v")
+        if "image_to_video" in flags:
+            out.append("i2v")
+        if "video_to_video" in flags:
+            out.append("v2v")
+    return out or None
+
+
 def _group_ids(models, canonical_by_id: Dict[str, str]) -> None:
     """Mark which published ids are the same model, in place.
 
@@ -7151,7 +7186,11 @@ class MultiModelManager:
                 # to remember which a given model type uses.
                 modes=((meta.get("defaults") or {}).get("modes")
                        or meta.get("modes")
-                       or meta.get("video_subtypes") or None),
+                       or meta.get("video_subtypes")
+                       # Nothing on the card: infer from the capabilities it
+                       # already publishes, so "can this take a prompt alone?"
+                       # is answerable without sending one.
+                       or _modes_from_caps(caps, resolved_type)),
                 license=((meta.get("defaults") or {}).get("license")
                          or meta.get("license") or meta.get("licence") or None),
                 available=meta.get("available"),

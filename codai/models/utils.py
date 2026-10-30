@@ -23,6 +23,42 @@ from typing import Optional, Any
 _global_args = None
 
 
+def generator_device(pipeline):
+    """A device a ``torch.Generator`` can actually be built on.
+
+    A pipeline's own ``.device`` is not always one. Sequential CPU offload
+    leaves every module on the META device until its own forward pulls it in,
+    and a pipeline whose modules are all on meta reports meta as its device --
+    so ``torch.Generator(device=pipeline.device)`` reached torch's accelerator
+    hooks with a meta device and raised:
+
+        RuntimeError: META device type not an accelerator.
+
+    Measured on Z-Image-Turbo (bf16, sequential_text_encoder): the image route
+    reported it as "Failed to load image model 'Tongyi-MAI/Z-Image-Turbo'",
+    naming the load -- which had in fact succeeded, footprint and all -- rather
+    than the seed. Only a SEEDED request failed, so the model looked broken to
+    anyone who passes a seed and fine to anyone who does not.
+
+    diffusers already knows the answer: ``_execution_device`` is the device an
+    offloaded pipeline will actually compute on. Use it when present, and
+    otherwise fall back to anything that is not meta.
+    """
+    import torch
+    for candidate in (getattr(pipeline, "_execution_device", None),
+                      getattr(pipeline, "device", None)):
+        try:
+            dev = torch.device(candidate) if candidate is not None else None
+        except (TypeError, ValueError, RuntimeError):
+            dev = None
+        if dev is not None and dev.type not in ("meta", "lazy"):
+            return dev
+    try:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    except Exception:
+        return torch.device("cpu")
+
+
 def set_global_args(args: Any):
     """Set the global arguments object for use in utility functions."""
     global _global_args
