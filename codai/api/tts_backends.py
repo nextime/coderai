@@ -74,6 +74,51 @@ _FAMILY_STYLES: dict[str, list[str]] = {
 }
 
 
+#: What each family can SPEAK. Every entry is the engine's own declared set,
+#: read from the model rather than assumed:
+#:
+#:   coqui   XTTS-v2's own config.json `languages` (17)
+#:   kokoro  the accents encoded in its voice ids -- see _KOKORO_ACCENTS below,
+#:           which this is derived from at import so the two cannot drift
+#:   bark    suno/bark's speaker_embeddings bank: 13 languages x speakers 0-9
+#:   parler  parler-tts-mini-multilingual's model card (8 European languages)
+#:
+#: This exists because the languages were never advertised. All four TTS models
+#: published `languages: null` on /v1/models while the STT models published
+#: theirs correctly, so a client was told nothing and could only discover a
+#: language by trying it -- which is how a 17-language engine gets taken for an
+#: English-and-Italian one. A card's own `languages` still wins: this is the
+#: default for a card that says nothing, not an override of one that does.
+#:
+#: `melo` and the generic `transformers` fallback are absent on purpose: what
+#: they can say depends on the checkpoint, and a wrong list is worse than none.
+_FAMILY_LANGUAGES: dict[str, list[str]] = {
+    "coqui": ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+              "cs", "ar", "zh-cn", "hu", "ko", "ja", "hi"],
+    "bark": ["de", "en", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt",
+             "ru", "tr", "zh"],
+    "parler": ["en", "fr", "de", "es", "it", "pt", "pl", "nl"],
+}
+
+
+def family_languages(model_name: str, config: Optional[dict] = None) -> list[str]:
+    """Languages this model can speak, or [] when nothing is known.
+
+    A ``languages`` list on the model's own card wins -- an operator who has
+    restricted or extended a model knows something this table does not.
+    """
+    if config:
+        declared = config.get("languages")
+        if declared:
+            return [str(x) for x in declared]
+    fam = _family(model_name)
+    if fam == "kokoro":
+        # Derived from the voice-id accents, so adding a voice family adds its
+        # language without a second list to remember.
+        return sorted({lang for lang, _ in _KOKORO_ACCENTS.values()})
+    return list(_FAMILY_LANGUAGES.get(fam, []))
+
+
 def family_emotions(model_name: str) -> list[str]:
     """Emotions the given model can steer, or [] when none are available."""
     return list(_FAMILY_EMOTIONS.get(_family(model_name), []))
@@ -577,14 +622,28 @@ def remember_voices(model_name: str, backend) -> None:
         pass
 
 
+#: The parsed voices cache, keyed by (path, mtime, size). /v1/models is a
+#: POLLED endpoint and now asks for voices on every TTS entry, so re-reading and
+#: re-parsing the file per model per poll is a cost with no new information in
+#: it. Re-read as soon as the file changes, which is what a load records.
+_VOICES_MEMO: dict = {}
+
+
 def _remembered_voices(model_name: str) -> list:
     try:
         import json
         f = _voices_cache_file()
         if not f.is_file():
             return []
-        cur = json.loads(f.read_text())
-        return [str(v) for v in (cur.get(model_name) or [])]
+        st = f.stat()
+        stamp = (str(f), st.st_mtime_ns, st.st_size)
+        cached = _VOICES_MEMO.get("stamp")
+        if cached != stamp:
+            parsed = json.loads(f.read_text())
+            _VOICES_MEMO.clear()
+            _VOICES_MEMO["stamp"] = stamp
+            _VOICES_MEMO["data"] = parsed if isinstance(parsed, dict) else {}
+        return [str(v) for v in (_VOICES_MEMO.get("data", {}).get(model_name) or [])]
     except Exception:
         return []
 
@@ -611,7 +670,16 @@ def family_voices(model_name: str, backend=None) -> dict:
             source = "remembered"
     if not ids and fam == "bark":
         # Deterministic ids, so they can be named without loading anything.
-        ids = [f"v2/en_speaker_{i}" for i in range(10)]
+        # ALL of bark's languages, not just English: suno/bark ships a speaker
+        # bank of 13 languages x speakers 0-9, and listing only the English ten
+        # is what made a 13-language engine look like an English one. Ordered
+        # English-first so a client taking voices[0] as a default still gets an
+        # English speaker.
+        ids = [f"v2/en_speaker_{i}" for i in range(10)] + [
+            f"v2/{lang}_speaker_{i}"
+            for lang in _FAMILY_LANGUAGES["bark"] if lang != "en"
+            for i in range(10)
+        ]
         source = "static"
     return {
         "voices": [_voice_meta(fam, v) for v in ids],

@@ -7160,6 +7160,22 @@ class MultiModelManager:
                     video_geom = video_geometry.geometry_for(model_id, meta)
                 except Exception:
                     video_geom = None
+            # A speaking model carries what it can SAY, the same way an STT
+            # model already does. Without this every TTS entry published
+            # `languages: null` while the STT entries published theirs, so a
+            # client was told nothing and could only find a language by trying
+            # it -- which is how XTTS-v2's seventeen got taken for two. Derived,
+            # never fatal, and the card still wins (see family_languages).
+            tts_languages, tts_voices = None, None
+            if resolved_type == "tts" or "text_to_speech" in caps.to_list():
+                try:
+                    from codai.api import tts_backends
+                    tts_languages = tts_backends.family_languages(
+                        model_id, meta) or None
+                    _v = tts_backends.family_voices(model_id)
+                    tts_voices = _v.get("voices") or None
+                except Exception:
+                    tts_languages, tts_voices = None, None
             models.append(ModelInfo(
                 id=model_id,
                 canonical_id=_canon.get(model_id) or model_id,
@@ -7172,7 +7188,8 @@ class MultiModelManager:
                 port=meta.get("port"),
                 gpu_device=meta.get("gpu_device"),
                 load_mode=meta.get("load_mode"),
-                languages=meta.get("languages") or None,
+                languages=meta.get("languages") or tts_languages or None,
+                voices=tts_voices,
                 supports_translation=meta.get("supports_translation"),
                 video=video_geom,
                 max_model_len=context_window_for(self, model_id, meta),

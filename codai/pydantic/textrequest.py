@@ -156,10 +156,16 @@ class ModelInfo(BaseModel):
     port: Optional[int] = None
     gpu_device: Optional[int] = None
     load_mode: Optional[str] = None
-    # Speech-to-text: languages this model supports (empty/None = accepts any) and
-    # whether it can translate (source→target_language, e.g. NVIDIA Canary).
+    # Languages this model handles (empty/None = unknown, or accepts any):
+    # for speech-to-text the ones it transcribes, for text-to-speech the ones it
+    # can speak. `supports_translation` is STT-only (source→target_language,
+    # e.g. NVIDIA Canary).
     languages: Optional[List[str]] = None
     supports_translation: Optional[bool] = None
+    # Text-to-speech: the built-in voices, each with whatever is genuinely known
+    # about it (id, name, gender, languages). Published so a client can offer a
+    # voice picker without loading the model to ask it.
+    voices: Optional[List[Dict]] = None
     speaker_diarization: Optional[bool] = None
     # The context window this model is being SERVED with, in tokens.
     #
