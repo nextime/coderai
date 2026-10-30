@@ -80,9 +80,12 @@ def read_layout(path) -> dict:
             n_tensors = struct.unpack('<Q', f.read(8))[0]
             n_kv = struct.unpack('<Q', f.read(8))[0]
             arch, block_count, nextn = None, 0, 0
+            array_lengths = {}
             for _ in range(n_kv):
                 key = _read_str(f)
                 val = _read_val(f, struct.unpack('<I', f.read(4))[0])
+                if isinstance(val, list):
+                    array_lengths[key] = len(val)
                 if key == 'general.architecture':
                     arch = str(val)
                 elif key.endswith('.block_count'):
@@ -109,6 +112,11 @@ def read_layout(path) -> dict:
                 'blocks_present': len(blocks),
                 'contiguous': bool(blocks) and blocks == set(range(len(blocks))),
                 'tensor_types': types,
+                # Metadata arrays with one entry PER LAYER. llama.cpp validates
+                # their length against block_count, so they decide whether the
+                # count can be overridden at all -- see block_count_override.
+                'per_layer_arrays': {k: n for k, n in array_lengths.items()
+                                     if block_count and n == block_count},
             }
     except Exception:
         out = {}
@@ -143,8 +151,52 @@ def block_count_override(path):
         return None
     if declared - present != nextn:
         return None
+    # A per-layer metadata ARRAY pins the count. llama.cpp validates arrays like
+    # `<arch>.attention.recurrent_layers` against block_count, and kv_overrides
+    # can only carry a scalar -- bool, int, float or str -- so there is no way to
+    # shorten the array to match. Overriding the count regardless does not fix
+    # the load, it only changes which error it fails with: measured live on
+    # 2026-10-30, a Qwen3.5 quant went from
+    #     missing tensor 'blk.64.attn_norm.weight'
+    # to
+    #     key qwen35.attention.recurrent_layers has wrong array length;
+    #     expected 64, got 65
+    # which is strictly worse -- the first names the real problem. So decline,
+    # and let the honest error stand. unrepairable_reason() says why.
+    if layout.get('per_layer_arrays'):
+        return None
     return {f"{layout['arch']}.block_count": present,
             f"{layout['arch']}.nextn_predict_layers": 0}
+
+
+def unrepairable_reason(path) -> str:
+    """Why a dropped-MTP GGUF could not be repaired, or '' when nothing applies.
+
+    Only speaks for the one case worth explaining: the file IS a quant whose
+    NextN block was dropped, but a per-layer array pins the block count, so the
+    repair is impossible rather than merely unnecessary.
+    """
+    layout = read_layout(path)
+    if not layout or not layout.get('arch'):
+        return ''
+    declared = int(layout.get('block_count') or 0)
+    nextn = int(layout.get('nextn') or 0)
+    present = int(layout.get('blocks_present') or 0)
+    arrays = layout.get('per_layer_arrays') or {}
+    if not (nextn > 0 and declared > 0 and present > 0
+            and layout.get('contiguous') and declared - present == nextn
+            and arrays):
+        return ''
+    names = ", ".join(f"{k} ({n} entries)" for k, n in sorted(arrays.items()))
+    return (
+        f"this quant dropped its {nextn} NextN (multi-token-prediction) block, so "
+        f"it declares {declared} blocks and carries {present}. Correcting the "
+        f"declared count would normally fix that, but {names} has one entry per "
+        f"layer and llama.cpp checks its length against block_count -- and a "
+        f"metadata override can only carry a single value, not a shorter array. "
+        f"So the count cannot be corrected without rewriting the file. Use a "
+        f"quant that keeps its NextN block (or one built without it), or a "
+        f"llama.cpp that derives the layer count from nextn_predict_layers.")
 
 
 def explain(path) -> str:

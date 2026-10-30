@@ -1736,6 +1736,14 @@ class VulkanBackend(ModelBackend):
             if _mtp_over and not (set(_mtp_over) & set(_kv_over)):
                 _kv_over.update(_mtp_over)
                 print(f"  blocks       : {gguf_mtp.explain(model_path)}")
+            elif not _mtp_over:
+                # The repair recognised the shape but cannot apply it. Say so
+                # BEFORE llama.cpp's own error, so the missing-tensor message
+                # that follows is read as the real problem rather than as
+                # something the override should have handled.
+                _why_not = gguf_mtp.unrepairable_reason(model_path)
+                if _why_not:
+                    print(f"  blocks       : {_why_not}")
         if _kv_over:
             if _llama_accepts('kv_overrides'):
                 llama_kwargs['kv_overrides'] = _kv_over

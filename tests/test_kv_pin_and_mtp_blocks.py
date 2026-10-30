@@ -30,20 +30,32 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 # ── GGUF fixtures ────────────────────────────────────────────────────────────
 
-def _write_gguf(path, meta: dict, tensor_names):
-    """Minimal GGUF v3 header: metadata KV section + tensor index, no data."""
+def _write_gguf(path, meta: dict, tensor_names, arrays: dict = None):
+    """Minimal GGUF v3 header: metadata KV section + tensor index, no data.
+
+    ``arrays`` adds array-valued metadata as {key: length} — written as an
+    int32 array of that length, which is the shape of a per-layer array.
+    """
     def s(val):
         b = val.encode('utf-8')
         return struct.pack('<Q', len(b)) + b
 
+    arrays = arrays or {}
     out = [b'GGUF', struct.pack('<I', 3),
-           struct.pack('<Q', len(tensor_names)), struct.pack('<Q', len(meta))]
+           struct.pack('<Q', len(tensor_names)),
+           struct.pack('<Q', len(meta) + len(arrays))]
     for k, v in meta.items():
         out.append(s(k))
         if isinstance(v, str):
             out.append(struct.pack('<I', 8) + s(v))
         else:
             out.append(struct.pack('<I', 4) + struct.pack('<I', int(v)))
+    for k, n in arrays.items():
+        out.append(s(k))
+        out.append(struct.pack('<I', 9))                 # ARRAY
+        out.append(struct.pack('<I', 4))                 # of UINT32
+        out.append(struct.pack('<Q', int(n)))
+        out.extend(struct.pack('<I', 0) for _ in range(int(n)))
     for name in tensor_names:
         out.append(s(name))
         out.append(struct.pack('<I', 1))        # n_dims
@@ -61,12 +73,80 @@ def _blocks(lo, hi, arch_tensors=('attn_norm.weight', 'ffn_up.weight')):
 
 @pytest.fixture
 def tmpgguf(tmp_path):
-    def make(name, meta, names):
-        return _write_gguf(str(tmp_path / name), meta, names)
+    def make(name, meta, names, arrays=None):
+        gguf_mtp._LAYOUT_CACHE.clear()
+        return _write_gguf(str(tmp_path / name), meta, names, arrays)
     return make
 
 
 # ── 1. The MTP block override ────────────────────────────────────────────────
+
+def test_a_per_layer_array_blocks_the_repair(tmpgguf):
+    """Measured live 2026-10-30. The repair fired on a Qwen3.5 quant and made
+    the failure WORSE: llama.cpp validates per-layer metadata arrays against
+    block_count, and kv_overrides can only carry a scalar, so there is no way to
+    shorten the array. The load went from
+
+        missing tensor 'blk.64.attn_norm.weight'
+
+    which names the real problem, to
+
+        key qwen35.attention.recurrent_layers has wrong array length;
+        expected 64, got 65
+
+    which does not. A repair that only changes which error you get is not a
+    repair, so it declines and the honest message stands.
+    """
+    p = tmpgguf('pinned.gguf',
+                {'general.architecture': 'qwen35',
+                 'qwen35.block_count': 65,
+                 'qwen35.nextn_predict_layers': 1},
+                ['token_embd.weight'] + _blocks(0, 64),
+                arrays={'qwen35.attention.recurrent_layers': 65})
+    assert gguf_mtp.block_count_override(p) is None
+
+
+def test_the_blocked_repair_explains_itself(tmpgguf):
+    p = tmpgguf('pinned2.gguf',
+                {'general.architecture': 'qwen35',
+                 'qwen35.block_count': 65,
+                 'qwen35.nextn_predict_layers': 1},
+                ['token_embd.weight'] + _blocks(0, 64),
+                arrays={'qwen35.attention.recurrent_layers': 65})
+    why = gguf_mtp.unrepairable_reason(p)
+    assert 'recurrent_layers' in why and '65' in why and '64' in why
+    assert 'one entry per' in why          # names the mechanism
+    assert 'quant that keeps its NextN block' in why   # and the way out
+
+
+def test_an_unrelated_array_does_not_block_the_repair(tmpgguf):
+    """Only arrays whose length EQUALS block_count are per-layer. A tokenizer's
+    248,320-entry token list must not veto the repair."""
+    p = tmpgguf('okarray.gguf',
+                {'general.architecture': 'qwen35',
+                 'qwen35.block_count': 65,
+                 'qwen35.nextn_predict_layers': 1},
+                ['token_embd.weight'] + _blocks(0, 64),
+                arrays={'tokenizer.ggml.tokens': 4, 'qwen35.rope.dimension_sections': 4})
+    assert gguf_mtp.block_count_override(p) == {'qwen35.block_count': 64,
+                                                'qwen35.nextn_predict_layers': 0}
+
+
+def test_no_reason_is_given_when_nothing_is_wrong(tmpgguf):
+    """unrepairable_reason speaks only for the one case it understands."""
+    p = tmpgguf('plain2.gguf',
+                {'general.architecture': 'gemma4', 'gemma4.block_count': 60},
+                ['token_embd.weight'] + _blocks(0, 60))
+    assert gguf_mtp.unrepairable_reason(p) == ''
+    assert gguf_mtp.unrepairable_reason('/no/such.gguf') == ''
+
+
+def test_the_loader_prints_the_reason_before_llama_cpp_fails():
+    src = open(SRC).read()
+    assert 'gguf_mtp.unrepairable_reason(model_path)' in src
+    i = src.index('gguf_mtp.unrepairable_reason(model_path)')
+    assert 'elif not _mtp_over:' in src[max(0, i - 400):i]
+
 
 def test_quant_that_dropped_the_nextn_block_is_corrected(tmpgguf):
     """65 declared, 64 present, nextn=1 — the shape that proves the quantizer
