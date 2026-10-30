@@ -1581,6 +1581,63 @@ class ModelInstancePool:
 _TASK_NAMESPACES = ("img2img:", "inpaint:", "depth:", "segment:")
 
 
+def _group_ids(models, canonical_by_id: Dict[str, str]) -> None:
+    """Mark which published ids are the same model, in place.
+
+    One model is published under several ids deliberately: its alias, its repo
+    id or file path, and the bare filename. An alias can stand for a
+    round-robin group and a typed id can coexist with the checkpoint it names,
+    so the ids are a feature. What was missing is any way for a client to tell
+    which of them are one model -- a live catalogue published 206 ids for 119
+    cards, and a capability sweep reported seventy "new models" that were names
+    it had already tested.
+
+    After this:
+
+    * ``canonical_id`` is the same string on every id of one model, so grouping
+      by it is sufficient;
+    * ``alias_of`` is set ONLY on the non-canonical ids, so a client that skips
+      the entries carrying it tests each model exactly once;
+    * ``aliases`` on the canonical entry lists the other names it answers to.
+
+    Two cards that share a checkpoint but differ in configuration are not the
+    same model: they carry different canonical ids and are left as separate
+    entries. A bare path that only one of them can claim (ids are unique in the
+    listing) therefore groups with the card that claimed it, and the other card
+    keeps its own canonical name -- which is the honest answer, since sending
+    that path reaches the first card's settings.
+
+    Only ids this listing actually published are named: a canonical id that was
+    filtered out (parked, assigned to another engine) is not invented into an
+    ``aliases`` list, and its surviving ids are left ungrouped rather than
+    pointed at something a client cannot call.
+    """
+    published = {getattr(m, "id", None) for m in models}
+    groups: Dict[str, list] = {}
+    for m in models:
+        mid = getattr(m, "id", None)
+        if not mid:
+            continue
+        canon = canonical_by_id.get(mid) or mid
+        if canon not in published:
+            # The canonical name is not on offer here, so there is nothing to
+            # point at. Leave this id standing on its own.
+            canon = mid
+        m.canonical_id = canon
+        groups.setdefault(canon, []).append(mid)
+    for canon, ids in groups.items():
+        others = sorted(i for i in ids if i != canon)
+        for m in models:
+            mid = getattr(m, "id", None)
+            if mid not in ids:
+                continue
+            if mid == canon:
+                m.aliases = others or None
+                m.alias_of = None
+            else:
+                m.alias_of = canon
+
+
 class MultiModelManager:
     """
     Manages multiple models: main text model, audio transcription, and image generation.
@@ -6966,6 +7023,8 @@ class MultiModelManager:
 
         models = []
         seen_ids: set = set()
+        # id -> the canonical id of the model it belongs to (see _add).
+        _canon: Dict[str, str] = {}
 
         CAT_TYPE = {
             "text_models": "text",
@@ -6993,10 +7052,18 @@ class MultiModelManager:
             "moderation": "moderation",
         }
 
-        def _add(model_id: str, model_type: str = None, meta: Dict[str, Any] = None):
+        def _add(model_id: str, model_type: str = None, meta: Dict[str, Any] = None,
+                 canonical: str = None):
             if model_id in seen_ids:
                 return
             seen_ids.add(model_id)
+            # Which model this id belongs to. One model is published under
+            # several ids on purpose (alias, repo id or path, bare filename),
+            # and a client had no way to tell them apart -- 206 ids for 119
+            # cards, so a capability sweep tested some models three times. The
+            # canonical id is the same on every id of one model; _group_ids
+            # below turns that into alias_of/aliases.
+            _canon[model_id] = canonical or model_id
             meta = meta or {}
             # Use saved capabilities from config when available; fall back to heuristic.
             saved_caps = meta.get("capabilities") or []
@@ -7060,6 +7127,7 @@ class MultiModelManager:
                     video_geom = None
             models.append(ModelInfo(
                 id=model_id,
+                canonical_id=_canon.get(model_id) or model_id,
                 type=resolved_type,
                 capabilities=caps.to_list(),
                 backend=meta.get("backend"),
@@ -7132,15 +7200,18 @@ class MultiModelManager:
                             else:
                                 mid = alias or raw
                                 if raw and raw != mid:
-                                    _add(raw, mtype, m)
+                                    _add(raw, mtype, m, canonical=mid)
                                     short = raw.split("/")[-1] if "/" in raw else raw
                                     if short != raw:
-                                        _add(short, mtype, m)
+                                        _add(short, mtype, m, canonical=mid)
                         if mid:
-                            _add(mid, mtype, m if isinstance(m, dict) else None)
+                            _add(mid, mtype, m if isinstance(m, dict) else None,
+                                 canonical=mid)
                             short = mid.split("/")[-1] if "/" in mid else mid
                             if short != mid:
-                                _add(short, mtype, m if isinstance(m, dict) else None)
+                                _add(short, mtype,
+                                     m if isinstance(m, dict) else None,
+                                     canonical=mid)
         except Exception:
             pass
 
@@ -7285,6 +7356,7 @@ class MultiModelManager:
             if mid:
                 _add(mid, "text", {"backend": "vllm"})
 
+        _group_ids(models, _canon)
         return models
 
 

@@ -205,6 +205,28 @@ class ModelInfo(BaseModel):
     # check has to be visible before content is sent for it, and an omitted
     # entry would read as "this server does not do that at all".
     available: Optional[bool] = None
+    # The ONE name that identifies this model, and the other names it also
+    # answers to.
+    #
+    # A model is published under more than one id on purpose: its alias, its
+    # repo id or file path, and the bare filename. That is how an alias can
+    # stand for a round-robin group, and how "image:name"-style ids coexist
+    # with the underlying checkpoint. The cost is that a client walking
+    # /v1/models sees 206 ids for 119 cards and has no way to tell which of
+    # them are the same model -- so a capability sweep tests several of them
+    # three times and reports a catalogue that grew.
+    #
+    # `canonical_id` is the same string on every id belonging to one model, so
+    # grouping by it is enough. `alias_of` is set only on the NON-canonical
+    # ids, so skipping the entries that have it leaves exactly one per model.
+    # `aliases`, on the canonical entry, lists the others.
+    #
+    # Two cards that share a checkpoint but differ in configuration are NOT the
+    # same model and never share a canonical_id: they are separate entries with
+    # separate settings, and a client that wants both must be able to see both.
+    canonical_id: Optional[str] = None
+    alias_of: Optional[str] = None
+    aliases: Optional[List[str]] = None
 
 
 class ModelList(BaseModel):
