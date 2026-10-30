@@ -172,6 +172,65 @@ is correct at two different model sizes, and Qwen3.5's OWN vision tower is
 correct when transformers runs it instead of llama.cpp — so it is not the model,
 not the family, and not our pipeline.
 
+## The answer: llama.cpp's qwen35 port is text-only by design
+
+Qwen3.8-27B is built on the Qwen3.5 architecture -- the model version and the
+architecture name are different numbers, which is easy to miss:
+
+```
+our GGUFs (fine-tune and base):  arch = qwen35
+Qwen's own config.json:          model_type: qwen3_5
+                                 architectures: [Qwen3_5ForConditionalGeneration]
+```
+
+llama.cpp's `qwen35` support was contributed WITHOUT vision, and says so three
+times over:
+
+| | |
+|---|---|
+| #19435, merged 2026-02-08 | "[Model] Qwen3.5 dense and MoE support **(no vision)**" |
+| #19456 | "[Model] Qwen3.5 support **w/o vision**, WIP" |
+| #22954, open | "a vision encoder (`v.blk.*` tensors) that the **text-only qwen35.cpp implementation does not load**" -- and its fix relaxes the tensor-count check so multimodal GGUFs load as text-only, rather than adding vision |
+
+That accounts for every observation. The mmproj loads because clip loading is
+generic and architecture-independent. mtmd injects the image tokens. The
+tokenizer carries `<|vision_start|>`, `<|vision_end|>` and `<|image_pad|>` at the
+ids the base config names, so the model NOTICES whether an image was sent -- it
+says "no image provided in prompt?" when none is. But `qwen35.cpp` has no code
+to consume image embeddings, so the content contributes nothing and the answer is
+constant.
+
+No configuration, version, quantization, projector or fine-tune changes this. It
+needs vision written for `qwen35` upstream.
+
+## Eight wrong theories, and what each one cost
+
+Recorded because the failure was one of method, not of knowledge. Every one of
+these was argued from reading code, headers or commit logs; the answer was in the
+TITLE of a search result seen at the start of the investigation and not read.
+
+| theory | killed by |
+|---|---|
+| mmproj/model dimensional mismatch | `projection_dim` 5120 = `hidden_size` 5120 |
+| missing deepstack tensors | unsloth's reference mmproj is identically shaped |
+| a bad artifact from one publisher | a second publisher's projector fails the same |
+| our own 1024-token image floor | tested at 1024 AND at 0 -- byte-identical output |
+| llama.cpp predating `align_corners` (#25781) | built and ran 0.3.36 -- byte-identical output |
+| CUDA flash attention (#29629) | tested with FA off and f16 KV -- byte-identical |
+| the abliterated fine-tune | the BASE model fails identically |
+| (the above, collectively) | PR #19435: there is no vision for this arch |
+
+Two of those theories were written into these docs as settled before being
+tested. The floor was dismissed with "the symptom predates it", which was never
+checked and could not have been, because the floor applies automatically whenever
+the projector type matches -- so every observation had it on. Two publishers'
+projectors were then compared while the one variable this repo introduced was
+held constant in both.
+
+What produced knowledge: gemma as a known-good control through the same pipeline,
+varying one thing at a time, accepting negative results, and reading the upstream
+issue tracker FIRST rather than eighth.
+
 ## A fourth wrong theory: the llama.cpp version
 
 I claimed the cause was found, and it was not. Recorded in full because the
