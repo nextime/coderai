@@ -66,6 +66,30 @@ RUN set -eux; \
         --force-reinstall /tmp/llama-wheels/llama_cpp_python-*.whl; \
     install -m 755 /tmp/llama-wheels/rpc-server /opt/coderai/python/bin/rpc-server; \
     rm -rf /tmp/llama-wheels; \
+    # The engines run with LD_LIBRARY_PATH=/opt/coderai/local-libs FIRST, and
+    # that beats the wheel's DT_RUNPATH. So the wheel's own libllama.so is
+    # loaded by absolute path, and then resolves its libggml-base.so.0 against
+    # whatever local-libs holds -- which is the PREVIOUS llama build, because
+    # replacing the wheel never touched that directory. Measured 2026-10-30:
+    # a 0.3.36 wheel (libggml 0.25.3, libllama 0.5.0) against local-libs'
+    # 0.9.7/0.0.8351 gave, in every engine at once,
+    #
+    #   Failed to load shared library '.../llama_cpp/lib/libllama.so':
+    #   undefined symbol: ggml_rope_set_offset
+    #
+    # i.e. no GGUF serving at all. It stayed hidden because a `docker restart`
+    # keeps the container's original image, so the new runtime was never
+    # actually executed until the container was recreated.
+    #
+    # Copy the libs this build produced over the stale ones, so both search
+    # paths resolve to the SAME version whatever order they are found in.
+    # Orphaned older sonames are left alone: they are harmless once the soname
+    # every binary asks for points at the new file, and removing them would
+    # break anything else in the bundle still linked to them.
+    cp -af /opt/coderai/python/lib/python3.13/site-packages/llama_cpp/lib/libggml*.so* \
+           /opt/coderai/python/lib/python3.13/site-packages/llama_cpp/lib/libllama.so* \
+           /opt/coderai/python/lib/python3.13/site-packages/llama_cpp/lib/libmtmd.so* \
+           /opt/coderai/local-libs/; \
     # The wheel must link against THIS image (its CUDA runtime is on local-libs)
     # and carry the RPC backend. libcuda.so is the driver — present only at run
     # time, mounted by the NVIDIA container runtime — so it is the one library
@@ -88,6 +112,38 @@ assert "libggml-rpc" in names or "ggml_backend_rpc" in syms, \
     "RPC backend missing from the rebuilt llama-cpp-python"
 print("llama-cpp-python links cleanly and carries the RPC backend: OK")
 PY
+# Resolve SYMBOLS, not just libraries, along the path the engines really use.
+#
+# `ldd` answers "can every needed library be found", which both the wheel check
+# above and this one asked -- and it is blind to the failure that matters: a
+# library that IS found but is the wrong version. The ggml mismatch fixed above
+# passed `ldd` cleanly on every file while no engine could load a GGUF.
+#
+# `ldd -r` performs relocations too, so it names the undefined symbol exactly
+# as the runtime would. It runs with LD_LIBRARY_PATH set the way the engines set
+# it, because the search ORDER is the whole bug: checking the wheel directory in
+# isolation finds a consistent set and proves nothing. Only ggml_/llama_/mtmd_
+# symbols are fatal here; libcuda/libnvidia-ml are the driver, mounted by the
+# container runtime and absent at build time by definition.
+#
+# It checks the WHEEL's libllama.so -- the file llama-cpp-python actually
+# dlopens by absolute path -- and not local-libs' own copy. That distinction is
+# the test: local-libs' old libllama against local-libs' old libggml is a
+# self-consistent pair and reports nothing wrong. Checked that way this very
+# image, which could not serve a single GGUF, passed with zero findings; checked
+# the right way it reported ten, ggml_rope_set_offset among them.
+RUN set -eux; \
+    LLIB=/opt/coderai/python/lib/python3.13/site-packages/llama_cpp/lib; \
+    LD_LIBRARY_PATH=/opt/coderai/local-libs \
+      ldd -r "$LLIB/libllama.so" "$LLIB/libmtmd.so" > /tmp/sym.txt 2>&1 || true; \
+    if grep -E 'undefined symbol: (ggml|llama|mtmd)_' /tmp/sym.txt; then \
+        echo "FATAL: llama/ggml libraries disagree along the engines' own library path" >&2; \
+        echo "  (the wheel and /opt/coderai/local-libs are different builds)" >&2; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/sym.txt; \
+    echo "llama/ggml symbols resolve under the engines' LD_LIBRARY_PATH: OK"
+
 # Check what it LINKS, not that it runs — the same rule the wheel check above
 # states and follows. Executing it here fails on a correctly built binary:
 #
