@@ -169,9 +169,13 @@ def test_the_bounds_reach_the_params_upstream_builds(monkeypatch):
     monkeypatch.setitem(sys.modules, "llama_cpp", pkg)
     monkeypatch.setitem(sys.modules, "llama_cpp.llama_chat_format", mod)
 
-    cls = M._make_handler_class()
-    h = cls(clip_model_path="/m.gguf", image_min_tokens=1024,
-            image_max_tokens=4096)
+    # Through handler(), the entry point the backend actually calls. Built via
+    # _make_handler_class() directly, this test passed while the shipped path
+    # raised NameError -- a probe that does not call what the code calls proves
+    # nothing.
+    M._HANDLER_CLASS = None
+    h = M.handler("/m.gguf", use_gpu=True, image_min_tokens=1024,
+                  image_max_tokens=4096)
     h._init_mtmd_context(object())
     assert seen["params"].image_min_tokens == 1024
     assert seen["params"].image_max_tokens == 4096
@@ -204,3 +208,31 @@ def test_the_floor_is_announced_in_the_log():
 
 def test_the_field_is_savable_from_the_admin_page():
     assert '"image_min_tokens", "image_max_tokens",' in _src("codai/admin/routes.py")
+
+
+def test_the_floor_handler_is_reachable_the_way_the_backend_reaches_it(monkeypatch):
+    """The regression this file shipped once: the class was named as a global
+    inside this module and built by a module-level __getattr__, which PEP 562
+    consults only for attribute access from OUTSIDE the module. So handler()
+    raised NameError, the except around the mmproj block reported "failed to
+    load projector (name 'ImageTokenFloorHandler' is not defined)", and the
+    model came up text-only -- refusing images instead of answering them
+    wrongly, which is better, and still broken."""
+    import sys
+    import types
+
+    class _Upstream:
+        def __init__(self, **kw):
+            self.kw = kw
+            self.mtmd_ctx = None
+
+    mod = types.ModuleType("llama_cpp.llama_chat_format")
+    mod.MTMDChatHandler = _Upstream
+    pkg = types.ModuleType("llama_cpp")
+    pkg.llama_chat_format = mod
+    monkeypatch.setitem(sys.modules, "llama_cpp", pkg)
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_chat_format", mod)
+    monkeypatch.setattr(M, "_HANDLER_CLASS", None)
+    out = M.handler("/m.gguf", use_gpu=True, image_min_tokens=1024)
+    assert isinstance(out, _Upstream)
+    assert out.kw["clip_model_path"] == "/m.gguf"

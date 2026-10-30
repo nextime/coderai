@@ -135,13 +135,27 @@ def handler(mmproj_path: str, *, use_gpu: bool = True, verbose: bool = False,
     if not (image_min_tokens or image_max_tokens):
         return MTMDChatHandler(clip_model_path=mmproj_path, verbose=verbose,
                                use_gpu=use_gpu)
-    return ImageTokenFloorHandler(
-        clip_model_path=mmproj_path, verbose=verbose, use_gpu=use_gpu,
-        image_min_tokens=image_min_tokens, image_max_tokens=image_max_tokens)
+    # Built through the factory, not referenced as a global. A module-level
+    # __getattr__ is consulted only for attribute access from OUTSIDE the
+    # module (PEP 562), never for a global name lookup inside it -- so naming
+    # the class here raised NameError at load time, the except around the
+    # mmproj block reported "failed to load projector" and the model came up
+    # text-only. Deferred construction is the point of the factory; use it.
+    cls = _handler_class()
+    return cls(clip_model_path=mmproj_path, verbose=verbose, use_gpu=use_gpu,
+               image_min_tokens=image_min_tokens,
+               image_max_tokens=image_max_tokens)
 
 
-class _LazyBase:
-    """Deferred base so importing this module never imports llama_cpp."""
+_HANDLER_CLASS = None
+
+
+def _handler_class():
+    """The floor-aware handler class, built once on first use."""
+    global _HANDLER_CLASS
+    if _HANDLER_CLASS is None:
+        _HANDLER_CLASS = _make_handler_class()
+    return _HANDLER_CLASS
 
 
 def _make_handler_class():
@@ -192,7 +206,10 @@ def _make_handler_class():
 
 def __getattr__(name):
     # ImageTokenFloorHandler is built on first use so that `import
-    # mtmd_vision` costs nothing on a server with no vision model.
+    # mtmd_vision` costs nothing on a server with no vision model. This serves
+    # `mtmd_vision.ImageTokenFloorHandler` from outside; code in this module
+    # calls _handler_class() instead, because PEP 562 does not route a global
+    # name lookup here.
     if name == "ImageTokenFloorHandler":
         cls = _make_handler_class()
         globals()[name] = cls
