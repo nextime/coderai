@@ -107,6 +107,16 @@ class Footprint:
     #: partial load. Distinct from an object we simply cannot introspect, and
     #: the difference decides whether a fallback estimate is legitimate.
     empty_load: bool = False
+    #: False when the weights total is known but its GPU/host SPLIT is not.
+    #: True of every GGUF: there is no torch object to walk, so the total comes
+    #: from the file size, which says nothing about where llama.cpp put the
+    #: layers. The size was being banked in ``weights_cpu_gb`` and so reported
+    #: as host-resident -- measured on zeiss 2026-10-30, a Gemma-4-14B IQ4_XS
+    #: loaded with `n_gpu_layers: all` and holding 10.1 GB of VRAM described
+    #: itself as "weights 7.71 GB (0.00 on GPU, 7.71 on host)", and the Tasks
+    #: page called it "CPU offload 7.71 GB". llama.cpp's own layer placement is
+    #: the authority on the split; this helper must not invent one.
+    weights_split_known: bool = True
     notes: list = field(default_factory=list)
 
     @property
@@ -120,7 +130,11 @@ class Footprint:
 
     def describe(self) -> str:
         bits = [f"weights {self.weights_gb:.2f} GB"]
-        if self.weights_cpu_gb > 0.005:
+        if not self.weights_split_known:
+            # Saying nothing is right here. The alternative that shipped said
+            # "0.00 on GPU" about models that were entirely on the GPU.
+            bits[-1] += " (placement not measured here)"
+        elif self.weights_cpu_gb > 0.005:
             bits[-1] += (f" ({self.weights_gpu_gb:.2f} on GPU, "
                          f"{self.weights_cpu_gb:.2f} on host)")
         if self.kv_gb > 0.005:
@@ -494,11 +508,16 @@ def measure(obj, cfg: dict = None, model_type: str = "", *,
                 fp.complete = False
             elif file_size_gb > 0:
                 fp.weights_cpu_gb = float(file_size_gb)
+                fp.weights_split_known = False
                 fp.notes.append("fell back to the on-disk size")
             else:
                 fp.complete = False
     elif file_size_gb > 0:
+        # A GGUF: the weights ARE the file, loaded as-is. That fixes the total
+        # and says nothing about placement, so the split stays unknown rather
+        # than defaulting to "all on host".
         fp.weights_cpu_gb = float(file_size_gb)
+        fp.weights_split_known = False
     else:
         fp.complete = False
         fp.notes.append("nothing to measure: no model object and no file size")

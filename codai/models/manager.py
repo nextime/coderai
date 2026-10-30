@@ -4035,16 +4035,29 @@ class MultiModelManager:
         # host RAM" -- the whole 18.2 GB file, near enough. The TOTAL stays
         # usable (and the sizing that consumed it was right), but the split is
         # not, so the line below says which of the two it is holding.
+        # `ram_kind` says what the number actually is, because three different
+        # things end up in `measured_ram` and only the first is weights that
+        # were offloaded:
+        #   None            a per-module measurement: genuinely on the host.
+        #   'unsplit'       a GGUF's file size. The footprint has no torch
+        #                   object to walk, so the total is the file and the
+        #                   GPU/host split is unknown; it lands in
+        #                   weights_cpu_gb only to keep the total right.
+        #   'process-delta' the process's RSS growth across the load, which for
+        #                   a memory-mapped GGUF is about the file size whatever
+        #                   the layer split.
         measured_ram = None
-        ram_is_process_delta = False
+        ram_kind = None
         if fp is not None:
             measured_ram = round(fp.weights_cpu_gb, 3) or None
+            if not getattr(fp, "weights_split_known", True):
+                ram_kind = 'unsplit'
         elif ram_before is not None and ram_before >= 0:
             try:
                 rd = round(self._get_own_ram_gb() - ram_before, 3)
                 if rd > 0:
                     measured_ram = rd
-                    ram_is_process_delta = True
+                    ram_kind = 'process-delta'
             except Exception:
                 measured_ram = None
 
@@ -4123,7 +4136,7 @@ class MultiModelManager:
             # process delta would put the whole mmap'd file on the Tasks page as
             # "CPU offload", which is how a fully-GPU-resident GGUF came to look
             # like a wholly offloaded one.
-            if measured_ram and not ram_is_process_delta:
+            if measured_ram and ram_kind is None:
                 _dev += f" · CPU offload {measured_ram:.1f} GB"
             elif offloaded:
                 _dev += " · CPU offload"
@@ -4133,7 +4146,11 @@ class MultiModelManager:
         # so don't add measured_ram again here — that would double-count.
         if measured_ram is None:
             _host = "0.00 GB was offloaded to host RAM this load"
-        elif ram_is_process_delta:
+        elif ram_kind == 'unsplit':
+            _host = (f"{measured_ram:.2f} GB is the whole weights total and its "
+                     f"GPU/host split was NOT measured here (no torch object to "
+                     f"walk; llama.cpp's own layer placement is the authority)")
+        elif ram_kind == 'process-delta':
             _host = (f"host RSS grew {measured_ram:.2f} GB during this load "
                      f"(process delta, NOT the offloaded weights: a memory-mapped "
                      f"GGUF grows RSS by about its file size whatever the layer "

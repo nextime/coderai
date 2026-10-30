@@ -518,3 +518,70 @@ def test_geometry_is_found_through_the_backend_wrapper_too():
     assert geom.get("num_key_value_heads") == 8, geom
     fp = F.measure(w, {"n_ctx": 8192}, "text")
     assert fp.kv_gb > 0, f"the KV term was dropped: {fp.describe()}"
+
+
+# ---------------------------------------------------------------------------
+# A GGUF's weights total is the file; its PLACEMENT is not this helper's to say
+# ---------------------------------------------------------------------------
+#
+# Measured on zeiss 2026-10-30. Gemma-4-14B-A4B-Heretic IQ4_XS, loaded with
+# `n_gpu_layers: all` and holding 10.1 GB of VRAM by nvtop, described itself as
+#
+#     footprint: 8.48 GB total (weights 7.71 GB (0.00 on GPU, 7.71 on host), …)
+#
+# and the Tasks page called it "CPU offload 7.71 GB". The file size was banked
+# in `weights_cpu_gb` -- which keeps the TOTAL right, and the total is what
+# sizing consumes -- but nothing had measured a split, and "0.00 on GPU" is the
+# opposite of the truth for a fully-resident model. It is also precisely the
+# line an operator reads when chasing a CPU-spill problem.
+
+def test_a_gguf_total_is_still_the_file_size():
+    """The total is load-bearing for sizing and eviction; this must not change
+    it. Under-reporting a footprint is how eviction stops freeing room."""
+    fp = F.measure(None, cfg={"n_ctx": 32000}, model_type="text_models",
+                 file_size_gb=7.71, measured_kv_gb=0.5)
+    assert abs(fp.weights_gb - 7.71) < 0.001
+    assert fp.total_gb > 7.71
+
+
+def test_a_gguf_does_not_claim_a_placement():
+    fp = F.measure(None, cfg={"n_ctx": 32000}, model_type="text_models",
+                 file_size_gb=7.71, measured_kv_gb=0.5)
+    assert fp.weights_split_known is False
+    assert "0.00 on GPU" not in fp.describe()
+    assert "on host" not in fp.describe()
+    assert "placement not measured" in fp.describe()
+
+
+def test_a_real_per_module_measurement_still_reports_its_split():
+    """The case where the numbers ARE measured must keep saying so -- an
+    actually-offloaded model is the thing this breakdown exists for."""
+    fp = F.Footprint(weights_gpu_gb=3.0, weights_cpu_gb=1.0)
+    assert fp.weights_split_known is True
+    assert "(3.00 on GPU, 1.00 on host)" in fp.describe()
+
+
+def test_the_on_disk_fallback_also_stops_claiming_a_split():
+    """The other path to the same figure: an object that could not be walked,
+    falling back to the file size."""
+    class Unwalkable:
+        pass
+
+    fp = F.measure(Unwalkable(), cfg={"n_ctx": 4096}, model_type="text_models",
+                   file_size_gb=5.0)
+    if not fp.complete:
+        pytest.skip("this object is rejected outright, not fallen back for")
+    assert fp.weights_split_known is False
+    assert "placement not measured" in fp.describe()
+
+
+def test_the_manager_does_not_call_an_unsplit_total_an_offload():
+    import io as _io
+    import os as _os
+    mgr = _io.open(_os.path.join(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__))), "codai/models/manager.py"),
+        encoding="utf-8").read()
+    assert "ram_kind = 'unsplit'" in mgr
+    assert "GPU/host split was NOT measured here" in mgr
+    # And the Tasks page only states a SIZE for a genuine measurement.
+    assert "if measured_ram and ram_kind is None:" in mgr

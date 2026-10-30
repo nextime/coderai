@@ -173,15 +173,20 @@ def test_the_field_exists_on_the_published_schema():
 
 # ── the footprint label ──────────────────────────────────────────────────────
 
-def test_the_host_figure_states_which_of_the_two_it_is():
-    assert 'ram_is_process_delta' in MGR
+def test_the_host_figure_states_which_of_the_three_it_is():
+    """Three different things land in `measured_ram` and only one is offloaded
+    weights: a per-module measurement, a GGUF's whole file size with no split
+    measured, and the process's RSS growth."""
+    assert "ram_kind = 'unsplit'" in MGR
+    assert "ram_kind = 'process-delta'" in MGR
     assert 'host RSS grew' in MGR
     assert 'NOT the offloaded weights' in MGR
+    assert 'GPU/host split was NOT measured here' in MGR
 
 
 def test_the_mmap_reason_is_recorded_where_the_number_is_made():
-    i = MGR.index('ram_is_process_delta = False')
-    head = MGR[max(0, i - 1500):i]
+    i = MGR.index('ram_kind = None')
+    head = MGR[max(0, i - 2000):i]
     assert 'MMAPS' in head or 'mmap' in head.lower()
 
 
@@ -191,8 +196,8 @@ def test_a_real_per_module_measurement_keeps_the_plain_wording():
     assert i > 0
 
 
-def test_the_tasks_page_does_not_print_a_delta_as_an_offload_size():
-    i = MGR.index('if measured_ram and not ram_is_process_delta:')
+def test_the_tasks_page_only_prints_a_measured_offload_size():
+    i = MGR.index('if measured_ram and ram_kind is None:')
     block = MGR[i:i + 400]
     assert 'CPU offload {measured_ram:.1f} GB' in block
     assert 'elif offloaded:' in block
