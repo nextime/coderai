@@ -30,9 +30,17 @@ ENV PYTHONUNBUFFERED=1 \
 # Without them the first quantised forward dies with "Failed to find C compiler", the
 # way Surya did locally before v0.2.62. Linking also needs libcuda.so, which the nvidia
 # container runtime provides on a pod.
+# g++ is a RUNTIME requirement too, for the same reason gcc is: XTTS's Japanese
+# phonemiser (cutlet) pulls mojimoji, a C++ extension that ships no cp313 wheel,
+# so it compiles when the isolated TTS venv is built. The bundled Python records
+# clang++ as its C++ compiler and the image has no clang, so the build asks for
+# clang++, finds nothing, and XTTS loses exactly one of its seventeen languages
+# -- measured on zeiss 2026-10-30. g++ provides /usr/bin/c++ and the C++ headers,
+# which were absent entirely.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
         gcc \
+        g++ \
         libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 

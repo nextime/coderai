@@ -17,3 +17,14 @@ coqui-tts>=0.24.0
 # which is what the audiocraft venv cost before that lesson took.
 click>=8.0
 soundfile>=0.12.0
+# Per-language phonemisers, which coqui-tts also does not declare -- the same
+# class of gap as the click above, found the same way. Without them XTTS installs
+# cleanly, advertises all seventeen of its languages, and refuses two of them at
+# synthesis time: zh-cn with "ImportError: Chinese requires: pypinyin" and ja
+# with "ModuleNotFoundError: No module named 'cutlet'". cutlet romanises through
+# fugashi, which needs its dictionary at RUNTIME, so unidic-lite comes too; and
+# it pulls mojimoji, a C++ extension with no wheel, so the base image needs g++.
+pypinyin
+cutlet
+fugashi
+unidic-lite

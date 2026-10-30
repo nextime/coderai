@@ -144,6 +144,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # only a log line to say why. Dockerfile.oci and Dockerfile.update carried
 # these packages; THIS file -- the one build_oci_image.sh actually builds --
 # never did, so every image built the normal way shipped without them.
+# g++ is a RUNTIME requirement too, for the same reason gcc is: XTTS's Japanese
+# phonemiser (cutlet) pulls mojimoji, a C++ extension that ships no cp313 wheel,
+# so it compiles when the isolated TTS venv is built. The bundled Python records
+# clang++ as its C++ compiler and the image has no clang, so the build asks for
+# clang++, finds nothing, and XTTS loses exactly one of its seventeen languages
+# -- measured on zeiss 2026-10-30. g++ provides /usr/bin/c++ and the C++ headers,
+# which were absent entirely.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
@@ -156,6 +163,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fonts-liberation \
       fonts-dejavu-core \
       gcc \
+      g++ \
       libc6-dev \
       git \
       libgomp1 \

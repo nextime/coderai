@@ -2,4 +2,10 @@
 from TTS.api import TTS                                   # noqa
 from TTS.tts.models.xtts import Xtts                      # noqa
 import click                                              # noqa  (undeclared, found the hard way)
-print("coqui-tts deep check: XTTS model class imports")
+# The phonemisers for the two non-Latin scripts. Imported here because the
+# failure they cause is invisible at install and at boot: the pod answers
+# /v1/models with all seventeen languages and refuses two of them per request.
+import pypinyin                                           # noqa  (zh-cn)
+import cutlet                                             # noqa  (ja)
+cutlet.Cutlet()                   # builds the fugashi tagger -- needs a dictionary
+print("coqui-tts deep check: XTTS model class + zh/ja phonemisers import")

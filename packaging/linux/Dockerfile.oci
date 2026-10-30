@@ -165,10 +165,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   variable or set triton.knobs.build.impl.
 # which surfaces as "vLLM exited (code 1) before becoming ready" — so every vLLM
 # engine, surya OCR included, silently fell back to another engine.
+# g++ is a RUNTIME requirement too, for the same reason gcc is: XTTS's Japanese
+# phonemiser (cutlet) pulls mojimoji, a C++ extension that ships no cp313 wheel,
+# so it compiles when the isolated TTS venv is built. The bundled Python records
+# clang++ as its C++ compiler and the image has no clang, so the build asks for
+# clang++, finds nothing, and XTTS loses exactly one of its seventeen languages
+# -- measured on zeiss 2026-10-30. g++ provides /usr/bin/c++ and the C++ headers,
+# which were absent entirely.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       ffmpeg \
       gcc \
+      g++ \
       libc6-dev \
       git \
       libgomp1 \
