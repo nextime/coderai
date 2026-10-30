@@ -1213,6 +1213,59 @@ def _supports_images(model_obj) -> bool:
             or 'image' in type(proc).__name__.lower())
 
 
+def _takes_image_in_input(model_name) -> bool:
+    """Whether this model is image-only AND expects the image in ``input``.
+
+    Name-only, so it can be answered before anything is loaded -- the mirror of
+    :func:`_may_embed_images`, and for the reason its call site records: a
+    refusal that waits for the model to load costs the caller the whole load.
+    Measured after the first version of this guard shipped: text to `salad`
+    stopped hanging but still took 42s to answer 400, because the check sat
+    after the load rather than before it.
+    """
+    n = str(model_name or '').strip().lower().replace('_', '-')
+    return n in _VPR_IDS or n in _SALAD_IDS
+
+
+def _looks_like_image_ref(src) -> bool:
+    """Whether this string could be an image reference at all.
+
+    The same four shapes :func:`_decode_image` accepts -- http(s) URL, data URI,
+    existing file path, or a bare base64 blob -- tested without decoding, so a
+    real image is not decoded twice just to be checked.
+
+    Exists because the image-only models whose contract puts the image in
+    `input` rather than `image` had no way to refuse text. `vpr` decodes locally
+    and so fails cleanly, but `vpr-server` (SALAD) hands the strings to an
+    isolated subprocess, which received four sentences, could not answer, and
+    never replied: measured on zeiss 2026-10-30, the request hung past 180s and
+    the sweep recorded it as a 500 with no error logged anywhere. A hang is worse
+    than a refusal -- it holds a slot and tells the caller nothing -- and dinov2,
+    whose refusal is keyed on its backend name, answered the identical request
+    with a clean 400.
+    """
+    import os as _os
+    import re as _re
+    if not isinstance(src, str) or not src.strip():
+        return False
+    t = src.strip()
+    if t.startswith(('http://', 'https://', 'data:')):
+        return True
+    try:
+        if _os.path.isfile(t):
+            return True
+    except (OSError, ValueError):
+        pass        # absurdly long strings raise rather than returning False
+    # A bare base64 blob. Short strings are text, not an encoded picture.
+    if len(t) < 64:
+        return False
+    try:
+        base64.b64decode(_re.sub(r'\s+', '', t), validate=True)
+        return True
+    except Exception:
+        return False
+
+
 def _decode_image(src: str):
     """Accept a data URI, http(s) URL, local file path or bare base64 blob."""
     import io
@@ -1972,12 +2025,24 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None,
         # image model: the HomeHunter contract sends the image data URI in 'input'
         return _geoclip_embed_images(
             model, [_decode_image(t) for t in texts], dimensions)
-    elif backend == 'vpr':
-        # VPR is image-only; the contract sends the image data URI in 'input'.
-        return _vpr_embed_images(
-            model, [_decode_image(t) for t in texts], dimensions)
-    elif backend == 'vpr-server':
-        # SALAD subprocess is image-only; 'input' carries image data URIs.
+    elif backend in ('vpr', 'vpr-server'):
+        # Image-only, and their contract puts the image in `input` rather than
+        # `image` -- so the refusal cannot be keyed on the field that was used,
+        # only on what is in it. Checked BEFORE dispatch: vpr-server hands these
+        # strings to a subprocess that cannot answer and does not reply, so text
+        # arriving here used to hang the request instead of failing it.
+        _bad = [i for i, t in enumerate(texts) if not _looks_like_image_ref(t)]
+        if _bad:
+            raise ValueError(
+                f"this embedding model is image-only (no text tower) and takes "
+                f"the image in 'input' as a data URI, http(s) URL, file path or "
+                f"base64 blob -- input[{_bad[0]}] is none of those. Send an "
+                f"image, or use a text/multimodal embedding model."
+                + (f" ({len(_bad)} of {len(texts)} inputs are not images.)"
+                   if len(_bad) > 1 else ""))
+        if backend == 'vpr':
+            return _vpr_embed_images(
+                model, [_decode_image(t) for t in texts], dimensions)
         return _embed_images(model_obj, texts, dimensions)
     elif backend == 'llama':
         # llama.cpp embedding mode. With a pooling type baked into the GGUF the
@@ -2355,6 +2420,20 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     # used to come after the load: images sent to a text-only 8 GB embedder
     # spent forty seconds loading it and then answered 400. A caller cannot
     # tell that from a hang, and the work was wasted either way.
+    # The mirror case, refused here for the same reason: these models are
+    # image-only and take the image in `input`, so text in `input` can never be
+    # served -- and loading SALAD to find that out costs a subprocess spawn.
+    if texts and not images and _takes_image_in_input(model_name):
+        _bad = [i for i, t in enumerate(texts) if not _looks_like_image_ref(t)]
+        if _bad:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_name}' is image-only (no text tower) and "
+                       f"takes the image in 'input' as a data URI, http(s) URL, "
+                       f"file path or base64 blob — input[{_bad[0]}] is none of "
+                       f"those. Send an image, or use a text/multimodal "
+                       f"embedding model.")
+
     if images and model_obj is None and not _may_embed_images(model_name, _emb_cfg):
         raise HTTPException(
             status_code=400,

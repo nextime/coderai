@@ -43,6 +43,7 @@ hang.
 
 import io
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,8 +60,22 @@ _SRC = io.open(os.path.join(_ROOT, "codai/api/embeddings.py"), encoding="utf-8")
 # What the entry names is what gets loaded
 # --------------------------------------------------------------------------
 
+def _run_embeddings_body():
+    """The whole of `_run_embeddings`, not a fixed slice of it.
+
+    A `[:4000]` window broke when a pre-load refusal was added ahead of the
+    load: `_load_embedding_locked` moved past the cutoff and the test failed
+    with "substring not found" on code that was correct. The window was never
+    the thing being asserted — ordering within the function is.
+    """
+    after = _SRC.split("async def _run_embeddings", 1)[1]
+    # Up to the next top-level def, so the body is bounded by structure.
+    nxt = re.search(r"\n(?:async def |def )", after)
+    return after[:nxt.start()] if nxt else after
+
+
 def test_the_entry_path_decides_what_is_loaded():
-    body = _SRC.split("async def _run_embeddings", 1)[1][:4000]
+    body = _run_embeddings_body()
     assert "_cfg_path" in body, "the entry's path is never consulted"
     assert body.index("_cfg_path") < body.index("_load_embedding_locked"), (
         "the name is resolved after the load, which is too late to change it")
