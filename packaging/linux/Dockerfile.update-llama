@@ -20,7 +20,15 @@ ARG CUDA_BUILDER=nvidia/cuda:13.0.2-devel-ubuntu24.04
 FROM ${CUDA_BUILDER} AS llamabuild
 ARG PYTHON_VERSION=3.13.5
 ARG PBS_RELEASE=20250612
-ARG LLAMA_CPP_PYTHON_VERSION=0.3.30
+# 0.3.30 vendored llama.cpp e3a74b299 (2026-06-16), five weeks BEFORE
+# b4aa7dd47 "mtmd : use align_corners for qwen3vl vision position embedding
+# interpolation" (#25781, 2026-07-21). Without that fix a qwen3vl projector
+# loads, injects its image tokens, and describes every picture identically --
+# measured on zeiss 2026-10-30 across two publishers' conversions, with and
+# without an image-token floor, while a gemma4v projector read the same images
+# correctly through the same code. 0.3.36 vendors 0c1e57098 (2026-10-01), which
+# contains it. See docs/serving-a-model-this-box-cannot-hold.md.
+ARG LLAMA_CPP_PYTHON_VERSION=0.3.36
 # SASS for every card the release may meet (Ampere → Blackwell). sm_86 alone
 # is what the local box needs; the GitHub release is for anyone.
 ARG CUDA_ARCHS="80;86;89;90;120"

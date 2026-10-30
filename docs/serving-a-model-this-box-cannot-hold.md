@@ -172,6 +172,38 @@ is correct at two different model sizes, and Qwen3.5's OWN vision tower is
 correct when transformers runs it instead of llama.cpp — so it is not the model,
 not the family, and not our pipeline.
 
+## The actual cause: our llama.cpp predates the fix
+
+```
+our build (0.3.30)  vendors llama.cpp e3a74b299   2026-06-16
+the fix             b4aa7dd47  "mtmd : use align_corners for qwen3vl vision
+                    position embedding interpolation" (#25781)   2026-07-21
+0.3.36              vendors llama.cpp 0c1e57098   2026-10-01   <- contains it
+```
+
+Five weeks. Wrong position-embedding interpolation makes the vision features
+spatially meaningless, which is why the output is constant rather than merely
+wrong, and why `gemma4v` -- a different graph, untouched by that bug -- reads the
+same images correctly through the same pipeline.
+
+Everything observed fits: the projector pairs correctly, loads, and injects
+tokens the model notices (it says so when there is no image); two publishers'
+conversions fail identically because the defect is in the consumer, not the
+artifact; and the image-token floor is irrelevant, confirmed by testing with it
+at 1024 and at 0 and getting byte-identical answers.
+
+`packaging/linux/Dockerfile.update-llama` is bumped to 0.3.36 for this reason.
+It takes effect only on a rebuild, so until one runs, `mmproj` stays off the
+qwen38 cards and vision goes to gemma-4-31B-heretic.
+
+One method note, since it cost most of the investigation: three conclusions were
+drawn from reading headers and code, and all three were wrong. The floor was
+dismissed with "the symptom predates it" -- never checked, and it could not have
+been, because the floor is applied automatically whenever the projector type
+matches. Two projectors were compared while the one variable introduced by this
+repo was held constant in both. What settled it was varying one thing at a time
+against a known-good control.
+
 ## If you try a newer llama.cpp, do NOT pip install it
 
 Six versions of llama-cpp-python have shipped since the one we run (0.3.30 vs
