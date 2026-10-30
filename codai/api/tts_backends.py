@@ -668,6 +668,42 @@ def _voice_meta(family: str, voice_id: str) -> dict:
     return out
 
 
+def _voice_ids(backend) -> list:
+    """The voice ids a loaded backend can offer, however it exposes them.
+
+    Every backend in this module declares ``voices`` as a METHOD, and both
+    callers used to read it as if it were a sequence::
+
+        [str(v) for v in (getattr(backend, "voices", None) or [])]
+
+    A bound method is truthy, so the ``or []`` never fired; iterating it raised
+    TypeError; both callers caught that and fell back to "nothing known". So the
+    loaded and remembered paths never recorded or returned a single voice for any
+    engine, and the cache file was never written at all. Kokoro and bark hid it
+    behind their static lists; XTTS and parler, which have none, reported zero
+    voices for ever.
+
+    The tests did not catch it because their fake set ``voices`` as a list
+    attribute -- a shape no real backend has.
+    """
+    try:
+        # The getattr is inside the guard too: a backend may expose `voices` as
+        # a PROPERTY, and then merely reading the attribute runs its code and
+        # can raise. This runs on the load path, so every failure mode here
+        # costs the voice list and nothing else.
+        got = getattr(backend, "voices", None)
+        if callable(got):
+            got = got()
+    except Exception:
+        return []
+    if not got:
+        return []
+    try:
+        return [str(v) for v in got]
+    except TypeError:
+        return []
+
+
 def _voices_cache_file() -> Path:
     return _cache_dir() / "tts_voices.json"
 
@@ -679,10 +715,7 @@ def remember_voices(model_name: str, backend) -> None:
     unwritable cache or a malformed existing file must not affect synthesis,
     which is what the caller is actually doing.
     """
-    try:
-        voices = [str(v) for v in (getattr(backend, "voices", None) or [])]
-    except Exception:
-        return
+    voices = _voice_ids(backend)
     if not voices:
         return
     try:
@@ -726,7 +759,21 @@ def _remembered_voices(model_name: str) -> list:
             _VOICES_MEMO.clear()
             _VOICES_MEMO["stamp"] = stamp
             _VOICES_MEMO["data"] = parsed if isinstance(parsed, dict) else {}
-        return [str(v) for v in (_VOICES_MEMO.get("data", {}).get(model_name) or [])]
+        data = _VOICES_MEMO.get("data", {})
+        got = data.get(model_name)
+        if got is None:
+            # A model answers to several ids, and the one that RECORDED the
+            # voices is whichever the request used while the one asking is
+            # whichever the listing publishes: "XTTS-v2" was written and
+            # "coqui/XTTS-v2" looked up, so 58 recorded voices read as none.
+            # Match on the last path segment, as the coqui speaker lookup
+            # already does for the same reason.
+            want = str(model_name).rsplit("/", 1)[-1].lower()
+            for key, val in data.items():
+                if str(key).rsplit("/", 1)[-1].lower() == want:
+                    got = val
+                    break
+        return [str(v) for v in (got or [])]
     except Exception:
         return []
 
@@ -742,12 +789,9 @@ def family_voices(model_name: str, backend=None,
     fam = _family(model_name)
     ids, source = [], "none"
     if backend is not None:
-        try:
-            ids = [str(v) for v in (getattr(backend, "voices", None) or [])]
-            if ids:
-                source = "loaded"
-        except Exception:
-            ids = []
+        ids = _voice_ids(backend)
+        if ids:
+            source = "loaded"
     if not ids:
         ids = _remembered_voices(model_name)
         if ids:

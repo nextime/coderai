@@ -228,3 +228,146 @@ def test_the_engine_package_alone_is_not_evidence(tmp_path, monkeypatch):
 def test_every_venv_family_requires_torch():
     for fam, modules in T._VENV_FAMILIES.items():
         assert "torch" in modules, f"{fam} can report ready without torch"
+
+
+# ── the loaded/remembered paths had never once worked ────────────────────────
+#
+# Every backend in tts_backends declares `voices` as a METHOD, and both callers
+# read it as a sequence:
+#
+#     [str(v) for v in (getattr(backend, "voices", None) or [])]
+#
+# A bound method is truthy, so `or []` never fired; iterating it raised
+# TypeError; both callers caught that and fell back to "nothing known". So no
+# voice was ever recorded or returned for any engine, and the cache file was
+# never written. Kokoro and bark hid it behind their static lists; XTTS and
+# parler, having none, reported zero voices for ever -- after 17 successful
+# syntheses in one afternoon.
+#
+# These tests did not catch it because `_Loaded` sets `voices` as a LIST
+# ATTRIBUTE, a shape no real backend has. The fixtures below use both.
+
+
+class _LoadedMethod:
+    """How every real backend actually looks."""
+
+    def __init__(self, voices):
+        self._v = voices
+
+    def voices(self):
+        return self._v
+
+
+def test_a_backend_whose_voices_is_a_method_is_read():
+    got = T.family_voices("coqui/XTTS-v2", _LoadedMethod(["Claribel Dervla",
+                                                          "Daisy Studious"]))
+    assert got["voices_source"] == "loaded"
+    assert [v["id"] for v in got["voices"]] == ["Claribel Dervla", "Daisy Studious"]
+
+
+def test_the_attribute_shape_still_works():
+    """Belt and braces: whichever way a backend exposes them."""
+    got = T.family_voices("coqui/XTTS-v2", _Loaded(["A", "B"]))
+    assert [v["id"] for v in got["voices"]] == ["A", "B"]
+
+
+def test_every_real_backend_exposes_voices_the_way_the_reader_expects():
+    """The assumption the bug rested on, asserted against the real classes
+    instead of a fixture."""
+    import inspect
+    classes = [obj for _, obj in inspect.getmembers(T, inspect.isclass)
+               if hasattr(obj, "voices") and obj.__module__ == T.__name__]
+    assert classes, "no backend classes found — this test has stopped checking"
+    for cls in classes:
+        assert callable(cls.voices), f"{cls.__name__}.voices is not callable"
+        # And the reader handles exactly that.
+        assert T._voice_ids(_LoadedMethod(["x"])) == ["x"]
+
+
+def test_a_backend_that_raises_when_asked_costs_only_the_list(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+
+    class Broken:
+        def voices(self):
+            raise RuntimeError("engine not ready")
+
+    class Angry:
+        @property
+        def voices(self):
+            raise RuntimeError("cannot even read the attribute")
+
+    assert T._voice_ids(Broken()) == []
+    assert T._voice_ids(Angry()) == []
+    assert T.family_voices("coqui/XTTS-v2", Broken())["voices_source"] == "none"
+
+
+def test_a_backend_with_no_voices_attribute_at_all():
+    class Bare:
+        pass
+
+    assert T._voice_ids(Bare()) == []
+
+
+def test_remember_voices_actually_writes_now(tmp_path, monkeypatch):
+    """It had never written the file once."""
+    import json
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    T.remember_voices("coqui/XTTS-v2", _LoadedMethod(["Claribel Dervla"]))
+    stored = json.loads((tmp_path / "tts_voices.json").read_text())
+    assert stored["coqui/XTTS-v2"] == ["Claribel Dervla"]
+
+
+# ── recorded under one id, published under another ───────────────────────────
+
+def test_voices_recorded_under_an_alias_are_found_by_the_canonical_id(
+        tmp_path, monkeypatch):
+    """A model answers to several ids. The one that RECORDS is whichever the
+    request used; the one that ASKS is whichever the listing publishes. 58 XTTS
+    voices were written under "XTTS-v2" and looked up under "coqui/XTTS-v2",
+    so they read as none."""
+    import json
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    (tmp_path / "tts_voices.json").write_text(
+        json.dumps({"XTTS-v2": ["Claribel Dervla", "Daisy Studious"]}))
+    assert len(T._remembered_voices("coqui/XTTS-v2")) == 2
+    assert len(T._remembered_voices("XTTS-v2")) == 2
+
+
+def test_the_match_works_in_the_other_direction_too(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    (tmp_path / "tts_voices.json").write_text(
+        json.dumps({"coqui/XTTS-v2": ["Claribel Dervla"]}))
+    assert len(T._remembered_voices("XTTS-v2")) == 1
+
+
+def test_the_match_is_case_insensitive(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    (tmp_path / "tts_voices.json").write_text(json.dumps({"XTTS-v2": ["A"]}))
+    assert len(T._remembered_voices("coqui/xtts-v2")) == 1
+
+
+def test_a_different_model_is_not_matched(tmp_path, monkeypatch):
+    """Matching on the last segment must not collapse distinct models."""
+    import json
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    (tmp_path / "tts_voices.json").write_text(json.dumps({"XTTS-v2": ["A"]}))
+    assert T._remembered_voices("suno/bark") == []
+    assert T._remembered_voices("hexgrad/Kokoro-82M") == []
+
+
+def test_an_exact_key_wins_over_a_segment_match(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    (tmp_path / "tts_voices.json").write_text(json.dumps({
+        "XTTS-v2": ["alias-recorded"],
+        "coqui/XTTS-v2": ["canonical-recorded"]}))
+    assert T._remembered_voices("coqui/XTTS-v2") == ["canonical-recorded"]
