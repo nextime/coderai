@@ -1514,9 +1514,29 @@ def _llama_vl_embed(model_obj, items, dimensions=None):
                     raise ValueError("mtmd bitmap init failed")
                 chunks = _M.mtmd_input_chunks_init()
                 try:
-                    itext = _M.mtmd_input_text(
-                        text=_prompt(marker).encode(),
-                        add_special=True, parse_special=True)
+                    # text_len must be SET, and the encoded bytes must stay
+                    # alive. Built field by field, exactly as llama_cpp's own
+                    # chat handler builds it, because the constructor form left
+                    # text_len at 0 and llama.cpp then read an empty prompt:
+                    #
+                    #   mtmd_tokenize: error: number of media markers in text
+                    #   (0) does not match number of bitmaps (1)
+                    #
+                    # -> `Embedding failed: mtmd_tokenize failed (2)`, a 500 on
+                    # every image sent to a GGUF vision embedder. The marker was
+                    # in the prompt all along (verified: mtmd_default_marker()
+                    # is b'<__media__>' and _prompt() interpolates it); the
+                    # length said the prompt was zero characters long.
+                    #
+                    # `_itext_bytes` is a named local on purpose: `text` is a
+                    # c_char_p, so a temporary would be free to be collected
+                    # while the struct still points at it.
+                    _itext_bytes = _prompt(marker).encode('utf-8')
+                    itext = _M.mtmd_input_text()
+                    itext.text = _itext_bytes
+                    itext.text_len = len(_itext_bytes)
+                    itext.add_special = True
+                    itext.parse_special = True
                     arr = (_M.mtmd_bitmap_p_ctypes * 1)(bmp)
                     rc = _M.mtmd_tokenize(
                         mctx, chunks, ctypes.byref(itext),

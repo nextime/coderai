@@ -74,6 +74,16 @@ def _summarise(parsed) -> str:
             bits.append(f"chars={chars}")
     elif isinstance(inp, str):
         bits.append(f"inputs=1 chars={len(inp)}")
+    # The `image` field, counted. Its absence here cost a real debugging
+    # detour: `model=gme-… inputs=4 chars=84` was read as a text-only request,
+    # so an mtmd failure on the IMAGE path looked impossible and the search went
+    # looking for text being mistaken for pictures. The count is shape, not
+    # content -- the same rule the rest of this line follows.
+    img = parsed.get("image")
+    if isinstance(img, list):
+        bits.append(f"images={len(img)}")
+    elif isinstance(img, str):
+        bits.append("images=1")
     for key in ("dimensions", "encoding_format"):
         if parsed.get(key) is not None:
             bits.append(f"{key}={parsed[key]}")
