@@ -34,6 +34,65 @@ _MAX_AUDIO_BYTES = 100 * 1024 * 1024
 _SAFE_EXTENSIONS = {'.wav', '.mp3', '.ogg', '.flac', '.m4a', '.webm', '.mp4'}
 
 
+def _whisper_server_timings(result: dict) -> tuple:
+    """``(segments, words)`` from a whisper.cpp server reply, in OpenAI shape.
+
+    Two reply shapes exist and both are accepted. ``verbose_json`` gives
+    OpenAI-style ``segments`` with float seconds; whisper.cpp's native json
+    gives ``transcription`` entries carrying ``offsets`` in MILLISECONDS. A
+    build with DTW enabled adds per-word entries, either at the top level or
+    inside each segment.
+
+    The route used to pass ``[]`` here regardless, so every whisper.cpp model
+    answered with text and no timings at all -- while the HF and Vosk backends
+    on the same endpoint returned both, which reads as whisper being the broken
+    one. Anything missing stays missing: this reports what the server sent, and
+    never invents a timing.
+    """
+    segs, words = [], []
+
+    def _secs(v, scale=1.0):
+        try:
+            return round(float(v) * scale, 3)
+        except (TypeError, ValueError):
+            return None
+
+    for item in (result.get("segments") or []):
+        if not isinstance(item, dict):
+            continue
+        start, end = _secs(item.get("start")), _secs(item.get("end"))
+        if start is None and isinstance(item.get("offsets"), dict):
+            start = _secs(item["offsets"].get("from"), 0.001)
+            end = _secs(item["offsets"].get("to"), 0.001)
+        segs.append({"start": start or 0.0, "end": end or 0.0,
+                     "text": str(item.get("text") or "").strip()})
+        for w in (item.get("words") or []):
+            if isinstance(w, dict):
+                words.append(w)
+    # whisper.cpp's own json names the list "transcription" and counts in ms.
+    for item in (result.get("transcription") or []):
+        if not isinstance(item, dict):
+            continue
+        off = item.get("offsets") if isinstance(item.get("offsets"), dict) else {}
+        segs.append({"start": _secs(off.get("from"), 0.001) or 0.0,
+                     "end": _secs(off.get("to"), 0.001) or 0.0,
+                     "text": str(item.get("text") or "").strip()})
+    for w in (result.get("words") or []):
+        if isinstance(w, dict):
+            words.append(w)
+    norm_words = []
+    for w in words:
+        start, end = _secs(w.get("start")), _secs(w.get("end"))
+        if start is None and isinstance(w.get("offsets"), dict):
+            start = _secs(w["offsets"].get("from"), 0.001)
+            end = _secs(w["offsets"].get("to"), 0.001)
+        text = str(w.get("word") or w.get("text") or "").strip()
+        if text:
+            norm_words.append({"word": text, "start": start or 0.0,
+                               "end": end or 0.0})
+    return segs, norm_words
+
+
 def _upload_name(file) -> str:
     """The name of the audio being transcribed, whatever ``file`` is.
 
@@ -552,7 +611,17 @@ async def _run_transcription_inner(
         )
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
-        return await _finalize(response_format, result.get("text", ""), [])
+        _ws_segs, _ws_words = _whisper_server_timings(result)
+        if word_timestamps and not _ws_words:
+            # Said out loud rather than returned as an empty list. whisper.cpp
+            # only produces per-word timings when the server was started with
+            # DTW; without it the caller gets segments, and a silent absence is
+            # indistinguishable from a model that found no speech.
+            print(f"  [stt] '{model}' returned no word timings: whisper.cpp "
+                  f"emits them only when its server runs with DTW enabled "
+                  f"({len(_ws_segs)} segment timing(s) returned)", flush=True)
+        return await _finalize(response_format, result.get("text", ""),
+                               _ws_segs, _ws_words)
 
     # Use the manager to resolve the model and manage VRAM
     model_info = await asyncio.to_thread(

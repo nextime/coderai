@@ -1379,8 +1379,19 @@ class WhisperServerManager:
                 except OSError:
                     pass
 
-    def transcribe(self, audio_data: bytes, language: str = None, prompt: str = None):
-        """Send transcription request to whisper-server."""
+    def transcribe(self, audio_data: bytes, language: str = None, prompt: str = None,
+                   verbose: bool = True):
+        """Send transcription request to whisper-server.
+
+        ``verbose`` asks for ``verbose_json``, which carries the per-segment
+        timings (and word timings on a build with DTW enabled). It defaults to
+        ON because the caller discarded them either way before: the transcription
+        route passed an empty segment list straight through, so every
+        whisper.cpp model answered with text and nothing else -- no segments, no
+        words -- while the HF and Vosk backends on the same endpoint returned
+        both. The extra fields cost one JSON key and are ignored by a caller
+        that asked for plain ``json``.
+        """
         if not self.is_running():
             return {"error": "whisper-server not running"}
         with self.lock:
@@ -1393,6 +1404,8 @@ class WhisperServerManager:
             audio_data = self._to_wav_16k_mono(audio_data)
             files = {"file": ("audio.wav", audio_data, "audio/wav")}
             data = {}
+            if verbose:
+                data["response_format"] = "verbose_json"
             if language:
                 data["language"] = language
             if prompt:

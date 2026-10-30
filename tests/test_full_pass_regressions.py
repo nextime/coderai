@@ -329,3 +329,82 @@ def test_the_multimodal_path_is_visible_in_the_log():
     keep = src[head:src.index("\n    )", head)]
     for word in ("mtmd", "clip", "bitmap", "media", "projector"):
         assert f"'{word}'" in keep, word
+
+
+# ---------------------------------------------------------------------------
+# "Plain whisper0-3 return no word timings"
+# ---------------------------------------------------------------------------
+
+def test_openai_shaped_whisper_server_segments_are_read():
+    from codai.api.transcriptions import _whisper_server_timings
+    segs, words = _whisper_server_timings({
+        "text": "ciao mondo",
+        "segments": [{"start": 0.0, "end": 1.5, "text": " ciao"},
+                     {"start": 1.5, "end": 2.25, "text": " mondo"}],
+    })
+    assert [s["text"] for s in segs] == ["ciao", "mondo"]
+    assert segs[1]["start"] == 1.5 and segs[1]["end"] == 2.25
+    assert words == []
+
+
+def test_whisper_cpps_own_shape_is_read_and_converted_from_ms():
+    """whisper.cpp's native json names the list 'transcription' and counts in
+    MILLISECONDS — read as seconds it would place a 2-second clip 2000 s in."""
+    from codai.api.transcriptions import _whisper_server_timings
+    segs, _ = _whisper_server_timings({
+        "transcription": [
+            {"offsets": {"from": 0, "to": 1500}, "text": " ciao"},
+            {"offsets": {"from": 1500, "to": 2250}, "text": " mondo"},
+        ]})
+    assert segs[0]["end"] == 1.5
+    assert segs[1]["start"] == 1.5 and segs[1]["end"] == 2.25
+
+
+def test_word_timings_are_read_from_either_place():
+    """A DTW build puts them at the top level or inside each segment."""
+    from codai.api.transcriptions import _whisper_server_timings
+    _, words = _whisper_server_timings({
+        "words": [{"word": "ciao", "start": 0.0, "end": 0.4}]})
+    assert words == [{"word": "ciao", "start": 0.0, "end": 0.4}]
+    _, words = _whisper_server_timings({
+        "segments": [{"start": 0, "end": 1, "text": "ciao",
+                      "words": [{"text": "ciao",
+                                 "offsets": {"from": 0, "to": 400}}]}]})
+    assert words == [{"word": "ciao", "start": 0.0, "end": 0.4}]
+
+
+def test_nothing_is_invented_when_the_server_sent_nothing():
+    """The old behaviour returned [] for every whisper.cpp model; the new one
+    must return [] only when the server really sent nothing."""
+    from codai.api.transcriptions import _whisper_server_timings
+    assert _whisper_server_timings({"text": "ciao"}) == ([], [])
+    assert _whisper_server_timings({}) == ([], [])
+    assert _whisper_server_timings({"segments": [None, "x"]}) == ([], [])
+
+
+def test_a_malformed_timing_does_not_raise():
+    from codai.api.transcriptions import _whisper_server_timings
+    segs, words = _whisper_server_timings({
+        "segments": [{"start": "nonsense", "end": None, "text": "ciao"}],
+        "words": [{"word": "ciao", "start": "x", "end": "y"}]})
+    assert segs[0]["start"] == 0.0
+    assert words[0]["start"] == 0.0
+
+
+def test_the_server_is_asked_for_the_verbose_reply():
+    """It was never asked, so there was nothing to map."""
+    src = _src("codai/models/manager.py")
+    head = src.index("def transcribe(self, audio_data")
+    body = src[head:head + 2500]
+    assert 'data["response_format"] = "verbose_json"' in body
+
+
+def test_the_route_passes_the_timings_on():
+    src = _src("codai/api/transcriptions.py")
+    assert "_whisper_server_timings(result)" in src
+    assert "_finalize(response_format, result.get(\"text\", \"\"),\n" in src
+
+
+def test_a_missing_word_timing_is_reported_not_silently_empty():
+    src = _src("codai/api/transcriptions.py")
+    assert "returned no word timings" in src
