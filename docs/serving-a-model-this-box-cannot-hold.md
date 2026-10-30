@@ -172,37 +172,51 @@ is correct at two different model sizes, and Qwen3.5's OWN vision tower is
 correct when transformers runs it instead of llama.cpp — so it is not the model,
 not the family, and not our pipeline.
 
-## The actual cause: our llama.cpp predates the fix
+## A fourth wrong theory: the llama.cpp version
 
-```
-our build (0.3.30)  vendors llama.cpp e3a74b299   2026-06-16
-the fix             b4aa7dd47  "mtmd : use align_corners for qwen3vl vision
-                    position embedding interpolation" (#25781)   2026-07-21
-0.3.36              vendors llama.cpp 0c1e57098   2026-10-01   <- contains it
-```
+I claimed the cause was found, and it was not. Recorded in full because the
+reasoning looked strong and was still worthless.
 
-Five weeks. Wrong position-embedding interpolation makes the vision features
-spatially meaningless, which is why the output is constant rather than merely
-wrong, and why `gemma4v` -- a different graph, untouched by that bug -- reads the
-same images correctly through the same pipeline.
+The argument was: our 0.3.30 vendors llama.cpp e3a74b299 (2026-06-16); the
+commit b4aa7dd47 "mtmd : use align_corners for qwen3vl vision position embedding
+interpolation" (#25781) landed 2026-07-21; 0.3.36 vendors 0c1e57098 (2026-10-01)
+and so contains it. Wrong position-embedding interpolation would make vision
+features spatially meaningless, which fits a constant answer exactly, and
+`gemma4v` runs a different graph so it would be untouched. Every observation
+fitted.
 
-Everything observed fits: the projector pairs correctly, loads, and injects
-tokens the model notices (it says so when there is no image); two publishers'
-conversions fail identically because the defect is in the consumer, not the
-artifact; and the image-token floor is irrelevant, confirmed by testing with it
-at 1024 and at 0 and getting byte-identical answers.
+It was still only a plausible commit plus date arithmetic, and I wrote it into
+these docs as "the actual cause" without having run it.
 
-`packaging/linux/Dockerfile.update-llama` is bumped to 0.3.36 for this reason.
-It takes effect only on a rebuild, so until one runs, `mmproj` stays off the
-qwen38 cards and vision goes to gemma-4-31B-heretic.
+**Tested: llama-cpp-python 0.3.36 was built from source with the full
+-DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_RPC=ON set and put into service. The same
+two images still return byte-identical answers.** So align_corners was not it,
+and the fourth theory joins the other three.
 
-One method note, since it cost most of the investigation: three conclusions were
-drawn from reading headers and code, and all three were wrong. The floor was
-dismissed with "the symptom predates it" -- never checked, and it could not have
-been, because the floor is applied automatically whenever the projector type
-matches. Two projectors were compared while the one variable introduced by this
-repo was held constant in both. What settled it was varying one thing at a time
-against a known-good control.
+What that does buy: the last standing candidate is eliminated BY TEST. The
+remaining explanation is that llama.cpp's qwen3vl graph does not fit this model
+at all -- the base is `qwen3_5` / `Qwen3_5ForConditionalGeneration` while the
+projector declares `qwen3vl_merger`, so a faithful implementation of the wrong
+graph on correctly-shaped tensors is still the best reading, and one that no
+version bump fixes.
+
+`mmproj` stays off the qwen38 cards; vision goes to gemma-4-31B-heretic.
+
+## The method, since it cost more than the finding
+
+Four theories, each argued from reading rather than running: bad pairing, missing
+deepstack, a bad artifact, an outdated llama.cpp. All four wrong.
+
+The floor was dismissed with "the symptom predates it" -- never checked, and it
+could not have been, because the floor is applied automatically whenever the
+projector type matches, so every observation had it on. Two publishers'
+projectors were then compared while the one variable this repo introduced was
+held constant in both.
+
+What actually produced knowledge: gemma as a known-good control through the same
+pipeline, varying one thing at a time, and accepting a negative result. Three of
+the four theories could have been killed in the time it took to write the
+paragraph asserting them.
 
 ## If you try a newer llama.cpp, do NOT pip install it
 

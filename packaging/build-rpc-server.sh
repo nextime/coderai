@@ -57,9 +57,41 @@ CM=(-DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_
 [ -n "$CUDA" ] && CM+=(-DGGML_CUDA=ON ${CMAKE_CUDA_ARCHITECTURES:+-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES"})
 [ -n "$VULKAN" ] && CM+=(-DGGML_VULKAN=ON)
 cmake -S "$SRC" -B build "${CM[@]}" ${EXTRA_CMAKE_ARGS:-} >/dev/null
-cmake --build build --target rpc-server -j"$(nproc)"
-BIN=$(find build -type f -name rpc-server | head -1)
-[ -x "$BIN" ] || { echo "rpc-server did not build" >&2; exit 1; }
+
+# The CMake target was renamed: tools/rpc/CMakeLists.txt declares
+# `ggml-rpc-server` in current llama.cpp and `rpc-server` in older ones. Asking
+# for the wrong one fails the whole image build with
+#     gmake: *** No rule to make target 'rpc-server'.  Stop.
+# which names the target but not the rename -- measured on the 0.3.30 -> 0.3.36
+# bump, where the wheel itself built fine and only this step died. Ask the
+# generator which targets exist rather than guessing, so the script spans both.
+# Matched in pure bash, with the target list captured first. NOT
+# `cmake --target help | grep -q`: this script runs under `set -euo pipefail`,
+# and `grep -q` exits the moment it matches, which closes the pipe, kills cmake
+# with SIGPIPE, and pipefail then reports the whole pipeline as failed -- so a
+# SUCCESSFUL match tested as a failure and both candidates were skipped. The
+# diagnostic below used `grep -i rpc` without -q, read to EOF, and printed the
+# target it had just "not found", which is what gave it away.
+TARGETS="$(cmake --build build --target help 2>/dev/null || true)"
+RPC_TARGET=""
+for cand in ggml-rpc-server rpc-server; do
+    # make lists targets as "... name"; some generators omit the prefix.
+    if [[ $'\n'"$TARGETS"$'\n' == *$'\n'"... $cand"$'\n'* ]] \
+       || [[ $'\n'"$TARGETS"$'\n' == *$'\n'"$cand"$'\n'* ]]; then
+        RPC_TARGET="$cand"; break
+    fi
+done
+if [ -z "$RPC_TARGET" ]; then
+    echo "neither ggml-rpc-server nor rpc-server is a target in this llama.cpp;" >&2
+    echo "available targets containing 'rpc':" >&2
+    cmake --build build --target help 2>/dev/null | grep -i rpc >&2 || true
+    exit 1
+fi
+echo "rpc target: $RPC_TARGET"
+cmake --build build --target "$RPC_TARGET" -j"$(nproc)"
+BIN=$(find build -type f \( -name ggml-rpc-server -o -name rpc-server \) | head -1)
+[ -x "$BIN" ] || { echo "$RPC_TARGET did not build" >&2; exit 1; }
+# Installed under the name coderai invokes regardless of the upstream target.
 install -m 755 "$BIN" "$DEST/rpc-server"
-echo "installed $DEST/rpc-server"
+echo "installed $DEST/rpc-server (from $RPC_TARGET)"
 "$DEST/rpc-server" --help 2>&1 | head -3 || true

@@ -88,6 +88,27 @@ assert "libggml-rpc" in names or "ggml_backend_rpc" in syms, \
     "RPC backend missing from the rebuilt llama-cpp-python"
 print("llama-cpp-python links cleanly and carries the RPC backend: OK")
 PY
-# Run it the way the launcher does (local-libs on the library path); fail the
-# build if it cannot start, not just print an error and carry on.
-RUN LD_LIBRARY_PATH=/opt/coderai/python/lib:/opt/coderai/local-libs /opt/coderai/python/bin/rpc-server --help >/dev/null
+# Check what it LINKS, not that it runs — the same rule the wheel check above
+# states and follows. Executing it here fails on a correctly built binary:
+#
+#   rpc-server: error while loading shared libraries: libcuda.so.1
+#
+# libcuda.so.1 is the NVIDIA driver, mounted by the container runtime and so
+# absent at build time by definition. The old `--help` invocation only became
+# reachable once the build stopped failing earlier (the rpc-server CMake target
+# was renamed to ggml-rpc-server upstream), and a CUDA-enabled rpc-server links
+# the driver directly — so the first build that got this far could not pass.
+#
+# Every other dependency must still resolve: a missing libggml or libgomp here
+# means a binary that will not start on a real host either.
+RUN set -eux; \
+    LD_LIBRARY_PATH=/opt/coderai/python/lib:/opt/coderai/local-libs \
+      ldd /opt/coderai/python/bin/rpc-server > /tmp/rpc-ldd.txt || true; \
+    cat /tmp/rpc-ldd.txt; \
+    if grep -v 'libcuda\.so' /tmp/rpc-ldd.txt | grep -q 'not found'; then \
+        echo "rpc-server has unresolved libraries other than the driver:" >&2; \
+        grep 'not found' /tmp/rpc-ldd.txt >&2; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/rpc-ldd.txt; \
+    echo "rpc-server links cleanly (libcuda.so.1 resolves at run time): OK"

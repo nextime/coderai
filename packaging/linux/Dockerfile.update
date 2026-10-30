@@ -54,6 +54,24 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "nv
 # without it (discovery just stays off), hence `|| true`.
 RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "zeroconf>=0.130" || true
 
+# Vosk, the CPU STT backend. It is declared in requirements.txt, which the FULL
+# build picks up through the pre-built venv bundle -- but this overlay never
+# touches the venv, so an image updated incrementally shipped without it and
+# every vosk transcription answered
+#     Transcription error: No module named 'vosk'
+# while /v1/models advertised vosk-en and vosk-it as available. Installed here
+# for the same reason nvidia-ml-py and zeroconf are: the overlay has to carry
+# what the bundle would have.
+#
+# Install into the venv's own site-packages explicitly. Installing it the
+# ordinary way inside the running container put it in ~/.local instead, because
+# the venv is not writable by the container user, and the engine -- which does
+# not load the user site -- went on reporting the module as missing while pip
+# reported success.
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
+        --target /opt/coderai/python/lib/python3.13/site-packages \
+        "vosk>=0.3.45" || true
+
 # openssh-client so `coderai-docker --upgrade --ssh-key …` can fetch over SSH
 # (git is present but the CUDA runtime base ships no ssh). Tiny; keep the overlay
 # still fast. `|| true` keeps offline overlay builds working (HTTPS upgrade still
@@ -62,7 +80,15 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "ze
 # model with real audio instead of a reachability check. Without it the probe
 # degrades silently to "configured, not verified" — caught by inspecting a built
 # image, not by any test, because the fallback is deliberately not an error.
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client espeak \
+# g++: a RUNTIME requirement, like the gcc the base carries for Triton. XTTS's
+# Japanese phonemiser (cutlet) pulls mojimoji, a C++ extension with no cp313
+# wheel, so it compiles when the isolated TTS venv is built on demand. The
+# bundled Python records clang++ as its C++ compiler and no clang is present, so
+# the build asked for clang++ and found nothing -- and the image had no C++
+# compiler at all: g++, c++ and clang were all absent and /usr/include/c++ did
+# not exist, which made gcc's presence look like it covered this. Without it
+# XTTS loses exactly one of its seventeen languages.
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client espeak g++ \
     && rm -rf /var/lib/apt/lists/* || true
 
 # Fonts for burned-in captions and overlays (codai/compose): Montserrat and
