@@ -44,7 +44,14 @@ _PINS = ("--extra-index-url", "https://download.pytorch.org/whl/cu124",
          "torchaudio==2.6.0+cu124",
          "coqui-tts",
          "soundfile>=0.12.0",
-         "requests>=2.28.0")
+         "requests>=2.28.0",
+         # Chinese and Japanese phonemisers -- see requirements-xtts.txt. Not
+         # declared by coqui-tts, so without them XTTS advertises 17 languages
+         # and fails on 2.
+         "pypinyin",
+         "cutlet",
+         "fugashi",
+         "unidic-lite")
 
 
 def venv_dir() -> Path:

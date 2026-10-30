@@ -21,3 +21,16 @@ torchaudio==2.6.0+cu124
 coqui-tts
 soundfile>=0.12.0
 requests>=2.28.0
+
+# Per-language phonemiser dependencies. coqui-tts declares neither, so XTTS
+# installs cleanly, advertises all seventeen of its languages, and then fails on
+# two of them at synthesis time -- measured on zeiss 2026-10-30:
+#   zh-cn -> ImportError: Chinese requires: pypinyin
+#   ja    -> ModuleNotFoundError: No module named 'cutlet'
+# cutlet romanises through fugashi, which needs a dictionary at RUNTIME, not
+# just at install; unidic-lite is the small bundled one (the same chain
+# requirements-melotts.txt notes for MeloTTS).
+pypinyin
+cutlet
+fugashi
+unidic-lite
