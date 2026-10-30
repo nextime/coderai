@@ -22,6 +22,7 @@ import json
 import re
 import threading
 import time
+from collections import deque
 from typing import AsyncIterator, Optional, Union, List, Dict, Any
 from pathlib import Path
 
@@ -611,6 +612,33 @@ _KV_OBSERVED: dict = {"gpu": 0.0, "cpu": 0.0}
 _KV_BUF_RE = re.compile(
     r"llama_kv_cache[^:]*:\s*(\S+)\s+KV buffer size\s*=\s*([0-9.]+)\s*MiB")
 
+#: The last lines llama.cpp logged during the CURRENT load, whatever they said.
+#: llama-cpp-python raises one generic sentence for every failure -- "Failed to
+#: load model from file: <path>" -- while the REASON is written by llama.cpp to
+#: its log callback. The callback below used to print only lines matching a
+#: keyword list about layers and buffers, so an error naming the architecture or
+#: the missing tensor matched nothing and was dropped. Four models then failed
+#: with no reason anywhere, through six retries each.
+_LOG_TAIL: deque = deque(maxlen=60)
+
+#: Lines worth surfacing even though they say nothing about layers or buffers.
+_LOG_TROUBLE = ("error", "failed", "unsupported", "unknown", "missing",
+                "not supported", "cannot", "invalid", "corrupt", "assert")
+
+
+def llama_log_tail(limit: int = 6, trouble_only: bool = True) -> str:
+    """The tail of llama.cpp's own log for the load just attempted.
+
+    ``trouble_only`` keeps the lines that look like a diagnosis, which is almost
+    always what a failure needs; the whole tail is there when it is not.
+    """
+    lines = list(_LOG_TAIL)
+    if trouble_only:
+        picked = [ln for ln in lines
+                  if any(t in ln.lower() for t in _LOG_TROUBLE)]
+        lines = picked or lines
+    return " | ".join(lines[-max(1, int(limit)):])
+
 
 def _install_layer_log_callback():
     """Replace llama.cpp's log callback with one that prints load-time layer/buffer
@@ -625,6 +653,7 @@ def _install_layer_log_callback():
         return None
     _KV_OBSERVED["gpu"] = 0.0
     _KV_OBSERVED["cpu"] = 0.0
+    _LOG_TAIL.clear()
 
     # Keywords that identify interesting load-phase messages
     _KEEP = (
@@ -642,7 +671,13 @@ def _install_layer_log_callback():
             if _m:
                 _where = "cpu" if _m.group(1).upper().startswith("CPU") else "gpu"
                 _KV_OBSERVED[_where] += float(_m.group(2)) / 1024.0
-            if msg and any(k in msg for k in _KEEP):
+            if msg:
+                # EVERY line is kept, so a failure can be explained afterwards
+                # even when the line said nothing this filter was looking for.
+                _LOG_TAIL.append(msg)
+            _low = msg.lower()
+            if msg and (any(k in msg for k in _KEEP)
+                        or any(t in _low for t in _LOG_TROUBLE)):
                 print(f"  [llama.cpp] {msg}", flush=True)
         except Exception:
             pass
@@ -1938,9 +1973,27 @@ class VulkanBackend(ModelBackend):
                     break
                 except Exception as e:
                     _last_err = e
+                    _why = llama_log_tail()
                     print(f"Error loading GGUF model "
-                          f"(attempt {_attempt + 1}/{_max_attempts}): {e}")
+                          f"(attempt {_attempt + 1}/{_max_attempts}): {e}"
+                          + (f"\n  llama.cpp said: {_why}" if _why else ""))
                     if _attempt + 1 >= _max_attempts:
+                        break
+                    # The ladder exists to answer ONE question -- does it fit? --
+                    # by moving layers to the host. An attempt with NO layers on
+                    # the GPU has already answered it: whatever is wrong is not
+                    # VRAM, and four more attempts cannot discover that. Measured
+                    # on three MTP/next-N checkpoints: six attempts each, down to
+                    # n_gpu_layers=0, every one failing in ~0.2 s with the same
+                    # generic "Failed to load model from file" -- 18 loads whose
+                    # only effect was to bury the reason further up the log.
+                    _was = llama_kwargs.get('n_gpu_layers', self.n_gpu_layers)
+                    if _was == 0:
+                        print(f"  not retrying: this attempt had every layer on "
+                              f"the CPU and still failed, so the model is not "
+                              f"too big for the GPU — llama.cpp cannot load this "
+                              f"file at all"
+                              + (f" ({_why})" if _why else ""))
                         break
                     _cur = llama_kwargs.get('n_gpu_layers', self.n_gpu_layers)
                     _tot = _block_count or (_cur if (_cur and _cur > 0) else 40)
@@ -1953,7 +2006,17 @@ class VulkanBackend(ModelBackend):
                     print(f"  Retrying with n_gpu_layers={_new} "
                           f"({max(0, _tot - _new)}/{_tot} layers on CPU)…")
             if self.model is None:
-                print(f"Error loading model after {_max_attempts} attempts: {_last_err}")
+                # Raise with llama.cpp's own words attached. The exception
+                # llama-cpp-python produces names the file and nothing else, and
+                # that string is what reaches the client -- so a model that this
+                # build genuinely cannot read was indistinguishable from one that
+                # did not fit, from a bad path, or from a corrupt download.
+                _why = llama_log_tail(limit=4)
+                print(f"Error loading model after {_max_attempts} attempts: "
+                      f"{_last_err}" + (f"\n  llama.cpp said: {_why}" if _why else ""))
+                if _why and str(_why) not in str(_last_err):
+                    raise RuntimeError(f"{_last_err} — llama.cpp reported: {_why}") \
+                        from _last_err
                 raise _last_err
         finally:
             _params_mod.llama_model_default_params = _orig_params

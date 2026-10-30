@@ -48,7 +48,17 @@ def _coqui_name(name: str) -> str:
     mapped = _HF_TO_COQUI.get(n.lower())
     if mapped:
         return mapped
-    if "/" in n and "xtts" in n.lower():
+    # Match on the LAST path segment, so an org-less alias is recognised too.
+    # The previous test required a "/", which is exactly the case that does not
+    # apply to a card registered as "XTTS-v2": coqui then split a name with no
+    # separator and reported "not enough values to unpack (expected 4, got 1)",
+    # an error about its own four-part naming that says nothing about the alias
+    # that caused it. The caller passes the card's path now, but the worker is
+    # reached by other paths too and must not depend on that.
+    tail = n.rsplit("/", 1)[-1].lower().replace("_", "-")
+    if "xtts" in tail:
+        if "v1.1" in tail or "v1-1" in tail:
+            return "tts_models/multilingual/multi-dataset/xtts_v1.1"
         # An unknown XTTS repo: the v2 architecture is the safe assumption.
         return "tts_models/multilingual/multi-dataset/xtts_v2"
     return n

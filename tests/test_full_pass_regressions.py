@@ -202,3 +202,117 @@ def test_an_exact_name_wins_even_unhealthy(registry_with_a_split_engine):
     up = _FakeEngine("nvidia-gguf", "nvidia", healthy=True)
     reg._engines = {1: up, 2: down}
     assert reg.by_name("nvidia") is down
+
+
+# ---------------------------------------------------------------------------
+# "Five models won't load" -- llama.cpp said why and the filter dropped it
+# ---------------------------------------------------------------------------
+
+def test_llama_cpp_log_lines_are_all_kept():
+    """The callback printed only lines matching a keyword list about layers and
+    buffers. An error naming the architecture or a missing tensor matches none
+    of them, so three MTP checkpoints failed with no reason anywhere in the log
+    and llama-cpp-python's one generic sentence reached the client."""
+    from codai.backends import vulkan as V
+    V._LOG_TAIL.clear()
+    V._LOG_TAIL.extend([
+        "llama_model_loader: loaded meta data",
+        "load_tensors: layer 0 assigned to device CUDA0",
+        "error loading model: missing tensor 'blk.0.nextn.weight'",
+    ])
+    tail = V.llama_log_tail()
+    assert "missing tensor" in tail
+
+
+def test_the_tail_prefers_lines_that_look_like_a_diagnosis():
+    """A 60-line ring ending in routine chatter must still surface the error."""
+    from codai.backends import vulkan as V
+    V._LOG_TAIL.clear()
+    V._LOG_TAIL.append("unknown model architecture: 'qwen35moe'")
+    for i in range(40):
+        V._LOG_TAIL.append(f"load_tensors: layer {i} assigned to device CUDA0")
+    tail = V.llama_log_tail()
+    assert "unknown model architecture" in tail
+
+
+def test_the_whole_tail_is_available_when_nothing_looks_wrong():
+    from codai.backends import vulkan as V
+    V._LOG_TAIL.clear()
+    V._LOG_TAIL.extend(["routine one", "routine two"])
+    assert "routine two" in V.llama_log_tail()
+    assert "routine two" in V.llama_log_tail(trouble_only=False)
+
+
+def test_an_empty_log_yields_no_claim():
+    from codai.backends import vulkan as V
+    V._LOG_TAIL.clear()
+    assert V.llama_log_tail() == ""
+
+
+def test_the_ladder_stops_once_cpu_only_has_failed():
+    """The retry ladder answers "does it fit?" by moving layers to the host. An
+    attempt with no layers on the GPU has answered it — the three MTP models
+    each burned six attempts down to n_gpu_layers=0, every one failing in a
+    fraction of a second with the same generic message."""
+    src = _src("codai/backends/vulkan.py")
+    assert "not retrying: this attempt had every layer on" in src
+    head = src.index("Error loading GGUF model ")
+    body = src[head:head + 2000]
+    assert "if _was == 0:" in body
+
+
+def test_the_raised_error_carries_llama_cpps_words():
+    src = _src("codai/backends/vulkan.py")
+    assert "llama.cpp reported:" in src
+
+
+def test_trouble_lines_are_printed_even_when_no_keyword_matches():
+    src = _src("codai/backends/vulkan.py")
+    head = src.index("def _install_layer_log_callback")
+    body = src[head:src.index("async def _aiter_blocking")]
+    assert "_LOG_TROUBLE" in body
+    assert "_LOG_TAIL.append(msg)" in body
+
+
+# ---------------------------------------------------------------------------
+# "XTTS-v2 and parler don't load" -- both got an alias, not a repo id
+# ---------------------------------------------------------------------------
+
+def test_every_tts_backend_is_given_the_cards_path():
+    """Kokoro already took `model_path or model_name`; coqui, bark, parler, melo
+    and the transformers fallback took the request's name, which for a card
+    registered under an alias is the alias."""
+    src = _src("codai/api/tts_backends.py")
+    head = src.index("def _load_backend(")
+    body = src[head:src.index("# encoding", head)]
+    assert "_ckpt = model_path or model_name" in body
+    assert "_CoquiBackend(_ckpt" in body
+    assert "_BarkBackend(_ckpt" in body
+    assert "_KokoroBackend(_ckpt" in body
+    assert "_TransformersBackend(_ckpt" in body
+    assert "parler_worker.ensure_service(_ckpt)" in body
+    assert "melotts_worker.ensure_service(_ckpt)" in body
+    # And no backend is left taking the bare request name.
+    assert "_CoquiBackend(model_name" not in body
+    assert "_BarkBackend(model_name" not in body
+
+
+def test_the_xtts_worker_recognises_an_org_less_alias():
+    """'XTTS venv could not load XTTS-v2: not enough values to unpack
+    (expected 4, got 1)' — coqui splits a name into four parts and the bare
+    alias has no separator at all. The old test required a '/', which is
+    exactly the case that does not apply."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_xtts_svc", os.path.join(_ROOT, "tools/xtts_service.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    four = "tts_models/multilingual/multi-dataset/xtts_v2"
+    assert mod._coqui_name("XTTS-v2") == four
+    assert mod._coqui_name("coqui/XTTS-v2") == four
+    assert mod._coqui_name("xtts_v2") == four
+    assert mod._coqui_name("xtts_v1.1").endswith("xtts_v1.1")
+    assert mod._coqui_name("coqui/xtts-v1.1").endswith("xtts_v1.1")
+    # Already coqui's own four-part naming, and an unrelated model: untouched.
+    assert mod._coqui_name(four) == four
+    assert mod._coqui_name("some/other-model") == "some/other-model"

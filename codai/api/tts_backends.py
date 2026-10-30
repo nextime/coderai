@@ -632,12 +632,30 @@ def load_backend(model_name: str, model_path: Optional[str], config: Optional[di
 def _load_backend(model_name: str, model_path: Optional[str], config: Optional[dict]):
     fam = _family(model_name)
     config = config or {}
+    # Every backend that has to RESOLVE a checkpoint gets the card's path, with
+    # the request's name only as a fallback. `model_name` is whatever the caller
+    # asked for, which for a card registered under an alias is the alias -- and
+    # an alias is not a repo id. Kokoro already did this; the others took
+    # `model_name`, and both isolated workers failed on it, each in its own way:
+    #
+    #   XTTS:   "XTTS venv could not load 'XTTS-v2': ValueError: not enough
+    #            values to unpack (expected 4, got 1)" -- coqui splits a model
+    #            name into type/lang/dataset/model, and the bare alias has no
+    #            separator at all (the HF id 'coqui/XTTS-v2' has one, which is
+    #            the case the worker's translation table was written for).
+    #   parler: "parler-tts-mini-multilingual is not the path to a directory
+    #            containing a file named config.json" -- the org is missing, so
+    #            the real repo 'parler-tts/parler-tts-mini-multilingual' is
+    #            never looked up, and the worker reports it as "not in the cache,
+    #            download it from the model interface first" for a model that IS
+    #            in the cache.
+    _ckpt = model_path or model_name
     if fam == "kokoro":
-        return _KokoroBackend(model_path or model_name, config)
+        return _KokoroBackend(_ckpt, config)
     if fam == "coqui":
-        return _CoquiBackend(model_name, config)
+        return _CoquiBackend(_ckpt, config)
     if fam == "bark":
-        return _BarkBackend(model_name, config)
+        return _BarkBackend(_ckpt, config)
     if fam == "melo":
         # MeloTTS is OpenVoice V2's base speaker model. Its pins conflict with this
         # stack the way parler's do, so it runs in an isolated venv worker and is
@@ -645,9 +663,9 @@ def _load_backend(model_name: str, model_path: Optional[str], config: Optional[d
         if config.get("service_url"):
             return _RemoteSpeechBackend(config, family="melo")
         from codai.api import melotts_worker
-        url = melotts_worker.ensure_service(model_name)
+        url = melotts_worker.ensure_service(_ckpt)
         return _RemoteSpeechBackend({**config, "service_url": url}, family="melo",
-                                    managed_model=model_name)
+                                    managed_model=_ckpt)
     if fam == "parler":
         # An explicit service_url points at an externally-run service. Otherwise
         # coderai fully manages the worker: bootstrap its venv, spawn it, and
@@ -655,10 +673,10 @@ def _load_backend(model_name: str, model_path: Optional[str], config: Optional[d
         if config.get("service_url"):
             return _RemoteSpeechBackend(config, family="parler")
         from codai.api import parler_worker
-        url = parler_worker.ensure_service(model_name)
+        url = parler_worker.ensure_service(_ckpt)
         return _RemoteSpeechBackend({**config, "service_url": url},
-                                    family="parler", managed_model=model_name)
-    return _TransformersBackend(model_name, config)
+                                    family="parler", managed_model=_ckpt)
+    return _TransformersBackend(_ckpt, config)
 
 
 # --------------------------------------------------------------------------- #
