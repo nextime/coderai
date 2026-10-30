@@ -65,10 +65,17 @@ def test_an_id_that_carries_nothing_reports_none_not_a_guess():
 
 
 def test_bark_is_listed_without_loading_anything():
+    """The static list was the ten English speakers. suno/bark ships a bank of
+    13 languages x speakers 0-9, and listing only the English ten is what made
+    a 13-language engine look like an English one. English stays first so a
+    client taking voices[0] as its default is unaffected."""
     got = T.family_voices("suno/bark", None)
     assert got["voices_source"] == "static"
-    assert len(got["voices"]) == 10
+    assert len(got["voices"]) == 13 * 10
     assert got["voices"][0]["languages"] == ["en"]
+    assert all(v["languages"] == ["en"] for v in got["voices"][:10])
+    langs = {l for v in got["voices"] for l in v["languages"]}
+    assert langs == set(T._FAMILY_LANGUAGES["bark"])
 
 
 def test_parler_says_it_is_described_rather_than_chosen():

@@ -101,6 +101,33 @@ _FAMILY_LANGUAGES: dict[str, list[str]] = {
 }
 
 
+def xtts_language(lang: str) -> str:
+    """``lang`` as XTTS-v2 names it.
+
+    XTTS keys its speaker/phonemiser tables by its own codes, and one of them is
+    not two letters: Chinese is ``zh-cn``. The call site used to truncate to
+    ``lang[:2]``, which turned the only such code into ``zh`` and made XTTS
+    raise ``KeyError: 'zh'`` -- so the one language whose code is longer than two
+    characters was the one language that could not be spoken. Measured
+    2026-10-30: the other sixteen all worked.
+
+    Resolution is against XTTS's own declared list, so a region a caller sends
+    ("en-us", "pt-br") lands on the code XTTS actually has ("en", "pt").
+    """
+    want = str(lang or "en").strip().lower().replace("_", "-")
+    declared = _FAMILY_LANGUAGES["coqui"]
+    if want in declared:
+        return want
+    base = want.split("-")[0]
+    if base in declared:
+        return base
+    # A regioned XTTS code reached by its bare prefix -- "zh" -> "zh-cn".
+    for code in declared:
+        if code.split("-")[0] == base:
+            return code
+    return base
+
+
 def family_languages(model_name: str, config: Optional[dict] = None) -> list[str]:
     """Languages this model can speak, or [] when nothing is known.
 
@@ -375,7 +402,7 @@ class _CoquiBackend:
         # or fall back to a default. `voice` may be a wav path, a built-in
         # speaker name, or (e.g. a Kokoro id like "af_sarah") neither — so only
         # treat it as a clone source when it's an actual file.
-        kwargs = {"text": text, "language": (lang or "en")[:2]}
+        kwargs = {"text": text, "language": xtts_language(lang)}
         speakers = list(getattr(self._tts, "speakers", None) or [])
         cfg_wav = self._cfg.get("speaker_wav")
         if voice and os.path.isfile(voice):

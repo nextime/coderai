@@ -78,11 +78,37 @@ def _load(name: str) -> dict:
             "sample_rate": _state["sr"]}
 
 
+#: XTTS-v2's own language codes. Duplicated from codai.api.tts_backends on
+#: purpose: this worker runs in its own venv with coqui's dependency set and
+#: cannot import the server package. tests/test_tts_languages_are_published.py
+#: asserts the two lists stay identical.
+_XTTS_LANGUAGES = ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+                   "cs", "ar", "zh-cn", "hu", "ko", "ja", "hi"]
+
+
+def _xtts_language(lang) -> str:
+    """``lang`` as XTTS names it -- see the note on tts_backends.xtts_language.
+
+    The bug this replaces: ``lang[:2]`` turned "zh-cn", the one XTTS code longer
+    than two characters, into "zh", and XTTS raised ``KeyError: 'zh'``.
+    """
+    want = str(lang or "en").strip().lower().replace("_", "-")
+    if want in _XTTS_LANGUAGES:
+        return want
+    base = want.split("-")[0]
+    if base in _XTTS_LANGUAGES:
+        return base
+    for code in _XTTS_LANGUAGES:
+        if code.split("-")[0] == base:
+            return code
+    return base
+
+
 def _tts(req: dict) -> dict:
     tts = _state["tts"]
     if tts is None:
         return {"ok": False, "error": "no model loaded"}
-    kwargs = {"text": req.get("text") or "", "language": (req.get("language") or "en")[:2]}
+    kwargs = {"text": req.get("text") or "", "language": _xtts_language(req.get("language"))}
     for key in ("speaker", "speaker_wav"):
         if req.get(key):
             kwargs[key] = req[key]

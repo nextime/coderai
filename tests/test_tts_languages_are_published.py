@@ -366,3 +366,82 @@ def test_every_language_kokoro_advertises_resolves_to_something_espeak_takes():
         assert resolved in measured_bare_ok or code in T._ESPEAK_REGIONLESS, (
             f"Kokoro advertises {code!r} but it resolves to {resolved!r}, "
             f"which was never measured against espeak")
+
+
+# ── XTTS keys by its OWN codes, one of which is not two letters ──────────────
+#
+# Probing XTTS's seventeen on 2026-10-30: sixteen returned audio and `zh-cn`
+# failed with `KeyError: 'zh'`. Our own call site did it -- `language=lang[:2]`
+# truncated the one XTTS code longer than two characters, so the single language
+# with a regioned code was the single language that could not be spoken.
+
+def test_chinese_keeps_its_region():
+    """The regression: zh-cn[:2] == 'zh', which XTTS has no table entry for."""
+    assert T.xtts_language("zh-cn") == "zh-cn"
+
+
+def test_a_bare_zh_reaches_the_regioned_code():
+    """Clients send 'zh'; XTTS only has 'zh-cn'."""
+    assert T.xtts_language("zh") == "zh-cn"
+
+
+@pytest.mark.parametrize("code", ["en", "es", "fr", "de", "it", "pt", "pl",
+                                  "tr", "ru", "nl", "cs", "ar", "hu", "ko",
+                                  "ja", "hi"])
+def test_the_two_letter_codes_are_unchanged(code):
+    assert T.xtts_language(code) == code
+
+
+@pytest.mark.parametrize("sent,expect", [("en-us", "en"), ("en_GB", "en"),
+                                         ("pt-br", "pt"), ("ZH_CN", "zh-cn")])
+def test_a_region_a_client_sends_lands_on_the_code_xtts_has(sent, expect):
+    """OpenAI-compatible clients send locales; XTTS mostly wants bare codes."""
+    assert T.xtts_language(sent) == expect
+
+
+def test_every_language_xtts_advertises_resolves_into_its_own_table():
+    """The invariant that broke: nothing may be advertised that then raises."""
+    for code in T.family_languages("coqui/XTTS-v2"):
+        assert T.xtts_language(code) in T._FAMILY_LANGUAGES["coqui"], code
+
+
+def test_the_call_site_no_longer_truncates():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'codai', 'api', 'tts_backends.py')).read()
+    head = src.index("class _CoquiBackend") if "class _CoquiBackend" in src \
+        else src.index('family = "coqui"')
+    body = src[head:head + 3000]
+    assert '"language": xtts_language(lang)' in body
+    assert '(lang or "en")[:2]' not in body
+
+
+def test_the_isolated_worker_agrees_with_the_server():
+    """tools/xtts_service.py runs in coqui's own venv and cannot import codai,
+    so the list is duplicated there. Duplicated is fine; diverging is not --
+    the worker is what actually synthesises when XTTS is run isolated."""
+    import re
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        'tools', 'xtts_service.py')
+    src = open(path).read()
+    m = re.search(r'_XTTS_LANGUAGES\s*=\s*\[(.*?)\]', src, re.S)
+    assert m, 'the worker no longer declares its language list'
+    worker = [x.strip().strip('"\'') for x in m.group(1).split(',') if x.strip()]
+    assert worker == T._FAMILY_LANGUAGES["coqui"], (
+        f'worker and server disagree:\n  worker: {worker}\n'
+        f'  server: {T._FAMILY_LANGUAGES["coqui"]}')
+    assert '(req.get("language") or "en")[:2]' not in src
+    assert '_xtts_language(req.get("language"))' in src
+
+
+def test_the_worker_normaliser_behaves_like_the_servers():
+    """Same inputs, same answers -- checked by running the worker's own copy."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        'tools', 'xtts_service.py')
+    src = open(path).read()
+    ns: dict = {}
+    start = src.index('_XTTS_LANGUAGES = [')
+    end = src.index('def _tts(', start)
+    exec(compile(src[start:end], '<worker>', 'exec'), ns)
+    for code in ("zh", "zh-cn", "en", "en-us", "pt-br", "it", "ja", "", None, "xx"):
+        assert ns['_xtts_language'](code) == T.xtts_language(code), code
