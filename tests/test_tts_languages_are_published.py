@@ -108,6 +108,108 @@ def test_bark_voices_start_with_english(tmp_path, monkeypatch):
     assert all(x["languages"] == ["en"] for x in v["voices"][:10])
 
 
+# ── kokoro's voices, named without loading it ────────────────────────────────
+
+def _fake_voices_bin(path, names):
+    """An npz whose keys are voice names — the shape kokoro-onnx selects from."""
+    import numpy as np
+    np.savez(str(path), **{n: np.zeros((1, 1), dtype=np.float32) for n in names})
+    # np.savez appends .npz; the real file has no such suffix.
+    os.replace(str(path) + '.npz', str(path))
+    return path
+
+
+def test_kokoro_voices_are_named_from_the_file_the_backend_selects_from(
+        tmp_path, monkeypatch):
+    """Not a hand-kept list: the names come out of the very file synthesis picks
+    from, so the listing cannot offer a voice that then gets rejected."""
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_KOKORO_VOICE_MEMO", {}, raising=False)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    _fake_voices_bin(tmp_path / 'voices-v1.0.bin',
+                     ['af_sarah', 'am_adam', 'if_sara', 'jf_alpha'])
+    v = T.family_voices('hexgrad/Kokoro-82M')
+    assert v['voices_source'] == 'static'
+    assert [x['id'] for x in v['voices']] == ['af_sarah', 'am_adam',
+                                              'if_sara', 'jf_alpha']
+    # And the accent map still decodes each one.
+    by_id = {x['id']: x for x in v['voices']}
+    assert by_id['if_sara']['languages'] == ['it']
+    assert by_id['am_adam']['gender'] == 'male'
+
+
+def test_a_listing_never_downloads_the_voices_file(tmp_path, monkeypatch):
+    """_resolve_kokoro_files fetches a 28 MB release when nothing local matches.
+    /v1/models is polled; it must not be a download trigger."""
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_KOKORO_VOICE_MEMO", {}, raising=False)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+
+    def explode(*a, **k):
+        raise AssertionError('the listing tried to download a TTS asset')
+
+    monkeypatch.setattr(T, '_download', explode)
+    monkeypatch.setattr(T, '_resolve_kokoro_files', explode)
+    v = T.family_voices('hexgrad/Kokoro-82M')      # no file on disk
+    assert v['voices'] == []
+    assert v['voices_source'] == 'none'
+
+
+def test_kokoro_voice_file_is_reread_when_it_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_KOKORO_VOICE_MEMO", {}, raising=False)
+    f = tmp_path / 'voices-v1.0.bin'
+    _fake_voices_bin(f, ['af_sarah'])
+    assert T._kokoro_static_voices() == ['af_sarah']
+    assert T._kokoro_static_voices() == ['af_sarah']       # memoised
+    os.utime(f, (1, 1))
+    _fake_voices_bin(f, ['af_sarah', 'if_sara'])
+    assert T._kokoro_static_voices() == ['af_sarah', 'if_sara']
+
+
+def test_a_corrupt_voices_file_costs_only_the_voice_list(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_KOKORO_VOICE_MEMO", {}, raising=False)
+    (tmp_path / 'voices-v1.0.bin').write_bytes(b'not an npz')
+    assert T._kokoro_static_voices() == []
+
+
+def test_a_cards_voices_path_is_honoured(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path / 'nothing-here')
+    monkeypatch.setattr(T, "_KOKORO_VOICE_MEMO", {}, raising=False)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    custom = tmp_path / 'my-voices.bin'
+    _fake_voices_bin(custom, ['bf_emma'])
+    v = T.family_voices('hexgrad/Kokoro-82M', config={'voices_path': str(custom)})
+    assert [x['id'] for x in v['voices']] == ['bf_emma']
+
+
+def test_a_remembered_list_still_beats_the_kokoro_file(tmp_path, monkeypatch):
+    """What a load actually enumerated outranks what the file contains."""
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(T, "_KOKORO_VOICE_MEMO", {}, raising=False)
+    monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)
+    _fake_voices_bin(tmp_path / 'voices-v1.0.bin', ['af_sarah', 'am_adam'])
+    (tmp_path / 'tts_voices.json').write_text(
+        json.dumps({'hexgrad/Kokoro-82M': ['if_sara']}))
+    v = T.family_voices('hexgrad/Kokoro-82M')
+    assert v['voices_source'] == 'remembered'
+    assert [x['id'] for x in v['voices']] == ['if_sara']
+
+
+def test_described_engines_report_no_voices_and_say_why():
+    """parler has no speaker names at all; an empty list plus selection
+    'described' is the honest answer, not a bug to fill in."""
+    v = T.family_voices('parler-tts/parler-tts-mini-multilingual')
+    assert v['voices'] == []
+    assert v['voice_selection'] == 'described'
+
+
+def test_the_listing_passes_the_card_to_the_voice_lookup():
+    src = open(MANAGER).read()
+    assert 'tts_backends.family_voices(model_id, config=meta)' in src
+
+
 def test_a_remembered_voice_list_still_beats_the_static_one(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
     monkeypatch.setattr(T, "_VOICES_MEMO", {}, raising=False)

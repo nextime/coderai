@@ -7172,7 +7172,7 @@ class MultiModelManager:
                     from codai.api import tts_backends
                     tts_languages = tts_backends.family_languages(
                         model_id, meta) or None
-                    _v = tts_backends.family_voices(model_id)
+                    _v = tts_backends.family_voices(model_id, config=meta)
                     tts_voices = _v.get("voices") or None
                 except Exception:
                     tts_languages, tts_voices = None, None

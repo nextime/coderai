@@ -183,6 +183,55 @@ def _resolve_kokoro_files(model_path: str, config: dict) -> Tuple[str, str]:
     return onnx_path, voices_path
 
 
+#: Kokoro's voice names, by (path, mtime) of the file they came from. Reading
+#: them is a zip-index read of a 28 MB archive, and /v1/models is polled.
+_KOKORO_VOICE_MEMO: dict = {}
+
+
+def _kokoro_voices_file_if_present(config: Optional[dict] = None):
+    """The voices file, ONLY if it is already on disk.
+
+    Deliberately not :func:`_resolve_kokoro_files`: that downloads the official
+    release when nothing local matches, and a model LISTING must never start a
+    28 MB download. An absent file just means no voice names yet.
+    """
+    cand = (config or {}).get("voices_path")
+    paths = [Path(cand)] if cand else []
+    paths.append(_cache_dir() / "voices-v1.0.bin")
+    for p in paths:
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _kokoro_static_voices(config: Optional[dict] = None) -> list:
+    """Kokoro's selectable voices, named without loading the model.
+
+    The names come from the very file the backend selects out of, so the list
+    cannot promise a voice synthesis would then reject. Empty when the file is
+    not on disk — a listing does not fetch it.
+    """
+    f = _kokoro_voices_file_if_present(config)
+    if f is None:
+        return []
+    try:
+        st = f.stat()
+        stamp = (str(f), st.st_mtime_ns, st.st_size)
+        if _KOKORO_VOICE_MEMO.get("stamp") != stamp:
+            import numpy as _np
+            with _np.load(str(f)) as z:        # npz: reads the zip index only
+                names = sorted(str(k) for k in z.files)
+            _KOKORO_VOICE_MEMO.clear()
+            _KOKORO_VOICE_MEMO["stamp"] = stamp
+            _KOKORO_VOICE_MEMO["names"] = names
+        return list(_KOKORO_VOICE_MEMO.get("names") or [])
+    except Exception:
+        return []
+
+
 #: espeak-ng names English by REGION -- ``en-us``, ``en-gb`` -- and rejects the
 #: bare code outright: `language "en" is not supported by the espeak backend`.
 #: Every OpenAI-compatible client in existence sends "en", so Kokoro's English
@@ -648,7 +697,8 @@ def _remembered_voices(model_name: str) -> list:
         return []
 
 
-def family_voices(model_name: str, backend=None) -> dict:
+def family_voices(model_name: str, backend=None,
+                  config: Optional[dict] = None) -> dict:
     """The model's built-in voices, and where the list came from.
 
     ``source`` is part of the answer on purpose: "none" means nothing is known
@@ -668,6 +718,10 @@ def family_voices(model_name: str, backend=None) -> dict:
         ids = _remembered_voices(model_name)
         if ids:
             source = "remembered"
+    if not ids and fam == "kokoro":
+        ids = _kokoro_static_voices(config)
+        if ids:
+            source = "static"
     if not ids and fam == "bark":
         # Deterministic ids, so they can be named without loading anything.
         # ALL of bark's languages, not just English: suno/bark ships a speaker
