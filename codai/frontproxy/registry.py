@@ -263,21 +263,43 @@ class EngineRegistry:
             return next((e for e in self._engines.values() if e.healthy), prim)
 
     def by_name(self, name: Optional[str]) -> Optional[Engine]:
-        """Resolve an engine by its declared name (or, failing that, its backend).
+        """Resolve an engine by its declared NAME, or failing that by its backend.
 
         Used for the configured default engine and per-model pins. Prefers a healthy
-        match but returns an unhealthy one too, so callers can decide."""
+        match but returns an unhealthy one too, so callers can decide.
+
+        The two matches are tried in two passes, and that ordering is the whole
+        point. A GGUF-isolation split runs two engines on one card -- ``nvidia``
+        (transformers) and ``nvidia-gguf`` -- and BOTH declare the backend
+        ``nvidia``. A single pass accepting either kind of match returned
+        whichever healthy engine came first in the dict, so a model pinned to
+        ``nvidia`` could land on the GGUF sibling and be refused for a
+        capability the engine it actually named has:
+
+            WARNING: model 'longcat-avatar' is pinned to 'nvidia' but engine
+            'nvidia' (backend 'nvidia') can't serve a 'transformers' model
+            (capabilities: ['gguf']); failing the request
+
+        -- and the warning says "engine 'nvidia'" for an engine named
+        ``nvidia-gguf``, because it prints the pin rather than what was
+        resolved. The sibling fallback could not save it either: it appends
+        ``-gguf`` to the PIN, so it tried the same engine twice and never the
+        one named ``nvidia``. An exact name is unambiguous, so it wins."""
         if not name:
             return None
         name = name.strip().lower()
         with self._lock:
             engines = list(self._engines.values())
         match = None
-        for e in engines:
-            if (e.name or "").lower() == name or (e.backend or "").lower() == name:
+        for key in ("name", "backend"):
+            for e in engines:
+                if (getattr(e, key, None) or "").lower() != name:
+                    continue
                 if e.healthy:
                     return e
                 match = match or e
+            if match is not None:
+                return match
         return match
 
     def remove(self, engine_id: int) -> None:

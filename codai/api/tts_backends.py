@@ -138,6 +138,28 @@ def _resolve_kokoro_files(model_path: str, config: dict) -> Tuple[str, str]:
     return onnx_path, voices_path
 
 
+#: espeak-ng names English by REGION -- ``en-us``, ``en-gb`` -- and rejects the
+#: bare code outright: `language "en" is not supported by the espeak backend`.
+#: Every OpenAI-compatible client in existence sends "en", so Kokoro's English
+#: voices were unreachable while its Italian ones worked, which reads as the
+#: model being broken rather than as a two-letter code needing a region.
+#: Only codes espeak actually refuses belong here: "it", "fr" and "de" are
+#: accepted bare and must pass through untouched.
+_ESPEAK_REGIONLESS = {
+    "en": "en-us",
+    "pt": "pt-br",
+    "zh": "cmn",
+}
+
+
+def espeak_language(lang: str) -> str:
+    """``lang`` as espeak-ng names it."""
+    want = str(lang or "").strip().lower().replace("_", "-")
+    if not want:
+        return "en-us"
+    return _ESPEAK_REGIONLESS.get(want, want)
+
+
 class _KokoroBackend:
     family = "kokoro"
     default_voice = "af_sarah"
@@ -150,10 +172,24 @@ class _KokoroBackend:
 
     def synthesize(self, text: str, voice: str, speed: float, lang: str,
                    emotion: str = "", style: str = "") -> Tuple[np.ndarray, int]:
-        samples, sr = self._kokoro.create(
-            text, voice=voice or self.default_voice, speed=speed or 1.0,
-            lang=lang or "en-us",
-        )
+        _lang = espeak_language(lang)
+        try:
+            samples, sr = self._kokoro.create(
+                text, voice=voice or self.default_voice, speed=speed or 1.0,
+                lang=_lang,
+            )
+        except Exception as exc:
+            # A language espeak does not know is a request problem, not a
+            # server one, and the message has to say which language and what
+            # to send instead -- "RuntimeError: language ... is not supported
+            # by the espeak backend" reached the client as a 500.
+            if "espeak" in str(exc).lower():
+                raise ValueError(
+                    f"this voice cannot speak {lang!r}: espeak-ng has no such "
+                    f"language (tried {_lang!r}). espeak names some languages "
+                    f"by region — send 'en-us' or 'en-gb' rather than 'en'."
+                ) from exc
+            raise
         return np.asarray(samples, dtype=np.float32), int(sr)
 
     def voices(self):

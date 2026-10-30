@@ -2196,7 +2196,8 @@ def _load_rife(model_name: str, device: str):
 # Generation logic
 # =============================================================================
 
-def _build_call_kwargs(request: VideoGenerationRequest) -> dict:
+def _build_call_kwargs(request: VideoGenerationRequest, model_name: str = "",
+                       model_cfg: dict = None) -> dict:
     # NOTE: this populates steps/guidance ONLY when the REQUEST set them. The
     # caller's accel and model-card defaults are layered on afterwards with
     # setdefault, and both of those depend on an unset key meaning "the caller
@@ -2213,8 +2214,23 @@ def _build_call_kwargs(request: VideoGenerationRequest) -> dict:
     if request.num_frames:
         kw['num_frames'] = request.num_frames
     if request.width and request.height:
-        kw['width'] = request.width
-        kw['height'] = request.height
+        # Snapped to the family's VAE grid, not passed through. Every family in
+        # video_geometry declares a side_multiple -- 64 for Wan, 32 for LTX, 16
+        # for H3 -- and nothing read it, so an ordinary 848x480 request reached
+        # LTX-2.5 and was refused with "`height` and `width` have to be
+        # divisible by 32 but are 848 and 480". 480 was already legal; 848 is
+        # 26.5 cells. The server knows the multiple, so it does the rounding
+        # instead of making the caller discover it from an error.
+        from codai.models import video_geometry
+        _geom = video_geometry.geometry_for(model_name or "", model_cfg or {})
+        _w, _h, _moved = video_geometry.snap_frame_size(
+            request.width, request.height, _geom)
+        if _moved:
+            print(f"  [video] {request.width}x{request.height} is not on this "
+                  f"model's {_geom.get('side_multiple')}-pixel grid — "
+                  f"generating {_w}x{_h}", flush=True)
+        kw['width'] = _w
+        kw['height'] = _h
     if request.seed is not None:
         import torch
         kw['generator'] = torch.Generator().manual_seed(request.seed)
@@ -3000,11 +3016,12 @@ def _pipeline_takes(pipe, name: str) -> bool:
     return name in params
 
 
-def _generate_video(pipe, request: VideoGenerationRequest):
+def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
+                    model_cfg: dict = None):
     mode = request.mode or ('i2v' if (request.image or request.init_image)
                              else 'v2v' if request.video else 't2v')
     fps = request.fps or 8
-    kw = _build_call_kwargs(request)
+    kw = _build_call_kwargs(request, model_name, model_cfg)
     # Acceleration/distillation defaults (Lightning / Lightx2v): when the model has
     # a fused distill LoRA, default to its low step-count / guidance instead of the
     # standard 25 steps / 7.5 CFG. The request always wins if it set these — note
@@ -5513,7 +5530,7 @@ async def video_generations(request: VideoGenerationRequest,
                 _gen_audio = {}
             else:
                 frames, fps, _gen_audio = await _loop.run_in_executor(
-                    None, _generate_video, pipe, request)
+                    None, _generate_video, pipe, request, model_name, _model_cfg)
             _last_err = None
             break  # success → return to client
         except Exception as e:
@@ -5557,7 +5574,8 @@ async def video_generations(request: VideoGenerationRequest,
                         _gen_audio = {}
                     else:
                         frames, fps, _gen_audio = await _loop.run_in_executor(
-                            None, _generate_video, pipe, request)
+                            None, _generate_video, pipe, request, model_name,
+                            _model_cfg)
                     _last_err = None
                     break  # success → return to client
                 except Exception as _e3:

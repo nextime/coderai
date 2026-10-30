@@ -88,6 +88,31 @@ FAMILIES = {
         "side_multiple": 16,
         "continuation": "chained",
     },
+    "ltx": {
+        "family": "ltx",
+        "label": "LTX-2.x",
+        # Everything here except the side multiple is the Wan fallback LTX was
+        # already being described with, kept deliberately: the only property this
+        # entry exists to correct is the one a refusal proved.
+        #
+        # "`height` and `width` have to be divisible by 32 but are 848 and 480"
+        # -- LTX's VAE has a 32-pixel cell, where Wan's is 16, and with no family
+        # of its own LTX inherited 16. So an 848-wide request was already "on the
+        # grid" as far as the server was concerned and was then refused by the
+        # pipeline. Snapping to the wrong multiple is indistinguishable from not
+        # snapping at all.
+        "native_fps": 16,
+        "segment_frames": None,
+        "cond_frames": 0,
+        "frame_base": 1,
+        "frame_step": 4,
+        "min_frames": 5,
+        "max_frames": None,
+        "max_frames_per_render": 81,
+        "default_frames": None,
+        "side_multiple": 32,
+        "continuation": "chained",
+    },
 }
 
 # The family used when nothing matches. Wan is the historical shape of every
@@ -132,6 +157,15 @@ def family_for(model_name: str = "", config: dict = None) -> str:
     except Exception:
         if "minimax-h3" in str(model_name or "").lower().replace("_", "-"):
             return "h3"
+    # LTX by name, over the id AND the configured path: a card registered under
+    # an alias ("ltx-2.3-pinkcherry") and one registered as the repo
+    # ("Lightricks/LTX-2.5-Diffusers") must both find the 32-pixel cell.
+    _hay = " ".join(str(x or "").lower() for x in (
+        model_name, cfg.get("path"), cfg.get("model"), cfg.get("alias"),
+        (cfg.get("_raw_cfg") or {}).get("path") if isinstance(
+            cfg.get("_raw_cfg"), dict) else ""))
+    if "ltx" in _hay:
+        return "ltx"
     return DEFAULT_FAMILY
 
 
@@ -179,6 +213,48 @@ def snap_frames(num_frames, geom: dict, mode: str = "nearest") -> int:
         while out > int(hi):
             out -= step
     return max(base, out)
+
+
+def snap_side(value, geom: dict, *, minimum: int = 0) -> int:
+    """One side of the frame moved onto the family's legal grid.
+
+    Every family in the table above declares a ``side_multiple`` -- 64 for Wan's
+    VAE cell, 32 for LTX, 16 for H3 -- and until this existed nothing read it.
+    So a perfectly ordinary 848x480 request reached LTX-2.5 and came back
+    ```height` and `width` have to be divisible by 32 but are 848 and 480`:
+    480 is legal, 848 is 26.5 cells, and the caller is told to do arithmetic the
+    server already knows how to do. (The frame COUNT had been snapped for ages
+    by :func:`snap_frames`; the sides were simply forgotten.)
+
+    Rounds to the NEAREST legal side rather than down, so an odd width moves by
+    at most half a cell and the aspect ratio barely shifts, and never returns
+    less than one cell.
+    """
+    mult = max(1, int(geom.get("side_multiple") or 1))
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return int(max(minimum, mult))
+    if v <= 0:
+        return int(max(minimum, mult))
+    out = int(round(v / float(mult))) * mult
+    if out < mult:
+        out = mult
+    if minimum:
+        while out < minimum:
+            out += mult
+    return out
+
+
+def snap_frame_size(width, height, geom: dict) -> tuple:
+    """``(width, height)`` both on the family's grid, and whether either moved."""
+    w = snap_side(width, geom)
+    h = snap_side(height, geom)
+    try:
+        moved = (int(width) != w) or (int(height) != h)
+    except (TypeError, ValueError):
+        moved = True
+    return w, h, moved
 
 
 def segments_for(total_frames, geom: dict) -> int:

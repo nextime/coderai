@@ -699,7 +699,33 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
 
     # All loading parameters come from the per-model configuration.
     no_ram = bool(_cfg('no_ram', False))
-    precision = _cfg('precision', 'f32') or 'f32'
+    # A card that does not state a precision gets a HALF one, not f32.
+    #
+    # f32 was the default here, and only --no-ram mode coerced it down, so
+    # whether a model loaded at 2 bytes or 4 per parameter came down to an
+    # unrelated flag. Measured on one production run: CyberRealisticPony and
+    # wai-illustrious (no_ram=True) loaded at 7.49 GB, while PonyRealism and
+    # pornmaster-pro -- the same SDXL architecture, no_ram=False -- measured
+    # 14.98 GB, exactly double, filled the card and failed with "CUDA out of
+    # memory. Tried to allocate 12.00 MiB". The inflation then spread to the
+    # estimate: the f32 precision factor turned that 14.98 GB into a 30.9 GB
+    # need, which triggered a round of eviction that could not possibly help
+    # ("this model needs more than the whole card").
+    #
+    # Nothing was gained for it. These checkpoints are published in fp16/bf16,
+    # so f32 doubles the weights by upcasting what was never computed at that
+    # width. bf16 rather than fp16 because it keeps f32's range: a flow-matching
+    # DiT run in fp16 goes past 65504, the latents go NaN, and the VAE decodes
+    # NaN to uniform black -- answered 200 OK with a plausible PNG (the same
+    # reasoning as the --no-ram branch below).
+    #
+    # An explicit 'f32' on the card is still honoured: this changes the default,
+    # not the operator's choice.
+    _precision_cfg = _cfg('precision')
+    precision = str(_precision_cfg or '').strip() or 'bf16'
+    if not _precision_cfg:
+        print(f"Using precision: {precision} (card states none; f32 would "
+              f"double the weights of a checkpoint published at half width)")
     precision_map = {
         'bf16': torch.bfloat16,
         'f32': torch.float32,
