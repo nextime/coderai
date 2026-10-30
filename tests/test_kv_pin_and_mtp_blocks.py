@@ -76,7 +76,22 @@ def test_quant_that_dropped_the_nextn_block_is_corrected(tmpgguf):
                  'qwen35.block_count': 65,
                  'qwen35.nextn_predict_layers': 1},
                 ['token_embd.weight'] + _blocks(0, 64))
-    assert gguf_mtp.block_count_override(p) == {'qwen35.block_count': 64}
+    assert gguf_mtp.block_count_override(p) == {'qwen35.block_count': 64,
+                                                'qwen35.nextn_predict_layers': 0}
+
+
+def test_the_override_also_zeroes_nextn_so_the_count_is_read_the_same_way(tmpgguf):
+    """Builds disagree on whether block_count includes the NextN blocks. A build
+    that subtracts them would read a corrected 64 as 63 and drop a real layer, so
+    the override states both halves."""
+    p = tmpgguf('mtp3.gguf',
+                {'general.architecture': 'qwen35',
+                 'qwen35.block_count': 65,
+                 'qwen35.nextn_predict_layers': 1},
+                ['token_embd.weight'] + _blocks(0, 64))
+    over = gguf_mtp.block_count_override(p)
+    assert over['qwen35.nextn_predict_layers'] == 0
+    assert over['qwen35.block_count'] == 64
 
 
 def test_intact_model_needs_no_override(tmpgguf):
@@ -346,3 +361,53 @@ def test_modules_have_no_heavy_imports():
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names.add(node.module.split('.')[0])
         assert not (names & {'torch', 'llama_cpp', 'transformers', 'diffusers'}), names
+
+
+# ── 5. The knobs are reachable from the model page ───────────────────────────
+#
+# A lever the loader reads but the model page cannot set is a lever that only
+# exists for whoever edits models.json by hand. All four of these decide whether
+# a load fits in host RAM at all, so they belong in the UI — and the savable-list
+# in the admin routes is where a field silently stops persisting.
+
+ROUTES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      'codai', 'admin', 'routes.py')
+MODELS_HTML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'codai', 'admin', 'templates', 'models.html')
+
+KV_FIELDS = ('kv_autoplan', 'swa_full', 'measured_kv_gb', 'mtp_block_fix')
+
+
+@pytest.mark.parametrize('field', KV_FIELDS)
+def test_field_is_savable(field):
+    assert f'"{field}"' in open(ROUTES).read(), f'{field} is dropped on save'
+
+
+@pytest.mark.parametrize('field', KV_FIELDS)
+def test_field_is_sent_by_the_form(field):
+    assert f'{field}:' in open(MODELS_HTML).read(), f'{field} is never posted'
+
+
+@pytest.mark.parametrize('el', ('cfg-kv-autoplan', 'cfg-swa-full',
+                                'cfg-measured-kv', 'cfg-mtp-fix'))
+def test_control_exists_is_populated_and_is_gguf_only(el):
+    html = open(MODELS_HTML).read()
+    assert f'id="{el}"' in html, f'{el} has no control'
+    assert f"getElementById('{el}')" in html, f'{el} is never read or written'
+    assert f"show('{el}-row'" in html or f"show('{el.replace('cfg-', 'cfg-')}-row'" in html \
+        or f"'{el}-row'" in html, f'{el} row is not gated to GGUF models'
+
+
+def test_the_loader_reads_each_field_it_offers():
+    """The other half of the round trip: the UI must not offer a setting the
+    loader ignores."""
+    src = open(SRC).read()
+    for field in ('kv_autoplan', 'swa_full', 'measured_kv_gb', 'mtp_block_fix'):
+        assert f"'{field}'" in src, f'{field} is offered but never read'
+
+
+def test_measured_kv_accepts_both_stored_shapes():
+    """It has been written by hand as {n_ctx: gb} and is now journalled as a
+    plain number; the form must not render one of them as [object Object]."""
+    html = open(MODELS_HTML).read()
+    assert "typeof mk === 'object'" in html

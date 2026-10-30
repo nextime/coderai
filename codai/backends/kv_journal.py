@@ -31,9 +31,14 @@ _PATH_OVERRIDE = None
 
 
 def journal_path() -> str:
+    """Next to the config it supplements, so a deployment keeps one home."""
     if _PATH_OVERRIDE:
         return _PATH_OVERRIDE
-    base = os.environ.get('CODERAI_HOME') or os.path.expanduser('~/.coderai')
+    try:
+        from codai.platform_paths import legacy_style_config_dir
+        base = str(legacy_style_config_dir())
+    except Exception:
+        base = os.path.expanduser('~/.coderai')
     return os.path.join(base, 'cache', 'kv_sizes.json')
 
 

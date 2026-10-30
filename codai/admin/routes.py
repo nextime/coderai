@@ -2981,6 +2981,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
                 "cache_type_k", "cache_type_v", "kv_offload", "n_batch", "n_ubatch", "n_seq_max",
+                # The KV cache's size decides whether a load fits in host RAM at
+                # all, so the levers that govern it belong on the model page:
+                # whether the placement check runs, how sliding-window layers
+                # reserve, the measured size it acts on, and the MTP-block repair.
+                "kv_autoplan", "swa_full", "measured_kv_gb", "mtp_block_fix",
                 "embed_max_concurrency", "embed_max_backlog", "embed_min_interval_ms",
                 "gpu_split", "tensor_split", "split_strategy", "split_secondary_cap_gb",
                 "turboquant", "engine", "engine_fallback",

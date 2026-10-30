@@ -1374,6 +1374,36 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="q4_0">q4_0 (smallest)</option>
           </select>
         </div>
+        <div class="form-row" style="margin:0" id="cfg-kv-autoplan-row">
+          <label class="form-label">KV placement check <span class="muted">(GGUF text)</span></label>
+          <select id="cfg-kv-autoplan" class="form-input">
+            <option value="">On (recommended)</option>
+            <option value="0">Off — load even if the KV cache cannot fit</option>
+          </select>
+          <span class="form-hint" style="font-size:11px">Before loading, checks the KV cache against free VRAM and host RAM and picks a placement that fits. A pinned <b>Keys</b>/<b>Values</b> type is never changed and a pinned <b>KV offload</b> is never moved — but if nothing fits, the load is <b>refused</b> rather than left to the kernel's OOM killer, which takes the whole engine and every other model on it. Turning this off restores the old behaviour.</span>
+        </div>
+        <div class="form-row" style="margin:0" id="cfg-swa-full-row">
+          <label class="form-label">Sliding-window KV <span class="muted">(GGUF; llama.cpp swa_full)</span></label>
+          <select id="cfg-swa-full" class="form-input">
+            <option value="">Auto (decided by the placement check)</option>
+            <option value="1">Full — sliding layers reserve the whole context</option>
+            <option value="0">Window only — smaller KV, no quality cost</option>
+          </select>
+          <span class="form-hint" style="font-size:11px">On a sliding-window model (Gemma's 1024-token window) the sliding layers can reserve the full context or just their window. <b>Window only</b> costs no quality — it limits context reuse between requests, not attention — so it is the first lever tried when the KV does not fit.</span>
+        </div>
+        <div class="form-row" style="margin:0" id="cfg-measured-kv-row">
+          <label class="form-label">Measured KV size <span class="muted">(GB, for this n_ctx)</span></label>
+          <input type="number" id="cfg-measured-kv" class="form-input" min="0" step="0.1" placeholder="auto — measured and remembered on load">
+          <span class="form-hint" style="font-size:11px">What the KV cache really costs at the configured context. Measured from llama.cpp's own report and remembered automatically, so this is normally blank; set it to override that. Predicting it from model metadata does not work (it was off 5× in both directions), which is why the placement check acts only on a measured number.</span>
+        </div>
+        <div class="form-row" style="margin:0" id="cfg-mtp-fix-row">
+          <label class="form-label">Repair dropped MTP blocks <span class="muted">(GGUF text)</span></label>
+          <select id="cfg-mtp-fix" class="form-input">
+            <option value="">On (recommended)</option>
+            <option value="0">Off — fail on the missing block</option>
+          </select>
+          <span class="form-hint" style="font-size:11px">Some quantizers drop a checkpoint's NextN (multi-token-prediction) blocks but leave <code>block_count</code> counting them, so llama.cpp asks for a block the file does not have and reports <code>missing tensor 'blk.N.attn_norm.weight'</code> — which looks like a corrupt download. When the file's shape proves that is what happened, the declared count is corrected and the model serves as its dense stack. A file missing blocks for any other reason still fails.</span>
+        </div>
         <div class="form-row" style="margin:0" id="cfg-mmproj-row">
           <label class="form-label">Multimodal projector <span class="muted">(mmproj → vision)</span></label>
           <select id="cfg-mmproj" class="form-input" onchange="_onMmprojChange()">
@@ -4160,6 +4190,10 @@ function _applyBackendCfgVisibility(m){
   show('cfg-gpu-layers-row', isGguf);
   show('cfg-kv-k-row', isGguf);
   show('cfg-kv-v-row', isGguf);
+  show('cfg-kv-autoplan-row', isGguf);
+  show('cfg-swa-full-row', isGguf);
+  show('cfg-measured-kv-row', isGguf);
+  show('cfg-mtp-fix-row', isGguf);
   // mmproj pairing only applies to GGUF text models on llama.cpp.
   show('cfg-mmproj-row', isGguf);
 }
@@ -4369,6 +4403,19 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-embed-min-interval-ms').value = s.embed_min_interval_ms != null ? s.embed_min_interval_ms : '';
   document.getElementById('cfg-cache-type-k').value = s.cache_type_k || '';
   document.getElementById('cfg-cache-type-v').value = s.cache_type_v || '';
+  document.getElementById('cfg-kv-autoplan').value = (s.kv_autoplan === false) ? '0' : '';
+  document.getElementById('cfg-swa-full').value =
+    (s.swa_full === true) ? '1' : (s.swa_full === false) ? '0' : '';
+  // Stored either as a plain number for the current n_ctx, or as a
+  // {n_ctx: gb} map from an older hand-written config; show the entry that
+  // applies rather than "[object Object]".
+  (function(mk, ctx){
+    var el = document.getElementById('cfg-measured-kv');
+    if (mk === null || mk === undefined) { el.value = ''; return; }
+    if (typeof mk === 'object') { el.value = (mk[String(ctx)] ?? mk[ctx] ?? ''); return; }
+    el.value = mk;
+  })(s.measured_kv_gb, s.n_ctx);
+  document.getElementById('cfg-mtp-fix').value = (s.mtp_block_fix === false) ? '0' : '';
   _populateMmprojSelect(m, s);
   document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
   document.getElementById('cfg-preload-all-instances').checked = !!s.preload_all_instances;
@@ -5482,6 +5529,12 @@ async function saveModelConfig(){
     embed_min_interval_ms: document.getElementById('cfg-embed-min-interval-ms').value === '' ? null : parseInt(document.getElementById('cfg-embed-min-interval-ms').value),
     cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
     cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
+    kv_autoplan:       document.getElementById('cfg-kv-autoplan').value === '0' ? false : null,
+    swa_full:          (function(v){ return v === '' ? null : v === '1'; })(
+                         document.getElementById('cfg-swa-full').value),
+    measured_kv_gb:    document.getElementById('cfg-measured-kv').value === ''
+                         ? null : parseFloat(document.getElementById('cfg-measured-kv').value),
+    mtp_block_fix:     document.getElementById('cfg-mtp-fix').value === '0' ? false : null,
     mmproj:            document.getElementById('cfg-mmproj').value || null,
     auto_compact:      document.getElementById('cfg-autocompact').checked,
     auto_compact_pct:  parseInt(document.getElementById('cfg-autocompact-pct').value) || 85,

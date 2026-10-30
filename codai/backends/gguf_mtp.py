@@ -107,10 +107,19 @@ def read_layout(path) -> dict:
 
 
 def block_count_override(path):
-    """``{"<arch>.block_count": n}`` when a GGUF's NextN blocks were dropped.
+    """Metadata overrides that make a de-MTP'd GGUF load as what it is.
 
-    Returns ``None`` whenever the file's shape does not prove that — including a
-    file that is simply missing blocks, which must keep failing.
+    Returns ``{"<arch>.block_count": n, "<arch>.nextn_predict_layers": 0}``, or
+    ``None`` whenever the file's shape does not prove the NextN blocks were
+    dropped — including a file that is simply missing blocks, which must keep
+    failing.
+
+    Both keys are set, not just the count. Whether llama.cpp loads
+    ``block_count`` blocks or ``block_count - nextn_predict_layers`` of them has
+    changed between builds: the build this was written against does the former
+    (it asked for ``blk.64`` of a 65/1 file), and a build doing the latter would
+    read a corrected count of 64 as 63 and quietly leave a real layer out of the
+    model. Saying "64 blocks, none of them NextN" is true under both.
     """
     layout = read_layout(path)
     if not layout or not layout.get('arch'):
@@ -124,7 +133,8 @@ def block_count_override(path):
         return None
     if declared - present != nextn:
         return None
-    return {f"{layout['arch']}.block_count": present}
+    return {f"{layout['arch']}.block_count": present,
+            f"{layout['arch']}.nextn_predict_layers": 0}
 
 
 def explain(path) -> str:
