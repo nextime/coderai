@@ -903,6 +903,33 @@ async def bad_request_says_why(request: Request, exc: HTTPException):
     return JSONResponse(status_code=400, content={"detail": detail or "bad request"})
 
 
+@app.exception_handler(500)
+async def server_error_says_why(request: Request, exc: HTTPException):
+    """Same as the 400 handler, for the status where it matters more.
+
+    A 400 is a statement about the request; a 500 is a statement about us, and
+    this side logged the first and not the second. A capability sweep recorded
+
+        POST /v1/embeddings model=geoclip          -> 500
+        POST /v1/embeddings model=geoclip-location -> 500
+
+    and the engine log held the thermal check, the VRAM estimate and then
+    `DEBUG: Response status: 500` -- no detail, no traceback, no mention of a
+    model. The detail existed ("Failed to load embedding model: No module named
+    'geoclip'") and went only to the client, which in a sweep is a row in
+    somebody else's report. Finding it meant running the import by hand against
+    the image.
+
+    Behaviour is unchanged; this only makes the class diagnosable.
+    """
+    detail = getattr(exc, "detail", "") or ""
+    print(f"[http] 500 on {request.method} {request.url.path}: {detail!r} "
+          f"(peer {getattr(getattr(request, 'client', None), 'host', '-')})",
+          flush=True)
+    return JSONResponse(status_code=500,
+                        content={"detail": detail or "internal server error"})
+
+
 @app.exception_handler(401)
 async def unauthorized_redirect(request: Request, exc: HTTPException):
     """Redirect browser clients to login page on 401; return JSON for API clients."""

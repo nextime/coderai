@@ -42,8 +42,40 @@ def journal_path() -> str:
     return os.path.join(base, 'cache', 'kv_sizes.json')
 
 
-def _key(model_path, n_ctx) -> str:
-    return f"{model_path}@{int(n_ctx or 0)}"
+#: Settings that change how big the KV cache is, beyond the path and n_ctx the
+#: key already carries. The path pins the weights and their quantization; these
+#: pin the cache.
+_KV_SETTINGS = ('swa_full', 'cache_type_k', 'cache_type_v')
+
+
+def signature(cfg) -> str:
+    """Short hash of the KV settings a measurement describes.
+
+    Part of the key, so a measurement taken under one KV configuration simply
+    does not match a lookup under another. Without it the key was
+    ``<path>@<n_ctx>`` and survived any change that left those two alone --
+    measured on zeiss 2026-10-30: `swa_full=False` cut one model's KV from
+    7.5 GB to 1.0 GB, the 7.5 GB entry stayed reachable, and the next load
+    sized against it, decided it needed 22.7 of the 22.9 GB free, and spilled
+    14 of 60 layers to CPU. One request then spent five minutes on 14 cores
+    with the GPU at 6%, on a card that had room for all of it.
+
+    A miss costs one measurement; a stale hit costs that. So an unrecognised or
+    unreadable config yields a signature rather than falling back to the bare
+    key -- orphaning old entries is the safe direction.
+    """
+    import hashlib
+    c = cfg if isinstance(cfg, dict) else {}
+    payload = {k: c.get(k) for k in _KV_SETTINGS}
+    # The loader accepts either spelling; one must not key differently.
+    payload['kv_offload'] = c.get('kv_offload', c.get('offload_kqv'))
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def _key(model_path, n_ctx, sig='') -> str:
+    base = f"{model_path}@{int(n_ctx or 0)}"
+    return f"{base}@{sig}" if sig else base
 
 
 def _load() -> dict:
@@ -55,7 +87,7 @@ def _load() -> dict:
         return {}
 
 
-def record(model_path, n_ctx, gb) -> bool:
+def record(model_path, n_ctx, gb, sig='') -> bool:
     """Write down that this model at this context length cost ``gb`` of KV.
 
     Returns True when the entry was written. Never raises: a journal that cannot
@@ -67,7 +99,7 @@ def record(model_path, n_ctx, gb) -> bool:
         path = journal_path()
         with _LOCK:
             data = _load()
-            data[_key(model_path, n_ctx)] = round(float(gb), 2)
+            data[_key(model_path, n_ctx, sig)] = round(float(gb), 2)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix='.tmp')
             try:
@@ -87,12 +119,13 @@ def record(model_path, n_ctx, gb) -> bool:
         return False
 
 
-def lookup(model_path, n_ctx) -> float:
-    """Journalled KV size in GB for this model at this context, else 0.0."""
+def lookup(model_path, n_ctx, sig='') -> float:
+    """Journalled KV size in GB for this model at this context AND these KV
+    settings, else 0.0. A signature mismatch is a miss on purpose."""
     try:
         if not model_path or not n_ctx:
             return 0.0
-        val = _load().get(_key(model_path, n_ctx))
+        val = _load().get(_key(model_path, n_ctx, sig))
         return float(val) if val else 0.0
     except Exception:
         return 0.0

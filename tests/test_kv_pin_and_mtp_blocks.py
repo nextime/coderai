@@ -384,6 +384,19 @@ def test_journal_write_is_atomic(tmp_path, monkeypatch):
     assert not list(tmp_path.glob('*.tmp'))      # no leftovers
 
 
+def _flat(text):
+    """Source with its line breaks and indentation collapsed.
+
+    These tests assert that a particular call is made with particular
+    arguments. Asserting the literal source made them fail twice on changes
+    that were correct -- once when the journal key gained a KV-settings
+    signature, and again when the extra argument pushed the calls onto
+    continuation lines. What is being tested is the call, not its layout.
+    """
+    import re
+    return re.sub(r'\s+', ' ', text)
+
+
 def test_the_host_resident_size_is_recorded_from_the_log_callback():
     """Recorded during the load, not after it: a KV cache this size is one the
     OOM killer may take the process for while it is still loading."""
@@ -391,26 +404,31 @@ def test_the_host_resident_size_is_recorded_from_the_log_callback():
     start = src.index('def _install_layer_log_callback(')
     end = src.index('return _cb  # caller must hold this reference', start)
     cb = src[start:end]
-    assert 'kv_journal.record(model_path, n_ctx, _total)' in cb
+    # Matched on the call, not on its exact argument list: asserting the
+    # literal broke when the key gained a KV-settings signature, on a change
+    # that made the recording MORE correct.
+    assert 'kv_journal.record(model_path, n_ctx, _total' in cb
     assert '_KV_OBSERVED["cpu"] > 1.0' in cb
 
 
 def test_the_callback_is_given_the_model_identity():
-    src = open(SRC).read()
-    assert '_install_layer_log_callback(model_path, int(self.n_ctx or 0))' in src
+    src = _flat(open(SRC).read())
+    assert '_install_layer_log_callback( model_path, int(self.n_ctx or 0)' in src \
+        or '_install_layer_log_callback(model_path, int(self.n_ctx or 0)' in src
 
 
 def test_the_plan_reads_the_journal_when_the_config_has_no_measurement():
-    block = _plan_block()
-    assert 'kv_journal.lookup(model_path, _ctx)' in block
+    block = _flat(_plan_block())
+    assert 'kv_journal.lookup( model_path, _ctx' in block \
+        or 'kv_journal.lookup(model_path, _ctx' in block
 
 
 def test_config_measurement_still_wins_over_the_journal():
     """measured_kv_gb is configuration; the journal is a cache. The journal is
     consulted only when the config said nothing."""
-    block = _plan_block()
+    block = _flat(_plan_block())
     cfg = block.index("_raw_cfg.get('measured_kv_gb')")
-    jrnl = block.index('kv_journal.lookup(model_path, _ctx)')
+    jrnl = block.index('kv_journal.lookup(')
     assert cfg < jrnl
     assert 'if _meas <= 0:' in block
 

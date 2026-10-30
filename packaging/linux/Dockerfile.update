@@ -72,6 +72,24 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
         --target /opt/coderai/python/lib/python3.13/site-packages \
         "vosk>=0.3.45" || true
 
+# GeoCLIP, for the same reason and in the same way. Declared in requirements.txt
+# since the embedder was added, absent from every incrementally-updated image,
+# and the two model ids it serves were advertised by /v1/models the whole time:
+#
+#     POST /v1/embeddings model=geoclip          -> 500
+#     POST /v1/embeddings model=geoclip-location -> 500
+#
+# in half a second, with no load and nothing logged. Both ids share
+# _load_geoclip, so one missing import takes out both. geopy and
+# geographiclib are its own dependencies and are pure python.
+#
+# Checked against the built image rather than against requirements.txt --
+# a declared dependency the overlay never installs is invisible from the
+# source tree, which is what hid this one for as long as it hid vosk.
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
+        --target /opt/coderai/python/lib/python3.13/site-packages \
+        "geoclip>=1.2.0" "geopy>=2.4" "geographiclib>=2.0" || true
+
 # openssh-client so `coderai-docker --upgrade --ssh-key …` can fetch over SSH
 # (git is present but the CUDA runtime base ships no ssh). Tiny; keep the overlay
 # still fast. `|| true` keeps offline overlay builds working (HTTPS upgrade still

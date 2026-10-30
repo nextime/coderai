@@ -641,7 +641,7 @@ def llama_log_tail(limit: int = 6, trouble_only: bool = True) -> str:
     return " | ".join(lines[-max(1, int(limit)):])
 
 
-def _install_layer_log_callback(model_path=None, n_ctx=0):
+def _install_layer_log_callback(model_path=None, n_ctx=0, kv_sig=''):
     """Replace llama.cpp's log callback with one that prints load-time layer/buffer
     messages directly to stdout.  Returns the callback object — keep a reference
     alive for the duration of the load so ctypes doesn't garbage-collect it.
@@ -693,7 +693,7 @@ def _install_layer_log_callback(model_path=None, n_ctx=0):
                 if model_path and n_ctx:
                     _total = _KV_OBSERVED["gpu"] + _KV_OBSERVED["cpu"]
                     if _KV_OBSERVED["cpu"] > 1.0:
-                        kv_journal.record(model_path, n_ctx, _total)
+                        kv_journal.record(model_path, n_ctx, _total, kv_sig)
             if msg:
                 # EVERY line is kept, so a failure can be explained afterwards
                 # even when the line said nothing this filter was looking for.
@@ -1378,14 +1378,54 @@ class VulkanBackend(ModelBackend):
                         _headroom = 1.5 + (self.n_ctx or 0) / 40000.0
                     else:
                         _headroom = 2.0 + (self.n_ctx or 0) / 12000.0   # ~2 GB + ~1 GB per 12k ctx
-                    _usable = max(0.0, _free - _headroom)
-                    _fit = int(_nlayers * _usable / (_exp * 1.20))
-                    _fit = max(0, min(_nlayers - 1, _fit))
-                    self.n_gpu_layers = _fit
-                    print(f"  Auto-offload: model needs ~{_exp:.1f} GB but only "
-                          f"{_free:.1f} GB free — placing {_fit}/{_nlayers} layers on "
-                          f"GPU, {_nlayers - _fit} on CPU (slower). Lower n_ctx or use a "
-                          f"smaller model to keep it fully on GPU.", flush=True)
+                    # Spilling to CPU is a LAST resort, not a first response to a
+                    # thin margin. Before giving layers away, ask for more room:
+                    # another resident model may be idle and evictable, and
+                    # trading someone else's residency for this model's is almost
+                    # always better than running 14 of 60 layers on the host.
+                    #
+                    # Measured on zeiss 2026-10-30: a 31B needed 22.7 GB against
+                    # 22.9 GB free -- 0.2 GB short of the 95% trigger -- and the
+                    # sizing moved 14 layers to CPU. That request then spent five
+                    # minutes on fourteen cores with the GPU at 6%, while another
+                    # engine still held 0.4 GB it would have released on request.
+                    # Eviction had already worked correctly and handed this code
+                    # 22.9 GB; the sizing simply never asked for the rest.
+                    _want = _exp * 1.20 + _headroom
+                    if _free < _want:
+                        try:
+                            from codai.models.manager import multi_model_manager as _mm
+                            _mm._evict_models_for_vram(_want)
+                            _free2 = _pooled_free_vram_gb(
+                                cross=bool(kwargs.get('gpu_split')))
+                            if _free2 > _free:
+                                print(f"  Auto-offload: {_free:.1f} GB free was short "
+                                      f"of the {_want:.1f} GB a full-GPU placement "
+                                      f"needs — evicted to {_free2:.1f} GB rather than "
+                                      f"spilling to CPU", flush=True)
+                                _free = _free2
+                        except Exception as _ev_e:
+                            # Never fatal: a failed eviction leaves the original
+                            # spill decision, which is what used to happen anyway.
+                            print(f"  Auto-offload: could not ask for more VRAM "
+                                  f"({type(_ev_e).__name__}: {_ev_e}) — sizing "
+                                  f"against the {_free:.1f} GB already free",
+                                  flush=True)
+
+                    if _exp <= _free * 0.95:
+                        print(f"  Auto-offload: {_free:.1f} GB free now covers the "
+                              f"~{_exp:.1f} GB needed — keeping every layer on GPU",
+                              flush=True)
+                    else:
+                        _usable = max(0.0, _free - _headroom)
+                        _fit = int(_nlayers * _usable / (_exp * 1.20))
+                        _fit = max(0, min(_nlayers - 1, _fit))
+                        self.n_gpu_layers = _fit
+                        print(f"  Auto-offload: model needs ~{_exp:.1f} GB but only "
+                              f"{_free:.1f} GB free even after evicting what could be "
+                              f"evicted — placing {_fit}/{_nlayers} layers on GPU, "
+                              f"{_nlayers - _fit} on CPU (slower). Lower n_ctx or use "
+                              f"a smaller model to keep it fully on GPU.", flush=True)
             except Exception as _off_e:
                 # Loud on purpose, and it says what the consequence is. This
                 # printed "(auto-offload sizing skipped: …)" for an
@@ -1591,7 +1631,8 @@ class VulkanBackend(ModelBackend):
                     _meas = _meas.get(str(_ctx)) or _meas.get(_ctx)
                 _meas = float(_meas) if _meas not in (None, '', 0) else 0.0
                 if _meas <= 0:
-                    _meas = kv_journal.lookup(model_path, _ctx)
+                    _meas = kv_journal.lookup(
+                        model_path, _ctx, kv_journal.signature(_raw_cfg))
                     if _meas > 0:
                         print(f"  KV plan: {_meas:.1f} GB journalled for this model at "
                               f"n_ctx={_ctx} by an earlier load")
@@ -2026,7 +2067,8 @@ class VulkanBackend(ModelBackend):
             gpu_supported = _llama_cpp.llama_supports_gpu_offload()
             print(f"  GPU offload  : {'supported' if gpu_supported else 'NOT supported by this build'}")
 
-        _log_cb = _install_layer_log_callback(model_path, int(self.n_ctx or 0))
+        _log_cb = _install_layer_log_callback(
+            model_path, int(self.n_ctx or 0), kv_journal.signature(_raw_cfg))
         # Progress feedback during the (otherwise silent) tensor load. llama.cpp's
         # progress_callback isn't exposed by the Llama wrapper, so inject it by
         # patching the default model-params factory for the duration of construction.
@@ -2087,7 +2129,8 @@ class VulkanBackend(ModelBackend):
                             self.last_kv_gb = round(_kv_gpu + _kv_cpu, 2)
                             self.last_kv_ctx = int(self.n_ctx or 0)
                             _kept = kv_journal.record(model_path, self.last_kv_ctx,
-                                                      self.last_kv_gb)
+                                                      self.last_kv_gb,
+                                                      kv_journal.signature(_raw_cfg))
                             print(f"  KV measured: {self.last_kv_gb:.1f} GB at "
                                   f"n_ctx={self.last_kv_ctx} ({_kv_gpu:.1f} GB VRAM + "
                                   f"{_kv_cpu:.1f} GB host RAM)"
