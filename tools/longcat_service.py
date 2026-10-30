@@ -179,6 +179,55 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
         if family and shared != root:
             log(f"family '{family}': tokenizer/text_encoder/vae from {shared}")
 
+        # offload "auto": decide the placement from what the card HAS FREE right
+        # now, instead of from a setting written when the model was configured.
+        #
+        # The two settings that look independent are not. A quantised text
+        # encoder must be resident (bitsandbytes quantises as the weights land on
+        # CUDA and cannot shuttle them back), so asking for a quantised encoder
+        # AND for spilling when VRAM runs short asks for two incompatible things:
+        # on a 24 GB card it pins 22.1 GB (13.6 DiT + 8.0 nf4 encoder + 0.5 VAE)
+        # and leaves under 2 GB for the activations of a 13.6B video model. Which
+        # is an OOM at the first long clip rather than at load, so it looks like a
+        # flaky model.
+        #
+        # So one decision is taken here, with the numbers logged either way: go
+        # fully resident when it fits with headroom, else keep the DiT and VAE on
+        # the card and let the encoder live on the host and swap in for the
+        # encode. The prediction is logged next to the free VRAM it was made
+        # against, so a wrong constant shows up as a wrong prediction rather than
+        # as an OOM nobody can place.
+        if str(offload or "").strip().lower() == "auto":
+            # Decided against the card's CAPACITY, not the free VRAM at this
+            # instant. Free VRAM makes the placement depend on whichever model
+            # happened to be resident when the request arrived -- a sibling
+            # holding 8 GB would park LongCat on the host, and it would stay
+            # there for every later request because nothing re-examines the
+            # condition. It is also self-fulfilling: the worker RESERVES this
+            # footprint and the manager evicts whatever is in the way, so "no
+            # room right now" is not a fact about the card.
+            _total_gb, _free_gb = 0.0, 0.0
+            try:
+                if torch.cuda.is_available():
+                    _free_b, _total_b = torch.cuda.mem_get_info()
+                    _free_gb, _total_gb = _free_b / 1e9, _total_b / 1e9
+            except Exception:
+                pass
+            _cap_gb = LC.usable_capacity_gb(_total_gb)
+            _plan = LC.placement_plan(_cap_gb,
+                                      _state.get("variant") or "int8",
+                                      _state.get("text_encoder_quant") or "none")
+            log(f"placement (auto): card holds {_total_gb:.1f} GB "
+                f"({_cap_gb:.1f} GB usable), {_free_gb:.1f} GB free right now")
+            log(f"placement (auto): {_plan['why']}")
+            if (_state.get("text_encoder_quant") or "none") != _plan["text_encoder_quant"]:
+                log(f"placement (auto): text_encoder_quant "
+                    f"{_state.get('text_encoder_quant')!r} -> "
+                    f"{_plan['text_encoder_quant']!r}")
+            _state["text_encoder_quant"] = _plan["text_encoder_quant"]
+            _state["placement_plan"] = _plan
+            offload = "" if _plan["resident"] else "model"
+
         tokenizer = AutoTokenizer.from_pretrained(shared, subfolder="tokenizer")
         te_quant = str(_state.get("text_encoder_quant") or "none").strip().lower()
         te_kw = {"torch_dtype": td}
@@ -294,6 +343,27 @@ def load_pipeline(checkpoint_dir: str, source_dir: str, dtype: str = "bfloat16",
                 f"passes keep BSA, at the cost of attending over latent frames the "
                 f"pipeline still marks as noise")
         _place_pipeline(pipe, offload)
+        # What the placement actually cost, against what it was predicted to cost.
+        # The plan is arithmetic over measured constants, and a constant that drifts
+        # (a new variant, a different encoder) would otherwise be invisible until it
+        # produced an OOM at generation time. Logging both makes the prediction
+        # falsifiable on every load.
+        try:
+            if torch.cuda.is_available():
+                _alloc = torch.cuda.memory_allocated() / 1e9
+                _free_now = torch.cuda.mem_get_info()[0] / 1e9
+                _p = _state.get("placement_plan") or {}
+                if _p:
+                    _delta = _alloc - float(_p.get("needed_gb") or 0.0)
+                    log(f"placement: {_alloc:.2f} GB on the card after loading "
+                        f"(predicted {_p.get('needed_gb')} GB, "
+                        f"{_delta:+.2f} GB vs the plan), {_free_now:.2f} GB still "
+                        f"free for activations")
+                else:
+                    log(f"placement: {_alloc:.2f} GB on the card after loading, "
+                        f"{_free_now:.2f} GB still free for activations")
+        except Exception:
+            pass
         _state.update(pipe=pipe, model=root, source=src, dtype=dtype)
         log("ready")
         return pipe
@@ -1752,7 +1822,9 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--dtype", default="bfloat16")
-    ap.add_argument("--offload", default="", help="'' | model | sequential")
+    ap.add_argument("--offload", default="",
+                    help="'' (all on the card) | auto (measure, then decide) | "
+                         "model | sequential")
     ap.add_argument("--attention", default="xformers",
                     help="xformers | flash | flash3 (falls back to what is installed)")
     ap.add_argument("--text-encoder-quant", default="none",

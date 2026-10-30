@@ -43,7 +43,11 @@ Per-model config keys (models.json entry, all optional)::
     "longcat_source": "",          # repo checkout; blank = bundled/config
     "variant": "bf16",             # bf16 | fp8 | int8
     "quality": "fast",             # draft | fast | best
-    "offload_strategy": "",        # '' | model | sequential
+    "offload_strategy": "",        # '' | auto | model | sequential
+                                   #   '' = everything on the card
+                                   #   auto = measure free VRAM, then go resident
+                                   #          or keep the encoder on the host
+                                   #   model = always keep the encoder on the host
     "bsa": "off",                  # block-sparse attention: on | off | auto
     "bsa_pad_cond": "off",         # on | off — let i2v/continuation passes use BSA by
                                    #   rounding the conditioning latents up to the
@@ -463,10 +467,16 @@ def ensure_service(model_path: str, config: dict = None,
                         env[k.strip()] = v
 
         offload = str(config.get("offload_strategy") or "").strip().lower()
-        if offload in ("auto", "balanced", "disk", "group", "leaf"):
+        if offload in ("balanced", "disk", "group", "leaf"):
             # The upstream pipeline exposes only the diffusers CPU-offload hooks; the
             # manager's other strategies have no equivalent here.
             offload = "model"
+        # "auto" is passed THROUGH, not collapsed to "model". It used to be
+        # collapsed, which made the one setting that means "use the card and spill
+        # if it is not enough" a synonym for "always keep the encoder on the host"
+        # -- so a bigger card could never be used, and a 24 GB one could never be
+        # told apart from it. The service decides at load time from the free VRAM
+        # it can actually see, and logs the arithmetic (see LC.placement_plan).
         # Context parallelism: upstream splits the DiT's spatial dims across GPUs under
         # torchrun, so cp_size > 1 means N processes, not N threads. Only rank 0 binds
         # the port; the others take their jobs over a broadcast (see the service).
@@ -926,17 +936,47 @@ def acquire(model_name: str, config: dict = None) -> LongcatHandle:
     key = service_key(model_path, cfg)
 
     register_releaser()                          # both directions, from the first use
-    url = ensure_service(model_path, cfg)        # idempotent; re-spawns on a new port
+
+    needed = float(cfg.get("used_vram_gb") or 0.0)
+    _plan = None
+    if not needed and str(cfg.get("offload_strategy") or "").strip().lower() == "auto":
+        # Size the reservation from the placement the service is about to choose,
+        # so the manager evicts enough room for it. Both sides run the SAME pure
+        # arithmetic over the card's capacity, so they cannot disagree -- and the
+        # reservation has to be the resident footprint, not a default, or the
+        # service would decide "resident" against a card the manager never
+        # cleared and OOM at the first long clip.
+        try:
+            LCc = common()
+            _cap = LCc.usable_capacity_gb(multi_model_manager._total_vram_gb())
+            _plan = LCc.placement_plan(_cap, cfg.get("variant") or "int8",
+                                       cfg.get("text_encoder_quant") or "none")
+            needed = float(_plan.get("needed_gb") or 0.0)
+            print(f"[longcat] placement: {_plan['why']}", flush=True)
+        except Exception as exc:
+            print(f"[longcat] could not plan the placement ({exc}); "
+                  f"reserving the default", flush=True)
+            _plan = None
+    needed = needed or DEFAULT_VRAM_GB
+
+    # Spawned INSIDE the loader, so the reservation above evicts first. Spawning
+    # before it meant the service loaded its weights onto a card the manager had
+    # not cleared yet, and the eviction that was supposed to make room for it
+    # happened afterwards -- which is fine for a 13.6 GB DiT and wrong for any
+    # placement that needs the whole card.
+    _url = {}
 
     def _loader():
-        return LongcatHandle(key, url)
+        _url["v"] = ensure_service(model_path, cfg)   # idempotent; may re-spawn
+        return LongcatHandle(key, _url["v"])
 
-    needed = float(cfg.get("used_vram_gb") or 0.0) or DEFAULT_VRAM_GB
     # The manager's generic "register an out-of-band backend as an evictable,
     # VRAM-tracked model" entry point (STT is merely where it was first needed).
     handle = multi_model_manager.acquire_stt_backend(key, needed, True, _loader,
                                                      keep_resident=False)
-    handle.url = url                             # a re-spawned worker may have moved
+    # A handle that was already loaded never ran the loader, so make sure the
+    # service is up and the url is current either way.
+    handle.url = _url.get("v") or ensure_service(model_path, cfg)
     return handle
 
 

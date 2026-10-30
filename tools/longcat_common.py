@@ -597,3 +597,147 @@ def source_problems(src_dir: str) -> list:
     needed = ("pipeline_longcat_video.py", os.path.join("modules", "longcat_video_dit.py"))
     return [f"missing longcat_video/{n}" for n in needed
             if not os.path.isfile(os.path.join(pkg, n))]
+
+
+# ── placement planning ────────────────────────────────────────────────────────
+#
+# Measured component sizes on a 3090, used only to DECIDE a placement before any
+# weights are read. Every number here is checked against the real footprint after
+# the load, and the decision is logged with both, so a wrong constant shows up as
+# a wrong prediction rather than as an OOM nobody can explain.
+TEXT_ENCODER_BF16_GB = 11.0     # UMT5-XXL, 5.6B stored fp32 and loaded bf16
+VAE_GB = 0.5
+DIT_GB = {
+    "int8": 13.6,               # upstream's base_model_int8/, 1 byte per weight
+    "fp8": 13.6,
+    "gguf": 13.6,
+    "bf16": 27.0,
+}
+#: Room left for latents, activations and compute buffers. A 13.6B video DiT at
+#: 480x832x93 frames was measured using 13-20 GB beyond its weights on the LTX
+#: cards of the same shape, but LongCat runs its own segment loop with the KV
+#: cache offloadable, so this is the floor below which full residency is not
+#: worth attempting -- not a prediction of the peak.
+PLACEMENT_HEADROOM_GB = 3.0
+
+#: Held back from the card's total for the CUDA context, the driver and the
+#: allocator's own overhead, none of which a model gets to use.
+CONTEXT_RESERVE_GB = 1.0
+
+
+def usable_capacity_gb(total_vram_gb, reserve_gb: float = CONTEXT_RESERVE_GB) -> float:
+    """What a model may occupy on a card of ``total_vram_gb``."""
+    try:
+        total = float(total_vram_gb or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    return max(0.0, total - max(0.0, float(reserve_gb or 0.0)))
+
+
+def placement_plan(capacity_gb, variant: str = "int8",
+                   text_encoder_quant: str = "none",
+                   headroom_gb: float = PLACEMENT_HEADROOM_GB) -> dict:
+    """Decide where LongCat's components go, from the card's CAPACITY.
+
+    Returns ``{"resident": bool, "text_encoder_quant": str, "needed_gb": float,
+    "capacity_gb": float, "why": str}``.
+
+    ``capacity_gb`` is what the card holds with this model as THE ONLY ONE on
+    it -- total VRAM less the context reserve -- deliberately not the free VRAM
+    at this instant. Deciding on free VRAM makes the placement depend on
+    whichever model happens to be resident when the request arrives: a sibling
+    occupying 8 GB would push LongCat onto the host permanently, and it would
+    stay there for every later request too, because the condition that caused it
+    is never re-examined. Worse, it is self-fulfilling -- the whole point of a
+    reservation is that the manager evicts what is in the way, so "there is no
+    room right now" is not a fact about the card, it is a fact about a decision
+    nobody has taken yet.
+
+    So the question asked here is the stable one: can this model be resident on
+    this card at all? The answer sizes the reservation, the manager evicts
+    whatever it must to honour it, and a model that could be resident is never
+    left on the CPU merely because something else got there first.
+
+    The question is narrow, because only one component can move. The DiT has to
+    be resident -- it runs every denoising step of every segment -- and the VAE
+    is half a gigabyte. The UMT5-XXL text encoder is 11 GB and runs ONCE per
+    request, to turn the prompt into embeddings, so it is the only candidate for
+    the host.
+
+    Two placements follow:
+
+    * **resident** -- everything on the card, no swapping. Needs the DiT, the
+      VAE and the encoder (quantised, if asked) to fit together with headroom.
+      A quantised encoder MUST be resident: bitsandbytes quantises as weights
+      land on CUDA and cannot shuttle them back, so quantising it is also a
+      decision to keep it there.
+    * **offload** -- DiT and VAE resident, encoder on the host, the two swapping
+      places for encode_prompt so only one is ever on the card. Slower per
+      request by one swap, and it always fits.
+
+    Which is why "quantise the encoder" and "spill if it does not fit" are the
+    same decision rather than two: asking for both at once pins 22.1 GB of a
+    24 GB card (13.6 DiT + 8.0 nf4 encoder + 0.5 VAE) and leaves under 2 GB for
+    the activations of a 13.6B video model. So when the quantised encoder does
+    not fit, this plan drops the quantisation rather than the spill -- an
+    unquantised encoder on the host costs host RAM, while a resident one that
+    does not fit costs the request.
+    """
+    try:
+        free = float(capacity_gb or 0.0)
+    except (TypeError, ValueError):
+        free = 0.0
+    head = max(0.0, float(headroom_gb or 0.0))
+    dit = DIT_GB.get(str(variant or "int8").strip().lower(), DIT_GB["bf16"])
+    want = str(text_encoder_quant or "none").strip().lower()
+    frac = component_quant_fraction(want)
+    te_resident = TEXT_ENCODER_BF16_GB * frac if frac is not None else None
+
+    base = dit + VAE_GB
+    if te_resident is None:
+        # No quantisation asked for. Full residency would mean an 11 GB bf16
+        # encoder parked on the card doing nothing between prompts, so it is
+        # only worth it when there is room to spare.
+        resident_need = base + TEXT_ENCODER_BF16_GB
+        if resident_need + head <= free:
+            return {"resident": True, "text_encoder_quant": "none",
+                    "needed_gb": round(resident_need, 2),
+                    "resident_needed_gb": round(resident_need, 2),
+                    "capacity_gb": round(free, 2),
+                    "why": (f"{resident_need:.1f} GB fits the card's {free:.1f} GB "
+                            f"usable with {head:.1f} GB to spare — everything stays "
+                            f"on the card, nothing swaps")}
+        return {"resident": False, "text_encoder_quant": "none",
+                # Reserve the SPILL placement, not residency: the encoder is on
+                # the host and swaps with the DiT, so only one of them is ever on
+                # the card. Reserving the residency figure would evict siblings to
+                # free 8 GB that this placement never touches.
+                "needed_gb": round(base, 2),
+                "resident_needed_gb": round(resident_need, 2),
+                "capacity_gb": round(free, 2),
+                "why": (f"{resident_need:.1f} GB does not fit the card's "
+                        f"{free:.1f} GB usable (+{head:.1f} GB headroom) — the DiT "
+                        f"and VAE stay resident ({base:.1f} GB) and the "
+                        f"{TEXT_ENCODER_BF16_GB:.0f} GB encoder swaps in for "
+                        f"encode_prompt")}
+
+    resident_need = base + te_resident
+    if resident_need + head <= free:
+        return {"resident": True, "text_encoder_quant": want,
+                "needed_gb": round(resident_need, 2),
+                "resident_needed_gb": round(resident_need, 2),
+                "capacity_gb": round(free, 2),
+                "why": (f"{dit:.1f} GB DiT + {te_resident:.1f} GB {want} encoder "
+                        f"+ {VAE_GB:.1f} GB VAE = {resident_need:.1f} GB fits the "
+                        f"card's {free:.1f} GB usable with {head:.1f} GB to spare")}
+    # The quantised encoder is what does not fit, and it cannot be offloaded, so
+    # the quantisation is what gives way.
+    return {"resident": False, "text_encoder_quant": "none",
+            "needed_gb": round(base, 2),
+            "resident_needed_gb": round(resident_need, 2),
+            "capacity_gb": round(free, 2),
+            "why": (f"a resident {want} encoder would need {resident_need:.1f} GB "
+                    f"of the card's {free:.1f} GB usable (+{head:.1f} GB headroom), "
+                    f"and a quantised encoder cannot be offloaded — loading it "
+                    f"unquantised on the host instead ({base:.1f} GB on the card), "
+                    f"swapping with the DiT for encode_prompt")}

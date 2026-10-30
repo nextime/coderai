@@ -721,18 +721,19 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </select></div>
           <div class="form-row" style="margin:0"><label class="form-label">Offload</label>
             <select id="cfg-longcat-offload" class="form-input">
+              <option value="auto">auto — measure the card, spill only if needed</option>
               <option value="">none — all on the card</option>
-              <option value="model">model — per-module CPU offload</option>
+              <option value="model">model — encoder on the host, swaps for encode</option>
               <option value="sequential">sequential — lowest VRAM, slowest</option>
             </select></div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.5rem">
           <div class="form-row" style="margin:0"><label class="form-label">Text encoder</label>
             <select id="cfg-longcat-te-quant" class="form-input">
-              <option value="">bf16 — ~11 GB, needs offload</option>
-              <option value="int8">int8 — ~9.8 GB, too big to stay resident</option>
-              <option value="nf4">nf4 — ~8.0 GB, resident but tight</option>
-              <option value="fp4">fp4 — ~8.0 GB, resident but tight</option>
+              <option value="">bf16 — ~11 GB, lives on the host</option>
+              <option value="int8">int8 — ~9.8 GB, resident (needs a card over 24 GB)</option>
+              <option value="nf4">nf4 — ~8.0 GB, resident (needs a card over 24 GB)</option>
+              <option value="fp4">fp4 — ~8.0 GB, resident (needs a card over 24 GB)</option>
             </select></div>
           <div class="form-row" style="margin:0"><label class="form-label">Block-sparse attention</label>
             <select id="cfg-longcat-bsa" class="form-input">
