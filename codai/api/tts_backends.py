@@ -237,10 +237,17 @@ def _kokoro_static_voices(config: Optional[dict] = None) -> list:
 #: Every OpenAI-compatible client in existence sends "en", so Kokoro's English
 #: voices were unreachable while its Italian ones worked, which reads as the
 #: model being broken rather than as a two-letter code needing a region.
-#: Only codes espeak actually refuses belong here: "it", "fr" and "de" are
-#: accepted bare and must pass through untouched.
+#: Only codes espeak actually refuses belong here. Measured against the running
+#: engine 2026-10-30, one language per request: "de", "it", "nl", "pl", "tr",
+#: "ru", "ko", "ar", "cs", "hu" and "sv" are all accepted bare and must pass
+#: through untouched -- but "fr" is NOT, which this comment previously asserted
+#: it was. French is regioned in espeak exactly like English (fr-fr, fr-be,
+#: fr-ch), so Kokoro's French voice answered every request with a 500 while its
+#: Italian one worked. Do not add a code here on the strength of the pattern:
+#: probe it, because the pattern is what got "fr" wrong.
 _ESPEAK_REGIONLESS = {
     "en": "en-us",
+    "fr": "fr-fr",
     "pt": "pt-br",
     "zh": "cmn",
 }

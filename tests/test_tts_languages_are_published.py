@@ -305,3 +305,64 @@ def test_xtts_set_matches_the_checkpoints_own_config():
     if not declared:
         pytest.skip('this XTTS config declares no languages')
     assert sorted(T._FAMILY_LANGUAGES['coqui']) == sorted(declared)
+
+
+# ── a language we advertise has to actually come out ─────────────────────────
+#
+# Advertising is only half the job. Probing all nine of Kokoro's languages
+# through the real endpoint on 2026-10-30 found eight working and ONE failing:
+# `fr` returned `espeak-ng has no such language`, because French is regioned in
+# espeak (fr-fr, fr-be, fr-ch) exactly as English is. The map's own comment
+# asserted the opposite -- that "it", "fr" and "de" all pass bare -- so the
+# claim had never been tested. de/it/nl/pl/tr/ru/ko/ar/cs/hu/sv do pass bare;
+# fr does not.
+
+def test_french_is_regioned_like_english():
+    """The regression: a bare 'fr' is what every OpenAI-compatible client
+    sends, and it 500ed."""
+    assert T.espeak_language("fr") == "fr-fr"
+
+
+@pytest.mark.parametrize("code", ["en", "fr", "pt", "zh"])
+def test_every_regioned_language_is_mapped(code):
+    """These four are the ones espeak refuses bare."""
+    assert T.espeak_language(code) != code
+
+
+@pytest.mark.parametrize("code", ["de", "it", "nl", "pl", "tr", "ru",
+                                  "ko", "ar", "cs", "hu", "sv"])
+def test_a_bare_code_espeak_accepts_is_left_alone(code):
+    """Measured: each of these works bare. Rewriting one would send espeak a
+    region it may not have."""
+    assert T.espeak_language(code) == code
+
+
+@pytest.mark.parametrize("code", ["fr-fr", "fr-be", "en-gb", "pt-br"])
+def test_an_explicit_region_passes_through(code):
+    assert T.espeak_language(code) == code
+
+
+def test_a_blank_language_defaults_to_english():
+    assert T.espeak_language("") == "en-us"
+    assert T.espeak_language(None) == "en-us"
+
+
+def test_case_and_underscores_are_normalised():
+    """Clients send en_US and EN-GB; both name a real espeak voice."""
+    assert T.espeak_language("FR") == "fr-fr"
+    assert T.espeak_language("en_GB") == "en-gb"
+
+
+def test_every_language_kokoro_advertises_resolves_to_something_espeak_takes():
+    """The listing and the synthesis path must agree. Each advertised code is
+    either accepted bare (measured) or mapped to a region that is.
+
+    This is the invariant that was broken: `fr` was advertised through the voice
+    ids and rejected at synthesis.
+    """
+    measured_bare_ok = {"es", "hi", "it", "ja", "en-gb", "en-us", "pt-br"}
+    for code in T.family_languages("hexgrad/Kokoro-82M"):
+        resolved = T.espeak_language(code)
+        assert resolved in measured_bare_ok or code in T._ESPEAK_REGIONLESS, (
+            f"Kokoro advertises {code!r} but it resolves to {resolved!r}, "
+            f"which was never measured against espeak")

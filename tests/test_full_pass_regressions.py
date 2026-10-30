@@ -128,10 +128,24 @@ def test_a_bare_en_becomes_an_espeak_language():
 
 
 def test_languages_espeak_accepts_bare_are_untouched():
-    """Rewriting 'it' would break the voices that were working."""
+    """Rewriting 'it' would break the voices that were working.
+
+    'fr' USED to be in this list, on the strength of the pattern rather than a
+    measurement, and it was wrong: probing the running engine on 2026-10-30
+    showed French is regioned in espeak exactly like English, so a bare 'fr'
+    answered every request with a 500 while 'it' worked. It now maps to 'fr-fr'
+    and lives in the mapped set below. The rest of these were measured bare.
+    """
     from codai.api.tts_backends import espeak_language
-    for code in ("it", "fr", "de", "es", "en-gb", "en-us"):
+    for code in ("it", "de", "es", "nl", "pl", "tr", "ru", "ko", "ar",
+                 "cs", "hu", "sv", "en-gb", "en-us"):
         assert espeak_language(code) == code
+
+
+def test_french_is_regioned_like_english():
+    from codai.api.tts_backends import espeak_language
+    assert espeak_language("fr") == "fr-fr"
+    assert espeak_language("fr-be") == "fr-be"
 
 
 def test_an_empty_language_still_has_a_default():
