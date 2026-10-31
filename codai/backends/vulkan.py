@@ -2819,8 +2819,35 @@ class VulkanBackend(ModelBackend):
         _stop = self._augment_model_stops(stop)
         if _stop:
             kwargs['stop'] = _stop
-        if response_format and response_format.get('type') == 'json_object':
-            kwargs['response_format'] = {'type': 'json_object'}
+        # JSON mode, including a SCHEMA when the caller supplies one.
+        #
+        # `json_object` alone constrains syntax and nothing else, so the model
+        # may keep a valid object open forever: measured on zeiss 2026-10-31, 21
+        # script generations ended `finish_reason=length` having written 6000
+        # tokens of well-formed-but-unfinished JSON for a job needing ~800, one
+        # of them after 8.5 minutes. Nothing was broken — the array simply never
+        # closed. A schema bounds the shape (these keys, this many scenes), so
+        # the object has to close, which fixes the truncation without touching
+        # the caller's max_tokens.
+        #
+        # llama-cpp-python accepts ONLY `type: json_object` (its
+        # `_grammar_for_response_format` returns None for anything else) and
+        # reads a sibling `schema` key. OpenAI sends the schema nested under
+        # `json_schema`, so the two shapes are translated here rather than
+        # forwarded; forwarding OpenAI's form verbatim silently disables the
+        # grammar instead of tightening it.
+        _rf = response_format or {}
+        if _rf.get('type') in ('json_object', 'json_schema'):
+            _schema = None
+            if _rf.get('type') == 'json_schema':
+                _js = _rf.get('json_schema')
+                if isinstance(_js, dict):
+                    _schema = _js.get('schema')
+            if _schema is None:
+                _schema = _rf.get('schema')      # llama.cpp's own shape
+            kwargs['response_format'] = (
+                {'type': 'json_object', 'schema': _schema} if _schema
+                else {'type': 'json_object'})
         _tc = _make_llama_thermal_criteria()
         if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
@@ -2839,7 +2866,116 @@ class VulkanBackend(ModelBackend):
             completion_tokens=usage.get('completion_tokens', 0),
         )
         content = result['choices'][0]['message'].get('content') or ''
+
+        # A caller who asked for JSON and hit the token budget currently gets
+        # invalid JSON — the grammar keeps every token legal but never forces
+        # the root object to close. Close it, so the answer holds the items that
+        # did arrive instead of failing to parse. Only for a JSON request, only
+        # on a `length` finish, and only when the repair itself parses;
+        # `finish_reason` is untouched, so a caller that checks still learns the
+        # answer was cut short.
+        try:
+            if kwargs.get('response_format') and content:
+                _fr = (result['choices'][0] or {}).get('finish_reason')
+                if _fr == 'length':
+                    _fixed = self.close_truncated_json(content)
+                    if _fixed is not None:
+                        print(f"  JSON response hit max_tokens mid-structure — "
+                              f"closed it ({len(content)} -> {len(_fixed)} chars) "
+                              f"so it parses; finish_reason stays 'length'",
+                              flush=True)
+                        content = _fixed
+        except Exception as _jx:
+            print(f"  (JSON close-up skipped: {_jx})", flush=True)
         return content
+
+    @staticmethod
+    def close_truncated_json(text: str):
+        """Close a JSON document cut off mid-structure, or return None.
+
+        A caller who asked for `json_object` and receives syntactically invalid
+        JSON got a protocol violation, not an answer. It happens whenever the
+        model runs to `max_tokens` with the generic JSON grammar: the grammar
+        keeps every token legal but never requires the root object to close, so
+        an array of scenes can grow until the budget ends mid-token. Measured on
+        zeiss 2026-10-31: 21 generations ended that way, and the client reported
+        them as "broken JSON after 1493 s".
+
+        This closes what is open — finishing a dangling string, dropping a
+        half-written value or key, and emitting the missing brackets — so the
+        client gets valid JSON holding the scenes that DID arrive. It never
+        invents content, and `finish_reason` stays `length`, so a caller that
+        checks can still tell the answer was cut short.
+
+        Returns None when the text already parses, when nothing is open, or
+        when the result still will not parse: a repair that cannot be verified
+        is not applied.
+        """
+        import json as _json
+        if not text or not text.strip():
+            return None
+        try:
+            _json.loads(text)
+            return None                      # nothing to fix
+        except Exception:
+            pass
+
+        stack, in_str, esc = [], False, False
+        last_safe = None                     # index just past the last complete item
+        for i, ch in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in '{[':
+                stack.append('}' if ch == '{' else ']')
+            elif ch in '}]':
+                if stack:
+                    stack.pop()
+                last_safe = i + 1
+            elif ch == ',' and stack:
+                last_safe = i            # a comma ends the previous item cleanly
+        if not stack and not in_str:
+            return None                      # not a truncation we understand
+
+        # Cut back to the last point where a value had finished, so a
+        # half-written key/value is dropped rather than closed around.
+        body = text[:last_safe] if last_safe else text
+        body = body.rstrip().rstrip(',')
+        for _ in range(len(stack)):
+            pass
+        # Recompute the open stack for the trimmed body: trimming may have
+        # closed some of it already.
+        stack2, in_str2, esc2 = [], False, False
+        for ch in body:
+            if in_str2:
+                if esc2:
+                    esc2 = False
+                elif ch == '\\':
+                    esc2 = True
+                elif ch == '"':
+                    in_str2 = False
+                continue
+            if ch == '"':
+                in_str2 = True
+            elif ch in '{[':
+                stack2.append('}' if ch == '{' else ']')
+            elif ch in '}]' and stack2:
+                stack2.pop()
+        if in_str2:
+            body += '"'
+        repaired = body + ''.join(reversed(stack2))
+        try:
+            _json.loads(repaired)
+        except Exception:
+            return None                      # unverifiable repair -> leave it alone
+        return repaired
 
     def _render_chat_prompt(self, messages):
         """Render the chat prompt with a CACHED, non-sandboxed Jinja env, identical

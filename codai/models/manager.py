@@ -236,6 +236,15 @@ def _gguf_architecture(path: str):
 # --------------------------------------------------------------------------- #
 
 # Ordered by arbitration preference for ambiguous names. New engines append here.
+#: Eviction frees this much MORE than the caller asked for. Every size that
+#: reaches eviction is an estimate; one landing a few hundred MB short leaves the
+#: load exactly on the edge, where it is admitted, allocates, and dies on a tiny
+#: buffer. Measured on 2026-10-30/31: "Tried to allocate 20.00 MiB ... 8.69 MiB
+#: is free", "190.00 MiB ... 18.69 MiB free", "12.00 MiB ... 8.69 MiB free" --
+#: all on loads eviction had just reported as satisfied. The cost of the margin
+#: is at most one more idle model unloaded.
+_EVICT_HEADROOM_FRACTION = 0.10
+
 _ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "runpod")
 
 
@@ -6127,6 +6136,21 @@ class MultiModelManager:
         if needed_gb <= 0:
             return
 
+        # Always free a little MORE than asked. Every figure that reaches here is
+        # an estimate, and an estimate landing a few hundred MB short puts the
+        # load exactly on the edge: it is admitted, allocates, and then fails on
+        # a 20 MiB buffer. Measured repeatedly on 2026-10-30/31 -- "Tried to
+        # allocate 20.00 MiB ... 8.69 MiB is free", "190.00 MiB ... 18.69 MiB
+        # free", "12.00 MiB ... 8.69 MiB free" -- loads that eviction had just
+        # "satisfied". 10% of the request is cheap (one more idle model at
+        # worst) and takes the edge case out of reach.
+        #
+        # The headroom is what eviction TARGETS, not what it reports: the
+        # shortfall warning below still measures against what the caller asked
+        # for, so freeing enough for the load but not the headroom is a success
+        # and stays silent.
+        target_gb = needed_gb * (1.0 + _EVICT_HEADROOM_FRACTION)
+
         _evict_key = self._evict_one
 
         def _size_label(key: str) -> str:
@@ -6148,7 +6172,7 @@ class MultiModelManager:
                 continue
             if key in self._keep_resident:
                 continue
-            if self._get_free_vram_gb() >= needed_gb:
+            if self._get_free_vram_gb() >= target_gb:
                 break
             if self._is_key_busy(key):
                 print(f"  '{key}' is busy serving a request — not evicting it")
@@ -6158,7 +6182,7 @@ class MultiModelManager:
 
         # Second pass: evict the active model if still not enough AND it is idle
         # (unless it's keep-resident — that's handled by the last-resort pass).
-        if (self._get_free_vram_gb() < needed_gb and self.active_in_vram
+        if (self._get_free_vram_gb() < target_gb and self.active_in_vram
                 and self.active_in_vram not in self._keep_resident
                 and self.active_in_vram in self.models):
             _active = self.active_in_vram
@@ -6178,11 +6202,11 @@ class MultiModelManager:
         # co-resident STT/diarization models) so a genuinely-larger load — e.g. a
         # 26B LLM — can still fit. They yield rather than block it; that's the
         # "never fight the LLM" half of the co-residency policy.
-        if self._get_free_vram_gb() < needed_gb and self._keep_resident:
+        if self._get_free_vram_gb() < target_gb and self._keep_resident:
             for key in list(self._lru_order()):
                 if key not in self._keep_resident:
                     continue
-                if self._get_free_vram_gb() >= needed_gb:
+                if self._get_free_vram_gb() >= target_gb:
                     break
                 if self._is_key_busy(key) and not self._wait_until_idle(key):
                     print(f"  keep-resident '{key}' still busy — leaving it loaded")
@@ -6197,7 +6221,7 @@ class MultiModelManager:
         # model) to release their VRAM. These aren't tracked models, so eviction
         # above can't see them — this is what stops a cached training base from
         # forcing the next image request into CPU/disk offload.
-        if self._get_free_vram_gb() < needed_gb and self._external_vram_releasers:
+        if self._get_free_vram_gb() < target_gb and self._external_vram_releasers:
             for _rel in list(self._external_vram_releasers):
                 try:
                     freed = _rel(needed_gb)
@@ -6205,7 +6229,7 @@ class MultiModelManager:
                         print(f"On-request VRAM eviction: external releaser freed {freed:.1f} GB")
                 except Exception as e:
                     print(f"  Warning in external VRAM releaser: {e}")
-                if self._get_free_vram_gb() >= needed_gb:
+                if self._get_free_vram_gb() >= target_gb:
                     break
 
         # Report what we actually freed so a failure to free is visible.
