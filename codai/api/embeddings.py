@@ -693,7 +693,23 @@ def _allow_remote_automodel_reregister():
     which is what the remote code would pass if it had been written against
     this version.
 
-    Idempotent and never fatal. Returns a callable that restores the original.
+    Idempotent and never fatal. Returns a callable that restores the original
+    `register` AND undoes every mapping entry the remote code wrote through it.
+
+    Undoing them is the whole point, and it was missed first time round. The
+    registration is process-wide: `AutoModel.register(LlavaNextConfig, …)` makes
+    every LLaVA-NeXT checkpoint loaded afterwards in this process come back as
+    MM-Embed's class. Measured during a customer test run on zeiss 2026-10-31 --
+    MM-Embed was tried first (and failed on its gated retriever), then e5-v,
+    which IS a LLaVA-NeXT checkpoint, answered
+
+        500 Failed to load embedding model: 'LlavaNextConfig' object has no
+            attribute 'retriever'
+
+    i.e. e5-v was being built as MM-Embed and asked its config for MM-Embed's
+    field. e5-v alone had worked all day; it only breaks after MM-Embed has been
+    touched in the same process, which is why the order the test happened to use
+    found it.
     """
     try:
         from transformers.models.auto.auto_factory import _BaseAutoModelClass
@@ -703,13 +719,43 @@ def _allow_remote_automodel_reregister():
     if _orig is None or getattr(_orig, '_coderai_exist_ok', False):
         return lambda: None
 
+    #: (extra_content_dict, config_class, was_present, previous_value)
+    _touched = []
+
     @classmethod
     def _register(cls, config_class, model_class, exist_ok=True):
+        # `exist_ok=True` writes into the lazy mapping's _extra_content, so that
+        # dict is where an override lives and where it has to be taken back
+        # from. Recorded BEFORE the call, because afterwards the old value is
+        # gone. Never `.get()` on the lazy mapping itself: _LazyAutoMapping.get
+        # requires a default and raises without one.
+        try:
+            _extra = getattr(getattr(cls, '_model_mapping', None),
+                             '_extra_content', None)
+            if isinstance(_extra, dict):
+                _touched.append((_extra, config_class,
+                                 config_class in _extra,
+                                 _extra.get(config_class)))
+        except Exception:
+            pass
         return _orig.__func__(cls, config_class, model_class, exist_ok=True)
 
     _register.__func__._coderai_exist_ok = True
     _BaseAutoModelClass.register = _register
-    return lambda: setattr(_BaseAutoModelClass, 'register', _orig)
+
+    def _restore():
+        setattr(_BaseAutoModelClass, 'register', _orig)
+        for _extra, _key, _had, _was in reversed(_touched):
+            try:
+                if _had:
+                    _extra[_key] = _was
+                else:
+                    _extra.pop(_key, None)
+            except Exception:
+                pass
+        del _touched[:]
+
+    return _restore
 
 
 def _load_mmembed(model_name, device, model_config=None):
