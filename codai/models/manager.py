@@ -3808,8 +3808,23 @@ class MultiModelManager:
             pass
         return 24.0
 
-    def _get_free_vram_gb(self) -> float:
+    def _get_free_vram_gb(self, exclude_key: str = "") -> float:
         """Return estimated free VRAM in GB across the cards this engine can use.
+
+        ``exclude_key`` leaves that model's OWN in-flight load reservation out of
+        the subtraction. A reservation exists so OTHER loads do not count VRAM
+        that is already spoken for; subtracting it from the reserving load's own
+        view tells that load the room it just reserved does not exist.
+
+        Measured on zeiss 2026-10-30. Eviction unloaded a resident 17.24 GB FLUX
+        pipeline and reported "freed 13.4 GB (now 16.3 GB free)". Two seconds
+        later the host-RAM admission check for the load that triggered it read
+        0.0 GB free -- `max(0, 16.3 - 30.9)`, its own reservation -- concluded
+        the whole 30.9 GB footprint had to spill to the host, and refused the
+        load at 32.9 GB against 27.8 GB available. So the eviction cost another
+        model its residency and bought nothing: with its own reservation
+        excluded the spill is 30.9 - 16.3 = 14.6 GB, about 16.6 GB of host RAM,
+        which fits.
 
         ALWAYS multi-device: sums every visible CUDA device (torch honours
         CUDA_VISIBLE_DEVICES, so it's scoped to this engine's NVIDIA cards — e.g.
@@ -3851,7 +3866,8 @@ class MultiModelManager:
             # if the loading model hasn't materialized all its weights yet.
             # max(0, …) — late in a load the reservation overlaps memory the
             # card already reports as used; being conservative here is the point.
-            _reserved = sum(self._loading_reservations.values())
+            _reserved = sum(gb for k, gb in self._loading_reservations.items()
+                            if k != exclude_key)
             return max(0.0, total_free - _reserved)
         return 999.0  # Unknown — assume enough
 
@@ -6418,7 +6434,13 @@ class MultiModelManager:
         need = host_ram.estimate_need(
             total_need_gb=self._get_model_used_vram_gb(
                 model_key, resolved_name, requested_id),
-            free_vram_gb=self._get_free_vram_gb(),
+            # This load's OWN reservation must not count against it: it is the
+            # load being judged, and the VRAM it reserved is the VRAM it will
+            # use. Including it reported 0.0 GB free immediately after an
+            # eviction had freed 16.3 GB, so the whole footprint looked like a
+            # host spill and the load was refused — after the eviction had
+            # already cost another model its residency.
+            free_vram_gb=self._get_free_vram_gb(exclude_key=model_key),
             measured_ram_gb=_measured,
             offload_strategy=cfg.get("offload_strategy"),
             no_ram=bool(cfg.get("no_ram")),
