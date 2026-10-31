@@ -33,7 +33,10 @@ MGR = io.open(os.path.join(ROOT, 'codai/models/manager.py'), encoding='utf-8').r
 
 
 def _fn():
-    i = MGR.index('    def _evict_models_for_vram(self, needed_gb: float):')
+    # Matched without the rest of the signature: `protect` was added later,
+    # and an anchor that pins the whole parameter list fails on a change
+    # that has nothing to do with the headroom this file is about.
+    i = MGR.index('    def _evict_models_for_vram(self, needed_gb: float')
     return MGR[i:MGR.index('\n    def ', i + 10)]
 
 

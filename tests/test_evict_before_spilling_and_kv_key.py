@@ -193,6 +193,10 @@ def test_the_evictor_it_calls_skips_busy_models():
     earlier the same day."""
     mgr = open(os.path.join(os.path.dirname(VULKAN), '..', 'models',
                             'manager.py')).read()
+    # The WHOLE method, not a fixed number of characters from its `def`: the
+    # docstring grew when `protect` was added and pushed these two calls past a
+    # 4000-character window, failing this test while the behaviour it guards
+    # was untouched.
     i = mgr.index('def _evict_models_for_vram')
-    body = mgr[i:i + 4000]
+    body = mgr[i:mgr.index('\n    def ', i + 10)]
     assert '_is_key_busy' in body and '_wait_until_idle' in body

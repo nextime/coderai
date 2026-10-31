@@ -61,12 +61,18 @@ def test_the_manager_prefers_the_requested_cards_own_size():
     try:
         m.config.clear()
         m.config.update({
+            # load_in_4bit as the real cards carry it. Without it this pair
+            # only "fit" a 24 GiB card because the estimator was also halving a
+            # configured VRAM figure by the checkpoint's storage dtype -- fixed
+            # 2026-10-31 after that same halving let a 7B embedder load with
+            # 954 MiB left and OOM on its first batch.
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers": {
                 "path": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-                "used_vram_gb": 151.42, "alias": None},
+                "used_vram_gb": 151.42, "load_in_4bit": True, "alias": None},
             "__lightning": {
                 "path": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-                "used_vram_gb": 22.0, "alias": "Wan2.2-I2V-A14B-Lightning"},
+                "used_vram_gb": 22.0, "load_in_4bit": True,
+                "alias": "Wan2.2-I2V-A14B-Lightning"},
         })
         big = m._get_model_used_vram_gb("Wan-AI/Wan2.2-I2V-A14B-Diffusers")
         small = m._get_model_used_vram_gb(

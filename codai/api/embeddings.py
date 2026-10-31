@@ -23,6 +23,7 @@ Supports sentence-transformers, BGE, E5, nomic-embed, etc.
 import asyncio
 import base64
 import contextlib
+import functools
 import os
 import time
 from typing import List
@@ -2946,11 +2947,16 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
                 pass
             try:
                 # Only scratch room is needed (the model is already resident) — and
-                # marking it active first keeps the eviction pass off the embedding
-                # model itself while it frees other idle models.
+                # `protect` keeps the eviction pass off the embedding model
+                # itself, including the second pass, which otherwise falls back
+                # to evicting the ACTIVE model and waits out its whole budget
+                # for this very request to go idle. It cannot: it is blocked on
+                # the memory the pass was called to free.
                 multi_model_manager.active_in_vram = model_key
                 await asyncio.get_event_loop().run_in_executor(
-                    None, multi_model_manager._evict_models_for_vram, 2.0)
+                    None, functools.partial(
+                        multi_model_manager._evict_models_for_vram, 2.0,
+                        protect=model_key))
                 vectors = []
                 _chunks = []
                 if texts:

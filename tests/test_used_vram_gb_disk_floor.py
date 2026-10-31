@@ -134,7 +134,11 @@ def test_the_factors_are_still_applied_to_the_floor():
 
 def test_the_ordinary_path_is_unchanged():
     i = MGR.index('return _dbg_est("used_vram_gb",')
-    assert '_apply_factors(_explicit_val)' in MGR[i:i + 200]
+    # from_disk=False since 2026-10-31: the storage->load precision ratio
+    # belongs to a baseline measured from the bytes on disk, and applying it
+    # to a configured VRAM figure halved one that was already in the right
+    # units (17.0 GB declared -> 2.75 GB estimated -> 5.64 GB measured).
+    assert '_apply_factors(_explicit_val, from_disk=False)' in MGR[i:i + 240]
 
 
 def test_the_measured_path_still_wins_and_still_skips_factors():

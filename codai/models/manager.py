@@ -5340,11 +5340,34 @@ class MultiModelManager:
                 pass
             return value
 
-        def _apply_factors(raw_weights_gb: float) -> float:
-            """Adjust raw weight size for quantization and GPU-offload settings."""
-            # Normalize storage precision → load precision, then apply the
-            # (fp16-relative) quantization multiplier.
-            gpu_gb = raw_weights_gb * prec_factor * quant_mult
+        def _apply_factors(raw_weights_gb: float, from_disk: bool = True) -> float:
+            """Adjust raw weight size for quantization and GPU-offload settings.
+
+            ``from_disk`` says whether the baseline was measured from the bytes
+            on disk. The precision normalization (storage bytes-per-element ->
+            load bytes-per-element) only means something there. A configured
+            ``used_vram_gb`` is a VRAM figure by definition and by convention an
+            UNQUANTIZED one, so the quantization multiplier applies to it and
+            the precision ratio does not -- applying it halves a number that was
+            already in the right units.
+
+            Measured on zeiss 2026-10-31. gme-Qwen2-VL-7B-Instruct declares
+            used_vram_gb=17.0 with load_in_4bit, and its config.json says
+            torch_dtype float32, so:
+
+                source=used_vram_gb -> 2.75 GB | used_vram_gb=17.0
+                load_in_4bit=True quant_mult=0.300 prec(load2/disk4)=0.50
+
+            17.0 x 0.300 = 5.1 GB, which matches the 5.64 GB the loader then
+            measured; the extra x0.50 took it to 2.75. The load was admitted
+            against that figure, really took 5.6 GB, left 954 MiB on the card,
+            and the first forward pass died with "CUDA out of memory. Tried to
+            allocate 1.02 GiB" -- an under-estimate in the one direction that
+            cannot be recovered from.
+            """
+            gpu_gb = raw_weights_gb * quant_mult
+            if from_disk:
+                gpu_gb *= prec_factor
 
             # When offload is active the model is split across GPU + CPU RAM.
             # Only the GPU portion counts toward free-VRAM requirements.
@@ -5512,7 +5535,8 @@ class MultiModelManager:
                                 _apply_factors(_floor)
                                 + self._config_lora_vram_gb(cfg))
             return _dbg_est("used_vram_gb",
-                            _apply_factors(_explicit_val) + self._config_lora_vram_gb(cfg))
+                            _apply_factors(_explicit_val, from_disk=False)
+                            + self._config_lora_vram_gb(cfg))
         if _explicit_val is not None and _explicit_val <= 0 and (measured or 0) > 0:
             # A configured ZERO is not a declaration that the model needs no
             # VRAM -- zero is this function's own "could not determine" sentinel
@@ -6151,12 +6175,29 @@ class MultiModelManager:
         self._evict_models_for_vram(gb)
         return self._get_free_vram_gb()
 
-    def _evict_models_for_vram(self, needed_gb: float):
+    def _evict_models_for_vram(self, needed_gb: float, protect: str = ""):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 
         Never evicts a model that is actively serving a request — doing so would
         move its weights off the GPU mid-generation and crash the CUDA context.
         Busy models are waited on (briefly) before eviction.
+
+        ``protect`` is the key this room is being made FOR, and it is never
+        evicted and never waited on. Without it the second pass goes after the
+        active model as a fallback -- which, when the caller is a resident model
+        asking for scratch space, is the caller itself. Measured on zeiss
+        2026-10-31, after a gme-Qwen2-VL-7B encode ran out of memory:
+
+            [embeddings] encode OOM (Tried to allocate 1.02 GiB ... 954 MiB
+            free) — evicting to make room and retrying
+            Active model 'embedding:…gme-Qwen2-VL-7B-Instruct' is busy —
+            waiting for it to go idle before eviction…
+
+        It cannot go idle: it is blocked on the memory this pass was called to
+        free. So the pass spent its whole wait budget on a model it must not
+        touch, while 17.8 GB sat idle in the sibling engine on the same card --
+        and the external releaser that would have asked for it runs only after
+        the wait.
         """
         if needed_gb <= 0:
             return
@@ -6193,6 +6234,8 @@ class MultiModelManager:
         # keep-resident set (the small co-resident STT/diarization models) — they
         # are only evicted as a last resort below.
         for key in self._lru_order():
+            if protect and key == protect:
+                continue
             if key == self.active_in_vram:
                 continue
             if key in self._keep_resident:
@@ -6208,6 +6251,7 @@ class MultiModelManager:
         # Second pass: evict the active model if still not enough AND it is idle
         # (unless it's keep-resident — that's handled by the last-resort pass).
         if (self._get_free_vram_gb() < target_gb and self.active_in_vram
+                and self.active_in_vram != protect
                 and self.active_in_vram not in self._keep_resident
                 and self.active_in_vram in self.models):
             _active = self.active_in_vram
