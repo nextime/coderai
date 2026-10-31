@@ -56,8 +56,12 @@ def _bare():
 # ── the helper reads what is really on disk ──────────────────────────────────
 
 def test_a_local_weights_file_is_measured(tmp_path):
+    # Sparse: the helper reads st_size, so a 2 GB apparent file costs no disk.
+    # Writing the bytes for real failed with OSError on a host whose root
+    # filesystem was 98% full, which is a silly way for a size test to fail.
     f = tmp_path / "model.safetensors"
-    f.write_bytes(b"\0" * 2_000_000_000)
+    with open(f, "wb") as fh:
+        fh.truncate(2_000_000_000)
     gb = MultiModelManager._disk_weights_gb(_bare(), "m", "", {"path": str(f)})
     assert 1.9 < gb < 2.1, gb
 
@@ -92,7 +96,7 @@ def test_an_unrecognised_extension_is_ignored(tmp_path):
 def test_the_floor_only_moves_the_estimate_up():
     """The field's purpose is that a configured number stays put. A floor that
     could lower it would break exactly that."""
-    i = MGR.index('_floor = self._disk_weights_gb(')
+    i = MGR.index('_floor = (self._disk_weights_gb(')
     block = MGR[i:i + 1200]
     assert '_floor > _explicit_val * 1.25' in block, (
         "the floor no longer requires the disk size to EXCEED the "
@@ -103,12 +107,12 @@ def test_the_margin_tolerates_an_honest_difference():
     """A configured value a little under the disk size is ordinary (weights vs
     checkpoint, tokenizer files, a shard counted twice). Only a gross mismatch
     is treated as a bad number."""
-    i = MGR.index('_floor = self._disk_weights_gb(')
+    i = MGR.index('_floor = (self._disk_weights_gb(')
     assert '* 1.25' in MGR[i:i + 1200]
 
 
 def test_it_says_what_it_did_and_why():
-    i = MGR.index('_floor = self._disk_weights_gb(')
+    i = MGR.index('_floor = (self._disk_weights_gb(')
     block = MGR[i:i + 1600]
     assert 'well under the' in block and 'weights on disk' in block
     assert 'before the' in block and 'download finished' in block
@@ -154,3 +158,50 @@ def test_the_incident_model_now_sizes_from_its_checkpoint():
     # so the load is refused or makes room, instead of being attempted and
     # failing on a 3.13 GB estimate.
     assert gb * 0.30 > 5.6 * 0.95
+
+
+# ---------------------------------------------------------------------------
+# NOT for diffusers pipelines: the repo on disk is not a VRAM lower bound
+# ---------------------------------------------------------------------------
+#
+# Found the same night the floor was added, in production, by the floor itself
+# misfiring. FLUX.2-klein-4B declares `used_vram_gb = 17.0` and really occupies
+# 17.24 GB -- the eviction log states the measured figure -- while its cached
+# repo is ~23.7 GB, because a diffusers cache holds every component and
+# routinely duplicate formats and variants of which one subset loads. The floor
+# raised the estimate to 25.61 GB, past the 24 GB card, so each load announced
+# "this model needs more than the whole card", evicted the resident fleet and
+# gained nothing:
+#
+#     [vram-est] key='image:black-forest-labs/FLUX.2-klein-4B'
+#                source=used_vram_gb(disk-floor) -> 25.61 GB | used_vram_gb=17.0
+#     Loading 'image:black-forest-labs/FLUX.2-klein-4B': need 25.6 GB VRAM,
+#                have 0.0 GB free — evicting models to make room
+#
+# The two errors are not symmetric. The under-estimate this floor prevents made
+# a text model attempt a load that could not fit. An over-estimate on an image
+# pipeline costs OTHER models their residency, every time, and the model it was
+# "protecting" was already sized correctly.
+
+def test_the_floor_is_gated_to_single_file_models():
+    i = MGR.index('_floor = (self._disk_weights_gb(')
+    block = MGR[max(0, i - 1800):i + 400]
+    assert '_single_file' in block
+    assert '"image_models", "video_models"' in block
+    assert 'if _single_file else 0.0' in block
+
+
+def test_the_gate_records_why_a_repo_size_is_not_a_bound():
+    i = MGR.index('_floor = (self._disk_weights_gb(')
+    block = MGR[max(0, i - 1800):i]
+    assert 'diffusers' in block
+    assert 'duplicate' in block or 'variants' in block
+    assert '17.24' in block and '25.61' in block, (
+        'the measured counter-example is what stops this being re-added')
+
+
+def test_text_models_keep_the_floor():
+    """The Qwen3.5-9B case this exists for must still be covered."""
+    i = MGR.index('_floor = (self._disk_weights_gb(')
+    block = MGR[max(0, i - 1800):i + 400]
+    assert '("text", "vision")' in block

@@ -5426,7 +5426,32 @@ class MultiModelManager:
             # that is already larger is the operator's, and this must not
             # quietly shrink it (the whole point of the field is that a
             # configured number stays put).
-            _floor = self._disk_weights_gb(model_key, resolved_name, cfg)
+            # ONLY for a single-file / single-checkpoint model. A diffusers
+            # repository's on-disk size is NOT a lower bound on its VRAM: the
+            # cache holds every component (transformer, two text encoders, VAE)
+            # and routinely duplicate formats and variants -- .bin beside
+            # .safetensors, fp32 beside fp16 -- of which one subset loads.
+            #
+            # Measured the same night this floor was added, which is how the
+            # mistake was found: FLUX.2-klein-4B declares used_vram_gb=17.0 and
+            # really occupies 17.24 GB (the eviction log says so), while its
+            # cached repo is ~23.7 GB. The floor raised the estimate to
+            # 25.61 GB -- past the 24 GB card -- so every load declared "this
+            # model needs more than the whole card", evicted the resident
+            # fleet, and achieved nothing. An over-estimate on an image
+            # pipeline costs other models their residency; the under-estimate
+            # this floor exists to stop was a text model attempting a load that
+            # could not fit. Different failure, different direction, and the
+            # floor belongs only where it was measured to help.
+            _mtype = ""
+            try:
+                _mtype = self._model_type_of(model_key) or ""
+            except Exception:
+                _mtype = ""
+            _single_file = _mtype in ("text", "vision") and str(
+                cfg.get("model_type") or "") not in ("image_models", "video_models")
+            _floor = (self._disk_weights_gb(model_key, resolved_name, cfg)
+                      if _single_file else 0.0)
             if _floor and _floor > _explicit_val * 1.25:
                 print(f"  used_vram_gb={_explicit_val:.3f} GB for '{model_key}' is "
                       f"well under the {_floor:.2f} GB of weights on disk — sizing "
