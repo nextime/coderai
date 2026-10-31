@@ -294,3 +294,47 @@ def test_a_missing_requirements_file_installs_the_pins_instead(w, monkeypatch, t
     install = [c for c in seen if "install" in c and "-U" not in c][0]
     assert "-r" not in install, install
     assert "transformers==4.49.0" in install, install
+
+
+# ── the library path of a venv that brings its own CUDA ──────────────────────
+
+def test_the_child_does_not_inherit_the_servers_library_path(w, monkeypatch, tmp_path):
+    """This venv is built by the server's interpreter -- so venv_env would keep
+    LD_LIBRARY_PATH, which is right for a venv that shares our native libraries
+    and wrong for this one: it ships its own torch and its own CUDA/cuDNN
+    wheels. Measured live: the text tower answered on the GPU and every image
+    failed with CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED, because only the vision
+    tower runs convolutions."""
+    seen = {}
+
+    def _env_for_venv(venv, extra=None, hf=True, own_libs=False):
+        seen["own_libs"] = own_libs
+        return {"PATH": "/usr/bin"}
+
+    monkeypatch.setattr(w.venv_env, "env_for_venv", _env_for_venv)
+    monkeypatch.setattr(w, "ensure_installed", lambda log=None: Path(sys.executable))
+    script = tmp_path / "fake_server.py"
+    script.write_text("import json\nprint(json.dumps({'ready': True, 'dim': 4}),"
+                      " flush=True)\nimport sys\nsys.stdin.read()\n")
+    monkeypatch.setattr(w, "_SERVER_SCRIPT", script)
+    proc = w.spawn("x", device="cpu", load_timeout=60)
+    try:
+        assert seen.get("own_libs") is True
+    finally:
+        proc.kill()
+
+
+def test_own_libs_strips_our_lib_dirs_even_for_our_own_interpreter(monkeypatch, tmp_path):
+    from codai.api import venv_env
+    venv = tmp_path / "v"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(f"home = {os.path.dirname(sys.executable)}\n")
+    # A directory that is part of the server's install whatever python is
+    # running the test -- sys.prefix is /usr here and is deliberately treated as
+    # the whole system, not as ours.
+    ours = "/opt/coderai/local-libs"
+    monkeypatch.setenv("LD_LIBRARY_PATH", ours + ":/opt/vendor/cuda")
+    kept = venv_env.env_for_venv(venv, own_libs=True).get("LD_LIBRARY_PATH", "")
+    assert ours not in kept.split(":"), kept
+    # An entry outside our install is the operator's and is left alone.
+    assert "/opt/vendor/cuda" in kept.split(":"), kept

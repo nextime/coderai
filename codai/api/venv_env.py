@@ -167,7 +167,7 @@ def built_by_this_interpreter(venv_dir) -> bool:
 
 
 def env_for_venv(venv_dir, extra: Optional[dict] = None,
-                 hf: bool = True) -> dict:
+                 hf: bool = True, own_libs: bool = False) -> dict:
     """The environment to run something inside ``venv_dir`` with.
 
     Always drops what redirects an interpreter (``PYTHONHOME`` above all: it is
@@ -179,8 +179,22 @@ def env_for_venv(venv_dir, extra: Optional[dict] = None,
     :func:`built_by_this_interpreter`. Keeping it for a foreign python breaks
     it; stripping it for one of ours breaks it. Deciding per venv is the only
     way both work.
+
+    ``own_libs`` is the third case, and it is not about the interpreter at all:
+    a venv built by THIS python that nevertheless ships its own torch and its
+    own CUDA/cuDNN wheels. Keeping our ``LD_LIBRARY_PATH`` there points its
+    torch at the server's native libraries, which are a different build.
+    Measured 2026-10-31 on the jina-clip-v2 venv (its own torch 2.15+cu132
+    beside the server's): the text tower answered normally on the GPU and every
+    image failed with
+
+        RuntimeError: CUDNN_BACKEND_TENSOR_DESCRIPTOR cudnnFinalize failed
+        ptrDesc->finalize() cudnn_status: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+
+    because only the vision tower runs convolutions. Pass it for any venv whose
+    requirements install a CUDA stack of their own.
     """
-    if built_by_this_interpreter(venv_dir):
+    if built_by_this_interpreter(venv_dir) and not own_libs:
         base = dict(os.environ)
         for var in _LEAKY:
             base.pop(var, None)
@@ -200,9 +214,10 @@ def env_for_venv(venv_dir, extra: Optional[dict] = None,
     return env
 
 
-def env_for_python(py, extra: Optional[dict] = None, hf: bool = True) -> dict:
+def env_for_python(py, extra: Optional[dict] = None, hf: bool = True,
+                  own_libs: bool = False) -> dict:
     """:func:`env_for_venv`, given the venv's interpreter instead of its root."""
-    return env_for_venv(Path(py).parent.parent, extra, hf)
+    return env_for_venv(Path(py).parent.parent, extra, hf, own_libs=own_libs)
 
 
 def venv_python(venv_dir) -> Path:

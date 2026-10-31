@@ -206,7 +206,13 @@ def spawn(model_id: str, device: str = "cuda", load_timeout: float = 900.0,
     py = ensure_installed()
     if not _SERVER_SCRIPT.is_file():
         raise RuntimeError(f"jina-clip server script missing: {_SERVER_SCRIPT}")
-    env = venv_env.env_for_venv(resolve_venv_dir(), extra=dict(env_extra or {}))
+    # own_libs: this venv is built by the server's interpreter but ships its own
+    # torch and its own CUDA/cuDNN wheels, so it must not inherit the server's
+    # LD_LIBRARY_PATH. With it, the text tower answered normally on the GPU and
+    # every image failed in cuDNN (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED) --
+    # only the vision tower runs convolutions, so half of the model worked.
+    env = venv_env.env_for_venv(resolve_venv_dir(), extra=dict(env_extra or {}),
+                                own_libs=True)
     env["JINACLIP_MODEL"] = str(model_id)
     if str(device) == "cpu":
         env["JINACLIP_FORCE_CPU"] = "1"
