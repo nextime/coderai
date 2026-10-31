@@ -191,9 +191,21 @@ def test_the_floor_is_gated_to_single_file_models():
     assert 'if _single_file else 0.0' in block
 
 
-def test_the_gate_records_why_a_repo_size_is_not_a_bound():
+def _gate_block() -> str:
+    """The whole rationale for the gate, however long it grows.
+
+    Measured from the comment that opens it rather than a fixed number of
+    characters back from the code: a second exemption added later pushed the
+    diffusers counter-example out of an 1800-character window, failing this
+    test while the rationale it guards was still there, word for word.
+    """
     i = MGR.index('_floor = (self._disk_weights_gb(')
-    block = MGR[max(0, i - 1800):i]
+    start = MGR.rindex('ONLY for a single-file', 0, i)
+    return MGR[start:i]
+
+
+def test_the_gate_records_why_a_repo_size_is_not_a_bound():
+    block = _gate_block()
     assert 'diffusers' in block
     assert 'duplicate' in block or 'variants' in block
     assert '17.24' in block and '25.61' in block, (
@@ -205,3 +217,59 @@ def test_text_models_keep_the_floor():
     i = MGR.index('_floor = (self._disk_weights_gb(')
     block = MGR[max(0, i - 1800):i + 400]
     assert '("text", "vision")' in block
+
+
+# ---------------------------------------------------------------------------
+# NOR for one of two cards over the same weights file
+# ---------------------------------------------------------------------------
+#
+# The second misfire, and the same shape as the first: the floor sized the
+# SMALL member of a shared-weights pair by the file both of them point at.
+#
+#     [vram-est] sizing 'Wan2.2-I2V-A14B-Lightning' by its own config
+#                (shares a weights file with 'Wan2.2-I2V-A14B-Diffusers')
+#     used_vram_gb=22.000 GB for 'Wan-AI/Wan2.2-I2V-A14B-Diffusers' is well
+#                under the 126.18 GB of weights on disk — sizing against the
+#                disk instead
+#
+# i.e. the floor undid, in the next breath, the disambiguation the same
+# function had just applied. Two entries over one checkpoint differ for real --
+# lisa and lisa-32k are that 26B GGUF at n_ctx 178000 and 32768, measured
+# 51.97 GB and 14.33 GB -- so for the smaller one the file on disk is not a
+# bound at all. What the floor catches is a half-downloaded checkpoint, and no
+# sibling entry declares a size for one of those.
+
+def test_a_shared_weights_sibling_disables_the_floor():
+    from codai.models.manager import multi_model_manager as m
+    saved = dict(m.config or {})
+    calls = []
+    orig = m._disk_weights_gb
+    try:
+        m.config.clear()
+        m.config.update({
+            "big": {"path": "shared/repo", "used_vram_gb": 151.42, "alias": None},
+            "small": {"path": "shared/repo", "used_vram_gb": 22.0,
+                      "alias": "accelerated"},
+        })
+        m._disk_weights_gb = lambda *a, **k: (calls.append(a) or 126.18)
+        small = m._get_model_used_vram_gb("shared/repo", requested_id="accelerated")
+    finally:
+        m._disk_weights_gb = orig
+        m.config.clear()
+        m.config.update(saved)
+    # 22 GB plus whatever reserve the estimator adds -- nowhere near the 126 GB
+    # checkpoint, and nowhere near the 151 GB its sibling declares.
+    assert small < 126.18 / 2, (
+        f"the small card was sized by the shared checkpoint ({small:.2f} GB)")
+    assert small > 22.0, f"the configured figure was lost entirely ({small:.2f})"
+
+
+def test_the_exemption_needs_a_declared_size_not_just_a_shared_path():
+    """A sibling that declares nothing cannot be the one saying the file is not
+    a bound — a half-downloaded checkpoint is exactly a path with no second
+    opinion on it."""
+    block = _gate_block() + MGR[MGR.index('_floor = (self._disk_weights_gb('):][:200]
+    i = MGR.index("_mypath = str((cfg.get('path')")
+    gate = MGR[i:i + 1200]
+    assert "used_vram_gb" in gate, "the sibling's declared size is not consulted"
+    assert "_single_file = False" in gate

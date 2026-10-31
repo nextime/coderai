@@ -5475,6 +5475,31 @@ class MultiModelManager:
                 _mtype = ""
             _single_file = _mtype in ("text", "vision") and str(
                 cfg.get("model_type") or "") not in ("image_models", "video_models")
+            # Nor when another entry shares this weights file and declares a
+            # different size. Two configs over one checkpoint differ for real:
+            # lisa and lisa-32k are the same 26B GGUF at n_ctx 178000 and 32768,
+            # measured 51.97 GB and 14.33 GB, and an acceleration variant points
+            # at its sibling's weights on purpose. For the smaller of such a pair
+            # the file on disk is not a bound at all -- the floor sized a 22 GB
+            # card by its 126 GB sibling's checkpoint, which is the very
+            # mis-sizing the same function's requested_id disambiguation exists
+            # to undo. What this floor catches is a half-downloaded checkpoint,
+            # and no sibling declares a size for one of those.
+            _mypath = str((cfg.get('path') or cfg.get('model_path') or '')).strip()
+            if _single_file and _mypath:
+                for _sib in (self.config or {}).values():
+                    if not isinstance(_sib, dict) or _sib is cfg:
+                        continue
+                    if str((_sib.get('path') or _sib.get('model_path')
+                            or '')).strip() != _mypath:
+                        continue
+                    try:
+                        _sib_val = float(_sib.get('used_vram_gb'))
+                    except (TypeError, ValueError):
+                        continue
+                    if _sib_val > 0 and abs(_sib_val - _explicit_val) > 0.01:
+                        _single_file = False
+                        break
             _floor = (self._disk_weights_gb(model_key, resolved_name, cfg)
                       if _single_file else 0.0)
             if _floor and _floor > _explicit_val * 1.25:

@@ -79,6 +79,15 @@ def test_it_uses_a_total_vram_accessor_that_exists():
 
 def test_it_suggests_something_actionable():
     """A model larger than the card is fixed by quantization or by correcting
-    a wrong declared size -- not by waiting longer in a queue."""
-    tail = _SRC.split("needs more than the whole card", 1)[1][:400]
-    assert "quantize" in tail and "used_vram_gb" in tail
+    a wrong declared size -- not by waiting longer in a queue.
+
+    Every occurrence of the phrase is checked, not the first: the first one in
+    the file is a COMMENT that quotes the message while explaining a different
+    decision, and anchoring on it made this test fail while the message it
+    guards was untouched.
+    """
+    windows = _SRC.split("needs more than the whole card")[1:]
+    assert windows, "the whole-card case no longer says so"
+    assert any("quantize" in w[:400] and "used_vram_gb" in w[:400]
+               for w in windows), \
+        "no whole-card message names a way out of it"
