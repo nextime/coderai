@@ -560,6 +560,20 @@ def _os_basename(p) -> str:
 # evictable, but from the identical bundled weights, so the two spaces coincide
 # BY CONSTRUCTION — the mismatched-checkpoint failure the request warns about
 # (silently wrong scores, no error) cannot happen here.
+#: NVIDIA MM-Embed. Text, image, or text+image in one 4096-d space, but behind
+#: an API of its own: `model.encode([{'txt':…, 'img':…}], max_length=…)` returning
+#: a dict whose 'hidden_states' holds the vectors, with an optional task
+#: `instruction` for the query side. Nothing else in the stack calls a model that
+#: way, so it gets its own backend rather than being bent into the
+#: sentence-transformers or qwenvl paths.
+_MMEMBED_IDS = {'mm-embed', 'mmembed', 'nvidia/mm-embed'}
+
+
+def _is_mmembed(model_name) -> bool:
+    n = str(model_name or '').strip().lower().replace('_', '-')
+    return n in _MMEMBED_IDS or n.endswith('/mm-embed')
+
+
 _GEOCLIP_IDS_IMAGE = {'geoclip', 'geoclip-image', 'geoclip-img'}
 _GEOCLIP_IDS_LOCATION = {'geoclip-location', 'geoclip-loc', 'geoclip-gps'}
 
@@ -599,6 +613,52 @@ def _load_geoclip(model_name, device):
     model = GeoCLIP().to(device)
     model.eval()
     return _EmbeddingModel('geoclip', (model, mode, device))
+
+
+def _load_mmembed(model_name, device, model_config=None):
+    """NVIDIA MM-Embed, loaded through its own remote code.
+
+    `trust_remote_code` is required by the checkpoint (its encode() lives in the
+    repo), and is passed explicitly rather than taken from the model entry: a
+    model that cannot load without it is not served by silently failing when the
+    operator has not set the flag.
+    """
+    import torch
+    from transformers import AutoModel
+    kw = {'trust_remote_code': True}
+    fp = build_from_pretrained_kwargs(model_config)
+    if 'quantization_config' in fp:
+        kw['quantization_config'] = fp['quantization_config']
+    else:
+        kw['torch_dtype'] = torch.float16
+    model = AutoModel.from_pretrained(model_name, **kw)
+    if 'quantization_config' not in kw and 'device_map' not in kw:
+        model = model.to(device)
+    model.eval()
+    return _EmbeddingModel('mmembed', (model, device))
+
+
+def _mmembed_embed(model_tuple, items, dimensions=None, instruction=""):
+    """Embed MM-Embed `items` -- dicts carrying 'txt' and/or 'img'.
+
+    Its encode() returns ``{'hidden_states': tensor}`` already L2-normalised, so
+    the vectors are used as given; `dimensions` truncation re-normalises, which
+    `_truncate_dims` handles.
+    """
+    import torch
+    model, _device = model_tuple
+    kw = {'max_length': 4096}
+    if instruction:
+        # The query side of an asymmetric retrieval pair. Without an
+        # instruction the model embeds the item as a PASSAGE, which is the
+        # right default for "embed this" and the wrong one for a query.
+        kw['is_query'] = True
+        kw['instruction'] = instruction
+    with torch.no_grad():
+        out = model.encode(items, **kw)
+    vecs = out['hidden_states'] if isinstance(out, dict) else out
+    vecs = vecs.float().cpu().tolist()
+    return _truncate_dims(vecs, dimensions)
 
 
 def _parse_latlon(s):
@@ -856,6 +916,9 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
 
     # GeoCLIP image/location encoders (shared 512-d space). Caught before the
     # GGUF/HF paths — 'geoclip'/'geoclip-location' are logical ids, not repos.
+    if _is_mmembed(model_name):
+        return _load_mmembed(model_name, device, model_config)
+
     if _is_geoclip(model_name):
         return _load_geoclip(model_name, device)
 
@@ -1156,6 +1219,8 @@ def _may_embed_images(model_name: str, model_config: dict = None) -> bool:
                 return answer
         except Exception:
             pass
+    if _is_mmembed(name):
+        return True          # text, image, or both — that is the point of it
     if low in ('geoclip', 'geoclip-location'):
         return low == 'geoclip'
 
@@ -1191,7 +1256,11 @@ def _supports_images(model_obj) -> bool:
             return model[1] == 'image'
         except Exception:
             return False
-    if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp', 'vpr', 'vpr-server'):
+    # NOT 'geoclip': its two modes share this backend name, so claiming the
+    # backend takes images would claim it of geoclip-LOCATION, which takes
+    # coordinates. The geoclip image path is reached without this check.
+    if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp', 'vpr',
+                   'vpr-server', 'mmembed'):
         return True
     if backend != 'sentence_transformers':
         return False
@@ -2062,6 +2131,8 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None,
         return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'text': t} for t in texts], dimensions)
+    elif backend == 'mmembed':
+        return _mmembed_embed(model, [{'txt': t} for t in texts], dimensions)
     elif backend == 'geoclip':
         _obj, _mode, _dev = model
         if _mode == 'location':
@@ -2226,6 +2297,8 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'image': im} for im in pil_images],
                                dimensions)
+    elif backend == 'mmembed':
+        return _mmembed_embed(model, [{'img': im} for im in pil_images], dimensions)
     elif backend == 'geoclip':
         return _geoclip_embed_images(model, pil_images, dimensions)
     elif backend == 'vpr':

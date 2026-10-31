@@ -90,6 +90,15 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
         --target /opt/coderai/python/lib/python3.13/site-packages \
         "geoclip>=1.2.0" "geopy>=2.4" "geographiclib>=2.0" || true
 
+# timm, for the same reason and in the same way: declared in requirements.txt
+# since the depth/segment endpoints were added, and absent from every
+# incrementally-updated image (confirmed by listing the built image's packages,
+# not the source tree). It is also a hard requirement of jina-clip-v2, whose
+# EVA vision tower IS a timm model, so that embedder cannot load without it.
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
+        --target /opt/coderai/python/lib/python3.13/site-packages \
+        "timm>=1.0.9" || true
+
 # openssh-client so `coderai-docker --upgrade --ssh-key …` can fetch over SSH
 # (git is present but the CUDA runtime base ships no ssh). Tiny; keep the overlay
 # still fast. `|| true` keeps offline overlay builds working (HTTPS upgrade still
