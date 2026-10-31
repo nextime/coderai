@@ -3939,6 +3939,14 @@ class RunpodPodPool:
             print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
                   f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
                   flush=True)
+            # RunPod bills from here, not from the moment the pod can serve, so
+            # this is what the ledger has to start from. The handle used to be
+            # stamped after the image pull and the warm-up, and a pod rented at
+            # 09:44:53, ready at 09:58:39 and terminated at 09:58:54 was recorded
+            # as "billed ~$0.002" -- fourteen minutes of A40 reported as fifteen
+            # seconds. The waste that produced the figure was invisible in the
+            # one place built to show it.
+            _rented_at = time.time()
             boot_to = float(self.mcfg.boot_timeout_s or self.PORT_TIMEOUT_S)
             load_to = float(self.mcfg.load_timeout_s or self.HEALTH_TIMEOUT_S)
             # Phase timings. A cold pod takes minutes and "it was slow" is not a
@@ -4027,7 +4035,7 @@ class RunpodPodPool:
                           # adoption of a pod carrying another one cannot make
                           # this one unreachable.
                           api_key=self.api_key,
-                          started_at=time.time(), gpu=sel["display_name"],
+                          started_at=_rented_at, gpu=sel["display_name"],
                           is_spot=sel["is_spot"], healthy=True, last_used=time.time(),
                           console_url=console,
                           data_center=(sel.get("_dc") or self._data_center()),
@@ -4524,6 +4532,23 @@ class RunpodPodPool:
             # NOT a demand figure. Demand is already met — one pod is exactly
             # right for `threshold` in flight — and this rents ahead of the
             # next request rather than for one that exists.
+            #
+            # Which is why it is the one trigger that must check whether the
+            # pool is allowed to HOLD an idle pod at all. Renting for a future
+            # burst into a pool that reaps anything idle buys twelve minutes of
+            # boot and a termination fifteen seconds after it completes, over
+            # and over. Demand-driven growth above is not gated this way: that
+            # work exists now, and a pod that takes it is not idle.
+            _reaped = self._reaps_on_arrival()
+            if _reaped:
+                if not getattr(self, "_no_speculative_logged", False):
+                    print(f"[runpod] {self.model_key!r}: not renting ahead of "
+                          f"the next burst — {_reaped}, so an idle pod would be "
+                          f"terminated as soon as it finished booting",
+                          flush=True)
+                    self._no_speculative_logged = True
+                return ""
+            self._no_speculative_logged = False
             return (f"every pod is at its {threshold}-in-flight threshold "
                     f"(least loaded carries {least}) — renting one more for "
                     f"the next burst, not for work already queued")
@@ -5385,6 +5410,36 @@ class RunpodPodPool:
                 out.setdefault("notes", []).extend(narrow["notes"])
         return out
 
+    def _reaps_on_arrival(self) -> str:
+        """Why a pod rented right now would be killed as soon as it is ready.
+
+        Two states make the idle timeout effectively one second (see
+        :meth:`maintain`): the warm-pod window is closed, and a client has asked
+        for the fleet back. In both, a pod carrying no work is terminated on the
+        next scaler pass -- which, for a pod that spends twelve minutes pulling
+        its image and warming its weights, means terminated on arrival.
+
+        Measured on 2026-10-31, a Saturday, against a pool whose window is
+        weekdays only:
+
+            09:44:53  pod w9u0tgs1reu5dn created ... booting
+            09:52:06  port open after 433s
+            09:58:39  weights resident after 392s -- ready means ready
+            09:58:54  terminated (idle); billed ~$0.002
+
+        and again at 08:54, 09:05, 09:15, 09:34, 09:42 -- roughly $0.14 of A40
+        per cycle, four to six cycles an hour, for a pod that never answered a
+        request. Returns "" when nothing would reap it.
+        """
+        try:
+            if self.effective_min_pods() < int(self.mcfg.min_pods or 0):
+                return "its warm-pod window is closed"
+        except Exception:
+            pass
+        if getattr(self, "_release_pending", False):
+            return "a client has asked for the fleet back"
+        return ""
+
     def effective_min_pods(self) -> int:
         """The warm floor that applies right now.
 
@@ -5710,7 +5765,7 @@ class RunpodPodPool:
         # Idle teardown (down to min_pods), only pods with no in-flight work.
         idle_to = self.mcfg.idle_timeout_s
         keep_min = self.effective_min_pods()
-        if keep_min < self.mcfg.min_pods:
+        if keep_min < self.mcfg.min_pods:   # _reaps_on_arrival() says so too
             # The window just closed. Do not wait out idle_timeout_s before
             # releasing the pod that only existed to be warm — that is the whole
             # point of scheduling it — but still never kill one mid-request.
