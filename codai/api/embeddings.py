@@ -269,6 +269,51 @@ class _EmbeddingModel:
         self.model = None
 
 
+def _shim_transformers5_clip_helpers() -> None:
+    """Restore `clip_loss` for remote code written against transformers 4.x.
+
+    jina-clip-v2's model code lives in `jinaai/jina-clip-implementation` and
+    opens with
+
+        from transformers.models.clip.modeling_clip import (
+            CLIPOutput, CLIPTextModelOutput, CLIPVisionModelOutput, clip_loss)
+
+    Three of those still exist in transformers 5.12; `clip_loss` was removed, so
+    the import fails before a single weight is read and the model reports only
+
+        Cannot load embedding model 'jinaai/jina-clip-v2':
+        attribute name must be string, not ...
+
+    which names neither the cause nor the fix. Measured on zeiss 2026-10-31.
+
+    `clip_loss` is a TRAINING loss over a similarity matrix and is never called
+    during inference, so restoring it changes no embedding. It is defined here
+    exactly as transformers defined it, in terms of `contrastive_loss`, which is
+    still present — a re-implementation that merely satisfied the import would
+    quietly change the meaning of anyone who did call it.
+
+    Idempotent, and never fatal: a transformers that still has the symbol, or
+    has moved it, is left alone.
+    """
+    try:
+        from transformers.models.clip import modeling_clip as _mc
+    except Exception:
+        return
+    if hasattr(_mc, 'clip_loss'):
+        return
+    _contrastive = getattr(_mc, 'contrastive_loss', None)
+    if _contrastive is None:
+        return
+    def clip_loss(similarity):
+        caption_loss = _contrastive(similarity)
+        image_loss = _contrastive(similarity.t())
+        return (caption_loss + image_loss) / 2.0
+    _mc.clip_loss = clip_loss
+    print("  [embeddings] restored transformers.models.clip.modeling_clip."
+          "clip_loss for 4.x-era remote code (training-only; inference "
+          "unaffected)", flush=True)
+
+
 def _trust_remote_code(model_config: dict = None) -> bool:
     cfg = model_config or {}
     raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
@@ -566,6 +611,20 @@ def _os_basename(p) -> str:
 #: `instruction` for the query side. Nothing else in the stack calls a model that
 #: way, so it gets its own backend rather than being bent into the
 #: sentence-transformers or qwenvl paths.
+#: jina-clip v1/v2. Multimodal and multilingual (94 languages incl. ar/ja), but
+#: SentenceTransformer 5.x reports it as text-only -- "Modality 'image' is not
+#: supported by this SentenceTransformer model. Supported modalities: text." --
+#: so images never reach it through that path. The HF model exposes
+#: `encode_text(sentences)` and `encode_image(images)` itself, which is one
+#: shared space and exactly what is wanted, so it is driven directly.
+_JINACLIP_MARKERS = ('jina-clip', 'jina_clip')
+
+
+def _is_jinaclip(model_name) -> bool:
+    n = str(model_name or '').strip().lower()
+    return any(m in n for m in _JINACLIP_MARKERS)
+
+
 _MMEMBED_IDS = {'mm-embed', 'mmembed', 'nvidia/mm-embed'}
 
 
@@ -615,6 +674,42 @@ def _load_geoclip(model_name, device):
     return _EmbeddingModel('geoclip', (model, mode, device))
 
 
+def _allow_remote_automodel_reregister():
+    """Let remote code register a config class transformers already owns.
+
+    MM-Embed's `modeling_nvmmembed` calls `AutoModel.register(LlavaNextConfig,
+    NVMMEmbedModel)` at IMPORT time. Its config is the plain built-in
+    LlavaNextConfig, which the built-in LLaVA-NeXT model already claims, so
+    transformers 5 refuses:
+
+        '<class …configuration_llava_next.LlavaNextConfig>' is already used by
+        a Transformers model.
+
+    Because it happens while the module is being imported, loading the class
+    directly instead of through AutoModel does not avoid it -- the import is
+    the thing that fails. `exist_ok=True` is defaulted here for the duration,
+    which is what the remote code would pass if it had been written against
+    this version.
+
+    Idempotent and never fatal. Returns a callable that restores the original.
+    """
+    try:
+        from transformers.models.auto.auto_factory import _BaseAutoModelClass
+    except Exception:
+        return lambda: None
+    _orig = getattr(_BaseAutoModelClass, 'register', None)
+    if _orig is None or getattr(_orig, '_coderai_exist_ok', False):
+        return lambda: None
+
+    @classmethod
+    def _register(cls, config_class, model_class, exist_ok=True):
+        return _orig.__func__(cls, config_class, model_class, exist_ok=True)
+
+    _register.__func__._coderai_exist_ok = True
+    _BaseAutoModelClass.register = _register
+    return lambda: setattr(_BaseAutoModelClass, 'register', _orig)
+
+
 def _load_mmembed(model_name, device, model_config=None):
     """NVIDIA MM-Embed, loaded through its own remote code.
 
@@ -625,17 +720,113 @@ def _load_mmembed(model_name, device, model_config=None):
     """
     import torch
     from transformers import AutoModel
+    from codai.models.hf_loading import build_from_pretrained_kwargs
     kw = {'trust_remote_code': True}
     fp = build_from_pretrained_kwargs(model_config)
     if 'quantization_config' in fp:
         kw['quantization_config'] = fp['quantization_config']
     else:
-        kw['torch_dtype'] = torch.float16
-    model = AutoModel.from_pretrained(model_name, **kw)
+        # `dtype`, not `torch_dtype`. transformers 5 renamed it, and a model
+        # whose remote config walks its kwargs chokes on the legacy name:
+        #   TypeError: attribute name must be string, not 'torch.dtype'
+        # Measured on zeiss 2026-10-31 — jina-clip-v2 fails with torch_dtype=
+        # and loads with dtype=. The legacy name still works for models with
+        # no remote config code, which is why the rest of the stack has not
+        # noticed; it is not changed here.
+        kw['dtype'] = torch.float16
+
+    # Load the repo's class DIRECTLY rather than through AutoModel.
+    #
+    # Its config is a plain LlavaNextConfig, and AutoModel honouring the
+    # `auto_map` tries to register that config against the remote class —
+    # which transformers 5 refuses, because the built-in LLaVA-NeXT model
+    # already owns it:
+    #
+    #   '<class …configuration_llava_next.LlavaNextConfig>' is already used
+    #   by a Transformers model.
+    #
+    # Fetching the class by its auto_map path skips the registry entirely and
+    # loads the same weights with the same code. Falls back to AutoModel so a
+    # future checkpoint that registers cleanly still works.
+    model = None
+    _restore = _allow_remote_automodel_reregister()
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        _ref = None
+        try:
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            _ref = (getattr(_cfg, 'auto_map', None) or {}).get('AutoModel')
+        except Exception:
+            _ref = None
+        if _ref:
+            _cls = get_class_from_dynamic_module(_ref, model_name)
+            model = _cls.from_pretrained(model_name, **kw)
+            print(f"  [embeddings] {model_name}: loaded {_ref} directly "
+                  f"(AutoModel cannot register its config)", flush=True)
+    except Exception as _e:
+        print(f"  [embeddings] direct class load failed ({type(_e).__name__}: "
+              f"{_e}); falling back to AutoModel", flush=True)
+        model = None
+    try:
+        if model is None:
+            model = AutoModel.from_pretrained(model_name, **kw)
+    finally:
+        _restore()
     if 'quantization_config' not in kw and 'device_map' not in kw:
         model = model.to(device)
     model.eval()
     return _EmbeddingModel('mmembed', (model, device))
+
+
+def _load_jinaclip(model_name, device, model_config=None):
+    """jina-clip through its own encode_* methods."""
+    import torch
+    from transformers import AutoModel
+    from codai.models.hf_loading import build_from_pretrained_kwargs
+    _shim_transformers5_clip_helpers()
+    kw = {'trust_remote_code': True}
+    fp = build_from_pretrained_kwargs(model_config)
+    if 'quantization_config' in fp:
+        kw['quantization_config'] = fp['quantization_config']
+    else:
+        # `dtype`, not `torch_dtype`. transformers 5 renamed it, and a model
+        # whose remote config walks its kwargs chokes on the legacy name:
+        #   TypeError: attribute name must be string, not 'torch.dtype'
+        # Measured on zeiss 2026-10-31 — jina-clip-v2 fails with torch_dtype=
+        # and loads with dtype=. The legacy name still works for models with
+        # no remote config code, which is why the rest of the stack has not
+        # noticed; it is not changed here.
+        # bfloat16, not float16. Its EVA-style vision tower overflows in
+        # fp16: measured on zeiss 2026-10-31, the TEXT side returned proper
+        # floats while every one of the image vector's 1024 components came
+        # back null — NaN, which FastAPI serialises as null. bf16 carries
+        # fp32's exponent range at half the width, so the tower's activations
+        # stay finite without doubling the footprint.
+        kw['dtype'] = torch.bfloat16
+    model = AutoModel.from_pretrained(model_name, **kw)
+    if 'quantization_config' not in kw and 'device_map' not in kw:
+        model = model.to(device)
+    model.eval()
+    return _EmbeddingModel('jinaclip', (model, device))
+
+
+def _jinaclip_embed_texts(model_tuple, texts, dimensions=None):
+    import torch
+    model, _device = model_tuple
+    with torch.no_grad():
+        v = model.encode_text(list(texts), convert_to_numpy=True)
+    rows = _truncate_dims([list(map(float, row)) for row in v], dimensions)
+    return _require_finite(rows, 'jina-clip', 'text embedding')
+
+
+def _jinaclip_embed_images(model_tuple, pil_images, dimensions=None):
+    import torch
+    model, _device = model_tuple
+    with torch.no_grad():
+        v = model.encode_image(list(pil_images), convert_to_numpy=True)
+    rows = _truncate_dims([list(map(float, row)) for row in v], dimensions)
+    return _require_finite(rows, 'jina-clip', 'image embedding')
 
 
 def _mmembed_embed(model_tuple, items, dimensions=None, instruction=""):
@@ -913,9 +1104,16 @@ def _load_salad(model_name, device, model_config=None):
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
+    if trust:
+        # Remote code may predate transformers 5; restore what it expects
+        # BEFORE the module is imported, which is when it would fail.
+        _shim_transformers5_clip_helpers()
 
     # GeoCLIP image/location encoders (shared 512-d space). Caught before the
     # GGUF/HF paths — 'geoclip'/'geoclip-location' are logical ids, not repos.
+    if _is_jinaclip(model_name):
+        return _load_jinaclip(model_name, device, model_config)
+
     if _is_mmembed(model_name):
         return _load_mmembed(model_name, device, model_config)
 
@@ -1219,7 +1417,7 @@ def _may_embed_images(model_name: str, model_config: dict = None) -> bool:
                 return answer
         except Exception:
             pass
-    if _is_mmembed(name):
+    if _is_mmembed(name) or _is_jinaclip(name):
         return True          # text, image, or both — that is the point of it
     if low in ('geoclip', 'geoclip-location'):
         return low == 'geoclip'
@@ -1260,7 +1458,7 @@ def _supports_images(model_obj) -> bool:
     # backend takes images would claim it of geoclip-LOCATION, which takes
     # coordinates. The geoclip image path is reached without this check.
     if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp', 'vpr',
-                   'vpr-server', 'mmembed'):
+                   'vpr-server', 'mmembed', 'jinaclip'):
         return True
     if backend != 'sentence_transformers':
         return False
@@ -1386,6 +1584,35 @@ def _decode_image(src: str):
         raise ValueError(
             f"{src[:40]!r} decodes as base64 but is not an image ({e}); send a "
             f"data URI, an http(s) URL, a file path, or base64 image bytes")
+
+
+def _require_finite(vectors, model_name: str, what: str = "embedding"):
+    """Refuse to return a vector that is not finite.
+
+    An embedding of NaNs is not a degraded answer, it is a useless one that
+    looks like an answer: every cosine against it is NaN, so a ranking built on
+    it is arbitrary and nothing downstream can tell. The caller gets a 500
+    naming the model instead.
+
+    Measured on zeiss 2026-10-31: jina-clip-v2's TEXT side returns proper
+    floats while its image tower returns 1024 NaNs on this stack (torch 2.11 /
+    transformers 5.12) — at fp32, bf16 and fp16, with its xformers attention
+    path both enabled and disabled, and when called directly without coderai in
+    the way. Before this check, `/v1/embeddings` answered 200 and the nulls only
+    became visible to whoever tried to use them.
+
+    Cheap: one pass, and it stops at the first bad value.
+    """
+    import math
+    for row in (vectors or []):
+        for x in row:
+            if x is None or not math.isfinite(x):
+                raise RuntimeError(
+                    f"model '{model_name}' returned a non-finite {what} "
+                    f"(NaN/Inf). This is a model or dependency fault, not a "
+                    f"bad request: the vector cannot be compared with anything, "
+                    f"so it is refused rather than returned.")
+    return vectors
 
 
 def _truncate_dims(results, dimensions):
@@ -2131,6 +2358,8 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None,
         return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'text': t} for t in texts], dimensions)
+    elif backend == 'jinaclip':
+        return _jinaclip_embed_texts(model, texts, dimensions)
     elif backend == 'mmembed':
         return _mmembed_embed(model, [{'txt': t} for t in texts], dimensions)
     elif backend == 'geoclip':
@@ -2297,6 +2526,8 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'image': im} for im in pil_images],
                                dimensions)
+    elif backend == 'jinaclip':
+        return _jinaclip_embed_images(model, pil_images, dimensions)
     elif backend == 'mmembed':
         return _mmembed_embed(model, [{'img': im} for im in pil_images], dimensions)
     elif backend == 'geoclip':

@@ -54,6 +54,23 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "nv
 # without it (discovery just stays off), hence `|| true`.
 RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "zeroconf>=0.130" || true
 
+# --no-deps on every one of these, deliberately.
+#
+# `pip install --target <site-packages>` cannot see what is already installed,
+# so it resolves each package's dependency tree from scratch and reinstalls it.
+# Measured on the 2026-10-31 build, which pulled in fresh copies of
+# typing-extensions, setuptools, triton, sympy, safetensors, tokenizers 0.23.3,
+# huggingface-hub 2.4.0, fsspec, filelock, click, python-dateutil and even
+# cuda-toolkit, then reported:
+#
+#   tokenizers 0.22.2 requires huggingface-hub<2.0, but you have 2.4.0
+#   datasets 4.8.5 requires fsspec<=2026.2.0, but you have 2026.9.0
+#
+# i.e. three small additions silently re-pointed the core of the ML stack. That
+# is how an image gets a working geoclip and a broken transformers. Every
+# dependency these three actually need -- torch, torchvision, huggingface-hub,
+# safetensors, numpy, pandas, Pillow -- is already in the bundle, and the two
+# that are not (geopy, geographiclib) are named explicitly below.
 # Vosk, the CPU STT backend. It is declared in requirements.txt, which the FULL
 # build picks up through the pre-built venv bundle -- but this overlay never
 # touches the venv, so an image updated incrementally shipped without it and
@@ -68,7 +85,7 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "ze
 # the venv is not writable by the container user, and the engine -- which does
 # not load the user site -- went on reporting the module as missing while pip
 # reported success.
-RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir --no-deps \
         --target /opt/coderai/python/lib/python3.13/site-packages \
         "vosk>=0.3.45" || true
 
@@ -86,7 +103,7 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
 # Checked against the built image rather than against requirements.txt --
 # a declared dependency the overlay never installs is invisible from the
 # source tree, which is what hid this one for as long as it hid vosk.
-RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir --no-deps \
         --target /opt/coderai/python/lib/python3.13/site-packages \
         "geoclip>=1.2.0" "geopy>=2.4" "geographiclib>=2.0" || true
 
@@ -95,7 +112,7 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
 # incrementally-updated image (confirmed by listing the built image's packages,
 # not the source tree). It is also a hard requirement of jina-clip-v2, whose
 # EVA vision tower IS a timm model, so that embedder cannot load without it.
-RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir \
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir --no-deps \
         --target /opt/coderai/python/lib/python3.13/site-packages \
         "timm>=1.0.9" || true
 

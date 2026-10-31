@@ -87,6 +87,46 @@ def resolve_dtype(cfg: Optional[Dict[str, Any]], default: str = 'bf16'):
     }.get(precision, torch.bfloat16 if default == 'bf16' else torch.float32)
 
 
+#: Submodules left at full precision when a model is quantized: the vision tower
+#: and the projector that maps its output into the language model's space.
+#:
+#: A vision-language EMBEDDER lives or dies on those. The language side is doing
+#: comparatively coarse work -- pooling a hidden state -- while the tower turns
+#: pixels into the vector being compared, and the projector is a single small
+#: matrix whose error lands on every image. Quantizing them saves little (the
+#: tower is a fraction of a 7B's weights) and spends it in the one place the
+#: model is judged. nf4 on the language layers is the cheap part.
+#:
+#: Names, not classes, because transformers matches these against module names:
+#: `visual` is Qwen2-VL's tower, `vision_tower` + `multi_modal_projector` are
+#: LLaVA's, `vision_model`/`visual_projection` are CLIP-style, and `merger` is
+#: Qwen2-VL's patch merger. A name that does not exist in a given model is
+#: simply never matched, so one list is safe across families -- and harmless on
+#: a text-only model, which has none of them.
+_DEFAULT_QUANT_SKIP = (
+    'visual', 'vision_tower', 'vision_model', 'vision_encoder',
+    'multi_modal_projector', 'visual_projection', 'merger',
+    'mm_projector', 'image_newline',
+)
+
+
+def quant_skip_modules(cfg: Optional[Dict[str, Any]]):
+    """Which submodules to leave unquantized, or None to quantize everything.
+
+    `quant_skip_modules` on the model entry overrides the default. An explicit
+    empty list means "quantize all of it" -- an operator who asks for that gets
+    it, and the difference between "not configured" and "configured empty" is
+    the only way to say so.
+    """
+    c = _norm(cfg)
+    if 'quant_skip_modules' in c:
+        v = c.get('quant_skip_modules')
+        if not v:
+            return None
+        return list(v) if isinstance(v, (list, tuple)) else [str(v)]
+    return list(_DEFAULT_QUANT_SKIP)
+
+
 def build_quantization_config(cfg: Optional[Dict[str, Any]]):
     """Build a transformers BitsAndBytesConfig from the model config, or None."""
     c = _norm(cfg)
@@ -97,14 +137,17 @@ def build_quantization_config(cfg: Optional[Dict[str, Any]]):
     try:
         import torch
         from transformers import BitsAndBytesConfig
+        _skip = quant_skip_modules(cfg)
+        _extra = {'llm_int8_skip_modules': _skip} if _skip else {}
         if load_in_4bit:
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type='nf4',
                 bnb_4bit_compute_dtype=resolve_dtype(cfg),
                 bnb_4bit_use_double_quant=True,
+                **_extra,
             )
-        return BitsAndBytesConfig(load_in_8bit=True)
+        return BitsAndBytesConfig(load_in_8bit=True, **_extra)
     except Exception as e:
         print(f"  Quantization requested but unavailable: {e}")
         return None
