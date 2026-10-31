@@ -484,16 +484,14 @@ def test_the_probe_covers_every_requirement_the_models_need(w):
     pins = {p.split(">")[0].split("=")[0].strip().lower()
             for p in w._FALLBACK_PINS}
     # torch/transformers are probed under their import names already.
-    for pkg, module in (("bitsandbytes", "bitsandbytes"),
-                        ("accelerate", "accelerate"),
-                        ("timm", "timm"),
-                        ("einops", "einops")):
+    for pkg, module in (("timm", "timm"), ("einops", "einops")):
         assert pkg in pins, pkg
         assert module in w._PROBE_IMPORTS, module
     # …and the per-generation extras likewise, against their own pin's probe.
     for pin, extras in w.PIN_EXTRAS.items():
         for spec in extras:
-            name = spec.split("=")[0]
+            # A spec is either `pkg==x.y` or `pkg>=x.y`.
+            name = spec.split("=")[0].rstrip("><!~")
             assert name in w.probe_imports(pin), (pin, name)
         assert name not in w._PROBE_IMPORTS, \
             f"{name} is pinned per generation; probing it for every pin would " \

@@ -125,7 +125,25 @@ PIN_EXTRAS = {
     # is the package that refuses numpy 1.x ("pyarrow requires NumPy 2.0 or
     # newer, found 1.26.4"). Pinning datasets without it fixes the version that
     # was named in the error and not the one that caused it.
-    "4.42.4": ("peft==0.11.1", "datasets==2.20.0", "pyarrow==16.1.0"),
+    "4.42.4": ("peft==0.11.1", "datasets==2.20.0", "pyarrow==16.1.0",
+               # accelerate too, and this one is not about numpy. Its 1.x
+               # `dispatch_model` takes a `model.to(device)` shortcut for a
+               # single-device map, which transformers 4.42 forbids for a
+               # bitsandbytes model -- so a quantized GPU load died in
+               # accelerate's own frame:
+               #
+               #   transformers/modeling_utils.py:3904 in from_pretrained
+               #     dispatch_model(model, **device_map_kwargs)
+               #   accelerate/big_modeling.py:514 in dispatch_model
+               #     model.to(device)
+               #   transformers/modeling_utils.py:2774 in to
+               #     ValueError: `.to` is not supported for `4-bit` or `8-bit`
+               #     bitsandbytes models.
+               #
+               # and the model fell back to the CPU: 30x slower and 33 GB of
+               # host RAM for what fits in 5 GB of card.
+               "accelerate==0.32.1",
+               "bitsandbytes>=0.45"),
 }
 
 #: …and what each of those adds to the import probe, so a venv missing one is
@@ -134,7 +152,7 @@ PIN_PROBE_IMPORTS = {
     # pyarrow directly as well as through datasets: it is the one that refuses
     # numpy 1.x, and probing it by name repairs a venv whose pyarrow drifted
     # without relying on `import datasets` to notice.
-    "4.42.4": ("peft", "datasets", "pyarrow"),
+    "4.42.4": ("peft", "datasets", "pyarrow", "accelerate", "bitsandbytes"),
 }
 
 
@@ -193,8 +211,7 @@ def model_for(name) -> Optional[Tf4Model]:
 #: timm/einops/PIL, returned early, and the model failed with "This modeling
 #: file requires the following packages that were not found in your
 #: environment: peft".
-_PROBE_IMPORTS = ("torch", "transformers", "timm", "einops", "PIL",
-                  "bitsandbytes", "accelerate")
+_PROBE_IMPORTS = ("torch", "transformers", "timm", "einops", "PIL")
 
 #: The same pins as requirements-embedders-tf4.txt, for installs that cannot see
 #: it. The container bind-mounts codai/, tools/ and third_party/ over the image,
@@ -214,8 +231,6 @@ _FALLBACK_PINS = (
     "numpy>=1.26",
     "sentencepiece>=0.2",
     "protobuf>=4.25",
-    "bitsandbytes>=0.45",
-    "accelerate>=1.0",
     # MM-Embed's chain (peft, datasets) is NOT here: those two are pinned per
     # transformers generation, see PIN_EXTRAS.
 )

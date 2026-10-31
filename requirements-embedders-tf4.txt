@@ -63,8 +63,12 @@ protobuf>=4.25
 # (including which modules to leave at full precision: a VL embedder's vision
 # tower and projector) is decided by the parent and handed over as JSON,
 # because the child cannot import coderai to ask.
-bitsandbytes>=0.45
-accelerate>=1.0
+# bitsandbytes and accelerate are NOT here either, for the same reason as peft
+# and datasets: only the quantizing pin needs them, and accelerate in
+# particular has to match the transformers generation. accelerate 1.x's
+# dispatch_model calls `model.to(device)` for a single-device map, which
+# transformers 4.42 forbids for a bitsandbytes model -- so the quantized GPU
+# load died in accelerate's frame and the model ran on the CPU instead.
 
 # MM-Embed's dependency chain, which its repo declares nowhere a resolver can
 # see and which transformers checks by SCANNING the modeling file's imports:
