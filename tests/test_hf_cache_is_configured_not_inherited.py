@@ -84,7 +84,11 @@ def test_config_beats_the_image(image_env):
     assert os.environ["HF_HOME"] == "/AI/huggingface"
     assert os.environ["HF_HUB_CACHE"] == "/AI/huggingface/hub"
     assert os.environ["HUGGINGFACE_HUB_CACHE"] == "/AI/huggingface/hub"
-    assert os.environ["TRANSFORMERS_CACHE"] == "/AI/huggingface/transformers"
+    # The hub directory, not a `transformers` one beside it: transformers 4.x
+    # honours TRANSFORMERS_CACHE as a HUB-layout cache, so pointing it at its
+    # own corner gives the machine two hub caches and a worker that cannot see
+    # what the server downloaded (measured: 122 models in one, 2 in the other).
+    assert os.environ["TRANSFORMERS_CACHE"] == "/AI/huggingface/hub"
 
 
 def test_all_four_variables_or_the_cache_splits_again(image_env):
@@ -158,7 +162,7 @@ def test_a_venv_child_gets_all_four(image_env):
     hf_cache.apply_hf_cache_env()
     env = hf_cache.child_env()
     assert env["HF_HOME"] == "/AI/huggingface"
-    assert env["TRANSFORMERS_CACHE"] == "/AI/huggingface/transformers"
+    assert env["TRANSFORMERS_CACHE"] == "/AI/huggingface/hub"
     assert env["HF_HUB_CACHE"] == env["HUGGINGFACE_HUB_CACHE"] == "/AI/huggingface/hub"
 
 
@@ -213,7 +217,7 @@ def test_the_ocr_supervisor_uses_the_configured_dir(image_env):
     env = mod.worker_env(0, 2)
     assert env["HF_HOME"] == "/AI/huggingface"
     assert env["HF_HUB_CACHE"] == "/AI/huggingface/hub"
-    assert env["TRANSFORMERS_CACHE"] == "/AI/huggingface/transformers"
+    assert env["TRANSFORMERS_CACHE"] == "/AI/huggingface/hub"
     # and it still keeps the cache dir it genuinely owns
     assert env["XDG_CACHE_HOME"] == "/cache"
 
@@ -248,5 +252,5 @@ def test_importing_the_package_applies_it(tmp_path):
         "HF_HOME": "/AI/huggingface",
         "HF_HUB_CACHE": "/AI/huggingface/hub",
         "HUGGINGFACE_HUB_CACHE": "/AI/huggingface/hub",
-        "TRANSFORMERS_CACHE": "/AI/huggingface/transformers",
+        "TRANSFORMERS_CACHE": "/AI/huggingface/hub",
     }

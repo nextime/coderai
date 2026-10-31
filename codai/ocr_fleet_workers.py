@@ -118,7 +118,17 @@ def worker_env(i: int, n: int) -> dict:
         env["HF_HOME"] = hf
         env["HF_HUB_CACHE"] = os.path.join(hf, "hub")
         env["HUGGINGFACE_HUB_CACHE"] = os.path.join(hf, "hub")
-        env["TRANSFORMERS_CACHE"] = os.path.join(hf, "transformers")
+        # The HUB directory, like the three above it. transformers 4.x honours
+        # TRANSFORMERS_CACHE as a hub-layout cache, not as a store of its own,
+        # so `<hf>/transformers` does not give transformers its own corner --
+        # it gives the machine two hub caches, and which one a process reads
+        # depends on the transformers version in its venv. Measured 2026-10-28:
+        # `<hf>/hub` held 122 models and `<hf>/transformers` held 2, and a
+        # worker forced offline reported "We couldn't connect to
+        # https://huggingface.co" for a model sitting in the other directory.
+        # codai/hf_cache.py says the same; this copy is inline because importing
+        # the package into this supervisor costs what it exists to save.
+        env["TRANSFORMERS_CACHE"] = os.path.join(hf, "hub")
     env["PYTHONUNBUFFERED"] = "1"
     env["CODERAI_OCR_WORKER"] = f"{i}/{n}"
     env["CODERAI_ENGINE_NAME"] = f"ocrw{i}"
