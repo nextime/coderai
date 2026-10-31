@@ -6002,6 +6002,103 @@ async def api_lipsync_engine_install(request: Request,
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --------------------------------------------------------------------------- #
+# Isolated embedder venvs (jina-clip-v2)
+# --------------------------------------------------------------------------- #
+# Same distinction as the lip-sync engines: not a models.json row of its own --
+# jina-clip-v2 IS an embedding_models entry and is served like any other -- but
+# it can only be served out of a venv pinned to transformers 4, and whether that
+# venv exists is a state an operator has to be able to see and act on. Built
+# on demand by the first request too, which is minutes a request should not
+# have to spend.
+
+def _jinaclip_worker():
+    from codai.api import jinaclip_worker
+    return jinaclip_worker
+
+
+#: name -> {"state","error","log"}. As with the lip-sync installs: minutes of
+#: pip, so it runs in a thread and the caller polls.
+_embed_venv_jobs: dict = {}
+_embed_venv_lock = _t.RLock()
+
+
+@router.get("/admin/api/embedder-venvs", summary="Isolated embedder venv status")
+async def api_embedder_venvs(username: str = Depends(require_admin)):
+    """Every embedder that needs a venv of its own, and whether it has one."""
+    try:
+        st = dict(_jinaclip_worker().state())
+        with _embed_venv_lock:
+            job = dict(_embed_venv_jobs.get(st["name"]) or {})
+        st["state"] = job.get("state", "idle")
+        st["error"] = job.get("error")
+        st["log"] = job.get("log", [])[-20:]
+        return {"success": True, "venvs": [st]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/admin/api/embedder-venv-install",
+             summary="Build an isolated embedder venv")
+async def api_embedder_venv_install(request: Request,
+                                    username: str = Depends(require_admin)):
+    """Start the build and return at once; poll /admin/api/embedder-venvs."""
+    data = await request.json()
+    name = (data.get("name") or data.get("venv") or "jina-clip-v2").strip().lower()
+    if name not in ("jina-clip-v2", "jinaclip", "jina-clip"):
+        raise HTTPException(status_code=400,
+                            detail=f"no isolated embedder venv called {name!r}")
+    worker = _jinaclip_worker()
+    key = worker.state()["name"]
+    with _embed_venv_lock:
+        job = _embed_venv_jobs.get(key)
+        if job and job.get("state") == "running":
+            return {"success": True, "state": "running"}
+        job = {"state": "running", "error": None, "log": []}
+        _embed_venv_jobs[key] = job
+
+    def _log(line: str) -> None:
+        with _embed_venv_lock:
+            job["log"].append(str(line))
+            del job["log"][:-200]
+
+    def _run():
+        try:
+            worker.ensure_installed(log=_log)
+            with _embed_venv_lock:
+                job["state"] = "done"
+        except Exception as exc:
+            _log(f"build failed: {type(exc).__name__}: {exc}")
+            with _embed_venv_lock:
+                job["state"] = "failed"
+                job["error"] = f"{type(exc).__name__}: {exc}"
+
+    _t.Thread(target=_run, daemon=True).start()
+    return {"success": True, "state": "running"}
+
+
+@router.post("/admin/api/embedder-venv-remove",
+             summary="Delete an isolated embedder venv")
+async def api_embedder_venv_remove(request: Request,
+                                   username: str = Depends(require_admin)):
+    """Delete the venv. The weights are in the HF cache and are not touched."""
+    import shutil
+    data = await request.json()
+    name = (data.get("name") or "jina-clip-v2").strip().lower()
+    if name not in ("jina-clip-v2", "jinaclip", "jina-clip"):
+        raise HTTPException(status_code=400,
+                            detail=f"no isolated embedder venv called {name!r}")
+    worker = _jinaclip_worker()
+    venv = worker.resolve_venv_dir()
+    try:
+        shutil.rmtree(venv, ignore_errors=True)
+        # Otherwise the next request skips the rebuild on a cached "ready".
+        worker._bootstrapped = False
+        return {"success": True, "removed": str(venv)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/admin/api/lipsync-engine-remove", summary="Remove a lip-sync engine")
 async def api_lipsync_engine_remove(request: Request,
                                     username: str = Depends(require_admin)):

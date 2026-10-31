@@ -45,7 +45,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 <div class="tabs">
   <button class="tab active" onclick="switchTab('local', this)">Local models</button>
   <button class="tab" onclick="switchTab('search', this)">Find on HuggingFace</button>
-  <button class="tab" onclick="switchTab('lipsync', this); loadLipsyncEngines()">Lip-sync engines</button>
+  <button class="tab" onclick="switchTab('lipsync', this); loadLipsyncEngines(); loadEmbedderVenvs()">Isolated engines</button>
 </div>
 
 <!-- active downloads strip (all tabs) -->
@@ -1900,6 +1900,18 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
     </p>
     <div id="lipsync-list">Loading…</div>
   </div>
+
+  <div class="card">
+    <div class="card-title">Embedders with their own venv</div>
+    <p style="color:var(--text-2);font-size:13px;margin:.25rem 0 1rem">
+      These ARE ordinary model entries and are served like any other embedder — but
+      only out of a venv pinned to a different stack than the server's, so they run
+      as a subprocess whose VRAM the manager reclaims by stopping it. The first
+      request builds the venv if it is missing, which is minutes a request should
+      not have to spend: build it here instead.
+    </p>
+    <div id="embedder-venv-list">Loading…</div>
+  </div>
 </div>
 {% endblock %}
 
@@ -2006,6 +2018,79 @@ async function loadLipsyncEngines(){
     document.getElementById('lipsync-list').innerHTML =
       '<div style="color:#a3321f">Could not read engine status: ' + err + '</div>';
   }
+}
+
+let _embedVenvPoll = null;
+
+function _embedVenvBadge(v){
+  if (v.state === 'running') return '<span class="badge" style="background:#8a6d1f22;color:#8a6d1f">building…</span>';
+  if (v.state === 'failed')  return '<span class="badge" style="background:#a3321f22;color:#a3321f">build failed</span>';
+  if (v.available)           return '<span class="badge" style="background:#1f6f4322;color:#1f6f43">ready</span>';
+  if (v.installed)           return '<span class="badge" style="background:#8a6d1f22;color:#8a6d1f">venv present, not usable</span>';
+  return '<span class="badge" style="background:#5c616922;color:var(--text-2)">not built</span>';
+}
+
+function renderEmbedderVenvs(venvs){
+  const el = document.getElementById('embedder-venv-list');
+  if (!venvs || !venvs.length){ el.innerHTML = '<div style="color:var(--text-2)">None.</div>'; return; }
+  el.innerHTML = venvs.map(v => {
+    const busy = v.state === 'running';
+    const err = v.error ? `<div style="font-size:12px;color:#a3321f;margin-top:.35rem">${esc(v.error)}</div>` : '';
+    const log = (v.log && v.log.length && (busy || v.state === 'failed'))
+      ? `<pre style="margin:.5rem 0 0;padding:.5rem;background:var(--raised);border-radius:6px;font-size:11px;max-height:9rem;overflow:auto">${esc(v.log.join('\n'))}</pre>` : '';
+    return `
+    <div style="border:1px solid var(--border);border-radius:8px;padding:.875rem;margin-bottom:.75rem">
+      <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+        <strong style="font-size:15px">${esc(v.name)}</strong>
+        ${_embedVenvBadge(v)}
+        <span style="margin-left:auto;display:flex;gap:.4rem">
+          <button class="btn btn-sm btn-secondary" ${busy?'disabled':''} onclick="buildEmbedderVenv('${esc(v.name)}')">
+            ${v.installed ? 'Rebuild' : 'Build'}</button>
+          <button class="btn btn-sm btn-ghost" ${busy||!v.installed?'disabled':''} onclick="removeEmbedderVenv('${esc(v.name)}')">Delete</button>
+        </span>
+      </div>
+      <div style="font-size:12px;color:var(--text-2);margin-top:.4rem">
+        <code>${esc(v.venv)}</code> · from <code>${esc(v.requirements)}</code>
+      </div>
+      <div style="font-size:12px;color:var(--text-2);margin-top:.2rem">${esc(v.why || '')}</div>
+      ${err}${log}
+    </div>`;
+  }).join('');
+}
+
+async function loadEmbedderVenvs(){
+  try {
+    const r = await fetch('/admin/api/embedder-venvs');
+    const j = await r.json();
+    renderEmbedderVenvs(j.venvs || []);
+    const busy = (j.venvs || []).some(v => v.state === 'running');
+    if (busy && !_embedVenvPoll) _embedVenvPoll = setInterval(loadEmbedderVenvs, 3000);
+    if (!busy && _embedVenvPoll){ clearInterval(_embedVenvPoll); _embedVenvPoll = null; }
+  } catch (err) {
+    document.getElementById('embedder-venv-list').innerHTML =
+      '<div style="color:#a3321f">Could not read venv status: ' + err + '</div>';
+  }
+}
+
+async function buildEmbedderVenv(name){
+  const ok = await showConfirm('Build the venv for ' + name + '?',
+    'This downloads several GB (torch and transformers 4.49). It runs in the background; you can leave this page.');
+  if (!ok) return;
+  await fetch('/admin/api/embedder-venv-install', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:name})});
+  loadEmbedderVenvs();
+}
+
+async function removeEmbedderVenv(name){
+  const ok = await showConfirm('Delete the venv for ' + name + '?',
+    'The model weights stay in the HF cache. The next request would rebuild the venv, which takes minutes.');
+  if (!ok) return;
+  const r = await fetch('/admin/api/embedder-venv-remove', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:name})});
+  if (!r.ok){ const j = await r.json().catch(()=>({})); showAlert('Could not delete', j.detail || r.statusText); }
+  loadEmbedderVenvs();
 }
 
 async function installLipsync(name){

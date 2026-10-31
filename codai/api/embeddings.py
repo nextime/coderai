@@ -186,7 +186,8 @@ class _EmbeddingModel:
         self.respawn = respawn
         # llama.cpp contexts are NOT thread-safe: two executor threads calling
         # embed() on one ctx segfault the engine. Serialize per model instance.
-        if backend in ('llama', 'llama-vl', 'dinov2cpp', 'vpr-server'):
+        if backend in ('llama', 'llama-vl', 'dinov2cpp', 'vpr-server',
+                       'jinaclip'):
             import threading
             self.lock = threading.Lock()
         else:
@@ -213,7 +214,7 @@ class _EmbeddingModel:
 
     def _cleanup_locked(self):
         try:
-            if self.backend in ('dinov2cpp', 'vpr-server'):
+            if self.backend in ('dinov2cpp', 'vpr-server', 'jinaclip'):
                 # persistent embed server subprocess — terminating it frees
                 # its (V)RAM; eviction restarts it on the next request.
                 try:
@@ -780,52 +781,87 @@ def _load_mmembed(model_name, device, model_config=None):
 
 
 def _load_jinaclip(model_name, device, model_config=None):
-    """jina-clip through its own encode_* methods."""
-    import torch
-    from transformers import AutoModel
-    from codai.models.hf_loading import build_from_pretrained_kwargs
-    _shim_transformers5_clip_helpers()
-    kw = {'trust_remote_code': True}
-    fp = build_from_pretrained_kwargs(model_config)
-    if 'quantization_config' in fp:
-        kw['quantization_config'] = fp['quantization_config']
-    else:
-        # `dtype`, not `torch_dtype`. transformers 5 renamed it, and a model
-        # whose remote config walks its kwargs chokes on the legacy name:
-        #   TypeError: attribute name must be string, not 'torch.dtype'
-        # Measured on zeiss 2026-10-31 — jina-clip-v2 fails with torch_dtype=
-        # and loads with dtype=. The legacy name still works for models with
-        # no remote config code, which is why the rest of the stack has not
-        # noticed; it is not changed here.
-        # bfloat16, not float16. Its EVA-style vision tower overflows in
-        # fp16: measured on zeiss 2026-10-31, the TEXT side returned proper
-        # floats while every one of the image vector's 1024 components came
-        # back null — NaN, which FastAPI serialises as null. bf16 carries
-        # fp32's exponent range at half the width, so the tower's activations
-        # stay finite without doubling the footprint.
-        kw['dtype'] = torch.bfloat16
-    model = AutoModel.from_pretrained(model_name, **kw)
-    if 'quantization_config' not in kw and 'device_map' not in kw:
-        model = model.to(device)
-    model.eval()
-    return _EmbeddingModel('jinaclip', (model, device))
+    """jina-clip-v2 in its OWN venv, as a subprocess.
+
+    Not in this process, and not optionally. The model's remote code is pinned
+    by its own config to a July-2025 revision that will never be transformers-5
+    code: on the server's transformers 5.12 it needs two shims to import at all
+    and then returns 1024 NaNs from every image -- measured on zeiss at fp32,
+    bf16 and fp16, with xattn on and off, and outside coderai too. The same
+    weights and images on transformers 4.49 give finite unit-norm vectors with
+    cos(text, image) ~0.26, on CUDA and CPU alike.
+
+    So an in-process path is kept only as far as the error message: there is no
+    stack this process can offer the model that produces a usable vector, and a
+    second code path that silently produces NaNs is worth nothing.
+    (:mod:`codai.api.jinaclip_worker` owns the venv and builds it on demand.)
+    """
+    from codai.api import jinaclip_worker
+
+    cfg = model_config or {}
+    raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
+    # A model pinned off the GPU keeps that pin in the child: n_gpu_layers=0 is
+    # how every other backend here is told to stay on the CPU.
+    _ngl = cfg.get('n_gpu_layers', raw.get('n_gpu_layers'))
+    _dev = 'cpu' if (str(device) == 'cpu' or _ngl == 0) else 'cuda'
+
+    def _spawn():
+        return jinaclip_worker.spawn(model_name, device=_dev)
+
+    return _EmbeddingModel('jinaclip', _spawn(), respawn=_spawn)
 
 
-def _jinaclip_embed_texts(model_tuple, texts, dimensions=None):
-    import torch
-    model, _device = model_tuple
-    with torch.no_grad():
-        v = model.encode_text(list(texts), convert_to_numpy=True)
-    rows = _truncate_dims([list(map(float, row)) for row in v], dimensions)
+def _jinaclip_proc(model_obj):
+    """The live server for this handle, respawned if it has died.
+
+    Eviction frees this model's VRAM by killing the child (see
+    ``_cleanup_locked``), and the cached handle outlives it, so every request
+    has to be able to find a dead process and start another one.
+    """
+    from codai.api import jinaclip_worker
+
+    proc = model_obj.model if hasattr(model_obj, 'model') else model_obj
+    if getattr(proc, 'poll', None) is not None and proc.poll() is not None:
+        _rs = getattr(model_obj, 'respawn', None)
+        if _rs is None:
+            raise RuntimeError(
+                "the jina-clip server died — retry (it will reload)")
+        proc = _rs()
+        model_obj.model = proc
+    return jinaclip_worker, proc
+
+
+def _jinaclip_embed_texts(model_obj, texts, dimensions=None):
+    import contextlib
+    worker, proc = _jinaclip_proc(model_obj)
+    _mlock = getattr(model_obj, 'lock', None)
+    with (_mlock if _mlock is not None else contextlib.nullcontext()):
+        rows = worker.request(proc, {'texts': list(texts)})
+    rows = _truncate_dims([list(map(float, r)) for r in rows], dimensions)
     return _require_finite(rows, 'jina-clip', 'text embedding')
 
 
-def _jinaclip_embed_images(model_tuple, pil_images, dimensions=None):
-    import torch
-    model, _device = model_tuple
-    with torch.no_grad():
-        v = model.encode_image(list(pil_images), convert_to_numpy=True)
-    rows = _truncate_dims([list(map(float, row)) for row in v], dimensions)
+def _jinaclip_embed_images(model_obj, pil_images, dimensions=None):
+    import contextlib
+    import os as _os
+    import tempfile
+    worker, proc = _jinaclip_proc(model_obj)
+    paths = []
+    try:
+        for im in pil_images:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                paths.append(f.name)
+            im.convert('RGB').save(paths[-1], 'PNG')
+        _mlock = getattr(model_obj, 'lock', None)
+        with (_mlock if _mlock is not None else contextlib.nullcontext()):
+            rows = worker.request(proc, {'images': paths})
+    finally:
+        for pth in paths:
+            try:
+                _os.unlink(pth)
+            except OSError:
+                pass
+    rows = _truncate_dims([list(map(float, r)) for r in rows], dimensions)
     return _require_finite(rows, 'jina-clip', 'image embedding')
 
 
@@ -2359,7 +2395,7 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None,
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'text': t} for t in texts], dimensions)
     elif backend == 'jinaclip':
-        return _jinaclip_embed_texts(model, texts, dimensions)
+        return _jinaclip_embed_texts(model_obj, texts, dimensions)
     elif backend == 'mmembed':
         return _mmembed_embed(model, [{'txt': t} for t in texts], dimensions)
     elif backend == 'geoclip':
@@ -2527,7 +2563,7 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
         return _llama_vl_embed(model_obj, [{'image': im} for im in pil_images],
                                dimensions)
     elif backend == 'jinaclip':
-        return _jinaclip_embed_images(model, pil_images, dimensions)
+        return _jinaclip_embed_images(model_obj, pil_images, dimensions)
     elif backend == 'mmembed':
         return _mmembed_embed(model, [{'img': im} for im in pil_images], dimensions)
     elif backend == 'geoclip':

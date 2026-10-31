@@ -1,0 +1,42 @@
+# Isolated venv for jina-clip-v2, the multilingual text-AND-image embedder.
+#
+# It cannot share the server's environment for one reason: transformers 5. The
+# model's remote code is pinned by its own config to revision 39e6a55 (July
+# 2025), which predates transformers 5 and is not coming back -- jinaai's
+# jina-clip-implementation has had no commit since. On transformers 5.12 that
+# code needs two shims just to import (`clip_loss`, deleted from modeling_clip;
+# `dtype=` instead of `torch_dtype=`), and after both it loads and then returns
+# 1024 NaNs from every image: measured on zeiss at fp32, bf16 and fp16, with
+# xattn on and off, and outside coderai entirely. A NaN vector scores every
+# comparison equally and silently, which is worse than an error.
+#
+# Measured the same day, same weights, same images, on transformers 4.49:
+#
+#   text : shape=(2, 1024) finite=True nan=0 norm=0.9992
+#   image: shape=(1, 1024) finite=True nan=0 norm=1.0007
+#   cos(text, image): 0.258 / 0.260
+#
+# on CUDA and on CPU, on python 3.11 and on 3.13 alike. So the venv needs no
+# interpreter of its own: it is built with the server's own python, and the only
+# thing it pins differently is transformers.
+#
+# Do NOT merge these into requirements.txt -- transformers 4.49 would take the
+# whole install back two major versions.
+
+# The cause, and the only hard pin here. 4.49 is the last release the pinned
+# remote code was written against.
+transformers==4.49.0
+
+# Everything else: the versions this was measured with, as a floor rather than a
+# pin, because none of them is implicated. torch comes from PyPI (its own CUDA
+# wheels), as the engine's does.
+torch>=2.6
+torchvision>=0.21
+# jina-clip-v2's vision tower IS a timm model (EVA02), so this is not optional.
+timm>=1.0.9
+einops>=0.8
+pillow>=10.0
+numpy>=1.26
+# The XLM-RoBERTa tokenizer the text tower uses.
+sentencepiece>=0.2
+protobuf>=4.25
