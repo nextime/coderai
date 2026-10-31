@@ -83,16 +83,24 @@ def test_the_location_half_of_geoclip_is_unaffected():
 
 
 # ── the new backend is wired on both paths ───────────────────────────────────
+#
+# MM-Embed's API resembles nothing else here, and since 2026-10-31 it is not
+# driven from this process at all: three transformers-5 shims in a row (the
+# third of which, a process-wide AutoModel registration, broke e5-v) and a
+# fourth name still missing was enough. It runs in the transformers-4.49 venv
+# beside jina-clip-v2, so the dispatch below is shared and the API details are
+# asserted against the child that implements them.
 
-def test_text_goes_through_the_backend():
-    i = SRC.index("elif backend == 'mmembed':")
-    assert "{'txt': t}" in SRC[i:i + 220]
+SERVER = io.open(os.path.join(ROOT, 'codai/api/tf4_embed_server.py'),
+                 encoding='utf-8').read()
 
 
-def test_images_go_through_the_backend():
-    hits = [i for i in range(len(SRC)) if SRC.startswith("elif backend == 'mmembed':", i)]
+def test_both_paths_dispatch_to_the_isolated_backend():
+    hits = [i for i in range(len(SRC))
+            if SRC.startswith("elif backend in ('jinaclip', 'mmembed'):", i)]
     assert len(hits) == 2, f'expected a text and an image dispatch, found {len(hits)}'
-    assert "{'img': im}" in SRC[hits[1]:hits[1] + 220]
+    assert "_tf4_embed_texts(model_obj" in SRC[hits[0]:hits[0] + 160]
+    assert "_tf4_embed_images(model_obj" in SRC[hits[1]:hits[1] + 160]
 
 
 def test_the_loader_is_dispatched_by_name_before_the_hf_path():
@@ -106,37 +114,41 @@ def test_the_loader_is_dispatched_by_name_before_the_hf_path():
 def test_trust_remote_code_is_not_left_to_the_operator():
     """The checkpoint's encode() lives in its repo: without remote code it
     cannot load at all, so a missing flag would be a silent failure."""
-    i = SRC.index('def _load_mmembed')
-    body = SRC[i:SRC.index('\ndef ', i + 10)]
-    assert "'trust_remote_code': True" in body
+    assert '"trust_remote_code": True' in SERVER
 
 
 def test_the_vectors_are_taken_from_hidden_states():
-    i = SRC.index('def _mmembed_embed')
-    body = SRC[i:SRC.index('\ndef ', i + 10)]
-    assert "out['hidden_states']" in body
+    i = SERVER.index('if family == "mmembed":')
+    body = SERVER[i:i + 900]
+    assert 'out["hidden_states"]' in body
 
 
 def test_an_instruction_switches_it_to_query_mode():
     """Without one the model embeds the item as a PASSAGE. That is the right
     default for "embed this" and the wrong one for a query, so the distinction
     is kept rather than hardcoded."""
-    i = SRC.index('def _mmembed_embed')
-    body = SRC[i:SRC.index('\ndef ', i + 10)]
-    assert "kw['is_query'] = True" in body
+    i = SERVER.index('if family == "mmembed":')
+    body = SERVER[i:i + 900]
+    assert 'kw["is_query"] = True' in body
     assert 'instruction' in body
 
 
 def test_dimensions_truncation_is_applied():
-    i = SRC.index('def _mmembed_embed')
+    """In the parent, on what comes back -- the child does not know about it."""
+    i = SRC.index('def _tf4_embed_texts(')
     body = SRC[i:SRC.index('\ndef ', i + 10)]
-    assert '_truncate_dims(vecs, dimensions)' in body
+    assert '_truncate_dims(' in body and 'dimensions' in body
 
 
 def test_it_runs_without_grad():
-    i = SRC.index('def _mmembed_embed')
-    body = SRC[i:SRC.index('\ndef ', i + 10)]
-    assert 'torch.no_grad()' in body
+    assert 'with torch.no_grad():' in SERVER
+
+
+def test_the_items_still_carry_txt_and_img():
+    """The shape its encode() documents, now built in the child."""
+    i = SERVER.index('if family == "mmembed":')
+    body = SERVER[i:i + 900]
+    assert '{"txt": t}' in body and '{"img":' in body
 
 
 # ── the three that need no new code ──────────────────────────────────────────

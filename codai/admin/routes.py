@@ -6005,17 +6005,23 @@ async def api_lipsync_engine_install(request: Request,
 # --------------------------------------------------------------------------- #
 # Isolated embedder venvs (jina-clip-v2)
 # --------------------------------------------------------------------------- #
-# Same distinction as the lip-sync engines: not a models.json row of its own --
-# jina-clip-v2 IS an embedding_models entry and is served like any other -- but
-# it can only be served out of a venv pinned to transformers 4, and whether that
-# venv exists is a state an operator has to be able to see and act on. Built
-# on demand by the first request too, which is minutes a request should not
-# have to spend.
+# Same distinction as the lip-sync engines: not models.json rows of their own --
+# jina-clip-v2 and MM-Embed ARE embedding_models entries and are served like any
+# other -- but they can only be served out of a venv pinned to transformers 4,
+# and whether that venv exists is a state an operator has to be able to see and
+# act on. Built on demand by the first request too, which is minutes a request
+# should not have to spend.
 
-def _jinaclip_worker():
-    from codai.api import jinaclip_worker
-    return jinaclip_worker
+def _tf4_embedders():
+    from codai.api import tf4_embedders
+    return tf4_embedders
 
+
+#: What the UI may call this venv. It serves several models, so the old
+#: single-model name still has to be accepted: a page cached in a browser keeps
+#: posting it.
+_EMBED_VENV_NAMES = ("transformers 4.49 (embedders)", "tf4", "tf4-embedders",
+                     "jina-clip-v2", "jinaclip", "jina-clip", "mm-embed")
 
 #: name -> {"state","error","log"}. As with the lip-sync installs: minutes of
 #: pip, so it runs in a thread and the caller polls.
@@ -6027,13 +6033,16 @@ _embed_venv_lock = _t.RLock()
 async def api_embedder_venvs(username: str = Depends(require_admin)):
     """Every embedder that needs a venv of its own, and whether it has one."""
     try:
-        st = dict(_jinaclip_worker().state())
-        with _embed_venv_lock:
-            job = dict(_embed_venv_jobs.get(st["name"]) or {})
-        st["state"] = job.get("state", "idle")
-        st["error"] = job.get("error")
-        st["log"] = job.get("log", [])[-20:]
-        return {"success": True, "venvs": [st]}
+        venvs = []
+        for st in _tf4_embedders().state():
+            st = dict(st)
+            with _embed_venv_lock:
+                job = dict(_embed_venv_jobs.get(st["pin"]) or {})
+            st["state"] = job.get("state", "idle")
+            st["error"] = job.get("error")
+            st["log"] = job.get("log", [])[-20:]
+            venvs.append(st)
+        return {"success": True, "venvs": venvs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -6044,37 +6053,44 @@ async def api_embedder_venv_install(request: Request,
                                     username: str = Depends(require_admin)):
     """Start the build and return at once; poll /admin/api/embedder-venvs."""
     data = await request.json()
-    name = (data.get("name") or data.get("venv") or "jina-clip-v2").strip().lower()
-    if name not in ("jina-clip-v2", "jinaclip", "jina-clip"):
+    pin = str(data.get("pin") or "").strip()
+    name = (data.get("name") or data.get("venv") or "").strip().lower()
+    if name and not pin and name not in _EMBED_VENV_NAMES:
         raise HTTPException(status_code=400,
                             detail=f"no isolated embedder venv called {name!r}")
-    worker = _jinaclip_worker()
-    key = worker.state()["name"]
+    worker = _tf4_embedders()
+    # Which pin to build: the one named, or all of them.
+    want = [p for p in worker.pins() if not pin or p == pin]
+    if not want:
+        raise HTTPException(status_code=400,
+                            detail=f"no embedder venv pinned to {pin!r}; "
+                                   f"known: {', '.join(worker.pins())}")
     with _embed_venv_lock:
-        job = _embed_venv_jobs.get(key)
-        if job and job.get("state") == "running":
-            return {"success": True, "state": "running"}
-        job = {"state": "running", "error": None, "log": []}
-        _embed_venv_jobs[key] = job
+        for p in want:
+            job = _embed_venv_jobs.get(p)
+            if job and job.get("state") == "running":
+                continue
+            _embed_venv_jobs[p] = {"state": "running", "error": None,
+                                   "log": []}
 
-    def _log(line: str) -> None:
-        with _embed_venv_lock:
-            job["log"].append(str(line))
-            del job["log"][:-200]
-
-    def _run():
-        try:
-            worker.ensure_installed(log=_log)
+    def _run(one: str) -> None:
+        def _log(line: str) -> None:
             with _embed_venv_lock:
-                job["state"] = "done"
+                _embed_venv_jobs[one]["log"].append(str(line))
+                del _embed_venv_jobs[one]["log"][:-200]
+        try:
+            worker.ensure_installed(one, log=_log)
+            with _embed_venv_lock:
+                _embed_venv_jobs[one]["state"] = "done"
         except Exception as exc:
             _log(f"build failed: {type(exc).__name__}: {exc}")
             with _embed_venv_lock:
-                job["state"] = "failed"
-                job["error"] = f"{type(exc).__name__}: {exc}"
+                _embed_venv_jobs[one]["state"] = "failed"
+                _embed_venv_jobs[one]["error"] = f"{type(exc).__name__}: {exc}"
 
-    _t.Thread(target=_run, daemon=True).start()
-    return {"success": True, "state": "running"}
+    for _p in want:
+        _t.Thread(target=_run, args=(_p,), daemon=True).start()
+    return {"success": True, "state": "running", "pins": want}
 
 
 @router.post("/admin/api/embedder-venv-remove",
@@ -6084,17 +6100,22 @@ async def api_embedder_venv_remove(request: Request,
     """Delete the venv. The weights are in the HF cache and are not touched."""
     import shutil
     data = await request.json()
-    name = (data.get("name") or "jina-clip-v2").strip().lower()
-    if name not in ("jina-clip-v2", "jinaclip", "jina-clip"):
+    pin = str(data.get("pin") or "").strip()
+    worker = _tf4_embedders()
+    want = [p for p in worker.pins() if not pin or p == pin]
+    if not want:
         raise HTTPException(status_code=400,
-                            detail=f"no isolated embedder venv called {name!r}")
-    worker = _jinaclip_worker()
-    venv = worker.resolve_venv_dir()
+                            detail=f"no embedder venv pinned to {pin!r}; "
+                                   f"known: {', '.join(worker.pins())}")
+    removed = []
     try:
-        shutil.rmtree(venv, ignore_errors=True)
-        # Otherwise the next request skips the rebuild on a cached "ready".
-        worker._bootstrapped = False
-        return {"success": True, "removed": str(venv)}
+        for p in want:
+            venv = worker.resolve_venv_dir(p)
+            shutil.rmtree(venv, ignore_errors=True)
+            # Otherwise the next request skips the rebuild on a cached "ready".
+            worker._bootstrapped.pop(p, None)
+            removed.append(str(venv))
+        return {"success": True, "removed": removed}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

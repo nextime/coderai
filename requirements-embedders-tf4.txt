@@ -1,0 +1,86 @@
+# Isolated venv for the embedders whose remote code predates transformers 5.
+#
+# Two models, one reason. jina-clip-v2's code is pinned by its own config to
+# revision 39e6a55 (July 2025) and jinaai's jina-clip-implementation has had no
+# commit since: on transformers 5.12 it needs two shims just to import
+# (`clip_loss`, deleted from modeling_clip; `dtype=` for `torch_dtype=`) and
+# then returns 1024 NaNs from every image -- measured on zeiss at fp32, bf16 and
+# fp16, with xattn on and off, and outside coderai entirely. A NaN vector scores
+# every comparison equally and silently, which is worse than an error.
+#
+# MM-Embed needed three shims and then asked for a fourth: its
+# modeling_nvmmembed registers LlavaNextConfig against its own class at import
+# time (process-wide, which made e5-v answer "'LlavaNextConfig' object has no
+# attribute 'retriever'"), and once that was contained it failed on "cannot
+# import name 'MISTRAL_INPUTS_DOCSTRING'". Out of the process, none of it
+# applies.
+#
+# Measured the same day, same weights, same images, on transformers 4.49:
+#
+#   text : shape=(2, 1024) finite=True nan=0 norm=0.9992
+#   image: shape=(1, 1024) finite=True nan=0 norm=1.0007
+#   cos(text, image): 0.258 / 0.260
+#
+# on CUDA and on CPU, on python 3.11 and on 3.13 alike. So the venv needs no
+# interpreter of its own: it is built with the server's own python, and the only
+# thing it pins differently is transformers.
+#
+# Do NOT merge these into requirements.txt -- transformers 4.49 would take the
+# whole install back two major versions.
+
+# transformers is deliberately NOT here. It is the one line that differs
+# between these venvs, and the version comes from the registry in
+# codai/api/tf4_embedders.py so that one requirements file serves every pin:
+#
+#     jina-clip-v2   transformers 4.49.0
+#     MM-Embed       transformers 4.42.4   (its retriever runs its own decoder
+#                                           loop and calls each Mistral layer
+#                                           without `position_embeddings`,
+#                                           which transformers computed inside
+#                                           the attention layer until the
+#                                           rotary refactor of 4.43; on 4.49 it
+#                                           dies in transformers' own code with
+#                                           "cannot unpack non-iterable
+#                                           NoneType object", and NV-Embed-v1's
+#                                           card says transformers==4.42.4)
+
+# Everything else: the versions this was measured with, as a floor rather than a
+# pin, because none of them is implicated. torch comes from PyPI (its own CUDA
+# wheels), as the engine's does.
+torch>=2.6
+torchvision>=0.21
+# jina-clip-v2's vision tower IS a timm model (EVA02), so this is not optional.
+timm>=1.0.9
+einops>=0.8
+pillow>=10.0
+numpy>=1.26
+# The XLM-RoBERTa tokenizer jina's text tower uses.
+sentencepiece>=0.2
+protobuf>=4.25
+
+# models.json is the source of truth for quantization, and MM-Embed is
+# configured 4-bit -- so the venv needs the library that does it. The policy
+# (including which modules to leave at full precision: a VL embedder's vision
+# tower and projector) is decided by the parent and handed over as JSON,
+# because the child cannot import coderai to ask.
+bitsandbytes>=0.45
+accelerate>=1.0
+
+# MM-Embed's dependency chain, which its repo declares nowhere a resolver can
+# see and which transformers checks by SCANNING the modeling file's imports:
+# it loads `config.retriever` (nvidia/NV-Embed-v1) with trust_remote_code, so
+# NV-Embed's modeling_nvembed.py has to import too. Between them they want peft
+# and datasets -- and the same file is what cannot run on transformers 5 at all:
+#
+#     from transformers.models.mistral.modeling_mistral import \
+#         MISTRAL_INPUTS_DOCSTRING          # deleted in transformers 5
+#     from datasets import Dataset
+#
+# Each missing one surfaces only as the next load failure, which is why they are
+# listed here rather than discovered one restart at a time.
+# peft and datasets are NOT here. MM-Embed imports peft and its retriever
+# imports datasets, and both have to match the transformers generation: with
+# transformers 4.42.4 (which pins numpy<2) peft 0.21 fails on "cannot import
+# name 'EncoderDecoderCache'" and datasets 5 pulls pyarrow 26, which "requires
+# NumPy 2.0 or newer". So they are pinned per generation in PIN_EXTRAS, in
+# codai/api/tf4_embedders.py, beside the transformers version they belong to.

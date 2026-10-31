@@ -2044,15 +2044,18 @@ function renderEmbedderVenvs(venvs){
         <strong style="font-size:15px">${esc(v.name)}</strong>
         ${_embedVenvBadge(v)}
         <span style="margin-left:auto;display:flex;gap:.4rem">
-          <button class="btn btn-sm btn-secondary" ${busy?'disabled':''} onclick="buildEmbedderVenv('${esc(v.name)}')">
+          <button class="btn btn-sm btn-secondary" ${busy?'disabled':''} onclick="buildEmbedderVenv('${esc(v.pin || '')}')">
             ${v.installed ? 'Rebuild' : 'Build'}</button>
-          <button class="btn btn-sm btn-ghost" ${busy||!v.installed?'disabled':''} onclick="removeEmbedderVenv('${esc(v.name)}')">Delete</button>
+          <button class="btn btn-sm btn-ghost" ${busy||!v.installed?'disabled':''} onclick="removeEmbedderVenv('${esc(v.pin || '')}')">Delete</button>
         </span>
       </div>
       <div style="font-size:12px;color:var(--text-2);margin-top:.4rem">
         <code>${esc(v.venv)}</code> · from <code>${esc(v.requirements)}</code>
       </div>
       <div style="font-size:12px;color:var(--text-2);margin-top:.2rem">${esc(v.why || '')}</div>
+      ${(v.models && v.models.length) ? `<div style="font-size:12px;color:var(--text-2);margin-top:.3rem">
+        ${v.models.map(m => `<div><code>${esc(m.repo)}</code> — ${esc(m.why)}</div>`).join('')}
+      </div>` : ''}
       ${err}${log}
     </div>`;
   }).join('');
@@ -2072,23 +2075,23 @@ async function loadEmbedderVenvs(){
   }
 }
 
-async function buildEmbedderVenv(name){
-  const ok = await showConfirm('Build the venv for ' + name + '?',
-    'This downloads several GB (torch and transformers 4.49). It runs in the background; you can leave this page.');
+async function buildEmbedderVenv(pin){
+  const ok = await showConfirm('Build the venv for transformers ' + pin + '?',
+    'This downloads several GB (torch and that transformers). It runs in the background; you can leave this page.');
   if (!ok) return;
   await fetch('/admin/api/embedder-venv-install', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({name:name})});
+    body: JSON.stringify({pin:pin})});
   loadEmbedderVenvs();
 }
 
-async function removeEmbedderVenv(name){
-  const ok = await showConfirm('Delete the venv for ' + name + '?',
+async function removeEmbedderVenv(pin){
+  const ok = await showConfirm('Delete the venv for transformers ' + pin + '?',
     'The model weights stay in the HF cache. The next request would rebuild the venv, which takes minutes.');
   if (!ok) return;
   const r = await fetch('/admin/api/embedder-venv-remove', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({name:name})});
+    body: JSON.stringify({pin:pin})});
   if (!r.ok){ const j = await r.json().catch(()=>({})); showAlert('Could not delete', j.detail || r.statusText); }
   loadEmbedderVenvs();
 }

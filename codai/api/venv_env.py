@@ -33,6 +33,7 @@ reporting something else entirely.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -472,3 +473,166 @@ def gpu_conv_ok(py) -> Tuple[bool, str]:
         return True, ""
     tail = ((r.stderr or "") or (r.stdout or "")).strip().splitlines()
     return False, (tail[-1][:300] if tail else f"exit {r.returncode}")
+
+
+# --------------------------------------------------------------------------- #
+# An interpreter a venv's pins can live on
+# --------------------------------------------------------------------------- #
+# Shared, because more than one isolated venv needs a python the server is not
+# running. The lip-sync engines pin 3.11 (decord and mediapipe publish nothing
+# for 3.13), and the embedders' transformers 4.42.4 pins tokenizers<0.20 whose
+# newest wheel is cp312 -- so each needs an interpreter found, or fetched, the
+# same way. Both `clean_py_env` above and this live here for the same reason:
+# running a DIFFERENT python than this process's is one problem with one set of
+# answers.
+
+#: python-build-standalone release the interpreters come from -- the same
+#: release and the same publisher the image's own pythons are built from, so a
+#: provisioned 3.11 is the same kind of thing as the bundled 3.10 and 3.13.
+_PBS_RELEASE = "20250612"
+#: Patch version per minor, because the asset name carries the full version.
+#: A minor an engine pins but this map does not know is a hard error with the
+#: name of the file to edit, not a 404 at install time.
+_PBS_PATCH = {"3.10": "3.10.18", "3.11": "3.11.13", "3.12": "3.12.11",
+              "3.13": "3.13.5"}
+_PBS_TRIPLE = {"x86_64": "x86_64-unknown-linux-gnu",
+               "aarch64": "aarch64-unknown-linux-gnu",
+               "arm64": "aarch64-unknown-linux-gnu"}
+
+
+def pbs_url(version: str) -> str:
+    """Download URL for a standalone python of this minor version."""
+    import platform
+    patch = _PBS_PATCH.get(version)
+    if not patch:
+        raise RuntimeError(
+            f"no python-build-standalone version recorded for python {version}; "
+            f"add it to _PBS_PATCH in {__file__}")
+    machine = platform.machine().lower()
+    triple = _PBS_TRIPLE.get(machine)
+    if not triple:
+        raise RuntimeError(
+            f"no standalone python build for this architecture ({machine}); "
+            f"install python {version} yourself, or uv, and retry")
+    return ("https://github.com/astral-sh/python-build-standalone/releases/"
+            f"download/{_PBS_RELEASE}/cpython-{patch}+{_PBS_RELEASE}-{triple}"
+            "-install_only.tar.gz")
+
+
+def provisioned_python_dir(version: str) -> Path:
+    """Where a fetched interpreter is kept: under the config root.
+
+    Not /opt and not a temp dir. The config root is the one directory every
+    deployment mounts and keeps, so an interpreter put there survives an image
+    upgrade and is visible at the same path to the server that will use it --
+    which is the same reason the engines' own install roots live there.
+    """
+    flat = "py" + version.replace(".", "")
+    try:
+        from codai.platform_paths import legacy_style_config_dir
+        return legacy_style_config_dir() / flat
+    except Exception:
+        return Path(os.path.expanduser(f"~/.coderai/{flat}"))
+
+
+def python_minor(py: Path) -> Optional[str]:
+    """``3.11`` for an interpreter that runs, None for one that does not.
+
+    Checked by running it rather than by reading the filename: a dangling
+    symlink named python3.11 is the normal state of a venv built on a host whose
+    interpreter is gone, and it has to count as absent.
+    """
+    try:
+        r = subprocess.run(
+            [str(py), "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=60, env=clean_py_env())
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def standalone_python(version: str) -> Optional[Path]:
+    """A python <version> that is not on PATH: bundled, or already provisioned."""
+    flat = "py" + version.replace(".", "")
+    roots = [Path(f"/opt/coderai/{flat}"), provisioned_python_dir(version)]
+    for root in roots:
+        for cand in (root / "bin" / f"python{version}",
+                     root / "bin" / "python3", root / "bin" / "python"):
+            if cand.is_file() and python_minor(cand) == version:
+                return cand
+    return None
+
+
+def fetch_standalone_python(version: str, log=None) -> Path:
+    """Download and unpack a standalone interpreter; return its python."""
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    url = pbs_url(version)
+    dest = provisioned_python_dir(version)
+    if log:
+        log(f"[python{version}] fetching a standalone interpreter: {url}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(dest.parent),
+                                     prefix=f".{dest.name}-fetch-") as tmp:
+        tar = Path(tmp) / "python.tar.gz"
+        with urllib.request.urlopen(url, timeout=600) as src, open(tar, "wb") as out:
+            shutil.copyfileobj(src, out)
+        # The archive holds a single top-level `python/` directory. filter=
+        # "data" refuses absolute paths, links out of the tree and device nodes
+        # -- the default in 3.14 and the right one for a downloaded archive.
+        with tarfile.open(tar) as tf:
+            tf.extractall(tmp, filter="data")
+        unpacked = Path(tmp) / "python"
+        if not (unpacked / "bin").is_dir():
+            raise RuntimeError(
+                f"the standalone python archive from {url} has no python/bin")
+        # Move into place only once it is complete, so an interrupted fetch
+        # cannot leave a half-tree that _standalone_python would then find.
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.move(str(unpacked), str(dest))
+    found = standalone_python(version)
+    if found is None:
+        raise RuntimeError(
+            f"fetched a standalone python {version} into {dest} but it does not "
+            f"report that version when run")
+    if log:
+        log(f"[python{version}] interpreter ready: {found}")
+    return found
+
+
+def prune_dead_links(venv: Path, log=None) -> int:
+    """Remove symlinks under an existing venv that point nowhere; count them.
+
+    ``python -m venv`` into an existing directory is the supported way to repair
+    one, and it is what keeps the several GB of wheels already installed there
+    instead of fetching them again. But it fails outright on a dangling symlink:
+
+        Error: [Errno 2] No such file or directory:
+        '…/latentsync_venv/bin/python3.11'
+
+    which is exactly the state of a venv built against an interpreter this
+    filesystem has not got -- one built on the host and then used from inside
+    the container, where the host's /usr/bin/python3.11 does not exist. The
+    installed packages are cp311 wheels and do not care which 3.11 runs them,
+    so the dead links go and the packages stay.
+    """
+    gone = 0
+    for d in (venv, venv / "bin"):
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for e in entries:
+            if e.is_symlink() and not e.exists():
+                try:
+                    e.unlink()
+                    gone += 1
+                except OSError:
+                    pass
+    if gone and log:
+        log(f"[{venv.name}] removed {gone} symlink(s) pointing at an "
+            f"interpreter this filesystem has not got")
+    return gone

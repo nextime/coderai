@@ -74,7 +74,7 @@ def test_a_provisioned_interpreter_is_found(le, tmp_path, monkeypatch):
     mine = f"{sys.version_info[0]}.{sys.version_info[1]}"
     root = tmp_path / ("py" + mine.replace(".", ""))
     _fake_python_tree(root, "python3", sys.executable)
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     assert le._standalone_python(mine) == root / "bin" / "python3"
 
 
@@ -84,7 +84,7 @@ def test_an_interpreter_that_does_not_run_counts_as_absent(le, tmp_path, monkeyp
     the file 'exists' by name and cannot execute a byte."""
     root = tmp_path / "py311"
     _fake_python_tree(root, "python3.11", "/nowhere/python3.11")
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     assert le._standalone_python("3.11") is None
     assert le._python_minor(root / "bin" / "python3.11") is None
 
@@ -94,7 +94,7 @@ def test_an_interpreter_of_the_wrong_minor_is_not_accepted(le, tmp_path, monkeyp
     other = "3.11" if mine != "3.11" else "3.10"
     root = tmp_path / ("py" + other.replace(".", ""))
     _fake_python_tree(root, f"python{other}", sys.executable)
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     assert le._standalone_python(other) is None
 
 
@@ -102,7 +102,7 @@ def test_the_provisioned_directory_is_under_the_config_root(le):
     """Not /opt and not a temp dir: the config root is what a deployment mounts
     and keeps, so the interpreter is still there, at the same path, for the
     server that runs the engine."""
-    d = le._provisioned_python_dir("3.11")
+    d = le.venv_env.provisioned_python_dir("3.11")
     assert d.name == "py311"
     from codai.platform_paths import legacy_style_config_dir
     assert d.parent == legacy_style_config_dir()
@@ -120,8 +120,9 @@ def test_the_standalone_interpreter_is_used_when_path_has_none(le, tmp_path, mon
     monkeypatch.setitem(le.ENGINES, "probe", sp)
     root = tmp_path / ("py" + mine.replace(".", ""))
     _fake_python_tree(root, "python3", sys.executable)
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     monkeypatch.setattr(le.shutil, "which", lambda n: None)
+    monkeypatch.setattr(le.venv_env.shutil, "which", lambda n: None)
     monkeypatch.setattr(le, "_uv", lambda: None)
     monkeypatch.setattr(le, "_fetch_standalone_python",
                         lambda *a, **k: pytest.fail("fetched despite a bundled python"))
@@ -146,7 +147,7 @@ def test_a_dead_python_on_path_does_not_consume_the_attempt(le, tmp_path, monkey
     monkeypatch.setattr(le.shutil, "which", lambda n: str(dead))
     root = tmp_path / ("py" + mine.replace(".", ""))
     _fake_python_tree(root, "python3", sys.executable)
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     monkeypatch.setattr(le, "_uv", lambda: None)
     venv = tmp_path / "venv"
     le._create_venv("probe", venv)
@@ -159,6 +160,7 @@ def test_the_error_names_every_route_that_failed(le, tmp_path, monkeypatch):
                        ready_markers=(), probe_imports=())
     monkeypatch.setitem(le.ENGINES, "probe", sp)
     monkeypatch.setattr(le.shutil, "which", lambda n: None)
+    monkeypatch.setattr(le.venv_env.shutil, "which", lambda n: None)
     monkeypatch.setattr(le, "_standalone_python", lambda v: None)
     monkeypatch.setattr(le, "_uv", lambda: None)
     def _boom(v, log=None):
@@ -180,6 +182,7 @@ def test_fetching_is_the_last_route_not_the_first(le, tmp_path, monkeypatch):
                        ready_markers=(), probe_imports=())
     monkeypatch.setitem(le.ENGINES, "probe", sp)
     monkeypatch.setattr(le.shutil, "which", lambda n: None)
+    monkeypatch.setattr(le.venv_env.shutil, "which", lambda n: None)
     monkeypatch.setattr(le, "_standalone_python", lambda v: None)
     seen = []
     fake_uv = tmp_path / "uv"
@@ -207,8 +210,9 @@ def test_a_venv_whose_interpreter_is_gone_is_repaired_not_abandoned(le, tmp_path
     monkeypatch.setitem(le.ENGINES, "probe", sp)
     root = tmp_path / ("py" + mine.replace(".", ""))
     _fake_python_tree(root, "python3", sys.executable)
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     monkeypatch.setattr(le.shutil, "which", lambda n: None)
+    monkeypatch.setattr(le.venv_env.shutil, "which", lambda n: None)
     monkeypatch.setattr(le, "_uv", lambda: None)
 
     venv = tmp_path / "venv"
@@ -235,8 +239,9 @@ def test_an_unrepairable_venv_is_rebuilt_from_scratch(le, tmp_path, monkeypatch)
     monkeypatch.setitem(le.ENGINES, "probe", sp)
     root = tmp_path / ("py" + mine.replace(".", ""))
     _fake_python_tree(root, "python3", sys.executable)
-    monkeypatch.setattr(le, "_provisioned_python_dir", lambda v: root)
+    monkeypatch.setattr(le.venv_env, "provisioned_python_dir", lambda v: root)
     monkeypatch.setattr(le.shutil, "which", lambda n: None)
+    monkeypatch.setattr(le.venv_env.shutil, "which", lambda n: None)
     monkeypatch.setattr(le, "_uv", lambda: None)
 
     # No network in a test: the fetch route must not be the one that saves it.
@@ -259,6 +264,7 @@ def test_the_rebuild_is_attempted_once(le, tmp_path, monkeypatch):
                        ready_markers=(), probe_imports=())
     monkeypatch.setitem(le.ENGINES, "probe", sp)
     monkeypatch.setattr(le.shutil, "which", lambda n: None)
+    monkeypatch.setattr(le.venv_env.shutil, "which", lambda n: None)
     monkeypatch.setattr(le, "_standalone_python", lambda v: None)
     monkeypatch.setattr(le, "_uv", lambda: None)
     tries = []

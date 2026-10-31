@@ -188,7 +188,7 @@ class _EmbeddingModel:
         # llama.cpp contexts are NOT thread-safe: two executor threads calling
         # embed() on one ctx segfault the engine. Serialize per model instance.
         if backend in ('llama', 'llama-vl', 'dinov2cpp', 'vpr-server',
-                       'jinaclip'):
+                       'jinaclip', 'mmembed'):
             import threading
             self.lock = threading.Lock()
         else:
@@ -215,7 +215,8 @@ class _EmbeddingModel:
 
     def _cleanup_locked(self):
         try:
-            if self.backend in ('dinov2cpp', 'vpr-server', 'jinaclip'):
+            if self.backend in ('dinov2cpp', 'vpr-server', 'jinaclip',
+                                 'mmembed'):
                 # persistent embed server subprocess — terminating it frees
                 # its (V)RAM; eviction restarts it on the next request.
                 try:
@@ -676,174 +677,43 @@ def _load_geoclip(model_name, device):
     return _EmbeddingModel('geoclip', (model, mode, device))
 
 
-def _allow_remote_automodel_reregister():
-    """Let remote code register a config class transformers already owns.
+def _tf4_quantization(model_config) -> dict:
+    """The quantization policy for a model served out of the tf4 venv.
 
-    MM-Embed's `modeling_nvmmembed` calls `AutoModel.register(LlavaNextConfig,
-    NVMMEmbedModel)` at IMPORT time. Its config is the plain built-in
-    LlavaNextConfig, which the built-in LLaVA-NeXT model already claims, so
-    transformers 5 refuses:
-
-        '<class …configuration_llava_next.LlavaNextConfig>' is already used by
-        a Transformers model.
-
-    Because it happens while the module is being imported, loading the class
-    directly instead of through AutoModel does not avoid it -- the import is
-    the thing that fails. `exist_ok=True` is defaulted here for the duration,
-    which is what the remote code would pass if it had been written against
-    this version.
-
-    Idempotent and never fatal. Returns a callable that restores the original
-    `register` AND undoes every mapping entry the remote code wrote through it.
-
-    Undoing them is the whole point, and it was missed first time round. The
-    registration is process-wide: `AutoModel.register(LlavaNextConfig, …)` makes
-    every LLaVA-NeXT checkpoint loaded afterwards in this process come back as
-    MM-Embed's class. Measured during a customer test run on zeiss 2026-10-31 --
-    MM-Embed was tried first (and failed on its gated retriever), then e5-v,
-    which IS a LLaVA-NeXT checkpoint, answered
-
-        500 Failed to load embedding model: 'LlavaNextConfig' object has no
-            attribute 'retriever'
-
-    i.e. e5-v was being built as MM-Embed and asked its config for MM-Embed's
-    field. e5-v alone had worked all day; it only breaks after MM-Embed has been
-    touched in the same process, which is why the order the test happened to use
-    found it.
+    Decided HERE, from models.json, and handed to the child as JSON, because
+    the child runs in another venv and cannot import coderai to ask. The skip
+    list is the part that matters: for a vision-language EMBEDDER the tower
+    turns pixels into the vector being compared and the projector is one small
+    matrix whose error lands on every image, so they stay at full precision
+    while the language layers are quantized (hf_loading.quant_skip_modules).
     """
-    try:
-        from transformers.models.auto.auto_factory import _BaseAutoModelClass
-    except Exception:
-        return lambda: None
-    _orig = getattr(_BaseAutoModelClass, 'register', None)
-    if _orig is None or getattr(_orig, '_coderai_exist_ok', False):
-        return lambda: None
+    from codai.models.hf_loading import quant_skip_modules
+    cfg = model_config or {}
+    raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
 
-    #: (extra_content_dict, config_class, was_present, previous_value)
-    _touched = []
+    def _flag(name):
+        return bool(cfg.get(name, raw.get(name, False)))
 
-    @classmethod
-    def _register(cls, config_class, model_class, exist_ok=True):
-        # `exist_ok=True` writes into the lazy mapping's _extra_content, so that
-        # dict is where an override lives and where it has to be taken back
-        # from. Recorded BEFORE the call, because afterwards the old value is
-        # gone. Never `.get()` on the lazy mapping itself: _LazyAutoMapping.get
-        # requires a default and raises without one.
-        try:
-            _extra = getattr(getattr(cls, '_model_mapping', None),
-                             '_extra_content', None)
-            if isinstance(_extra, dict):
-                _touched.append((_extra, config_class,
-                                 config_class in _extra,
-                                 _extra.get(config_class)))
-        except Exception:
-            pass
-        return _orig.__func__(cls, config_class, model_class, exist_ok=True)
-
-    _register.__func__._coderai_exist_ok = True
-    _BaseAutoModelClass.register = _register
-
-    def _restore():
-        setattr(_BaseAutoModelClass, 'register', _orig)
-        for _extra, _key, _had, _was in reversed(_touched):
-            try:
-                if _had:
-                    _extra[_key] = _was
-                else:
-                    _extra.pop(_key, None)
-            except Exception:
-                pass
-        del _touched[:]
-
-    return _restore
+    spec = {"load_in_4bit": _flag('load_in_4bit'),
+            "load_in_8bit": _flag('load_in_8bit'),
+            "compute_dtype": str(cfg.get('precision')
+                                 or raw.get('precision') or 'bf16')}
+    if spec["load_in_4bit"] or spec["load_in_8bit"]:
+        spec["skip_modules"] = quant_skip_modules(cfg) or []
+    return spec
 
 
-def _load_mmembed(model_name, device, model_config=None):
-    """NVIDIA MM-Embed, loaded through its own remote code.
+def _load_tf4_embedder(model_name, device, model_config=None, backend=''):
+    """A model that only runs on transformers 4, as a subprocess in its own venv.
 
-    `trust_remote_code` is required by the checkpoint (its encode() lives in the
-    repo), and is passed explicitly rather than taken from the model entry: a
-    model that cannot load without it is not served by silently failing when the
-    operator has not set the flag.
+    jina-clip-v2 and MM-Embed both come through here. Neither is loadable in
+    this process: jina's image tower returns NaNs on transformers 5 and
+    MM-Embed's remote code asks for names transformers 5 deleted, one after the
+    other, while registering LlavaNextConfig process-wide on the way past --
+    which is what made e5-v start answering with MM-Embed's config error.
+    :mod:`codai.api.tf4_embedders` owns the venv and builds it on demand.
     """
-    import torch
-    from transformers import AutoModel
-    from codai.models.hf_loading import build_from_pretrained_kwargs
-    kw = {'trust_remote_code': True}
-    fp = build_from_pretrained_kwargs(model_config)
-    if 'quantization_config' in fp:
-        kw['quantization_config'] = fp['quantization_config']
-    else:
-        # `dtype`, not `torch_dtype`. transformers 5 renamed it, and a model
-        # whose remote config walks its kwargs chokes on the legacy name:
-        #   TypeError: attribute name must be string, not 'torch.dtype'
-        # Measured on zeiss 2026-10-31 — jina-clip-v2 fails with torch_dtype=
-        # and loads with dtype=. The legacy name still works for models with
-        # no remote config code, which is why the rest of the stack has not
-        # noticed; it is not changed here.
-        kw['dtype'] = torch.float16
-
-    # Load the repo's class DIRECTLY rather than through AutoModel.
-    #
-    # Its config is a plain LlavaNextConfig, and AutoModel honouring the
-    # `auto_map` tries to register that config against the remote class —
-    # which transformers 5 refuses, because the built-in LLaVA-NeXT model
-    # already owns it:
-    #
-    #   '<class …configuration_llava_next.LlavaNextConfig>' is already used
-    #   by a Transformers model.
-    #
-    # Fetching the class by its auto_map path skips the registry entirely and
-    # loads the same weights with the same code. Falls back to AutoModel so a
-    # future checkpoint that registers cleanly still works.
-    model = None
-    _restore = _allow_remote_automodel_reregister()
-    try:
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-        _ref = None
-        try:
-            from transformers import AutoConfig
-            _cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            _ref = (getattr(_cfg, 'auto_map', None) or {}).get('AutoModel')
-        except Exception:
-            _ref = None
-        if _ref:
-            _cls = get_class_from_dynamic_module(_ref, model_name)
-            model = _cls.from_pretrained(model_name, **kw)
-            print(f"  [embeddings] {model_name}: loaded {_ref} directly "
-                  f"(AutoModel cannot register its config)", flush=True)
-    except Exception as _e:
-        print(f"  [embeddings] direct class load failed ({type(_e).__name__}: "
-              f"{_e}); falling back to AutoModel", flush=True)
-        model = None
-    try:
-        if model is None:
-            model = AutoModel.from_pretrained(model_name, **kw)
-    finally:
-        _restore()
-    if 'quantization_config' not in kw and 'device_map' not in kw:
-        model = model.to(device)
-    model.eval()
-    return _EmbeddingModel('mmembed', (model, device))
-
-
-def _load_jinaclip(model_name, device, model_config=None):
-    """jina-clip-v2 in its OWN venv, as a subprocess.
-
-    Not in this process, and not optionally. The model's remote code is pinned
-    by its own config to a July-2025 revision that will never be transformers-5
-    code: on the server's transformers 5.12 it needs two shims to import at all
-    and then returns 1024 NaNs from every image -- measured on zeiss at fp32,
-    bf16 and fp16, with xattn on and off, and outside coderai too. The same
-    weights and images on transformers 4.49 give finite unit-norm vectors with
-    cos(text, image) ~0.26, on CUDA and CPU alike.
-
-    So an in-process path is kept only as far as the error message: there is no
-    stack this process can offer the model that produces a usable vector, and a
-    second code path that silently produces NaNs is worth nothing.
-    (:mod:`codai.api.jinaclip_worker` owns the venv and builds it on demand.)
-    """
-    from codai.api import jinaclip_worker
+    from codai.api import tf4_embedders
 
     cfg = model_config or {}
     raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
@@ -851,48 +721,53 @@ def _load_jinaclip(model_name, device, model_config=None):
     # how every other backend here is told to stay on the CPU.
     _ngl = cfg.get('n_gpu_layers', raw.get('n_gpu_layers'))
     _dev = 'cpu' if (str(device) == 'cpu' or _ngl == 0) else 'cuda'
+    _quant = _tf4_quantization(model_config)
 
     def _spawn():
-        return jinaclip_worker.spawn(model_name, device=_dev)
+        return tf4_embedders.spawn(model_name, device=_dev,
+                                   quantization=_quant)
 
-    return _EmbeddingModel('jinaclip', _spawn(), respawn=_spawn)
+    return _EmbeddingModel(backend or 'jinaclip', _spawn(), respawn=_spawn)
 
 
-def _jinaclip_proc(model_obj):
+def _tf4_proc(model_obj):
     """The live server for this handle, respawned if it has died.
 
     Eviction frees this model's VRAM by killing the child (see
     ``_cleanup_locked``), and the cached handle outlives it, so every request
     has to be able to find a dead process and start another one.
     """
-    from codai.api import jinaclip_worker
+    from codai.api import tf4_embedders
 
     proc = model_obj.model if hasattr(model_obj, 'model') else model_obj
     if getattr(proc, 'poll', None) is not None and proc.poll() is not None:
         _rs = getattr(model_obj, 'respawn', None)
         if _rs is None:
             raise RuntimeError(
-                "the jina-clip server died — retry (it will reload)")
+                "the embedding server died — retry (it will reload)")
         proc = _rs()
         model_obj.model = proc
-    return jinaclip_worker, proc
+    return tf4_embedders, proc
 
 
-def _jinaclip_embed_texts(model_obj, texts, dimensions=None):
+def _tf4_embed_texts(model_obj, texts, dimensions=None, instruction=""):
     import contextlib
-    worker, proc = _jinaclip_proc(model_obj)
+    worker, proc = _tf4_proc(model_obj)
+    payload = {'texts': list(texts)}
+    if instruction:
+        payload['instruction'] = instruction
     _mlock = getattr(model_obj, 'lock', None)
     with (_mlock if _mlock is not None else contextlib.nullcontext()):
-        rows = worker.request(proc, {'texts': list(texts)})
+        rows = worker.request(proc, payload)
     rows = _truncate_dims([list(map(float, r)) for r in rows], dimensions)
-    return _require_finite(rows, 'jina-clip', 'text embedding')
+    return _require_finite(rows, 'tf4-embed', 'text embedding')
 
 
-def _jinaclip_embed_images(model_obj, pil_images, dimensions=None):
+def _tf4_embed_images(model_obj, pil_images, dimensions=None):
     import contextlib
     import os as _os
     import tempfile
-    worker, proc = _jinaclip_proc(model_obj)
+    worker, proc = _tf4_proc(model_obj)
     paths = []
     try:
         for im in pil_images:
@@ -909,30 +784,7 @@ def _jinaclip_embed_images(model_obj, pil_images, dimensions=None):
             except OSError:
                 pass
     rows = _truncate_dims([list(map(float, r)) for r in rows], dimensions)
-    return _require_finite(rows, 'jina-clip', 'image embedding')
-
-
-def _mmembed_embed(model_tuple, items, dimensions=None, instruction=""):
-    """Embed MM-Embed `items` -- dicts carrying 'txt' and/or 'img'.
-
-    Its encode() returns ``{'hidden_states': tensor}`` already L2-normalised, so
-    the vectors are used as given; `dimensions` truncation re-normalises, which
-    `_truncate_dims` handles.
-    """
-    import torch
-    model, _device = model_tuple
-    kw = {'max_length': 4096}
-    if instruction:
-        # The query side of an asymmetric retrieval pair. Without an
-        # instruction the model embeds the item as a PASSAGE, which is the
-        # right default for "embed this" and the wrong one for a query.
-        kw['is_query'] = True
-        kw['instruction'] = instruction
-    with torch.no_grad():
-        out = model.encode(items, **kw)
-    vecs = out['hidden_states'] if isinstance(out, dict) else out
-    vecs = vecs.float().cpu().tolist()
-    return _truncate_dims(vecs, dimensions)
+    return _require_finite(rows, 'tf4-embed', 'image embedding')
 
 
 def _parse_latlon(s):
@@ -1194,11 +1046,16 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
 
     # GeoCLIP image/location encoders (shared 512-d space). Caught before the
     # GGUF/HF paths — 'geoclip'/'geoclip-location' are logical ids, not repos.
+    # The two models that only run on transformers 4: one isolated venv, one
+    # subprocess each. Caught here, before any in-process route, because for
+    # these there is no in-process route that produces a usable vector.
     if _is_jinaclip(model_name):
-        return _load_jinaclip(model_name, device, model_config)
+        return _load_tf4_embedder(model_name, device, model_config,
+                                  backend='jinaclip')
 
     if _is_mmembed(model_name):
-        return _load_mmembed(model_name, device, model_config)
+        return _load_tf4_embedder(model_name, device, model_config,
+                                  backend='mmembed')
 
     if _is_geoclip(model_name):
         return _load_geoclip(model_name, device)
@@ -2441,10 +2298,8 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None,
         return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'text': t} for t in texts], dimensions)
-    elif backend == 'jinaclip':
-        return _jinaclip_embed_texts(model_obj, texts, dimensions)
-    elif backend == 'mmembed':
-        return _mmembed_embed(model, [{'txt': t} for t in texts], dimensions)
+    elif backend in ('jinaclip', 'mmembed'):
+        return _tf4_embed_texts(model_obj, texts, dimensions)
     elif backend == 'geoclip':
         _obj, _mode, _dev = model
         if _mode == 'location':
@@ -2609,10 +2464,8 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'image': im} for im in pil_images],
                                dimensions)
-    elif backend == 'jinaclip':
-        return _jinaclip_embed_images(model_obj, pil_images, dimensions)
-    elif backend == 'mmembed':
-        return _mmembed_embed(model, [{'img': im} for im in pil_images], dimensions)
+    elif backend in ('jinaclip', 'mmembed'):
+        return _tf4_embed_images(model_obj, pil_images, dimensions)
     elif backend == 'geoclip':
         return _geoclip_embed_images(model, pil_images, dimensions)
     elif backend == 'vpr':
