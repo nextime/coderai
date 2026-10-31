@@ -655,6 +655,82 @@ def _finish_image_load(pipeline, model_config):
     return pipeline
 
 
+def _is_cuda_oom(exc) -> bool:
+    """Whether this exception is the GPU running out of memory.
+
+    Matched by type where torch offers one and by text otherwise, because the
+    same condition arrives as ``torch.OutOfMemoryError``, as a bare
+    ``RuntimeError`` from older call paths, and as a diffusers error that only
+    wraps the message.
+    """
+    try:
+        import torch
+        if isinstance(exc, getattr(torch, "OutOfMemoryError", ())):
+            return True
+    except Exception:
+        pass
+    return "out of memory" in str(exc).lower()
+
+
+#: VRAM, in GB, at or below which an undeclared precision becomes a half one.
+#: A 24 GB card cannot hold an SDXL checkpoint at f32 and still decode its VAE;
+#: an 80 GB card can, and upcasting there costs nothing anyone will notice.
+AUTO_HALF_PRECISION_VRAM_GB = 32.0
+
+
+def _largest_visible_vram_gb() -> float:
+    """Total VRAM (GB) of the biggest card this engine may use, 0.0 if unknown.
+
+    Deliberately the LARGEST and not the sum: a pipeline loads onto one card
+    unless it is explicitly sharded, so two 24 GB cards do not make a 48 GB one.
+    """
+    try:
+        from codai.models.gpu_query import visible_gpu_memory
+        best = 0.0
+        for d in (visible_gpu_memory() or []):
+            best = max(best, float(d.get("total") or 0) / 1e9)
+        return best
+    except Exception:
+        return 0.0
+
+
+def _auto_precision() -> tuple:
+    """Resolve precision "auto" to (precision, why) from the card's size.
+
+    The policy, and the reason it is not simply "always half":
+
+    A checkpoint published at fp16/bf16 loaded at f32 takes twice the VRAM for
+    weights that were never computed at that width. On a 24 GB card that is the
+    difference between fitting and not: measured 2026-10-31 on zeiss,
+    pornmaster-pro-pony (SDXL, no declared precision) loaded at f32, completed
+    all 30 denoising steps, and then died on the VAE decode -- "Tried to
+    allocate 1008.00 MiB ... 704.69 MiB is free" -- with 22.12 GiB of a 23.56
+    GiB card held by its own weights. The same architecture at half width
+    measures 7.49 GB and leaves the decode room to breathe.
+
+    On a card big enough to hold both, f32 is harmless and is left alone: this
+    is a rule about not overflowing small cards, not a claim that half precision
+    is better. An unknown card size is treated as small, because that is the
+    case where guessing wrong is survivable.
+
+    bf16 rather than fp16 for the half type. They are both two bytes, so the
+    VRAM saving is identical, but fp16 tops out near 65504 and a flow-matching
+    DiT runs past it: the latents go NaN and the VAE decodes NaN to a uniform
+    black image, answered 200 OK with a plausible PNG and nothing in the log
+    (measured on Z-Image-Turbo, 2026-10-25). A model that wants fp16 can still
+    ask for it by name.
+    """
+    vram = _largest_visible_vram_gb()
+    if vram <= 0:
+        return 'bf16', "card size unknown — treating it as small"
+    if vram <= AUTO_HALF_PRECISION_VRAM_GB:
+        return 'bf16', (f"{vram:.0f} GB card at or under "
+                        f"{AUTO_HALF_PRECISION_VRAM_GB:.0f} GB — f32 would double "
+                        f"the weights of a checkpoint published at half width")
+    return 'f32', (f"{vram:.0f} GB card is over "
+                   f"{AUTO_HALF_PRECISION_VRAM_GB:.0f} GB — f32 fits")
+
+
 def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = None):
     """
     Try to load a model using the diffusers library.
@@ -722,11 +798,12 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     #
     # An explicit 'f32' on the card is still honoured: this changes the default,
     # not the operator's choice.
-    _precision_cfg = _cfg('precision')
-    precision = str(_precision_cfg or '').strip() or 'bf16'
-    if not _precision_cfg:
-        print(f"Using precision: {precision} (card states none; f32 would "
-              f"double the weights of a checkpoint published at half width)")
+    _precision_cfg = str(_cfg('precision') or '').strip()
+    _auto_why = ''
+    if not _precision_cfg or _precision_cfg.lower() == 'auto':
+        precision, _auto_why = _auto_precision()
+    else:
+        precision = _precision_cfg
     precision_map = {
         'bf16': torch.bfloat16,
         'f32': torch.float32,
@@ -753,7 +830,8 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
             print("--no-ram mode: precision was f32 -> using fp16 "
                   "(half the VRAM, and FlashAttention needs a half type)")
         else:
-            print(f"--no-ram mode: keeping the configured precision "
+            _src = f"auto ({_auto_why})" if _auto_why else "configured"
+            print(f"--no-ram mode: keeping the {_src} precision "
                   f"{precision} (fp16 would be the same size and a narrower "
                   f"range)")
     else:
@@ -776,7 +854,8 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                       "(f32 breaks FlashAttention and defeats quantization)")
                 dtype = torch.bfloat16
                 precision = 'bf16'
-        print(f"Using precision: {precision} ({dtype})")
+        _suffix = f" (auto: {_auto_why})" if _auto_why else ""
+        print(f"Using precision: {precision} ({dtype}){_suffix}")
     
     # CPU offload comes from the per-model configuration: an explicit
     # cpu_offload flag, or an offload_strategy that implies CPU offloading.
@@ -1627,6 +1706,17 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     width, height = _parse_size(request.size, 1024, 1024, global_args)
 
     # Enable memory optimizations
+    #
+    # Slicing decodes the batch one image at a time; TILING decodes one image in
+    # overlapping tiles, and that is the one that bounds the peak of a large
+    # single image. Slicing alone does nothing for n=1, which is why a 768x1344
+    # decode could still ask for a contiguous 1008 MiB on a card its own weights
+    # had just filled (zeiss, 2026-10-31: pornmaster-pro-pony and Krea-2 both
+    # finished every denoising step and then died in the decode).
+    #
+    # Tiling is off unless the model asks for it, because it trades a little
+    # seam fidelity for the headroom and that is the operator's call -- the same
+    # `vae_tiling` key the video path reads, where it defaults ON instead.
     try:
         if hasattr(pipeline, 'enable_attention_slicing'):
             pipeline.enable_attention_slicing(slice_size="auto")
@@ -1634,6 +1724,16 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             pipeline.vae.enable_slicing()
         elif hasattr(pipeline, 'enable_vae_slicing'):
             pipeline.enable_vae_slicing()
+        if (model_config or {}).get('vae_tiling'):
+            _tiled = False
+            if hasattr(pipeline, 'vae') and hasattr(pipeline.vae, 'enable_tiling'):
+                pipeline.vae.enable_tiling()
+                _tiled = True
+            elif hasattr(pipeline, 'enable_vae_tiling'):
+                pipeline.enable_vae_tiling()
+                _tiled = True
+            _state = 'enabled' if _tiled else 'requested, but this pipeline offers none'
+            print(f"  [image] VAE tiling {_state} (vae_tiling=true)")
     except Exception as e:
         print(f"Warning: Could not enable memory optimizations: {e}")
 
@@ -2575,6 +2675,9 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                                cancellable=False, pausable=False)
 
         # Try diffusers first (for non-GGUF models)
+        # Set once the pipeline is in hand, so GENERATION runs outside the load's
+        # exception handler. See the note where it is consumed below.
+        _loaded_diffusers = None
         if not is_gguf:
             try:
                 print(f"Loading diffusers model: {model_name}")
@@ -2611,9 +2714,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     print(f"Loaded diffusers model: {model_name}")
 
                     _treg.finish(_ltid, "done")
-                    return await _generate_with_diffusers(pipeline, request, global_args,
-                                                          http_request, model_config=_diff_cfg)
-                    
+                    _loaded_diffusers = pipeline
+
             except HTTPException:
                 # The model loaded and the request itself was rejected (a bad
                 # size, an embedding that does not exist). Falling through to
@@ -2628,7 +2730,52 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 diffusers_error = str(e)
                 print(f"diffusers error: {diffusers_error}")
                 print(f"Traceback: {traceback.format_exc()}")
-        
+
+            # Generation runs HERE, outside the load's try, because a failure
+            # during generation is not a failure to load and must not be
+            # reported as one.
+            #
+            # It used to run inside that try. A model would load, denoise every
+            # step, and die on the final VAE decode -- and the handler above
+            # filed the decode's OOM as `diffusers_error`, fell through to the
+            # sd.cpp branch, and answered "Failed to load image model 'X'.
+            # Errors: diffusers: CUDA out of memory". Measured on zeiss
+            # 2026-10-31: pornmaster-pro-pony finished 30/30 steps and Krea-2
+            # finished 8/8, then both failed on a 1008 MiB and a 190 MiB
+            # allocation respectively -- the VAE decode of a 768x1344 image, not
+            # a weight load. Two separate readers concluded from that wording
+            # that eviction was leaking VRAM and that the models never loaded;
+            # neither was true, and the real causes (an f32 default and no
+            # decode headroom) went unexamined. The same wording had already
+            # mislabelled a seeded-request failure once before -- see
+            # :func:`codai.models.utils.generator_device`.
+            #
+            # A loaded model also means the sd.cpp fallback is wrong: the
+            # backend worked, so retrying the request on another one would
+            # answer a confused report about backends that never failed.
+            if _loaded_diffusers is not None:
+                try:
+                    return await _generate_with_diffusers(
+                        _loaded_diffusers, request, global_args,
+                        http_request, model_config=_diff_cfg)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    import traceback
+                    print(f"image generation error (model '{model_name}' IS "
+                          f"loaded): {e}")
+                    print(f"Traceback: {traceback.format_exc()}")
+                    _oom = _is_cuda_oom(e)
+                    _treg.finish(_ltid, "error", str(e))
+                    raise HTTPException(
+                        status_code=503 if _oom else 500,
+                        detail=(f"Image generation failed for '{model_name}' — "
+                                f"the model loaded and ran, so this is not a "
+                                f"load failure. "
+                                + (f"The GPU ran out of memory while finishing "
+                                   f"the image (typically the VAE decode): {e}"
+                                   if _oom else str(e))))
+
         # Try stable-diffusion-cpp-python (for GGUF models or as fallback)
         try:
             # For GGUF models or URLs, resolve the model path through the cache

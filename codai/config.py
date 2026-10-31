@@ -358,7 +358,10 @@ class ImageConfig:
     width: int = 512
     height: int = 512
     cfg_scale: float = 1.0
-    precision: str = "f32"
+    # "auto" = decide from the card (see codai.api.images._auto_precision):
+    # a card of 32 GB or less gets a half precision, a bigger one keeps f32.
+    # An explicit "f32"/"bf16"/"f16" here, or on a model, is always honoured.
+    precision: str = "auto"
     cpu_offload: bool = False
     seed: Optional[int] = None
     vae_tiling: bool = False

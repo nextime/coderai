@@ -412,8 +412,10 @@ def test_a_rejected_request_is_not_mistaken_for_a_failed_backend():
     head = src.index("Step 4: Model not loaded")
     tail = src.index("Step 5: Both backends failed")
     section = src[head:tail]
-    # one pass-through per backend attempt, each above its catch-all
-    assert section.count("except HTTPException:") == 2
+    # One pass-through per backend attempt, each above its catch-all -- plus a
+    # third for the generate call, which now runs outside the load's handler so
+    # a VAE-decode OOM is not reported as "Failed to load image model".
+    assert section.count("except HTTPException:") == 3
     for idx in (section.index("diffusers_error = str(e)\n                print(f\"diffusers error"),
                 section.index("sdcpp_error = str(e)\n            print(f\"sd.cpp error")):
         assert "except HTTPException:" in section[max(0, idx - 700):idx]

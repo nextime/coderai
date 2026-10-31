@@ -43,16 +43,23 @@ def test_an_image_card_without_a_precision_does_not_get_f32():
     down -- so a model's width in bytes came down to an unrelated flag."""
     src = _src("codai/api/images.py")
     assert "_cfg('precision', 'f32')" not in src
-    assert "precision = str(_precision_cfg or '').strip() or 'bf16'" in src
+    # The default is no longer a constant: it resolves from the card, because a
+    # card big enough to hold an f32 checkpoint loses nothing by upcasting
+    # while a 24 GB one cannot hold the weights AND decode the VAE. See
+    # tests/test_image_precision_auto_and_decode_errors.py for the policy and
+    # the measurement behind it.
+    assert "_auto_precision()" in src
+    assert "AUTO_HALF_PRECISION_VRAM_GB" in src
 
 
 def test_an_explicit_f32_is_still_honoured():
     """Changing a default must not overrule an operator who chose."""
     src = _src("codai/api/images.py")
-    head = src.index("_precision_cfg = _cfg('precision')")
+    head = src.index("_precision_cfg = str(_cfg('precision')")
     assert "_cfg('precision')" in src[head:head + 200]
-    # The default is applied only when the card states nothing.
-    assert "if not _precision_cfg:" in src
+    # The default is applied only when the card states nothing, or says "auto".
+    assert "if not _precision_cfg or _precision_cfg.lower() == 'auto':" in src
+    assert "precision = _precision_cfg" in src
 
 
 # ---------------------------------------------------------------------------

@@ -141,7 +141,7 @@ def test_the_prefix_reaches_the_encode_and_the_cache_key_together():
     prefixes would share one entry and the second would get the first's text."""
     src = open("codai/api/images.py").read()
     head = src.index("async def _generate_with_diffusers")
-    body = src[head:head + 9000]
+    body = src[head:head + 12000]   # the function grew; the two calls are still paired
     assert "prompt, neg_prompt = _effective_prompts(request, model_config)" in body
     assert "_embed_cache.get(prompt, neg_prompt, model_id)" in body
     assert "_embed_cache.get(request.prompt" not in body
