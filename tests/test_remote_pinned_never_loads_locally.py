@@ -140,15 +140,20 @@ def test_a_real_url_still_reaches_requests(monkeypatch):
     from codai.models.cache import download_model
     seen = {}
 
+    # A one-byte body, not an empty one. download_model now refuses a download
+    # that delivered nothing ("the server sent no data for ..."), which is
+    # right -- a zero-byte GGUF is not a model -- and left this stub testing
+    # that guard instead of the thing it is here for: that the URL reaches
+    # requests at all.
     class _Resp:
-        headers = {"content-length": "0"}
+        headers = {"content-length": "1"}
         status_code = 200
 
         def raise_for_status(self):
             return None
 
         def iter_content(self, chunk_size=0):
-            return iter(())
+            return iter((b"\0",))
 
     def _get(url, **k):
         seen["url"] = url
