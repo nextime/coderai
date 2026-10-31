@@ -270,6 +270,22 @@ def _candidate_dirs(pin: str) -> list:
     names = [f"embedders-tf-{pin}-venv"]
     if pin == "4.49.0":
         names += ["tf4-embedders-venv", "jinaclip-venv"]
+    # Roomiest root first for a venv that does not exist yet. Six GB has to go
+    # somewhere, and the cache roots are not equivalent: on zeiss the engines'
+    # CODERAI_CACHE_DIR is /AI/guffcache with 197 GB free while the default
+    # cache root had 15 GB, and building there took that partition to 11 MB
+    # free -- at which point HF_HOME, also on it, failed every download with
+    # "No space left on device" and MM-Embed fell back to the CPU. An EXISTING
+    # venv still wins over a roomier empty root: the order below is only
+    # consulted after the caller has looked for one.
+    def _free(d: Path) -> int:
+        try:
+            st = os.statvfs(d if d.exists() else d.parent)
+            return st.f_bavail * st.f_frsize
+        except Exception:
+            return 0
+
+    roots.sort(key=_free, reverse=True)
     out = []
     for root in roots:
         for name in names:
@@ -517,6 +533,21 @@ def _create_venv_on(version: str, venv: Path, say) -> Path:
     return made
 
 
+def _pump_stderr(proc: subprocess.Popen, model_id: str) -> None:
+    """Copy the child's stderr into this process's log until it closes."""
+    def _run():
+        try:
+            for line in proc.stderr:
+                line = line.rstrip()
+                if line:
+                    print(f"[tf4-embed:{model_id}] {line}", flush=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True,
+                     name=f"tf4-stderr-{model_id}").start()
+
+
 def _die_with_parent():
     try:
         import ctypes
@@ -567,18 +598,23 @@ def spawn(model_id: str, device: str = "cuda", load_timeout: float = 900.0,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env, text=True, bufsize=1,
         preexec_fn=_die_with_parent)
+    # Pump stderr into the engine log, in a thread, for the whole life of the
+    # child. Not only on a silent exit, which is all this used to do: a child
+    # that falls back from the GPU to the CPU says so on stderr, and MM-Embed
+    # did exactly that on zeiss 2026-10-31 -- "ready on cpu" in the log, 33 GB
+    # of host RAM, 1100% CPU, and the reason sitting unread in a pipe. A pipe
+    # nobody drains is also a pipe that fills: 64 KB of warnings and the child
+    # blocks writing to it, which looks like a model that hangs.
+    _pump_stderr(proc, model_id)
     deadline = time.time() + float(load_timeout)
     while time.time() < deadline:
         line = proc.stdout.readline()
         if not line:
-            err = ""
-            try:
-                err = (proc.stderr.read() or "")[-800:]
-            except Exception:
-                pass
+            # stderr is being pumped to the log by the thread above, so the
+            # reason is already there rather than read from the pipe here.
             raise RuntimeError(
-                f"the {spec.family} server exited while loading"
-                + (f": {err.strip()}" if err.strip() else ""))
+                f"the {spec.family} server for {model_id} exited while "
+                f"loading; its output is in the engine log")
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -589,7 +625,16 @@ def spawn(model_id: str, device: str = "cuda", load_timeout: float = 900.0,
         if msg.get("ready"):
             print(f"[tf4-embed] {model_id} ready on {msg.get('device')} "
                   f"({msg.get('dim')}-d, transformers "
-                  f"{msg.get('transformers')})", flush=True)
+                  f"{msg.get('transformers')}"
+                  + (", quantized" if msg.get("quantized") else "")
+                  + ")", flush=True)
+            if msg.get("gpu_error"):
+                # Loud, because the difference is 30x and tens of GB of host
+                # RAM: a model on the CPU because it was pinned there and a
+                # model on the CPU because the GPU load failed look identical
+                # in the log otherwise.
+                print(f"[tf4-embed] {model_id} IS ON THE CPU because the GPU "
+                      f"load failed: {msg['gpu_error']}", flush=True)
             return proc
         if msg.get("error"):
             proc.kill()

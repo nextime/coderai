@@ -36,6 +36,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 EMB = (ROOT / "codai/api/embeddings.py").read_text(encoding="utf-8")
 SERVER = (ROOT / "codai/api/tf4_embed_server.py").read_text(encoding="utf-8")
+SERVER_SRC = SERVER
 
 
 @pytest.fixture
@@ -51,12 +52,20 @@ def test_an_explicit_venv_path_wins(w, tmp_path, monkeypatch):
     assert w.resolve_venv_dir("4.49.0") == tmp_path / "v"
 
 
-def test_otherwise_it_sits_under_the_cache_root(w, tmp_path, monkeypatch):
-    """Rebuildable derived state, several GB of it -- not the config root."""
+def test_otherwise_it_sits_under_a_cache_root(w, tmp_path, monkeypatch):
+    """Rebuildable derived state, several GB of it -- not the config root.
+
+    Which cache root is a separate question (the roomiest, see below), so this
+    pins the only one on offer.
+    """
     monkeypatch.delenv("CODERAI_TF4_EMBEDDERS_VENV", raising=False)
     monkeypatch.delenv("CODERAI_JINACLIP_VENV", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setenv("CODERAI_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(w, "_BAKED_VENV", tmp_path / "nothing-here")
+    monkeypatch.setattr(w, "_pointer_file", lambda pin: tmp_path / "none")
+    import codai.platform_paths as pp
+    monkeypatch.setattr(pp, "legacy_style_cache_root", lambda: tmp_path / "xdg")
     assert w.resolve_venv_dir("4.49.0") == tmp_path / "embedders-tf-4.49.0-venv"
 
 
@@ -288,6 +297,10 @@ def test_the_fallback_pins_mirror_the_requirements_file(w):
 def test_a_missing_requirements_file_installs_the_pins_instead(w, monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(w, "_REQUIREMENTS", tmp_path / "not-here.txt")
+    # Into tmp_path, NOT the real config root: this test wrote a pointer file
+    # into ~/.coderai naming a pytest directory, which a later process would
+    # then have resolved the venv from.
+    monkeypatch.setattr(w, "_pointer_file", lambda pin: tmp_path / "ptr")
     monkeypatch.setattr(w, "resolve_venv_dir", lambda pin="4.49.0": tmp_path / "venv")
     monkeypatch.setattr(w.venv_env, "create_venv",
                         lambda d, **k: Path(sys.executable))
@@ -696,3 +709,103 @@ def test_the_extras_reach_the_pip_command(w, monkeypatch, tmp_path):
     w.ensure_installed("4.42.4")
     install = [c for c in cmds if "install" in c and "-U" not in c][0]
     assert "peft==0.11.1" in install and "datasets==2.20.0" in install, install
+
+
+# ── what the child says, and to whom ─────────────────────────────────────────
+
+def test_the_childs_stderr_reaches_the_log(w, capsys):
+    """A reason nobody reads is a reason nobody has. MM-Embed fell back from the
+    GPU to the CPU on zeiss 2026-10-31 — "ready on cpu" in the log, 33 GB of
+    host RAM, 1100% CPU — and said why on a stderr pipe that was only ever read
+    if the child exited silently."""
+    import io
+    import types
+    proc = types.SimpleNamespace(
+        stderr=io.StringIO("would not load on the GPU (CUDA error)\nretrying\n"))
+    w._pump_stderr(proc, "nvidia/MM-Embed")
+    import time
+    for _ in range(50):
+        if "would not load" in capsys.readouterr().out:
+            return
+        time.sleep(0.02)
+    pytest.fail("the child's stderr never reached the log")
+
+
+def test_the_pipe_is_drained_for_the_childs_whole_life():
+    """Not only on a silent exit: a pipe nobody drains fills at 64 KB and the
+    child blocks writing to it, which looks like a model that hangs."""
+    src = (ROOT / "codai/api/tf4_embedders.py").read_text(encoding="utf-8")
+    i = src.index("proc = subprocess.Popen(")
+    assert "_pump_stderr(proc, model_id)" in src[i:i + 1400]
+    # …and the failure path no longer competes with the pump for the pipe.
+    assert "proc.stderr.read()" not in src
+
+
+def test_a_cpu_fallback_is_loud_and_says_why():
+    """A model pinned to the CPU and a model that fell to it look identical in
+    the log otherwise, and the difference is 30x and tens of GB."""
+    src = (ROOT / "codai/api/tf4_embedders.py").read_text(encoding="utf-8")
+    # The phrase is split across two source lines by the f-string.
+    assert "IS ON THE CPU because the GPU " in src and "load failed" in src
+    assert "gpu_error" in SERVER_SRC and "fell_back" in SERVER_SRC
+
+
+def test_a_failed_gpu_load_gives_the_card_back():
+    """It has already allocated by the time it fails, and those allocations live
+    in the process's CUDA context for the rest of its life: measured at
+    9756 MiB held by a model that was running on the CPU, invisible to the
+    manager's ledger and unusable by anything else."""
+    i = SERVER_SRC.index("fell_back = f\"{type(exc).__name__}")
+    body = SERVER_SRC[i:i + 1200]
+    assert "empty_cache()" in body
+    assert body.index("empty_cache()") < body.index('device = "cpu"')
+
+
+def test_no_test_here_writes_into_the_real_config_root(w):
+    """One did: it ran ensure_installed() without patching _pointer_file and
+    left ~/.coderai/embedders-tf-4.49.0-venv.path naming a pytest tmpdir, which
+    a later process would have resolved the venv from."""
+    src = (ROOT / "tests/test_tf4_embedders.py").read_text(encoding="utf-8")
+    for block in src.split("\ndef test_")[1:]:
+        if "ensure_installed(" in block and "_pointer_file" not in block:
+            pytest.fail("a test calls ensure_installed() without redirecting "
+                        "_pointer_file:\n  " + block.splitlines()[0])
+
+
+def test_a_new_venv_goes_on_the_roomiest_root(w, monkeypatch, tmp_path):
+    """Six GB has to go somewhere, and the cache roots are not equivalent. On
+    zeiss the engines' CODERAI_CACHE_DIR is /AI/guffcache (197 GB free) while
+    the default cache root had 15 GB — building there took that partition to
+    11 MB free, and HF_HOME lives on it too, so every shard download failed
+    with "No space left on device" and MM-Embed fell back to the CPU."""
+    small = tmp_path / "small"
+    big = tmp_path / "big"
+    small.mkdir(); big.mkdir()
+    monkeypatch.setenv("CODERAI_CACHE_DIR", str(small))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(big))
+    free = {str(small): 15 * 2**30, str(big): 400 * 2**30}
+
+    class _St:
+        f_frsize = 1
+
+        def __init__(self, n):
+            self.f_bavail = n
+
+    monkeypatch.setattr(w.os, "statvfs",
+                        lambda d: _St(free.get(str(d), 2**30)))
+    first = w._candidate_dirs("4.42.4")[0]
+    assert str(first).startswith(str(big)), first
+
+
+def test_an_existing_venv_still_wins_over_a_roomier_root(w, monkeypatch, tmp_path):
+    """Otherwise a second copy gets built beside the one already on disk."""
+    small = tmp_path / "small"
+    (small / "embedders-tf-4.42.4-venv" / "bin").mkdir(parents=True)
+    (small / "embedders-tf-4.42.4-venv" / "bin" / "python").write_text("")
+    big = tmp_path / "big"
+    big.mkdir()
+    monkeypatch.setenv("CODERAI_CACHE_DIR", str(small))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(big))
+    monkeypatch.setattr(w, "_pointer_file", lambda pin: tmp_path / "none")
+    monkeypatch.setattr(w, "_BAKED_VENV", tmp_path / "nothing")
+    assert w.resolve_venv_dir("4.42.4") == small / "embedders-tf-4.42.4-venv"

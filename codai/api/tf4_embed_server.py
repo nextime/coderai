@@ -121,16 +121,37 @@ def main():
     want_gpu = torch.cuda.is_available() and not force_cpu
     device = "cuda" if want_gpu else "cpu"
     quant = _quantization_config(quant_spec, torch) if want_gpu else None
+    fell_back = ""
     try:
         model = _load(model_id, family, device, quant, torch)
-    except Exception:
+    except Exception as exc:
         if device == "cpu":
             raise
         # GPU first, CPU as the fallback -- and without quantization, which
-        # bitsandbytes cannot do on the CPU anyway.
-        print(f"[tf4-embed] {model_id} would not load on the GPU; retrying on "
-              f"the CPU", file=sys.stderr, flush=True)
+        # bitsandbytes cannot do on the CPU anyway. The REASON travels with the
+        # fallback: a model quietly running on the CPU is 30x slower and tens
+        # of GB of host RAM, and "ready on cpu" alone does not say whether that
+        # was asked for or fallen into.
+        import gc
+        import traceback
+        fell_back = f"{type(exc).__name__}: {exc}"
+        print(f"[tf4-embed] {model_id} would not load on the GPU "
+              f"({fell_back}); retrying on the CPU\n{traceback.format_exc()}",
+              file=sys.stderr, flush=True)
+        # Give the card back first. A load that failed part-way has already
+        # allocated, and those allocations live in this process's CUDA context
+        # for the rest of its life -- measured on zeiss 2026-10-31, where this
+        # model held 9756 MiB of VRAM while running on the CPU, invisible to
+        # the manager's ledger and unusable by anything else.
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
         device = "cpu"
+        quant = None
         model = _load(model_id, family, device, None, torch)
 
     def _norm(rows):
@@ -175,7 +196,8 @@ def main():
         probe = _embed({"texts": ["dimension probe"]})
     dim = int(np.asarray(probe).shape[-1])
     _say({"ready": True, "device": device, "dim": dim, "family": family,
-          "quantized": bool(quant), "transformers": transformers.__version__})
+          "quantized": bool(quant), "transformers": transformers.__version__,
+          **({"gpu_error": fell_back} if fell_back else {})})
 
     for line in sys.stdin:
         line = line.strip()
