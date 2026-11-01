@@ -58,6 +58,14 @@ BLOCKING = {
     "ensure_service": "starts vLLM and sleeps until it is ready",
     "placement.any_candidate": "may start the local vLLM (ensure_service)",
     "placement.candidates": "may start the local vLLM (ensure_service)",
+    # Ends in the host teardown-leak breaker, which walks gc.get_referrers
+    # over every surviving tensor. Measured 2026-11-01 on an LTX-2.3
+    # teardown run on the loop: the watchdog reported 249 s of a dead loop
+    # and climbing, and the breaker finished ~11 minutes later having nulled
+    # 7020 references over 23.9 GB. Nothing at all was served in that window,
+    # /healthz included, so a slow request read from outside as a hung box.
+    "_free_pipeline_vram": "ends in the leak breaker: gc.get_referrers over "
+                           "every live tensor, measured at ~11 minutes",
 }
 
 #: Method names that block when the receiver is not an asyncio primitive.

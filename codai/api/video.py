@@ -497,6 +497,35 @@ def _video_bytes_to_path(video_b64: str) -> str:
 # Pipeline loading
 # =============================================================================
 
+def _effective_mode(request) -> str:
+    """The mode this request really is, whether or not it says so.
+
+    ``mode`` is optional and clients leave it off: an image and no mode means
+    image-to-video. That inference was made in ``_generate_video``, which
+    builds the call kwargs, but not at the load site, which picks the pipeline
+    CLASS from the raw field. The two then disagreed, and the disagreement was
+    invisible until the pipeline was called — minutes in, with the weights
+    loaded and the prompt already encoded. Measured 2026-11-01 on an LTX-2.3
+    fine-tune sent an image with no mode:
+
+        [video] generation (initial) FAILED for 'diffusers/LTX-2.3-Diffusers':
+        LTX2Pipeline.__call__() got an unexpected keyword argument 'image'
+
+    LTX2Pipeline is the text-to-video class and takes no picture; the
+    image-to-video sibling was there and would have been chosen had the load
+    site inferred the mode the same way. Deriving it once, here, is what keeps
+    the class and the kwargs talking about the same request.
+    """
+    m = getattr(request, 'mode', None)
+    if m:
+        return str(m)
+    if getattr(request, 'image', None) or getattr(request, 'init_image', None):
+        return 'i2v'
+    if getattr(request, 'video', None):
+        return 'v2v'
+    return 't2v'
+
+
 def _detect_pipeline_class(model_name: str, mode: str):
     """Return the appropriate diffusers pipeline class."""
     n = model_name.lower()
@@ -3001,6 +3030,32 @@ def _maybe_i2v_fallback(pipe, kw, mode):
     return view, 'ti2v'
 
 
+def _require_image_conditioning(pipe, mode: str):
+    """Refuse an image-conditioned run on a pipeline that takes no image.
+
+    Dropping the keyframe instead would answer 200 with a clip the picture
+    never touched, which is worse than failing: the caller asked for this
+    frame and has no way to tell it was ignored. Raising here costs the load
+    that already happened; raising it as a sentence rather than
+
+        LTX2Pipeline.__call__() got an unexpected keyword argument 'image'
+
+    costs nothing and says which half is wrong. With the mode derived once
+    this should be unreachable, which is the point of checking: it is how a
+    future family whose image-to-video sibling is named differently announces
+    itself, rather than failing inside diffusers.
+    """
+    if _pipeline_takes(pipe, 'image'):
+        return
+    cls = type(pipe).__name__
+    raise ValueError(
+        f"{cls} takes no image, so a {mode} request cannot run on it. This is "
+        f"the text-to-video class for this family; its image-to-video sibling "
+        f"is the one that accepts a keyframe. Either the pipeline was chosen "
+        f"for a different mode than the request, or this family has no "
+        f"image-to-video pipeline in the installed diffusers.")
+
+
 def _pipeline_takes(pipe, name: str) -> bool:
     """True when this pipeline's __call__ accepts ``name`` as a keyword.
 
@@ -3018,8 +3073,7 @@ def _pipeline_takes(pipe, name: str) -> bool:
 
 def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
                     model_cfg: dict = None):
-    mode = request.mode or ('i2v' if (request.image or request.init_image)
-                             else 'v2v' if request.video else 't2v')
+    mode = _effective_mode(request)
     fps = request.fps or 8
     kw = _build_call_kwargs(request, model_name, model_cfg)
     # Acceleration/distillation defaults (Lightning / Lightx2v): when the model has
@@ -3159,10 +3213,12 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
         kw.pop('image_end', None)
 
     elif mode == 'i2v' and init_src:
+        _require_image_conditioning(pipe, mode)
         kw['image'] = _pil_from_b64(init_src)
         kw.pop('prompt', None)  # SVD doesn't take text
 
     elif mode == 'ti2v' and init_src:
+        _require_image_conditioning(pipe, mode)
         kw['image'] = _pil_from_b64(init_src)
         # prompt stays — model uses both
 
@@ -5372,7 +5428,7 @@ async def video_generations(request: VideoGenerationRequest,
         try:
             with loading_task(model_name, model_type="video"):
                 pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_video_pipeline, model_name, device, request.mode,
+                    None, _load_video_pipeline, model_name, device, _effective_mode(request),
                     _offload, _model_cfg, True, _full_gpu_viable)
         except Exception as e:
             # Log the FULL traceback — otherwise the only trace of a post-load
@@ -5406,7 +5462,7 @@ async def video_generations(request: VideoGenerationRequest,
                 with loading_task(model_name, model_type="video"):
                     pipe = await asyncio.get_event_loop().run_in_executor(
                         None, _load_video_pipeline, model_name, device,
-                        request.mode, _offload, _model_cfg, False)
+                        _effective_mode(request), _offload, _model_cfg, False)
                 _retried_fresh = True
             except Exception as _e2:
                 import traceback as _tb2
@@ -5504,7 +5560,7 @@ async def video_generations(request: VideoGenerationRequest,
             try:
                 with _loading_task(model_name, model_type="video"):
                     pipe = await _loop.run_in_executor(
-                        None, _load_video_pipeline, model_name, device, request.mode,
+                        None, _load_video_pipeline, model_name, device, _effective_mode(request),
                         _strat, _model_cfg, _incr)
                 multi_model_manager.models[model_key] = pipe
                 multi_model_manager.active_in_vram = model_key
@@ -5519,7 +5575,8 @@ async def video_generations(request: VideoGenerationRequest,
                 multi_model_manager.clear_loading(model_key)
                 multi_model_manager.models.pop(model_key, None)
                 multi_model_manager.model_pools.pop(model_key, None)
-                _free_pipeline_vram(pipe)
+                # Off the loop: see the note at the teardown below.
+                await _loop.run_in_executor(None, _free_pipeline_vram, pipe)
                 pipe = None
                 continue  # try the next rung
         # Generate on the current pipe.
@@ -5588,17 +5645,30 @@ async def video_generations(request: VideoGenerationRequest,
         # Failure handling OUTSIDE the except: free the pipe + activations.
         multi_model_manager.models.pop(model_key, None)
         multi_model_manager.model_pools.pop(model_key, None)
-        _free_pipeline_vram(pipe)
+
+        # In a thread, not here. _free_pipeline_vram ends in the host
+        # teardown-leak breaker, which walks gc.get_referrers over every
+        # surviving tensor; a full gc pass and cuda.synchronize follow it.
+        # Measured 2026-11-01 on an LTX-2.3 teardown, all of it on the event
+        # loop: the watchdog reported 249 s of a dead loop and climbing, and
+        # the breaker finished ~11 minutes later having nulled 7020
+        # references over 23.9 GB. Nothing of any kind was served in that
+        # window — not a chat token, not /healthz — so from outside the box
+        # it looked exactly like a hung server, and the request that was
+        # merely slow took every unrelated client down with it.
+        def _teardown(_p):
+            _free_pipeline_vram(_p)
+            for _ in range(2):
+                _gc.collect()
+            try:
+                import torch as _t
+                if _t.cuda.is_available():
+                    _t.cuda.synchronize()
+                    _t.cuda.empty_cache()
+            except Exception:
+                pass
+        await _loop.run_in_executor(None, _teardown, pipe)
         pipe = None
-        for _ in range(2):
-            _gc.collect()
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                _torch.cuda.synchronize()
-                _torch.cuda.empty_cache()
-        except Exception:
-            pass
         _recoverable = ("out of memory" in _err_str
                         or ("cuda" in _err_str and "memory" in _err_str)
                         or "same device" in _err_str or "index_select" in _err_str
