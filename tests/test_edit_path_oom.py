@@ -29,7 +29,9 @@ def test_the_edit_path_asks_for_headroom_before_calling():
         "so it has to ask for its own working room"
     )
     i_head = src.index("_evict_headroom_gb")
-    i_call = src.index("run_in_executor")
+    # The call became `await asyncio.to_thread(pipe, **_call_kwargs)` on
+    # 2026-11-01, when the text-encoder offload was added ahead of it.
+    i_call = src.index("await asyncio.to_thread(pipe,")
     assert i_head < i_call, "the room must be made BEFORE the call, not after"
 
 

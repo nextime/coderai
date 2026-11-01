@@ -3744,6 +3744,76 @@ def _declared_max_reference_images(model_config):
     return n if n >= 1 else None
 
 
+def _components_of(pipeline):
+    """This pipeline's component modules, by name, best effort."""
+    try:
+        comps = dict(getattr(pipeline, "components", None) or {})
+    except Exception:
+        comps = {}
+    if not comps:
+        for _n in ("transformer", "unet", "vae", "text_encoder",
+                   "text_encoder_2", "image_encoder"):
+            _c = getattr(pipeline, _n, None)
+            if _c is not None:
+                comps[_n] = _c
+    return comps
+
+
+def _restore_pipeline_device(pipeline, device):
+    """Move any component that has drifted to the CPU back onto ``device``.
+
+    The cure for a failure that outlived the request that caused it. Sibling
+    cards that share a weights file also share their component MODULES, and
+    eviction moves a pipeline with ``obj.to('cpu')`` -- so unloading one
+    sibling moves the shared VAE and transformer off the card while every
+    other sibling is still registered as loaded. Nothing moved them back, so
+    the first edit failed slowly and every edit after it failed in under a
+    second, for every model, until the server was restarted. Measured
+    2026-11-01 across Qwen-Image-Edit-2511, -NSFW, Rapid-AIO and
+    Rapid-AIO-v23::
+
+        Input type (CUDABFloat16Type) and weight type (CPUBFloat16Type)
+        should be the same
+          in autoencoder_kl_qwenimage.py, encode()
+
+    Components under an accelerate offload hook are LEFT ALONE: living on the
+    CPU between calls is what those hooks are for, and the hook moves them for
+    the forward pass. A component that cannot be moved is reported rather than
+    raised on -- the request is no worse off for the attempt.
+
+    Returns the names it moved.
+    """
+    import torch
+    try:
+        _target = torch.device(device)
+    except Exception:
+        return []
+    if _target.type == "cpu":
+        return []               # nothing to bring back TO the CPU
+    moved = []
+    for name, comp in _components_of(pipeline).items():
+        if not hasattr(comp, "parameters"):
+            continue
+        if getattr(comp, "_hf_hook", None) is not None:
+            continue            # accelerate owns this one's placement
+        try:
+            p = next(comp.parameters(), None)
+            if p is None or p.device.type != "cpu":
+                continue
+        except Exception:
+            continue
+        try:
+            comp.to(device)
+            moved.append(name)
+        except Exception as exc:
+            _log.warning("could not bring %s back to %s: %s", name, device, exc)
+    if moved:
+        _log.warning("brought %s back to %s before the call — something had "
+                     "moved them to host RAM (shared components are moved by "
+                     "a sibling's eviction)", ", ".join(moved), device)
+    return moved
+
+
 def _distinct_reference_refs(request):
     """This request's reference images, in order, without repeats.
 
@@ -4080,11 +4150,20 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
                 # and died on "Input type (CUDABFloat16Type) and weight type
                 # (CPUBFloat16Type) should be the same" -- _evict_one had
                 # moved those weights to the CPU underneath it.
+                # By object AND by shared components. Sibling cards on one
+                # weights file hold the SAME module objects, and eviction
+                # moves a pipeline wholesale, so unloading a sibling takes
+                # this pipeline's VAE and transformer to host RAM with it.
                 _protect = {_edit_key or model_name}
                 try:
-                    _protect |= {k for k, v in
-                                 dict(multi_model_manager.models).items()
-                                 if v is pipe}
+                    _mine = {id(c) for c in _components_of(pipe).values()}
+                    for k, v in dict(multi_model_manager.models).items():
+                        if v is pipe:
+                            _protect.add(k)
+                            continue
+                        if _mine and any(id(c) in _mine for c in
+                                         _components_of(v).values()):
+                            _protect.add(k)
                 except Exception:
                     pass
                 _log.info("Edit needs about %.1f GB of working room and the "
@@ -4099,14 +4178,44 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         except Exception as _he:
             _log.warning("Could not check edit headroom: %s", _he)
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: pipe(
-                **_edit_call_kwargs(pipe, request, sources, num_steps, cfg_scale,
-                                    generator, request.n),
-                **_prompt_call_kwargs(pipe, request, _edit_cfg),
-            )
-        )
+        _call_kwargs = {
+            **_edit_call_kwargs(pipe, request, sources, num_steps, cfg_scale,
+                                generator, request.n),
+            **_prompt_call_kwargs(pipe, request, _edit_cfg),
+        }
+
+        # Whatever moved them, put them back. See _restore_pipeline_device:
+        # a sibling's eviction moves components this pipeline shares, and the
+        # breakage outlived the request that caused it.
+        try:
+            await asyncio.to_thread(
+                _restore_pipeline_device, pipe,
+                _derive_diffusers_device(global_args))
+        except Exception as _rd:
+            _log.warning("device check skipped: %s", _rd)
+
+        # The same sequential text-encoder offload the generation path does,
+        # and an edit needs it MORE. An in-context edit appends the reference's
+        # tokens to the canvas's, so the attention activations are larger than
+        # the same model's plain generation -- and the encoder is dead weight
+        # for every denoising step after the first.
+        #
+        # Measured 2026-11-01 on zeiss: Krea-2-RealDream generates fine at
+        # 17.22 GB of weights, and editing died with 23.50 GiB of a 23.56 GiB
+        # card in use -- "Tried to allocate 48.00 MiB ... 46.00 MiB is free" --
+        # with nothing else resident to evict. Its card already asks for this
+        # offload and its generations log "3.0 GiB back for the denoiser"; the
+        # edit path simply never did it.
+        if bool((_edit_cfg or {}).get('sequential_text_encoder')):
+            try:
+                from codai.models.text_encoder_offload import encode_then_free
+                _call_kwargs, _ = await asyncio.to_thread(
+                    encode_then_free, pipe, _call_kwargs)
+            except Exception as _teo:
+                _log.warning("[text-encoder-offload] skipped on the edit "
+                             "path: %s", _teo)
+
+        result = await asyncio.to_thread(pipe, **_call_kwargs)
     except HTTPException:
         raise                       # a 400 from here is the caller's, not ours
     except Exception as e:
