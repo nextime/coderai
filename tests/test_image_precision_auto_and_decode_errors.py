@@ -138,11 +138,37 @@ def test_a_decode_oom_is_503_and_names_the_decode():
 @pytest.mark.parametrize("exc,expected", [
     (RuntimeError("CUDA out of memory. Tried to allocate 1008.00 MiB"), True),
     (RuntimeError("Out Of Memory"), True),
+    # Measured on Krea-2-RealDream: a 31 GB pipeline on a 24 GB card, where the
+    # card filled before cuBLAS could take its workspace. The allocator never
+    # got to say "out of memory", so this was answered 500 -- a server fault --
+    # and described as something other than a full card.
+    (RuntimeError("CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling "
+                  "`cublasCreate(handle)`"), True),
+    (RuntimeError("cuDNN error: CUDNN_STATUS_ALLOC_FAILED"), True),
+    (RuntimeError("cudaErrorMemoryAllocation"), True),
+    (RuntimeError("failed to allocate 2.00 GiB on device 0"), True),
     (ValueError("size must be a multiple of 8"), False),
     (RuntimeError("CUDA error: device-side assert triggered"), False),
+    # Not every cuBLAS complaint is a full card, and a mis-set compute
+    # capability must not be answered "come back later".
+    (RuntimeError("CUBLAS_STATUS_EXECUTION_FAILED"), False),
 ])
 def test_is_cuda_oom_matches_the_wordings_this_actually_arrives_as(exc, expected):
     assert images_mod._is_cuda_oom(exc) is expected
+
+
+def test_an_allocator_failure_from_any_library_is_still_a_full_card():
+    """The markers are a declared list and not a chain of ifs, so the next
+    library that reports its own allocation failure is one line."""
+    assert "alloc_failed" in images_mod._CUDA_OOM_MARKERS
+    assert "out of memory" in images_mod._CUDA_OOM_MARKERS
+
+
+def test_the_oom_detail_names_cublas_as_well_as_the_decode():
+    """Both are real points of failure and they are not the same place; a
+    message naming only the decode sent the last one looking in the VAE."""
+    body = SRC[SRC.index("if _loaded_diffusers is not None:"):][:2000]
+    assert "cuBLAS" in body and "VAE decode" in body
 
 
 def test_is_cuda_oom_matches_the_torch_type_too():

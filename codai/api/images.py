@@ -655,13 +655,29 @@ def _finish_image_load(pipeline, model_config):
     return pipeline
 
 
+#: Text markers for a full card. ``out of memory`` is the allocator's own
+#: wording; the rest are libraries that ask CUDA for memory of their own and
+#: report the refusal in their own vocabulary. cuBLAS needs a workspace before
+#: it can multiply anything, so an exhausted card surfaces as
+#: ``CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate(handle)`` -- measured
+#: on a 31 GB pipeline loaded onto a 24 GB card, where it was classified 500
+#: and described as something other than the GPU being full.
+_CUDA_OOM_MARKERS = (
+    "out of memory",
+    "alloc_failed",          # CUBLAS_STATUS_ALLOC_FAILED, CUDNN_STATUS_ALLOC_FAILED
+    "cudaerrormemoryallocation",
+    "failed to allocate",
+)
+
+
 def _is_cuda_oom(exc) -> bool:
     """Whether this exception is the GPU running out of memory.
 
     Matched by type where torch offers one and by text otherwise, because the
     same condition arrives as ``torch.OutOfMemoryError``, as a bare
-    ``RuntimeError`` from older call paths, and as a diffusers error that only
-    wraps the message.
+    ``RuntimeError`` from older call paths, as a diffusers error that only
+    wraps the message, and as an allocation failure reported by whichever
+    library happened to ask for the memory first.
     """
     try:
         import torch
@@ -669,7 +685,8 @@ def _is_cuda_oom(exc) -> bool:
             return True
     except Exception:
         pass
-    return "out of memory" in str(exc).lower()
+    text = str(exc).lower()
+    return any(marker in text for marker in _CUDA_OOM_MARKERS)
 
 
 #: VRAM, in GB, at or below which an undeclared precision becomes a half one.
@@ -2777,8 +2794,10 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                         detail=(f"Image generation failed for '{model_name}' — "
                                 f"the model loaded and ran, so this is not a "
                                 f"load failure. "
-                                + (f"The GPU ran out of memory while finishing "
-                                   f"the image (typically the VAE decode): {e}"
+                                + (f"The GPU ran out of memory while making "
+                                   f"the image — the VAE decode and cuBLAS's "
+                                   f"own workspace are the usual points of "
+                                   f"failure: {e}"
                                    if _oom else str(e))))
 
         # Try stable-diffusion-cpp-python (for GGUF models or as fallback)
