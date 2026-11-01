@@ -32,12 +32,26 @@ the family's edit LoRAs are trained against, and it is also why ``strength``
 has no meaning here: there is no partial noising to control. The capability a
 card should report is therefore ``instruction_edit``, not ``image_to_image``.
 
-Telling the two token groups apart is the whole trick. ``position_ids`` is
-``(seq, 3)``: text at the origin and image tokens carrying ``(0, h, w)``. The
-reference gets the SAME ``(h, w)`` grid but ``1`` on the first axis, so the
-rotary embedding separates "this pixel of the canvas" from "this pixel of the
-reference" while keeping them spatially aligned. Without that the two groups
-occupy identical coordinates and the model cannot tell which it is painting.
+Telling the token groups apart is the whole trick. ``position_ids`` is
+``(seq, 3)``: text at the origin and image tokens carrying ``(0, h, w)``. A
+reference gets the SAME ``(h, w)`` grid but a non-zero value on the first
+axis, so the rotary embedding separates "this pixel of the canvas" from "this
+pixel of the reference" while keeping them spatially aligned. Without that the
+groups occupy identical coordinates and the model cannot tell which it is
+painting.
+
+SEVERAL references are allowed, each encoded separately and given its own
+plane on that axis -- 1, 2, 3 ... -- and concatenated along the SEQUENCE so
+they are extra context rather than extra pictures to produce. One plane each
+for the same reason the first gets one: two references sharing a plane are as
+indistinguishable from each other as a reference was from the canvas, and
+"the man from picture 2" needs picture 2 to be addressable. They are NOT
+passed to the encoder as a list -- ``image_processor.preprocess`` stacks a
+list on dim 0, which makes a BATCH of references, and a batch of two cannot
+be concatenated with a canvas of one.
+
+Each reference costs its own tokens, so the sequence grows with their number
+and ``grounding_px`` is the knob that bounds it.
 """
 
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -176,20 +190,39 @@ else:
             grid_h = height // multiple
             grid_w = width // multiple
 
-            # -------------------------------------------------- reference
+            # ------------------------------------------------- references
+            # One at a time, each with its own grid and its own plane. A list
+            # handed to _encode_reference in one go would come back as a
+            # BATCH of references -- image_processor.preprocess stacks on dim
+            # 0 -- and a batch of two cannot be concatenated with a canvas of
+            # one. Measured 2026-11-01, a two-picture combine request:
+            # "Sizes of tensors must match except in dimension 1. Expected
+            # size 1 but got size 0 for tensor number 1 in the list."
+            refs = list(image) if isinstance(image, (list, tuple)) else [image]
+            refs = [r for r in refs if r is not None]
+            if not refs:
+                raise ValueError("an edit needs at least one reference image")
             ref_px = int(grounding_px) if grounding_px else max(height, width)
-            ref_h, ref_w = _fit_to_grid(image, ref_px, multiple)
-            ref_tokens, ref_grid = self._encode_reference(
-                image, ref_h, ref_w, dtype, device, generator)
-            ref_tokens = ref_tokens.repeat(
-                batch_size * num_images_per_prompt // ref_tokens.shape[0], 1, 1) \
-                if ref_tokens.shape[0] != batch_size * num_images_per_prompt \
-                else ref_tokens
+            _want_batch = batch_size * num_images_per_prompt
+            _ref_parts = []
+            ref_grids = []
+            for _img in refs:
+                _rh, _rw = _fit_to_grid(_img, ref_px, multiple)
+                _tok, _grid = self._encode_reference(
+                    _img, _rh, _rw, dtype, device, generator)
+                if _tok.shape[0] != _want_batch:
+                    _tok = _tok.repeat(_want_batch // _tok.shape[0], 1, 1)
+                _ref_parts.append(_tok)
+                ref_grids.append(_grid)
+            # Along the SEQUENCE, so the references are extra context rather
+            # than extra pictures being made.
+            ref_tokens = (_ref_parts[0] if len(_ref_parts) == 1
+                          else torch.cat(_ref_parts, dim=1))
 
             # ------------------------------------------------ coordinates
             position_ids = self._edit_position_ids(
-                prompt_embeds.shape[1], grid_h, grid_w, ref_grid[0], ref_grid[1],
-                device)
+                prompt_embeds.shape[1], grid_h, grid_w, device=device,
+                ref_grids=ref_grids)
 
             # ------------------------------------------------- timesteps
             sigmas = (np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
@@ -324,18 +357,25 @@ else:
 
 
 def edit_position_ids(text_len: int, grid_h: int, grid_w: int,
-                      ref_h: int, ref_w: int, device=None):
-    """Coordinates for text, then the canvas, then the reference.
+                      ref_h: int = None, ref_w: int = None, device=None,
+                      ref_grids=None):
+    """Coordinates for text, then the canvas, then each reference.
 
     ``position_ids`` is ``(seq, 3)``. The canvas keeps the base pipeline's
-    ``(0, h, w)``. The reference repeats its own grid but sits at ``1`` on the
-    first axis, which is what lets the model tell the two apart: identical
-    coordinates would make a reference token and the canvas token aligned with
-    it indistinguishable to the rotary embedding, and the model could not tell
-    which of the two it is painting.
+    ``(0, h, w)``. A reference repeats its own grid but sits at a NON-ZERO
+    value on the first axis, which is what lets the model tell the groups
+    apart: identical coordinates would make a reference token and the canvas
+    token aligned with it indistinguishable to the rotary embedding, and the
+    model could not tell which of the two it is painting.
 
-    Module-level and pure, so it can be checked without the 12B weights and on
-    a build whose diffusers ships no Krea 2 at all.
+    Several references get 1, 2, 3 ... on that axis, one plane each, for the
+    same reason the first one gets 1: two references sharing a plane would be
+    as indistinguishable from each other as a reference was from the canvas,
+    and "the man from picture 2" needs picture 2 to be addressable.
+
+    ``ref_grids`` is a list of ``(h, w)``; ``ref_h``/``ref_w`` remain for the
+    single-reference call. Module-level and pure, so it can be checked without
+    the 12B weights and on a build whose diffusers ships no Krea 2 at all.
     """
     text_ids = torch.zeros(text_len, 3, device=device)
 
@@ -346,8 +386,12 @@ def edit_position_ids(text_len: int, grid_h: int, grid_w: int,
         ids[..., 2] = torch.arange(w, device=device)[None, :]
         return ids.reshape(h * w, 3)
 
-    return torch.cat([text_ids, _grid(grid_h, grid_w, 0),
-                      _grid(ref_h, ref_w, 1)], dim=0)
+    if ref_grids is None:
+        ref_grids = [] if ref_h is None else [(ref_h, ref_w)]
+    parts = [text_ids, _grid(grid_h, grid_w, 0)]
+    for plane, (h, w) in enumerate(ref_grids, start=1):
+        parts.append(_grid(h, w, plane))
+    return torch.cat(parts, dim=0)
 
 
 def _image_size(image):

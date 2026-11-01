@@ -36,17 +36,24 @@ def test_the_edit_path_asks_for_headroom_before_calling():
 def test_it_asks_only_for_headroom_not_for_the_weights():
     """The weights are already resident; asking for them would evict for nothing."""
     src = _edit_source()
-    assert "_evict_models_for_vram(\n                    _head" in src or \
-           "_evict_models_for_vram(_head" in src
+    seg = src[src.index("_evict_headroom_gb"):]
+    i = seg.index("_evict_models_for_vram")
+    # The call now goes through asyncio.to_thread, so the amount is the first
+    # argument AFTER the bound method rather than inside the parentheses.
+    assert "_head," in seg[i:i + 200], seg[i:i + 200]
 
 
 def test_it_protects_the_model_it_is_making_room_for():
     src = _edit_source()
-    seg = src[src.index("_evict_models_for_vram"):]
-    assert "protect=" in seg[:200], (
-        "without protect, the pass can evict the very pipeline the edit is "
+    seg = src[src.index("_evict_headroom_gb"):]
+    # Protection is now a SET built by identity -- protecting the requested
+    # name alone evicted the sibling key the pipeline was registered under.
+    # See tests/test_edit_eviction_protects_the_pipeline_in_use.py.
+    assert "_protect" in seg, (
+        "without protection, the pass can evict the very pipeline the edit is "
         "about to call"
     )
+    assert "if v is pipe" in seg
 
 
 def test_an_oom_is_reported_as_503_with_an_explanation():

@@ -137,16 +137,23 @@ def test_the_source_never_waits_on_the_protected_model():
     # window stopped reaching the assertion below -- the test failed while the
     # guarantee it protects was perfectly intact.
     body = src[i:src.index("\n    def ", i + 10)]
-    assert "protect: str = \"\"" in body
+    # One key or a collection of them since 2026-11-01: a pipeline can be
+    # reachable under several keys and protecting one name evicted the object
+    # in use. The default is still "no protection".
+    assert 'protect=""' in body
     # Pass 1 skips it outright…
-    assert "if protect and key == protect:" in body
+    # A membership test since 2026-11-01, because `protect` can name several
+    # keys: one pipeline object is reachable under each of the sibling cards
+    # that share its checkpoint, and an equality against a single name evicted
+    # the object the caller was using.
+    assert "if key in _protected:" in body
     # …and the active-model fallback does not fire for it.
-    assert "self.active_in_vram != protect" in body
+    assert "self.active_in_vram not in _protected" in body
     # …and the busy sweep waits only on what pass 1 collected, which is why it
     # cannot wait on `protect` either: the skip above happens first.
     assert "_busy_candidates = []" in body
     assert "for key in _busy_candidates:" in body
-    assert body.index("if protect and key == protect:") > body.index("_busy_candidates = []")
+    assert body.index("if key in _protected:") > body.index("_busy_candidates = []")
 
 
 def test_the_embedding_retry_protects_the_model_it_is_making_room_for():

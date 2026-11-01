@@ -6274,7 +6274,7 @@ class MultiModelManager:
             pass
         return max(0.0, base)
 
-    def _evict_models_for_vram(self, needed_gb: float, protect: str = "",
+    def _evict_models_for_vram(self, needed_gb: float, protect="",
                                for_key: str = ""):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 
@@ -6293,7 +6293,16 @@ class MultiModelManager:
         passes it.
 
         ``protect`` is the key this room is being made FOR, and it is never
-        evicted and never waited on. Without it the second pass goes after the
+        evicted and never waited on. It may be a single key or a COLLECTION of
+        them, because one pipeline object can be reachable under several keys:
+        siblings that share a checkpoint are separate entries, and a caller
+        that got its pipeline from one of them while naming another would
+        otherwise evict the very object it is about to use. Measured
+        2026-11-01: an edit on Krea-2-RealDream protected that key, evicted
+        'image:Krea-2-Edit' -- the key the pipeline it held was registered
+        under -- and the call then failed with "Input type (CUDABFloat16Type)
+        and weight type (CPUBFloat16Type) should be the same", because
+        _evict_one had moved those weights to the CPU. Without it the second pass goes after the
         active model as a fallback -- which, when the caller is a resident model
         asking for scratch space, is the caller itself. Measured on zeiss
         2026-10-31, after a gme-Qwen2-VL-7B encode ran out of memory:
@@ -6325,7 +6334,14 @@ class MultiModelManager:
         # shortfall warning below still measures against what the caller asked
         # for, so freeing enough for the load but not the headroom is a success
         # and stays silent.
-        _headroom = self._evict_headroom_gb(needed_gb, for_key or protect)
+        # One key or many; normalised once so every test below is a membership
+        # test rather than an equality that silently misses the other spellings.
+        if isinstance(protect, str):
+            _protected = {protect} if protect else set()
+        else:
+            _protected = {k for k in (protect or ()) if k}
+        _protect_one = next(iter(_protected)) if len(_protected) == 1 else ""
+        _headroom = self._evict_headroom_gb(needed_gb, for_key or _protect_one)
         target_gb = needed_gb + _headroom
 
         _evict_key = self._evict_one
@@ -6347,7 +6363,7 @@ class MultiModelManager:
         # on _busy_candidates for the sweep that follows this loop.
         _busy_candidates = []
         for key in self._lru_order():
-            if protect and key == protect:
+            if key in _protected:
                 continue
             if key == self.active_in_vram:
                 continue
@@ -6402,7 +6418,7 @@ class MultiModelManager:
         # Second pass: evict the active model if still not enough AND it is idle
         # (unless it's keep-resident — that's handled by the last-resort pass).
         if (self._get_free_vram_gb() < target_gb and self.active_in_vram
-                and self.active_in_vram != protect
+                and self.active_in_vram not in _protected
                 and self.active_in_vram not in self._keep_resident
                 and self.active_in_vram in self.models):
             _active = self.active_in_vram

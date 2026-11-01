@@ -53,7 +53,10 @@ def test_the_target_is_the_request_plus_headroom():
     The shape of the target is unchanged: the request plus the headroom."""
     body = _fn()
     assert 'target_gb = needed_gb + _headroom' in body
-    assert '_headroom = self._evict_headroom_gb(needed_gb, for_key or protect)' \
+    # `protect` became one-key-or-many on 2026-11-01; the single-key spelling
+    # it falls back to is _protect_one. The claim is unchanged: the amount
+    # comes from the per-model resolver, which is what makes it configurable.
+    assert '_headroom = self._evict_headroom_gb(needed_gb, for_key or _protect_one)' \
         in body, "the per-model resolver is what makes it configurable"
 
 

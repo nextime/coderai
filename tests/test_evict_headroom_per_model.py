@@ -102,7 +102,11 @@ SRC = open("codai/models/manager.py").read()
 def test_eviction_uses_the_resolver_and_not_the_bare_constant():
     i = SRC.index("def _evict_models_for_vram")
     body = SRC[i:SRC.index("\n    def ", i + 10)]
-    assert "self._evict_headroom_gb(needed_gb, for_key or protect)" in body
+    # `protect` became one-key-or-many on 2026-11-01, so the single-key
+    # spelling it falls back to is now _protect_one. The point of the
+    # assertion is unchanged: the amount comes from the resolver, keyed by a
+    # model, and never from the bare module constant.
+    assert "self._evict_headroom_gb(needed_gb, for_key or _protect_one)" in body
     assert "needed_gb * (1.0 + _EVICT_HEADROOM_FRACTION)" not in body, \
         "the fraction-only form is what could not cover a decode"
 

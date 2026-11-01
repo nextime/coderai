@@ -3744,6 +3744,33 @@ def _declared_max_reference_images(model_config):
     return n if n >= 1 else None
 
 
+def _distinct_reference_refs(request):
+    """This request's reference images, in order, without repeats.
+
+    A caller that sends the source as ``image`` AND repeats it as the first
+    entry of ``images`` is describing two pictures, not three. Motus's combine
+    does exactly that -- ``image: A``, ``images: [A, B]`` -- and counting the
+    repeat made a two-reference edit look like a three-reference one, which
+    refused a request that was within the model's capacity.
+
+    Compared as sent, because that is the only form available before the bytes
+    are fetched or decoded: the same file referenced by the same URL is the
+    same picture, and two different spellings of one picture are not worth a
+    download to discover.
+    """
+    seen = set()
+    out = []
+    for ref in [request.image] + list(getattr(request, 'images', None) or []):
+        if not ref:
+            continue
+        key = ref if isinstance(ref, str) else id(ref)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
 def _pipeline_reference_semantics(pipeline):
     """Whether this pipeline treats an image LIST as references or as one image.
 
@@ -3938,7 +3965,8 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
             or multi_model_manager._config_for_model(request.model) or {})
     except Exception:
         _ref_cfg = {}
-    _n_refs = 1 + len(list(getattr(request, 'images', None) or []))
+    _distinct_refs = _distinct_reference_refs(request)
+    _n_refs = len(_distinct_refs)
     _check_reference_image_count(_n_refs, request.model, _ref_cfg,
                                  allow_defer=True)
 
@@ -3962,11 +3990,14 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         # Up to three images for an instruction edit ("put the person from
         # image 2 into image 1"); `image` remains the first and only one for
         # every denoising model.
-        refs = [request.image] + list(getattr(request, 'images', None) or [])
+        # The de-duplicated list, so a repeated source is not encoded twice
+        # and the pipeline is told the same number of references the check
+        # above allowed.
+        refs = _distinct_refs
         if len(refs) > 3:
             raise HTTPException(status_code=400, detail=(
-                f"{len(refs)} images given; an instruction edit takes at most 3 "
-                f"(`image` plus up to 2 in `images`)"))
+                f"{len(refs)} distinct images given; an instruction edit takes "
+                f"at most 3 (`image` plus up to 2 in `images`)"))
         sources = [_decode_b64_image(r) for r in refs]
         source_img = sources[0]
 
@@ -4039,11 +4070,32 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
                     requested_id=request.model) or 0.0,
                 _edit_key or model_name)
             if _head > 0 and multi_model_manager._get_free_vram_gb() < _head:
+                # Protect by IDENTITY, not by name. `pipe` may be registered
+                # under a key other than _edit_key -- siblings sharing a
+                # checkpoint are separate entries and the task resolver may
+                # hand back either one's object -- so protecting only the
+                # requested key evicted the pipeline this call was about to
+                # use. Measured 2026-11-01: an edit on Krea-2-RealDream
+                # unloaded 'image:Krea-2-Edit', whose object it was holding,
+                # and died on "Input type (CUDABFloat16Type) and weight type
+                # (CPUBFloat16Type) should be the same" -- _evict_one had
+                # moved those weights to the CPU underneath it.
+                _protect = {_edit_key or model_name}
+                try:
+                    _protect |= {k for k, v in
+                                 dict(multi_model_manager.models).items()
+                                 if v is pipe}
+                except Exception:
+                    pass
                 _log.info("Edit needs about %.1f GB of working room and the "
-                          "card has less — evicting idle models", _head)
-                multi_model_manager._evict_models_for_vram(
-                    _head, protect=_edit_key or model_name,
-                    for_key=_edit_key or model_name)
+                          "card has less — evicting idle models (keeping %s)",
+                          _head, ", ".join(sorted(_protect)))
+                # Off the event loop: this moves whole pipelines to host RAM,
+                # which took over 30 s and tripped the loop-stall watchdog
+                # repeatedly when it ran inline. Measured 2026-11-01, same run.
+                await asyncio.to_thread(
+                    multi_model_manager._evict_models_for_vram,
+                    _head, _protect, _edit_key or model_name)
         except Exception as _he:
             _log.warning("Could not check edit headroom: %s", _he)
 
