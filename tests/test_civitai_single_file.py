@@ -196,8 +196,36 @@ def test_an_explicit_file_id_is_obeyed(ampere):
 
 
 def test_without_a_file_id_precision_decides_rather_than_size(ampere):
+    """And fp8 wins, not int8.
+
+    This asserted int8 while the order preferred it, on the reasoning that the
+    two builds were the same weights and the smaller file should win. They are
+    not the same weights. Read out of the safetensors headers 2026-11-01, the
+    fp8 build is 453 F8_E4M3 tensors and nothing else, while the int8 build is
+    224 I8 tensors plus 224 U8 companion SCALES, 76 BF16 and 354 F32 -- a
+    quantization scheme, not a narrower float, and diffusers has no dequantizer
+    for it. F8_E4M3 is a torch dtype that loads unambiguously and that
+    layerwise casting can then keep narrow.
+    """
     from codai.models.hf_loading import _pick_civitai_file
     got = _pick_civitai_file(REAL_DREAM, "3396368", None)
+    assert got["name"] == "fp8.safetensors"
+
+
+def test_an_unverifiable_quantization_loses_to_a_plain_float(ampere):
+    """int8 sits below bf16/fp16 too: a correct load that needs offload beats a
+    small one whose arithmetic nobody has checked."""
+    from codai.models.hf_loading import _CIVITAI_FP_PREFERENCE as pref
+    assert pref.index("fp8") < pref.index("int8")
+    assert pref.index("bf16") < pref.index("int8")
+    assert pref.index("fp16") < pref.index("int8")
+
+
+def test_the_int8_build_can_still_be_named_explicitly(ampere):
+    """Demoting it is not removing it -- an operator who knows the scheme works
+    for their loader must still be able to ask for it."""
+    from codai.models.hf_loading import _pick_civitai_file
+    got = _pick_civitai_file(REAL_DREAM, "3396368", "3304483")
     assert got["name"] == "int8.safetensors"
 
 

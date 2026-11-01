@@ -427,7 +427,27 @@ def civitai_token() -> Optional[str]:
 #: a card that can run them all. nvfp4 is deliberately absent: it needs
 #: Blackwell (compute capability 10.0), and on anything older the file is
 #: unusable — 8 GB downloaded to produce a load error.
-_CIVITAI_FP_PREFERENCE = ("int8", "fp8", "bf16", "fp16", "fp32")
+#:
+#: fp8 ahead of int8, and ahead of the full-width floats. This order used to put
+#: int8 first, on the reasoning that the two builds were the same weights and
+#: the smaller file should win. They are not the same weights. Read out of the
+#: safetensors headers, 2026-11-01, for Real Dream's Krea 2 V3:
+#:
+#:   fp8  (3286566)  453-odd tensors, every one F8_E4M3        12.84 GiB
+#:   int8 (3304483)  224 I8 tensors + 224 U8 companion scales,
+#:                   76 BF16, 354 F32                          12.57 GiB
+#:
+#: F8_E4M3 is a torch dtype: from_single_file reads it, and layerwise casting
+#: (see codai.models.layerwise) then stores it narrow and computes wide. The
+#: int8 build is a quantization SCHEME -- weights plus per-tensor scales -- and
+#: diffusers has no dequantizer for it, so what those tensors become on load is
+#: not something this code can vouch for. A format the loader understands beats
+#: 0.27 GiB saved.
+#:
+#: int8 therefore sits BELOW the full-width floats: bf16 and fp16 are large but
+#: unambiguous, and a correct load that needs offload is worth more than a small
+#: one whose arithmetic nobody has verified.
+_CIVITAI_FP_PREFERENCE = ("fp8", "bf16", "fp16", "int8", "fp32")
 _CIVITAI_FP_BLACKWELL_ONLY = ("nvfp4", "fp4")
 
 
@@ -449,12 +469,15 @@ def _fp_is_runnable_here(fp: str) -> bool:
 def _pick_civitai_file(files: list, vid: str, fid: Optional[str]) -> dict:
     """Choose which file of a Civitai version to download.
 
-    A version is not one checkpoint. Real Dream's Krea 2 V3 publishes the same
-    weights three times — fp8 at 13.46 GB, int8 at 13.18 GB and nvfp4 at
-    8.12 GB — and they are not interchangeable: nvfp4 needs Blackwell, so on an
-    Ampere card it is a 8 GB download that cannot load. Picking the largest, as
-    this used to, lands on fp8 here purely because it is 0.28 GB bigger than the
-    int8 build, which is not a decision anybody made.
+    A version is not one checkpoint, and it is not the same weights at three
+    widths either. Real Dream's Krea 2 V3 publishes fp8 at 13.46 GB, int8 at
+    13.18 GB and nvfp4 at 8.12 GB, and none of the three is interchangeable
+    with another: nvfp4 needs Blackwell, so on an Ampere card it is an 8 GB
+    download that cannot load, and the int8 build is a quantization scheme with
+    its own scale tensors rather than a narrower float (see
+    _CIVITAI_FP_PREFERENCE). Picking the largest, as this once did, lands on
+    fp8 here purely because it is 0.28 GB bigger, which is not a decision
+    anybody made.
 
     So: an explicit file id wins, and without one the choice is made among the
     files this machine can actually run, by precision rather than by size.
