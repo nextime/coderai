@@ -28,6 +28,18 @@ reported it as "Failed to load image model 'Tongyi-MAI/Z-Image-Turbo'" -- naming
 the load, which had in fact succeeded (footprint measured, 1.56 GB offloaded) --
 and only SEEDED requests failed, so the model looked broken to anyone who
 passes a seed and perfectly fine to anyone who does not.
+
+Following ``_execution_device`` fixed the meta crash and left a second one, for
+the same reason: that is the device the pipeline COMPUTES on, not necessarily
+the one it allocates its initial latents on. diffusers' randn_tensor tolerates
+a CPU generator (draw on the host, copy over) and REFUSES a CUDA one whenever
+the target is CPU --
+
+    Cannot generate a cpu tensor from a generator of type cuda.
+
+-- measured again on Z-Image-Turbo, 2026-11-01. So the generator is built on
+the host unconditionally, which also makes a seed reproduce the same image
+whether the model is resident, offloaded or sharded.
 """
 
 import io
@@ -60,10 +72,48 @@ def test_a_meta_device_is_never_handed_to_a_generator():
     torch.Generator(device=dev).manual_seed(1234)
 
 
-def test_the_execution_device_wins_when_diffusers_offers_one():
-    """diffusers already knows where an offloaded pipeline computes."""
+def test_an_offloaded_pipeline_gets_a_host_generator():
+    """_execution_device no longer decides. It is where the pipeline COMPUTES,
+    and an offloaded pipeline allocates its first latents elsewhere -- which is
+    how the cuda-generator/cpu-tensor refusal got in after the meta fix."""
     dev = generator_device(_Pipe(device="meta", execution_device="cpu"))
     assert dev == torch.device("cpu")
+
+
+def test_a_cuda_pipeline_still_gets_a_host_generator():
+    """THE new guarantee, and the one that would be lost by "optimising" this
+    back to the pipeline's device. A CUDA generator is fatal the moment the
+    pipeline wants a CPU tensor; a CPU generator is never fatal, because
+    randn_tensor draws on the host and copies.
+
+        if gen_device_type != device.type and gen_device_type == "cpu":
+            rand_device = "cpu"          # fine
+        elif gen_device_type != device.type and gen_device_type == "cuda":
+            raise ValueError(...)        # the measured failure
+    """
+    assert generator_device(_Pipe(device="cuda")) == torch.device("cpu")
+    assert generator_device(
+        _Pipe(device="cuda", execution_device="cuda")) == torch.device("cpu")
+
+
+def test_the_device_is_always_one_a_generator_can_be_built_on():
+    """Whatever the pipeline claims -- including nothing at all."""
+    for pipe in (_Pipe(device="meta"), _Pipe(device="cuda"), _Pipe(device="cpu"),
+                 object()):
+        torch.Generator(device=generator_device(pipe)).manual_seed(7)
+
+
+def test_a_seed_no_longer_depends_on_where_the_model_sits():
+    """Two placements of the same model must draw the same noise: that is what
+    a seed is for, and it was not true while the generator followed the
+    pipeline."""
+    a = generator_device(_Pipe(device="cuda"))
+    b = generator_device(_Pipe(device="meta", execution_device="cpu"))
+    assert a == b
+    first = torch.Generator(device=a).manual_seed(42)
+    second = torch.Generator(device=b).manual_seed(42)
+    assert torch.equal(torch.randn(8, generator=first),
+                       torch.randn(8, generator=second))
 
 
 def test_an_ordinary_pipeline_is_left_exactly_alone():

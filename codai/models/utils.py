@@ -40,23 +40,34 @@ def generator_device(pipeline):
     than the seed. Only a SEEDED request failed, so the model looked broken to
     anyone who passes a seed and fine to anyone who does not.
 
-    diffusers already knows the answer: ``_execution_device`` is the device an
-    offloaded pipeline will actually compute on. Use it when present, and
-    otherwise fall back to anything that is not meta.
+    The answer is CPU, always, and the reason is an asymmetry in diffusers'
+    own ``randn_tensor``::
+
+        if gen_device_type != device.type and gen_device_type == "cpu":
+            rand_device = "cpu"          # generate here, then move. Fine.
+        elif gen_device_type != device.type and gen_device_type == "cuda":
+            raise ValueError(f"Cannot generate a {device} tensor from a "
+                             f"generator of type {gen_device_type}.")
+
+    A CPU generator is portable: whatever device the pipeline asks for, the
+    noise is drawn on the host and copied. A CUDA generator is only correct
+    while the pipeline happens to want CUDA tensors, and an offloaded pipeline
+    does not -- measured 2026-11-01, Z-Image-Turbo answering
+
+        Cannot generate a cpu tensor from a generator of type cuda.
+
+    This function used to follow ``_execution_device``, which is the device the
+    pipeline COMPUTES on and not necessarily the one it allocates its initial
+    latents on, so a seeded request on an offloaded model failed where the same
+    request on a resident one worked.
+
+    Drawing the noise on the host costs one copy of a few MB, once per request,
+    and buys something worth more than that: the SAME seed now gives the same
+    image whether the model is resident, offloaded or sharded, because the RNG
+    stream no longer depends on placement.
     """
     import torch
-    for candidate in (getattr(pipeline, "_execution_device", None),
-                      getattr(pipeline, "device", None)):
-        try:
-            dev = torch.device(candidate) if candidate is not None else None
-        except (TypeError, ValueError, RuntimeError):
-            dev = None
-        if dev is not None and dev.type not in ("meta", "lazy"):
-            return dev
-    try:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    except Exception:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
 
 def set_global_args(args: Any):
