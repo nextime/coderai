@@ -205,3 +205,20 @@ def test_a_clip_architecture_without_a_vision_config_still_counts(monkeypatch):
                         lambda name: {"model_type": "clip_text_model",
                                       "architectures": ["CLIPModel"]})
     assert E._may_embed_images("any/model", {}) is True
+
+
+def test_the_text_only_refusal_does_not_depend_on_the_model_being_resident():
+    """It was gated on `model_obj is None`, so the SAME request was refused 400
+    on a cold server and admitted on a warm one -- where only the loaded-object
+    check stood between images and a text-only encoder. A correctness check must
+    not read a cache state.
+
+    Reported 2026-10-29: four texts and four images to Qwen3-Embedding-4B
+    dropped the connection after ~40 s and the engine stopped answering until it
+    came back on its own.
+    """
+    body = _SRC[_SRC.index("# Refuse an impossible request BEFORE loading"):]
+    body = body[:body.index("if model_obj is None:")]
+    assert "if images and not _may_embed_images(" in body, \
+        "the refusal must not be conditioned on residency"
+    assert "model_obj is None and not _may_embed_images" not in body

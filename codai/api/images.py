@@ -670,6 +670,75 @@ _CUDA_OOM_MARKERS = (
 )
 
 
+def _exc_text(exc) -> str:
+    """An exception rendered so the reader always learns something.
+
+    ``str(exc)`` is empty for any exception raised with no arguments, and
+    several of the ones that reach this path are: a bare ``RuntimeError()`` out
+    of a pipeline's own validation, an ``AssertionError`` from a shape check.
+    Interpolated straight into a sentence it produces a message that simply
+    stops -- measured 2026-11-01, where Z-Image-Turbo answered "Image
+    generation failed ... so this is not a load failure." with nothing after it,
+    and the reader could not tell a shape error from a full card.
+
+    So always name the type, and say plainly when there is no message rather
+    than leaving a blank where one should be.
+    """
+    text = str(exc or "").strip()
+    name = type(exc).__name__
+    if not text:
+        return f"{name} (raised with no message)"
+    if text.startswith(name):
+        return text
+    return f"{name}: {text}"
+
+
+def _second_is_a_mask(enc, call_params) -> bool:
+    """Whether a 2-tuple from ``encode_prompt`` is (embeds, MASK), not (pos, neg).
+
+    Both shapes exist and they are indistinguishable by length. SD 1.x returns
+    ``(prompt_embeds, negative_prompt_embeds)``; Krea 2 and the Qwen-Image
+    family return ``(prompt_embeds, prompt_embeds_mask)``; MOSS-Image and
+    Kromoss return ``(embeds, mask)`` and call the parameter
+    ``prompt_attention_mask``.
+
+    This used to be decided by looking for the single name
+    ``prompt_embeds_mask``, so MOSS fell through to the SD 1.x branch and its
+    boolean ``[B, S]`` mask was handed over as ``negative_prompt_embeds``. The
+    pipeline then said
+
+        Prompt embeddings must be [B, S, C] with matching batch size.
+
+    -- true, and about an argument the caller never meant to pass. Measured
+    2026-11-01, every MOSS-Image generation.
+
+    So ask the tensors, not the vocabulary: a negative embedding matches the
+    positive in rank and width, and a mask is boolean or one rank short. The
+    names are still consulted first because they are free and unambiguous when
+    present.
+    """
+    if {"prompt_embeds_mask", "prompt_attention_mask"} & set(call_params or ()):
+        return True
+    try:
+        pos, second = enc[0], enc[1]
+    except Exception:
+        return False
+    try:
+        if "bool" in str(getattr(second, "dtype", "")):
+            return True
+        pos_ndim = getattr(pos, "ndim", None)
+        snd_ndim = getattr(second, "ndim", None)
+        if pos_ndim is not None and snd_ndim is not None and snd_ndim != pos_ndim:
+            return True
+        if pos_ndim == 3 and second.shape[-1] != pos.shape[-1]:
+            return True
+    except Exception:
+        # Not tensors, or a shape that cannot be compared. The name check above
+        # is the only evidence, and it said nothing.
+        return False
+    return False
+
+
 def _is_cuda_oom(exc) -> bool:
     """Whether this exception is the GPU running out of memory.
 
@@ -1923,13 +1992,15 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                 # enc is a tuple; length varies by pipeline type
                 _call_params = set(
                     _inspect.signature(pipeline.__call__).parameters)
-                if len(enc) == 2 and 'prompt_embeds_mask' in _call_params:
-                    # Krea 2 and the Qwen-Image family also return a 2-tuple,
-                    # but it is (prompt_embeds, prompt_embeds_mask) -- not a
-                    # negative. Passing the mask AS the negative is what the
-                    # pipeline reports as "If `prompt_embeds` are provided,
-                    # `prompt_embeds_mask` also have to be passed", which reads
-                    # like a missing argument rather than a mislabelled one.
+                if len(enc) == 2 and _second_is_a_mask(enc, _call_params):
+                    # Krea 2, the Qwen-Image family, MOSS-Image and Kromoss all
+                    # return a 2-tuple, but it is (prompt_embeds, mask) -- not a
+                    # negative. Passing the mask AS the negative is what Krea 2
+                    # reports as "If `prompt_embeds` are provided,
+                    # `prompt_embeds_mask` also have to be passed" and what MOSS
+                    # reports as "Prompt embeddings must be [B, S, C]": both read
+                    # like a missing or malformed argument rather than a
+                    # mislabelled one. See :func:`_second_is_a_mask`.
                     # These are not CLIP-pair pipelines, so weighted 75-token
                     # windows mean nothing to them: let the pipeline encode the
                     # prompt itself, the way Z-Image already does.
@@ -2784,11 +2855,12 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     raise
                 except Exception as e:
                     import traceback
+                    _etext = _exc_text(e)
                     print(f"image generation error (model '{model_name}' IS "
-                          f"loaded): {e}")
+                          f"loaded): {_etext}")
                     print(f"Traceback: {traceback.format_exc()}")
                     _oom = _is_cuda_oom(e)
-                    _treg.finish(_ltid, "error", str(e))
+                    _treg.finish(_ltid, "error", _etext)
                     raise HTTPException(
                         status_code=503 if _oom else 500,
                         detail=(f"Image generation failed for '{model_name}' — "
@@ -2797,8 +2869,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                                 + (f"The GPU ran out of memory while making "
                                    f"the image — the VAE decode and cuBLAS's "
                                    f"own workspace are the usual points of "
-                                   f"failure: {e}"
-                                   if _oom else str(e))))
+                                   f"failure: {_etext}"
+                                   if _oom else _etext)))
 
         # Try stable-diffusion-cpp-python (for GGUF models or as fallback)
         try:

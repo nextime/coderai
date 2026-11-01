@@ -2730,7 +2730,13 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
                        f"those. Send an image, or use a text/multimodal "
                        f"embedding model.")
 
-    if images and model_obj is None and not _may_embed_images(model_name, _emb_cfg):
+    # NOT gated on `model_obj is None`. It was, which made a refusal depend on
+    # whether the model happened to be resident: the same request was answered
+    # 400 on a cold server and admitted on a warm one, where only the
+    # loaded-object check below stood between it and the encoder. A correctness
+    # check must not read a cache state. The cost of asking twice is one
+    # config.json lookup, which :func:`_may_embed_images` reads from disk.
+    if images and not _may_embed_images(model_name, _emb_cfg):
         raise HTTPException(
             status_code=400,
             detail=f"Model '{model_name}' is text-only; image embedding needs a "

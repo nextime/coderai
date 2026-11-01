@@ -196,3 +196,37 @@ def test_slicing_alone_is_not_enough_and_the_code_says_why():
     # Slicing splits a BATCH; it does nothing for n=1, which is the case that
     # OOMed. Whoever next trims these comments should know that.
     assert "n=1" in body
+
+
+# --------------------------------------------------------------------------- #
+#  an error the reader can act on
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("exc,expect", [
+    (RuntimeError(), "RuntimeError (raised with no message)"),
+    (RuntimeError(""), "RuntimeError (raised with no message)"),
+    (RuntimeError("   "), "RuntimeError (raised with no message)"),
+    (AssertionError(), "AssertionError (raised with no message)"),
+    (ValueError("size must be a multiple of 8"),
+     "ValueError: size must be a multiple of 8"),
+])
+def test_an_exception_with_no_message_still_says_something(exc, expect):
+    """Measured 2026-11-01: Z-Image-Turbo answered "Image generation failed ...
+    so this is not a load failure." and then stopped, because str(exc) was
+    empty. The reader could not tell a shape error from a full card."""
+    assert images_mod._exc_text(exc) == expect
+
+
+def test_the_type_is_not_repeated_when_the_message_already_carries_it():
+    """diffusers and torch both raise messages that start with their own class
+    name; 'RuntimeError: RuntimeError: ...' reads like a bug in the reporter."""
+    assert images_mod._exc_text(
+        RuntimeError("RuntimeError: already named")) == "RuntimeError: already named"
+
+
+def test_the_generation_path_reports_through_the_helper():
+    """Not str(e) interpolated raw -- that is the shape that produced the
+    message with nothing after it."""
+    body = SRC[SRC.index("if _loaded_diffusers is not None:"):][:2200]
+    assert "_exc_text(e)" in body, "the detail has to go through the helper"
+    assert "else str(e)" not in body, "the raw-str fallback is what broke"

@@ -10,6 +10,12 @@ Krea 2 and the Qwen-Image family return ``(prompt_embeds, prompt_embeds_mask)``
 
 which reads like a missing argument rather than a mislabelled one, and it
 arrives wrapped in "Failed to load image model", minutes into a 7.4B load.
+
+MOSS-Image and Kromoss do the same thing and name the parameter
+``prompt_attention_mask`` instead, so a check for the single name
+``prompt_embeds_mask`` missed them and their boolean mask went over as a
+negative. See :mod:`tests.test_encode_prompt_two_tuple`, which covers the
+shape-based discriminator that replaced it.
 """
 import inspect
 
@@ -21,11 +27,13 @@ def _source():
 
 
 def test_the_mask_families_are_told_apart_by_signature_not_by_name():
-    """A name list would have to grow for every new family; the pipelines that
-    need a mask say so in their own __call__ signature."""
+    """A name list would have to grow for every new family -- which is exactly
+    what happened: the one name here did not cover MOSS. The signature is still
+    asked first, for both spellings, and the tensors decide when it is silent."""
     src = _source()
-    assert "'prompt_embeds_mask' in _call_params" in src
-    # And the discriminator comes from the pipeline itself.
+    assert "_second_is_a_mask(enc, _call_params)" in src
+    assert '"prompt_embeds_mask", "prompt_attention_mask"' in src
+    # And the discriminator still comes from the pipeline itself.
     assert "_inspect.signature(pipeline.__call__).parameters" in src
 
 
@@ -33,8 +41,8 @@ def test_a_mask_pipeline_falls_back_to_its_own_encoder():
     """Weighted 75-token windows are a CLIP-pair feature and mean nothing to
     these pipelines, so the right answer is to pass the raw prompt."""
     src = _source()
-    i = src.index("'prompt_embeds_mask' in _call_params")
-    branch = src[i:i + 1200]
+    i = src.index("_second_is_a_mask(enc, _call_params)")
+    branch = src[i:i + 1400]
     assert "embed_kwargs = {}" in branch
     # The SD 1.x reading must still exist, just after it.
     assert "elif len(enc) == 2:" in branch

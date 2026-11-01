@@ -1105,9 +1105,24 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
     ``QwenImageEditPlusPipeline.from_pretrained(base, transformer=
     QwenImageTransformer2DModel.from_pretrained(derivative))``.
 
-    The component's own entry in ``component_quantization`` still applies, so a
-    bf16 or fp8 transformer too large for the card can be quantized as it
-    loads: ``{"transformer": "4bit"}`` alongside the override above.
+    The component's own entry in ``component_quantization`` still applies to a
+    component loaded from a REPO, so a bf16 or fp8 transformer too large for the
+    card can be quantized as it loads: ``{"transformer": "4bit"}`` alongside the
+    override above.
+
+    It does NOT apply to a component that is a single FILE. This docstring said
+    it did, and it does not: ``from_single_file`` given a bitsandbytes config
+    takes the PRE-quantized path -- it expects the checkpoint to already carry
+    bnb metadata and reads none, so the load dies with
+
+        Supplied state dict for transformer_blocks.0.attn.to_gate.weight does
+        not contain `bitsandbytes__*` and possibly other `quantized_stats`
+        components
+
+    which names a tensor and not the cause. Measured 2026-11-01 on
+    Krea-2-RealDream (``civitai:3396368:3304483``). Asked for bnb on a single
+    file, this now refuses BEFORE reading 12.9 GB and names the two things that
+    do work: a GGUF of the same component, or no quantization plus offload.
 
     Returns ``(components_dict, description)``; empty when none configured.
     """
@@ -1130,6 +1145,27 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
         source = str(source or '').strip()
         if not source:
             continue
+        mode = str(comp_q.get(name) or '').strip().lower()
+        if mode in ("4bit", "8bit") and is_single_file_ref(source):
+            # REFUSE, rather than pass a config that cannot work, and refuse
+            # HERE -- before the class lookup and long before the file is read.
+            # bnb on a single file means "this checkpoint is already quantized,
+            # read its metadata", and a plain community fine-tune carries none,
+            # so the load reads the whole 12.9 GB and then fails naming a
+            # tensor. Whether the base pipeline resolves a class for the
+            # component does not enter into it: the combination is impossible as
+            # configured. Say what the operator can actually do instead; see the
+            # docstring.
+            raise RuntimeError(
+                f"component '{name}' is a single file ({source}) and "
+                f"component_quantization asks for {mode}, which "
+                f"from_single_file cannot do: bitsandbytes there reads a "
+                f"checkpoint that is ALREADY quantized, and this one is not. "
+                f"Either point component_quantization['{name}'] at a GGUF of "
+                f"the same component (that path quantizes on load), or drop it "
+                f"and give the model enough room another way "
+                f"(offload_strategy, a smaller size, or a repo that publishes "
+                f"the component pre-quantized).")
         spec = specs.get(name)
         cls_name = spec[1] if spec and len(spec) > 1 else None
         cls = getattr(diffusers, cls_name, None) if cls_name else None
@@ -1138,7 +1174,6 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
                   f"loadable class for it (got {spec}).")
             continue
         kwargs: Dict[str, Any] = {"torch_dtype": dtype}
-        mode = str(comp_q.get(name) or '').strip().lower()
         if mode in ("4bit", "8bit"):
             try:
                 from diffusers import BitsAndBytesConfig as DiffBnb
