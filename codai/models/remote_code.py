@@ -92,12 +92,13 @@ def kwargs_for(cfg, repo: str, custom_pipeline: Optional[str]) -> dict:
     return {"custom_pipeline": name, "trust_remote_code": True}
 
 
-def declared_pipeline_class(repo: str) -> Optional[str]:
-    """The ``_class_name`` the repo's ``model_index.json`` declares, or None.
+def _model_index(repo: str) -> Optional[dict]:
+    """The repo's parsed ``model_index.json``, or None.
 
-    Read rather than guessed, because the name is the only thing that says a
-    repository means to supply its own pipeline: MOSS-Image declares
-    ``MOSSImagePipeline``, which exists in the repo and nowhere in diffusers.
+    Fetched, not read cache-only: a repo being loaded for the first time has no
+    cache yet, and a cache-only answer to "what does this declare" is
+    permanently wrong on a freshly-rented pod. The file is a few hundred bytes
+    and the weights are about to follow.
     """
     import json
     import os
@@ -108,18 +109,87 @@ def declared_pipeline_class(repo: str) -> Optional[str]:
                 return None
         else:
             from huggingface_hub import hf_hub_download
-            # Fetched, not read cache-only: a repo being loaded for the first
-            # time has no cache yet, and a cache-only answer to "what class does
-            # this declare" is permanently wrong on a freshly-rented pod. The
-            # file is a few hundred bytes and the weights are about to follow.
             path = hf_hub_download(repo, "model_index.json")
         with open(path) as fh:
-            name = (json.load(fh) or {}).get("_class_name")
-        return str(name) if name else None
+            idx = json.load(fh)
+        return idx if isinstance(idx, dict) else None
     except Exception:
         # Not a diffusers repo, not reachable, or no index. Either way there is
         # nothing to declare, and the ordinary load must be left alone.
         return None
+
+
+def declared_pipeline_class(repo: str) -> Optional[str]:
+    """The ``_class_name`` the repo's ``model_index.json`` declares, or None.
+
+    Read rather than guessed, because the name is the only thing that says a
+    repository means to supply its own pipeline: MOSS-Image declares
+    ``MOSSImagePipeline``, which exists in the repo and nowhere in diffusers.
+    """
+    name = (_model_index(repo) or {}).get("_class_name")
+    return str(name) if name else None
+
+
+def _is_installed_library(name: str) -> bool:
+    """Whether ``name`` is a package here, rather than a file in some repo."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        # A dotted or malformed candidate, or a package whose import machinery
+        # objects. Either way it is not a plain module in a model repository.
+        return True
+
+
+def _repo_has_root_file(repo: str, name: str) -> bool:
+    import os
+    try:
+        if os.path.isdir(repo):
+            return os.path.isfile(os.path.join(repo, name))
+        from huggingface_hub import list_repo_files
+        return name in set(list_repo_files(repo))
+    except Exception:
+        return False
+
+
+def declared_pipeline_module(repo: str) -> Optional[str]:
+    """The module INSIDE ``repo`` that holds its pipeline class, or None.
+
+    diffusers resolves a ``custom_pipeline`` given as a repository by one
+    convention only: the file is called ``pipeline.py``. So passing the repo id
+    for MOSS-Image and Kromoss, whose file is ``pipeline_moss_image.py``,
+    fetched ``<repo>/resolve/main/pipeline.py`` and got a 404 -- on a path that
+    had never existed. That reads as "this model is not on Hugging Face", which
+    is how three working repositories came to be reported as wrong names.
+
+    The real module name is in ``model_index.json``: a component whose library
+    slot holds neither diffusers nor any installed package is naming a module
+    that travels with the weights::
+
+        "scheduler": ["pipeline_moss_image", "MOSSImageScheduler"]
+
+    Given that bare name diffusers does the right thing -- it looks for
+    ``<module>.py`` among the repo's own files and, finding it, loads the module
+    from the repo -- so return the name rather than the id. None when the repo
+    follows the ``pipeline.py`` convention after all, or says nothing useful, so
+    the caller keeps the behaviour that is correct for every community pipeline.
+    """
+    idx = _model_index(repo) or {}
+    seen = []
+    for key, value in idx.items():
+        if key.startswith("_") or not isinstance(value, (list, tuple)):
+            continue
+        if not value or not isinstance(value[0], str):
+            continue
+        candidate = value[0].strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.append(candidate)
+        if _is_installed_library(candidate):
+            continue
+        if _repo_has_root_file(repo, f"{candidate}.py"):
+            return candidate
+    return None
 
 
 def kwargs_for_declared_class(cfg, repo: str) -> dict:
@@ -150,5 +220,8 @@ def kwargs_for_declared_class(cfg, repo: str) -> dict:
     except Exception:
         return {}
     require(cfg, repo, f"its own pipeline class {cls!r}")
-    return {"custom_pipeline": repo, "trust_remote_code": True,
+    # The module the repo keeps it in when it is not the conventional
+    # ``pipeline.py``; the id otherwise. See :func:`declared_pipeline_module`.
+    module = declared_pipeline_module(repo)
+    return {"custom_pipeline": module or repo, "trust_remote_code": True,
             "_declared_class": cls}

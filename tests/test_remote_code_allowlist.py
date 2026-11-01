@@ -164,11 +164,93 @@ def test_a_repo_declaring_an_unavailable_class_is_detected(monkeypatch):
     from codai.models import remote_code as R
     monkeypatch.setattr(R, "declared_pipeline_class",
                         lambda repo: "MOSSImagePipeline")
+    monkeypatch.setattr(R, "declared_pipeline_module",
+                        lambda repo: "pipeline_moss_image")
     kw = R.kwargs_for_declared_class(_cfg(["openmoss-team/*"]),
                                      "OpenMOSS-Team/MOSS-Image-SFT")
     assert kw["trust_remote_code"] is True
-    assert kw["custom_pipeline"] == "OpenMOSS-Team/MOSS-Image-SFT"
+    assert kw["custom_pipeline"] == "pipeline_moss_image"
     assert kw["_declared_class"] == "MOSSImagePipeline"
+
+
+def test_the_repo_id_is_kept_when_the_file_is_the_conventional_one(monkeypatch):
+    """Every community pipeline ships pipeline.py, and for those the id is
+    exactly what diffusers wants. Only the odd one out gets the module name."""
+    from codai.models import remote_code as R
+    monkeypatch.setattr(R, "declared_pipeline_class",
+                        lambda repo: "WhateverPipeline")
+    monkeypatch.setattr(R, "declared_pipeline_module", lambda repo: None)
+    kw = R.kwargs_for_declared_class(_cfg(["org/*"]), "org/community-thing")
+    assert kw["custom_pipeline"] == "org/community-thing"
+
+
+# ---------------------------------------------------------------------------
+# Finding the module the pipeline actually lives in
+# ---------------------------------------------------------------------------
+
+MOSS_INDEX = {
+    "_class_name": "MOSSImagePipeline",
+    "_diffusers_version": "0.38.0",
+    "scheduler": ["pipeline_moss_image", "MOSSImageScheduler"],
+    "text_encoder": ["transformers", "Qwen3_5Model"],
+    "tokenizer": ["transformers", "Qwen2Tokenizer"],
+    "transformer": ["pipeline_moss_image", "MOSSImageTransformer"],
+    "vae": ["diffusers", "AutoencoderKLFlux2"],
+}
+
+
+def _repo_dir(tmp_path, index, files=()):
+    import json
+    (tmp_path / "model_index.json").write_text(json.dumps(index))
+    for name in files:
+        (tmp_path / name).write_text("# code\n")
+    return str(tmp_path)
+
+
+def test_the_module_is_read_from_the_index_not_assumed_to_be_pipeline_py(tmp_path):
+    """Kromoss and MOSS-Image as they are published: the class is in
+    pipeline_moss_image.py, and asking for pipeline.py 404s on a file that
+    never existed -- which is what made three live repositories look like
+    wrong model names."""
+    from codai.models import remote_code as R
+    repo = _repo_dir(tmp_path, MOSS_INDEX, ["pipeline_moss_image.py"])
+    assert R.declared_pipeline_module(repo) == "pipeline_moss_image"
+
+
+def test_an_installed_library_is_never_mistaken_for_a_module_in_the_repo(tmp_path):
+    """'transformers' and 'diffusers' sit in the same slot of the index as the
+    repo's own module; picking one of those would name a file nobody ships."""
+    from codai.models import remote_code as R
+    index = dict(MOSS_INDEX)
+    index.pop("scheduler")
+    index.pop("transformer")
+    repo = _repo_dir(tmp_path, index, ["transformers.py", "diffusers.py"])
+    assert R.declared_pipeline_module(repo) is None
+
+
+def test_a_named_module_the_repo_does_not_ship_is_not_returned(tmp_path):
+    """diffusers only takes the bare name when <module>.py is among the repo's
+    files; returning one that is missing would swap one 404 for another."""
+    from codai.models import remote_code as R
+    repo = _repo_dir(tmp_path, MOSS_INDEX)      # index only, no .py
+    assert R.declared_pipeline_module(repo) is None
+
+
+def test_an_ordinary_repo_names_no_module(tmp_path):
+    from codai.models import remote_code as R
+    repo = _repo_dir(tmp_path, {
+        "_class_name": "StableDiffusionXLPipeline",
+        "unet": ["diffusers", "UNet2DConditionModel"],
+        "text_encoder": ["transformers", "CLIPTextModel"],
+    })
+    assert R.declared_pipeline_module(repo) is None
+
+
+def test_the_class_still_comes_from_the_same_index(tmp_path):
+    from codai.models import remote_code as R
+    repo = _repo_dir(tmp_path, MOSS_INDEX, ["pipeline_moss_image.py"])
+    assert R.declared_pipeline_class(repo) == "MOSSImagePipeline"
+    assert R.declared_pipeline_class(str(tmp_path / "nope")) is None
 
 
 def test_such_a_repo_is_refused_by_name_when_not_allow_listed(monkeypatch):

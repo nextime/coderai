@@ -901,8 +901,13 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 getattr(_cm, "config", None), model_name)
         if _img_remote:
             _declared = _img_remote.pop("_declared_class", None)
+            # Name the module as well as the repo: the two differ whenever the
+            # pipeline file is not the conventional pipeline.py, and that
+            # difference is what a 404 on this path is about.
+            _cp = _img_remote['custom_pipeline']
+            _where = _cp if _cp == model_name else f"{model_name} ({_cp}.py)"
             print(f"  Custom pipeline from the repository: "
-                  f"{_img_remote['custom_pipeline']} (allow-listed)"
+                  f"{_where} (allow-listed)"
                   + (f" — it declares {_declared}, which is not in diffusers"
                      if _declared else ""))
     except PermissionError:
