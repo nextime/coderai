@@ -1173,7 +1173,22 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
             print(f"  component_models skip '{name}': the base pipeline has no "
                   f"loadable class for it (got {spec}).")
             continue
-        kwargs: Dict[str, Any] = {"torch_dtype": dtype}
+        # Loaded at the STORAGE dtype when one is configured for this
+        # component, not at the compute dtype. Casting after a bf16 load would
+        # save the resident cost and still need the bf16 peak to get there --
+        # and for a 12.9 GB fp8 file on a 24 GB card that peak IS the problem.
+        # See codai.models.layerwise.
+        _store_dtype = None
+        try:
+            from codai.models import layerwise as _lw
+            _store_dtype = _lw.storage_dtype_for(c, name)
+        except Exception:
+            _store_dtype = None
+        kwargs: Dict[str, Any] = {"torch_dtype": _store_dtype or dtype}
+        if _store_dtype is not None:
+            print(f"  component '{name}': loading at "
+                  f"{str(_store_dtype).replace('torch.', '')} (layerwise "
+                  f"casting upcasts it per module at compute time)")
         if mode in ("4bit", "8bit"):
             try:
                 from diffusers import BitsAndBytesConfig as DiffBnb

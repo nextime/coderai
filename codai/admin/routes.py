@@ -2972,6 +2972,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "call_kwargs", "component_dtype",
                 "lora_train_base_model", "lora_train_nodes",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
+                # Store the weights narrow, compute at full width. For the
+                # community fine-tunes published in fp8, where loading at the
+                # compute dtype doubles a file that already fits the card.
+                "layerwise_casting",
                 # Image prompt handling: which CLIP layer to read, and whether
                 # the A1111 weight grammar is parsed. Per model because the
                 # booru-tag fine-tunes need clip_skip 2 whatever the caller

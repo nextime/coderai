@@ -1284,6 +1284,20 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                             **_xtra,
                         )
 
+            # Layerwise casting BEFORE placement. The hooks replace each
+            # module's weights with the narrow storage dtype and upcast on its
+            # own forward, so doing it first means the device move carries the
+            # small tensors rather than the large ones. Never fatal: a pipeline
+            # that has loaded and can generate must not be failed by an
+            # optimisation. See codai.models.layerwise.
+            try:
+                from codai.models import layerwise as _layerwise
+                _lw_note = _layerwise.apply(pipeline, _mc, dtype)
+                if _lw_note:
+                    print(f"  [image][layerwise] {_lw_note}")
+            except Exception as _lw_exc:
+                print(f"  [image][layerwise] skipped ({_lw_exc})")
+
             # Apply memory optimizations based on attempt
             if torch.cuda.is_available():
                 if load_attempt >= 2:
