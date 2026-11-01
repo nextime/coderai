@@ -127,3 +127,72 @@ def test_eviction_protects_keys_that_share_a_component():
         "modules this pipeline shares with it"
     )
     assert "id(c) in _mine" in seg
+
+
+# --------------------------------------------------------------------------- #
+#  the device check must not fight a DELIBERATE offload
+# --------------------------------------------------------------------------- #
+
+def test_excluded_components_are_left_where_they_are():
+    """The text-encoder offload puts them on the CPU on purpose.
+
+    Measured 2026-11-01: this check "rescued" the text encoder on every edit
+    of a card with `sequential_text_encoder`, and the warning blamed a sibling
+    eviction that had not happened -- a wrong cause in a log line costs
+    somebody a debug cycle.
+    """
+    class _Recording(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 2)
+            self.sent_to = None
+
+        def to(self, *a, **kw):
+            self.sent_to = a[0] if a else kw.get("device")
+            return self
+
+    te = _Recording()
+    vae = _Recording()
+    p = _Pipe(text_encoder=te, vae=vae)
+    moved = images._restore_pipeline_device(
+        p, "cuda:0", exclude=("text_encoder",))
+    assert moved == ["vae"], moved
+    assert te.sent_to is None, "an excluded component must not be moved"
+
+
+def test_the_offload_owned_names_are_the_ones_the_helper_offloads():
+    """So the exclusion cannot drift from what actually gets offloaded."""
+    import inspect
+    from codai.models import text_encoder_offload as teo
+    src = inspect.getsource(teo)
+    for name in images._TEXT_ENCODER_OFFLOAD_COMPONENTS:
+        assert f'"{name}"' in src, (
+            f"{name} is excluded here but is not a component the offload "
+            f"manages"
+        )
+
+
+def test_the_edit_path_excludes_them_only_when_the_card_offloads():
+    import inspect
+    src = inspect.getsource(images.create_image_edit)
+    # Bounded by the call itself, not a byte count: a comment added above it
+    # must not decide whether this passes.
+    i = src.index("_restore_pipeline_device")
+    seg = src[i:src.index(")", src.index("sequential_text_encoder", i)) + 1]
+    assert "_TEXT_ENCODER_OFFLOAD_COMPONENTS" in seg
+    assert "sequential_text_encoder" in seg, (
+        "a card that does NOT offload still wants its text encoder rescued"
+    )
+
+
+def test_the_warning_does_not_assert_a_single_cause():
+    import inspect
+    src = inspect.getsource(images._restore_pipeline_device)
+    # The LAST warning in the function is the summary one; the earlier one
+    # reports a component that could not be moved.
+    i = src.rindex('_log.warning')
+    msg = src[i:]
+    assert "something moved them" in msg
+    assert "shared components are moved by" not in msg, (
+        "the old wording named sibling eviction as the cause, which was wrong "
+        "in the case that actually fired"
+    )

@@ -3759,7 +3759,17 @@ def _components_of(pipeline):
     return comps
 
 
-def _restore_pipeline_device(pipeline, device):
+#: Components the sequential text-encoder offload owns. It moves these to the
+#: CPU on purpose, to hand their VRAM to the denoiser, and brings them back
+#: itself before the next encode -- see codai/models/text_encoder_offload.py.
+#: A device check that "rescues" them fights that, and worse, reports a
+#: deliberate placement as damage. Measured 2026-11-01: the warning below fired
+#: on every edit of a card with `sequential_text_encoder`, blaming a sibling
+#: eviction that had not happened.
+_TEXT_ENCODER_OFFLOAD_COMPONENTS = ("text_encoder", "text_encoder_2")
+
+
+def _restore_pipeline_device(pipeline, device, exclude=()):
     """Move any component that has drifted to the CPU back onto ``device``.
 
     The cure for a failure that outlived the request that caused it. Sibling
@@ -3778,8 +3788,10 @@ def _restore_pipeline_device(pipeline, device):
 
     Components under an accelerate offload hook are LEFT ALONE: living on the
     CPU between calls is what those hooks are for, and the hook moves them for
-    the forward pass. A component that cannot be moved is reported rather than
-    raised on -- the request is no worse off for the attempt.
+    the forward pass. So are the names in ``exclude``, for the same reason --
+    the sequential text-encoder offload puts those on the CPU deliberately and
+    restores them itself. A component that cannot be moved is reported rather
+    than raised on -- the request is no worse off for the attempt.
 
     Returns the names it moved.
     """
@@ -3791,7 +3803,10 @@ def _restore_pipeline_device(pipeline, device):
     if _target.type == "cpu":
         return []               # nothing to bring back TO the CPU
     moved = []
+    _skip = set(exclude or ())
     for name, comp in _components_of(pipeline).items():
+        if name in _skip:
+            continue
         if not hasattr(comp, "parameters"):
             continue
         if getattr(comp, "_hf_hook", None) is not None:
@@ -3808,9 +3823,13 @@ def _restore_pipeline_device(pipeline, device):
         except Exception as exc:
             _log.warning("could not bring %s back to %s: %s", name, device, exc)
     if moved:
-        _log.warning("brought %s back to %s before the call — something had "
-                     "moved them to host RAM (shared components are moved by "
-                     "a sibling's eviction)", ", ".join(moved), device)
+        # Deliberately not naming a cause. A sibling's eviction is the one
+        # this exists for, but anything that moves a pipeline can do it, and
+        # asserting the wrong cause in a warning costs somebody a debug cycle.
+        _log.warning("brought %s back to %s before the call — they were in "
+                     "host RAM and this model does not offload them, so "
+                     "something moved them (a sibling's eviction will)",
+                     ", ".join(moved), device)
     return moved
 
 
@@ -4190,7 +4209,9 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         try:
             await asyncio.to_thread(
                 _restore_pipeline_device, pipe,
-                _derive_diffusers_device(global_args))
+                _derive_diffusers_device(global_args),
+                _TEXT_ENCODER_OFFLOAD_COMPONENTS
+                if (_edit_cfg or {}).get('sequential_text_encoder') else ())
         except Exception as _rd:
             _log.warning("device check skipped: %s", _rd)
 

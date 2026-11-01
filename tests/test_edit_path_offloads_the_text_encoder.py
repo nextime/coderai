@@ -35,8 +35,13 @@ def test_the_edit_path_offloads_when_the_card_asks():
 def test_it_is_opt_in_per_model():
     """Freeing it costs a host-RAM copy, so it is not done unasked."""
     src = _edit_src()
-    i = src.index("sequential_text_encoder")
-    assert "if bool(" in src[max(0, i - 120):i], (
+    # The flag is now read twice: once to exclude the offload-owned
+    # components from the device check, and once to guard the offload itself.
+    # Anchor on the offload, which is what this test is about.
+    i = src.index("encode_then_free")
+    seg = src[:i]
+    j = seg.rindex("sequential_text_encoder")
+    assert "if bool(" in seg[max(0, j - 120):j], (
         "guarded by the card's flag, not unconditional"
     )
 

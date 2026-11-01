@@ -5896,6 +5896,70 @@ class MultiModelManager:
         _trim_cpu_ram()
         return True
 
+    @staticmethod
+    def _pipeline_components(obj):
+        """A diffusers pipeline's component modules by name, best effort."""
+        try:
+            comps = dict(getattr(obj, "components", None) or {})
+        except Exception:
+            comps = {}
+        if not comps:
+            for _n in ("transformer", "transformer_2", "unet", "vae",
+                       "text_encoder", "text_encoder_2", "image_encoder"):
+                _c = getattr(obj, _n, None)
+                if _c is not None:
+                    comps[_n] = _c
+        return comps
+
+    def _detach_components_shared_with_loaded(self, key, model_obj):
+        """Unhook from ``model_obj`` anything another LOADED model still holds.
+
+        Cards that share a weights file share their component MODULES, and
+        eviction frees a pipeline by walking ``pipe.components`` and stripping
+        their tensors. So unloading one sibling took the VAE and transformer
+        of every other sibling with it, while those were still registered as
+        loaded and believed to be on the card -- and nothing moved them back.
+        Measured 2026-11-01 across the four Qwen-Image-Edit cards: the first
+        edit failed slowly, every edit after it failed in under a second with
+
+            Input type (CUDABFloat16Type) and weight type (CPUBFloat16Type)
+            should be the same
+
+        and it stayed that way until the server was restarted.
+
+        Returns ``(skip_free, detached_names)``. ``skip_free`` is True when
+        another key holds this very OBJECT, in which case nothing may be freed
+        at all -- dropping the registry entry is the whole of the eviction.
+
+        Call AFTER the key has been removed from ``self.models``, so this
+        model's own entry is not mistaken for a sharer.
+        """
+        try:
+            others = [v for k, v in dict(self.models).items() if k != key]
+        except Exception:
+            return False, []
+        if any(v is model_obj for v in others):
+            return True, []
+        mine = self._pipeline_components(model_obj)
+        if not mine:
+            return False, []
+        held = set()
+        for v in others:
+            for c in self._pipeline_components(v).values():
+                held.add(id(c))
+        if not held:
+            return False, []
+        detached = []
+        for name, comp in mine.items():
+            if id(comp) not in held:
+                continue
+            try:
+                setattr(model_obj, name, None)
+                detached.append(name)
+            except Exception:
+                pass
+        return False, detached
+
     def _evict_one(self, key, reason: str = ""):
         """Fully unload ONE model by key and free its VRAM + host RAM.
 
@@ -5957,6 +6021,19 @@ class MultiModelManager:
                 pool.cleanup_all()
             except Exception as e:
                 print(f"  Warning cleaning pool for '{key}': {e}")
+        if model_obj is not None:
+            # Never free what another loaded model is still using. See
+            # _detach_components_shared_with_loaded: freeing a pipeline walks
+            # its components, and siblings on one weights file share those.
+            _skip_free, _detached = self._detach_components_shared_with_loaded(
+                key, model_obj)
+            if _detached:
+                print(f"  '{key}': {', '.join(_detached)} left alone — still "
+                      f"held by another loaded model")
+            if _skip_free:
+                print(f"  '{key}': the same pipeline object is loaded under "
+                      f"another key — dropping this entry only, freeing nothing")
+                model_obj = None
         if model_obj is not None:
             try:
                 if hasattr(model_obj, 'cleanup'):
