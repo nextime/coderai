@@ -1245,6 +1245,18 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
                 _base = str((c or {}).get('path') or '').strip() or model_name
                 components[name] = cls.from_single_file(
                     _path, config=_base, subfolder=name, **kwargs)
+                # Scales kept beside the weights, which diffusers drops. Read
+                # from the file and applied to the module OUTPUTS, so the
+                # weights stay as stored and the arithmetic is still exact.
+                # Not optional and not caught: a checkpoint of this shape is
+                # unusable without them -- its weights are hundreds of times
+                # too large -- so failing to apply them has to fail the load.
+                # See codai.models.scaled_fp8.
+                from codai.models import scaled_fp8 as _sfp8
+                _sfp8_note = _sfp8.apply_to_component(
+                    components[name], cls, _path)
+                if _sfp8_note:
+                    print(f"  component '{name}': {_sfp8_note}")
             else:
                 components[name] = cls.from_pretrained(source, **kwargs)
             descs.append(f"{name}:{source.split('/')[-1]}{'/' + mode if mode else ''}")
