@@ -439,6 +439,13 @@ class OlmOcrEngine(OcrEngine):
             # "continuation" is a second transcription of the same page.
             extra = {"continue_final_message": True,
                      "add_generation_prompt": False}
+        if bool(getattr(self.cfg, "olmocr_logprobs", True)):
+            # The same ask the HTTP path makes. codai/api/text.py forwards
+            # request.logprobs to the backend and attaches what comes back to
+            # choices[0].logprobs; this path simply never asked, so every page
+            # read on a pod that serves olmOCR itself reported
+            # confidence_measured: false.
+            extra["logprobs"] = True
         req = ChatCompletionRequest(
             model=model_id, messages=messages, stream=False,
             temperature=temperature, max_tokens=max_tokens, **extra,
@@ -455,11 +462,12 @@ class OlmOcrEngine(OcrEngine):
         if not content.strip() and not prefix:
             raise OcrError(f"olmOCR model '{model_id}' returned no text", status=500)
         reason, used_in, used_out = resume.finish_and_usage(result)
-        # coderai's in-process chat handler surfaces no per-token logprobs, so this
-        # path reports "not measured" rather than a 0.0 posing as one.
+        # Measured here too, now that the request above asks for it. Still None
+        # when the backend declines logprobs, which is a configuration and not
+        # an error.
         return resume.Reply(text=content, finish_reason=reason,
                             prompt_tokens=used_in, completion_tokens=used_out,
-                            conf=None)
+                            conf=mean_token_prob(logprobs_of(_as_dict(result))))
 
     def _ask_http(self, messages, max_tokens, temperature, base: str = "",
                   api_key: str = "", model_name: str = "", prefix: str = ""):
@@ -559,6 +567,28 @@ class OlmOcrEngine(OcrEngine):
         return resume.Reply(text=content, finish_reason=reason,
                             prompt_tokens=used_in, completion_tokens=used_out,
                             conf=mean_token_prob(logprobs_of(body)))
+
+
+def _as_dict(result):
+    """A chat-completions reply as a plain dict, whatever shape it arrives in.
+
+    The in-process handler returns a dict or a pydantic model and FastAPI hands
+    back a JSONResponse. Shared with the confidence read so both look at the
+    same object.
+    """
+    if isinstance(result, dict):
+        return result
+    if hasattr(result, "model_dump"):
+        try:
+            return result.model_dump()
+        except Exception:
+            pass
+    if hasattr(result, "body"):
+        try:
+            return json.loads(result.body)
+        except Exception:
+            pass
+    return None
 
 
 def _content_of(result) -> str:

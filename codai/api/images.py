@@ -755,7 +755,8 @@ _LARGEST_COMPONENT_FRACTION = 0.8
 _BORDERLINE_GB = 3.0
 
 
-def _auto_offload_strategy(model_key, resolved_name, requested_id, strategy):
+def _auto_offload_strategy(model_key, resolved_name, requested_id, strategy,
+                           quantized=False):
     """Resolve ``auto`` / ``auto-borderline`` into a concrete offload strategy.
 
     Returns ``(strategy_or_None, why)``; None means "load it on the card".
@@ -774,11 +775,37 @@ def _auto_offload_strategy(model_key, resolved_name, requested_id, strategy):
     want = str(strategy or "").strip().lower()
     if want not in ("auto", "auto-borderline"):
         return None, ""
+    if quantized:
+        # A pre-quantized component has two outcomes and only two: every layer
+        # on the card, or a model that loads and then fails every request --
+        # bitsandbytes' kernels take device pointers and an offload hook moves
+        # the tensors out from under them. Measured before, recorded in
+        # codai/models/hf_loading.py; measured again 2026-11-01, when this
+        # function first sent Krea-2-RealDream (4-bit text encoder) down the
+        # sequential-offload path and accelerate's device move died on
+        # `Params4bit.__new__() got an unexpected keyword argument
+        # '_is_hf_initialized'`.
+        #
+        # So never CHOOSE offload for one. An explicit offload_strategy still
+        # wins -- an operator who knows their build works may say so -- and a
+        # model that does not fit now fails loudly instead of succeeding into a
+        # pipeline that cannot serve a request.
+        return None, ("has pre-quantized components, which cannot be offloaded "
+                      "(they load and then fail every request) — trying the "
+                      "card; make room by eviction rather than placement")
     try:
         from codai.models.manager import multi_model_manager as _mmm
         need = float(_mmm._get_model_used_vram_gb(
             model_key, resolved_name, requested_id=requested_id) or 0.0)
-        free = float(_mmm._get_free_vram_gb() or 0.0)
+        # exclude_key, because THIS load's own in-flight reservation must not
+        # count against it. Without it the free figure is already short by the
+        # whole footprint being judged: measured 2026-11-01 on
+        # Krea-2-RealDream, "9.7 GB needed against 4.8 GB free" on a card with
+        # about 14.5 GB free -- 14.5 minus its own 9.7 reservation -- so a model
+        # that fitted comfortably was sent to sequential offload. The same
+        # mistake is recorded in _get_free_vram_gb's own docstring, which is
+        # where the keyword comes from.
+        free = float(_mmm._get_free_vram_gb(exclude_key=model_key) or 0.0)
     except Exception as exc:
         # No sizing, no decision. Offloading on a guess costs every request a
         # PCIe trip; the ordinary load still falls back on a real OOM.
@@ -1021,7 +1048,9 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     if not use_sequential_offload:
         _auto_strategy, _auto_offload_why = _auto_offload_strategy(
             f"image:{_requested_id}", model_name, _requested_id,
-            _offload_strategy)
+            _offload_strategy,
+            quantized=bool(_mc.get('load_in_4bit') or _mc.get('load_in_8bit')
+                           or _mc.get('component_quantization')))
         if _auto_offload_why:
             print(f"  [image][offload] {_offload_strategy}: {_auto_offload_why}")
         if _auto_strategy:

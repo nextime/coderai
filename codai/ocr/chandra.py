@@ -739,6 +739,14 @@ class ChandraEngine(OcrEngine):
             # which the proxy forwards verbatim (v0.3.51).
             extra = {"continue_final_message": True,
                      "add_generation_prompt": False}
+        if self._want_logprobs():
+            # The in-process handler forwards `logprobs` to the backend and
+            # attaches what comes back to choices[0].logprobs, exactly as the
+            # HTTP path does -- it was simply never asked. Without this the
+            # page reports confidence_measured: false on every pod that serves
+            # chandra itself, which is every OCR pod (the pipeline and its vLLM
+            # share the process, so the dispatcher picks this path).
+            extra["logprobs"] = True
         req = ChatCompletionRequest(
             model=model_id, messages=messages, stream=False,
             temperature=temperature, top_p=top_p, max_tokens=max_tokens,
@@ -757,12 +765,15 @@ class ChandraEngine(OcrEngine):
         if not content.strip() and not prefix:
             raise OcrError(f"Chandra model '{model_id}' returned no text", status=500)
         reason, used_in, used_out = resume.finish_and_usage(result)
-        # No confidence from this path: coderai's in-process chat handler does not
-        # surface per-token logprobs. Reported as "not measured" rather than 0.0
-        # pretending to be one.
+        # Measured here too. This used to return conf=None with a comment saying
+        # the in-process handler could not surface per-token logprobs; it can
+        # (codai/api/text.py forwards request.logprobs to the backend and puts
+        # what comes back on choices[0].logprobs), and the request above now
+        # asks. Still None when the backend declines them, which is a
+        # configuration rather than an error.
         return resume.Reply(text=content, finish_reason=reason,
                             prompt_tokens=used_in, completion_tokens=used_out,
-                            conf=None)
+                            conf=mean_token_prob(logprobs_of(_as_dict(result))))
 
     def _ask_http(self, messages, max_tokens, temperature, top_p, base: str = "",
                   api_key: str = "", model_name: str = "", prefix: str = ""):
@@ -868,22 +879,33 @@ class ChandraEngine(OcrEngine):
                             conf=mean_token_prob(logprobs_of(body)))
 
 
+def _as_dict(result):
+    """A chat-completions reply as a plain dict, whatever shape it arrives in.
+
+    The in-process handler returns a dict or a pydantic model, and FastAPI
+    hands back a JSONResponse. Shared by :func:`_content_of` and the confidence
+    read below so both look at the same object -- they disagreed once, which is
+    how a reply with logprobs in it was read for its text and not its numbers.
+    """
+    if isinstance(result, dict):
+        return result
+    if hasattr(result, "model_dump"):
+        try:
+            return result.model_dump()
+        except Exception:
+            pass
+    if hasattr(result, "body"):
+        try:
+            return json.loads(result.body)
+        except Exception:
+            pass
+    return None
+
+
 def _content_of(result) -> str:
     """Assistant message content out of a chat-completions result, whatever shape it
     arrives in (dict, pydantic model, JSONResponse)."""
-    r = None
-    if isinstance(result, dict):
-        r = result
-    elif hasattr(result, "model_dump"):
-        try:
-            r = result.model_dump()
-        except Exception:
-            r = None
-    if r is None and hasattr(result, "body"):
-        try:
-            r = json.loads(result.body)
-        except Exception:
-            r = None
+    r = _as_dict(result)
     if not isinstance(r, dict):
         return ""
     choices = r.get("choices") or []

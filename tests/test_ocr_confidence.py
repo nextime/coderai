@@ -167,15 +167,33 @@ def test_chandras_scope_is_page_because_it_generates_a_page_at_once():
     assert [l.conf for l in page.lines] == [0.8, 0.8]
 
 
-def test_the_local_model_path_reports_no_confidence():
-    """coderai's in-process chat handler surfaces no logprobs, so this path must
-    not pretend otherwise."""
+def test_the_local_model_path_measures_confidence_too():
+    """It used to report none, on the premise that coderai's in-process chat
+    handler could not surface logprobs. It can: codai/api/text.py forwards
+    request.logprobs to the backend and attaches what comes back to
+    choices[0].logprobs. Nothing had asked -- and this is the path every OCR POD
+    takes, since the pipeline and its vLLM share the process there, which is why
+    Digesta saw confidence_measured: false from chandra while surya reported
+    0.99 for the same pages.
+
+    The invariant that test was really protecting -- never a 0.0 posing as a
+    measurement -- is unchanged and asserted below.
+    """
     import inspect
     src = inspect.getsource(ch.ChandraEngine._ask_local)
-    # The value is carried on a resume.Reply since v0.3.62 (which also brings the
-    # finish reason, so a cut-off page can be continued) — but this path still
-    # has to say "not measured" rather than hand back a 0.0 posing as one.
-    assert "conf=None)" in src
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.strip().startswith("#"))
+    assert 'extra["logprobs"] = True' in code, "the path has to ask"
+    assert "mean_token_prob(" in code, "and turn the answer into a figure"
+    assert "conf=None)" not in code, "no longer hardcoded as unmeasured"
+
+
+def test_an_unmeasured_page_is_still_never_a_zero_posing_as_one():
+    """The guarantee the test above used to carry. mean_token_prob returns None
+    for a reply with no logprobs, and parse_page reports that as
+    confidence_measured: false rather than a confident 0.0."""
+    from codai.ocr.base import logprobs_of, mean_token_prob
+    assert mean_token_prob(logprobs_of({"choices": [{"message": {"content": "x"}}]})) is None
 
 
 # -------------------------------------------------------------------- olmOCR #

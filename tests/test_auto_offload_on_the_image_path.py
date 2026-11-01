@@ -35,21 +35,34 @@ SRC = open("codai/api/images.py").read()
 
 
 class _FakeManager:
-    def __init__(self, need, free):
-        self._need, self._free = need, free
+    """`free` is what the card has with this load's reservation EXCLUDED.
+
+    `reserved` is what a caller that forgets exclude_key would see subtracted
+    from its own view -- the mistake this fixture exists to catch.
+    """
+
+    def __init__(self, need, free, reserved=0.0):
+        self._need, self._free, self._reserved = need, free, reserved
+        self.exclude_seen = []
 
     def _get_model_used_vram_gb(self, *a, **kw):
         return self._need
 
-    def _get_free_vram_gb(self, *a, **kw):
-        return self._free
+    def _get_free_vram_gb(self, exclude_key: str = "", *a, **kw):
+        self.exclude_seen.append(exclude_key)
+        return self._free if exclude_key else self._free - self._reserved
 
 
 @pytest.fixture
 def mgr(monkeypatch):
-    def _use(need, free):
+    holder = {}
+
+    def _use(need, free, reserved=0.0):
         import codai.models.manager as M
-        monkeypatch.setattr(M, "multi_model_manager", _FakeManager(need, free))
+        holder["m"] = _FakeManager(need, free, reserved)
+        monkeypatch.setattr(M, "multi_model_manager", holder["m"])
+        return holder["m"]
+    _use.last = holder
     return _use
 
 
@@ -165,3 +178,72 @@ def test_model_offload_escalates_to_sequential_on_the_last_attempt():
     body = SRC[i:i + 900]
     assert "load_attempt >= 3" in body
     assert "_strategy = 'sequential'" in body
+
+
+# --------------------------------------------------------------------------- #
+#  a load must not be judged against its own reservation
+# --------------------------------------------------------------------------- #
+
+def test_the_loads_own_reservation_does_not_count_against_it(mgr):
+    """Measured 2026-11-01: "9.7 GB needed against 4.8 GB free" on a card with
+    about 14.5 GB free -- 14.5 minus the 9.7 this very load had just reserved.
+    A model that fitted comfortably was sent to sequential offload. The same
+    mistake is recorded in _get_free_vram_gb's own docstring, which is where
+    the exclude_key keyword comes from."""
+    m = mgr(9.7, 14.5, reserved=9.7)
+    strategy, why = _decide("auto-borderline")
+    assert strategy is None, why
+    assert "fits" in why
+    assert m.exclude_seen and all(k for k in m.exclude_seen), \
+        "free VRAM has to be asked with exclude_key set"
+
+
+def test_the_excluded_key_is_the_one_being_loaded(mgr):
+    m = mgr(9.7, 14.5, reserved=9.7)
+    _decide()
+    assert m.exclude_seen[0] == "image:Krea-2-RealDream"
+
+
+# --------------------------------------------------------------------------- #
+#  pre-quantized components are never sent to offload
+# --------------------------------------------------------------------------- #
+
+def test_a_quantized_pipeline_is_never_auto_offloaded(mgr):
+    """bitsandbytes kernels take device pointers and an offload hook moves the
+    tensors out from under them: the model loads and then fails every request.
+    Measured again when this function first sent Krea-2-RealDream (4-bit text
+    encoder) to sequential offload and accelerate died on
+    `Params4bit.__new__() got an unexpected keyword argument
+    '_is_hf_initialized'`."""
+    mgr(31.0, 10.0)          # hopelessly over: would otherwise be sequential
+    strategy, why = images_mod._auto_offload_strategy(
+        "image:X", "repo/x", "X", "auto-borderline", quantized=True)
+    assert strategy is None
+    assert "pre-quantized" in why
+    assert "fail every request" in why
+
+
+def test_an_unquantized_pipeline_still_offloads_when_it_must(mgr):
+    mgr(31.0, 10.0)
+    strategy, _ = images_mod._auto_offload_strategy(
+        "image:X", "repo/x", "X", "auto-borderline", quantized=False)
+    assert strategy == "sequential"
+
+
+def test_the_quantized_check_comes_before_any_sizing(mgr):
+    """It must not depend on a footprint being known: a quantized model with no
+    estimate must still not be offloaded."""
+    mgr(0.0, 0.0)
+    strategy, why = images_mod._auto_offload_strategy(
+        "image:X", "repo/x", "X", "auto", quantized=True)
+    assert strategy is None
+    assert "pre-quantized" in why
+
+
+def test_the_caller_passes_the_quantization_flags():
+    """All three ways a model declares itself quantized."""
+    src = open("codai/api/images.py").read()
+    i = src.index("_auto_offload_strategy(\n")
+    body = src[i:i + 500]
+    for flag in ("load_in_4bit", "load_in_8bit", "component_quantization"):
+        assert flag in body, flag
