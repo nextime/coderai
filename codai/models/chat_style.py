@@ -33,6 +33,7 @@ knowing is survivable — a wrong guess that silently produces wrong tool
 arguments is not — so an unreadable template changes nothing.
 """
 
+import re
 import json
 import os
 import threading
@@ -147,6 +148,27 @@ def tool_call_style(model_path: str) -> str:
     return ""
 
 
+#: ``<think>`` closed again with nothing but whitespace between. The template
+#: source is Jinja, so the newlines are the two-character escapes ``\n`` as
+#: often as they are real ones.
+_PRECLOSED_EMPTY_THINK = re.compile(r"<think>(?:\\[nrt]|\s)*</think>")
+
+
+def _preclosed_empty_think(tpl: str) -> bool:
+    """Whether the GENERATION PROMPT shuts an empty think block.
+
+    Scoped to the generation prompt because the same tag pair appears earlier in
+    these templates for an unrelated reason -- re-rendering a past assistant
+    turn that had reasoning of its own -- and that says nothing about what the
+    model is about to emit. chandra-ocr-2 has three ``<think>`` in total and
+    only the last one is the prefill.
+    """
+    i = tpl.rfind("add_generation_prompt")
+    if i < 0:
+        return False
+    return bool(_PRECLOSED_EMPTY_THINK.search(tpl[i:]))
+
+
 def thinks(model_path: str) -> bool:
     """True when this model emits a reasoning block of its own.
 
@@ -165,9 +187,35 @@ def thinks(model_path: str) -> bool:
     -- makes the model emit the thought body and a BARE ``</think>``, with no
     opening tag anywhere in the output. That is the form that leaks when
     nothing is looking for it.
+
+    A template that pre-fills a CLOSED and EMPTY one instead --
+
+        {%- if add_generation_prompt %}
+            {{- '<|im_start|>assistant\\n' }}
+            {{- '<think>\\n\\n</think>\\n\\n' }}
+
+    -- is saying the opposite: the block is shut before the model emits a
+    token, so its output contains no ``</think>`` at all. Measured on
+    datalab-to/chandra-ocr-2, an OCR fine-tune of a Qwen3.5 base whose template
+    still mentions the tags. It was read as a thinking model, launched with
+    ``--reasoning-parser qwen3``, and that parser -- which assumes the stream
+    starts INSIDE the block and ends at the tag -- filed every page of
+    transcription as ``reasoning_content`` and returned ``content`` empty. The
+    pod answered 200 OK twenty-eight times and read nothing.
+
+    ``enable_thinking`` is what separates the two, and it is checked first: a
+    template carrying that switch pre-closes the block only in its
+    thinking-disabled branch (Qwen3.5-9B does exactly this), so the model can
+    still think when asked. Without the switch, a pre-closed block in the
+    generation prompt is unconditional and the model never thinks.
     """
     tpl = chat_template_text(model_path)
     if not tpl:
+        return False
+    if "enable_thinking" in tpl:
+        # Switchable: thinking is the caller's choice, so the parser is needed.
+        return True
+    if _preclosed_empty_think(tpl):
         return False
     return any(t in tpl for t in ("<think>", "</think>", "<thinking>",
                                   "<|begin_of_thought|>", "enable_thinking"))
