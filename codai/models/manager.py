@@ -5240,14 +5240,28 @@ class MultiModelManager:
         # comparison and does not care how self.config happens to be keyed —
         # _config_for_model() resolves an alias THROUGH the alias map to the shared
         # path, which lands on the sibling and is exactly what went wrong here.
+        _sized_by_alias = False
         if requested_id:
             for _k, _c in (self.config or {}).items():
                 if isinstance(_c, dict) and _c.get('alias') == requested_id and _c is not cfg:
                     print(f"  [vram-est] sizing '{requested_id}' by its own config "
                           f"(shares a weights file with '{str(model_key).split('/')[-1]}')")
                     cfg = _c
+                    _sized_by_alias = True
                     break
-        for _cand in (requested_id, resolved_name):
+                if isinstance(_c, dict) and _c.get('alias') == requested_id:
+                    _sized_by_alias = True      # already the right entry
+                    break
+        # Only when the alias did NOT settle it. This loop looks the candidate
+        # up with _config_for_model, which resolves an alias THROUGH the alias
+        # map to the shared path -- landing on whichever sibling registered it,
+        # which is the exact mistake the block above exists to correct. Left
+        # unguarded it overwrote the right answer with the wrong one: measured
+        # 2026-11-01, "sizing 'Krea-2-RealDream' by its own config" was printed
+        # and the estimate still came out as Krea-2-Turbo's 9.68 GB for a model
+        # that measures 17.22 GB, because `resolved_name` is the shared path
+        # and its config is the sibling's.
+        for _cand in () if _sized_by_alias else (requested_id, resolved_name):
             if not _cand or _cand == model_key:
                 continue
             _req = self._config_for_model(_cand)
@@ -7216,7 +7230,15 @@ class MultiModelManager:
                 self.model_pools[model_key] = pool
 
             if pool.needs_new_instance():
-                needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
+                # _requested_id, or a same-path sibling's config is used: the
+                # three Krea cards share unsloth/Krea-2-Turbo, and without it
+                # Krea-2-RealDream (19.0 GB, civitai fp8 transformer) was sized
+                # by Krea-2-Turbo's entry (14.0 GB with a GGUF transformer,
+                # 9.68 GB after its quant multiplier) against a model that
+                # measures 17.22 GB. See _get_model_used_vram_gb, whose
+                # disambiguation needs the requested id to fire at all.
+                needed_gb = self._get_model_used_vram_gb(
+                    model_key, resolved_name, _requested_id)
                 free_gb = self._get_free_vram_gb()
                 if needed_gb > 0 and free_gb >= needed_gb:
                     print(f"Ondemand: all {pool.count} instance(s) of '{model_key}' busy — "
@@ -7255,7 +7277,10 @@ class MultiModelManager:
                 loaded_canonical = "legacy_model_manager"
             
             if loaded_canonical and loaded_canonical != model_key:
-                needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
+                # _requested_id for the same reason as above: this is the
+                # figure the "need N GB, have M GB free" decision is made on.
+                needed_gb = self._get_model_used_vram_gb(
+                    model_key, resolved_name, _requested_id)
                 free_gb = self._get_free_vram_gb()
 
                 # Require headroom beyond raw weight size for activation buffers
