@@ -177,3 +177,55 @@ def test_the_loader_applies_it_before_placement():
 
 def test_it_is_savable_from_the_admin_page():
     assert '"layerwise_casting",' in open("codai/admin/routes.py").read()
+
+
+# --------------------------------------------------------------------------- #
+#  the shape the loader actually passes
+# --------------------------------------------------------------------------- #
+
+NESTED = {
+    "precision": "bf16",
+    "_raw_cfg": {
+        "layerwise_casting": {"transformer": "f8"},
+        "component_quantization": {"text_encoder": "4bit"},
+    },
+}
+
+
+@requires_f8
+def test_it_reads_a_config_nested_under_raw_cfg():
+    """A model's config reaches the image loader as TRANSLATED kwargs with the
+    original entry under ``_raw_cfg``; hf_loading._norm exists to unwrap that
+    and every other reader uses it. This module had its own _norm that did not,
+    so `layerwise_casting` was invisible and NO casting hooks were installed --
+    while the storage dtype, read through the component loader's already
+    unwrapped copy, applied. Measured 2026-11-01: the weights loaded as fp8 and
+    nothing upcast them for the matmul, which on Ampere is a dtype the hardware
+    cannot multiply at all.
+    """
+    got, desc = layerwise.spec(NESTED)
+    assert got, "the nested config has to be seen"
+    assert "transformer" in got
+    assert layerwise.storage_dtype_for(NESTED, "transformer") is torch.float8_e4m3fn
+
+
+@requires_f8
+def test_a_flat_config_still_works():
+    flat = {"layerwise_casting": {"transformer": "f8"}}
+    assert layerwise.storage_dtype_for(flat, "transformer") is torch.float8_e4m3fn
+
+
+@requires_f8
+def test_the_hooks_are_installed_for_a_nested_config():
+    """The consequence, not just the parse: apply() had returned "" and
+    installed nothing."""
+    t = _Comp()
+    note = layerwise.apply(_Pipe(transformer=t), NESTED, torch.bfloat16)
+    assert t.calls == [(torch.float8_e4m3fn, torch.bfloat16)]
+    assert "transformer" in note
+
+
+def test_the_unwrap_is_shared_and_not_reimplemented():
+    src = open("codai/models/layerwise.py").read()
+    assert "hf_loading import _norm" in src, \
+        "a second copy of the unwrap is how the two readers disagreed"

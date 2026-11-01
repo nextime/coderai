@@ -71,7 +71,29 @@ _DEFAULT_COMPONENTS = ("transformer", "unet", "text_encoder", "text_encoder_2")
 
 
 def _norm(cfg) -> Dict[str, Any]:
-    return cfg if isinstance(cfg, dict) else {}
+    """The per-model config, with a forwarded ``_raw_cfg`` unwrapped.
+
+    Delegated to :func:`codai.models.hf_loading._norm` rather than reimplemented:
+    a model's config reaches the image loader as TRANSLATED kwargs with the
+    original entry nested under ``_raw_cfg``, and every other reader of it
+    unwraps that. This module did not, so ``layerwise_casting`` was invisible
+    here and no casting hooks were installed -- while the storage dtype, read
+    through the component loader's already-unwrapped copy, applied. The weights
+    loaded as fp8 and nothing upcast them for the matmul, which on Ampere is a
+    dtype the hardware cannot multiply at all.
+    """
+    try:
+        from codai.models.hf_loading import _norm as _hf_norm
+        return _hf_norm(cfg)
+    except Exception:
+        if not isinstance(cfg, dict):
+            return {}
+        raw = cfg.get("_raw_cfg")
+        merged = dict(cfg)
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                merged.setdefault(k, v)
+        return merged
 
 
 def _resolve_dtype(value):

@@ -755,6 +755,26 @@ _LARGEST_COMPONENT_FRACTION = 0.8
 _BORDERLINE_GB = 3.0
 
 
+def _declares_quantization(model_config) -> bool:
+    """Whether this model's config asks for pre-quantized components.
+
+    Through hf_loading._norm, because the per-model config arrives as
+    TRANSLATED kwargs with the original entry nested under ``_raw_cfg``. Read
+    directly, `component_quantization` is simply absent -- measured 2026-11-01,
+    when that made a 4-bit model look unquantized, sent it to sequential
+    offload, and died in accelerate's device move on
+    `Params4bit.__new__() got an unexpected keyword argument
+    '_is_hf_initialized'`.
+    """
+    try:
+        from codai.models.hf_loading import _norm
+        cfg = _norm(model_config)
+    except Exception:
+        cfg = model_config if isinstance(model_config, dict) else {}
+    return bool(cfg.get('load_in_4bit') or cfg.get('load_in_8bit')
+                or cfg.get('component_quantization'))
+
+
 def _auto_offload_strategy(model_key, resolved_name, requested_id, strategy,
                            quantized=False):
     """Resolve ``auto`` / ``auto-borderline`` into a concrete offload strategy.
@@ -1049,8 +1069,7 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
         _auto_strategy, _auto_offload_why = _auto_offload_strategy(
             f"image:{_requested_id}", model_name, _requested_id,
             _offload_strategy,
-            quantized=bool(_mc.get('load_in_4bit') or _mc.get('load_in_8bit')
-                           or _mc.get('component_quantization')))
+            quantized=_declares_quantization(_mc))
         if _auto_offload_why:
             print(f"  [image][offload] {_offload_strategy}: {_auto_offload_why}")
         if _auto_strategy:

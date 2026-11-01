@@ -240,10 +240,53 @@ def test_the_quantized_check_comes_before_any_sizing(mgr):
     assert "pre-quantized" in why
 
 
-def test_the_caller_passes_the_quantization_flags():
-    """All three ways a model declares itself quantized."""
+def test_all_three_declarations_of_quantization_are_considered():
+    """The flags moved into _declares_quantization when it grew the _raw_cfg
+    unwrap; the guarantee is that none of the three was left behind."""
     src = open("codai/api/images.py").read()
-    i = src.index("_auto_offload_strategy(\n")
-    body = src[i:i + 500]
+    i = src.index("def _declares_quantization")
+    body = src[i:src.index("\ndef ", i + 10)]
     for flag in ("load_in_4bit", "load_in_8bit", "component_quantization"):
         assert flag in body, flag
+    # ...and the caller routes through it rather than reading the dict itself.
+    j = src.index("_auto_offload_strategy(\n")
+    assert "_declares_quantization(_mc)" in src[j:j + 400]
+
+
+# --------------------------------------------------------------------------- #
+#  the quantization flags live under _raw_cfg
+# --------------------------------------------------------------------------- #
+
+def test_quantization_is_detected_through_the_raw_cfg_wrapper():
+    """Read directly, `component_quantization` is simply absent: the config
+    arrives as translated kwargs with the entry nested. Measured 2026-11-01 --
+    that made Krea-2-RealDream's 4-bit text encoder look unquantized, sent it
+    to sequential offload, and died in accelerate's device move on
+    `Params4bit.__new__() got an unexpected keyword argument
+    '_is_hf_initialized'`."""
+    nested = {"precision": "bf16",
+              "_raw_cfg": {"component_quantization": {"text_encoder": "4bit"}}}
+    assert images_mod._declares_quantization(nested) is True
+
+
+@pytest.mark.parametrize("flag", ["load_in_4bit", "load_in_8bit"])
+def test_the_boolean_flags_are_found_nested_too(flag):
+    assert images_mod._declares_quantization({"_raw_cfg": {flag: True}}) is True
+
+
+def test_a_flat_config_is_still_read():
+    assert images_mod._declares_quantization(
+        {"component_quantization": {"text_encoder": "4bit"}}) is True
+
+
+@pytest.mark.parametrize("cfg", [{}, None, {"_raw_cfg": {}},
+                                 {"precision": "bf16"}])
+def test_a_model_declaring_nothing_is_not_quantized(cfg):
+    assert images_mod._declares_quantization(cfg) is False
+
+
+def test_the_detection_goes_through_the_shared_unwrap():
+    src = open("codai/api/images.py").read()
+    i = src.index("def _declares_quantization")
+    body = src[i:i + 900]
+    assert "hf_loading import _norm" in body
