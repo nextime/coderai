@@ -1076,6 +1076,42 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
             _offload_strategy = _auto_strategy
             use_sequential_offload = True
 
+    # =====================================================================
+    # Host-RAM admission — BEFORE anything is allocated
+    # =====================================================================
+    # VRAM is handled by eviction; host RAM has to be handled by refusal,
+    # because the kernel's answer to running out of it is to kill the engine. The
+    # image path is where it bit hardest: the cards that quantize only their text
+    # encoder stage a bf16 transformer into host RAM, and on a full card nearly
+    # all of it spills. Raised, not caught — the caller turns it into a 503 that
+    # names the model, the size and the fix. See codai/models/host_ram.py.
+    #
+    # It runs HERE, ahead of the component building below, because it used to run
+    # after it -- about 150 lines later -- and a component is loaded to CPU
+    # first. So the check counted the memory of the very load it was admitting.
+    # Measured 2026-11-01 on Krea-2-RealDream: its 12.84 GB fp8 transformer was
+    # already resident when the check ran, the fleet read 49.1 GB against a 43 GB
+    # cap, and the load was refused for wanting 2 GB to stage the rest. Minutes
+    # later the same fleet measured 3.99 GB held with models loaded, so nothing
+    # was being retained -- the 49 GB was this load, counted against itself.
+    #
+    # The key is the REQUESTED id first, for the reason the VRAM sizing has it:
+    # `model_name` is the shared checkpoint by now, so Krea-2-RealDream was
+    # sized as Krea-2-Turbo (9.7 GB against its real 20.45 GB).
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+    except Exception:
+        _mmm = None
+    if _mmm is not None:
+        _hkey = None
+        for _k in (f"image:{_requested_id}", _requested_id,
+                   f"image:{model_name}", model_name):
+            if _k and _k in _mmm.config:
+                _hkey = _k
+                break
+        _mmm.ensure_host_ram_for(_hkey or f"image:{model_name}", model_name,
+                                 _requested_id)
+
     # Quantization (per-model config).  Builds a diffusers quantization config
     # applied per-component so 4-bit/8-bit image models use less VRAM.  Per-model
     # 'component_quantization' overrides win; otherwise the global flag applies
@@ -1258,28 +1294,6 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     _mmm._evict_models_for_vram(_total * 0.25 / 1e9)
         except Exception as _ee:
             print(f"  Proactive eviction skipped: {_ee}")
-
-    # =====================================================================
-    # Host-RAM admission
-    # =====================================================================
-    # VRAM is handled above by eviction; host RAM has to be handled by refusal,
-    # because the kernel's answer to running out of it is to kill the engine. The
-    # image path is where it bit hardest: the cards that quantize only their text
-    # encoder stage a bf16 transformer into host RAM, and on a full card nearly
-    # all of it spills. Raised, not caught — the caller turns it into a 503 that
-    # names the model, the size and the fix. See codai/models/host_ram.py.
-    try:
-        from codai.models.manager import multi_model_manager as _mmm
-    except Exception:
-        _mmm = None
-    if _mmm is not None:
-        _hkey = None
-        for _k in (f"image:{model_name}", model_name):
-            if _k in _mmm.config:
-                _hkey = _k
-                break
-        _mmm.ensure_host_ram_for(_hkey or f"image:{model_name}", model_name,
-                                 _requested_id)
 
     # =====================================================================
     # Standard loading path (with OOM fallback)
@@ -2115,7 +2129,31 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # lists during a run.  Reusing them on a later request corrupts the batch
     # dimension (`assert len(size) == bsz` in the Z-Image transformer's
     # unpatchify).  These are not safe to cache, so encode fresh every time.
-    _embed_cacheable = "ZImage" not in _pipe_cls
+    # A request carrying character references is not cacheable either, and the
+    # cache must not be READ for one.
+    #
+    # The IP-Adapter rewrites the UNet's attention processors and the shape of
+    # what cross-attention receives. Embeddings encoded for one arrangement,
+    # replayed into the other, reach the processor as something it does not
+    # expect: measured 2026-11-01 on CyberRealistic-Pony and pornmaster-pro-pony,
+    # where the COLD character request stored them and succeeded (119 s, 75 s)
+    # and the WARM one hit the cache and died at once with
+    #
+    #   AttributeError: 'tuple' object has no attribute 'shape'
+    #
+    # inside diffusers' attention_processor, answered to the client as a bare
+    # 500 because it escapes through the middleware. Both runs, both models, a
+    # cache HIT logged immediately before each failure.
+    #
+    # Decided from the REQUEST rather than from the pipeline's IP-Adapter state,
+    # so a character request neither reads nor writes the cache: the state is
+    # set later in this function, which would have let the cold request store a
+    # value only the warm one could trip over.
+    _has_char_refs = bool(
+        (getattr(request, 'character_profiles', None) or [])
+        or (getattr(request, 'character_references', None) or [])
+        or (getattr(request, 'environment_profiles', None) or []))
+    _embed_cacheable = "ZImage" not in _pipe_cls and not _has_char_refs
 
     cached_embeds = _embed_cache.get(prompt, neg_prompt, model_id) if _embed_cacheable else None
     embed_kwargs = {}
