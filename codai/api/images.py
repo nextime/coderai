@@ -3703,6 +3703,132 @@ def _is_instruction_edit(pipeline) -> bool:
     return "image" in params and "strength" not in params
 
 
+#: How many reference images a card accepts for one edit, when it says so.
+#: There is no way to detect this: every edit pipeline in diffusers annotates
+#: ``image`` as accepting ``list[PIL.Image.Image]``, but for some that list is
+#: SEVERAL REFERENCES ("put the man from picture 2 next to the woman") and for
+#: others it is a BATCH of independent sources. FluxKontextPipeline and
+#: Flux2KleinPipeline carry the same annotation and mean different things by
+#: it, so the signature cannot answer the question and the card has to.
+_MAX_REFERENCE_IMAGES_KEY = "max_reference_images"
+
+
+def _declared_max_reference_images(model_config):
+    """How many references this card says it takes, or None if it has not said.
+
+    None is NOT "unlimited" -- see :func:`_check_reference_image_count`. A card
+    that has not declared the capability is treated as single-reference,
+    because that is the safe reading: sending a second reference to a pipeline
+    that cannot use one produced, measured 2026-11-01 on zeiss with
+    Krea-2-Edit and two images,
+
+        Sizes of tensors must match except in dimension 1. Expected size 1
+        but got size 0 for tensor number 1 in the list.
+
+    an internal shape error reported as a 500, which tells the caller nothing
+    about what it did wrong.
+    """
+    try:
+        cfg = card_view(model_config) or {}
+    except Exception:
+        cfg = model_config if isinstance(model_config, dict) else {}
+    raw = cfg.get(_MAX_REFERENCE_IMAGES_KEY)
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        _log.warning("%s=%r is not a number — ignoring it",
+                     _MAX_REFERENCE_IMAGES_KEY, raw)
+        return None
+    return n if n >= 1 else None
+
+
+def _pipeline_reference_semantics(pipeline):
+    """Whether this pipeline treats an image LIST as references or as one image.
+
+    Returns "many", "one", or None when it cannot be told.
+
+    This is answerable, and neither the signature nor the docstring answers
+    it. Every edit pipeline annotates ``image`` as accepting
+    ``list[PIL.Image.Image]``, and their docstrings are the same copied
+    paragraph calling it "an image batch" -- wrong for the ones that take
+    several references. What differs is what the code DOES with the list
+    (read from diffusers 0.37.0.dev0, 2026-11-01):
+
+        Flux2KleinPipeline          `for img in image:`      -> many
+        QwenImageEditPlusPipeline   `for img in image:`      -> many
+        FluxKontextPipeline         `image[0] if isinstance` -> one
+
+    FluxKontext is the case worth catching: handed three references it uses
+    the first and silently discards the rest, so the request answers 200 with
+    a picture that ignored most of what was asked for.
+
+    A source read is evidence, not a guarantee -- an upstream refactor can
+    change the wording without changing the behaviour, which is why this only
+    supplies the DEFAULT and a card's own ``max_reference_images`` always
+    wins. When the read is inconclusive the caller refuses rather than guesses.
+    """
+    import inspect
+    import re
+    try:
+        src = inspect.getsource(pipeline.__call__)
+    except (TypeError, OSError):
+        return None
+    if re.search(r"\bfor\s+\w+\s+in\s+image\s*:", src):
+        return "many"
+    if re.search(r"image\s*\[\s*0\s*\]", src):
+        return "one"
+    return None
+
+
+def _check_reference_image_count(n_refs, model_id, model_config,
+                                 pipeline=None, allow_defer=False):
+    """Refuse an edit that sends more references than the card accepts.
+
+    Raises HTTPException(400). A 400 rather than a quiet truncation: dropping
+    a reference the caller explicitly sent produces a picture that answers the
+    wrong request, and this module already carries the lesson that a poor
+    result reported as success is worse than a refusal (see _accepts_image).
+    """
+    if n_refs <= 1:
+        return
+    cap = _declared_max_reference_images(model_config)
+    if cap is None and pipeline is None and allow_defer:
+        # Called before the model is loaded, and the card says nothing. The
+        # pipeline is the only remaining source, so judge it after the load
+        # rather than refuse a request that may be perfectly valid.
+        return
+    if cap is None and pipeline is not None:
+        # Nothing declared: ask the pipeline's own code rather than assume.
+        semantics = _pipeline_reference_semantics(pipeline)
+        if semantics == "many":
+            _log.info("%s iterates its image list, so %d references are "
+                      "passed through; set %s on the model to cap it",
+                      type(pipeline).__name__, n_refs,
+                      _MAX_REFERENCE_IMAGES_KEY)
+            return
+        if semantics == "one":
+            raise HTTPException(status_code=400, detail=(
+                f"'{model_id}' takes ONE reference image and {n_refs} were "
+                f"sent. Its pipeline ({type(pipeline).__name__}) uses the "
+                f"first and ignores the rest, so the result would silently "
+                f"answer a different request. Send one image, or use a "
+                f"multi-reference model (FLUX.2, Qwen-Image-Edit-2511)."))
+    if cap is None:
+        raise HTTPException(status_code=400, detail=(
+            f"'{model_id}' was sent {n_refs} reference images and it could "
+            f"not be established how many it accepts, so it is treated as "
+            f"taking one. Send a single image, or set "
+            f"`{_MAX_REFERENCE_IMAGES_KEY}` on the model to the number it "
+            f"really takes (FLUX.2 takes up to ten; Qwen-Image-Edit-2511 "
+            f"takes several; a denoising img2img model takes one)."))
+    if n_refs > cap:
+        raise HTTPException(status_code=400, detail=(
+            f"'{model_id}' accepts at most {cap} reference image"
+            f"{'' if cap == 1 else 's'} and {n_refs} were sent."))
+
+
 def _edit_call_kwargs(pipeline, request, images, steps, cfg, generator, n):
     """Call kwargs for an edit, shaped to what THIS pipeline accepts.
 
@@ -3804,6 +3930,18 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
     if not request.image:
         raise HTTPException(status_code=400, detail="image is required")
 
+    # Before the model is loaded, not after: refusing a request is not worth
+    # pulling 17 GB onto the card first.
+    try:
+        _ref_cfg = (multi_model_manager._config_for_model(
+            f"image:{request.model}")
+            or multi_model_manager._config_for_model(request.model) or {})
+    except Exception:
+        _ref_cfg = {}
+    _n_refs = 1 + len(list(getattr(request, 'images', None) or []))
+    _check_reference_image_count(_n_refs, request.model, _ref_cfg,
+                                 allow_defer=True)
+
     _progress_loading(request.model or "image")
     model_info = await asyncio.to_thread(
         multi_model_manager.request_model, request.model, model_type="image")
@@ -3814,6 +3952,10 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
 
     pipe = await _pipeline_for_task(model_info, "img2img")
     _edit_key = model_info.get('model_key') or f"image:{model_name}"
+
+    # Now the pipeline can be asked what it does with an image list. The cheap
+    # pre-load check above only enforced a cap the card had declared.
+    _check_reference_image_count(_n_refs, request.model, _ref_cfg, pipeline=pipe)
 
     try:
         import torch
@@ -3885,9 +4027,16 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         # weights are already on the card. Idle models go first and a busy one
         # is waited for, so this never pulls VRAM from work in flight.
         try:
+            # requested_id, for the same reason the load path needs it:
+            # siblings share a checkpoint and `model_name` is the checkpoint.
+            # Without it this sized Krea-2-Turbo (9.7 GB) while the resident
+            # model was Krea-2-RealDream (17.22 GB), asked for 1.0 GB of
+            # headroom instead of 1.7, and the edit OOMed anyway. Measured
+            # 2026-11-01, in the very run that added this block.
             _head = multi_model_manager._evict_headroom_gb(
                 multi_model_manager._get_model_used_vram_gb(
-                    _edit_key or model_name, model_name) or 0.0,
+                    _edit_key or model_name, model_name,
+                    requested_id=request.model) or 0.0,
                 _edit_key or model_name)
             if _head > 0 and multi_model_manager._get_free_vram_gb() < _head:
                 _log.info("Edit needs about %.1f GB of working room and the "

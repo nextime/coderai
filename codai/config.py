@@ -366,6 +366,14 @@ class ImageConfig:
     seed: Optional[int] = None
     vae_tiling: bool = False
     clip_on_cpu: bool = False
+    # How many reference images one edit may send to this model. None = the
+    # model has not said, which is read as ONE: every diffusers edit pipeline
+    # annotates `image` as accepting a list, but for some that list is several
+    # references of different subjects and for others a batch of independent
+    # sources, so the signature cannot be asked and the card must declare it.
+    # FLUX.2 takes up to ten, Qwen-Image-Edit-2511 takes several, a denoising
+    # img2img model takes one.
+    max_reference_images: Optional[int] = None
     # Which CLIP layer the text embedding comes from, counted from the end.
     # None = the pipeline's own choice. The booru-tag SDXL fine-tunes (Pony,
     # Illustrious, NoobAI) are trained at 2; a model can override this.

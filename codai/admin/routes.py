@@ -2981,6 +2981,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # image) and does not scale with the checkpoint, so a fraction
                 # of a small model never covers it.
                 "evict_headroom_gb", "evict_headroom_fraction",
+                # How many reference images one edit may send. Not detectable:
+                # every diffusers edit pipeline annotates `image` as taking a
+                # list, but for some that means several references and for
+                # others a batch, so the operator has to say. Undeclared is
+                # read as one, and a second reference is refused with a 400
+                # rather than reaching the pipeline as a shape error.
+                "max_reference_images",
                 # Image prompt handling: which CLIP layer to read, and whether
                 # the A1111 weight grammar is parsed. Per model because the
                 # booru-tag fine-tunes need clip_skip 2 whatever the caller
