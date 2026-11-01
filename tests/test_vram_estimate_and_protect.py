@@ -132,12 +132,21 @@ def test_the_source_never_waits_on_the_protected_model():
         os.path.abspath(__file__))), "codai/models/manager.py"),
         encoding="utf-8").read()
     i = src.index("def _evict_models_for_vram(")
-    body = src[i:i + 6000]
+    # Bounded by the next method, NOT by a character count. It was src[i:i+6000],
+    # and the moment the busy-model sweep was added inside this function the
+    # window stopped reaching the assertion below -- the test failed while the
+    # guarantee it protects was perfectly intact.
+    body = src[i:src.index("\n    def ", i + 10)]
     assert "protect: str = \"\"" in body
     # Pass 1 skips it outright…
     assert "if protect and key == protect:" in body
     # …and the active-model fallback does not fire for it.
     assert "self.active_in_vram != protect" in body
+    # …and the busy sweep waits only on what pass 1 collected, which is why it
+    # cannot wait on `protect` either: the skip above happens first.
+    assert "_busy_candidates = []" in body
+    assert "for key in _busy_candidates:" in body
+    assert body.index("if protect and key == protect:") > body.index("_busy_candidates = []")
 
 
 def test_the_embedding_retry_protects_the_model_it_is_making_room_for():

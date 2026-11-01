@@ -245,6 +245,11 @@ def _gguf_architecture(path: str):
 #: is at most one more idle model unloaded.
 _EVICT_HEADROOM_FRACTION = 0.10
 
+#: How often a wait-for-idle repeats itself in the log. The wait has no
+#: deadline, so it must never be silent: a hung generation has to be legible AS
+#: a hung generation rather than as an eviction that stopped responding.
+_WAIT_IDLE_SAY_EVERY_S = 15.0
+
 _ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "runpod")
 
 
@@ -5775,13 +5780,45 @@ class MultiModelManager:
                 else:
                     self._external_busy.pop(key, None)
 
-    def _wait_until_idle(self, key: str, timeout: float = 120.0) -> bool:
-        """Block until no instance of `key` is busy, or until timeout. Returns idle?"""
+    def _wait_until_idle(self, key: str, timeout: float = None) -> bool:
+        """Block until no instance of `key` is busy. Returns whether it went idle.
+
+        ``timeout=None`` (the default) waits for as long as the model is still
+        serving, because a request ends: eviction's rule is "wait for the busy
+        model to finish, then take its VRAM", and a deadline is an exception to
+        that rule dressed up as prudence. A 120 s one used to be the default,
+        and what it bought was a load silently spilling to the CPU while the
+        room it needed was merely in use -- measured on zeiss 2026-11-01, 1.5 GB
+        short of 18.0 GB with the shortfall held by a model mid-request.
+
+        Two things keep this from being an unbounded hang:
+
+        * the caller never waits on the key it is making room FOR (``protect``),
+          which is the one model that provably cannot go idle -- it is blocked
+          on the memory this pass exists to free;
+        * a model that vanishes from ``self.models`` while we wait has already
+          released its VRAM, so the wait ends.
+
+        A wait that outlasts ``_WAIT_IDLE_SAY_EVERY_S`` says so, and keeps
+        saying so, so a genuinely hung generation shows up in the log as a hung
+        generation instead of as an eviction that never returned.
+        """
         import time as _time
-        deadline = _time.time() + timeout
+        deadline = (_time.time() + timeout) if timeout is not None else None
+        started = _time.time()
+        said = 0.0
         while self._is_key_busy(key):
-            if _time.time() >= deadline:
+            if key not in self.models and key not in self.model_pools:
+                # Unloaded under us: its VRAM is back, which is all we wanted.
+                return True
+            now = _time.time()
+            if deadline is not None and now >= deadline:
                 return False
+            waited = now - started
+            if waited - said >= _WAIT_IDLE_SAY_EVERY_S:
+                said = waited
+                print(f"  still waiting for '{key}' to finish serving "
+                      f"({waited:.0f}s)", flush=True)
             _time.sleep(0.25)
         return True
 
@@ -5795,7 +5832,11 @@ class MultiModelManager:
         if key not in self.models and key not in self.model_pools:
             return False
         if self._is_key_busy(key):
-            if not self._wait_until_idle(key):
+            # Bounded ON PURPOSE, unlike eviction. This is an operator action
+            # with a caller waiting on an answer, and "not unloaded" is a
+            # perfectly good answer; eviction has no such option, because the
+            # alternative there is a load spilling to the CPU.
+            if not self._wait_until_idle(key, timeout=120.0):
                 print(f"  unload_model: '{key}' still busy — not unloaded")
                 return False
         model_obj = self.models.pop(key, None)
@@ -5834,18 +5875,21 @@ class MultiModelManager:
     def _evict_one(self, key, reason: str = ""):
         """Fully unload ONE model by key and free its VRAM + host RAM.
 
-        Shared by VRAM- and RAM-driven eviction. Never pulls a model that is still
-        mid-request; waits briefly first and skips it if it stays busy.
+        Shared by VRAM- and RAM-driven eviction. Never pulls a model that is
+        still mid-request: it waits for the request to finish and then takes the
+        VRAM. There is no "and otherwise skip it" -- that branch existed, could
+        only be reached through a deadline, and the deadline is gone.
 
         ``reason`` is recorded in the history so a swap can be explained after
         the fact rather than reconstructed from the log.
         """
         # Make absolutely sure nothing is mid-request on this model before we
-        # pull its tensors off the GPU.
+        # pull its tensors off the GPU. Pulling them from under a running
+        # generation crashes the CUDA context, so this wait is not a courtesy.
         if self._is_key_busy(key):
-            if not self._wait_until_idle(key):
-                print(f"  Skipping eviction of '{key}' — still busy after wait")
-                return
+            self._wait_until_idle(key)
+            if key not in self.models and key not in self.model_pools:
+                return      # finished and already unloaded; nothing left to do
         _free0 = self._get_free_vram_gb()
         _known = self._measured_vram_gb.get(key)
         model_obj = self.models.pop(key, None)
@@ -6180,7 +6224,12 @@ class MultiModelManager:
 
         Never evicts a model that is actively serving a request — doing so would
         move its weights off the GPU mid-generation and crash the CUDA context.
-        Busy models are waited on (briefly) before eviction.
+        A busy model is WAITED FOR and then evicted, in every pass: the idle
+        models go first (they cost nothing), then the busy ones under a single
+        wait budget, then the active model, then the keep-resident set. Until
+        2026-11-01 the first pass was the exception — it printed "is busy
+        serving a request — not evicting it" and moved on — so a load spilled to
+        the CPU whenever the room it needed was in use rather than unavailable.
 
         ``protect`` is the key this room is being made FOR, and it is never
         evicted and never waited on. Without it the second pass goes after the
@@ -6232,7 +6281,9 @@ class MultiModelManager:
 
         # First pass: evict idle non-active models in LRU order. Skip the
         # keep-resident set (the small co-resident STT/diarization models) — they
-        # are only evicted as a last resort below.
+        # are only evicted as a last resort below. A model that is busy is put
+        # on _busy_candidates for the sweep that follows this loop.
+        _busy_candidates = []
         for key in self._lru_order():
             if protect and key == protect:
                 continue
@@ -6243,10 +6294,48 @@ class MultiModelManager:
             if self._get_free_vram_gb() >= target_gb:
                 break
             if self._is_key_busy(key):
-                print(f"  '{key}' is busy serving a request — not evicting it")
+                # NOTED, not abandoned. Waiting for a model to finish and then
+                # taking its VRAM is already what this method does to the active
+                # model and to the keep-resident set; ordinary LRU models were
+                # the one exception, and that exception is what put loads on the
+                # CPU while the room they needed was merely in use rather than
+                # unavailable. Measured on zeiss 2026-11-01: eviction freed
+                # 12.2 GB of the 18.0 GB needed and stopped 1.5 GB short "held
+                # by a busy model", and Z-Image-Turbo loaded with CPU offload.
+                #
+                # Deferred to a second sweep rather than waited on here, so a
+                # cheap idle eviction further down the LRU order never queues
+                # behind a wait that may not be needed at all.
+                _busy_candidates.append(key)
                 continue
             print(f"On-request VRAM eviction: unloading '{key}' ({_size_label(key)}) to free VRAM")
             _evict_key(key, reason=f"vram: another load needed {needed_gb:.1f} GB")
+
+        # Busy sweep: the models the first pass passed over, oldest first, each
+        # waited for and then evicted. No budget and no fallback -- the rule is
+        # wait for it to finish, then take its VRAM, and it holds here exactly
+        # as it holds for the active model and the keep-resident set below.
+        if self._get_free_vram_gb() < target_gb and _busy_candidates:
+            for key in _busy_candidates:
+                if self._get_free_vram_gb() >= target_gb:
+                    break
+                if key not in self.models:
+                    # It finished and something else unloaded it while we were
+                    # working through this list; its VRAM is already back.
+                    continue
+                print(f"  '{key}' is busy serving a request — waiting for it to "
+                      f"finish, then evicting it")
+                if not self._wait_until_idle(key):
+                    continue        # unloaded under us; its VRAM is already back
+                if key not in self.models:
+                    continue
+                print(f"On-request VRAM eviction: unloading '{key}' "
+                      f"({_size_label(key)}) after it finished serving")
+                if key == self.active_in_vram:
+                    self.active_in_vram = None
+                _evict_key(key, reason=f"vram: another load needed "
+                                       f"{needed_gb:.1f} GB (waited for it "
+                                       f"to finish serving)")
 
         # Second pass: evict the active model if still not enough AND it is idle
         # (unless it's keep-resident — that's handled by the last-resort pass).
@@ -6258,14 +6347,16 @@ class MultiModelManager:
             if self._is_key_busy(_active):
                 print(f"  Active model '{_active}' is busy — waiting for it to go idle "
                       f"before eviction…")
-            if self._wait_until_idle(_active):
+            # No else: the wait has no deadline, so the only ways out are the
+            # model going idle or it being unloaded under us, and both mean its
+            # VRAM is available.
+            self._wait_until_idle(_active)
+            if _active in self.models:
                 print(f"On-request VRAM eviction: unloading active model '{_active}' "
                       f"({_size_label(_active)}) to free VRAM")
                 _evict_key(_active, reason=f"vram: another load needed {needed_gb:.1f} GB "
                                           f"(was the active model)")
-                self.active_in_vram = None
-            else:
-                print(f"  Active model '{_active}' still busy after wait — leaving it loaded")
+            self.active_in_vram = None
 
         # Last resort among tracked models: evict the keep-resident set (the small
         # co-resident STT/diarization models) so a genuinely-larger load — e.g. a
@@ -6277,9 +6368,12 @@ class MultiModelManager:
                     continue
                 if self._get_free_vram_gb() >= target_gb:
                     break
-                if self._is_key_busy(key) and not self._wait_until_idle(key):
-                    print(f"  keep-resident '{key}' still busy — leaving it loaded")
-                    continue
+                if self._is_key_busy(key):
+                    print(f"  keep-resident '{key}' is busy — waiting for it to "
+                          f"finish, then evicting it")
+                    self._wait_until_idle(key)
+                    if key not in self.models:
+                        continue
                 print(f"On-request VRAM eviction (last resort): unloading keep-resident "
                       f"'{key}' ({_size_label(key)}) to fit a larger load")
                 if key == self.active_in_vram:
