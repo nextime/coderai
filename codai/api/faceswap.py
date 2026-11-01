@@ -28,8 +28,26 @@ global_args = None
 global_file_path = None
 
 _INSWAPPER_MODEL_PATH = str(default_insightface_model_path())
-_INSWAPPER_HF_REPO = 'deepinsight/inswapper'
 _INSWAPPER_HF_FILE = 'inswapper_128.onnx'
+
+# The original publisher's repo (deepinsight/inswapper) now redirects to
+# deepinsight-unofficial/inswapper, which the Hub answers with
+# `"disabled": true` — the download has not been possible since. Measured
+# 2026-11-01: the repo API returns 307 -> 200 with disabled set, so the
+# download fails in under a second and reads exactly like a dead network
+# ("check your connection"), which is what sent this hunting for a firewall.
+#
+# Several mirrors carry the same 529 MB file. Trying them in order is what
+# makes face swapping work on a fresh install at all; one repo going away
+# then costs an operator nothing. Each was confirmed live and undisabled on
+# 2026-11-01.
+_INSWAPPER_HF_REPOS = (
+    'deepinsight/inswapper',
+    'ezioruan/inswapper_128.onnx',
+    'ashleykleynhans/inswapper',
+    'netrunner-exe/Insight-Swap-models-onnx',
+    'thebiglaskowski/inswapper_128.onnx',
+)
 
 _face_app = None      # FaceAnalysis singleton
 _swapper = None       # INSwapper singleton
@@ -46,23 +64,37 @@ def set_global_file_path(path):
 
 
 def _ensure_model():
-    """Download inswapper_128.onnx if not present."""
+    """Download inswapper_128.onnx if not present.
+
+    Tries every known source before giving up, and when they are all gone
+    says where to put the file by hand rather than blaming the network: a
+    disabled Hub repo and an unplugged cable produce the same sentence from
+    huggingface_hub, and only one of them is worth checking a firewall over.
+    """
     if os.path.exists(_INSWAPPER_MODEL_PATH):
         return
     os.makedirs(os.path.dirname(_INSWAPPER_MODEL_PATH), exist_ok=True)
-    print(f'Downloading inswapper_128.onnx from HuggingFace…')
-    try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(
-            repo_id=_INSWAPPER_HF_REPO,
-            filename=_INSWAPPER_HF_FILE,
-            local_dir=os.path.dirname(_INSWAPPER_MODEL_PATH),
-        )
-        if path != _INSWAPPER_MODEL_PATH:
-            import shutil
-            shutil.move(path, _INSWAPPER_MODEL_PATH)
-    except Exception as e:
-        raise RuntimeError(f'Failed to download inswapper model: {e}')
+    _errors = []
+    for _repo in _INSWAPPER_HF_REPOS:
+        print(f'Downloading {_INSWAPPER_HF_FILE} from {_repo}…')
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(
+                repo_id=_repo,
+                filename=_INSWAPPER_HF_FILE,
+                local_dir=os.path.dirname(_INSWAPPER_MODEL_PATH),
+            )
+            if path != _INSWAPPER_MODEL_PATH:
+                import shutil
+                shutil.move(path, _INSWAPPER_MODEL_PATH)
+            return
+        except Exception as e:
+            _errors.append(f'{_repo}: {type(e).__name__}: {e}')
+            continue
+    raise RuntimeError(
+        f'Could not fetch {_INSWAPPER_HF_FILE} from any known source. '
+        f'Place the file at {_INSWAPPER_MODEL_PATH} to enable face swapping. '
+        'Tried: ' + ' | '.join(_errors))
 
 
 def _get_face_app():
