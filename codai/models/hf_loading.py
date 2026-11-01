@@ -1221,13 +1221,25 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
         # tensor at the width the file stored it at; layerwise.apply then hooks
         # the ones that are actually narrow and brings the rest to the compute
         # dtype. Measured 2026-11-01.
-        kwargs: Dict[str, Any] = {
-            "torch_dtype": None if _store_dtype is not None else dtype}
+        # The STORAGE dtype, so the big weights stay narrow -- that is the whole
+        # saving, and it is what diffusers' loader will actually honour.
+        # torch_dtype=None does NOT keep the file's widths: the meta loader ends
+        # at accelerate's set_module_tensor_to_device, which does
+        # `if dtype is None: value = value.to(old_value.dtype)`, so every
+        # incoming tensor is cast to whatever the freshly-built model holds.
+        # Measured 2026-11-01: nothing was narrow afterwards and the footprint
+        # stayed 31.07 GB instead of 17.22 GB.
+        #
+        # Casting the whole component does downcast the F16 time embeddings and
+        # F32 norms as well, so remember_narrow() reads the FILE's header and
+        # puts those back from the file at their own precision -- exact, and a
+        # few hundred MB.
+        kwargs: Dict[str, Any] = {"torch_dtype": _store_dtype or dtype}
         if _store_dtype is not None:
-            print(f"  component '{name}': loading at the file's own widths "
-                  f"(layerwise casting keeps "
-                  f"{str(_store_dtype).replace('torch.', '')} at rest and "
-                  f"computes in {str(dtype).replace('torch.', '')})")
+            print(f"  component '{name}': loading at "
+                  f"{str(_store_dtype).replace('torch.', '')} "
+                  f"(computing in {str(dtype).replace('torch.', '')}; the "
+                  f"file's wider tensors are restored after)")
         if mode in ("4bit", "8bit"):
             try:
                 from diffusers import BitsAndBytesConfig as DiffBnb
@@ -1286,7 +1298,8 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
                 if _store_dtype is not None:
                     try:
                         from codai.models import layerwise as _lw2
-                        _lw2.remember_narrow(components[name], _store_dtype)
+                        _lw2.remember_narrow(components[name], _store_dtype,
+                                             path=_path, component_cls=cls)
                     except Exception as _re:
                         print(f"  component '{name}': could not record its "
                               f"narrow modules ({_re})")

@@ -106,6 +106,78 @@ def scales_in_file(path: str) -> Dict[str, float]:
     return out
 
 
+#: safetensors dtype names -> the torch attribute of the same type. Spelled out
+#: because the two vocabularies do not transform into each other: safetensors
+#: says ``F8_E4M3`` where torch says ``float8_e4m3fn``, and comparing the
+#: strings after stripping punctuation silently matches nothing -- measured
+#: 2026-11-01, when it reported "0 module(s) are float8_e4m3fn" for a file whose
+#: 256 big linears were exactly that.
+_ST_DTYPE_NAMES = {
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E4M3FN": "float8_e4m3fn",
+    "F8_E5M2": "float8_e5m2",
+    "BF16": "bfloat16",
+    "F16": "float16",
+    "F32": "float32",
+    "F64": "float64",
+}
+
+
+def torch_dtype_of(st_name):
+    """The torch dtype a safetensors dtype name denotes, or None."""
+    attr = _ST_DTYPE_NAMES.get(str(st_name or "").upper())
+    if not attr:
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+    return getattr(torch, attr, None)
+
+
+def dtypes_in_file(path: str) -> Dict[str, str]:
+    """``{tensor key -> dtype name}`` from a safetensors header. Header only."""
+    out: Dict[str, str] = {}
+    with open(path, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        header = json.loads(fh.read(n))
+    header.pop("__metadata__", None)
+    for key, meta in header.items():
+        if isinstance(meta, dict) and meta.get("dtype"):
+            out[key] = str(meta["dtype"])
+    return out
+
+
+def rename_keys(component_cls, keys) -> Dict[str, str]:
+    """``{file key -> the loaded model's key}``, via diffusers' own converter.
+
+    The same renaming the WEIGHTS get, for the reason :func:`module_scales`
+    gives: a copy of their table would drift and attach things to the wrong
+    modules.
+    """
+    if not keys:
+        return {}
+    try:
+        from diffusers.loaders.single_file_model import (
+            SINGLE_FILE_LOADABLE_CLASSES)
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot reach diffusers' single-file converter registry: {exc}"
+        ) from exc
+    name = getattr(component_cls, "__name__", str(component_cls))
+    entry = SINGLE_FILE_LOADABLE_CLASSES.get(name) or {}
+    convert = entry.get("checkpoint_mapping_fn")
+    if convert is None:
+        raise RuntimeError(
+            f"{name} has no single-file converter in diffusers, so this "
+            f"checkpoint's keys cannot be renamed to match its weights")
+    keys = list(keys)
+    # The converter POPS as it goes and renames by key, so a sentinel value per
+    # key is enough: nothing here needs the tensors.
+    renamed = convert({k: k for k in keys})
+    return {v: k for k, v in (renamed or {}).items() if isinstance(v, str)}
+
+
 def module_scales(component_cls, raw: Dict[str, float]) -> Dict[str, float]:
     """``{module path -> scale}`` in the loaded model's own naming.
 

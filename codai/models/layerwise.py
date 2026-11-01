@@ -160,33 +160,103 @@ def storage_dtype_for(cfg, component: str):
 _NARROW_ATTR = "_coderai_narrow_modules"
 
 
-def remember_narrow(component, storage_dtype) -> int:
-    """Record which of ``component``'s modules hold ``storage_dtype`` right now.
+def remember_narrow(component, storage_dtype, path=None,
+                    component_cls=None) -> int:
+    """Record which modules the FILE stored at ``storage_dtype``, and widen the rest.
 
-    Called immediately after the component is read from disk, because the
-    pipeline is about to lose that information:
-    ``DiffusionPipeline.from_pretrained`` casts a component it is handed to its
-    own ``torch_dtype``, so when layerwise casting runs afterwards nothing is
-    narrow and it installs nothing. Measured 2026-11-01 -- "not applied to
-    transformer (nothing stored at float8_e4m3fn)", and a 31.07 GB footprint
-    where the same model had measured 17.22 GB.
+    Sourced from the file's header, NOT from the loaded module's dtypes. Those
+    two are not the same thing, and the difference cost three attempts:
 
-    Restoring them later is exact rather than approximate: bf16 carries the
-    same exponent range as float8_e4m3fn and four more mantissa bits, so a
-    value that came from fp8 survives fp8 -> bf16 -> fp8 unchanged. Only the
-    modules recorded HERE are put back, so the F16 and F32 tensors the file
-    stored at full width are never narrowed.
+    * ``torch_dtype=<storage>`` casts the WHOLE component, so the F16 time
+      embeddings and F32 norms become fp8 too. diffusers' default skip patterns
+      then leave exactly those out of the casting hooks, and the first matmul
+      says "mat1 and mat2 must have the same dtype, but got BFloat16 and
+      Float8_e4m3fn" naming ``time_embed.linear_1``.
+    * ``torch_dtype=None`` does not preserve anything either. The meta loader
+      ends at accelerate's ``set_module_tensor_to_device``, which does
+      ``if dtype is None: value = value.to(old_value.dtype)`` -- so every
+      incoming fp8 tensor is cast to whatever the freshly-built model already
+      holds. Nothing was narrow afterwards, this function recorded zero, and
+      the footprint stayed 31.07 GB against the 17.22 GB the same model
+      measures when loaded as fp8.
+
+    So load as ``storage_dtype`` (narrow, which is the point) and then put back
+    the tensors the file stored WIDER, re-read from the file at their own
+    precision. That is exact: nothing goes through fp8 that was not fp8 on
+    disk. Those tensors are the small ones -- everything that is not a big
+    linear is a rounding error against them.
+
+    Returns the number of modules recorded as narrow. With no ``path`` it falls
+    back to asking the module what it holds, which is right for a component
+    that was not read from a single file.
     """
-    paths = []
-    for name, module in component.named_modules():
-        if any(p.dtype == storage_dtype
-               for p in module.parameters(recurse=False)):
-            paths.append(name)
+    if path is None or component_cls is None:
+        paths = [name for name, module in component.named_modules()
+                 if any(p.dtype == storage_dtype
+                        for p in module.parameters(recurse=False))]
+        try:
+            setattr(component, _NARROW_ATTR, (str(storage_dtype), tuple(paths)))
+        except Exception:
+            return 0
+        return len(paths)
+
+    from codai.models import scaled_fp8 as _sfp8
+    import torch
+
+    file_dtypes = _sfp8.dtypes_in_file(path)
+    renamed = _sfp8.rename_keys(component_cls, file_dtypes.keys())
+
+    narrow_modules, wide_keys = set(), []
+    for file_key, dtype_name in file_dtypes.items():
+        model_key = renamed.get(file_key)
+        if not model_key or "." not in model_key:
+            continue
+        module_path = model_key.rsplit(".", 1)[0]
+        # Compared as torch dtypes, not as strings: safetensors says "F8_E4M3"
+        # where torch says "float8_e4m3fn", and no amount of case folding makes
+        # those equal.
+        if _sfp8.torch_dtype_of(dtype_name) is storage_dtype:
+            narrow_modules.add(module_path)
+        else:
+            wide_keys.append((file_key, model_key))
+
+    # Put the wider tensors back at their own precision, from the file.
+    restored = 0
+    if wide_keys:
+        try:
+            from safetensors import safe_open
+            with safe_open(path, framework="pt") as fh:
+                for file_key, model_key in wide_keys:
+                    module_path, param_name = model_key.rsplit(".", 1)
+                    try:
+                        module = component.get_submodule(module_path)
+                    except Exception:
+                        continue
+                    target = getattr(module, param_name, None)
+                    if target is None:
+                        continue
+                    value = fh.get_tensor(file_key)
+                    if not value.is_floating_point():
+                        continue
+                    if tuple(value.shape) != tuple(target.shape):
+                        continue
+                    target.data = value.to(target.data.device)
+                    restored += 1
+        except Exception as exc:
+            print(f"  [layerwise] could not restore the file's wider tensors "
+                  f"({exc}); they keep the load dtype")
+
     try:
-        setattr(component, _NARROW_ATTR, (str(storage_dtype), tuple(paths)))
+        setattr(component, _NARROW_ATTR,
+                (str(storage_dtype), tuple(sorted(narrow_modules))))
     except Exception:
         return 0
-    return len(paths)
+    if restored:
+        print(f"  [layerwise] {len(narrow_modules)} module(s) are "
+              f"{str(storage_dtype).replace('torch.', '')} in the file; "
+              f"{restored} wider tensor(s) restored from it at their own "
+              f"precision")
+    return len(narrow_modules)
 
 
 def _hook_one(component, storage_dtype, compute_dtype):

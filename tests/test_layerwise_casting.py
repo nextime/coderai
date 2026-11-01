@@ -267,13 +267,26 @@ def test_a_component_with_nothing_narrow_is_reported_not_silently_hooked():
     assert "nothing stored at float8_e4m3fn" in note
 
 
-def test_the_loader_keeps_the_files_own_widths():
-    """torch_dtype=None, not the storage dtype: diffusers casts the WHOLE
-    component to whatever torch_dtype says."""
+def test_the_loader_loads_at_the_storage_dtype_not_none():
+    """This asserted the opposite, on a belief that turned out to be false.
+
+    torch_dtype=None does NOT keep the file's widths. The meta loader ends at
+    accelerate's set_module_tensor_to_device:
+
+        if dtype is None:
+            value = value.to(old_value.dtype)
+
+    so every incoming tensor is cast to whatever the freshly-built model
+    already holds. Measured 2026-11-01: nothing was narrow afterwards, the
+    recording step found zero modules, and the footprint stayed 31.07 GB
+    against the 17.22 GB the same model measures loaded as fp8.
+
+    So load narrow and let remember_narrow() restore the file's wider tensors
+    from the file -- see tests/test_narrow_from_the_file_header.py.
+    """
     src = open("codai/models/hf_loading.py").read()
-    # Anchored on _store_dtype: `kwargs: Dict[str, Any] = {` occurs more than
-    # once in this file and the first hit is a different function.
-    assert '"torch_dtype": None if _store_dtype is not None else dtype' in src
+    assert '"torch_dtype": _store_dtype or dtype' in src
+    assert '"torch_dtype": None if _store_dtype is not None else dtype' not in src
 
 
 def test_skip_patterns_are_not_relied_on():
@@ -367,9 +380,13 @@ def test_a_record_for_a_different_dtype_is_ignored():
     assert "nothing stored at float8_e4m3fn" in note
 
 
-def test_the_loader_records_them():
+def test_the_loader_records_them_from_the_file():
+    """The call now carries the file and the class, because the truth about
+    which tensors are narrow is in the header rather than in the loaded
+    object -- the loader has just cast them all."""
     src = open("codai/models/hf_loading.py").read()
-    assert "remember_narrow(components[name], _store_dtype)" in src
+    assert "remember_narrow(components[name], _store_dtype," in src
+    assert "path=_path, component_cls=cls" in src
     i = src.index("remember_narrow(")
     load = src.index("cls.from_single_file(")
     assert load < i, "recorded after the file is read, before the pipeline"
