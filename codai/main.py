@@ -177,7 +177,29 @@ def build_runtime_kwargs(model_cfg, model_type):
         kwargs['width'] = model_cfg.get('width', 512)
         kwargs['height'] = model_cfg.get('height', 512)
         kwargs['cfg_scale'] = model_cfg.get('cfg_scale', 1.0)
-        kwargs['precision'] = model_cfg.get('precision', 'f32')
+        # No default. A card that states no precision must reach the loader
+        # with none set, so the loader can apply its own card-aware policy --
+        # _auto_precision() in codai/api/images.py, which picks a HALF width on
+        # a card of 32 GB or less because these checkpoints are published at
+        # fp16/bf16 and f32 doubles them for nothing.
+        #
+        # This line defaulted to 'f32' and so that policy never ran: the key
+        # was always set by the time the loader read it, and the auto branch is
+        # dead whenever a default is supplied here. Measured 2026-11-01 on
+        # zeiss, PonyRealism-Uncensored (no `precision` key in its config):
+        #
+        #     Using precision: f32 (torch.float32)        <- no "(auto: ...)"
+        #     Measured footprint ...: 14.98 GB            <- 7.49 GB at half
+        #     IP-Adapter: aligned 72 module(s) to torch.float32
+        #     OutOfMemoryError: Tried to allocate 1008.00 MiB ... 306.00 MiB free
+        #
+        # Double the weights AND a float32 IP-Adapter, then the VAE decode had
+        # nowhere to go. 'f32' is an sd.cpp-era default (so are the steps/width
+        # /sample_method lines around it) that ended up applying to every
+        # diffusers model. Every other consumer of this key already reads it as
+        # `get('precision') or 'bf16'` -- the video path on line 194 included --
+        # so leaving it unset is both safe and consistent.
+        kwargs['precision'] = model_cfg.get('precision')
         kwargs['cpu_offload'] = model_cfg.get('cpu_offload', False)
         kwargs['seed'] = model_cfg.get('seed')
         kwargs['vae_tiling'] = model_cfg.get('vae_tiling', False)

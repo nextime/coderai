@@ -1578,18 +1578,29 @@ def ip_adapter_image_arg(pipeline, images):
 _IP_ADAPTER_VRAM_GB = 2.0
 
 
-def _character_ref_vram_gb(request) -> float:
+def _character_ref_vram_gb(request, model_config=None) -> float:
     """Extra VRAM to reserve for this request's character references.
 
     Zero when the request has none, so an ordinary generation is unaffected.
+
+    Doubled for an f32 pipeline. diffusers loads the adapter and its image
+    encoder at the pipeline's own dtype, so the figure above -- a half-width
+    one -- is half of what an f32 pipeline actually takes. Measured 2026-11-01
+    on zeiss: the two models that succeeded logged "aligned 72 module(s) to
+    torch.float16", and PonyRealism-Uncensored, loaded f32, logged
+    "torch.float32" and then died on the VAE decode.
     """
-    # The field names are the ones _character_reference_groups reads in
+    # The field names are the ones character_groups reads in
     # codai/api/characters.py -- all of them, because a caller may send saved
     # profile names or inline images and either one loads the adapter.
-    for _attr in ("characters", "character_profiles", "character_references"):
-        if getattr(request, _attr, None):
-            return _IP_ADAPTER_VRAM_GB
-    return 0.0
+    _wanted = any(getattr(request, _attr, None) for _attr in
+                  ("characters", "character_profiles", "character_references"))
+    if not _wanted:
+        return 0.0
+    _prec = str(((model_config or {}).get("precision") or "")).strip().lower()
+    if _prec in ("f32", "fp32", "float32"):
+        return _IP_ADAPTER_VRAM_GB * 2.0
+    return _IP_ADAPTER_VRAM_GB
 
 
 def _ip_processors_installed(pipeline) -> bool:
@@ -3042,7 +3053,16 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         # CyberRealistic-Pony died on a 96 MiB allocation with 50 MiB free, and
         # Krea-2-RealDream on 12 MiB with 8 MiB free. Both were character
         # requests, and both had been admitted as "fits".
-        _char_extra_gb = _character_ref_vram_gb(request)
+        # The config by the id asked for, so an f32 card reserves the wider
+        # adapter. Best-effort: an unknown id simply reserves the half-width
+        # figure, which is what it did before this was read at all.
+        try:
+            _char_cfg = (multi_model_manager._config_for_model(
+                f"image:{request.model}")
+                or multi_model_manager._config_for_model(request.model) or {})
+        except Exception:
+            _char_cfg = {}
+        _char_extra_gb = _character_ref_vram_gb(request, _char_cfg)
         model_info = await asyncio.to_thread(
             multi_model_manager.request_model,
             requested_model=request.model,
@@ -3379,6 +3399,44 @@ def _decode_b64_image(data: str, field: str = "image"):
     return PILImage.open(io.BytesIO(_image_bytes(data, field))).convert("RGB")
 
 
+def _drop_unsupported_call_kwargs(pipeline, kw):
+    """Remove kwargs a STRICT pipeline signature would refuse, and say so.
+
+    Most diffusers ``__call__`` signatures end in ``**kwargs`` (they carry the
+    deprecated ``callback`` pair), so an argument they do not understand is
+    accepted and dropped. Not all of them: FLUX.2 Klein's is strict, and a
+    ``negative_prompt`` it does not take is a TypeError, not a no-op.
+
+    Measured 2026-11-01 on zeiss::
+
+        [http] 500 on POST /v1/images/edits: "Image editing failed:
+        Flux2KleinPipeline.__call__() got an unexpected keyword argument
+        'negative_prompt'"
+
+    A pipeline with ``**kwargs`` is left alone -- it is allowed to receive
+    things it ignores, and filtering there would silently change behaviour
+    that works today.
+    """
+    if not kw:
+        return kw
+    try:
+        import inspect
+        params = inspect.signature(pipeline.__call__).parameters
+    except (TypeError, ValueError):
+        return kw            # cannot introspect it; let the pipeline speak
+    if not params:
+        return kw
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return kw            # tolerant signature
+    kept = {k: v for k, v in kw.items() if k in params}
+    dropped = sorted(set(kw) - set(kept))
+    if dropped:
+        _log.warning("%s takes a strict argument list and does not accept %s "
+                     "— dropped rather than failing the request",
+                     type(pipeline).__name__, ", ".join(dropped))
+    return kept
+
+
 def _prompt_call_kwargs(pipeline, request, model_config=None):
     """Prompt kwargs for an img2img / inpaint call: embeddings, or plain text.
 
@@ -3394,8 +3452,9 @@ def _prompt_call_kwargs(pipeline, request, model_config=None):
         _resolve_clip_skip(request, model_config, global_args),
         _resolve_prompt_weighting(request, model_config, global_args))
     if kw:
-        return kw
-    return {"prompt": prompt, "negative_prompt": neg or None}
+        return _drop_unsupported_call_kwargs(pipeline, kw)
+    return _drop_unsupported_call_kwargs(
+        pipeline, {"prompt": prompt, "negative_prompt": neg or None})
 
 
 def _accepts_image(pipeline) -> bool:
@@ -3809,6 +3868,36 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
 
         _edit_cfg = (multi_model_manager.config.get(_edit_key)
                      or multi_model_manager.config.get(model_name) or {})
+
+        # Make room for THIS call's peak before making it. An edit on an
+        # already-resident pipeline loads nothing, so none of the admission on
+        # the load path runs: no sizing, no headroom, no eviction. The edit
+        # then executes against whatever happens to be free, which is what the
+        # last model to load left behind.
+        #
+        # Measured 2026-11-01 on zeiss:
+        #
+        #     [http] 500 on POST /v1/images/edits: 'Image editing failed:
+        #     CUDA out of memory. Tried to allocate 576.00 MiB. GPU 0 has a
+        #     total capacity of 23.56 GiB of which 212.00 MiB is free.'
+        #
+        # Only the model's own headroom is asked for, not its weights: the
+        # weights are already on the card. Idle models go first and a busy one
+        # is waited for, so this never pulls VRAM from work in flight.
+        try:
+            _head = multi_model_manager._evict_headroom_gb(
+                multi_model_manager._get_model_used_vram_gb(
+                    _edit_key or model_name, model_name) or 0.0,
+                _edit_key or model_name)
+            if _head > 0 and multi_model_manager._get_free_vram_gb() < _head:
+                _log.info("Edit needs about %.1f GB of working room and the "
+                          "card has less — evicting idle models", _head)
+                multi_model_manager._evict_models_for_vram(
+                    _head, protect=_edit_key or model_name,
+                    for_key=_edit_key or model_name)
+        except Exception as _he:
+            _log.warning("Could not check edit headroom: %s", _he)
+
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: pipe(
@@ -3824,6 +3913,20 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         # 500 whose cause reaches the caller alone is one nobody can diagnose
         # afterwards, and the log showed the request and then just the status.
         _log.error("Image editing failed: %s", e, exc_info=True)
+        if _is_cuda_oom(e):
+            # The same classification the generation path gives: a 500 reads as
+            # a bug in the request, and this is a resource condition the caller
+            # can retry. Measured 2026-11-01, when an edit OOM answered a bare
+            # 500 while the identical condition on /v1/images/generations
+            # answered 503 with an explanation.
+            raise HTTPException(
+                status_code=503,
+                detail=(f"Image editing failed for '{request.model}' — the "
+                        f"model loaded and ran, so this is not a load "
+                        f"failure. The GPU ran out of memory while editing "
+                        f"the image — the VAE decode and cuBLAS's own "
+                        f"workspace are the usual points of failure: "
+                        f"{_exc_text(e)}"))
         raise HTTPException(status_code=500, detail=f"Image editing failed: {e}")
 
     try:

@@ -12,6 +12,7 @@ projects from, about 2 GB for SDXL -- and ``extra_vram_gb`` counted LoRAs only,
 so the adapter came out of whatever slack was left.
 """
 import inspect
+import re
 
 import codai.api.images as images
 from codai.api.characters import character_groups
@@ -41,9 +42,8 @@ def test_every_spelling_reserves_the_adapter():
 def test_the_fields_are_the_ones_the_reader_reads():
     """A name this helper checks and the resolver does not would be dead; a name
     the resolver reads and this does not is an unreserved adapter."""
-    mine = set(inspect.getsource(images._character_ref_vram_gb)
-               .split('for _attr in (')[1].split(')')[0]
-               .replace('"', '').replace(' ', '').strip(',').split(','))
+    src = inspect.getsource(images._character_ref_vram_gb)
+    mine = set(re.findall(r'"(character[a-z_]*|characters)"', src))
     theirs = {m for m in ("characters", "character_profiles",
                           "character_references")
               if f'getattr(request, "{m}"' in
