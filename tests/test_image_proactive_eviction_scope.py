@@ -85,6 +85,26 @@ def test_the_requested_id_is_captured_before_the_path_rewrite():
 
 
 def test_the_sizing_call_is_still_made_with_it():
-    block = _SRC.split("Proactive VRAM eviction", 1)[1][:2500]
+    # Bounded by the end of the block, NOT by a character count. It was
+    # [:2500], and a comment added inside the block pushed the sizing call to
+    # offset 2723 -- the test failed while the call it protects was untouched.
+    block = _SRC.split("Proactive VRAM eviction", 1)[1]
+    end = block.find("Step 1")
+    block = block[:end] if end != -1 else block[:6000]
     assert "requested_id=_requested_id" in block
     assert "_evict_models_for_vram" in block
+
+
+def test_the_requested_id_is_preferred_over_the_rewritten_path():
+    """One checkpoint, two cards: Krea-2-RealDream shares unsloth/Krea-2-Turbo
+    and is twice the size (20.45 GB against 9.7 GB). `model_name` has been
+    rewritten to that shared path by this point, so looking it up first sized
+    the wrong card, no eviction ran, accelerate spilled 4.60 GB to host RAM and
+    every generation died on CUBLAS_STATUS_INTERNAL_ERROR. Measured
+    2026-11-01."""
+    block = _SRC.split("Proactive VRAM eviction", 1)[1]
+    end = block.find("Step 1")
+    block = block[:end] if end != -1 else block[:6000]
+    req = block.index('f"image:{_requested_id}"')
+    path = block.index('f"image:{model_name}"')
+    assert req < path

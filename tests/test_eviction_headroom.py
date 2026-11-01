@@ -46,7 +46,15 @@ def test_the_headroom_fraction_is_ten_percent():
 
 
 def test_the_target_is_the_request_plus_headroom():
-    assert 'target_gb = needed_gb * (1.0 + _EVICT_HEADROOM_FRACTION)' in _fn()
+    """The headroom is now RESOLVED rather than computed inline, because it is
+    configurable per model: a VAE decode asks for about 1 GB in one allocation
+    whatever the checkpoint weighs, and a tenth of a 7.49 GB model is not that
+    (measured 2026-11-01, CyberRealistic-Pony, 110 MiB free at the decode).
+    The shape of the target is unchanged: the request plus the headroom."""
+    body = _fn()
+    assert 'target_gb = needed_gb + _headroom' in body
+    assert '_headroom = self._evict_headroom_gb(needed_gb, for_key or protect)' \
+        in body, "the per-model resolver is what makes it configurable"
 
 
 def test_every_enough_yet_check_uses_the_padded_target():
@@ -90,3 +98,11 @@ def test_the_arithmetic():
     from codai.models.manager import _EVICT_HEADROOM_FRACTION as H
     for need, want in ((10.0, 11.0), (2.62, 2.882), (0.1, 0.11), (30.9, 33.99)):
         assert abs(need * (1.0 + H) - want) < 0.001, (need, want)
+
+
+def test_the_fraction_is_still_the_floorless_default():
+    """A model that configures nothing gets exactly what it got before."""
+    from codai.models import manager as M
+    m = M.MultiModelManager.__new__(M.MultiModelManager)
+    m.config = {}
+    assert m._evict_headroom_gb(10.0) == 10.0 * M._EVICT_HEADROOM_FRACTION

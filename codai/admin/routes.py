@@ -2976,6 +2976,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # community fine-tunes published in fp8, where loading at the
                 # compute dtype doubles a file that already fits the card.
                 "layerwise_casting",
+                # How much VRAM eviction frees BEYOND this model's weights. The
+                # decode peak is an absolute amount (about 1 GB for a 768x1344
+                # image) and does not scale with the checkpoint, so a fraction
+                # of a small model never covers it.
+                "evict_headroom_gb", "evict_headroom_fraction",
                 # Image prompt handling: which CLIP layer to read, and whether
                 # the A1111 weight grammar is parsed. Per model because the
                 # booru-tag fine-tunes need clip_skip 2 whatever the caller

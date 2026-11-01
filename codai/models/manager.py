@@ -245,6 +245,16 @@ def _gguf_architecture(path: str):
 #: is at most one more idle model unloaded.
 _EVICT_HEADROOM_FRACTION = 0.10
 
+#: Per-model override keys for the above. The fraction is the wrong shape for
+#: what the headroom actually pays for: a model's PEAK above its weights. A VAE
+#: decode of a 768x1344 image asks for about 1 GB in ONE allocation whatever the
+#: checkpoint weighs, and a tenth of a 7.49 GB model is 0.75 GB -- so eviction
+#: reported success and the decode died on 1008 MiB with 110 MiB free (measured
+#: 2026-11-01, CyberRealistic-Pony). An absolute floor expresses that; a
+#: fraction cannot.
+_EVICT_HEADROOM_ABS_KEY = "evict_headroom_gb"
+_EVICT_HEADROOM_FRACTION_KEY = "evict_headroom_fraction"
+
 #: How often a wait-for-idle repeats itself in the log. The wait has no
 #: deadline, so it must never be silent: a hung generation has to be legible AS
 #: a hung generation rather than as an eviction that stopped responding.
@@ -6219,7 +6229,53 @@ class MultiModelManager:
         self._evict_models_for_vram(gb)
         return self._get_free_vram_gb()
 
-    def _evict_models_for_vram(self, needed_gb: float, protect: str = ""):
+    def _evict_headroom_gb(self, needed_gb: float, key: str = "") -> float:
+        """Extra VRAM to free beyond what a load needs, in GB.
+
+        Configurable per model, because the headroom pays for the model's peak
+        ABOVE its weights and that is not proportional to them. The global
+        default is a fraction (:data:`_EVICT_HEADROOM_FRACTION`); a model may
+        add an absolute floor with ``evict_headroom_gb``, or its own fraction
+        with ``evict_headroom_fraction``.
+
+        The two combine as a MAX rather than one overriding the other: the
+        fraction already protects large loads from an estimate that lands a few
+        hundred MB short, and the floor protects small ones from a peak that
+        does not scale with them. Measured 2026-11-01 on CyberRealistic-Pony --
+        7.49 GB of weights, 0.75 GB of fractional headroom, and a VAE decode
+        that asked for 1008 MiB with 110 MiB left on the card.
+        """
+        try:
+            base = float(needed_gb or 0.0) * float(_EVICT_HEADROOM_FRACTION)
+        except (TypeError, ValueError):
+            base = 0.0
+        cfg = {}
+        try:
+            raw = (self.config.get(key) or {}) if key else {}
+            if isinstance(raw, dict):
+                cfg = dict(raw)
+                nested = raw.get("_raw_cfg")
+                if isinstance(nested, dict):
+                    for k, v in nested.items():
+                        cfg.setdefault(k, v)
+        except Exception:
+            cfg = {}
+        try:
+            frac = cfg.get(_EVICT_HEADROOM_FRACTION_KEY)
+            if frac is not None:
+                base = max(base, float(needed_gb or 0.0) * float(frac))
+        except (TypeError, ValueError):
+            pass
+        try:
+            floor = cfg.get(_EVICT_HEADROOM_ABS_KEY)
+            if floor is not None:
+                base = max(base, float(floor))
+        except (TypeError, ValueError):
+            pass
+        return max(0.0, base)
+
+    def _evict_models_for_vram(self, needed_gb: float, protect: str = "",
+                               for_key: str = ""):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 
         Never evicts a model that is actively serving a request — doing so would
@@ -6230,6 +6286,11 @@ class MultiModelManager:
         2026-11-01 the first pass was the exception — it printed "is busy
         serving a request — not evicting it" and moved on — so a load spilled to
         the CPU whenever the room it needed was in use rather than unavailable.
+
+        ``for_key`` is the model the room is being made for, used only to read
+        its per-model eviction headroom (see :meth:`_evict_headroom_gb`); it
+        falls back to ``protect``, which is the same model wherever the caller
+        passes it.
 
         ``protect`` is the key this room is being made FOR, and it is never
         evicted and never waited on. Without it the second pass goes after the
@@ -6264,7 +6325,8 @@ class MultiModelManager:
         # shortfall warning below still measures against what the caller asked
         # for, so freeing enough for the load but not the headroom is a success
         # and stays silent.
-        target_gb = needed_gb * (1.0 + _EVICT_HEADROOM_FRACTION)
+        _headroom = self._evict_headroom_gb(needed_gb, for_key or protect)
+        target_gb = needed_gb + _headroom
 
         _evict_key = self._evict_one
 

@@ -1207,9 +1207,23 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 _free_gb = _free / 1e9
                 # Needed VRAM for this model (config used_vram_gb, with quant/offload
                 # factors applied) — 0 when it can't be determined.
+                # The REQUESTED id first. `model_name` has already been
+                # rewritten to the checkpoint this card is a config OF, so
+                # looking it up first sizes the wrong card: Krea-2-RealDream
+                # (fp8 transformer, 20.45 GB) was sized as Krea-2-Turbo (GGUF
+                # transformer, 9.7 GB), admission saw 13.6 GB free and skipped
+                # eviction, accelerate then spilled 4.60 GB of a 17.22 GB model
+                # to host RAM, and every generation died on
+                # CUBLAS_STATUS_INTERNAL_ERROR -- a quantized model with part of
+                # itself on the CPU. Measured 2026-11-01.
+                #
+                # requested_id below is a hint for disambiguation; it cannot
+                # override an explicit key that names the other card, which is
+                # why passing it was not enough on its own.
                 _key = None
-                for _k in (f"image:{model_name}", model_name):
-                    if _k in _mmm.config:
+                for _k in (f"image:{_requested_id}", _requested_id,
+                           f"image:{model_name}", model_name):
+                    if _k and _k in _mmm.config:
                         _key = _k
                         break
                 # requested_id: same-path siblings (one checkpoint, two cards
@@ -1228,7 +1242,11 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     if _free_gb < _need_gb:
                         print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
                               f"— evicting the minimum to fit (others may coexist)")
-                        _mmm._evict_models_for_vram(_need_gb)
+                        # for_key so the model's own eviction headroom applies:
+                        # the decode peak is an absolute ~1 GB, not a fraction of
+                        # the weights. See manager._evict_headroom_gb.
+                        _mmm._evict_models_for_vram(
+                            _need_gb, for_key=_key or model_name)
                     else:
                         print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
                               f"— no eviction needed (coexisting with loaded models)")
