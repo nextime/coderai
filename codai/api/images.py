@@ -4539,6 +4539,34 @@ def _build_realesrgan(weights_path: str, device):
 _UPSCALER_CACHE: dict = {}
 
 
+def _bound_upscaler_activations(pipe):
+    """Tile the VAE and slice attention on a diffusers upscaler.
+
+    The x4 pipeline decodes at the OUTPUT resolution with the VAE upcast to
+    float32, so its peak is set by the picture, not the checkpoint — which is
+    ~1.7 GB. Measured on a 24 GB card 2026-11-01, an untiled x4 of one photo
+    asked for a single 9.00 GiB allocation and died with 4.29 GiB free, after
+    eviction had already cleared the 18.1 GB the catalogue recorded for it.
+    Nothing was left to evict: the decode wanted more than the whole card.
+
+    That recorded 18.1 GB is itself the untiled peak, measured and saved on an
+    earlier run. Tiling is what makes the number small enough to be worth
+    reserving; without it the model is simply too big for the card it fits on.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    for _fn in ('enable_vae_tiling', 'enable_vae_slicing'):
+        try:
+            getattr(pipe, _fn)()
+        except Exception as e:
+            _log.debug("upscaler %s unavailable: %s", _fn, e)
+    try:
+        pipe.enable_attention_slicing()
+    except Exception as e:
+        _log.debug("upscaler attention slicing unavailable: %s", e)
+    return pipe
+
+
 def _load_upscaler(model_name: str, global_args):
     import logging
     _log = logging.getLogger(__name__)
@@ -4567,7 +4595,7 @@ def _load_upscaler(model_name: str, global_args):
         try:
             from diffusers import StableDiffusionLatentUpscalePipeline
             pipe = StableDiffusionLatentUpscalePipeline.from_pretrained(model_name, **_kw)
-            return ('diffusers_latent', pipe.to(device))
+            return ('diffusers_latent', _bound_upscaler_activations(pipe.to(device)))
         except Exception as e:
             _log.warning("latent upscaler load failed for '%s': %s", model_name, e)
 
@@ -4576,7 +4604,7 @@ def _load_upscaler(model_name: str, global_args):
         try:
             from diffusers import StableDiffusionUpscalePipeline
             pipe = StableDiffusionUpscalePipeline.from_pretrained(model_name, **_kw)
-            return ('diffusers', pipe.to(device))
+            return ('diffusers', _bound_upscaler_activations(pipe.to(device)))
         except Exception:
             pass
         # Generic fallback: let diffusers pick the right pipeline class.
@@ -4585,12 +4613,31 @@ def _load_upscaler(model_name: str, global_args):
             pipe = DiffusionPipeline.from_pretrained(model_name, **_kw)
             cls = type(pipe).__name__.lower()
             kind = 'diffusers_latent' if 'latent' in cls else 'diffusers'
-            return (kind, pipe.to(device))
+            return (kind, _bound_upscaler_activations(pipe.to(device)))
         except Exception as e:
             _log.warning("diffusers upscaler load failed for '%s': %s", model_name, e)
 
     # Not a recognised upscaler — callers treat 'pil' as "no real model".
     return ('pil', None)
+
+
+def _to_requested_scale(out_img, src_img, scale: int):
+    """Bring a fixed-factor upscale to the factor the caller asked for.
+
+    The diffusers upscalers have their ratio baked in — x2 for the latent one,
+    x4 for the super-res one — and ignore `scale` entirely, so a request for
+    x2 silently ran an x4 and paid four times the memory for it. Resampling the
+    real super-resolved result down to the asked-for size is still that result:
+    the detail was recovered by the model, which is what separates this from the
+    LANCZOS path the endpoint refuses to pass off as an upscale.
+    """
+    from PIL import Image as PILImage
+    if not scale or scale < 1:
+        return out_img
+    want = (src_img.size[0] * scale, src_img.size[1] * scale)
+    if out_img.size == want:
+        return out_img
+    return out_img.resize(want, PILImage.LANCZOS)
 
 
 def _run_upscale(upscaler, image_bytes: bytes, scale: int):
@@ -4606,10 +4653,10 @@ def _run_upscale(upscaler, image_bytes: bytes, scale: int):
         # detail-preserving upscale of an arbitrary input image.
         result = model(prompt="", image=img, num_inference_steps=20,
                        guidance_scale=0)
-        return result.images[0]
+        return _to_requested_scale(result.images[0], img, scale)
     if backend == 'diffusers':
         result = model(prompt="", image=img, num_inference_steps=20)
-        return result.images[0]
+        return _to_requested_scale(result.images[0], img, scale)
     # PIL fallback
     w, h = img.size
     return img.resize((w * scale, h * scale), PILImage.LANCZOS)
