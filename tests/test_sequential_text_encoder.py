@@ -85,11 +85,23 @@ class _KreaLike:
 
 
 class _LtxLike:
-    """One-call family: encodes both prompts together."""
+    """One-call family: encodes both prompts together.
+
+    It publishes ``do_classifier_free_guidance`` because the real pipeline does
+    (``pipeline_ltx.py``: ``return self._guidance_scale > 1.0``), and because
+    the caller now ASKS that property instead of assuming a threshold. Without
+    it the fake tested a contract no real pipeline has -- Z-Image and Krea 2
+    both answer ``> 0`` for the same question, and at guidance 1.0 that is the
+    difference between an image and an AssertionError.
+    """
     text_encoder = object()
 
     def __init__(self):
         self.calls = []
+
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1.0
 
     def encode_prompt(self, prompt, negative_prompt=None,
                       do_classifier_free_guidance=False,
@@ -163,11 +175,27 @@ def test_the_one_call_family_encodes_both_together():
     assert kw["negative_prompt_attention_mask"] == "NM"
 
 
-def test_cfg_is_derived_from_the_guidance_scale():
-    """At guidance 1.0 there is no classifier-free guidance to encode for."""
+def test_cfg_is_derived_from_the_pipelines_own_rule():
+    """At guidance 1.0 an LTX-style pipeline runs no guidance, so there is
+    nothing to encode for -- and it says so itself, in the property above."""
     p = _LtxLike()
     T.encode_then_free(p, {"prompt": "x", "guidance_scale": 1.0})
     assert p.calls[0][2] is False
+
+
+def test_a_pipeline_whose_rule_is_above_zero_gets_its_negative():
+    """The same scale, the other convention. Z-Image and Krea 2 both count
+    guidance 1.0 as ON, and encoding no negative for them hands the transformer
+    one caption for two latents -- `assert len(size) == bsz`, measured
+    2026-11-01 on Z-Image-Turbo."""
+    class _ZImageLike(_LtxLike):
+        @property
+        def do_classifier_free_guidance(self):
+            return self._guidance_scale > 0
+
+    p = _ZImageLike()
+    T.encode_then_free(p, {"prompt": "x", "guidance_scale": 1.0})
+    assert p.calls[0][2] is True
 
 
 # ------------------------------------------------------------------- failures

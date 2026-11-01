@@ -70,6 +70,69 @@ def generator_device(pipeline):
     return torch.device("cpu")
 
 
+_MISSING = object()
+
+
+def pipeline_wants_cfg(pipeline, guidance_scale) -> bool:
+    """Whether THIS pipeline will run classifier-free guidance at this scale.
+
+    There are two conventions and they differ exactly at 1.0. Stable Diffusion
+    and most of diffusers treat ``guidance_scale > 1`` as "guidance on", because
+    a scale of 1 leaves the formula ``uncond + 1 * (cond - uncond) == cond``.
+    Z-Image uses ``> 0``::
+
+        @property
+        def do_classifier_free_guidance(self):
+            return self._guidance_scale > 0
+
+    Guessing with the SD rule made the caller and the pipeline disagree about a
+    single request. Measured 2026-11-01 on Z-Image-Turbo, which runs at
+    guidance 1.0: the text-encoder-offload path asked ``encode_prompt`` for no
+    CFG and got ``negative_prompt_embeds = []``, then ``__call__`` decided CFG
+    WAS on, repeated the latents to batch 2, and handed the transformer one
+    caption for two images. diffusers pairs them with ``zip``, which truncates
+    in silence, and the run died three frames down on
+
+        assert len(size) == bsz
+        AssertionError
+
+    -- with no message, for a reason nothing in the traceback mentions.
+
+    So ask the pipeline instead of assuming. Its rule lives in its own
+    ``do_classifier_free_guidance`` property, which reads ``_guidance_scale`` --
+    an attribute ``__call__`` sets for itself and that is not set yet when we
+    are preparing its arguments. Set it, read the property, put it back.
+
+    Falls back to ``> 0`` rather than ``> 1.0`` when the pipeline has no such
+    property: a surplus negative embedding is wasted work on a pipeline that
+    will not use it, while a missing one is this crash. Of the two errors, only
+    one of them loses the request.
+    """
+    try:
+        gs = float(guidance_scale) if guidance_scale is not None else None
+    except (TypeError, ValueError):
+        gs = None
+    if gs is None:
+        return False
+    prop = getattr(type(pipeline), "do_classifier_free_guidance", None)
+    if isinstance(prop, property) and prop.fget is not None:
+        saved = getattr(pipeline, "_guidance_scale", _MISSING)
+        try:
+            pipeline._guidance_scale = gs
+            return bool(prop.fget(pipeline))
+        except Exception:
+            pass
+        finally:
+            try:
+                if saved is _MISSING:
+                    del pipeline._guidance_scale
+                else:
+                    pipeline._guidance_scale = saved
+            except Exception:
+                pass
+    return gs > 0
+
+
 def set_global_args(args: Any):
     """Set the global arguments object for use in utility functions."""
     global _global_args

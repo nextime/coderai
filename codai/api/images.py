@@ -739,6 +739,70 @@ def _second_is_a_mask(enc, call_params) -> bool:
     return False
 
 
+#: Of a diffusion pipeline's total footprint, roughly what the single largest
+#: component (the transformer/UNet) accounts for. Used to tell MODEL offload --
+#: which keeps the component in use resident, so its peak is that one component
+#: -- from SEQUENTIAL offload, which walks submodules and needs far less. A
+#: fraction rather than a GB constant because it is a statement about the shape
+#: of these pipelines, not about any one card.
+_LARGEST_COMPONENT_FRACTION = 0.8
+
+#: How far over free VRAM still counts as "borderline" for `auto-borderline`:
+#: try the card and fall back on a real OOM. The same 3.0 GB the video path
+#: uses, for the same reason -- the estimate is often a conservative round
+#: number and exiling a model that would have fit costs a PCIe trip per request
+#: for the life of the install.
+_BORDERLINE_GB = 3.0
+
+
+def _auto_offload_strategy(model_key, resolved_name, requested_id, strategy):
+    """Resolve ``auto`` / ``auto-borderline`` into a concrete offload strategy.
+
+    Returns ``(strategy_or_None, why)``; None means "load it on the card".
+
+    The dropdown promises "Prefer VRAM -- try the card, offload only if it
+    really will not fit", and ``auto-borderline`` is the DEFAULT. The video path
+    honours it and so does the CUDA backend; the image path did not -- its
+    offload check listed only the explicit strategies, so `auto` and
+    `auto-borderline` fell through as "no offload" and no image model EVER
+    offloaded on overshoot, however large.
+
+    Measured 2026-11-01: Krea-2-RealDream, 31.07 GB measured against a 23.56 GB
+    card, loaded whole every time and died mid-generation on cuBLAS's workspace.
+    Its configured strategy was `auto-borderline` the whole while.
+    """
+    want = str(strategy or "").strip().lower()
+    if want not in ("auto", "auto-borderline"):
+        return None, ""
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        need = float(_mmm._get_model_used_vram_gb(
+            model_key, resolved_name, requested_id=requested_id) or 0.0)
+        free = float(_mmm._get_free_vram_gb() or 0.0)
+    except Exception as exc:
+        # No sizing, no decision. Offloading on a guess costs every request a
+        # PCIe trip; the ordinary load still falls back on a real OOM.
+        return None, f"sizing unavailable ({exc})"
+    if need <= 0:
+        return None, "no footprint recorded for this model — trying the card"
+    if free <= 0:
+        return None, "free VRAM unknown — trying the card"
+    over = need - free
+    if over <= 0:
+        return None, f"{need:.1f} GB needed, {free:.1f} GB free — fits"
+    if want == "auto-borderline" and over <= _BORDERLINE_GB:
+        return None, (f"{need:.1f} GB needed is only {over:.1f} GB over "
+                      f"{free:.1f} GB free (borderline) — trying the card, "
+                      f"falling back on a real OOM")
+    if need * _LARGEST_COMPONENT_FRACTION <= free:
+        return "model", (f"{need:.1f} GB needed against {free:.1f} GB free — "
+                         f"model offload (the component in use stays on the "
+                         f"card)")
+    return "sequential", (f"{need:.1f} GB needed against {free:.1f} GB free, "
+                          f"and its largest component alone would not fit — "
+                          f"sequential offload (slower, far less VRAM)")
+
+
 def _is_cuda_oom(exc) -> bool:
     """Whether this exception is the GPU running out of memory.
 
@@ -950,6 +1014,19 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
         _mc.get('cpu_offload')
         or (_offload_strategy in ('cpu', 'sequential', 'model', 'disk'))
     )
+    # `auto` and `auto-borderline` are strategies too, and this is where the
+    # image path used to drop them: they are not in the list above, so they read
+    # as "never offload" -- and `auto-borderline` is the DEFAULT. See
+    # :func:`_auto_offload_strategy`.
+    if not use_sequential_offload:
+        _auto_strategy, _auto_offload_why = _auto_offload_strategy(
+            f"image:{_requested_id}", model_name, _requested_id,
+            _offload_strategy)
+        if _auto_offload_why:
+            print(f"  [image][offload] {_offload_strategy}: {_auto_offload_why}")
+        if _auto_strategy:
+            _offload_strategy = _auto_strategy
+            use_sequential_offload = True
 
     # Quantization (per-model config).  Builds a diffusers quantization config
     # applied per-component so 4-bit/8-bit image models use less VRAM.  Per-model
@@ -1236,6 +1313,16 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     # described them as different for a long time; the image path
                     # ran both as sequential.
                     _strategy = (_offload_strategy or '').strip().lower()
+                    # ESCALATE on the last attempt. Model offload keeps the
+                    # component in use resident, so a pipeline whose largest
+                    # component alone overflows the card fails it the same way
+                    # every time -- and retrying the identical placement twice
+                    # more just pays for the weights twice more. Sequential
+                    # offload walks submodules and is the one that fits.
+                    if _strategy == 'model' and load_attempt >= 3:
+                        print("  [image][offload] model offload already failed — "
+                              "escalating to sequential for the last attempt")
+                        _strategy = 'sequential'
                     if _strategy == 'model' and hasattr(pipeline, 'enable_model_cpu_offload'):
                         print("Enabling MODEL CPU offload (active component on GPU)...")
                         # A fully 4-bit module has no floating-point parameters, so
@@ -1985,7 +2072,12 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                 if "num_images_per_prompt" in _ep_params:
                     _ep_kwargs["num_images_per_prompt"] = 1
                 if "do_classifier_free_guidance" in _ep_params:
-                    _ep_kwargs["do_classifier_free_guidance"] = do_cfg
+                    # The pipeline's own rule, not `cfg_scale > 1.0`: the two
+                    # differ at exactly 1.0 (Z-Image counts > 0 as guidance on)
+                    # and disagreeing with the pipeline about one request costs
+                    # the request. See model_utils.pipeline_wants_cfg.
+                    _ep_kwargs["do_classifier_free_guidance"] = \
+                        model_utils.pipeline_wants_cfg(pipeline, cfg_scale)
                 if "negative_prompt" in _ep_params:
                     _ep_kwargs["negative_prompt"] = neg_prompt or None
                 enc = pipeline.encode_prompt(**_ep_kwargs)

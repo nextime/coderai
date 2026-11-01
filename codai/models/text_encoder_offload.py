@@ -319,9 +319,14 @@ def encode_then_free(pipe, kwargs: Dict[str, Any], *,
     if both_in_one:
         enc_kwargs["negative_prompt"] = negative
         if "do_classifier_free_guidance" in enc_params:
-            gs = kwargs.get("guidance_scale")
-            enc_kwargs["do_classifier_free_guidance"] = bool(
-                gs is not None and float(gs) > 1.0)
+            # ASKED OF THE PIPELINE, not assumed. `> 1.0` is the Stable
+            # Diffusion convention; Z-Image's own property is `> 0`, and at
+            # guidance 1.0 the two disagree -- so this told encode_prompt "no
+            # CFG", got an empty negative back, and __call__ then ran CFG with
+            # one caption for two latents. See model_utils.pipeline_wants_cfg.
+            from codai.models.utils import pipeline_wants_cfg
+            enc_kwargs["do_classifier_free_guidance"] = pipeline_wants_cfg(
+                pipe, kwargs.get("guidance_scale"))
 
     # Put the encoder back before using it: a previous request on this cached
     # pipeline may have left it on the CPU.
