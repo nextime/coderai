@@ -1273,6 +1273,23 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
                     components[name], cls, _path)
                 if _sfp8_note:
                     print(f"  component '{name}': {_sfp8_note}")
+                # Which modules the FILE stored narrow, recorded before the
+                # pipeline sees them. DiffusionPipeline.from_pretrained casts a
+                # component it is handed to its own torch_dtype, so by the time
+                # layerwise casting runs nothing is narrow any more and it
+                # installs nothing -- measured 2026-11-01, "not applied to
+                # transformer (nothing stored at float8_e4m3fn)" and a 31.07 GB
+                # footprint instead of 17.22 GB. Restoring them afterwards is
+                # exact: bf16 has the same exponent range as float8_e4m3fn and
+                # four more mantissa bits, so every stored value survives the
+                # round trip.
+                if _store_dtype is not None:
+                    try:
+                        from codai.models import layerwise as _lw2
+                        _lw2.remember_narrow(components[name], _store_dtype)
+                    except Exception as _re:
+                        print(f"  component '{name}': could not record its "
+                              f"narrow modules ({_re})")
             else:
                 components[name] = cls.from_pretrained(source, **kwargs)
             descs.append(f"{name}:{source.split('/')[-1]}{'/' + mode if mode else ''}")

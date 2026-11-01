@@ -283,3 +283,93 @@ def test_skip_patterns_are_not_relied_on():
     src = open("codai/models/layerwise.py").read()
     assert "apply_layerwise_casting_hook" in src
     assert "skip_modules_pattern" not in src.split('"""')[-1]
+
+
+# --------------------------------------------------------------------------- #
+#  the pipeline casts a component it is handed
+# --------------------------------------------------------------------------- #
+
+@requires_f8
+def _mixed_for_pipeline():
+    net = torch.nn.Module()
+    net.add_module("big", torch.nn.Linear(8, 8, bias=False))
+    net.add_module("time_embed", torch.nn.Linear(4, 4))
+    with torch.no_grad():
+        net.big.weight.data = net.big.weight.data.to(torch.float8_e4m3fn)
+        net.time_embed.weight.data = net.time_embed.weight.data.to(torch.float16)
+        net.time_embed.bias.data = net.time_embed.bias.data.to(torch.float16)
+    return net
+
+
+@requires_f8
+def test_the_narrow_modules_are_remembered_before_the_pipeline_sees_them():
+    net = _mixed_for_pipeline()
+    assert layerwise.remember_narrow(net, torch.float8_e4m3fn) == 1
+
+
+@requires_f8
+def test_they_are_restored_after_the_pipeline_has_cast_everything():
+    """DiffusionPipeline.from_pretrained casts a component it is handed to its
+    own torch_dtype, so layerwise casting afterwards found nothing narrow and
+    installed nothing. Measured 2026-11-01: "not applied to transformer
+    (nothing stored at float8_e4m3fn)" and a 31.07 GB footprint where the same
+    model had measured 17.22 GB."""
+    net = _mixed_for_pipeline()
+    layerwise.remember_narrow(net, torch.float8_e4m3fn)
+    net.to(torch.bfloat16)                       # what the pipeline does
+    assert net.big.weight.dtype is torch.bfloat16
+
+    note = layerwise.apply(_Pipe(transformer=net), NESTED, torch.bfloat16)
+    assert net.big.weight.dtype is torch.float8_e4m3fn, "put back to the file's width"
+    assert net.time_embed.weight.dtype is torch.bfloat16, "and only those"
+    assert "1 module(s) kept at float8_e4m3fn" in note
+    assert net.big(torch.ones(1, 8, dtype=torch.bfloat16)).dtype is torch.bfloat16
+
+
+@requires_f8
+def test_the_round_trip_through_bfloat16_is_exact():
+    """Which is what makes restoring them sound rather than a second loss:
+    bf16 carries the same exponent range as float8_e4m3fn and four more
+    mantissa bits."""
+    a = torch.randn(256).to(torch.float8_e4m3fn)
+    back = a.to(torch.bfloat16).to(torch.float8_e4m3fn)
+    assert torch.equal(back.float(), a.float())
+
+
+@requires_f8
+def test_only_the_recorded_modules_are_narrowed():
+    """A module the file stored at F16 or F32 must never be pushed down to fp8;
+    that was the bug before this -- casting the whole component."""
+    net = _mixed_for_pipeline()
+    layerwise.remember_narrow(net, torch.float8_e4m3fn)
+    net.to(torch.bfloat16)
+    layerwise.apply(_Pipe(transformer=net), NESTED, torch.bfloat16)
+    assert net.time_embed.weight.dtype is torch.bfloat16
+    assert net.time_embed.bias.dtype is torch.bfloat16
+
+
+@requires_f8
+def test_without_a_record_it_falls_back_to_asking_each_module():
+    """A component loaded some other way still works, just without the
+    restore step."""
+    net = _mixed_for_pipeline()          # no remember_narrow call
+    note = layerwise.apply(_Pipe(transformer=net), NESTED, torch.bfloat16)
+    assert "1 module(s) kept at float8_e4m3fn" in note
+    assert net.big.weight.dtype is torch.float8_e4m3fn
+
+
+@requires_f8
+def test_a_record_for_a_different_dtype_is_ignored():
+    net = _mixed_for_pipeline()
+    layerwise.remember_narrow(net, torch.float16)   # not what the config asks
+    net.to(torch.bfloat16)
+    note = layerwise.apply(_Pipe(transformer=net), NESTED, torch.bfloat16)
+    assert "nothing stored at float8_e4m3fn" in note
+
+
+def test_the_loader_records_them():
+    src = open("codai/models/hf_loading.py").read()
+    assert "remember_narrow(components[name], _store_dtype)" in src
+    i = src.index("remember_narrow(")
+    load = src.index("cls.from_single_file(")
+    assert load < i, "recorded after the file is read, before the pipeline"

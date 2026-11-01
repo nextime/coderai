@@ -156,6 +156,39 @@ def storage_dtype_for(cfg, component: str):
     return (spec(cfg)[0] or {}).get(str(component))
 
 
+#: Attribute a component carries listing the modules the FILE stored narrow.
+_NARROW_ATTR = "_coderai_narrow_modules"
+
+
+def remember_narrow(component, storage_dtype) -> int:
+    """Record which of ``component``'s modules hold ``storage_dtype`` right now.
+
+    Called immediately after the component is read from disk, because the
+    pipeline is about to lose that information:
+    ``DiffusionPipeline.from_pretrained`` casts a component it is handed to its
+    own ``torch_dtype``, so when layerwise casting runs afterwards nothing is
+    narrow and it installs nothing. Measured 2026-11-01 -- "not applied to
+    transformer (nothing stored at float8_e4m3fn)", and a 31.07 GB footprint
+    where the same model had measured 17.22 GB.
+
+    Restoring them later is exact rather than approximate: bf16 carries the
+    same exponent range as float8_e4m3fn and four more mantissa bits, so a
+    value that came from fp8 survives fp8 -> bf16 -> fp8 unchanged. Only the
+    modules recorded HERE are put back, so the F16 and F32 tensors the file
+    stored at full width are never narrowed.
+    """
+    paths = []
+    for name, module in component.named_modules():
+        if any(p.dtype == storage_dtype
+               for p in module.parameters(recurse=False)):
+            paths.append(name)
+    try:
+        setattr(component, _NARROW_ATTR, (str(storage_dtype), tuple(paths)))
+    except Exception:
+        return 0
+    return len(paths)
+
+
 def _hook_one(component, storage_dtype, compute_dtype):
     """Hook the modules that ARE stored narrow; bring the rest to compute dtype.
 
@@ -186,12 +219,34 @@ def _hook_one(component, storage_dtype, compute_dtype):
     """
     from diffusers.hooks.layerwise_casting import apply_layerwise_casting_hook
 
-    hooked = recast = 0
+    # The modules the FILE stored narrow, if that was recorded before the
+    # pipeline cast them. Without it we can only ask what each module holds
+    # NOW, which is the compute dtype for all of them once the pipeline has
+    # been through.
+    remembered = None
+    try:
+        stash = getattr(component, _NARROW_ATTR, None)
+        if stash and stash[0] == str(storage_dtype):
+            remembered = set(stash[1])
+    except Exception:
+        remembered = None
+
+    hooked = recast = restored = 0
     for _name, module in component.named_modules():
         params = list(module.parameters(recurse=False))
         if not params:
             continue
-        if any(p.dtype == storage_dtype for p in params):
+        if remembered is not None and _name in remembered:
+            # Put it back to the width the file had it at, then hook it.
+            for p in params:
+                if p.dtype != storage_dtype:
+                    p.data = p.data.to(storage_dtype)
+                    restored += 1
+            apply_layerwise_casting_hook(module, storage_dtype, compute_dtype,
+                                         False)
+            hooked += 1
+            continue
+        if remembered is None and any(p.dtype == storage_dtype for p in params):
             apply_layerwise_casting_hook(module, storage_dtype, compute_dtype,
                                          False)
             hooked += 1
@@ -200,7 +255,7 @@ def _hook_one(component, storage_dtype, compute_dtype):
             if p.dtype.is_floating_point and p.dtype != compute_dtype:
                 p.data = p.data.to(compute_dtype)
                 recast += 1
-    return hooked, recast
+    return hooked, recast + restored
 
 
 def apply(pipeline, cfg, compute_dtype) -> str:
