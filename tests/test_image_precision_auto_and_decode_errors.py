@@ -183,8 +183,21 @@ def test_is_cuda_oom_matches_the_torch_type_too():
 #  tiling is what bounds a single large decode
 # --------------------------------------------------------------------------- #
 
+def _memory_optimisations_block():
+    """The memory-optimisation block, bounded by its own extent.
+
+    These two tests used to read SRC[...][:2200]. On 2026-11-01 a comment added
+    to the same block pushed the assertion past the 2200th byte and a passing
+    test went red for a change it does not describe. The block ends where the
+    IP-Adapter work begins, so say that instead of guessing a length.
+    """
+    start = SRC.index("# Enable memory optimizations")
+    end = SRC.index("# Inject IP-Adapter images if character references", start)
+    return SRC[start:end]
+
+
 def test_vae_tiling_is_honoured_from_the_model_config():
-    body = SRC[SRC.index("# Enable memory optimizations"):][:2200]
+    body = _memory_optimisations_block()
     assert "(model_config or {}).get('vae_tiling')" in body, \
         "tiling has to be readable from the model's own config"
     assert "enable_tiling" in body and "enable_vae_tiling" in body, \
@@ -192,7 +205,7 @@ def test_vae_tiling_is_honoured_from_the_model_config():
 
 
 def test_slicing_alone_is_not_enough_and_the_code_says_why():
-    body = SRC[SRC.index("# Enable memory optimizations"):][:2200]
+    body = _memory_optimisations_block()
     # Slicing splits a BATCH; it does nothing for n=1, which is the case that
     # OOMed. Whoever next trims these comments should know that.
     assert "n=1" in body

@@ -928,7 +928,8 @@ def _auto_precision() -> tuple:
                    f"{AUTO_HALF_PRECISION_VRAM_GB:.0f} GB — f32 fits")
 
 
-def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = None):
+def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = None,
+                             model_key: str = None):
     """
     Try to load a model using the diffusers library.
 
@@ -951,11 +952,33 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
 
     _mc = model_config or {}
 
-    # The id the CALLER asked for, kept before `model_name` is rewritten to the
-    # checkpoint path below. Sizing needs it: two cards can share one
+    # The id the CALLER asked for. Sizing needs it: several cards can share one
     # checkpoint with different quantization and offload, and the one that was
     # asked for is the one whose footprint applies.
+    #
+    # It comes from `model_key`, NOT from `model_name`. By the time the request
+    # path reaches here `model_name` has already been resolved to the
+    # checkpoint -- request_model() returns the alias key and the path
+    # separately, and only the path was passed down -- so taking the requested
+    # id from `model_name` sizes whichever sibling happens to be registered
+    # under the shared path. Measured 2026-11-01 on zeiss, where three cards
+    # (Krea-2-Turbo 14.0 GB, Krea-2-Edit 14.5 GB, Krea-2-RealDream 19.0 GB) all
+    # carry path `unsloth/Krea-2-Turbo`:
+    #
+    #     [vram-est] key='image:unsloth/Krea-2-Turbo' -> 9.68 GB
+    #     Image model needs 9.7 GB, 14.2 GB free — no eviction needed
+    #     Measured footprint for 'image:Krea-2-RealDream': 17.22 GB
+    #       (of which 4.03 GB was offloaded to host RAM this load)
+    #     torch.OutOfMemoryError: Tried to allocate 12.00 MiB ... 8.00 MiB free
+    #
+    # Admission sized Turbo, the loader loaded RealDream, and the 3 GB gap went
+    # to host RAM -- a quantized model with part of itself on the CPU, which
+    # then fails every request. The fallback to `model_name` is for the preload
+    # path, which has no key yet and passes an id that is not an alias.
     _requested_id = model_name
+    if model_key:
+        _requested_id = (model_key.split(":", 1)[1]
+                         if model_key.startswith("image:") else model_key)
 
     # A multi-config sibling is registered under its alias, so `model_name` may
     # BE that alias rather than something from_pretrained can open. The config
@@ -1185,50 +1208,14 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     except ImportError:
         pass
 
-    # =====================================================================
-    # --no-ram mode: load directly on GPU, no CPU RAM fallback
-    # =====================================================================
-    if no_ram and torch.cuda.is_available():
-        cuda_device = _derive_diffusers_device(global_args)
-        print(f"--no-ram mode: loading diffusers model directly on {cuda_device}")
-        
-        try:
-            _xtra = {}
-            if _img_quant_config is not None:
-                _xtra['quantization_config'] = _img_quant_config
-            if _img_gguf_components:
-                _xtra.update(_img_gguf_components)
-            _xtra.update(_img_remote)
-            with _DIFFUSERS_LOAD_LOCK:
-                pipeline = build_single_file_pipeline(model_name, _mc, dtype, _xtra)
-                if pipeline is None:
-                    try:
-                        pipeline = StableDiffusionXLPipeline.from_pretrained(
-                            model_name,
-                            torch_dtype=dtype,
-                            use_safetensors=True,
-                            **_xtra,
-                        )
-                    except Exception:
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            model_name,
-                            torch_dtype=dtype,
-                            use_safetensors=True,
-                            **_xtra,
-                        )
-            try:
-                pipeline = pipeline.to(cuda_device)
-            except Exception:
-                if _img_quant_config is None:
-                    raise  # only quantized pipelines may reject .to()
-            print(f"--no-ram: Diffusers model loaded on {cuda_device}")
-            return _finish_image_load(pipeline, _mc)
-        except Exception as e:
-            raise RuntimeError(
-                f"--no-ram: Failed to load diffusers model entirely on GPU ({cuda_device}). "
-                f"The model may be too large for available VRAM. Error: {e}"
-            )
-    
+    # NOTE: the eviction below must stay ABOVE the --no-ram branch. That
+    # branch loads and RETURNS, so while this block sat after it the whole
+    # minimum-eviction path was dead code on any install running --no-ram --
+    # which is the mode that most needs it, since it is also the mode that
+    # refuses to offload. Measured 2026-11-01: CyberRealistic-Pony loaded
+    # directly onto a card still holding a 17.22 GB Krea-2-RealDream and died
+    # mid-generation asking for 96 MiB with 50 MiB free, and no eviction line
+    # appears anywhere in that run's log.
     # =====================================================================
     # Proactive VRAM eviction before first load attempt
     # =====================================================================
@@ -1275,8 +1262,30 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                     _key or model_name, model_name,
                     requested_id=_requested_id)
                 if _need_gb > 0:
-                    if _free_gb < _need_gb:
-                        print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
+                    # The weights are not the peak. A diffusion run wants
+                    # activations, cuBLAS's workspace and a VAE decode ON TOP
+                    # of everything it loaded, so admission has to ask for
+                    # weights PLUS headroom -- the same headroom the eviction
+                    # itself uses, read here so the DECISION and the amount
+                    # freed agree.
+                    #
+                    # Measured 2026-11-01: CyberRealistic-Pony, 8.6 GB needed
+                    # against 9.0 GB free, admitted as "no eviction needed"
+                    # beside a resident 17.22 GB Krea-2-RealDream. It loaded
+                    # with 0.4 GB to spare and died asking for 96 MiB with
+                    # 50 MiB left. Comparing weights to free VRAM says a model
+                    # fits when what fits is only its weights.
+                    _head_gb = 0.0
+                    try:
+                        _head_gb = float(_mmm._evict_headroom_gb(
+                            _need_gb, key=_key or model_name) or 0.0)
+                    except Exception:
+                        _head_gb = 0.0
+                    _want_gb = _need_gb + _head_gb
+                    if _free_gb < _want_gb:
+                        print(f"Image model needs {_need_gb:.1f} GB + "
+                              f"{_head_gb:.1f} GB generation headroom = "
+                              f"{_want_gb:.1f} GB, {_free_gb:.1f} GB free "
                               f"— evicting the minimum to fit (others may coexist)")
                         # for_key so the model's own eviction headroom applies:
                         # the decode peak is an absolute ~1 GB, not a fraction of
@@ -1284,7 +1293,9 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                         _mmm._evict_models_for_vram(
                             _need_gb, for_key=_key or model_name)
                     else:
-                        print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
+                        print(f"Image model needs {_need_gb:.1f} GB + "
+                              f"{_head_gb:.1f} GB generation headroom, "
+                              f"{_free_gb:.1f} GB free "
                               f"— no eviction needed (coexisting with loaded models)")
                 elif _total > 0 and (_free / _total) < 0.15:
                     # Size unknown and VRAM nearly full — evict LRU one at a time
@@ -1295,6 +1306,50 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
         except Exception as _ee:
             print(f"  Proactive eviction skipped: {_ee}")
 
+    # =====================================================================
+    # --no-ram mode: load directly on GPU, no CPU RAM fallback
+    # =====================================================================
+    if no_ram and torch.cuda.is_available():
+        cuda_device = _derive_diffusers_device(global_args)
+        print(f"--no-ram mode: loading diffusers model directly on {cuda_device}")
+        
+        try:
+            _xtra = {}
+            if _img_quant_config is not None:
+                _xtra['quantization_config'] = _img_quant_config
+            if _img_gguf_components:
+                _xtra.update(_img_gguf_components)
+            _xtra.update(_img_remote)
+            with _DIFFUSERS_LOAD_LOCK:
+                pipeline = build_single_file_pipeline(model_name, _mc, dtype, _xtra)
+                if pipeline is None:
+                    try:
+                        pipeline = StableDiffusionXLPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            use_safetensors=True,
+                            **_xtra,
+                        )
+                    except Exception:
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            use_safetensors=True,
+                            **_xtra,
+                        )
+            try:
+                pipeline = pipeline.to(cuda_device)
+            except Exception:
+                if _img_quant_config is None:
+                    raise  # only quantized pipelines may reject .to()
+            print(f"--no-ram: Diffusers model loaded on {cuda_device}")
+            return _finish_image_load(pipeline, _mc)
+        except Exception as e:
+            raise RuntimeError(
+                f"--no-ram: Failed to load diffusers model entirely on GPU ({cuda_device}). "
+                f"The model may be too large for available VRAM. Error: {e}"
+            )
+    
     # =====================================================================
     # Standard loading path (with OOM fallback)
     # =====================================================================
@@ -1513,6 +1568,53 @@ def ip_adapter_image_arg(pipeline, images):
     return [images] * n_adapters
 
 
+#: VRAM an IP-Adapter adds on top of the pipeline, in GB: the adapter weights
+#: plus the CLIP image encoder it projects from. SDXL's ip-adapter_sdxl.bin with
+#: CLIP-ViT-H-14 is the larger pair; SD1.5's is roughly half. Deliberately one
+#: conservative constant rather than a per-checkpoint lookup: the figure is
+#: needed BEFORE anything is downloaded, so the alternative is a network round
+#: trip on the admission path, and over-reserving by a gigabyte costs one more
+#: idle eviction while under-reserving costs the whole request.
+_IP_ADAPTER_VRAM_GB = 2.0
+
+
+def _character_ref_vram_gb(request) -> float:
+    """Extra VRAM to reserve for this request's character references.
+
+    Zero when the request has none, so an ordinary generation is unaffected.
+    """
+    # The field names are the ones _character_reference_groups reads in
+    # codai/api/characters.py -- all of them, because a caller may send saved
+    # profile names or inline images and either one loads the adapter.
+    for _attr in ("characters", "character_profiles", "character_references"):
+        if getattr(request, _attr, None):
+            return _IP_ADAPTER_VRAM_GB
+    return 0.0
+
+
+def _ip_processors_installed(pipeline) -> bool:
+    """Whether this pipeline's denoiser still carries IP-Adapter processors.
+
+    ``_coderai_ip_state`` records that we LOADED an adapter; it cannot record
+    that the processors are still there, because diffusers replaces them
+    wholesale on any attention-slicing change. Identified by their projection
+    Linears (``to_k_ip``/``to_v_ip``) rather than by class name, so a
+    subclass or a future rename still counts.
+    """
+    for _attr in ("unet", "transformer"):
+        denoiser = getattr(pipeline, _attr, None)
+        if denoiser is None:
+            continue
+        try:
+            procs = denoiser.attn_processors
+        except Exception:
+            continue
+        for proc in (procs or {}).values():
+            if hasattr(proc, "to_k_ip") or hasattr(proc, "to_v_ip"):
+                return True
+    return False
+
+
 def _ensure_ip_adapter_loaded(pipeline) -> bool:
     """Lazily load IP-Adapter weights matching the pipeline architecture.
 
@@ -1523,7 +1625,23 @@ def _ensure_ip_adapter_loaded(pipeline) -> bool:
     # Already loaded (or already known-unsupported) for this pipeline instance.
     flag = getattr(pipeline, '_coderai_ip_state', None)
     if flag == 'loaded':
-        return True
+        if _ip_processors_installed(pipeline):
+            return True
+        # The flag says loaded and the processors say otherwise, so something
+        # swapped them out from under us -- any call to enable/disable
+        # attention slicing does exactly that. Reload rather than generate:
+        # the UNet config still demands image_embeds, and a vanilla processor
+        # handed that tuple raises `'tuple' object has no attribute 'shape'`
+        # at the first denoising step. Measured 2026-11-01; the caller that
+        # did it is fixed, and this is here so the next one cannot do it
+        # silently.
+        _log.warning("IP-Adapter was attached but its attention processors "
+                     "are gone (something re-set them) — reloading it")
+        try:
+            pipeline._coderai_ip_state = None
+        except Exception:
+            pass
+        flag = None
     if flag == 'unsupported':
         return False
     if not hasattr(pipeline, 'load_ip_adapter'):
@@ -1989,8 +2107,35 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # Tiling is off unless the model asks for it, because it trades a little
     # seam fidelity for the headroom and that is the operator's call -- the same
     # `vae_tiling` key the video path reads, where it defaults ON instead.
+    # NOT while an IP-Adapter is attached. diffusers'
+    # `Attention.set_attention_slice()` REPLACES the processor on every
+    # attention module -- SlicedAttnProcessor(slice_size), or a bare
+    # AttnProcessor() for slice_size=None -- so enabling slicing here wipes
+    # every IPAdapterAttnProcessor off a cached pipeline. The loader knows this
+    # and deliberately leaves slicing off for the life of the adapter (see
+    # _ensure_ip_adapter_loaded); this block ran on the NEXT request and turned
+    # it straight back on.
+    #
+    # The failure is silent until generation: `_ensure_ip_adapter_loaded` sees
+    # `_coderai_ip_state == 'loaded'` and returns early without reinstalling
+    # anything, the UNet config still carries
+    # `encoder_hid_dim_type='ip_image_proj'`, and that makes diffusers hand the
+    # processor a tuple of (prompt_embeds, image_embeds) which only an
+    # IP-Adapter processor can unpack. Measured 2026-11-01 on zeiss,
+    # pornmaster-pro-pony with character_profiles=['motus_test_char'], second
+    # request on the cached pipeline:
+    #
+    #     AttributeError: 'tuple' object has no attribute 'shape'
+    #       hidden_states.shape if encoder_hidden_states is None
+    #                           else encoder_hidden_states.shape
+    #     "POST /v1/images/generations HTTP/1.1" 500 Internal Server Error
+    #
+    # So character consistency worked on the FIRST request against a pipeline
+    # and died on every one after it. Slicing is restored by the unload path
+    # when a request arrives without character references.
+    _ip_attached = getattr(pipeline, '_coderai_ip_state', None) == 'loaded'
     try:
-        if hasattr(pipeline, 'enable_attention_slicing'):
+        if hasattr(pipeline, 'enable_attention_slicing') and not _ip_attached:
             pipeline.enable_attention_slicing(slice_size="auto")
         if hasattr(pipeline, 'vae') and hasattr(pipeline.vae, 'enable_slicing'):
             pipeline.vae.enable_slicing()
@@ -2889,11 +3034,20 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 _lora_extra_gb = multi_model_manager._lora_vram_gb(request.loras)
             except Exception:
                 _lora_extra_gb = 0.0
+        # Character references cost VRAM too, and until 2026-11-01 nothing
+        # reserved it. A character request loads an IP-Adapter on top of the
+        # pipeline -- the adapter weights plus a CLIP image encoder, and for
+        # SDXL that is about 2 GB -- so admission sized the pipeline alone and
+        # the adapter came out of whatever slack was left. Measured on zeiss:
+        # CyberRealistic-Pony died on a 96 MiB allocation with 50 MiB free, and
+        # Krea-2-RealDream on 12 MiB with 8 MiB free. Both were character
+        # requests, and both had been admitted as "fits".
+        _char_extra_gb = _character_ref_vram_gb(request)
         model_info = await asyncio.to_thread(
             multi_model_manager.request_model,
             requested_model=request.model,
             model_type="image",
-            extra_vram_gb=_lora_extra_gb,
+            extra_vram_gb=_lora_extra_gb + _char_extra_gb,
         )
         
         # Check if the model was rejected as not allowed
@@ -3000,7 +3154,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 multi_model_manager.note_loading(model_key)
                 try:
                     pipeline = await asyncio.to_thread(
-                        _load_diffusers_pipeline, model_name, global_args, _diff_cfg)
+                        _load_diffusers_pipeline, model_name, global_args, _diff_cfg,
+                        model_key)
                 finally:
                     # Cleared here, not after add_model: there is no await
                     # between the two, so no other task can observe the gap.
@@ -3417,7 +3572,8 @@ async def _pipeline_for_task(model_info: dict, task: str):
                or multi_model_manager._config_for_model(model_name) or {})
         try:
             base = await asyncio.to_thread(
-                _load_diffusers_pipeline, model_name, global_args, cfg)
+                _load_diffusers_pipeline, model_name, global_args, cfg,
+                model_key)
         except Exception as e:
             base = None
             configured_error = e

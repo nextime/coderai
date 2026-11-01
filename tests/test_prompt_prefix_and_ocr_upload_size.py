@@ -139,9 +139,16 @@ def test_the_generation_request_takes_them_too():
 def test_the_prefix_reaches_the_encode_and_the_cache_key_together():
     """If the cache were keyed on the prompt as SENT, two models with different
     prefixes would share one entry and the second would get the first's text."""
-    src = open("codai/api/images.py").read()
-    head = src.index("async def _generate_with_diffusers")
-    body = src[head:head + 12000]   # the function grew; the two calls are still paired
+    import inspect
+
+    import codai.api.images as images
+
+    # The function's real extent, not a byte window. This test used to read
+    # src[head:head + 12000] and broke on 2026-11-01 when a comment pushed the
+    # second assertion past the 12000th byte -- a passing test turning red for
+    # a change in a different part of the function, which teaches nothing and
+    # costs a debug cycle. Its own comment already read "the function grew".
+    body = inspect.getsource(images._generate_with_diffusers)
     assert "prompt, neg_prompt = _effective_prompts(request, model_config)" in body
     assert "_embed_cache.get(prompt, neg_prompt, model_id)" in body
     assert "_embed_cache.get(request.prompt" not in body
