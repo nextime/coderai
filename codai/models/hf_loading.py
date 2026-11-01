@@ -1207,11 +1207,27 @@ def build_component_models(model_name: str, cfg: Optional[Dict[str, Any]], dtype
             _store_dtype = _lw.storage_dtype_for(c, name)
         except Exception:
             _store_dtype = None
-        kwargs: Dict[str, Any] = {"torch_dtype": _store_dtype or dtype}
+        # torch_dtype=None when a storage dtype is configured: NOT the storage
+        # dtype itself. diffusers casts the whole component to whatever
+        # torch_dtype says (single_file_model.py: `model.to(torch_dtype)`), and
+        # a checkpoint is not uniform -- Real Dream's fp8 build is 256 fp8
+        # linears plus F16 time-embedding projections and F32 norms. Passing
+        # fp8 downcast those too, and the first matmul reported
+        #
+        #   mat1 and mat2 must have the same dtype, but got BFloat16 and
+        #   Float8_e4m3fn
+        #
+        # naming time_embed.linear_1, which was F16 on disk. None keeps every
+        # tensor at the width the file stored it at; layerwise.apply then hooks
+        # the ones that are actually narrow and brings the rest to the compute
+        # dtype. Measured 2026-11-01.
+        kwargs: Dict[str, Any] = {
+            "torch_dtype": None if _store_dtype is not None else dtype}
         if _store_dtype is not None:
-            print(f"  component '{name}': loading at "
-                  f"{str(_store_dtype).replace('torch.', '')} (layerwise "
-                  f"casting upcasts it per module at compute time)")
+            print(f"  component '{name}': loading at the file's own widths "
+                  f"(layerwise casting keeps "
+                  f"{str(_store_dtype).replace('torch.', '')} at rest and "
+                  f"computes in {str(dtype).replace('torch.', '')})")
         if mode in ("4bit", "8bit"):
             try:
                 from diffusers import BitsAndBytesConfig as DiffBnb

@@ -156,6 +156,53 @@ def storage_dtype_for(cfg, component: str):
     return (spec(cfg)[0] or {}).get(str(component))
 
 
+def _hook_one(component, storage_dtype, compute_dtype):
+    """Hook the modules that ARE stored narrow; bring the rest to compute dtype.
+
+    Per module, because a checkpoint is not uniform. Real Dream's fp8 build is
+    256 fp8 linears plus F16 time-embedding projections and F32 norms, and
+    casting the WHOLE component to fp8 -- which is what passing torch_dtype did
+    -- downcast tensors the file never stored that way. diffusers' own
+    ``enable_layerwise_casting`` then skipped exactly those precision-critical
+    modules by default, so they kept an fp8 weight that nothing upcast and the
+    first matmul said
+
+        mat1 and mat2 must have the same dtype, but got BFloat16 and
+        Float8_e4m3fn
+
+    naming ``time_embed.linear_1`` -- a module that was F16 on disk. Measured
+    2026-11-01.
+
+    So: ask each module what dtype it actually holds. One holding the storage
+    dtype gets the casting hook (narrow at rest, compute dtype inside its own
+    forward). One holding anything else is brought to the compute dtype
+    outright, which is cheap -- everything that is not a big linear is a
+    rounding error against them -- and leaves nothing for a matmul to trip on.
+
+    ``skip_modules_pattern`` is not used at all: the per-module hook has no
+    pattern matching, so nothing can be excluded behind our back. That mattered
+    because diffusers appends the model's own
+    ``_skip_layerwise_casting_patterns`` even to an empty pattern tuple.
+    """
+    from diffusers.hooks.layerwise_casting import apply_layerwise_casting_hook
+
+    hooked = recast = 0
+    for _name, module in component.named_modules():
+        params = list(module.parameters(recurse=False))
+        if not params:
+            continue
+        if any(p.dtype == storage_dtype for p in params):
+            apply_layerwise_casting_hook(module, storage_dtype, compute_dtype,
+                                         False)
+            hooked += 1
+            continue
+        for p in params:
+            if p.dtype.is_floating_point and p.dtype != compute_dtype:
+                p.data = p.data.to(compute_dtype)
+                recast += 1
+    return hooked, recast
+
+
 def apply(pipeline, cfg, compute_dtype) -> str:
     """Enable layerwise casting on every configured component. Returns a note.
 
@@ -171,19 +218,27 @@ def apply(pipeline, cfg, compute_dtype) -> str:
         comp = getattr(pipeline, name, None)
         if comp is None:
             continue            # not a component of this pipeline at all
-        fn = getattr(comp, "enable_layerwise_casting", None)
-        if not callable(fn):
-            skipped.append(f"{name} (this diffusers build cannot)")
+        if not hasattr(comp, "named_modules"):
+            skipped.append(f"{name} (not a module)")
             continue
         try:
-            fn(storage_dtype=storage_dtype, compute_dtype=compute_dtype)
-            done.append(f"{name}:{str(storage_dtype).replace('torch.', '')}")
+            hooked, recast = _hook_one(comp, storage_dtype, compute_dtype)
         except Exception as exc:
             skipped.append(f"{name} ({exc})")
+            continue
+        if not hooked:
+            skipped.append(f"{name} (nothing stored at "
+                           f"{str(storage_dtype).replace('torch.', '')})")
+            continue
+        done.append(f"{name}: {hooked} module(s) kept at "
+                    f"{str(storage_dtype).replace('torch.', '')}"
+                    + (f", {recast} brought to "
+                       f"{str(compute_dtype).replace('torch.', '')}"
+                       if recast else ""))
     note = ""
     if done:
-        note = (f"storing {', '.join(done)} and computing in "
-                f"{str(compute_dtype).replace('torch.', '')}")
+        note = "; ".join(done) + (f"; computing in "
+                                  f"{str(compute_dtype).replace('torch.', '')}")
     if skipped:
         note += ("; not applied to " if note else "not applied to ") + \
             ", ".join(skipped)

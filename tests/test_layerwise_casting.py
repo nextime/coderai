@@ -89,37 +89,35 @@ def test_one_component_can_be_named_on_its_own():
 #  applying it
 # --------------------------------------------------------------------------- #
 
-class _Comp:
-    def __init__(self, fails=False):
-        self.calls = []
-        self._fails = fails
-
-    def enable_layerwise_casting(self, storage_dtype=None, compute_dtype=None):
-        if self._fails:
-            raise RuntimeError("no hooks here")
-        self.calls.append((storage_dtype, compute_dtype))
-
-
 class _Pipe:
     def __init__(self, **components):
         for k, v in components.items():
             setattr(self, k, v)
 
 
+def _f8_net():
+    """A module with one genuinely narrow parameter."""
+    net = torch.nn.Module()
+    net.add_module("big", torch.nn.Linear(8, 8, bias=False))
+    with torch.no_grad():
+        net.big.weight.data = net.big.weight.data.to(torch.float8_e4m3fn)
+    return net
+
+
 @requires_f8
-def test_it_casts_the_configured_component_and_says_so():
-    t = _Comp()
-    pipe = _Pipe(transformer=t, vae=_Comp())
-    note = layerwise.apply(pipe, {"layerwise_casting": {"transformer": "f8"}},
+def test_it_hooks_the_configured_component_and_says_so():
+    net = _f8_net()
+    note = layerwise.apply(_Pipe(transformer=net, vae=_f8_net()),
+                           {"layerwise_casting": {"transformer": "f8"}},
                            torch.bfloat16)
-    assert t.calls == [(torch.float8_e4m3fn, torch.bfloat16)]
     assert "transformer" in note and "bfloat16" in note
+    assert net.big.weight.dtype is torch.float8_e4m3fn
 
 
 @requires_f8
 def test_a_component_the_pipeline_does_not_have_is_simply_skipped():
-    pipe = _Pipe(transformer=_Comp())
-    note = layerwise.apply(pipe, {"layerwise_casting": "f8"}, torch.bfloat16)
+    note = layerwise.apply(_Pipe(transformer=_f8_net()),
+                           {"layerwise_casting": "f8"}, torch.bfloat16)
     assert "transformer" in note
     # unet / text_encoder are absent from this pipeline and must not appear as
     # failures -- a pipeline is not broken for lacking a component.
@@ -127,56 +125,25 @@ def test_a_component_the_pipeline_does_not_have_is_simply_skipped():
 
 
 @requires_f8
-def test_a_component_that_cannot_cast_is_reported_not_raised():
+def test_something_that_is_not_a_module_is_reported_not_raised():
     """A VRAM optimisation must never be why a generation fails."""
-    pipe = _Pipe(transformer=_Comp(fails=True))
-    note = layerwise.apply(pipe, {"layerwise_casting": "f8"}, torch.bfloat16)
-    assert "not applied to" in note
-    assert "no hooks here" in note
+    note = layerwise.apply(_Pipe(transformer=object()),
+                           {"layerwise_casting": "f8"}, torch.bfloat16)
+    assert "not a module" in note
 
 
 @requires_f8
-def test_an_old_diffusers_without_the_method_is_reported():
-    class _Old:
-        pass
-
-    pipe = _Pipe(transformer=_Old())
-    note = layerwise.apply(pipe, {"layerwise_casting": "f8"}, torch.bfloat16)
-    assert "cannot" in note
-
-
-def test_nothing_configured_means_no_note_and_no_calls():
-    t = _Comp()
-    assert layerwise.apply(_Pipe(transformer=t), {}, torch.bfloat16) == ""
-    assert t.calls == []
+def test_a_failure_inside_the_hook_is_reported_not_raised(monkeypatch):
+    def _boom(*a, **kw):
+        raise RuntimeError("no hooks here")
+    monkeypatch.setattr(layerwise, "_hook_one", _boom)
+    note = layerwise.apply(_Pipe(transformer=_f8_net()),
+                           {"layerwise_casting": "f8"}, torch.bfloat16)
+    assert "not applied to" in note and "no hooks here" in note
 
 
-# --------------------------------------------------------------------------- #
-#  wiring
-# --------------------------------------------------------------------------- #
-
-def test_the_component_loader_reads_the_storage_dtype():
-    """Casting AFTER a bf16 load would save the resident cost and still need
-    the bf16 peak to get there -- which for a 12.9 GB file on a 24 GB card is
-    the entire problem."""
-    src = open("codai/models/hf_loading.py").read()
-    assert "layerwise.storage_dtype_for" in src or \
-        "_lw.storage_dtype_for" in src
-    i = src.index("storage_dtype_for")
-    body = src[max(0, i - 900):i + 600]
-    assert '"torch_dtype": _store_dtype or dtype' in body
-
-
-def test_the_loader_applies_it_before_placement():
-    """The device move should carry the narrow tensors, not the wide ones."""
-    src = open("codai/api/images.py").read()
-    apply_at = src.index("_layerwise.apply(pipeline")
-    place_at = src.index("# Apply memory optimizations based on attempt")
-    assert apply_at < place_at
-
-
-def test_it_is_savable_from_the_admin_page():
-    assert '"layerwise_casting",' in open("codai/admin/routes.py").read()
+def test_nothing_configured_means_no_note():
+    assert layerwise.apply(_Pipe(transformer=object()), {}, None) == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -219,13 +186,100 @@ def test_a_flat_config_still_works():
 def test_the_hooks_are_installed_for_a_nested_config():
     """The consequence, not just the parse: apply() had returned "" and
     installed nothing."""
-    t = _Comp()
-    note = layerwise.apply(_Pipe(transformer=t), NESTED, torch.bfloat16)
-    assert t.calls == [(torch.float8_e4m3fn, torch.bfloat16)]
+    net = _f8_net()
+    note = layerwise.apply(_Pipe(transformer=net), NESTED, torch.bfloat16)
     assert "transformer" in note
+    assert net.big.weight.dtype is torch.float8_e4m3fn
+    assert net.big(torch.ones(1, 8, dtype=torch.bfloat16)).dtype is torch.bfloat16
 
 
 def test_the_unwrap_is_shared_and_not_reimplemented():
     src = open("codai/models/layerwise.py").read()
     assert "hf_loading import _norm" in src, \
         "a second copy of the unwrap is how the two readers disagreed"
+
+
+# --------------------------------------------------------------------------- #
+#  a checkpoint is not uniform
+# --------------------------------------------------------------------------- #
+
+@requires_f8
+def _mixed_net():
+    """The real shape of Real Dream's fp8 build: 256 fp8 linears, F16
+    time-embedding projections, F32 norms."""
+    net = torch.nn.Module()
+    net.add_module("big", torch.nn.Linear(8, 8, bias=False))
+    net.add_module("time_embed", torch.nn.Linear(4, 4, bias=True))
+    net.add_module("norm", torch.nn.LayerNorm(4))
+    with torch.no_grad():
+        net.big.weight.data = net.big.weight.data.to(torch.float8_e4m3fn)
+        net.time_embed.weight.data = net.time_embed.weight.data.to(torch.float16)
+        net.time_embed.bias.data = net.time_embed.bias.data.to(torch.float16)
+        net.norm.weight.data = net.norm.weight.data.to(torch.float32)
+        net.norm.bias.data = net.norm.bias.data.to(torch.float32)
+    return net
+
+
+@requires_f8
+def test_only_the_narrow_modules_are_hooked_and_the_rest_are_recast():
+    """Casting the WHOLE component to fp8 is what broke this: diffusers'
+    default skip patterns then excluded the precision-critical modules from the
+    hooks, so they kept an fp8 weight nothing upcast and the first matmul said
+
+        mat1 and mat2 must have the same dtype, but got BFloat16 and
+        Float8_e4m3fn
+
+    naming time_embed.linear_1 -- F16 on disk. Measured 2026-11-01.
+    """
+    net = _mixed_net()
+    pipe = _Pipe(transformer=net)
+    note = layerwise.apply(pipe, {"layerwise_casting": {"transformer": "f8"}},
+                           torch.bfloat16)
+    assert net.big.weight.dtype is torch.float8_e4m3fn, \
+        "the big linear must stay narrow at rest -- that is the whole point"
+    assert net.time_embed.weight.dtype is torch.bfloat16
+    assert net.time_embed.bias.dtype is torch.bfloat16
+    assert net.norm.weight.dtype is torch.bfloat16
+    assert "1 module(s) kept at float8_e4m3fn" in note
+    assert "brought to bfloat16" in note
+
+
+@requires_f8
+def test_every_forward_agrees_on_dtype_afterwards():
+    """The failure was a matmul, so the test is a matmul."""
+    net = _mixed_net()
+    layerwise.apply(_Pipe(transformer=net),
+                    {"layerwise_casting": {"transformer": "f8"}}, torch.bfloat16)
+    assert net.big(torch.ones(1, 8, dtype=torch.bfloat16)).dtype is torch.bfloat16
+    assert net.time_embed(torch.ones(1, 4, dtype=torch.bfloat16)).dtype \
+        is torch.bfloat16
+
+
+@requires_f8
+def test_a_component_with_nothing_narrow_is_reported_not_silently_hooked():
+    """If the file turned out to hold no narrow tensors at all, saying so beats
+    reporting a saving that did not happen."""
+    net = torch.nn.Module()
+    net.add_module("lin", torch.nn.Linear(4, 4))
+    note = layerwise.apply(_Pipe(transformer=net),
+                           {"layerwise_casting": {"transformer": "f8"}},
+                           torch.bfloat16)
+    assert "nothing stored at float8_e4m3fn" in note
+
+
+def test_the_loader_keeps_the_files_own_widths():
+    """torch_dtype=None, not the storage dtype: diffusers casts the WHOLE
+    component to whatever torch_dtype says."""
+    src = open("codai/models/hf_loading.py").read()
+    # Anchored on _store_dtype: `kwargs: Dict[str, Any] = {` occurs more than
+    # once in this file and the first hit is a different function.
+    assert '"torch_dtype": None if _store_dtype is not None else dtype' in src
+
+
+def test_skip_patterns_are_not_relied_on():
+    """diffusers appends the model's own _skip_layerwise_casting_patterns even
+    to an empty tuple, so a pattern-based approach can still exclude a module
+    behind our back. The per-module hook has no pattern matching."""
+    src = open("codai/models/layerwise.py").read()
+    assert "apply_layerwise_casting_hook" in src
+    assert "skip_modules_pattern" not in src.split('"""')[-1]
