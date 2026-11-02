@@ -652,17 +652,30 @@ async def _run_transcription_inner(
 
     cfg_backend = (stt_cfg.get('backend') or '').strip().lower()
 
-    # A whisper.cpp GGUF (or a model configured with the whisper-server backend)
-    # cannot be loaded by faster-whisper — handing it a .gguf path or a whisper
-    # alias makes faster-whisper raise the opaque "Invalid model size". That only
-    # happens when the request reached an engine that has no whisper-server
-    # registered for this model (routing should pin it to its owner engine). Fail
-    # with an actionable message instead of the misleading size error.
+    # A whisper.cpp weights FILE (or a model configured with the whisper-server
+    # backend) cannot be loaded by faster-whisper — handing it such a path or a
+    # whisper alias makes faster-whisper raise the opaque "Invalid model size".
+    # That only happens when the request reached an engine that has no
+    # whisper-server registered for this model (routing should pin it to its
+    # owner engine). Fail with an actionable message instead of the misleading
+    # size error.
+    #
+    # Both whisper.cpp extensions count. ".bin" is whisper.cpp's OWN historical
+    # format (ggml-large-v3.bin) and is still what most published quantisations
+    # ship as, so matching only ".gguf" let exactly those through: measured
+    # 2026-10-27, `whisper-large-v3-turbo-q8_0.bin` fell past this guard into
+    # the HuggingFace loader and came back as
+    #   500 "... is not a local folder and is not a valid model identifier"
+    # i.e. a whisper.cpp file reported as a missing Hub repo -- the same
+    # misdirection this guard exists to prevent, for the commoner of the two
+    # extensions. A bare weights file is never a transformers repo (that wants
+    # a DIRECTORY), so neither suffix can be a false positive here.
     if cfg_backend == 'whisper-server' or (
-            isinstance(model_name, str) and model_name.lower().endswith(".gguf")):
+            isinstance(model_name, str)
+            and model_name.lower().endswith((".gguf", ".bin"))):
         raise HTTPException(
             status_code=503,
-            detail=(f"'{model}' is a whisper-server (whisper.cpp GGUF) model but no "
+            detail=(f"'{model}' is a whisper-server (whisper.cpp) model but no "
                     "whisper-server is available on the engine handling this request. "
                     "It must run on its assigned engine.")
         )
