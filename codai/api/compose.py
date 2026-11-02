@@ -149,6 +149,26 @@ class SpeakerLine(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class CallerWord(BaseModel):
+    """One word already timed by whoever wrote the audio.
+
+    A caller that synthesised a scene's voice elsewhere (``scene.audio``) often
+    has the word timings as a by-product, or can get them from the provider
+    that spoke the line. Transcribing that audio again here to recover timings
+    we were never told about costs a speech model, a GPU and a load, and lands
+    on a WORSE answer: STT hears the audio, while the caller knows what was
+    said. Given these, the scene needs no speech-to-text at all.
+
+    ``start``/``end`` are seconds from the start of THIS scene's audio, the
+    same clock :func:`_stt_words` reports on, so both reach ``align_words``
+    unchanged.
+    """
+    word: str = ""
+    start: float = 0.0
+    end: float = 0.0
+    model_config = ConfigDict(extra="allow")
+
+
 class Scene(BaseModel):
     text: Optional[str] = None
     audio: Optional[str] = None
@@ -157,6 +177,11 @@ class Scene(BaseModel):
     padding: float = 0.15
     visuals: List[Visual] = Field(default_factory=list)
     voice: Optional[VoiceSpec] = None       # per-scene override (a second speaker)
+    # Word timings the caller already has, for THIS scene's audio. Present:
+    # captions are aligned onto these and this scene runs no speech-to-text.
+    # Absent (the default) or empty: nothing changes -- STT if one is
+    # configured, estimated timings otherwise.
+    words: List[CallerWord] = Field(default_factory=list)
     # Two or more characters talking, in order. Replaces `text`/`voice`/
     # `presenter` for this scene: the lines ARE the narration, each in its own
     # character's voice, and each character is lip-synced in its own region of
@@ -212,7 +237,12 @@ class MusicSpec(BaseModel):
 
 class CaptionSpec(BaseModel):
     enabled: bool = True
-    timing: str = "auto"                    # auto | stt | estimate
+    # auto     — scene.words when the scene has them, else STT, else estimated.
+    # caller    — scene.words only; a scene without them is estimated, and no
+    #             speech model is needed or loaded for any scene.
+    # stt       — transcribe every scene, ignoring scene.words.
+    # estimate  — never time anything; spread each scene's text over its span.
+    timing: str = "auto"                    # auto | caller | stt | estimate
     stt_model: Optional[str] = None
     preset: str = "karaoke"
     font: str = "Montserrat"
@@ -539,9 +569,10 @@ def _validate(req: ComposeRequest) -> None:
                 raise HTTPException(status_code=400, detail=(
                     f"scenes[{i}].visuals[{j}].src: required for type {vt!r}"))
     caps = req.captions
-    if caps and caps.enabled and (caps.timing or "auto").lower() not in ("auto", "stt", "estimate"):
+    if caps and caps.enabled and (caps.timing or "auto").lower() not in (
+            "auto", "caller", "stt", "estimate"):
         raise HTTPException(status_code=400,
-                            detail="captions.timing: expected auto, stt or estimate")
+                            detail="captions.timing: expected auto, caller, stt or estimate")
     if caps and caps.enabled and (caps.preset or "karaoke").lower() not in cap.PRESETS:
         raise HTTPException(status_code=400, detail=(
             "captions.preset: expected one of " + ", ".join(sorted(cap.PRESETS))))
@@ -569,7 +600,7 @@ def _validate(req: ComposeRequest) -> None:
         raise HTTPException(status_code=501, detail=(
             f"captions.timing=stt needs a speech-to-text model"
             f"{' called ' + repr(caps.stt_model) if caps.stt_model else ''} on this "
-            f"install; use \"estimate\" or \"auto\""))
+            f"install; use \"caller\" with scenes[].words, \"estimate\" or \"auto\""))
     if _voice_needed(req) and not _voice_available(req):
         raise HTTPException(status_code=501, detail=(
             "narration needs a TTS model (engine=tts) or a saved voice profile "
@@ -988,6 +1019,47 @@ def _scene_clip_visual(sc):
     return None
 
 
+def _caller_words(scene) -> List[dict]:
+    """A scene's own word timings, in the shape ``align_words`` reads.
+
+    Blank words are dropped (they would consume a caller word and give it no
+    time) and a reversed or zero-length span is squared up rather than
+    refused: these timings come from a speech provider, not from a person, and
+    one odd row should cost that row's precision, not the scene's captions.
+    """
+    out: List[dict] = []
+    for w in (getattr(scene, "words", None) or []):
+        word = str(getattr(w, "word", "") or "").strip()
+        if not word:
+            continue
+        try:
+            start = float(getattr(w, "start", 0.0) or 0.0)
+            end = float(getattr(w, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        out.append({"word": word, "start": start, "end": max(end, start)})
+    return out
+
+
+def _caller_words_for_line(scene_words: List[dict], line_start: float,
+                           line_dur: float) -> List[dict]:
+    """The slice of a scene's caller words belonging to one dialogue line.
+
+    ``scene.words`` are timed from the start of the SCENE's audio, but a
+    dialogue line is captioned on its own clock -- ``_stt_words`` would have
+    transcribed that line's file alone. So the window is taken by start time
+    and rebased, which is exactly what ``align_words`` is handed either way.
+
+    A word is placed by its START only: one that runs past the line's end
+    still belongs to the line it began in, and testing both ends would drop
+    the last word of every line whose speaker ran into the gap after it.
+    """
+    lo = float(line_start)
+    hi = lo + max(0.0, float(line_dur))
+    return [{"word": w["word"], "start": w["start"] - lo, "end": w["end"] - lo}
+            for w in (scene_words or []) if lo <= w["start"] < hi]
+
+
 def _stt_words(loop, audio_path: str, model: str, language: Optional[str]) -> List[dict]:
     """Word timestamps for a narration clip (only the timings are used)."""
     from codai.api.transcriptions import _run_transcription
@@ -1332,12 +1404,37 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
         if caps and caps.enabled:
             stage("captions", 30.0, "timing the words")
             timing = (caps.timing or "auto").lower()
+            # Words the caller already timed, per scene, in the shape
+            # `align_words` reads. Collected first because whether a speech
+            # model is needed AT ALL depends on it: a run whose every captioned
+            # scene brought its own words must not load one, and must not be
+            # warned at about not having one.
+            caller_words: Dict[int, List[dict]] = {}
+            if timing in ("auto", "caller"):
+                for _i, _sc in enumerate(req.scenes):
+                    _cw = _caller_words(_sc)
+                    if _cw:
+                        caller_words[_i] = _cw
+            # Which scenes still need transcribing: the ones that are captioned
+            # at all and did not bring their own timings.
+            _needs_stt = [i for i, _sc in enumerate(req.scenes)
+                          if i not in caller_words
+                          and ((_sc.text or "").strip() or scene_lines.get(i))]
             model = (_pick_stt_model(caps, _request_languages(req))
-                     if timing in ("auto", "stt") else None)
+                     if timing in ("auto", "stt") and _needs_stt else None)
             if timing == "stt" and not model:
                 raise rnd.RenderError("captions.timing=stt but no speech model is configured")
-            if timing == "auto" and not model:
+            if timing == "auto" and not model and _needs_stt:
                 warn("no speech model configured; caption timings are estimated")
+            if timing == "caller":
+                _missing = [i for i in _needs_stt]
+                if _missing:
+                    warn(f"captions.timing=caller but scene(s) {_missing} sent no "
+                         f"words; their timings are estimated")
+            # How each scene's captions were actually timed, reported per scene
+            # in the result: a caller that sent words for some scenes cannot
+            # otherwise tell which ones were honoured.
+            caption_timing: List[str] = ["estimated"] * n_scenes
             words: List[dict] = []
             _no_words_warned: set = set()
             for i, sc in enumerate(req.scenes):
@@ -1348,11 +1445,22 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 # a question and its answer landing in one caption.
                 info = scene_lines.get(i)
                 if info:
+                    _scene_cw = caller_words.get(i)
+                    if _scene_cw:
+                        caption_timing[i] = "caller"
                     for ln in info["lines"]:
                         if not ln["text"]:
                             continue
                         _lstt: List[dict] = []
-                        if model:
+                        if _scene_cw:
+                            # The caller timed the scene; each line wants the
+                            # slice of that inside its own window, rebased onto
+                            # the line's clock -- which is what `align_words`
+                            # expects, and what `_stt_words` would have
+                            # returned for this line's audio.
+                            _lstt = _caller_words_for_line(
+                                _scene_cw, ln["start"], ln["dur"])
+                        elif model:
                             try:
                                 _lstt = _stt_words(
                                     loop, ln["path"], model,
@@ -1361,6 +1469,9 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                             except Exception as exc:
                                 warn(f"scene {i} line {ln['index']}: word "
                                      f"timestamps failed ({exc}); estimated instead")
+                            else:
+                                if _lstt:
+                                    caption_timing[i] = "stt"
                         _lstart = starts[i] + float(ln["start"])
                         _lspan = max(0.2, float(ln["dur"]))
                         _got = (cap.align_words(ln["text"], _lstt, _lstart, _lspan)
@@ -1375,13 +1486,20 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
                 if not text:
                     continue
                 stt: List[dict] = []
-                if model and scene_audio[i]:
+                if caller_words.get(i):
+                    # The caller knows what was said; we would only be guessing
+                    # at it from the audio. No model, no load, no GPU.
+                    stt = caller_words[i]
+                    caption_timing[i] = "caller"
+                elif model and scene_audio[i]:
                     try:
                         stt = _stt_words(loop, scene_audio[i], model,
                                          (sc.voice or req.voice).language)
                     except Exception as exc:
                         warn(f"scene {i}: word timestamps failed ({exc}); estimated instead")
                     else:
+                        if stt:
+                            caption_timing[i] = "stt"
                         # A backend that cannot time words answers 200 with none
                         # of them, so without this the downgrade is invisible and
                         # the captions just drift. Named once, for the model, and
@@ -1836,6 +1954,12 @@ def _run_job(job_id: str, req: ComposeRequest, loop, base_url: str) -> None:
         result["scenes"] = [
             {"index": i, "start": starts[i],
              "end": round(starts[i] + scene_dur[i], 3),
+             # How this scene's captions were timed: "caller" (its own words),
+             # "stt" (transcribed here) or "estimated" (spread over the span).
+             # None when the render had no captions at all, which is not the
+             # same as having them estimated.
+             "caption_timing": (caption_timing[i]
+                                if caps and caps.enabled else None),
              "presenter": ({"engine": presenters[i]["engine"],
                             "layout": presenters[i]["layout"],
                             # Which matting engine cut them out, or None when
