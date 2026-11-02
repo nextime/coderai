@@ -108,6 +108,10 @@ else:
             prompt: Union[str, List[str]] = None,
             image: Any = None,
             negative_prompt: Optional[Union[str, List[str]]] = None,
+            prompt_embeds: Optional[torch.Tensor] = None,
+            prompt_embeds_mask: Optional[torch.Tensor] = None,
+            negative_prompt_embeds: Optional[torch.Tensor] = None,
+            negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
             height: Optional[int] = None,
             width: Optional[int] = None,
             num_inference_steps: int = 8,
@@ -165,20 +169,73 @@ else:
             batch_size = 1 if isinstance(prompt, str) or prompt is None else len(prompt)
 
             # ------------------------------------------------------- text
-            prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-                prompt=prompt or "",
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
-            negative_prompt_embeds = negative_prompt_embeds_mask = None
-            if self.do_classifier_free_guidance:
+            # Embeddings may arrive ALREADY COMPUTED, which is the only way the
+            # text encoder can be off the card before the denoiser runs:
+            # codai.models.text_encoder_offload encodes, moves the encoder to
+            # host RAM and hands the tensors here. It discovers whether a
+            # pipeline can be driven that way from this signature, so without
+            # `prompt_embeds` on it the offload declines --
+            #
+            #   [text-encoder-offload] Krea2EditPipeline cannot be driven from
+            #   embeddings (encode_prompt=True, text_encoder=True,
+            #   prompt_embeds=False) -- skipped
+            #
+            # -- and the encoder's ~3 GiB stays resident through every step.
+            # Measured on zeiss (24 GiB card, nothing else resident) 2026-11-02:
+            # an edit on Krea-2-RealDream reached 23.49 of 23.56 GiB inside
+            # encode_prompt and died asking for 48.00 MiB. The generation path
+            # has done this offload all along and logs "3.0 GiB back for the
+            # denoiser"; the edit path asked for it, was refused, and swallowed
+            # the refusal as a warning.
+            _want_batch = batch_size * num_images_per_prompt
+
+            def _match_batch(t):
+                """Embeddings encoded once, repeated for n images.
+
+                ``encode_prompt`` is called by the offload helper without
+                ``num_images_per_prompt``, so what comes back is a batch of
+                one while the latents are a batch of n. The transformer takes
+                ``encoder_hidden_states`` alongside ``hidden_states`` and the
+                two batches must agree.
+                """
+                if t is None or t.shape[0] == _want_batch:
+                    return t
+                if _want_batch % t.shape[0]:
+                    return t
+                return t.repeat(_want_batch // t.shape[0],
+                                *([1] * (t.ndim - 1)))
+
+            if prompt_embeds is None:
+                prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+                    prompt=prompt or "",
+                    device=device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+            elif prompt_embeds_mask is None:
+                # Krea 2 attends over a padded sequence. Without the mask the
+                # padding reads as prompt, so this is refused rather than
+                # guessed -- the same contract diffusers' own pipelines state.
+                raise ValueError(
+                    "`prompt_embeds_mask` must be supplied with `prompt_embeds`")
+            if not self.do_classifier_free_guidance:
+                negative_prompt_embeds = negative_prompt_embeds_mask = None
+            elif negative_prompt_embeds is None:
                 negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
                     prompt=negative_prompt or "",
                     device=device,
                     num_images_per_prompt=num_images_per_prompt,
                     max_sequence_length=max_sequence_length,
                 )
+            elif negative_prompt_embeds_mask is None:
+                raise ValueError(
+                    "`negative_prompt_embeds_mask` must be supplied with "
+                    "`negative_prompt_embeds`")
+
+            prompt_embeds = _match_batch(prompt_embeds)
+            prompt_embeds_mask = _match_batch(prompt_embeds_mask)
+            negative_prompt_embeds = _match_batch(negative_prompt_embeds)
+            negative_prompt_embeds_mask = _match_batch(negative_prompt_embeds_mask)
 
             # ----------------------------------------------------- canvas
             num_channels_latents = self.transformer.config.in_channels // (
@@ -203,7 +260,6 @@ else:
             if not refs:
                 raise ValueError("an edit needs at least one reference image")
             ref_px = int(grounding_px) if grounding_px else max(height, width)
-            _want_batch = batch_size * num_images_per_prompt
             _ref_parts = []
             ref_grids = []
             for _img in refs:
