@@ -78,6 +78,11 @@ _CACHE: Dict[str, tuple] = {}
 _CARRY: Dict[str, Dict[str, tuple]] = {}
 _LOCK = threading.Lock()
 
+#: The previous CPU reading, so a rate can be computed without blocking the
+#: caller: ``{at, busy, util, source}``. See :func:`host_cpu`.
+_CPU_SAMPLE: Dict[str, object] = {}
+_CPU_LOCK = threading.Lock()
+
 
 def parse_prometheus(text: str) -> dict:
     """The gauges in :data:`_WANTED` out of a Prometheus exposition body.
@@ -233,9 +238,122 @@ def host_memory() -> dict:
     return {}
 
 
+def _cpu_cores() -> Optional[float]:
+    """How many cores this container may actually use.
+
+    A CPU quota is the ceiling that binds, not the machine's core count: a pod
+    pinned to 8 cores on a 128-core host is saturated at 8, and dividing by 128
+    would report it as 6% busy while every request queues behind the scheduler.
+    cgroup v2 quota first, then the affinity mask (which honours a cpuset), then
+    the host's count as a last resort.
+    """
+    try:
+        with open("/sys/fs/cgroup/cpu.max", "r", encoding="utf-8") as fh:
+            quota, _, period = fh.read().strip().partition(" ")
+        if quota != "max":
+            q, p = float(quota), float(period or 100000)
+            if q > 0 and p > 0:
+                return q / p
+    except Exception:
+        pass
+    try:
+        import os as _os
+        return float(len(_os.sched_getaffinity(0)))
+    except Exception:
+        pass
+    try:
+        import os as _os
+        return float(_os.cpu_count() or 0) or None
+    except Exception:
+        return None
+
+
+def host_cpu() -> dict:
+    """``{cpu_util, cpu_cores}`` for THIS container, as a percentage of its quota.
+
+    CPU is the ceiling that does not show up anywhere else. A pod whose GPU
+    reads 40% busy with its KV cache a third full looks like it has headroom,
+    and raising the lane count on it changes nothing — because the work ahead of
+    the GPU (decoding a page to pixels, moving bytes) is CPU-bound and the cores
+    are already at 100%. That condition is indistinguishable from "demand
+    starved" on every other number this module reports, which is why it gets its
+    own figure.
+
+    Utilisation is a RATE, so it needs two samples: the first call after a
+    process starts can only report the core count, and the number appears on the
+    next one. The alternative is blocking the caller for a sampling interval on
+    a request that serves a status page, which is worse than one dash.
+
+    cgroup accounting first, for the same reason as :func:`host_memory`: in a
+    container ``/proc/stat`` counts the HOST's cores, so a busy neighbour would
+    be reported as this pod's load.
+    """
+    cores = _cpu_cores()
+    out: dict = {}
+    if cores:
+        out["cpu_cores"] = round(cores, 2)
+
+    busy: Optional[float] = None
+    source = ""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat", "r", encoding="utf-8") as fh:
+            for line in fh:
+                k, _, v = line.partition(" ")
+                if k == "usage_usec":
+                    busy, source = float(v.strip()) / 1e6, "cgroup"
+                    break
+    except Exception:
+        busy = None
+    if busy is None:
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("cpu "):
+                        f = [float(x) for x in line.split()[1:]]
+                        # total minus idle and iowait: the time cores spent working.
+                        ticks = sum(f) - (f[3] if len(f) > 3 else 0) - (f[4] if len(f) > 4 else 0)
+                        import os as _os
+                        hz = float(_os.sysconf("SC_CLK_TCK") or 100)
+                        busy, source = ticks / hz, "procstat"
+                        break
+        except Exception:
+            busy = None
+    if busy is None or not cores:
+        return out
+
+    now = time.monotonic()
+    with _CPU_LOCK:
+        prev = dict(_CPU_SAMPLE)
+        _CPU_SAMPLE.update(at=now, busy=busy)
+        last_at, last_busy = prev.get("at"), prev.get("busy")
+        if last_at is None or last_busy is None:
+            return out                      # first sample: nothing to compare to
+        dt = now - float(last_at)
+        if dt < 0.5:
+            # Too short an interval to divide by; reuse the last figure rather
+            # than reporting the quantisation noise as a reading. Several open
+            # tabs polling at once land here.
+            _CPU_SAMPLE.update(at=last_at, busy=last_busy)
+            if prev.get("util") is not None:
+                out["cpu_util"] = prev["util"]
+                out["cpu_source"] = prev.get("source") or source
+            return out
+        d_busy = busy - float(last_busy)
+        if d_busy < 0:                      # counter reset (cgroup replaced)
+            return out
+        util = max(0.0, min(100.0, 100.0 * d_busy / (dt * cores)))
+        util = round(util, 1)
+        _CPU_SAMPLE.update(util=util, source=source)
+    out["cpu_util"] = util
+    out["cpu_source"] = source
+    return out
+
+
 def snapshot(base_url: str = "") -> dict:
-    """Host memory plus this engine's serving load, for ``/internal/engine-state``."""
+    """Host memory, host CPU, plus this engine's serving load, for
+    ``/internal/engine-state``."""
     out = dict(host_memory())
+    out.update(host_cpu())
     out.update(engine_load(base_url))
     return out
 
@@ -245,3 +363,5 @@ def forget() -> None:
     with _LOCK:
         _CACHE.clear()
         _CARRY.clear()
+    with _CPU_LOCK:
+        _CPU_SAMPLE.clear()

@@ -91,19 +91,50 @@ function _meter(pct, label, opts){
    whether the pod is serving one request or sixty-four. KV cache occupancy is
    what moves with load, and a preemption is the proof the cache ran out — vLLM
    evicts a running request and recomputes it later, so throughput collapses
-   while every other counter still looks busy. */
+   while every other counter still looks busy.
+
+   Three bars, because a pod has three different ways of being busy and the
+   whole diagnostic question is WHICH one it is:
+
+   * KV is GPU-side headroom, and it decides how many more requests fit. Banded:
+     at the ceiling, vLLM starts preempting.
+   * GPU is how much of the card's time is actually spent computing. NEUTRAL on
+     purpose: a saturated GPU is the goal of a throughput run, not an alarm, and
+     painting it red would mean every pod earning its rent looks broken.
+   * CPU is the ceiling that is invisible everywhere else. A pod reading 40% GPU
+     with its KV cache a third full looks like it has room, and adding lanes to
+     it changes nothing — because the work AHEAD of the GPU (decoding pages to
+     pixels, moving bytes) is CPU-bound and the cores are already pinned. That
+     is indistinguishable from "nobody is sending it work" on every other number
+     here. Banded, because unlike the GPU it is a wall and not a target.
+
+   Each bar is omitted when its telemetry is missing: a booting or unreachable
+   pod has none, an older pod image reports no CPU, and an empty bar reads as
+   "idle" when the truth is "unknown". */
 function _loadCell(p){
+  const bars = [];
+  if (p.kv_cache_pct != null) {
+    bars.push(_meter(p.kv_cache_pct, `${Math.round(p.kv_cache_pct)}%`, {tag: 'KV'}));
+  }
+  if (p.gpu_util != null) {
+    bars.push(_meter(p.gpu_util, `${Math.round(p.gpu_util)}%`,
+                     {tag: 'GPU', band: false}));
+  }
+  if (p.cpu_util != null) {
+    bars.push(_meter(p.cpu_util,
+                     `${Math.round(p.cpu_util)}%` + (p.cpu_cores ? ` of ${p.cpu_cores} cores` : ''),
+                     {tag: 'CPU'}));
+  }
   const bits = [];
   if (p.running != null) bits.push(`${p.running} run`);
   if (p.waiting) bits.push(`<span style="color:#f59e0b">${p.waiting} wait</span>`);
-  if (p.gpu_util != null) bits.push(`${Math.round(p.gpu_util)}% gpu`);
   if (p.gpu_temp_c != null) bits.push(`${Math.round(p.gpu_temp_c)}°C`);
   const pre = p.preemptions ? `<div style="font-size:10px;color:#ef4444">${p.preemptions} preempted — past the KV ceiling</div>` : '';
-  if (p.kv_cache_pct == null) {
+  const txt = bits.length ? `<div style="font-size:10px;color:var(--text-3)">${bits.join(' · ')}</div>` : '';
+  if (!bars.length) {
     return (bits.length ? `<span style="font-size:11px">${bits.join(' · ')}</span>` : '<span class="dim">—</span>') + pre;
   }
-  return _meter(p.kv_cache_pct, `${Math.round(p.kv_cache_pct)}% KV`) +
-    (bits.length ? `<div style="font-size:10px;color:var(--text-3)">${bits.join(' · ')}</div>` : '') + pre;
+  return bars.join('') + txt + pre;
 }
 /* Two bars, because they are two different ceilings and only one of them is a
    warning sign. HOST RAM is the ceiling that actually bites -- an OCR pod was
@@ -152,6 +183,26 @@ function _servedCell(p){
   if (p.generation_tokens != null) tok.push(`${_fmtCount(p.generation_tokens)} out`);
   return req + (tok.length
     ? `<div style="font-size:10px;color:var(--text-3)">${tok.join(' · ')} tok</div>` : '');
+}
+
+/* A pod is not just up or down. PARKED is the state that must never be quiet:
+   it means the pod is rented and billing while belonging to no pool, so
+   nothing routes work to it and nothing reaps it either. It exists so an
+   in-place restart can survive its own pool (which would otherwise terminate
+   it ~135s into a boot), and it is only ever meant to last minutes -- a parked
+   row still on the page an hour later is money going nowhere. */
+function _healthCell(p){
+  if (p.state === 'parked') {
+    return `<span style="color:#f59e0b">parked</span>`
+      + (p.note ? `<div style="font-size:10px;color:var(--text-3)">${p.note}</div>` : '');
+  }
+  if (p.state === 'provisioning') return '<span style="color:#f59e0b">provisioning…</span>';
+  if (p.state === 'quarantined') {
+    return '<span style="color:#f59e0b">set aside</span>'
+      + (p.quarantined_for_s ? `<div style="font-size:10px;color:var(--text-3)">re-probed in ${p.quarantined_for_s}s</div>` : '');
+  }
+  return p.healthy ? '<span style="color:#22c55e">healthy</span>'
+                   : '<span style="color:#ef4444">down</span>';
 }
 
 async function rpRefresh(){
@@ -205,7 +256,7 @@ async function rpRefresh(){
       <td>${_usd(p.hourly_usd)}</td>
       <td>${_fmtDur(p.uptime_s)}</td>
       <td>${_usd(p.live_cost_usd)}</td>
-      <td>${p.state==='provisioning'?'<span style="color:#f59e0b">provisioning…</span>':(p.healthy?'<span style="color:#22c55e">healthy</span>':'<span style="color:#ef4444">down</span>')}</td>
+      <td>${_healthCell(p)}</td>
       <td><a href="#" onclick="rpLogs('${p.pod_id}');return false">view</a>${p.console_url?` · <a href="${p.console_url}" target="_blank" rel="noopener">console</a>`:''}</td>
     </tr>`).join('');
   }

@@ -147,12 +147,15 @@ def _fetch(pod_id: str, url: str, key: str) -> dict:
             return {}
         state = r.json() or {}
         out = summarise(cards_from_engine_state(state))
-        # Host memory, serving load, and what the pod has served since it
-        # booted. See codai.api.serving_load for why reserved VRAM is not one
-        # of the limits, and why the served counters survive an engine restart.
+        # Host memory, host CPU, serving load, and what the pod has served
+        # since it booted. See codai.api.serving_load for why reserved VRAM is
+        # not one of the limits, why CPU is reported separately (a CPU-bound pod
+        # is indistinguishable from an idle one on every GPU-side number), and
+        # why the served counters survive an engine restart.
         load = state.get("load")
         if isinstance(load, dict):
             for k in ("ram_used_gb", "ram_total_gb", "ram_free_gb",
+                      "cpu_util", "cpu_cores",
                       "kv_cache_pct", "running", "waiting", "preemptions",
                       "requests_done", "prompt_tokens", "generation_tokens"):
                 if isinstance(load.get(k), (int, float)):

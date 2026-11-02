@@ -148,6 +148,113 @@ def pod_console_url(pod_id: str) -> str:
     return f"https://www.runpod.io/console/pods/{pod_id}"
 
 
+#: How long after the CONTAINER has started (RunPod's own ``uptime``) a
+#: declared port may still be unpublished before the pod is called unreachable.
+#: Generous: the evidence for the opposite verdict was a pod that reached 578s
+#: of container uptime with no mapping, and a host that is going to publish one
+#: does it at container start.
+PORT_PUBLISH_GRACE_S = float(os.environ.get("CODERAI_RUNPOD_PORT_GRACE", "120"))
+
+
+def _is_routable(ip: str) -> bool:
+    """True for an address the public internet can actually reach.
+
+    The case this exists for: RunPod publishes its own agent port on
+    100.64.0.0/10 -- carrier-grade NAT -- on every pod, so "a port mapping
+    exists" is not the same as "a port we can reach exists". A direct-TCP pod
+    whose mapping is in CGNAT or RFC1918 space can never be connected to from
+    here, and waiting for it is waiting for something that cannot happen.
+    """
+    import ipaddress
+    try:
+        return bool(ipaddress.ip_address(str(ip or "").strip()).is_global)
+    except ValueError:
+        return False
+
+
+def classify_boot(info: dict, port: int, direct_tcp: bool = True,
+                  grace_s: float = None) -> tuple:
+    """What a booting pod is really doing: ``(verdict, why)``.
+
+    Measured 2026-11-02: an RTX PRO 6000 pod sat "booting" for 29 minutes at
+    $1.69/hr and was then terminated for not exposing its port. It had been
+    RUNNING the whole time; RunPod had published its own ``19123/http`` mapping
+    on 100.65.33.207 and *never published the declared 8000/tcp at all*. A
+    second one behaved identically. Meanwhile three pods on other hosts each
+    had 8000/tcp on a globally routable address within seconds of the container
+    starting.
+
+    So there was nothing to connect to, and nothing that any timeout could
+    change -- but the boot loop reported "image pull in progress" every 60
+    seconds, because that string was printed for ANY status that was not
+    EXITED. It cost the full ``boot_timeout_s`` per attempt, three attempts per
+    provision, in a loop, while pages waited for pods. The information needed
+    to tell the states apart was in the answer all along.
+
+    The verdicts, which have opposite correct responses:
+
+    * ``pulling`` -- no mapping yet and the container has not started (or is
+      inside the publish grace). Wait: a multi-GB image pull on a cold machine
+      is minutes of exactly this.
+    * ``starting`` -- the declared port is published on a routable address and
+      the connection is refused. Wait: that is a server still coming up.
+    * ``unreachable`` -- the container is running, past the grace, and the
+      declared port is either absent from the mapping or published somewhere
+      unroutable. GIVE UP NOW. The machine is the problem, and the next
+      candidate is the only thing that can help.
+    * ``ready`` -- the caller's own check already passed.
+    """
+    grace = PORT_PUBLISH_GRACE_S if grace_s is None else float(grace_s)
+    if info.get("ready"):
+        return "ready", ""
+    try:
+        uptime = float(info.get("uptime_s") or 0.0)
+    except (TypeError, ValueError):
+        uptime = 0.0
+    raw = info.get("published_ports")
+    if raw is None:
+        raw = info.get("ports") or []
+    ports = [p for p in raw if isinstance(p, dict)]
+    started = uptime > grace
+
+    def _priv(p):
+        try:
+            return int(p.get("privatePort") or p.get("private") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if not ports:
+        if started:
+            return "unreachable", (
+                f"the container has been running {uptime:.0f}s and RunPod has "
+                f"published no port mapping at all")
+        return "pulling", "no port mapping yet — the image is still being pulled"
+
+    mine = [p for p in ports if _priv(p) == int(port)]
+    if not mine:
+        others = ", ".join(f"{_priv(p)}/{p.get('type') or '?'}" for p in ports)
+        if started:
+            return "unreachable", (
+                f"RunPod published {others} but NOT the declared port {port}, "
+                f"and the container has been running {uptime:.0f}s — this host "
+                f"does not expose it")
+        return "pulling", (f"port {port} is not published yet (RunPod has "
+                           f"{others} so far)")
+
+    if direct_tcp and not any(_is_routable(p.get("ip")) for p in mine):
+        ips = ", ".join(str(p.get("ip") or "(no ip)") for p in mine) or "(no ip)"
+        if started:
+            return "unreachable", (
+                f"port {port} is published on {ips}, which is not globally "
+                f"routable (carrier-grade NAT or private space) — a direct-TCP "
+                f"pod there cannot be reached from here")
+        return "pulling", f"port {port} is on {ips}, not a routable address yet"
+
+    return "starting", (f"port {port} is published and routable; the server "
+                        f"inside has not accepted a connection yet "
+                        f"({uptime:.0f}s up)")
+
+
 def _machine_fields(p: dict) -> dict:
     """``{gpu, gpu_id, gpu_count, vram_gb}`` from a pod's machine, defensively.
 
@@ -501,6 +608,13 @@ class RunpodClient:
                 except OSError:
                     ok = False
         row["ready"] = ok and row.get("status") == "RUNNING"
+        # What RunPod has published, kept whatever `ready` says. `ports` is
+        # cleared below so no caller can build a URL to a port that does not
+        # accept yet -- but clearing it also threw away the only evidence that
+        # distinguishes "the server has not bound yet" from "this host will
+        # never publish the port at all", which is a 30-minute difference at
+        # the pod's hourly rate. See `classify_boot`.
+        row["published_ports"] = list(row.get("ports") or [])
         if not row["ready"]:
             row["ports"] = []
         return row
@@ -924,6 +1038,71 @@ class RunpodClient:
             "ready": bool(ports),
         }
 
+    #: The state transitions REST v2 accepts on a pod. `restart` is the only
+    #: one that keeps the machine: v2 documents it as restarting a RUNNING
+    #: pod's container IN PLACE, while `stop` is documented as "releasing
+    #: GPU/CPU compute while keeping its disk" -- i.e. the card goes back to
+    #: RunPod's pool and a later `start` takes whatever is free then. When the
+    #: card you are standing on is sold out, that difference is the whole game.
+    POD_ACTIONS = ("start", "stop", "restart", "terminate")
+
+    def edit_pod(self, pod_id: str, *, image: str = "",
+                 env: Optional[dict] = None, timeout: float = 60.0) -> dict:
+        """Change a RUNNING pod's image and/or environment in place.
+
+        What this buys: a rented card you already hold, running the wrong
+        image. Renting the right one means giving this one back first, and a
+        card that is sold out does not come back -- measured 2026-11-02, an OCR
+        pool failed to deploy a candidate 301 times in one hour while an idle
+        A40 sat in another pool on this account. Re-imaging the pod you have
+        skips the queue you cannot win.
+
+        ``image`` and ``env`` are both documented as mutable on
+        ``PATCH /v2/pods/{id}``, and a PATCH leaves omitted fields untouched --
+        but ``env``, when given, REPLACES the pod's environment rather than
+        merging into it. So a caller changing env must pass the whole set the
+        pod should boot with, which is exactly what ``pod_plan`` produces.
+
+        The change lands on the container's next start, so a caller that wants
+        it running now follows this with ``pod_action(pod_id, "restart")``.
+
+        REST v2 only. GraphQL has no documented equivalent, and v1 retires
+        2026-11-15 -- a write path that is about to be switched off is not
+        somewhere to put the one call that moves a production pod.
+        """
+        pid = str(pod_id or "").strip()
+        if not pid:
+            raise RunpodError("edit_pod: no pod id given")
+        body: dict = {}
+        if image:
+            body["image"] = str(image)
+        if env is not None:
+            body["env"] = {str(k): str(v) for k, v in (env or {}).items()}
+        if not body:
+            raise RunpodError("edit_pod: nothing to change (pass image and/or env)")
+        d = self._rest("PATCH", f"/pods/{pid}", body=body, timeout=timeout)
+        return _v2_pod_row(d if isinstance(d, dict) else {}, pid, with_ports=True)
+
+    def pod_action(self, pod_id: str, action: str, timeout: float = 60.0) -> dict:
+        """Trigger one state transition on a pod. Returns the updated pod row.
+
+        Read :attr:`POD_ACTIONS` before choosing one: `restart` keeps the
+        machine and `stop` hands the card back. ``terminate`` is accepted here
+        for completeness but :meth:`terminate_pod` is the one to call for it --
+        it retries, because a pod that cannot be terminated bills.
+        """
+        pid = str(pod_id or "").strip()
+        act = str(action or "").strip().lower()
+        if not pid:
+            raise RunpodError("pod_action: no pod id given")
+        if act not in self.POD_ACTIONS:
+            raise RunpodError(f"pod_action: {action!r} is not one of "
+                              f"{', '.join(self.POD_ACTIONS)}")
+        d = self._rest("POST", f"/pods/{pid}/action", body={"action": act},
+                       timeout=timeout)
+        # `terminate` answers 204 with no body; the others return the pod.
+        return _v2_pod_row(d if isinstance(d, dict) else {}, pid, with_ports=True)
+
     def stop_pod(self, pod_id: str) -> None:
         q = "mutation($input: PodStopInput!) { podStop(input: $input) { id } }"
         try:
@@ -1095,6 +1274,7 @@ class RunpodClient:
         # the caller set, and only then say the API was the thing that broke.
         api_down_since = 0.0
         last_transient = None
+        said_port_open = False
         while time.time() < deadline:
             try:
                 # A direct-TCP pod is polled over REST + a TCP connect: polling
@@ -1140,12 +1320,35 @@ class RunpodClient:
                 direct = direct_tcp_url(info.get("ports"), port, tls=tls)
                 if direct:
                     return direct
+            # WHICH of the three boot states this is, from RunPod's own answer,
+            # because they do not have the same correct response. Waiting is
+            # right for a pull and for a server still binding; it is pure waste
+            # for a host that will not publish the port, and that one used to be
+            # indistinguishable -- a full boot_timeout_s of it, per attempt.
+            verdict, why = classify_boot(info, port, direct_tcp)
+            if verdict == "unreachable":
+                raise RunpodError(
+                    f"Pod {pod_id} cannot be reached and more waiting will not "
+                    f"change that: {why}. Giving up after "
+                    f"{time.time() - started:.0f}s instead of waiting out "
+                    f"{ready_timeout:.0f}s. This is the MACHINE, not the image "
+                    f"or the model: retry on another candidate, and if one card "
+                    f"keeps doing it, take it out of `gpu_types`.")
+            if verdict == "starting" and not said_port_open:
+                said_port_open = True
+                print(f"[runpod] pod {pod_id}: port {port} is published and "
+                      f"routable after {time.time() - started:.0f}s — waiting "
+                      f"for the server inside to accept connections", flush=True)
             # A multi-GB image pull is minutes of silence otherwise, which reads
-            # exactly like a hung pod. Say what is actually being waited on.
+            # exactly like a hung pod. Say what is actually being waited on --
+            # and say the truth: this line claimed "image pull in progress" for
+            # any status that was not EXITED, including a pod whose own uptime
+            # proved the pull had finished eight minutes earlier.
             if time.time() >= next_report:
                 next_report = time.time() + 60.0
-                why = ("image pull in progress" if info.get("status") != "EXITED"
-                       else f"container has EXITED ({info.get('last_change') or 'no reason given'})")
+                if info.get("status") == "EXITED":
+                    why = (f"container has EXITED "
+                           f"({info.get('last_change') or 'no reason given'})")
                 print(f"[runpod] pod {pod_id}: still no port after "
                       f"{time.time() - started:.0f}s "
                       f"(status={info.get('status')} uptime={info.get('uptime_s')}s) "
@@ -1158,8 +1361,12 @@ class RunpodClient:
                 f"Pod {pod_id}: RunPod's API did not answer once in "
                 f"{ready_timeout:.0f}s ({last_transient}) — the pod's state is "
                 f"unknown, not known-bad.")
+        _verdict, _why = classify_boot(last, port, direct_tcp)
         raise RunpodError(
             f"Pod {pod_id} did not expose port {port} within {ready_timeout}s "
-            f"(last status={last.get('status')} uptime={last.get('uptime_s')}s). "
-            f"A cold machine pulling a multi-GB image is the usual cause — raise "
-            f"`boot_timeout_s` on the model if this repeats.")
+            f"(last status={last.get('status')} uptime={last.get('uptime_s')}s; "
+            f"{_why or 'no further detail'}). A cold machine pulling a "
+            f"multi-GB image is the usual cause — raise `boot_timeout_s` on the "
+            f"model if this repeats. Note that raising it does NOT help a host "
+            f"that never publishes the port; that case is reported as "
+            f"unreachable long before this.")

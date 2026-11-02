@@ -6760,6 +6760,431 @@ def release_pod(pod_id: str, reason: str = "released by client") -> dict:
     return out
 
 
+#: The pool key a PARKED pod is filed under. It is deliberately not a model
+#: key and deliberately not empty: no pool matches it, so no pool's adoption
+#: will take the pod while it is being worked on, and it is still a registry
+#: entry owned by THIS process, so `live_registered_pod_ids` counts it and the
+#: reaper leaves it alone through a boot that takes 6-14 minutes.
+PARKED_POOL = "(parked)"
+
+
+def park_pod(pod_id: str, reason: str = "parked", force: bool = False) -> dict:
+    """Take a pod out of its pool WITHOUT terminating it.
+
+    This is the piece that makes an in-place restart survivable. A pod its pool
+    is still holding does not simply go quiet while its container restarts: the
+    first request that fails calls ``discard``, which quarantines it for
+    QUARANTINE_S, and QUARANTINE_STRIKES failed probes later the pool
+    TERMINATES it. 45s x 3 is about 135 seconds -- roughly a seventh of the way
+    into one of these images' boots. So "just press restart" ends with the pool
+    killing the card the restart existed to keep.
+
+    Parking removes the handle (nothing routes to it), closes the bill for the
+    hours it has served SO FAR against the pool that rented it (the money
+    belongs to the work it did, not to whoever gets the pod next), and rewrites
+    the registry entry so that:
+
+    * no pool adopts it -- its pool key matches nothing (:data:`PARKED_POOL`);
+    * no reaper kills it -- the entry still carries this process's pid, and
+      `touch_registered_pods` keeps its heartbeat fresh;
+    * whoever picks it up knows what it was -- `parked` records the pool it came
+      from, the image it was running, and why.
+
+    A parked pod is NOT free: it is rented and billing, out of every pool, and
+    the only things that will ever move it are :func:`unpark_pod`,
+    :func:`release_pod` and an operator. Treat a park that is not followed by
+    one of those as a leak -- which is why parked pods are reported by
+    :func:`pods_status` as their own state rather than vanishing from the page.
+
+    Refuses a pod with work in flight unless ``force``: restarting a container
+    with requests on it throws that work away, and the caller is better placed
+    to drain it (see ``shed_now``) than this function is to guess.
+    """
+    pid = str(pod_id or "").strip()
+    if not pid:
+        raise LookupError("no pod id given")
+    out = {"pod_id": pid, "was_pool": None, "gpu": "", "hourly_usd": 0.0,
+           "inflight": 0, "parked": False, "billed_usd": 0.0}
+    cost, gpu, spot, port, image = 0.0, "", False, 0, ""
+    with _pools_lock:
+        pools = list(_pools.items())
+    for key, pool in pools:
+        with pool._cv:
+            victim = next((p for p in pool.pods if p.pod_id == pid), None)
+            if victim is None:
+                continue
+            held = _load(victim)
+            if held and not force:
+                raise RuntimeError(
+                    f"pod {pid} is serving {held} request(s) for {key!r}; "
+                    f"restarting it would discard them. Drain it first, or "
+                    f"pass force=True to accept losing them.")
+            out["was_pool"], out["inflight"] = key, int(held)
+            out["gpu"], out["hourly_usd"] = str(victim.gpu or ""), float(victim.hourly_usd or 0.0)
+            # Attributed BEFORE the handle goes, exactly as release_pod does it:
+            # the hours are the old pool's whatever happens next, and a cost
+            # recorded nowhere is the one that shows up on the invoice.
+            cost = ((time.time() - victim.started_at) / 3600.0
+                    * float(victim.hourly_usd or 0.0))
+            gpu, spot = str(victim.gpu or ""), bool(victim.is_spot)
+            try:
+                port = int(getattr(pool.mcfg, "port", 0) or 0)
+            except (TypeError, ValueError):
+                port = 0
+            victim.healthy = False
+            pool.pods.remove(victim)
+            pool._bump_cards()
+            pool._cv.notify_all()
+        break
+    was = registry_entry(pid)
+    image = str(was.get("image") or "")
+    if not was and out["was_pool"] is None:
+        raise LookupError(
+            f"pod {pid} is in no pool here and has no registry entry — this "
+            f"process has nothing to park. Check the RunPod console.")
+
+    def _write(d):
+        info = d.get(pid)
+        if not isinstance(info, dict):
+            # A pod a pool held but the registry had lost: park it from what the
+            # handle told us rather than refusing, or the pod is left in no pool
+            # AND no registry, which is the state the reaper exists to clean up.
+            info = {"created": time.time(), "url": "", "key": ""}
+        info.update({"pool": PARKED_POOL, "pid": os.getpid(), "proc": _PROC_ID,
+                     "at": time.time(),
+                     "parked": {"from": str(out["was_pool"] or
+                                            info.get("pool") or ""),
+                                "image": str(info.get("image") or image or ""),
+                                "reason": str(reason or ""),
+                                "at": time.time()}})
+        if gpu and not info.get("gpu"):
+            info["gpu"] = gpu
+        if out["hourly_usd"] and not info.get("hourly_usd"):
+            info["hourly_usd"] = float(out["hourly_usd"])
+        # Where the server inside the pod listens. `_recover_pod_url` needs it
+        # and register_pod never wrote it, so it has always guessed 8000 -- fine
+        # for a coderai pod, wrong for anything with `port` configured, and an
+        # in-place restart is precisely when the address has to be looked up
+        # again (a restarted container gets a NEW public port).
+        if port:
+            info["port"] = int(port)
+        d[pid] = info
+        return True
+
+    _registry_update(_write)
+    out["parked"] = True
+    if out["was_pool"]:
+        try:
+            from codai.api import runpod_ledger
+            runpod_ledger.record_spend(out["was_pool"], cost,
+                                       {"pod_id": pid, "gpu": gpu,
+                                        "is_spot": spot,
+                                        "reason": f"parked: {reason}"})
+            out["billed_usd"] = round(cost, 4)
+        except Exception:
+            pass
+    print(f"[runpod] pod {pid} PARKED ({reason}) — out of "
+          f"{out['was_pool'] or 'no pool'}, still rented at "
+          f"${out['hourly_usd']:.2f}/hr and still ours. It is in no pool: "
+          f"nothing routes to it and nothing reaps it until it is unparked or "
+          f"released.", flush=True)
+    if out["was_pool"]:
+        print(f"[runpod] note: {out['was_pool']!r} is now one pod short of its "
+              f"floor and its scaler may rent a replacement within ~15s.",
+              flush=True)
+    return out
+
+
+def parked_pods() -> list:
+    """Every parked pod this deployment is holding: the leak-watch list."""
+    data = _registry_update(lambda d: False)
+    out = []
+    for pid, info in (data or {}).items():
+        if isinstance(info, dict) and info.get("parked"):
+            p = dict(info.get("parked") or {})
+            out.append({"pod_id": str(pid), "gpu": str(info.get("gpu") or ""),
+                        "hourly_usd": float(info.get("hourly_usd") or 0.0),
+                        "image": str(info.get("image") or ""),
+                        "from_pool": str(p.get("from") or ""),
+                        "reason": str(p.get("reason") or ""),
+                        "parked_at": float(p.get("at") or 0.0),
+                        "created": float(info.get("created") or 0.0)})
+    return out
+
+
+def unpark_pod(pod_id: str, to_pool_key: str = "", image: str = "",
+               wait_s: float = 900.0, api_key: str = "") -> dict:
+    """Hand a parked pod to a pool: wait for it to answer, then add it.
+
+    The destination may be the pool it came from (an in-place restart that
+    changed nothing -- the dry run) or a different one (a re-image). Either way
+    the address is resolved from RunPod rather than remembered: a restarted
+    container is published on a NEW public port, so the url in the registry is
+    stale the moment the container goes down.
+
+    Blocking, up to ``wait_s``: these images take 6-14 minutes to boot. On
+    timeout the pod stays parked -- rented, billing, in no pool -- and says so,
+    because the alternative is adding a pod that cannot serve to a pool that
+    will then route work to it.
+    """
+    pid = str(pod_id or "").strip()
+    if not pid:
+        raise LookupError("no pod id given")
+    info = registry_entry(pid)
+    if not info:
+        raise LookupError(f"pod {pid} has no registry entry; nothing to unpark")
+    parked = dict(info.get("parked") or {})
+    key = str(to_pool_key or parked.get("from") or "")
+    if not key or key == PARKED_POOL:
+        raise LookupError(
+            f"pod {pid}: no destination pool. It was parked from "
+            f"{parked.get('from') or '(nothing recorded)'}; name the pool to "
+            f"give it to.")
+    with _pools_lock:
+        pool = _pools.get(key)
+    if pool is None:
+        raise LookupError(
+            f"no pool {key!r} is running here, so nothing can take pod {pid}. "
+            f"The pool is created when its model is loaded; load it first, or "
+            f"name a pool that exists.")
+    bearer = str(api_key or info.get("key") or getattr(pool, "api_key", "") or "")
+    deadline = time.time() + max(1.0, float(wait_s or 0))
+    url, said = "", False
+    while time.time() < deadline:
+        url = _recover_pod_url(pid, info) or ""
+        if url and _pod_health_ok(url, path=pool.health_path, api_key=bearer,
+                                  timeout=15.0):
+            break
+        if not said:
+            print(f"[runpod] waiting for parked pod {pid} to answer "
+                  f"{pool.health_path} before giving it to {key!r} "
+                  f"(up to {wait_s:.0f}s)", flush=True)
+            said = True
+        url = ""
+        time.sleep(10.0)
+    if not url:
+        print(f"[runpod] pod {pid} did not answer within {wait_s:.0f}s — it is "
+              f"STILL PARKED and still billing. Unpark it again when it is up, "
+              f"or release it.", flush=True)
+        return {"pod_id": pid, "adopted": False, "pool": key,
+                "error": f"pod did not become ready within {wait_s:.0f}s",
+                "still_parked": True}
+    h = PodHandle(pod_id=pid, url=url,
+                  hourly_usd=float(info.get("hourly_usd") or 0.0),
+                  api_key=bearer,
+                  # From CREATION, not from now: RunPod bills from creation and
+                  # a restarted pod is not a new pod. Resetting this would make
+                  # the uptime and the live cost on the page understate what the
+                  # account is actually paying.
+                  started_at=float(info.get("created") or time.time()),
+                  gpu=str(info.get("gpu") or ""), healthy=True,
+                  last_used=time.time(),
+                  gpu_count=int(info.get("gpu_count") or 1),
+                  vram_gb=float(info.get("vram_gb") or 0.0))
+    try:
+        from codai.api.runpod_client import pod_console_url
+        h.console_url = pod_console_url(pid)
+    except Exception:
+        pass
+    if not pool._add_pod(h):
+        return {"pod_id": pid, "adopted": False, "pool": key,
+                "error": f"pool {key!r} already holds this pod",
+                "still_parked": False}
+    pool._remember_pod_key(pid, bearer)
+    register_pod(pid, key, url, bearer,
+                 hourly_usd=float(info.get("hourly_usd") or 0.0),
+                 image=str(image or info.get("image") or ""),
+                 gpu=str(info.get("gpu") or ""),
+                 vram_gb=float(info.get("vram_gb") or 0.0),
+                 gpu_count=int(info.get("gpu_count") or 1))
+    # The park marker has to go, or every later reader still believes this pod
+    # is parked -- including the leak list, whose whole job is to be empty.
+    _registry_update(lambda d: (d.get(pid, {}).pop("parked", None) is not None)
+                     if isinstance(d.get(pid), dict) else False)
+    print(f"[runpod] parked pod {pid} is now serving {key!r} at {url}",
+          flush=True)
+    return {"pod_id": pid, "adopted": True, "pool": key, "url": url,
+            "gpu": str(info.get("gpu") or "")}
+
+
+def pool_launch_env(pool_key: str) -> dict:
+    """The environment a pool would launch one of its own pods with.
+
+    A pod keeps the environment it BOOTED with — the served model, the bearer
+    token its auth middleware checks, and the admission gate
+    (`CODERAI_SERVER_MAX_PARALLEL_REQUESTS`) that decides how hard it may be
+    driven. None of it can be changed from outside a running pod, which is why
+    raising a pool's `pod_max_parallel_requests` only ever reaches pods rented
+    afterwards.
+
+    So a pod moved to another pool needs this pool's answer, not the one it
+    came up with, or the new image boots configured as the old pool: the wrong
+    model served, and a bearer the new pool does not hold, which presents as a
+    pod that 401s every request for the rest of its paid life.
+    """
+    key = str(pool_key or "")
+    with _pools_lock:
+        pool = _pools.get(key)
+    if pool is None:
+        raise LookupError(
+            f"no pool {key!r} is running here, so there is no launch plan to "
+            f"copy. A pool exists once its model has been loaded.")
+    plan = pod_plan(pool.mcfg, pool.served, str(pool.model_key),
+                    _model_path_for(pool.model_key), api_key=pool.api_key,
+                    entry=pool.entry, seed_entries=pool.seed_entries)
+    return dict(plan.get("env") or {})
+
+
+def _unpark_quietly(pod_id: str, pool_key: str) -> None:
+    """Unpark in the background, reporting failure rather than raising.
+
+    Used by the startup reclaim, where there is no caller to hand an exception
+    to and the alternative to a log line is silence about a billing pod.
+    """
+    try:
+        unpark_pod(pod_id, pool_key)
+    except Exception as exc:                   # noqa: BLE001 - log, don't crash boot
+        print(f"[runpod] could not return parked pod {pod_id} to "
+              f"{pool_key!r} ({exc}) — it is still parked and still billing",
+              flush=True)
+
+
+def repurpose_pod(pod_id: str, to_pool_key: str = "", image: str = "",
+                  env: Optional[dict] = None, restart: bool = True,
+                  wait_s: float = 900.0, force: bool = False,
+                  background: bool = True) -> dict:
+    """Move a rented pod to another pool, and/or another image, IN PLACE.
+
+    The case this exists for: the card you want is sold out and you are already
+    holding one, in a pool that is not using it. Renting the right pod means
+    giving this one back first, and a `stop` is documented as releasing the
+    compute -- so the card goes into a queue you have already lost 301 times in
+    an hour. Re-imaging the pod you have does not join that queue.
+
+    The sequence, and every step is there because of a specific way this goes
+    wrong:
+
+    1. **park** it, so its own pool cannot terminate it 135 seconds into the
+       boot (see :func:`park_pod`);
+    2. **snapshot** the pod id and the card from RunPod, so step 5 has
+       something to compare against;
+    3. **edit** the image and/or the environment, when either was given. A pod
+       keeps the environment it BOOTED with, so a destination pool's served
+       model, bearer and admission gate have to be written here or the new
+       image comes up configured as the old pool;
+    4. **restart** the container in place -- not stop/start, which hands the
+       card back;
+    5. **verify** that the pod id and the GPU are the ones from step 2. This is
+       the whole risk of the operation, and RunPod does not promise it in
+       writing: if the card changed or the pod is gone, we stop here and say
+       so, leaving nothing half-done to discover later;
+    6. **unpark** it into the destination pool once it answers.
+
+    With no ``image`` and no ``env``, and the destination left as the pool it
+    came from, this is a DRY RUN: it proves on this account that a restart
+    keeps the machine, and puts the pod back where it was. Do that once before
+    trusting step 5 with a card you cannot re-rent.
+
+    ``background`` returns after step 5 and finishes step 6 in a thread, since
+    the boot is minutes long; the log carries the rest.
+    """
+    pid = str(pod_id or "").strip()
+    if not pid:
+        raise LookupError("no pod id given")
+    from codai.models.manager import get_active_runpod_config
+    acct = get_active_runpod_config()
+    if acct is None or not getattr(acct, "enabled", False):
+        raise RuntimeError("RunPod is not enabled")
+    from codai.api.runpod_client import RunpodClient
+    client = RunpodClient(acct)
+
+    before = client.get_pod(pid)
+    was_gpu = str(before.get("gpu") or "")
+    was_gpu_id = str(before.get("gpu_id") or "")
+    was_status = str(before.get("status") or "")
+    if was_status.upper() in ("TERMINATED", "EXITED", "FAILED"):
+        raise RuntimeError(f"pod {pid} is {was_status}; there is nothing "
+                           f"running to repurpose")
+
+    parked = park_pod(pid, reason=f"repurpose -> {to_pool_key or 'same pool'}",
+                      force=force)
+    out = {"pod_id": pid, "from_pool": parked.get("was_pool"),
+           "to_pool": to_pool_key or parked.get("was_pool"),
+           "gpu_before": was_gpu, "image": image or "(unchanged)",
+           "dry_run": not (image or env), "edited": False, "restarted": False,
+           "kept_the_machine": None, "billed_usd": parked.get("billed_usd", 0.0)}
+    try:
+        if image or env is not None:
+            client.edit_pod(pid, image=image, env=env)
+            out["edited"] = True
+            print(f"[runpod] pod {pid}: image/env updated"
+                  + (f" -> {image}" if image else ""), flush=True)
+        if restart:
+            client.pod_action(pid, "restart")
+            out["restarted"] = True
+            print(f"[runpod] pod {pid}: restart requested (in place)", flush=True)
+    except Exception as exc:
+        out["error"] = str(exc)
+        print(f"[runpod] pod {pid}: repurpose failed at the RunPod call "
+              f"({exc}) — it is PARKED and still billing. Unpark it back to "
+              f"{parked.get('was_pool') or 'its pool'} or release it.",
+              flush=True)
+        return out
+
+    # Step 5. Asked after a short settle: a restart that has not been actioned
+    # yet would otherwise be read as a pod that never moved.
+    time.sleep(5.0)
+    after = {}
+    try:
+        after = client.get_pod(pid)
+    except Exception as exc:
+        out["error"] = f"could not re-read the pod after the restart: {exc}"
+        out["kept_the_machine"] = None
+        print(f"[runpod] pod {pid}: {out['error']} — leaving it parked",
+              flush=True)
+        return out
+    now_gpu_id = str(after.get("gpu_id") or "")
+    now_status = str(after.get("status") or "")
+    out["gpu_after"] = str(after.get("gpu") or "")
+    out["status_after"] = now_status
+    if now_status.upper() in ("TERMINATED", "FAILED"):
+        out["kept_the_machine"] = False
+        out["error"] = (f"the restart left the pod {now_status} — the machine "
+                        f"was NOT kept")
+        print(f"[runpod] pod {pid}: {out['error']}", flush=True)
+        return out
+    # A blank card from a pod mid-restart is "not told", not "changed": only a
+    # card that is positively DIFFERENT fails this check.
+    if was_gpu_id and now_gpu_id and now_gpu_id != was_gpu_id:
+        out["kept_the_machine"] = False
+        out["error"] = (f"the restart moved the pod from {was_gpu} to "
+                        f"{out['gpu_after']} — restart-in-place did NOT keep "
+                        f"the machine on this account")
+        print(f"[runpod] pod {pid}: {out['error']} — leaving it parked so you "
+              f"can decide", flush=True)
+        return out
+    out["kept_the_machine"] = True
+    print(f"[runpod] pod {pid}: still on {out['gpu_after'] or was_gpu} after "
+          f"the restart — the machine was kept", flush=True)
+
+    dest = to_pool_key or parked.get("was_pool") or ""
+
+    def _finish():
+        try:
+            unpark_pod(pid, dest, image=image, wait_s=wait_s)
+        except Exception as exc:
+            print(f"[runpod] pod {pid}: could not hand it to {dest!r} ({exc}) "
+                  f"— it is STILL PARKED and billing", flush=True)
+
+    if background:
+        threading.Thread(target=_finish, daemon=True,
+                         name=f"unpark-{pid}").start()
+        out["handing_over"] = f"waiting for the pod to answer, then into {dest!r}"
+    else:
+        out["unpark"] = unpark_pod(pid, dest, image=image, wait_s=wait_s)
+    return out
+
+
 def set_client_pods(model: str, pods: int, teardown: bool = False,
                     gpu_types=None, allow_other_gpus=None,
                     max_pods=None) -> dict:
@@ -6881,7 +7306,10 @@ def pods_status() -> list:
                     "inflight": 0, "state": "busy",
                     "note": "the pool registry was locked; this snapshot is "
                             "incomplete (a provisioning wave holds it)"})
-        return out
+        # NOT a return. A pod that is in no pool is exactly the pod that has to
+        # be reported when there are no pools to walk: a PARKED pod belongs to
+        # none by design, and bailing out here hid it behind the one condition
+        # under which nothing else would mention it either.
     for key, pool in pools:
         with _lock_for_read(pool._cv) as got:
             if not got:
@@ -6934,6 +7362,29 @@ def pods_status() -> list:
             "live_cost_usd": round((now - (info.get("started_at") or now)) / 3600.0
                                    * (info.get("hourly_usd") or 0), 4),
             "console_url": info.get("console_url"), "state": "provisioning",
+        })
+    # PARKED pods: rented, billing, and in no pool at all. They have to appear
+    # here or they appear nowhere -- and a pod that bills while being invisible
+    # to the page an operator checks is the exact shape of every expensive
+    # surprise in this file's history.
+    try:
+        from codai.api.runpod_client import pod_console_url as _console
+    except Exception:                          # noqa: BLE001 - decoration only
+        def _console(_pid):
+            return ""
+    for row in parked_pods():
+        born = row.get("created") or now
+        out.append({
+            "model": row.get("from_pool") or "", "pod_id": row["pod_id"],
+            "gpu": row.get("gpu") or "", "healthy": False, "inflight": 0,
+            "hourly_usd": row.get("hourly_usd") or 0.0,
+            "uptime_s": int(now - born),
+            "live_cost_usd": round((now - born) / 3600.0
+                                   * float(row.get("hourly_usd") or 0.0), 4),
+            "console_url": _console(row["pod_id"]), "state": "parked",
+            "note": (f"parked from {row.get('from_pool') or '(nothing)'}"
+                     + (f": {row['reason']}" if row.get("reason") else "")
+                     + " — in no pool, still billing"),
         })
     return out
 
@@ -7771,12 +8222,55 @@ def reclaim_registered_pods() -> int:
         print(f"[runpod] reclaim: cannot read the registry ({exc})", flush=True)
         return 0
     keys = {}
+    orphaned_parks = []
     for pod_id, info in data.items():
         if not isinstance(info, dict) or _is_this_process(info):
+            continue
+        if info.get("pool") == PARKED_POOL or info.get("parked") is not None:
+            # Either marker is enough, and the POOL is the authoritative one: a
+            # half-written `parked` block (empty dict) is falsy, so testing only
+            # that let an orphaned park fall through to the ordinary reclaim,
+            # which then looked for a model named "(parked)" and left the pod to
+            # the reaper -- the one outcome this branch exists to prevent.
+            # A pod that was mid-repurpose when this process died. Nothing else
+            # will ever touch it: its pool key is the parked sentinel, so no
+            # adoption matches it, and the pid that protected it from the reaper
+            # is gone -- so in REAP_GRACE_SECONDS the reaper terminates the card
+            # the repurpose existed to keep. The hourly unattended upgrade
+            # restarts this process, and these images boot in 6-14 minutes, so
+            # this is a collision that happens, not one that might.
+            orphaned_parks.append((str(pod_id), dict(info)))
             continue
         key = str(info.get("pool") or "")
         if key:
             keys[key] = keys.get(key, 0) + 1
+    for pod_id, info in orphaned_parks:
+        parked = dict(info.get("parked") or {})
+        home = str(parked.get("from") or "")
+        # Re-own the entry FIRST, whatever happens next: that alone takes the
+        # reaper's deadline off it, and an unpark that fails must not also cost
+        # the pod.
+        def _reown(d, target=pod_id):
+            got = d.get(target)
+            if not isinstance(got, dict):
+                return False
+            got.update({"pid": os.getpid(), "proc": _PROC_ID, "at": time.time()})
+            return True
+
+        _registry_update(_reown)
+        print(f"[runpod] reclaim: pod {pod_id} was PARKED mid-repurpose when "
+              f"the last process stopped — it is ours again (no reaper will "
+              f"take it) and it is still billing at "
+              f"${float(info.get('hourly_usd') or 0):.2f}/hr. Giving it back "
+              f"to {home or '(nothing was recorded)'}.", flush=True)
+        if not home or home == PARKED_POOL:
+            print(f"[runpod] reclaim: pod {pod_id} records no pool to return "
+                  f"to — unpark it by hand or release it", flush=True)
+            continue
+        # In a thread: the pod may still be booting, and a startup path must not
+        # block for minutes on it.
+        threading.Thread(target=_unpark_quietly, args=(pod_id, home),
+                         daemon=True, name=f"reclaim-park-{pod_id}").start()
     if not keys:
         return 0
     taken = 0

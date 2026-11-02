@@ -1409,6 +1409,83 @@ async def runpod_release(body: RunpodReleaseRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"release failed: {exc}")
 
 
+class RunpodRepurposeRequest(BaseModel):
+    pod_id: str = Field(..., description="The pod to move, as reported by "
+                                        "/v1/runpod/status.")
+    to_pool: str = Field("", description="The pool to hand it to. Empty means "
+                                        "the pool it came from, which with no "
+                                        "image is a dry run: it restarts in "
+                                        "place and goes back where it was.")
+    image: str = Field("", description="The image to run instead. Empty leaves "
+                                      "the image alone.")
+    use_pool_env: bool = Field(True,
+        description="Rewrite the pod's environment from the destination pool's "
+                    "own launch plan (served model, bearer, admission gate). A "
+                    "pod keeps the environment it BOOTED with, so a new image "
+                    "without this comes up configured as the old pool.")
+    restart: bool = Field(True, description="Restart the container in place so "
+                                           "the change takes effect now.")
+    force: bool = Field(False, description="Proceed even with requests in "
+                                          "flight, discarding them.")
+    wait_s: float = Field(900.0, description="How long to wait for the pod to "
+                                            "answer before giving up and "
+                                            "leaving it parked.")
+    model_config = ConfigDict(extra="allow")
+
+
+@app.post("/v1/runpod/repurpose", summary="Move a rented pod to another pool "
+                                          "or image, in place", tags=["Core"])
+async def runpod_repurpose(body: RunpodRepurposeRequest, request: Request):
+    """Re-image a pod you already hold instead of renting the one you want.
+
+    For when the card is sold out and you are standing on one. RunPod's `stop`
+    releases the compute, so the ordinary way round — give this pod back, rent
+    the right one — joins a queue that may not come back. A restart in place
+    does not.
+
+    The orchestration is in `runpod_worker.repurpose_pod`, including the step
+    that matters: the pod is PARKED first, because its own pool terminates a
+    pod that stops answering for ~135 seconds and these images boot in 6-14
+    minutes. The reply says whether the machine survived; the hand-over to the
+    destination pool finishes in the background and goes to the log.
+
+    With no image and no destination this is a DRY RUN — worth doing once on an
+    expendable pod before trusting it with a card you cannot re-rent.
+
+    ADMIN-SCOPED, for the same reason /v1/runpod/release is: it is neither
+    bounded nor reversible, and it takes a pod away from whoever is using it.
+    """
+    if not _admin_scoped_token(request):
+        raise HTTPException(status_code=403,
+                            detail="repurposing a pod needs an admin-scoped "
+                                   "API key")
+    from codai.api import runpod_worker
+    env = None
+    if body.use_pool_env and (body.image or body.to_pool):
+        try:
+            env = runpod_worker.pool_launch_env(body.to_pool)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"could not work out the environment pool "
+                       f"{body.to_pool!r} would launch with ({exc}). Pass "
+                       f"use_pool_env=false to leave the pod's own "
+                       f"environment alone.")
+    try:
+        from codai.api.thread_pool import run_on_control_pool
+        return await run_on_control_pool(
+            runpod_worker.repurpose_pod, body.pod_id, body.to_pool,
+            body.image, env, body.restart, body.wait_s, body.force)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"repurpose failed: {exc}")
+
+
 @app.get("/coderai/capabilities", summary="Server capability document", tags=["Core"])
 async def get_broker_capabilities():
     """Return broker capability metadata."""
