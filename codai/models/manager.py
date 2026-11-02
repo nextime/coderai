@@ -6825,7 +6825,31 @@ class MultiModelManager:
         if self._evict_idle_on_ram_enabled():
             _cap = self._ram_cap_gb()
             if _cap:
-                self._evict_models_for_ram(_cap * 0.85)
+                # Evict toward what THIS LOAD needs, not toward the cap.
+                #
+                # The target was `cap * 0.85`, and _evict_models_for_ram returns
+                # immediately when the fleet already holds less than its target —
+                # which is exactly the state a big host-resident model is refused
+                # in. Measured 2026-11-01: a 26.2 GB video load was refused with
+                # the fleet holding 25.7 GB of a 43 GB cap. The budget was
+                # 13.3 GB, the eviction target 36.5 GB, so nothing was unloaded
+                # and the refusal landed one second after the line announcing
+                # that host RAM would be freed before deciding. Every loaded
+                # model stayed resident and the load that needed the room died.
+                #
+                # For `need` to fit under the cap the fleet has to come down to
+                # cap - floor - need, so ask for that. Capped at the old target,
+                # so this can only evict where it used to evict nothing. A room
+                # figure of zero or less means the cap itself cannot house this
+                # model even with an empty fleet: evicting would cost every
+                # resident model and still refuse, so don't.
+                _room = _cap - self._ram_admission_floor_gb() - need.gb
+                if _room > 0:
+                    self._evict_models_for_ram(min(_cap * 0.85, _room))
+                else:
+                    print(f"  the {_cap:.0f} GB server RAM cap cannot house a "
+                          f"{need.gb:.1f} GB load even with nothing else "
+                          f"resident — not evicting")
             else:
                 # No cap configured, so there is no target to evict towards --
                 # free what has gone quiet and re-measure against the kernel's
