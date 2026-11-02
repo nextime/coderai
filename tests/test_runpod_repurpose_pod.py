@@ -70,6 +70,8 @@ from codai.api.runpod_client import RunpodClient, RunpodError
 
 class _Mcfg:
     port = 8000
+    pool = ""
+    engine = "coderai"
 
 
 def _pool(key="digesta-qwen38"):
@@ -630,3 +632,92 @@ def test_a_parked_pod_is_not_counted_as_a_pool_to_reclaim(monkeypatch):
                         lambda: type("A", (), {"enabled": True})())
     assert rw.reclaim_registered_pods() == 0
     assert rw.PARKED_POOL not in looked
+
+
+# ---------------------------------------------------------------------------
+# a pod that bills must never be invisible
+# ---------------------------------------------------------------------------
+
+def test_a_pod_no_pool_holds_is_still_reported(monkeypatch):
+    """Live, 2026-11-02 19:22: the account billed FOUR pods while this page
+    showed two. `pods_status` walked the pools and the provisioning list, and a
+    pod that outlived the process that rented it is in neither -- so a healthy
+    RTX 6000 Ada at $0.74/hr serving nothing, and a booting RTX PRO 5000 at
+    $0.82/hr, appeared nowhere at all. That is the most expensive row on the
+    page precisely because nothing else mentions it."""
+    _install(monkeypatch, None, _Registry({
+        "orphan1": {"pool": "datalab-to/chandra-ocr-2", "pid": os.getpid(),
+                    "proc": rw._PROC_ID, "at": time.time(),
+                    "url": "https://107.150.186.62:12640/v1",
+                    "gpu": "RTX 6000 Ada", "hourly_usd": 0.74,
+                    "created": time.time() - 3600}}))
+    rows = [r for r in rw.pods_status() if r.get("state") == "unowned"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["pod_id"] == "orphan1"
+    assert row["gpu"] == "RTX 6000 Ada"
+    assert row["live_cost_usd"] == pytest.approx(0.74, rel=0.05)
+    assert "billing" in row["note"]
+    assert "nothing routes to it" in row["note"]
+
+
+def test_an_orphan_with_no_address_says_it_is_still_booting(monkeypatch):
+    """The two orphans have different stories and an operator acts on them
+    differently: one is serving nothing it could serve, the other may yet come
+    up."""
+    _install(monkeypatch, None, _Registry({
+        "orphan2": {"pool": "p", "pid": os.getpid(), "proc": rw._PROC_ID,
+                    "at": time.time(), "url": "", "gpu": "RTX PRO 5000",
+                    "hourly_usd": 0.82, "created": time.time() - 300}}))
+    row = [r for r in rw.pods_status() if r.get("state") == "unowned"][0]
+    assert "still booting" in row["note"]
+
+
+def test_a_pod_a_pool_here_holds_is_not_also_listed_as_unowned(monkeypatch):
+    """Otherwise every healthy pod is reported twice, and the fleet's cost is
+    doubled on the page built to show it."""
+    pool = _pool("p")
+    pool.pods.append(_handle("pod1"))
+    pool.pod_capacity_now = lambda p: 32
+    _install(monkeypatch, pool, _Registry({
+        "pod1": {"pool": "p", "pid": os.getpid(), "proc": rw._PROC_ID,
+                 "at": time.time(), "url": "https://x/v1", "gpu": "A40",
+                 "hourly_usd": 0.59, "created": time.time() - 60}}))
+    rows = rw.pods_status()
+    assert [r["state"] for r in rows] == ["ready"]
+
+
+def test_a_live_siblings_pods_are_left_to_the_sibling(monkeypatch):
+    """coderai runs one engine per GPU, each with its own pools. Listing a
+    sibling's managed pods would double-count the fleet on this page."""
+    _install(monkeypatch, None, _Registry({
+        "theirs": {"pool": "p", "pid": 999999, "proc": "another",
+                   "at": time.time(), "url": "https://x/v1", "gpu": "A40",
+                   "hourly_usd": 0.59, "created": time.time() - 60}}))
+    monkeypatch.setattr(rw, "_is_this_process", lambda info: False)
+    assert [r for r in rw.pods_status() if r.get("state") == "unowned"] == []
+
+
+def test_a_dead_siblings_pod_is_reported(monkeypatch):
+    """Its heartbeat stopped, so nothing is managing it — which is exactly the
+    pod that has to be seen."""
+    _install(monkeypatch, None, _Registry({
+        "stale": {"pool": "p", "pid": 999999, "proc": "another",
+                  "at": time.time() - rw.REAP_GRACE_SECONDS - 10,
+                  "url": "https://x/v1", "gpu": "A40", "hourly_usd": 0.59,
+                  "created": time.time() - 7200}}))
+    monkeypatch.setattr(rw, "_is_this_process", lambda info: False)
+    rows = [r for r in rw.pods_status() if r.get("state") == "unowned"]
+    assert [r["pod_id"] for r in rows] == ["stale"]
+
+
+def test_a_parked_pod_is_not_listed_twice(monkeypatch):
+    """It has its own row already, with its own story."""
+    _install(monkeypatch, None, _Registry({
+        "pod1": {"pool": rw.PARKED_POOL, "pid": os.getpid(),
+                 "proc": rw._PROC_ID, "at": time.time(), "gpu": "A40",
+                 "hourly_usd": 0.59, "created": time.time() - 60,
+                 "parked": {"from": "p", "reason": "moving"}}}))
+    states = [r.get("state") for r in rw.pods_status()]
+    assert states.count("parked") == 1
+    assert "unowned" not in states

@@ -7372,6 +7372,46 @@ def pods_status() -> list:
     except Exception:                          # noqa: BLE001 - decoration only
         def _console(_pid):
             return ""
+    # UNOWNED pods: in the registry, held by no pool here, not booting and not
+    # parked. A pod gets into this state by outliving the process that rented
+    # it (a forced upgrade restarts mid-boot) or by being refused adoption, and
+    # it is the most expensive row on this page because it is the one nothing
+    # else mentions. Live, 2026-11-02: the account billed four pods while this
+    # page showed two -- a healthy RTX 6000 Ada at $0.74/hr serving nothing and
+    # a booting RTX PRO 5000 at $0.82/hr, both invisible, because `pods_status`
+    # walked the pools and the provisioning list and neither contained them.
+    #
+    # Only pods with no live manager: ours that no pool here holds, or a
+    # sibling's whose heartbeat has stopped. A sibling that IS alive manages its
+    # own, and listing those would double-count the fleet on a multi-engine box.
+    held_here = {str(r.get("pod_id")) for r in out if r.get("pod_id")}
+    try:
+        data = _registry_update(lambda d: False) or {}
+    except Exception:                          # noqa: BLE001 - decoration only
+        data = {}
+    for pod_id, info in (data.items() if isinstance(data, dict) else []):
+        if not isinstance(info, dict) or str(pod_id) in held_here:
+            continue
+        if info.get("parked") or info.get("pool") == PARKED_POOL:
+            continue                           # already listed above
+        mine = _is_this_process(info)
+        fresh = (now - float(info.get("at") or 0)) < REAP_GRACE_SECONDS
+        if not mine and fresh:
+            continue                           # a live sibling is managing it
+        born = float(info.get("created") or 0) or now
+        rate = float(info.get("hourly_usd") or 0.0)
+        out.append({
+            "model": str(info.get("pool") or ""), "pod_id": str(pod_id),
+            "gpu": str(info.get("gpu") or ""), "healthy": False, "inflight": 0,
+            "hourly_usd": rate, "uptime_s": int(now - born),
+            "live_cost_usd": round((now - born) / 3600.0 * rate, 4),
+            "console_url": "", "state": "unowned",
+            "note": ("in the registry but held by no pool here — "
+                     + ("still booting (no address yet)"
+                        if not info.get("url") else "it answers but nothing "
+                        "routes to it")
+                     + ", and still billing"),
+        })
     for row in parked_pods():
         born = row.get("created") or now
         out.append({
@@ -7672,8 +7712,62 @@ def sibling_is_provisioning(pool_key: str) -> bool:
 
 
 def _gpu_name_matches(name: str, want: str) -> bool:
-    """Whether a recorded GPU name is the card ``want`` names."""
-    return _gpu_matches({"id": name, "display_name": name}, want)
+    """Whether a recorded GPU name is the card ``want`` names.
+
+    One recorded string has to be matched against what an operator typed, and
+    the two come from different columns of RunPod's catalogue: `register_pod`
+    stores the DISPLAY name ("RTX 6000 Ada") while `gpu_types` is written with
+    the id ("NVIDIA RTX 6000 Ada Generation"). `_gpu_matches` is exact after
+    stripping "NVIDIA " -- deliberately, because a substring match would let
+    "A40" adopt an "RTX A4000", a 16 GB card where 48 GB was asked for -- so
+    those two spellings did not match and the pod was refused.
+
+    Measured 2026-11-02 19:22: a healthy RTX 6000 Ada pod with a routable port,
+    55 minutes old at $0.74/hr, refused adoption every few seconds with
+    "it runs on RTX 6000 Ada, this pool asks for ... NVIDIA RTX 6000 Ada
+    Generation" -- the card it was being refused for was in the list. It billed
+    outside any pool and served nothing. A40, L40 and L40S hid the bug by
+    having a display name equal to their id minus the prefix.
+
+    So the two names are resolved THROUGH the catalogue: they match when they
+    name the same card there. Still not a substring match -- both ends go
+    through `_gpu_matches` against a real catalogue row -- and with no
+    catalogue readable it degrades to the old exact comparison.
+    """
+    if _gpu_matches({"id": name, "display_name": name}, want):
+        return True
+    if not str(name or "").strip() or not str(want or "").strip():
+        return False
+    try:
+        from codai.api.runpod_client import _load_saved_catalog_quiet
+        rows = _load_saved_catalog_quiet()
+    except Exception:                          # noqa: BLE001 - degrade, not fail
+        return False
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if _gpu_matches(row, name) and _gpu_matches(row, want):
+            return True
+    # The catalogue is a cached file and can be stale, short, or absent (one
+    # stale row, on the box this was written on), so the fix cannot depend on
+    # it. Fall back to matching on WHOLE WORDS: one name's words being a
+    # leading run of the other's is the same card named at two lengths, which
+    # is exactly how RunPod's id and display name differ.
+    #
+    # Whole words is what keeps this safe, and these are the cases it must get
+    # right -- all three are real cards in the same configurations:
+    #   "RTX 6000 Ada" vs "NVIDIA RTX 6000 Ada Generation" -> same card
+    #   "L40"          vs "L40S"                           -> DIFFERENT cards
+    #   "A40"          vs "NVIDIA RTX A4000"               -> DIFFERENT cards
+    # A substring match gets the last two wrong, and the second one wrong in a
+    # way that silently serves a lease on a card it did not ask for.
+    a = str(name).strip().lower().removeprefix("nvidia ").split()
+    b = str(want).strip().lower().removeprefix("nvidia ").split()
+    if a and b:
+        short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+        if long_[:len(short)] == short:
+            return True
+    return False
 
 
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",

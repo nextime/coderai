@@ -317,3 +317,15 @@ def test_the_template_is_still_valid_javascript():
             fh.write(script)
         r = subprocess.run([node, "--check", p], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_the_page_names_every_state_it_can_be_sent():
+    """A state the page does not know falls through to "healthy/down", and an
+    UNOWNED pod -- rented, billing, held by no pool -- would be drawn as a
+    plain "down" row among the ordinary ones. It is the row that must stand
+    out, not blend in."""
+    with open(_TEMPLATE, encoding="utf-8") as fh:
+        src = fh.read()
+    cell = src.split("function _healthCell(p){", 1)[1].split("\nfunction ", 1)[0]
+    for state in ("'parked'", "'unowned'", "'provisioning'", "'quarantined'"):
+        assert state in cell, state

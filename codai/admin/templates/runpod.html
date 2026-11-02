@@ -196,6 +196,13 @@ function _healthCell(p){
     return `<span style="color:#f59e0b">parked</span>`
       + (p.note ? `<div style="font-size:10px;color:var(--text-3)">${p.note}</div>` : '');
   }
+  if (p.state === 'unowned') {
+    // In the registry, held by no pool, billing. It gets the loudest colour on
+    // the page because it is the row nothing else would have mentioned: the
+    // account billed four pods while this table showed two.
+    return `<span style="color:#ef4444">unowned</span>`
+      + (p.note ? `<div style="font-size:10px;color:var(--text-3)">${p.note}</div>` : '');
+  }
   if (p.state === 'provisioning') return '<span style="color:#f59e0b">provisioning…</span>';
   if (p.state === 'quarantined') {
     return '<span style="color:#f59e0b">set aside</span>'
