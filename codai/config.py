@@ -1313,6 +1313,21 @@ class OcrConfig:
     # which is kept working so an operator who hits something odd on a new
     # transport can change one setting instead of waiting for a release.
     pod_http_async: bool = True
+    # How long ONE page may spend on a pod before the forward is abandoned,
+    # in seconds. 0 uses the default in codai.ocr.manager.
+    #
+    # It belongs beside `max_concurrency`, because the two have to be chosen
+    # together. A deep queue is a legitimate throughput setting -- it is how a
+    # fleet is kept fed and how a peak-rate measurement keeps this process out
+    # of the result -- but a page that waits longer than this is abandoned
+    # after `POD_PAGE_ATTEMPTS` tries, and under `pod_pipeline: require` that
+    # is a 503 for work the pod may have completed. Measured on a 512-page run
+    # at 128 lanes against one pod, 2026-11-02: 448 pages timed out at the
+    # then hard-coded 600 s while the pod answered 200 to everything it
+    # finished and refused nothing.
+    #
+    # A ceiling, not a target: nothing waits longer because this is larger.
+    pod_page_timeout_s: float = 600.0
     page_image_format: str = "auto"
     page_image_jpeg_quality: int = 95
     # An ADDITIONAL floor on passing a scan through, in real DPI. 0 means the
@@ -2449,6 +2464,7 @@ class ConfigManager:
                 "pod_pipeline": self.config.ocr.pod_pipeline,
                 "pod_pipeline_wait_s": self.config.ocr.pod_pipeline_wait_s,
                 "pod_http_async": self.config.ocr.pod_http_async,
+                "pod_page_timeout_s": self.config.ocr.pod_page_timeout_s,
                 "page_image_format": self.config.ocr.page_image_format,
                 "page_image_jpeg_quality": self.config.ocr.page_image_jpeg_quality,
                 "page_image_min_dpi": self.config.ocr.page_image_min_dpi,

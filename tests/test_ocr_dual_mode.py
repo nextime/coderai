@@ -368,7 +368,11 @@ def test_pages_come_back_in_document_order(monkeypatch):
 
     seen = []
 
-    def _post(base, key, blob, name, dpi, opts, detect, engine="surya"):
+    def _post(base, key, blob, name, dpi, opts, detect, engine="surya", **kw):
+        # **kw: this stands in for the real forward, which also takes the
+        # per-page timeout (and will take whatever is added next). A stub that
+        # pins the signature fails on an addition that the code under test
+        # handles perfectly well -- and the failure reads as a regression.
         seen.append(name)
         return {"engine": engine, "pages": [{"text": name, "width": 1, "height": 2}]}
     _stub_page_post(monkeypatch, _post)
@@ -408,7 +412,7 @@ def test_a_single_image_is_sent_whole(monkeypatch):
     _fake_placement(monkeypatch)
     sent = []
     _stub_page_post(monkeypatch,
-                    lambda b, k, blob, name, *a: sent.append(len(blob)) or
+                    lambda b, k, blob, name, *a, **kw: sent.append(len(blob)) or
                     {"engine": "surya", "pages": [{"text": "x"}]})
     asyncio.run(mgr._read_on_pods(buf.getvalue(), "x.png", "image/png", "m",
                                   dpi=250, page_opts=None, detect=None, cfg=_Cfg()))

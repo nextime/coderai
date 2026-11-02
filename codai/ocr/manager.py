@@ -376,6 +376,40 @@ class PodUnreachable(OcrError):
 #: which the next attempt's placement routes around.
 POD_PAGE_ATTEMPTS = 3
 
+#: How long one page may spend on a pod before the forward is abandoned.
+#:
+#: This was 600.0 hard-coded in both forwards, and a hard-coded timeout on this
+#: path is a throughput setting nobody can reach. Measured on Aruba 2026-11-02,
+#: a 512-page run at 128 lanes against one pod: 448 pages came back
+#:
+#:     pod OCR at https://.../v1/ocr is unreachable:
+#:     Read timed out. (read timeout=600)
+#:
+#: after POD_PAGE_ATTEMPTS each, and `ocr.pod_pipeline: require` then turned
+#: every one into a 503. The pod had answered 200 to everything it finished and
+#: its own admission gate had refused nothing, so those were pages waiting
+#: behind a service time longer than the timeout -- work paid for and thrown
+#: away. A deliberately deep queue (ocr.max_concurrency is a throughput dial,
+#: not a mistake) needs a timeout that covers the wait it creates, or the queue
+#: only converts completions into discards.
+#:
+#: It is a ceiling, not a target: nothing waits longer because this is larger.
+POD_PAGE_TIMEOUT_S = 600.0
+
+
+def _pod_page_timeout_s(cfg) -> float:
+    """`ocr.pod_page_timeout_s`, or the default.
+
+    Read from the config rather than baked in so a run that queues deeply can
+    raise it without a release -- the queue depth and this number have to be
+    chosen together, and only one of them was reachable before.
+    """
+    try:
+        v = float(getattr(cfg, "pod_page_timeout_s", 0) or 0)
+    except (TypeError, ValueError):
+        return POD_PAGE_TIMEOUT_S
+    return v if v > 0 else POD_PAGE_TIMEOUT_S
+
 #: Text that means "the connection failed", as opposed to a reply we dislike.
 #: Matched on the message because requests wraps urllib3 which wraps the
 #: socket, and the useful name is rarely the outermost one.
@@ -569,7 +603,8 @@ def _page_response(r, url: str) -> dict:
 
 async def _apost_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
                              dpi: int, opts: dict, detect,
-                             engine: str = "surya") -> dict:
+                             engine: str = "surya",
+                             timeout_s: float = POD_PAGE_TIMEOUT_S) -> dict:
     """One page to a pod, ON THE EVENT LOOP — no thread per page in flight.
 
     The sync twin below costs one thread for every outstanding page, and a
@@ -589,7 +624,7 @@ async def _apost_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
         try:
             r = await pod_http.apost(
                 url, files={"file": (name, blob, "application/pdf")},
-                data=fields, headers=headers, timeout=600)
+                data=fields, headers=headers, timeout=timeout_s)
             return _page_response(r, url)
         except OcrError:
             raise                      # an ANSWER; not a transport failure
@@ -637,7 +672,8 @@ def _use_async_pod_http(cfg) -> bool:
 
 
 def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
-                      dpi: int, opts: dict, detect, engine: str = "surya") -> dict:
+                      dpi: int, opts: dict, detect, engine: str = "surya",
+                      timeout_s: float = POD_PAGE_TIMEOUT_S) -> dict:
     """POST one page to a pod's own /v1/ocr and return its response dict.
 
     The THREAD path: the caller is on the pod thread pool, one thread per page
@@ -656,7 +692,7 @@ def _post_page_to_pod(base: str, api_key: str, blob: bytes, name: str,
     for attempt in range(1, POD_PAGE_ATTEMPTS + 1):
         try:
             r = pod_http.post(url, files={"file": (name, blob, "application/pdf")},
-                              data=fields, headers=headers, timeout=600)
+                              data=fields, headers=headers, timeout=timeout_s)
             return _page_response(r, url)
         except OcrError:
             raise                      # an ANSWER; not a transport failure
@@ -2675,6 +2711,9 @@ class OcrManager:
         # Decided once per document, not per page: a document whose pages
         # changed transport halfway would be unexplainable in the log.
         use_async = _use_async_pod_http(cfg)
+        # Also once per document, and for the same reason: a page that waited
+        # on a different clock from its siblings is unexplainable afterwards.
+        page_timeout = _pod_page_timeout_s(cfg)
         _say_rate_limited(
             ("pod-transport", model_id),
             f"[ocr] forwarding pages for {model_id!r} "
@@ -2709,7 +2748,8 @@ class OcrManager:
                             # documents a second needs ~3,200 outstanding.
                             return await _apost_page_to_pod(
                                 lease.base, lease.api_key, blob, page_name,
-                                dpi, opts, detect, engine_name)
+                                dpi, opts, detect, engine_name,
+                                timeout_s=page_timeout)
                         # THE POD POOL, not the default executor. `to_thread`
                         # hands the forward to the loop's default pool -- 32
                         # threads, shared with every other blocking call in the
@@ -2719,7 +2759,8 @@ class OcrManager:
                         # semaphore or the pods' own gate is set.
                         return await run_on_pod_pool(
                             _post_page_to_pod, lease.base, lease.api_key, blob,
-                            page_name, dpi, opts, detect, engine_name)
+                            page_name, dpi, opts, detect, engine_name,
+                            page_timeout)
                     except PodUnreachable as exc:
                         # A DEAD SOCKET IS NOT A VERDICT ON THE IMAGE. Ask the
                         # address whether anything is still there: a pod that
