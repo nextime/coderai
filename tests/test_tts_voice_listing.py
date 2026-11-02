@@ -35,6 +35,24 @@ import pytest
 from codai.api import tts_backends as T
 
 
+@pytest.fixture(autouse=True)
+def _own_voice_cache(tmp_path, monkeypatch):
+    """Never read the operator's real voice cache.
+
+    `test_bark_is_listed_without_loading_anything` asserts the STATIC list, and
+    the static list is only what a listing returns on a machine where bark has
+    never been loaded. Once the server has synthesised with suno/bark once, it
+    remembers that bank in ~/.coderai/tts_cache/tts_voices.json and the listing
+    rightly reports "remembered" -- so the test passed or failed according to
+    what the host had been used for, and it failed on 2026-11-02 for no reason
+    but a bark job the night before. The tests that exercise the cache point it
+    at their own tmp_path already; this does the same for the ones that must
+    not see one at all.
+    """
+    monkeypatch.setattr(T, "_cache_dir", lambda: tmp_path)
+    T._VOICES_MEMO.clear()
+
+
 class _Loaded:
     def __init__(self, voices):
         self.voices = voices
