@@ -467,6 +467,32 @@ def detect_watermark(wav_bytes: bytes) -> dict:
 
 CLONE_ENGINES = ("auto", "f5", "xtts", "chain", "melotts")
 
+#: The languages F5-TTS can actually speak, and the reason `auto` has to know.
+#:
+#: F5's checkpoint is the model's whole knowledge of speech: the default
+#: F5TTS_v1_Base is trained on Emilia (English and Chinese), and ``infer`` takes
+#: no language argument at all -- there is nothing to pass a target language TO.
+#: Handed Italian text it reads it with English phonetics, which is a clone of
+#: the right voice saying the right words in the wrong language.
+#:
+#: Measured 2026-11-03: a request with ``language: "it"``, an Italian reference
+#: and its Italian transcript answered 200 with 3.3 s of audio that does not
+#: sound Italian. `auto` had chosen F5 -- correctly by its old rule, which only
+#: compared the target with the REFERENCE's language and had no opinion about
+#: what the engine could pronounce.
+#:
+#: Override for a multilingual F5 fine-tune: CODERAI_F5_LANGUAGES="en,zh,it".
+F5_LANGUAGES = tuple(
+    x.strip().lower()[:2]
+    for x in (os.environ.get("CODERAI_F5_LANGUAGES") or "en,zh").split(",")
+    if x.strip())
+
+
+def _f5_can_speak(language: str) -> bool:
+    """Whether F5's checkpoint covers this language. No language = no claim."""
+    lang = (language or "").strip().lower()[:2]
+    return (not lang) or (lang in F5_LANGUAGES)
+
 
 def _pick_engine(requested: str, ref_text: str, language: str, ref_language: str) -> str:
     """Resolve engine='auto' to a concrete engine, and say why."""
@@ -480,6 +506,10 @@ def _pick_engine(requested: str, ref_text: str, language: str, ref_language: str
     ref_lang = (ref_language or "").strip().lower()[:2]
     if not ref_text:
         print("  [voice-clone] auto -> xtts (no transcript for the reference)", flush=True)
+        return "xtts"
+    if not _f5_can_speak(lang):
+        print(f"  [voice-clone] auto -> xtts (F5's checkpoint speaks "
+              f"{'/'.join(F5_LANGUAGES)}, not '{lang}')", flush=True)
         return "xtts"
     if lang and ref_lang and lang != ref_lang:
         print(f"  [voice-clone] auto -> xtts (target '{lang}' differs from the "
@@ -927,6 +957,18 @@ async def clone_voice(request: VoiceCloneRequest, http_request: Request = None):
         engine = _pick_engine(request.engine, ref_text, request.language, ref_language)
         speed = request.speed or 1.0
         lang = (request.language or ref_language or "en")[:2]
+        # F5 takes no language argument, so a language it cannot pronounce is
+        # not refused anywhere downstream -- it is simply read with the wrong
+        # phonetics. `auto` routes around it; an explicit engine=f5 is the
+        # caller's decision and is kept, but the answer says what happened.
+        notes: list = []
+        if engine == "f5" and not _f5_can_speak(request.language):
+            notes.append(
+                f"engine 'f5' was requested explicitly and its checkpoint "
+                f"speaks {'/'.join(F5_LANGUAGES)}; '{lang}' text will be read "
+                f"with those phonetics. Use engine 'xtts' (17 languages) or "
+                f"'chain'/'melotts' for {lang!r}.")
+            print(f"  [voice-clone] warning: {notes[-1]}", flush=True)
 
         def _run():
             if engine == "f5":
@@ -953,7 +995,10 @@ async def clone_voice(request: VoiceCloneRequest, http_request: Request = None):
 
         audio_bytes = apply_watermark(audio_bytes, request.watermark)
         result = _save_audio_response(audio_bytes, http_request)
-        return {"created": int(time.time()), "data": [result], "engine": engine}
+        answer = {"created": int(time.time()), "data": [result], "engine": engine}
+        if notes:
+            answer["warnings"] = notes
+        return answer
 
     finally:
         for t in temps:
