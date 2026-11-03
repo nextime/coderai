@@ -141,8 +141,11 @@ def family_languages(model_name: str, config: Optional[dict] = None) -> list[str
     fam = _family(model_name)
     if fam == "kokoro":
         # Derived from the voice-id accents, so adding a voice family adds its
-        # language without a second list to remember.
-        return sorted({lang for lang, _ in _KOKORO_ACCENTS.values()})
+        # language without a second list to remember -- minus any this install
+        # cannot phonemise, because advertising one is how a client picks the
+        # engine that cannot deliver it.
+        return sorted({lang for lang, _ in _KOKORO_ACCENTS.values()
+                       if not kokoro_unpronounceable(lang)})
     return list(_FAMILY_LANGUAGES.get(fam, []))
 
 
@@ -280,6 +283,36 @@ _ESPEAK_REGIONLESS = {
 }
 
 
+#: Kokoro's Japanese voices cannot be phonemised by this install, and why they
+#: are refused rather than served.
+#:
+#: kokoro-onnx phonemises with espeak-ng, which has no Japanese grapheme-to-
+#: phoneme rules: it falls back to NAMING the characters it cannot read.
+#: Measured 2026-11-03 on Kokoro-82M / ``jf_alpha``, a five-second Japanese
+#: sentence: 23 seconds of audio reading out "Chinese letter … Japanese
+#: letter …", rated 1/5, while every other Kokoro language scored 5.
+#:
+#: Kokoro's own pipeline uses misaki[ja] (pyopenjtalk) for this, which is not
+#: part of this install. Until it is, the honest answer is the one that names
+#: an engine that CAN speak Japanese -- XTTS-v2 and bark both declare it.
+#: ``CODERAI_KOKORO_ALLOW_JA=1`` serves it anyway for anyone who has wired a
+#: Japanese G2P in themselves.
+_KOKORO_UNPRONOUNCEABLE = {"ja"}
+
+
+def kokoro_japanese_enabled() -> bool:
+    return str(os.environ.get("CODERAI_KOKORO_ALLOW_JA", "")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def kokoro_unpronounceable(lang: str) -> bool:
+    """True when this install cannot phonemise ``lang`` for a Kokoro voice."""
+    if kokoro_japanese_enabled():
+        return False
+    base = str(lang or "").strip().lower().replace("_", "-").split("-")[0]
+    return base in _KOKORO_UNPRONOUNCEABLE
+
+
 def espeak_language(lang: str) -> str:
     """``lang`` as espeak-ng names it."""
     want = str(lang or "").strip().lower().replace("_", "-")
@@ -300,6 +333,27 @@ class _KokoroBackend:
 
     def synthesize(self, text: str, voice: str, speed: float, lang: str,
                    emotion: str = "", style: str = "") -> Tuple[np.ndarray, int]:
+        # A language espeak-ng cannot read is not a slightly worse voice, it is
+        # a voice reading the names of the characters (see
+        # _KOKORO_UNPRONOUNCEABLE). It answers 200 with audio, so nothing
+        # downstream can tell it apart from speech.
+        # The VOICE's own language counts as much as the requested one: the
+        # endpoint defaults `language` to "en-us", so a Japanese voice asked
+        # for with no language would otherwise be read with English rules --
+        # the same unusable audio by a different route.
+        _vlang = (_KOKORO_ACCENTS.get(
+            (voice or self.default_voice or "")[:1]) or ("",))[0]
+        _want = next((x for x in (lang, _vlang) if kokoro_unpronounceable(x)),
+                     "")
+        if _want:
+            raise ValueError(
+                f"this install cannot speak {_want!r} with a Kokoro voice: "
+                f"kokoro-onnx phonemises with espeak-ng, which has no "
+                f"grapheme-to-phoneme rules for it and reads the characters "
+                f"out by name instead (measured: 23 s of audio for a 5 s "
+                f"sentence). Kokoro upstream uses misaki[ja]/pyopenjtalk for "
+                f"this. Use XTTS-v2 or bark, which declare the language, or "
+                f"set CODERAI_KOKORO_ALLOW_JA=1 to serve it regardless.")
         _lang = espeak_language(lang)
         try:
             samples, sr = self._kokoro.create(
@@ -358,6 +412,29 @@ class _TransformersBackend:
 # coqui / XTTS (optional)
 # --------------------------------------------------------------------------- #
 
+#: XTTS verbalises a trailing full stop in some languages, so it is removed.
+#:
+#: Measured 2026-11-03 on XTTS-v2 (Claribel Dervla), Italian: "…in centro."
+#: was spoken as "in centro PUNTO" -- confirmed by transcribing the output,
+#: which heard the word. XTTS's per-language text normaliser expands symbols to
+#: words, and for Italian the sentence-final period is one of them.
+#:
+#: Only a trailing period is dropped, and only from the end: it carries no
+#: intonation an utterance's end does not already have, whereas "!" and "?" do
+#: and are left alone. Internal punctuation is what XTTS splits and phrases on,
+#: so none of it is touched.
+_TRAILING_STOPS = ".。｡…"
+
+
+def xtts_normalize_text(text: str) -> str:
+    """``text`` as XTTS should be handed it."""
+    out = str(text or "")
+    stripped = out.rstrip()
+    while stripped and stripped[-1] in _TRAILING_STOPS:
+        stripped = stripped[:-1].rstrip()
+    return stripped or out
+
+
 class _CoquiBackend:
     family = "coqui"
     default_voice = ""
@@ -402,7 +479,8 @@ class _CoquiBackend:
         # or fall back to a default. `voice` may be a wav path, a built-in
         # speaker name, or (e.g. a Kokoro id like "af_sarah") neither — so only
         # treat it as a clone source when it's an actual file.
-        kwargs = {"text": text, "language": xtts_language(lang)}
+        kwargs = {"text": xtts_normalize_text(text),
+                  "language": xtts_language(lang)}
         speakers = list(getattr(self._tts, "speakers", None) or [])
         cfg_wav = self._cfg.get("speaker_wav")
         if voice and os.path.isfile(voice):
@@ -883,6 +961,43 @@ def _load_backend(model_name: str, model_path: Optional[str], config: Optional[d
 # encoding
 # --------------------------------------------------------------------------- #
 
+#: How much trailing quiet a synthesised clip may keep, and why it is trimmed.
+#:
+#: Several engines keep generating after the words run out. Measured
+#: 2026-11-03: bark's Spanish ended in a long silence (and background noise);
+#: XTTS and bark both pad the tail. A clip whose last second is silence is a
+#: clip whose duration lies -- compose lines it up by that duration, a player
+#: shows it, and a caller stitching dialogue inherits the gap in the middle of
+#: a conversation.
+#:
+#: Only SILENCE is removed, never audio: a hallucinated word at the end is a
+#: different defect and cutting by duration would clip real speech. The
+#: threshold is deliberately low (-60 dBFS) and a margin is left in place so a
+#: fading final consonant survives.
+#:
+#: CODERAI_TTS_TRIM_SILENCE=0 keeps whatever the engine produced.
+_TRIM_FLOOR = 10 ** (-60.0 / 20.0)      # -60 dBFS, in amplitude
+_TRIM_MARGIN_S = 0.08                   # kept after the last sound
+
+
+def trim_trailing_silence(samples, sample_rate: int):
+    """``samples`` with its trailing silence cut back to a small margin."""
+    if str(os.environ.get("CODERAI_TTS_TRIM_SILENCE", "1")).strip().lower() in (
+            "0", "false", "no", "off"):
+        return samples
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size == 0 or sample_rate <= 0:
+        return samples
+    mono = np.abs(arr if arr.ndim == 1 else arr.mean(axis=1))
+    loud = np.flatnonzero(mono > _TRIM_FLOOR)
+    if loud.size == 0:
+        return samples                  # all quiet: not ours to judge
+    end = int(loud[-1]) + 1 + int(_TRIM_MARGIN_S * sample_rate)
+    if end >= arr.shape[0]:
+        return samples
+    return arr[:end] if arr.ndim == 1 else arr[:end, ...]
+
+
 def encode_audio(samples: np.ndarray, sample_rate: int, fmt: str) -> Tuple[bytes, str]:
     """Encode float samples to the requested container, returning (bytes, fmt).
 
@@ -892,6 +1007,7 @@ def encode_audio(samples: np.ndarray, sample_rate: int, fmt: str) -> Tuple[bytes
     import soundfile as sf
     fmt = (fmt or "wav").lower()
     samples = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    samples = trim_trailing_silence(samples, sample_rate)
 
     sf_formats = {"wav": "WAV", "flac": "FLAC", "ogg": "OGG"}
     if fmt in sf_formats:

@@ -52,10 +52,19 @@ def test_parler_multilingual_publishes_its_eight():
 
 def test_kokoro_languages_come_from_its_own_voice_ids():
     """Derived from _KOKORO_ACCENTS rather than a second hand-kept list, so a
-    new voice family cannot be added without its language appearing."""
+    new voice family cannot be added without its language appearing.
+
+    Minus the ones this install cannot phonemise: Japanese needs a G2P that
+    espeak-ng does not have, and a published language that answers with the
+    names of the characters is worse than one that is not published at all
+    (see test_kokoro_cannot_read_japanese.py).
+    """
     langs = T.family_languages("hexgrad/Kokoro-82M")
-    assert sorted(langs) == sorted({l for l, _ in T._KOKORO_ACCENTS.values()})
-    assert "it" in langs and "en-us" in langs and "ja" in langs
+    expected = {l for l, _ in T._KOKORO_ACCENTS.values()
+                if not T.kokoro_unpronounceable(l)}
+    assert sorted(langs) == sorted(expected)
+    assert "it" in langs and "en-us" in langs
+    assert "ja" not in langs
 
 
 def test_kokoro_language_list_tracks_the_accent_map(monkeypatch):

@@ -262,6 +262,13 @@ async def create_speech(request: TTSRequest, http_request: Request = None):
         except tts_backends.MissingEngineError as e:
             # Missing optional engine (e.g. coqui-tts) → actionable 501.
             raise HTTPException(status_code=501, detail=str(e))
+        except ValueError as e:
+            # The backends raise ValueError for what the REQUEST asked for --
+            # a language the voice cannot speak, a voice the model does not
+            # have. Those were answered 500, which tells a client to retry
+            # something that cannot work. The message is already written for
+            # the caller; only the status was wrong.
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             print(f"TTS error: {e}")
             import traceback
