@@ -3206,6 +3206,29 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
         kw.setdefault('guidance_scale', float(_c_cfg))
     if _card.get('num_frames'):
         kw.setdefault('num_frames', int(_card['num_frames']))
+    # A distilled video checkpoint whose entry carries no defaults. The image
+    # path has consulted the model's NAME for this since 0.5.x; the video path
+    # did not, so a Lightning or distilled checkpoint with a bare entry ran at
+    # the generic 25 steps / CFG 7.5 -- three times the work, and a distilled
+    # transformer at CFG 7.5 produces exactly the smeared, merged look reported
+    # 2026-11-03 across the text-to-video catalogue (subjects fused together,
+    # "a mix of colors"). Below the card and below a fused preset, because both
+    # know more; above the floor, because the name knows more than it does.
+    if 'num_inference_steps' not in kw or 'guidance_scale' not in kw:
+        try:
+            from codai.models.acceleration import distilled_defaults_for
+            _dist = distilled_defaults_for(
+                str((model_cfg or {}).get('path') or '')
+                or str(getattr(request, 'model', '') or ''))
+        except Exception:                                        # noqa: BLE001
+            _dist = None
+        if _dist:
+            print(f"  [video] '{_dist['token']}' in the model id: this "
+                  f"checkpoint is distilled, so {_dist['steps']} steps at CFG "
+                  f"{_dist['guidance_scale']} (its entry carries no defaults; "
+                  f"the generic fallback would be 25 at CFG 7.5)")
+            kw.setdefault('num_inference_steps', int(_dist['steps']))
+            kw.setdefault('guidance_scale', float(_dist['guidance_scale']))
     kw.setdefault('num_inference_steps', 25)
     kw.setdefault('guidance_scale', 7.5)
     kw.setdefault('num_frames', 16)
