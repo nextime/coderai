@@ -183,8 +183,9 @@ def run_engine(engine: str, face_path: str, audio_path: str, out_path: str,
     if eng == "wav2lip":
         binary = shutil.which("wav2lip") or shutil.which("Wav2Lip")
         if binary:
+            from codai.api.lipsync import wav2lip_extra_args
             cmd = [binary, "--face", face_path, "--audio", audio_path,
-                   "--outfile", out_path]
+                   "--outfile", out_path, *wav2lip_extra_args()]
             _run(cmd, cancel=cancel, timeout=timeout, log=log)
             if os.path.isfile(out_path):
                 return out_path
@@ -235,9 +236,10 @@ def run_engine(engine: str, face_path: str, audio_path: str, out_path: str,
         res_dir = os.path.join(workdir, "sadtalker-out")
         os.makedirs(res_dir, exist_ok=True)
         still = media.kind_of(media.sniff_mime(open(face_path, "rb").read(32))) == "image"
+        from codai.api.lipsync import sadtalker_extra_args
         cmd = [binary, "--driven_audio", audio_path,
                "--source_image" if still else "--source_video", face_path,
-               "--result_dir", res_dir]
+               "--result_dir", res_dir, *sadtalker_extra_args()]
         _run(cmd, cancel=cancel, timeout=timeout, log=log)
         made = sorted(glob.glob(os.path.join(res_dir, "**", "*.mp4"), recursive=True),
                       key=os.path.getmtime)

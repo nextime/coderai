@@ -497,6 +497,23 @@ def _video_bytes_to_path(video_b64: str) -> str:
 # Pipeline loading
 # =============================================================================
 
+
+class VideoRequestMismatch(ValueError):
+    """This model cannot serve this request, and no retry will change that.
+
+    The difference from every other failure in the generation ladder: the
+    caller has to change the request. Reloading at a smaller size, resetting
+    the attention backend or dropping to the next rung all answer a question
+    nobody asked, and each one costs a multi-GB load and a teardown first.
+
+    Raised after the weights are up, because the question it answers --
+    "is this checkpoint's transformer text-to-video or image-to-video?" --
+    cannot be read off the name or the config entry. The endpoint maps it to
+    400 and leaves the pipeline loaded: it is healthy, and the next caller
+    who sends the right request should not pay for this one's mistake.
+    """
+
+
 def _effective_mode(request) -> str:
     """The mode this request really is, whether or not it says so.
 
@@ -2583,6 +2600,74 @@ def _snap_wan_frames(n: int) -> int:
         return max(5, k * 4 + 1)
 
 
+def _frames_from_video_ref(data, width: int, height: int,
+                           count: int = 0, temps=None):
+    """Any accepted video reference → a list of RGB PIL frames at (width, height).
+
+    ``request.video`` is a reference, not frames: base64, a data URI, an
+    http(s) URL or a ``/v1/files/...`` id. It was handed to the pipeline as the
+    raw BYTES of the file, which no diffusers pipeline accepts -- a
+    video-to-video call therefore could not have used the clip even where the
+    pipeline took a ``video`` argument.
+
+    ``count`` resamples to exactly that many frames, picked evenly across the
+    whole clip rather than from its head: a 4-second input trimmed to the
+    first 81 frames would hand the model a fifth of the motion it was asked to
+    follow, and at a different speed.
+    """
+    import tempfile as _tf
+    from PIL import Image as _Image
+    raw = _decode_b64_or_url(data) if not isinstance(data, (bytes, bytearray)) else data
+    if not raw:
+        return []
+    f = _tf.NamedTemporaryFile(suffix=".mp4", delete=False)
+    f.write(raw)
+    f.close()
+    if temps is not None:
+        temps.append(f.name)
+    try:
+        arrays, _fps = _decode_video_pyav(f.name)
+    finally:
+        if temps is None:
+            try:
+                os.unlink(f.name)
+            except OSError:
+                pass
+    if not arrays:
+        return []
+    if count and count > 0:
+        n = len(arrays)
+        idx = [min(n - 1, int(round(i * (n - 1) / max(1, count - 1))))
+               for i in range(count)] if count > 1 else [0]
+        arrays = [arrays[i] for i in idx]
+    return [_Image.fromarray(a).convert('RGB').resize((width, height))
+            for a in arrays]
+
+
+def _build_vace_control(frames, num_frames: int, width: int, height: int):
+    """The (video, mask) pair for a control video: every frame regenerated.
+
+    The counterpart of :func:`_build_vace_conditioning`, which keeps the frames
+    it is given (mask BLACK) and generates the rest. A video-to-video edit is
+    the other arrangement: the whole clip is REACTIVE (mask WHITE), so VACE
+    re-renders every frame while its control branch still encodes the frames
+    themselves -- which is how VACE is driven by depth, pose or grayscale
+    control videos upstream.
+
+    Without this, a v2v request on a VACE pipeline fell through to the "pure
+    t2v" branch and the clip was dropped. Measured 2026-11-03 on
+    Wan2.2-VACE-Fun-A14B, "make it a snowy winter day": a competent snowy
+    scene, invented whole, following neither the input's content nor its
+    motion -- and answered 200, with nothing to say the clip had been ignored.
+    """
+    from PIL import Image as _Image
+    n = min(len(frames), num_frames)
+    gray = _Image.new('RGB', (width, height), (128, 128, 128))
+    white = _Image.new('L', (width, height), 255)
+    video = list(frames[:n]) + [gray] * (num_frames - n)
+    return video, [white] * num_frames
+
+
 def _build_vace_conditioning(cond_frames, num_frames: int, width: int, height: int):
     """Build the (video, mask) lists a WanVACE pipeline expects.
 
@@ -2991,43 +3076,41 @@ def _maybe_t2v_fallback(pipe, kw, mode):
     return view, 't2v'
 
 
-def _maybe_i2v_fallback(pipe, kw, mode):
-    """Reverse of _maybe_t2v_fallback: if a t2v request (no init image) lands on a
-    WanPipeline whose transformer is actually image-to-video (36 in-channels), the
-    t2v forward would mismatch (it builds 16-channel input). Rebuild as a
-    WanImageToVideoPipeline reusing the same components (image_encoder/processor
-    are optional and simply absent here) and seed it with a neutral gray frame so
-    the prompt still drives the clip. Returns (pipe_to_use, mode).
+def _refuse_t2v_on_an_i2v_model(pipe, kw, mode):
+    """A text-to-video request on an image-to-video checkpoint is refused.
 
-    This is a graceful degrade — an i2v model without a real keyframe can't lock a
-    first frame, so the neutral seed yields essentially prompt-driven output.
+    Wan ships the two directions as separate transformers, and only the
+    weights say which one a checkpoint holds: 16 in-channels is text-to-video,
+    36 is image-to-video (the extra channels carry the keyframe's latent).
+    Asked for t2v on a 36-channel model, the t2v forward builds 16-channel
+    input and mismatches, so this used to rebuild the i2v sibling pipeline and
+    seed it with a neutral gray frame -- "prompt-driven output" on the theory
+    that an i2v model with no real keyframe still follows the caption.
+
+    It does not. Measured 2026-11-03 across 30 clips (one plain prompt plus
+    nine styles, on Wan2.2-I2V-A14B-Diffusers, -Lightning and Wan2.2-Remix):
+    every one came back HTTP 200 with an mp4 of uniform grey noise, rated 1/5
+    by a human on all thirty. The gray seed is not weak conditioning, it is
+    no conditioning: the transformer is handed a latent that encodes nothing
+    and the sampler has nothing to walk towards.
+
+    So say so instead. A 400 naming the missing picture costs the caller one
+    request and tells them what to send; a grey mp4 answered 200 costs them
+    the whole catalogue entry and reads as "this model is broken", because
+    nothing in the response says a keyframe was required. Models that only
+    hold i2v weights belong in a catalogue as image_to_video, and this is how
+    one finds out which those are.
     """
     if type(pipe).__name__ != 'WanPipeline' or 'image' in kw:
         return pipe, mode
     if _wan_in_channels(pipe) != 36:
         return pipe, mode  # genuine t2v model — fine as-is
-    view = getattr(pipe, '_coderai_i2v_view', None)
-    if view is None:
-        try:
-            import inspect
-            from diffusers import WanImageToVideoPipeline
-            allowed = set(inspect.signature(WanImageToVideoPipeline.__init__).parameters)
-            comps = {k: v for k, v in pipe.components.items()
-                     if k in allowed and v is not None}
-            view = WanImageToVideoPipeline(**comps)
-            if getattr(pipe, '_coderai_accel', None) is not None:
-                view._coderai_accel = pipe._coderai_accel
-            pipe._coderai_i2v_view = view
-            print("  [video] model is image-to-video (transformer in_channels=36) but "
-                  "t2v was requested — seeding a neutral frame (prompt-driven)")
-        except Exception as e:
-            print(f"  [video] i2v fallback failed ({e}); attempting t2v as requested")
-            return pipe, mode
-    from PIL import Image as _Image
-    w = int(kw.get('width') or 512)
-    h = int(kw.get('height') or 512)
-    kw['image'] = _Image.new('RGB', (w, h), (128, 128, 128))
-    return view, 'ti2v'
+    raise VideoRequestMismatch(
+        "this model needs an input picture: its transformer is the "
+        "image-to-video one (36 in-channels), which cannot generate from a "
+        "prompt alone. Send `init_image` (or `image`) with mode 'i2v'/'ti2v'. "
+        "Running it without one returns a clip of grey noise, so it is "
+        "refused rather than served.")
 
 
 def _require_image_conditioning(pipe, mode: str):
@@ -3048,7 +3131,7 @@ def _require_image_conditioning(pipe, mode: str):
     if _pipeline_takes(pipe, 'image'):
         return
     cls = type(pipe).__name__
-    raise ValueError(
+    raise VideoRequestMismatch(
         f"{cls} takes no image, so a {mode} request cannot run on it. This is "
         f"the text-to-video class for this family; its image-to-video sibling "
         f"is the one that accepts a keyframe. Either the pipeline was chosen "
@@ -3206,6 +3289,18 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
             kw['video'], kw['mask'] = _build_vace_conditioning(
                 [_pil_from_b64(init_src)], total, w, h)
             kw['num_frames'] = total
+        elif mode == 'v2v' and getattr(request, 'video', None):
+            # The input clip IS the conditioning: VACE takes it as a control
+            # video (every frame reactive), which is what makes the edit follow
+            # the original's content and motion instead of inventing a clip.
+            total = _snap_wan_frames(new_frames)
+            _src = _frames_from_video_ref(request.video, w, h, total, temps=None)
+            if not _src:
+                raise VideoRequestMismatch(
+                    "mode 'v2v' needs a readable video in `video`; this one "
+                    "decoded to no frames")
+            kw['video'], kw['mask'] = _build_vace_control(_src, total, w, h)
+            kw['num_frames'] = total
         else:
             # Pure t2v on VACE: snap frame count, leave video/mask unset (free gen).
             kw['num_frames'] = _snap_wan_frames(new_frames)
@@ -3230,7 +3325,17 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
         kw.pop('prompt', None)
 
     elif mode == 'v2v' and request.video:
-        kw['video'] = _decode_b64_or_url(request.video)
+        # Frames, not the file's bytes: `video=` on a diffusers pipeline is a
+        # list of images, and the bytes were silently useless to every one of
+        # them.
+        _w = int(kw.get('width') or 512)
+        _h = int(kw.get('height') or 512)
+        kw['video'] = _frames_from_video_ref(
+            request.video, _w, _h, int(kw.get('num_frames') or 0) or 0)
+        if not kw['video']:
+            raise VideoRequestMismatch(
+                "mode 'v2v' needs a readable video in `video`; this one "
+                "decoded to no frames")
         if request.strength is not None:
             kw['strength'] = request.strength
 
@@ -3238,7 +3343,8 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
     # model's actual capability disagree (selecting the pipeline class by request
     # mode can mismatch the transformer's input channels):
     #   * ti2v/i2v request on a t2v model (16-ch) → run t2v, drop the keyframe.
-    #   * t2v request on an i2v model (36-ch)     → run i2v with a neutral seed frame.
+    #   * t2v request on an i2v model (36-ch)     → refused as a 400; a seeded
+    #     neutral frame was tried and produced grey noise, 200, thirty times.
     # Both rebuild a sibling pipeline that REUSES the same components, so fused
     # acceleration and per-request LoRAs on the shared transformer carry over.
     # The t2v/i2v fallbacks rebuild sibling Wan *I2V/T2V* pipelines (by transformer
@@ -3246,7 +3352,7 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
     # (video, mask) pair instead of an `image` kwarg.
     if not is_vace:
         pipe, mode = _maybe_t2v_fallback(pipe, kw, mode)
-        pipe, mode = _maybe_i2v_fallback(pipe, kw, mode)
+        pipe, mode = _refuse_t2v_on_an_i2v_model(pipe, kw, mode)
 
     # Per-request LoRA adapters (e.g. per-character identity LoRAs). Sync the
     # pipeline's adapters to this request's set, REUSING them if identical to the
@@ -4266,7 +4372,9 @@ def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list,
         # An explicit wav2lip binary still wins if the operator installed one.
         wav2lip_bin = shutil.which('wav2lip') or shutil.which('Wav2Lip')
         if wav2lip_bin:
-            cmd = [wav2lip_bin, '--face', video_path, '--audio', audio_path, '--outfile', out]
+            from codai.api.lipsync import wav2lip_extra_args
+            cmd = [wav2lip_bin, '--face', video_path, '--audio', audio_path,
+                   '--outfile', out, *wav2lip_extra_args()]
             r = subprocess.run(cmd, capture_output=True)
             if r.returncode == 0 and os.path.exists(out):
                 return out
@@ -4286,8 +4394,9 @@ def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list,
     elif method == 'sadtalker':
         sadtalker_bin = shutil.which('sadtalker')
         if sadtalker_bin:
+            from codai.api.lipsync import sadtalker_extra_args
             cmd = [sadtalker_bin, '--driven_audio', audio_path, '--source_video', video_path,
-                   '--result_dir', os.path.dirname(out)]
+                   '--result_dir', os.path.dirname(out), *sadtalker_extra_args()]
             r = subprocess.run(cmd, capture_output=True)
             if r.returncode == 0:
                 # Find output file
@@ -4861,6 +4970,35 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
             f"LongCat-Video does not support mode '{mode}'. Use 't2v', 'i2v', "
             f"'extend' (continuation), or 'at2v'/'ai2v' (audio-driven avatar)."))
 
+    # An avatar checkpoint is a DIFFERENT pipeline class upstream: it ships a
+    # transformer and an audio encoder, borrows tokenizer/text_encoder/vae from
+    # the base model, and exposes only the audio-driven methods. Asked for t2v
+    # or i2v it reached base methods that class does not have, which arrived at
+    # the client as a bare 500 with no body. Measured 2026-11-03 on
+    # 'longcat-avatar': 11 requests (t2v, i2v and nine style clips), every one
+    # "500 Internal Server Error" and nothing else.
+    #
+    # These weights CAN only be driven by audio, so the mode is the thing that
+    # is wrong, and that is answerable before anything loads.
+    _family = ""
+    try:
+        _family = lc.family_of(model_path, str(model_cfg.get("variant") or ""))
+    except Exception:                                            # noqa: BLE001
+        _family = ""
+    if _family and _task not in ("at2v", "ai2v"):
+        raise HTTPException(status_code=400, detail=(
+            f"'{model_name}' is a LongCat AVATAR checkpoint ({_family}): it is "
+            f"audio-driven and has no text-to-video or image-to-video pass. "
+            f"Use mode 'at2v' (prompt + `audio_file`) or 'ai2v' (plus a "
+            f"reference portrait in `init_image`). For a clip from a prompt "
+            f"alone, use the base LongCat-Video checkpoint."))
+    if not _family and _task in ("at2v", "ai2v"):
+        raise HTTPException(status_code=400, detail=(
+            f"mode '{mode}' is audio-driven and needs a LongCat AVATAR "
+            f"checkpoint; '{model_name}' is the base model, which has no audio "
+            f"encoder. Use mode 't2v'/'i2v'/'extend' here, or point this entry "
+            f"at LongCat-Video-Avatar(-1.5)."))
+
     # num_frames is the PER-CALL count (93 by default). A caller asking for more than
     # one call's worth gets the segment loop, server-side: the alternative is every
     # client reimplementing the chaining that LongCat does natively and better.
@@ -5046,13 +5184,19 @@ async def _generate_longcat(request: VideoGenerationRequest, model_name: str,
     try:
         data = await asyncio.to_thread(longcat_worker.generate, model_name, payload,
                                        model_cfg)
-    except Exception:
+    except Exception as _exc:
         if _cancelled["flag"]:
             task_registry.finish(_tid, "cancelled", "stopped on request")
             raise HTTPException(status_code=499,
                                 detail="LongCat generation cancelled") from None
         task_registry.finish(_tid, "error", "generation failed")
-        raise
+        # Say what the worker said. A bare `raise` of the worker's own
+        # RuntimeError reached FastAPI unhandled, and the client got
+        # "500 Internal Server Error" with no body -- the generation runs in
+        # another process, so its text is the only account of the failure
+        # anyone outside this box can see.
+        raise HTTPException(status_code=500, detail=(
+            f"LongCat generation failed ({mode}): {_exc}")) from None
     finally:
         _stop.set()
         _vid_progress_done()
@@ -5597,6 +5741,12 @@ async def video_generations(request: VideoGenerationRequest,
             print(f"  [video] generation ({_which}) FAILED for '{model_name}': "
                   f"{str(e).splitlines()[0] if str(e) else type(e).__name__}\n"
                   + _tb.format_exc())
+            # A request this model cannot serve, whatever the server does next.
+            # Answer it now: the ladder's remaining rungs reload several GB to
+            # ask the same question, and the pipeline that is up is healthy, so
+            # it stays loaded for the next caller instead of being torn down.
+            if isinstance(e, VideoRequestMismatch):
+                raise HTTPException(status_code=400, detail=str(e))
             _last_err = e
             e.__traceback__ = None  # drop NOW so the free below can reclaim VRAM
         # One-time self-heal: if a faster attention backend (flash/sage) is active and

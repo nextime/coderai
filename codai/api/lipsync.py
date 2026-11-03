@@ -159,6 +159,54 @@ def ensure_wav2lip(install_dir: Optional[Path] = None) -> Tuple[Path, Path]:
     return _ready
 
 
+#: Extra ``inference.py`` arguments for Wav2Lip, and why there is a default.
+#:
+#: Wav2Lip generates a 96x96 mouth region and composites it back over the
+#: detected face box. Upstream's default padding is ``0 10 0 0`` -- ten pixels
+#: of chin -- which is too little whenever the mouth is wide or the chin moves:
+#: the generated mouth does not cover the original one and BOTH are visible in
+#: the output, the synced mouth over the still one underneath.
+#:
+#: Measured 2026-11-03: "the lip sync is fantastic, but the generated mouth
+#: doesn't fully cover the original static mouth, so both show" (4/5). Twenty
+#: pixels of bottom padding is the fix upstream's own README recommends for
+#: exactly this, and it is what the demos use.
+#:
+#: ``CODERAI_WAV2LIP_PADS="top bottom left right"`` overrides it; empty passes
+#: nothing and leaves upstream's default in place.
+def wav2lip_extra_args() -> list:
+    """Padding (and anything else) to hand Wav2Lip's inference.py."""
+    raw = os.environ.get("CODERAI_WAV2LIP_PADS")
+    if raw is None:
+        raw = "0 20 0 0"
+    parts = [x for x in str(raw).replace(",", " ").split() if x]
+    if len(parts) != 4:
+        return []
+    return ["--pads", *parts]
+
+
+#: Extra ``inference.py`` arguments for SadTalker.
+#:
+#: SadTalker's ``--preprocess`` defaults to ``crop``, which renders -- and
+#: RETURNS -- only the cropped face. Measured 2026-11-03: good animation of the
+#: whole face, "but it crops the picture to a close-up of the face" (5/5 for the
+#: motion, wrong framing). ``full`` animates the same face and pastes it back
+#: into the original frame, which is what a caller who sent a framed portrait
+#: asked for.
+#:
+#: ``--still`` is NOT added: it suppresses head motion, and moving the whole
+#: head rather than only the mouth is the one thing SadTalker does that the
+#: video-driven engines do not. ``CODERAI_SADTALKER_ARGS`` overrides the lot
+#: (e.g. "--preprocess full --still" if the paste boundary shows on a
+#: particular source).
+def sadtalker_extra_args() -> list:
+    """Framing (and anything else) to hand SadTalker's inference.py."""
+    raw = os.environ.get("CODERAI_SADTALKER_ARGS")
+    if raw is None:
+        return ["--preprocess", "full"]
+    return [x for x in str(raw).split() if x]
+
+
 def run_wav2lip(video_path: str, audio_path: str, out_path: str,
                 timeout: int = 1800) -> str:
     """Lip-sync ``video_path`` to ``audio_path``. Returns ``out_path``.
@@ -172,7 +220,8 @@ def run_wav2lip(video_path: str, audio_path: str, out_path: str,
            "--checkpoint_path", str(ckpt),
            "--face", os.path.abspath(video_path),
            "--audio", os.path.abspath(audio_path),
-           "--outfile", os.path.abspath(out_path)]
+           "--outfile", os.path.abspath(out_path),
+           *wav2lip_extra_args()]
     # clean_py_env, not os.environ: this runs a python that is not this one,
     # and the PYTHONHOME the engine processes export kills a foreign
     # interpreter at startup ("No module named 'encodings'").
