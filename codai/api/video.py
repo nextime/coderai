@@ -3106,11 +3106,30 @@ def _refuse_t2v_on_an_i2v_model(pipe, kw, mode):
     if _wan_in_channels(pipe) != 36:
         return pipe, mode  # genuine t2v model — fine as-is
     raise VideoRequestMismatch(
-        "this model needs an input picture: its transformer is the "
-        "image-to-video one (36 in-channels), which cannot generate from a "
-        "prompt alone. Send `init_image` (or `image`) with mode 'i2v'/'ti2v'. "
-        "Running it without one returns a clip of grey noise, so it is "
-        "refused rather than served.")
+        f"this model needs an input picture: its transformer is the "
+        f"image-to-video one (36 in-channels), which cannot generate from a "
+        f"prompt alone, so mode {mode!r} cannot run on it. Send `init_image` "
+        f"(or `image`) with mode 'i2v'/'ti2v'. Without one the clip comes out "
+        f"as grey noise, so it is refused rather than served.")
+
+
+def _require_video_conditioning(pipe, mode: str):
+    """Refuse a video-conditioned run on a pipeline that takes no video.
+
+    The `video=` counterpart of :func:`_require_image_conditioning`, and it
+    arrived the same way: `WanImageToVideoPipeline.__call__() got an unexpected
+    keyword argument 'video'` from inside diffusers, minutes into a request,
+    with the weights up. Only the VACE class and the LTX/CogVideoX
+    video-to-video siblings take one; everything else in these families is
+    text- or image-conditioned and a v2v request on them cannot run.
+    """
+    if _pipeline_takes(pipe, 'video'):
+        return
+    raise VideoRequestMismatch(
+        f"{type(pipe).__name__} takes no video, so a {mode} request cannot run "
+        f"on it. This family's video-to-video work is done by a different "
+        f"pipeline (VACE for Wan); either this model is not one of them, or "
+        f"the installed diffusers has no video-to-video class for it.")
 
 
 def _require_image_conditioning(pipe, mode: str):
@@ -3348,6 +3367,7 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
         kw.pop('prompt', None)
 
     elif mode == 'v2v' and request.video:
+        _require_video_conditioning(pipe, mode)
         # Frames, not the file's bytes: `video=` on a diffusers pipeline is a
         # list of images, and the bytes were silently useless to every one of
         # them.

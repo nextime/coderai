@@ -115,3 +115,33 @@ def test_a_plain_v2v_pipeline_is_handed_frames_not_bytes():
     tail = src[i:i + 700]
     assert "_frames_from_video_ref" in tail
     assert "kw['video'] = _decode_b64_or_url" not in src
+
+
+# ------------------------------------- a pipeline that takes no video at all
+
+def test_a_pipeline_without_a_video_argument_refuses_in_a_sentence():
+    """16p's third symptom was `WanImageToVideoPipeline.__call__() got an
+    unexpected keyword argument 'video'`, from inside diffusers, minutes in.
+    The image side already answered that as a sentence; this is its twin."""
+    class _NoVideo:
+        def __call__(self, prompt=None, image=None):
+            pass
+    with pytest.raises(V.VideoRequestMismatch) as err:
+        V._require_video_conditioning(_NoVideo(), 'v2v')
+    assert "takes no video" in str(err.value)
+
+
+def test_a_pipeline_that_does_take_one_is_left_alone():
+    class _WithVideo:
+        def __call__(self, prompt=None, video=None, mask=None):
+            pass
+    V._require_video_conditioning(_WithVideo(), 'v2v')     # must not raise
+
+
+def test_the_v2v_branch_checks_before_decoding_the_clip():
+    """Decoding is the expensive half: a clip is written to disk and demuxed."""
+    src = inspect.getsource(V._generate_video)
+    i = src.index("elif mode == 'v2v' and request.video:")
+    window = src[i:i + 400]
+    assert window.index("_require_video_conditioning") < window.index(
+        "_frames_from_video_ref")
