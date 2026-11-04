@@ -225,6 +225,171 @@ def _split_lora_ref(ref: str):
     return ref, None
 
 
+def _lora_group_of(key: str) -> str:
+    """The sub-dictionary a converted LoRA key belongs to.
+
+    ``load_lora_weights`` splits a converted state dict by component prefix
+    (``transformer.``, ``connectors.``) and configures each group SEPARATELY,
+    so the alpha each one infers is its own. Normalising against a single
+    global alpha would therefore be right for one group and wrong for the
+    other.
+    """
+    return key.split(".", 1)[0]
+
+
+def _normalise_lora_scaling(sd: dict, owned: bool = False):
+    """Make peft's per-module LoRA scaling match what the checkpoint declares.
+
+    diffusers infers ONE ``lora_alpha`` for a whole adapter, and it infers it
+    from whichever module happens to come first in the state dict::
+
+        r = lora_alpha = list(rank_dict.values())[0]      # peft_utils.py
+
+    ``r`` is then recomputed to the most common rank and the rest go into
+    ``rank_pattern`` -- but ``lora_alpha`` is never revisited, and
+    ``alpha_pattern`` is filled in only from a ``network_alphas`` argument that
+    several loaders (LTX-2 among them) hard-code to ``None``. peft's scaling is
+    ``lora_alpha / r`` per module, so on any LoRA whose modules do not all share
+    one rank, every module whose rank differs from the first one's is scaled by
+    the wrong factor.
+
+    Measured 2026-11-04 on the two LTX-2.3 entries, whose checkpoints declare
+    ``alpha == rank`` for all 1660 modules -- i.e. a scale of exactly 1.0
+    everywhere:
+
+    ======================  =====  ==========  ==================
+    modules                 rank   got         wanted
+    ======================  =====  ==========  ==================
+    attention/ff body       384    **0.667**   1.0  (PinkCherry)
+    attention/ff body       256    1.0         1.0  (10Eros)
+    ``proj_in``/``proj_out``  128  **2.0**     1.0  (both)
+    ``*.to_gate_logits``     32    **8.0**     1.0  (both)
+    ======================  =====  ==========  ==================
+
+    PinkCherry's whole transformer body therefore received its distillation
+    LoRA at two thirds strength while its attention gate logits were driven
+    eight times too hard -- a gate logit saturates, so the attention branches
+    stop mixing. Run at the 8 steps the entry asks for, that is not a slightly
+    worse clip, it is a structurally broken one, and the two entries differ
+    only because 10Eros' most common rank happens to equal the rank of the
+    module diffusers picks the alpha from.
+
+    Two things are done about it, both to the converted dict rather than to
+    diffusers:
+
+    * **the non-peft keys come out.** A kohya/ComfyUI-style checkpoint carries
+      one ``<module>.alpha`` scalar per module. The Wan and Qwen converters
+      consume theirs; the LTX-2 converter passes them straight through, and
+      ``load_lora_weights`` then refuses the ENTIRE checkpoint, because its
+      format check is ``all("lora" in key)``. That is why 10Eros' LoRA never
+      loaded at all: a ValueError, caught and logged one layer up, leaving the
+      model un-distilled and still running 8 steps.
+    * **the scaling is baked into ``lora_B``.** Multiplying a module's up-
+      projection by ``declared_alpha / inferred_alpha`` makes peft's own
+      ``inferred_alpha / r`` come out at the declared ``declared_alpha / r``.
+      It needs no cooperation from the loader, survives ``set_adapters`` and
+      leaves ``acceleration.lora_weight`` as the single honest strength knob.
+
+    An absent ``.alpha`` means ``alpha == rank`` (scale 1.0), which is both the
+    peft default for a LoRA saved by peft itself and what these two files agree
+    on where one of them does say.
+
+    ``owned`` says the caller has no further use for ``sd`` and its entries may
+    be released as they are copied. These adapters are large -- PinkCherry's is
+    7.25 GB, and it is kept as a RUNTIME adapter rather than fused, so it stays
+    resident beside the transformer -- and holding the original and the rescaled
+    copy at once would transiently double that on a box that already has a
+    host-RAM ceiling. Callers that still need their dict (the tests) leave it
+    False and get an untouched input.
+
+    Returns ``(state_dict, note)`` -- a new dict, and a one-line summary for
+    the log, or None when nothing needed changing.
+    """
+    import collections as _c
+
+    import torch
+
+    out = {k: v for k, v in sd.items() if "lora" in k}
+    dropped = len(sd) - len(out)
+    # Per component group, in iteration order, exactly as the loader does it.
+    ranks: dict = {}
+    alphas: dict = {}
+    for k, v in sd.items():
+        if k.endswith(".alpha"):
+            try:
+                alphas[k[: -len(".alpha")]] = float(v)
+            except Exception:                              # noqa: BLE001
+                pass
+        elif "lora_B" in k and getattr(v, "ndim", 0) > 1:
+            ranks[k.split(".lora_B.")[0]] = int(v.shape[1])
+    if not ranks:
+        return out, (f"dropped {dropped} non-peft key(s)" if dropped else None)
+    inferred: dict = {}
+    for module, r in ranks.items():
+        inferred.setdefault(_lora_group_of(module), float(r))
+
+    scaled = _c.Counter()
+    for module, r in ranks.items():
+        base = inferred.get(_lora_group_of(module))
+        if not base:
+            continue
+        declared = alphas.get(module, float(r))
+        ratio = declared / base
+        if abs(ratio - 1.0) < 1e-9:
+            continue
+        # The bias, where one exists, is part of the same up-projection and
+        # peft scales it with the weight.
+        for suffix in (".lora_B.weight", ".lora_B.bias"):
+            key = module + suffix
+            t = out.get(key)
+            if t is None:
+                continue
+            out[key] = (t.to(torch.float32) * ratio).to(t.dtype)
+            if owned:
+                # The caller is done with it; drop the last reference to the
+                # original now rather than at the end of the loop.
+                del t
+                sd.pop(key, None)
+        scaled[round(ratio, 4)] += 1
+
+    bits = []
+    if dropped:
+        bits.append(f"dropped {dropped} non-peft key(s) diffusers would have "
+                    f"refused the whole checkpoint over")
+    if scaled:
+        worst = ", ".join(f"{n} module(s) by {rt:g}x"
+                          for rt, n in sorted(scaled.items()))
+        bits.append(f"corrected the scaling diffusers would have applied: "
+                    f"{worst}")
+    return out, ("; ".join(bits) if bits else None)
+
+
+def _prepared_lora(pipe, repo: str, weight_name):
+    """``(state_dict, note)`` for :func:`_normalise_lora_scaling`, or ``(None, _)``.
+
+    Reading the checkpoint here costs nothing extra: ``load_lora_weights``
+    calls the very same ``lora_state_dict`` on whatever it is given, and
+    handing it the resulting dict is a documented input. Any failure returns
+    None so the caller falls back to passing the reference through unchanged --
+    a LoRA that cannot be pre-read must still get its chance to load the old
+    way.
+    """
+    fn = getattr(type(pipe), "lora_state_dict", None)
+    if fn is None:
+        return None, None
+    try:
+        kw = {"weight_name": weight_name} if weight_name else {}
+        out = fn(repo, **kw)
+        sd = out[0] if isinstance(out, tuple) else out
+        if not isinstance(sd, dict) or not sd:
+            return None, None
+        return _normalise_lora_scaling(sd, owned=True)
+    except Exception as e:                                   # noqa: BLE001
+        log.info("[accel] could not pre-read %s (%s) — handing the reference "
+                 "to diffusers unchanged", repo, e)
+        return None, None
+
+
 #: Schedulers that parameterise a flow-matching trajectory. Swapping one of
 #: these for a DDPM-family scheduler (or the reverse) does not make a worse
 #: picture, it makes noise -- so both the request path (images._apply_sampler)
@@ -349,11 +514,18 @@ def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
     def _load_one(ref, into_t2: bool, adapter: str) -> bool:
         repo, weight_name = _split_lora_ref(ref)
         kw = {"adapter_name": adapter}
-        if weight_name:
-            kw["weight_name"] = weight_name
         if into_t2:
             kw["load_into_transformer_2"] = True
-        pipe.load_lora_weights(repo, **kw)
+        sd, note = _prepared_lora(pipe, repo, weight_name)
+        if sd is None:
+            if weight_name:
+                kw["weight_name"] = weight_name
+            pipe.load_lora_weights(repo, **kw)
+            return True
+        if note:
+            log.info("[accel] %s: %s", str(repo).rstrip("/").split("/")[-1],
+                     note)
+        pipe.load_lora_weights(sd, **kw)
         return True
 
     loaded_adapters = []
