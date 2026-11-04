@@ -3398,6 +3398,11 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
     # LoRA, or the ref failed to load), running 4 steps un-distilled collapses the
     # video to a solid colour — so fall back to a safe step count instead.
     _accel_fused = getattr(pipe, '_coderai_accel_fused', None)
+    # Snapshotted BEFORE any default is applied, because every block below uses
+    # setdefault: this is the only point at which "the client asked for this"
+    # and "something defaulted it" can still be told apart.
+    _steps_from_request = 'num_inference_steps' in kw
+    _cfg_from_request = 'guidance_scale' in kw
     if _accel and _accel_fused is not False:
         from codai.models.acceleration import accel_call_defaults
         for _k, _v in accel_call_defaults(_accel).items():
@@ -3460,6 +3465,34 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
     kw.setdefault('num_inference_steps', 25)
     kw.setdefault('guidance_scale', 7.5)
     kw.setdefault('num_frames', 16)
+
+    # The guard above announced "safe defaults (25 steps)" and then did not get
+    # them. It only declines to apply the PRESET's step count; the entry's own
+    # `defaults` are applied further down with setdefault, nothing had been set
+    # by then, so an entry that says `steps: 8` because it configures a distill
+    # LoRA still ran 8 steps after that LoRA failed to load -- un-distilled, at
+    # CFG 1.0, which is no classifier-free guidance either. That is the whole
+    # failure the guard exists to prevent, arriving one block later.
+    #
+    # Measured 2026-11-04: both LTX-2.3 entries. One scored 1.4/5 and the other
+    # 2.9/5 across a client's sweep, and neither had a working distill LoRA --
+    # see codai.models.acceleration._normalise_lora_scaling for why.
+    #
+    # The request still wins. A client that asks for 8 steps gets 8 steps; this
+    # only refuses to let a model CARD impose a step count that is only
+    # survivable with an adapter the model does not have.
+    if _accel and _accel_fused is False:
+        if not _steps_from_request and int(kw['num_inference_steps']) < 20:
+            print(f"  [video][accel] the entry's defaults ask for "
+                  f"{kw['num_inference_steps']} steps, which only works with "
+                  f"the distill LoRA that failed to load — running 25 instead",
+                  flush=True)
+            kw['num_inference_steps'] = 25
+        if not _cfg_from_request and float(kw['guidance_scale']) <= 1.0:
+            print(f"  [video][accel] CFG {kw['guidance_scale']} disables "
+                  f"classifier-free guidance, which only a distilled model "
+                  f"wants — running 7.5 instead", flush=True)
+            kw['guidance_scale'] = 7.5
 
     _vid_progress_reset(kw['num_inference_steps'])
 
