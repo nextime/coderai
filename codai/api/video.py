@@ -6022,12 +6022,23 @@ async def video_generations(request: VideoGenerationRequest,
     # and reload with the next, safer strategy, then retry generation. We return only
     # on the FIRST success, or 500 after EVERY rung is exhausted.
     #
-    # Fallback rungs are PLAIN device_map builds (incremental=False): no injected
-    # components, so device_map places everything itself — which sidesteps all the
+    # Fallback rungs pass incremental=False, which drops the per-component BNB
+    # cache so device_map can place those components itself — sidestepping the
     # injected-component failure modes (hook-based 'model' OOMs big forwards;
-    # 'sequential' hits a bnb Params4bit bug; device_map can't place injected
-    # components). With the monolithic cache finalized after the first build, these
-    # load the pre-quantized weights from cache (fast), not a fresh re-quantize.
+    # 'sequential' hits a bnb Params4bit bug; device_map cannot place an injected
+    # component). With the monolithic cache finalized after the first build,
+    # these load the pre-quantized weights from cache (fast), not a fresh
+    # re-quantize.
+    #
+    # It does NOT mean "no injected components". `use_incremental_cache` gates
+    # build_cached_components ALONE: build_gguf_pipeline_components runs on every
+    # rung, so a GGUF-backed entry still gets its GGUF transformer injected here
+    # and _load_video_pipeline still forces a hook strategy over the device_map
+    # one asked for. That is the behaviour we want -- it is what stops a rung
+    # from quietly serving the BASE transformer in place of a fine-tune whose
+    # only weights are a GGUF -- but the comment used to claim the opposite, and
+    # read as if an OOM fallback could silently swap the model out from under
+    # the request.
     import gc as _gc, traceback as _tb
     from codai.tasks import loading_task as _loading_task
     _loop = asyncio.get_event_loop()
