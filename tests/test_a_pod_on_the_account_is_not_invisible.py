@@ -78,12 +78,19 @@ def test_a_stopped_pod_is_not_listed_as_live(listing):
     assert "stopped" not in {r["pod_id"] for r in W.account_only_pod_rows(set())}
 
 
-def test_the_note_says_where_it_might_belong(listing):
-    note = W.account_only_pod_rows({"known1"})[0]["note"]
-    assert "billing" in note
-    assert "leak" in note, "an operator needs to know this may be nobody's pod"
-    assert "qwen38-b" in note, "the pod's own name is the first clue to its owner"
-    assert "coderai-vllm:latest" in note
+def test_the_row_carries_what_the_tooltip_needs(listing):
+    """The explanation moved out of the cell and into the tooltip, so the row
+    has to carry the pieces it is built from. The pod's own NAME is the first
+    clue to which orchestrator owns it, and the image is the second.
+
+    (The sentence itself is asserted where it is now assembled --
+    test_the_long_explanation_survives_as_a_tooltip.)
+    """
+    r = W.account_only_pod_rows({"known1"})[0]
+    assert r["pod_name"] == "qwen38-b"
+    assert r["image"] == "coderai-vllm:latest"
+    assert r["phase"] == "RUNNING"
+    assert r["console_url"], "the console link is the fallback for a pod we do not own"
 
 
 def test_it_offers_a_console_link(listing):
@@ -217,3 +224,160 @@ def test_the_pod_count_tile_keeps_them_separate():
     i = PAGE.rindex("rp-podcount")
     body = PAGE[max(0, i - 900):i + 400]
     assert "unmanaged" in body
+
+
+# ── a row for a pod that does not exist is worse than a missing row ──────────
+
+PHANTOMS = [
+    {"id": "nostatus", "name": "ghost", "status": "", "cost_per_hr": 0.9},
+    {"id": "nokeys", "name": "ghost2", "cost_per_hr": 0.9},
+    {"id": "weird", "name": "ghost3", "status": "DEAD", "cost_per_hr": 0.9},
+    {"id": "weird2", "name": "ghost4", "status": "PAUSED", "cost_per_hr": 0.9},
+    {"id": "terminated", "name": "ghost5", "status": "TERMINATED",
+     "cost_per_hr": 0.9},
+    {"id": "failed", "name": "ghost6", "status": "FAILED", "cost_per_hr": 0.9},
+]
+
+
+@pytest.mark.parametrize("pod", PHANTOMS, ids=lambda p: str(p.get("status")))
+def test_only_an_affirmatively_live_pod_gets_a_row(monkeypatch, pod):
+    """The first cut tested `if status and status != "RUNNING"`, which lets an
+    empty or unrecognised status through -- and `_v2_pod_row` passes an unmapped
+    phase straight into that field while `_v2_pods` returns every pod the API
+    still lists, console or no console. The result was a row for a pod that does
+    not exist: it cannot be found in the console, and Take down on it reports
+    "already gone", which reads as a broken button."""
+    monkeypatch.setattr(W, "account_listing", lambda force=False: [dict(pod)])
+    assert W.account_only_pod_rows(set()) == [], (
+        f"status {pod.get('status')!r} produced a row")
+
+
+def test_a_running_pod_is_still_listed(monkeypatch):
+    """The filter must not have become so strict that it shows nothing."""
+    monkeypatch.setattr(W, "account_listing",
+                        lambda force=False: [dict(ACCOUNT[1])])
+    assert [r["pod_id"] for r in W.account_only_pod_rows(set())] == ["strange"]
+
+
+def test_a_skipped_pod_is_named_in_the_log(monkeypatch, capsys):
+    """Silently dropping it would make an unexpected status indistinguishable
+    from an empty account."""
+    monkeypatch.setattr(W, "account_listing",
+                        lambda force=False: [dict(PHANTOMS[2])])
+    W.account_only_pod_rows(set())
+    out = capsys.readouterr().out
+    assert "weird" in out and "DEAD" in out
+
+
+# ── the note goes in a table cell, not a paragraph ───────────────────────────
+
+def test_the_note_is_short_enough_for_a_cell(listing):
+    """The first version was a whole sentence and the Health column stretched
+    until the table no longer fit the page. The long form is the tooltip."""
+    r = W.account_only_pod_rows({"known1"})[0]
+    assert len(r["note"]) <= 60, f"{len(r['note'])} chars in a table cell"
+    assert r["note"] == "qwen38-b"
+    # The pieces the tooltip is built from travel separately.
+    assert r["pod_name"] == "qwen38-b"
+    assert r["image"] == "coderai-vllm:latest"
+    assert r["phase"] == "RUNNING"
+
+
+def test_a_pod_with_no_name_still_says_something(monkeypatch):
+    monkeypatch.setattr(W, "account_listing", lambda force=False: [
+        {"id": "x", "status": "RUNNING", "cost_per_hr": 1.0,
+         "image": "ghcr.io/x/coderai-vllm:latest"}])
+    assert W.account_only_pod_rows(set())[0]["note"] == "coderai-vllm:latest"
+    monkeypatch.setattr(W, "account_listing", lambda force=False: [
+        {"id": "y", "status": "RUNNING", "cost_per_hr": 1.0}])
+    assert W.account_only_pod_rows(set())[0]["note"] == "no name reported"
+
+
+# ── terminating one must make the row go away ────────────────────────────────
+
+def test_forget_account_listing_drops_the_cache():
+    W._account_cache["pods"] = list(ACCOUNT)
+    W._account_cache["at"] = 1e12
+    W.forget_account_listing()
+    assert W._account_cache["pods"] is None
+    assert W._account_cache["at"] == 0.0
+
+
+def test_the_release_endpoint_forgets_the_listing():
+    """Without this the next refresh re-renders the row from a snapshot up to
+    ACCOUNT_LISTING_TTL_S old -- the pod is gone and the row is still there,
+    which is indistinguishable from the button not working. An `unmanaged` row
+    exists ONLY because of that cache, so it is the case that shows it."""
+    from codai.admin import routes
+    src = inspect.getsource(routes.api_runpod_pod_release)
+    assert "forget_account_listing" in src
+
+
+def test_terminating_an_unmanaged_pod_actually_clears_it(monkeypatch):
+    """End to end over the two caches: release, then the next listing must not
+    serve the stale row."""
+    from codai.admin import routes
+    monkeypatch.setattr(W, "release_pod",
+                        lambda pod_id, reason="x": {"terminated": True})
+    W._account_cache["pods"] = list(ACCOUNT)
+    W._account_cache["at"] = 1e12
+    assert W.account_only_pod_rows({"known1"})          # the row is there
+    asyncio.run(routes.api_runpod_pod_release(payload={"pod_id": "strange"},
+                                              username="root"))
+    assert W._account_cache["pods"] is None, "the stale listing survived"
+
+
+# ── the cell itself ──────────────────────────────────────────────────────────
+
+import shutil          # noqa: E402
+import subprocess      # noqa: E402
+
+needs_node = pytest.mark.skipif(not shutil.which("node"),
+                                reason="node is not installed")
+
+
+def _fn(name):
+    m = re.search(r"^function %s\(.*?^}" % re.escape(name), PAGE, re.S | re.M)
+    assert m, f"{name}() is gone from the page"
+    return m.group(0)
+
+
+def _cell(tmp_path, pod):
+    js = tmp_path / "h.js"
+    js.write_text(_fn("_attr") + "\n" + _fn("_healthCell")
+                  + "\nconsole.log(_healthCell(%s));" % __import__("json").dumps(pod),
+                  encoding="utf-8")
+    r = subprocess.run(["node", str(js)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr.strip()[:600]
+    return r.stdout
+
+
+@needs_node
+def test_the_cell_is_width_capped_and_short(tmp_path):
+    out = _cell(tmp_path, {"state": "unmanaged", "note": "qwen38-prod-2",
+                           "pod_name": "qwen38-prod-2",
+                           "image": "coderai-vllm:latest"})
+    assert "max-width" in out and "text-overflow:ellipsis" in out
+    visible = re.sub(r"<[^>]*>", "", out).strip()
+    assert len(visible) < 50, f"{len(visible)} chars of visible text in the cell"
+    assert "unmanaged" in visible and "qwen38-prod-2" in visible
+
+
+@needs_node
+def test_the_long_explanation_survives_as_a_tooltip(tmp_path):
+    out = _cell(tmp_path, {"state": "unmanaged", "note": "n", "pod_name": "n",
+                           "image": "i"})
+    assert "title=" in out
+    assert "leak" in out and "billing" in out
+
+
+@needs_node
+def test_a_quote_in_a_pod_name_cannot_break_out_of_the_tooltip(tmp_path):
+    """A pod name and an image tag are operator-supplied; an unescaped quote
+    would close the attribute and whatever followed would be parsed as markup."""
+    out = _cell(tmp_path, {"state": "unmanaged", "note": "x",
+                           "pod_name": 'a" onmouseover="alert(1)',
+                           "image": "<img src=x>"})
+    assert 'onmouseover="alert(1)"' not in out
+    assert "&quot;" in out
+    assert "<img src=x>" not in out

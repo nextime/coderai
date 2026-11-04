@@ -201,6 +201,15 @@ function _servedCell(p){
     ? `<div style="font-size:10px;color:var(--text-3)">${tok.join(' · ')} tok</div>` : '');
 }
 
+/* Text going into an HTML ATTRIBUTE. A pod name and an image tag are
+   operator- and registry-supplied, so an unescaped quote would close the
+   attribute early and whatever followed would be parsed as markup. */
+function _attr(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /* A pod is not just up or down. PARKED is the state that must never be quiet:
    it means the pod is rented and billing while belonging to no pool, so
    nothing routes work to it and nothing reaps it either. It exists so an
@@ -220,8 +229,20 @@ function _healthCell(p){
     // this row will ever mention. The take-down button works on it: release_pod
     // terminates whatever the account is running under that id whether or not
     // a pool here has heard of it.
-    return `<span style="color:#ef4444">unmanaged</span>`
-      + (p.note ? `<div style="font-size:10px;color:var(--text-3)">${p.note}</div>` : '');
+    // WIDTH-CAPPED. The first version put the whole explanation in the cell
+    // and the Health column stretched until the table no longer fit the page.
+    // The cell now carries the pod's name (or its image) and nothing else; the
+    // full sentence is the tooltip, so nothing is lost by shortening it.
+    const why = `On the RunPod account and billing, but no pool, boot or `
+      + `registry entry here knows it`
+      + (p.pod_name ? ` — named ${p.pod_name}` : '')
+      + (p.image ? `, running ${p.image}` : '')
+      + `. Another orchestrator on this account may own it; if none does, it `
+      + `is a leak. Take down terminates it whatever rented it.`;
+    return `<span style="color:#ef4444" title="${_attr(why)}">unmanaged</span>`
+      + (p.note ? `<div title="${_attr(why)}" style="font-size:10px;color:var(--text-3);`
+                + `max-width:16rem;overflow:hidden;text-overflow:ellipsis;`
+                + `white-space:nowrap">${p.note}</div>` : '');
   }
   if (p.state === 'unowned') {
     // In the registry, held by no pool, billing. It gets the loudest colour on

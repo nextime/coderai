@@ -7331,6 +7331,24 @@ def account_listing(force: bool = False) -> list:
     return list(pods)
 
 
+#: The statuses that mean "this pod exists and is on the meter". `_V2_STATUS`
+#: already folds PROVISIONING and STARTING into RUNNING, so one word covers a
+#: booting pod too -- and a booting pod is billing, which is the point.
+_ACCOUNT_LIVE_STATUSES = frozenset({"RUNNING"})
+
+
+def forget_account_listing() -> None:
+    """Drop the cached account listing.
+
+    Called after a termination: without it the page re-renders from a listing
+    up to ACCOUNT_LISTING_TTL_S old and the row an operator just acted on is
+    still there, which is indistinguishable from the button not working.
+    """
+    with _account_lock:
+        _account_cache["pods"] = None
+        _account_cache["at"] = 0.0
+
+
 def account_only_pod_rows(known_ids) -> list:
     """Rows for pods the ACCOUNT is billing that NO local source knows about.
 
@@ -7352,8 +7370,18 @@ def account_only_pod_rows(known_ids) -> list:
     live-rate tile would make the two hosts' pages disagree about the same
     account. It is reported as its own figure instead.
 
-    Only pods the account considers RUNNING: a stopped pod bills storage, not
-    compute, and listing it as live would be its own kind of wrong.
+    Only pods the account AFFIRMATIVELY reports as live. The first cut tested
+    ``if status and status != "RUNNING"``, which lets a pod with an empty or
+    unrecognised status through -- and `_v2_pod_row` passes an unmapped phase
+    straight into that field, while `_v2_pods` returns every pod the API still
+    lists, including ones the console has stopped showing. The result was a row
+    for a pod that does not exist: an operator cannot find it in the console,
+    and pressing Take down on it reports "already gone", which reads as the
+    button being broken. A pod this page invents is worse than a pod it misses,
+    so the test is now "the API says one of these words" and nothing else gets
+    a row. The raw phase travels in the note, so a pod skipped for an
+    unexpected status is still diagnosable from the log rather than silently
+    absent.
     """
     known = {str(k) for k in (known_ids or ()) if k}
     # pods_status binds its own `_console` as a LOCAL, so it is not reachable
@@ -7370,7 +7398,12 @@ def account_only_pod_rows(known_ids) -> list:
         if not pid or pid in known:
             continue
         status = str(p.get("status") or "").upper()
-        if status and status != "RUNNING":
+        phase = str(p.get("phase") or "").upper()
+        if status not in _ACCOUNT_LIVE_STATUSES:
+            if status or phase:
+                print(f"[runpod] account pod {pid} not listed on the pods page: "
+                      f"status={status or '(none)'!r} phase={phase or '(none)'!r}",
+                      flush=True)
             continue
         rate = float(p.get("cost_per_hr") or 0.0)
         up = p.get("uptime_s")
@@ -7382,13 +7415,16 @@ def account_only_pod_rows(known_ids) -> list:
             "uptime_s": int(up),
             "live_cost_usd": round(up / 3600.0 * rate, 4),
             "console_url": _console_url(pid), "state": "unmanaged",
-            "note": ("on the RunPod account and billing, but no pool, boot or "
-                     "registry entry here knows it"
-                     + (f" — named {p.get('name')!r}" if p.get("name") else "")
-                     + (f", running {str(p.get('image') or '').split('/')[-1]}"
-                        if p.get("image") else "")
-                     + ". Another orchestrator on this account may own it; if "
-                       "none does, it is a leak."),
+            # SHORT. This lands in a table cell, and the first version was a
+            # whole paragraph that stretched the Health column until the table
+            # no longer fit the page. The long form is the cell's tooltip,
+            # built on the page from these fields.
+            "note": (str(p.get("name") or "").strip()
+                     or str(p.get("image") or "").split("/")[-1]
+                     or "no name reported"),
+            "pod_name": str(p.get("name") or ""),
+            "image": str(p.get("image") or "").split("/")[-1],
+            "phase": status,
         })
     return out
 

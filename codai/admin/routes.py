@@ -5613,6 +5613,15 @@ async def api_runpod_pod_release(payload: dict = Body(...),
         pod_telemetry.forget(pod_id)
     except Exception:
         pass
+    # And the account listing, or the next refresh re-renders the row from a
+    # snapshot up to ACCOUNT_LISTING_TTL_S old. The pod is gone and the row is
+    # still there, which is indistinguishable from the button not working --
+    # especially for an `unmanaged` row, whose whole existence comes from that
+    # cache.
+    try:
+        runpod_worker.forget_account_listing()
+    except Exception:
+        pass
     return {"success": True, **(out or {})}
 
 
