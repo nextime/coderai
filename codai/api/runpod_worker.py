@@ -7289,6 +7289,110 @@ def held_pod_endpoints() -> list:
     return out
 
 
+#: How long the account listing is reused. The stats page polls every 10s and
+#: every open tab polls separately, so without a TTL this would spend one REST
+#: read per tab per 10s out of a quota that renting and boot-polling need --
+#: and a 429 there stops the fleet scaling (see codai.api.runpod_client).
+#: Two minutes: a pod nobody here manages is not a fast-moving fact.
+ACCOUNT_LISTING_TTL_S = float(
+    os.environ.get("CODERAI_RUNPOD_ACCOUNT_TTL", "120"))
+
+_account_cache = {"at": 0.0, "pods": None}
+_account_lock = threading.Lock()
+
+
+def account_listing(force: bool = False) -> list:
+    """The account's pods, cached. ``[]`` when RunPod cannot be asked.
+
+    Blocking (a REST read); always call it off the event loop.
+    """
+    with _account_lock:
+        hit = _account_cache["pods"]
+        fresh = (hit is not None
+                 and (time.time() - _account_cache["at"]) < ACCOUNT_LISTING_TTL_S)
+    if fresh and not force:
+        return list(hit)
+    from codai.models.manager import get_active_runpod_config
+    acct = get_active_runpod_config()
+    if acct is None or not getattr(acct, "enabled", False):
+        return []
+    try:
+        from codai.api.runpod_client import RunpodClient
+        pods = RunpodClient(acct).list_pods() or []
+    except Exception as exc:                   # noqa: BLE001 - decoration only
+        # Never fatal. This augments a page whose spend figures must stay right
+        # even when the API is refusing reads.
+        print(f"[runpod] account listing unavailable ({exc}); the pods page "
+              f"shows what this process manages", flush=True)
+        return list(hit) if hit is not None else []
+    with _account_lock:
+        _account_cache["pods"] = list(pods)
+        _account_cache["at"] = time.time()
+    return list(pods)
+
+
+def account_only_pod_rows(known_ids) -> list:
+    """Rows for pods the ACCOUNT is billing that NO local source knows about.
+
+    `pods_status` has four sources and all of them are local: the pools, the
+    provisioning list, this process's registry file and the parked set. That is
+    the whole fleet only when one orchestrator rents on the account. It is not:
+    a second host rents on the same account and keeps its own registry file, so
+    its pods are invisible here -- and so is a pod left behind by a process
+    whose registry entry was lost, which is the case that costs money.
+
+    The registry source was added for exactly this symptom once already ("the
+    account billed four pods while this page showed two") and it closed only
+    the half where the pod was ours. The authoritative answer is the account
+    listing, which is also what `reconcile_pools` and the reaper decide from --
+    never a probe, because a pod that does not answer is still billing.
+
+    Deliberately NOT folded into this host's rate or ledger: a pod another
+    orchestrator rents is its spend, not ours, and quietly adding it to the
+    live-rate tile would make the two hosts' pages disagree about the same
+    account. It is reported as its own figure instead.
+
+    Only pods the account considers RUNNING: a stopped pod bills storage, not
+    compute, and listing it as live would be its own kind of wrong.
+    """
+    known = {str(k) for k in (known_ids or ()) if k}
+    # pods_status binds its own `_console` as a LOCAL, so it is not reachable
+    # from here; import the helper itself. Best-effort, like there: a console
+    # deep-link that cannot be built must not cost the row.
+    try:
+        from codai.api.runpod_client import pod_console_url as _console_url
+    except Exception:                          # noqa: BLE001
+        def _console_url(_pid):
+            return ""
+    out = []
+    for p in account_listing():
+        pid = str(p.get("id") or "")
+        if not pid or pid in known:
+            continue
+        status = str(p.get("status") or "").upper()
+        if status and status != "RUNNING":
+            continue
+        rate = float(p.get("cost_per_hr") or 0.0)
+        up = p.get("uptime_s")
+        up = float(up) if isinstance(up, (int, float)) else 0.0
+        out.append({
+            "model": "", "pod_id": pid,
+            "gpu": str(p.get("gpu") or p.get("gpu_display_name") or ""),
+            "healthy": False, "inflight": 0, "hourly_usd": rate,
+            "uptime_s": int(up),
+            "live_cost_usd": round(up / 3600.0 * rate, 4),
+            "console_url": _console_url(pid), "state": "unmanaged",
+            "note": ("on the RunPod account and billing, but no pool, boot or "
+                     "registry entry here knows it"
+                     + (f" — named {p.get('name')!r}" if p.get("name") else "")
+                     + (f", running {str(p.get('image') or '').split('/')[-1]}"
+                        if p.get("image") else "")
+                     + ". Another orchestrator on this account may own it; if "
+                       "none does, it is a leak."),
+        })
+    return out
+
+
 def pods_status() -> list:
     """Snapshot of all pods across pools for the stats/tasks pages.
 

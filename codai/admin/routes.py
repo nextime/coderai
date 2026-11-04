@@ -17,6 +17,7 @@
 """Admin dashboard routes."""
 from pathlib import Path
 import asyncio
+import functools
 import re
 import shutil
 from typing import Optional
@@ -5499,14 +5500,42 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
         got = telemetry.get(row.get("pod_id"))
         if got:
             row.update(got)
+    # Pods the ACCOUNT is billing that no local source knows about. Every one of
+    # pods_status's four sources is local -- pools, provisioning, this process's
+    # registry file, parked -- so a second orchestrator renting on the same
+    # account is invisible here, and so is a pod orphaned by a process whose
+    # registry entry was lost. That second case is a leak, and this page is
+    # where it has to surface. Cached for 2 minutes inside account_listing(),
+    # because a page that polls every 10s must not spend the quota that renting
+    # depends on. Best-effort: if RunPod cannot be asked, the page still shows
+    # what this process manages and the spend figures below are unaffected.
+    account_only = await _part(
+        functools.partial(runpod_worker.account_only_pod_rows,
+                          {r.get("pod_id") for r in pods if r.get("pod_id")}),
+        [])
+    pods = list(pods) + list(account_only or [])
     # Every pod in the listing: RunPod bills from creation, and a pod spends
     # ~12 minutes booting without ever being healthy. Counting only healthy
     # pods showed $0.59 against an account billing $4.72 on 2026-10-18, which
     # is the admin page telling an operator a booting fleet is free.
+    # THE RATE IS ACCOUNT-WIDE, including pods nothing here manages. It was
+    # briefly filtered to this host's own pods, on the reasoning that another
+    # orchestrator's spend is not ours -- which is true of the LEDGER and false
+    # of the meter. This figure exists because it once read $0.59/hr against an
+    # account billing $4.72, and a client polling it concluded nothing was being
+    # spent and kept feeding work. A pod is billing whoever rented it, so
+    # excluding it here would recreate exactly that understatement by a new
+    # route. The attribution is reported separately instead.
     live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods)
     serving_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods
                          if p.get("healthy"))
-    live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
+    unmanaged_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods
+                           if p.get("state") == "unmanaged")
+    # The uncommitted figure IS a ledger concept -- "running, not yet billed to
+    # the ledger" -- and this host's ledger will never bill a pod another
+    # orchestrator rented. So this one is ours alone.
+    live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods
+                    if p.get("state") != "unmanaged")
     cfg = config_manager.config.runpod if config_manager and config_manager.config else None
     caps = {}
     if cfg is not None:
@@ -5519,7 +5548,10 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
             "live_hourly_usd": round(live_hourly, 4),
             "live_hourly_serving_usd": round(serving_hourly, 4),
             "live_hourly_booting_usd": round(live_hourly - serving_hourly, 4),
-            "live_uncommitted_usd": round(live_cost, 4)}
+            "live_uncommitted_usd": round(live_cost, 4),
+            "unmanaged_count": sum(1 for p in pods
+                                   if p.get("state") == "unmanaged"),
+            "unmanaged_hourly_usd": round(unmanaged_hourly, 4)}
 
 
 @router.get("/admin/api/runpod/pod-logs", summary="Fetch a RunPod pod's container/vLLM logs")

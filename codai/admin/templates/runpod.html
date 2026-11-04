@@ -212,6 +212,17 @@ function _healthCell(p){
     return `<span style="color:#f59e0b">parked</span>`
       + (p.note ? `<div style="font-size:10px;color:var(--text-3)">${p.note}</div>` : '');
   }
+  if (p.state === 'unmanaged') {
+    // On the RunPod ACCOUNT and billing, but no pool, boot or registry entry
+    // here knows it. Either another orchestrator on this account owns it --
+    // zeiss and the Digesta host rent from the same account and each keeps its
+    // own registry file -- or nothing does, and then it is a leak that only
+    // this row will ever mention. The take-down button works on it: release_pod
+    // terminates whatever the account is running under that id whether or not
+    // a pool here has heard of it.
+    return `<span style="color:#ef4444">unmanaged</span>`
+      + (p.note ? `<div style="font-size:10px;color:var(--text-3)">${p.note}</div>` : '');
+  }
   if (p.state === 'unowned') {
     // In the registry, held by no pool, billing. It gets the loudest colour on
     // the page because it is the row nothing else would have mentioned: the
@@ -252,7 +263,8 @@ function _killCell(p){
   // becomes a syntax error, which is a broken button on exactly the page
   // someone opens when a pod is already misbehaving.
   _rpRows[p.pod_id] = p;
-  const loud = (p.state === 'unowned' || p.state === 'parked');
+  const loud = (p.state === 'unowned' || p.state === 'parked'
+                || p.state === 'unmanaged');
   return `<button class="btn btn-secondary" style="font-size:11px;padding:.15rem .45rem;white-space:nowrap${
     loud ? ';border-color:#ef4444;color:#ef4444' : ''}"
     onclick="rpRelease('${p.pod_id}')"
@@ -324,7 +336,13 @@ async function rpRefresh(){
   document.getElementById('rp-disabled').style.display = caps.enabled ? 'none' : '';
   const pods = d.pods || [];
   const running = pods.filter(p=>p.healthy);
-  document.getElementById('rp-podcount').textContent = running.length + (pods.length>running.length ? ` (+${pods.length-running.length} unhealthy)` : '');
+  // Counted apart: an unmanaged pod is neither healthy-and-serving nor
+  // unhealthy-and-ours, and lumping it into either makes this tile lie.
+  const unmanaged = pods.filter(p=>p.state==='unmanaged').length;
+  const others = pods.length - running.length - unmanaged;
+  document.getElementById('rp-podcount').textContent = running.length
+    + (others>0 ? ` (+${others} unhealthy)` : '')
+    + (unmanaged>0 ? ` (+${unmanaged} unmanaged)` : '');
   // What the pods now running have served between them. Pods that have already
   // been released are not in this listing, so this is the live fleet's work,
   // not the account's history -- the ledger below is the history.
@@ -339,8 +357,15 @@ async function rpRefresh(){
   // too steep, and that was invisible while the figure excluded them.
   const boot = d.live_hourly_booting_usd || 0;
   const capTxt = caps.global_max_hourly_usd ? ('cap ' + _usd(caps.global_max_hourly_usd) + '/hr') : 'no rate cap';
-  document.getElementById('rp-rate-cap').textContent =
-    boot > 0 ? (capTxt + ' · ' + _usd(boot) + '/hr still booting') : capTxt;
+  // The rate above is ACCOUNT-WIDE: a pod bills whoever rented it, and this
+  // figure exists because it once read $0.59/hr against an account billing
+  // $4.72. So pods nothing here manages are counted in it, and attributed
+  // here rather than filtered out of it.
+  const unm = d.unmanaged_hourly_usd || 0;
+  document.getElementById('rp-rate-cap').textContent = capTxt
+    + (boot > 0 ? ' · ' + _usd(boot) + '/hr still booting' : '')
+    + (unm > 0 ? ' · of which ' + _usd(unm)
+                 + '/hr on pods nothing here manages' : '');
   document.getElementById('rp-uncommitted').textContent = _usd(d.live_uncommitted_usd);
   const gperiod = caps.global_cost_period || 'unlimited';
   const gspend = (d.ledger && d.ledger.global && gperiod!=='unlimited') ? d.ledger.global[gperiod] : null;
