@@ -2207,11 +2207,33 @@ async def talking_head_cancel(job_id: str, _auth=Depends(_require_api_auth)):
     return await compose_cancel(job_id, _auth)
 
 
-@router.get("/v1/video/presenter/engines", summary="Installed lip-sync engines",
-            tags=["Video"])
-async def presenter_engines(_auth=Depends(_require_api_auth)):
-    """What a presenter can be driven with here — so a client can grey out the
-    feature instead of discovering a 501 at submission."""
+# What `/v1/video/presenter/engines` last answered, and when.
+#
+# The probe behind it is far more expensive than it looks: `missing_pieces()`
+# runs `_pip_ok()` for every managed engine that is not installed, and that
+# SPAWNS A PYTHON INTERPRETER per engine to try the imports. On a polled
+# endpoint, on the event loop, that measured 0.9-1.3 s per call for a client
+# while the server was busy and about 5 s at peaks, against 0.04 s for
+# /v1/models (2026-11-03). A client's create page waits for it.
+#
+# Nothing it reports changes without an operator installing an engine, so it is
+# answered from memory and refreshed in a thread. `invalidate_engine_cache()`
+# drops it the moment an install finishes, so a fresh engine never waits out
+# the TTL.
+_ENGINES_TTL = float(os.environ.get("CODERAI_PRESENTER_ENGINES_TTL", "300"))
+_engines_cache = {"at": 0.0, "payload": None}
+_engines_lock = threading.Lock()
+
+
+def invalidate_engine_cache():
+    """Forget the cached engine listing (an install or removal changed it)."""
+    with _engines_lock:
+        _engines_cache["at"] = 0.0
+        _engines_cache["payload"] = None
+
+
+def _probe_presenter_engines():
+    """The filesystem/subprocess probe. Never call this on the event loop."""
     from codai.compose import presenter as _pres
     have = _pres.available_engines()
     try:
@@ -2240,6 +2262,28 @@ async def presenter_engines(_auth=Depends(_require_api_auth)):
             # a client greys out that toggle on its own.
             "matting_engine": matte, "remove_background": bool(matte),
             "talking_head_max_seconds": TALKING_HEAD_MAX_SECONDS}
+
+
+@router.get("/v1/video/presenter/engines", summary="Installed lip-sync engines",
+            tags=["Video"])
+async def presenter_engines(_auth=Depends(_require_api_auth)):
+    """What a presenter can be driven with here — so a client can grey out the
+    feature instead of discovering a 501 at submission.
+
+    Answered from a short-lived cache, and probed in a thread on a miss: see
+    the note above `_probe_presenter_engines`.
+    """
+    with _engines_lock:
+        _hit = _engines_cache["payload"]
+        _fresh = _hit is not None and (time.time() - _engines_cache["at"]) < _ENGINES_TTL
+    if _fresh:
+        return _hit
+    payload = await asyncio.get_event_loop().run_in_executor(
+        None, _probe_presenter_engines)
+    with _engines_lock:
+        _engines_cache["payload"] = payload
+        _engines_cache["at"] = time.time()
+    return payload
 
 
 @router.get("/v1/video/compose", summary="List composition jobs", tags=["Video"])

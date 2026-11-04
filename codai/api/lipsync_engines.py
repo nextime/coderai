@@ -935,6 +935,16 @@ def start_install(name: str) -> dict:
             finally:
                 with _install_lock:
                     job["finished"] = time.time()
+                # /v1/video/presenter/engines answers from a cache (its probe
+                # spawns an interpreter per engine), so a finished install has
+                # to say so rather than wait out the TTL. Either outcome
+                # changes the listing: a success adds the engine, a failure
+                # changes what it is short of.
+                try:
+                    from codai.api.compose import invalidate_engine_cache
+                    invalidate_engine_cache()
+                except Exception:
+                    pass
 
         t = threading.Thread(target=_run, name=f"install-{sp.name}", daemon=True)
         job["thread"] = t
@@ -977,6 +987,13 @@ def uninstall(name: str, keep_weights: bool = False) -> dict:
         else:
             shutil.rmtree(root, ignore_errors=True)
             removed.append(str(root))
+    # The presenter listing is cached; an engine that is gone has to stop being
+    # advertised now, not in five minutes.
+    try:
+        from codai.api.compose import invalidate_engine_cache
+        invalidate_engine_cache()
+    except Exception:
+        pass
     return {"name": sp.name, "removed": removed,
             "state": install_state(sp.name)}
 
