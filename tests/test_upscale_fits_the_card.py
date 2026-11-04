@@ -126,12 +126,27 @@ def test_a_non_square_picture_keeps_its_aspect():
 
 
 def test_both_diffusers_backends_honour_the_scale():
+    """Both fixed-factor pipelines must return through `_to_requested_scale`.
+
+    They now share one branch and one return -- the x2 and x4 pipelines differ
+    only in the call itself, since both are fed through
+    `_prepare_upscaler_input` first -- so the guarantee is structural: there is
+    a single exit and it resamples to the requested scale.
+    """
     i = SRC.index('def _run_upscale(upscaler, image_bytes: bytes, scale: int):')
     body = SRC[i:SRC.index('\ndef ', i + 10)]
-    for backend in ("backend == 'diffusers_latent'", "backend == 'diffusers'"):
-        j = body.index(backend)
-        branch = body[j:body.index('return', j) + 80]
-        assert '_to_requested_scale' in branch, backend
+    j = body.index("backend in ('diffusers_latent', 'diffusers')")
+    branch = body[j:]
+    assert "backend == 'diffusers_latent'" in branch, (
+        "the latent pipeline needs guidance_scale=0; it cannot share the call")
+    assert branch.count('_to_requested_scale') == 1
+    assert '_prepare_upscaler_input' in branch, (
+        "a fixed-factor pipeline must be fed the input that yields the "
+        "requested output, not the caller's full-size picture")
+    # And the scale is measured against the ORIGINAL picture, not the shrunken
+    # input handed to the model.
+    k = branch.index('_to_requested_scale')
+    assert 'result.images[0], img, scale' in branch[k:k + 80]
 
 
 def test_the_gan_backend_still_scales_through_the_model():

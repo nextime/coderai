@@ -4640,6 +4640,83 @@ def _to_requested_scale(out_img, src_img, scale: int):
     return out_img.resize(want, PILImage.LANCZOS)
 
 
+# How large an input a diffusers upscaler may be handed, per side.
+#
+# These pipelines denoise at the OUTPUT resolution, so their peak is set by the
+# picture rather than by the checkpoint, and it grows with the square of the
+# input side. The x4 model was trained on 128px inputs; at 1024px in, one
+# allocation asks for 9.00 GiB and dies on a 24 GB card with the server's own
+# weights resident (measured 2026-11-03: "Tried to allocate 9.00 GiB ... 5.26
+# GiB is free ... this process has 17.98 GiB in use"), tiled VAE and sliced
+# attention notwithstanding -- those bound the decode, not the UNet.
+# Per backend, because the two pipelines are not equally expensive at the same
+# output size: the x4 model concatenates the low-res image into its UNet input
+# and upcasts the VAE to float32, and it is the one that died at a 1024px
+# input. The latent x2 upscaler ran the same 2048px output on the same card in
+# the same sweep and was rated 5/5, so it is NOT capped -- a cap there would
+# make a working path resample for no reason. 0 or unset means no cap.
+_UPSCALER_MAX_INPUT_PX = {
+    'diffusers': int(os.environ.get("CODERAI_UPSCALER_MAX_INPUT_PX", "640")),
+    'diffusers_latent': int(
+        os.environ.get("CODERAI_LATENT_UPSCALER_MAX_INPUT_PX", "0")),
+}
+
+
+def _upscaler_input_cap(backend: str) -> int:
+    """Largest input side this backend may be handed; 0 for no limit."""
+    try:
+        return int(_UPSCALER_MAX_INPUT_PX.get(backend) or 0)
+    except Exception:
+        return 0
+
+
+def _native_upscale_factor(backend: str) -> int:
+    """The factor these pipelines are built around, whatever `scale` says."""
+    return 2 if backend == 'diffusers_latent' else 4
+
+
+def _prepare_upscaler_input(img, backend: str, scale: int):
+    """Shrink the input so the model's fixed-factor output IS what was asked for.
+
+    The ratio is baked into these pipelines, so a x2 request on the x4 model
+    used to upscale to x4 and LANCZOS the result back down -- paying four times
+    the memory for detail it then threw away, which is how a x2 of a 1024px
+    picture came to ask for 9 GiB. Feeding it `target / factor` instead gets the
+    requested size out of the model directly, at a quarter of the peak, with no
+    resampling after it at all.
+
+    Returns ``(image_to_run, note)``; `note` is None when nothing was changed.
+    """
+    from PIL import Image as PILImage
+    factor = _native_upscale_factor(backend)
+    w, h = img.size
+    if not scale or scale < 1:
+        scale = factor
+    # The size the caller asked for, and the input that produces it exactly.
+    want_w, want_h = w * scale, h * scale
+    in_w, in_h = max(1, round(want_w / factor)), max(1, round(want_h / factor))
+    # Still too big for one pass: run the model on what fits and resample the
+    # (genuinely super-resolved) result the rest of the way, which is what the
+    # old code did for the whole gap. Refusing instead would answer a question
+    # nobody asked -- the caller wants the picture bigger, not a lecture.
+    cap = _upscaler_input_cap(backend)
+    note = None
+    if cap and max(in_w, in_h) > cap:
+        _r = cap / float(max(in_w, in_h))
+        in_w, in_h = max(1, int(in_w * _r)), max(1, int(in_h * _r))
+        note = (f"input capped at {cap}px per side for the upscaler "
+                f"(see _UPSCALER_MAX_INPUT_PX); the model ran at "
+                f"{in_w}x{in_h} -> {in_w * factor}x{in_h * factor} and the "
+                f"result was resampled to {want_w}x{want_h}")
+    elif (in_w, in_h) != (w, h):
+        note = (f"ran the x{factor} model at {in_w}x{in_h} instead of {w}x{h} "
+                f"so its fixed x{factor} output is the requested "
+                f"{want_w}x{want_h} directly")
+    run_img = img if (in_w, in_h) == (w, h) else img.resize(
+        (in_w, in_h), PILImage.LANCZOS)
+    return run_img, note
+
+
 def _run_upscale(upscaler, image_bytes: bytes, scale: int):
     from PIL import Image as PILImage
     import numpy as np, io as _io
@@ -4648,14 +4725,19 @@ def _run_upscale(upscaler, image_bytes: bytes, scale: int):
     if backend == 'realesrgan':
         out_arr, _ = model.enhance(np.array(img), outscale=scale)
         return PILImage.fromarray(out_arr)
-    if backend == 'diffusers_latent':
-        # Latent upscaler: fixed ×2; needs guidance_scale=0 for an unconditioned
-        # detail-preserving upscale of an arbitrary input image.
-        result = model(prompt="", image=img, num_inference_steps=20,
-                       guidance_scale=0)
-        return _to_requested_scale(result.images[0], img, scale)
-    if backend == 'diffusers':
-        result = model(prompt="", image=img, num_inference_steps=20)
+    if backend in ('diffusers_latent', 'diffusers'):
+        run_img, _note = _prepare_upscaler_input(img, backend, scale)
+        if _note:
+            print(f"  [upscale] {_note}", flush=True)
+        if backend == 'diffusers_latent':
+            # Latent upscaler: fixed x2; needs guidance_scale=0 for an
+            # unconditioned detail-preserving upscale of an arbitrary input.
+            result = model(prompt="", image=run_img, num_inference_steps=20,
+                           guidance_scale=0)
+        else:
+            result = model(prompt="", image=run_img, num_inference_steps=20)
+        # Measured against the ORIGINAL, not the shrunken input: `scale` is what
+        # the caller asked of their own picture.
         return _to_requested_scale(result.images[0], img, scale)
     # PIL fallback
     w, h = img.size
