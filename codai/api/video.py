@@ -543,6 +543,14 @@ def _effective_mode(request) -> str:
     return 't2v'
 
 
+# The modes that are driven by a still picture, and so need a family's
+# image-to-video class rather than its text-to-video one. `interp` belongs here
+# as much as i2v does -- it is conditioned on two frames -- and leaving it out
+# picked the text-to-video class for a request that then passed `image=`, i.e.
+# the mismatch `_effective_mode` exists to prevent, one mode further along.
+_IMAGE_CONDITIONED_MODES = ('i2v', 'ti2v', 'interp')
+
+
 def _detect_pipeline_class(model_name: str, mode: str):
     """Return the appropriate diffusers pipeline class."""
     n = model_name.lower()
@@ -555,7 +563,8 @@ def _detect_pipeline_class(model_name: str, mode: str):
             AnimateDiffPipeline,
         )
         if 'cogvideox' in n or 'cogvideo' in n:
-            return CogVideoXImageToVideoPipeline if (mode in ('i2v', 'ti2v')) else CogVideoXPipeline
+            return (CogVideoXImageToVideoPipeline
+                    if (mode in _IMAGE_CONDITIONED_MODES) else CogVideoXPipeline)
         if 'ltx' in n:
             # LTX-2.x is a DIFFERENT architecture from LTX-Video 0.9, with its
             # own pipeline, transformer, video VAE and -- uniquely among the
@@ -571,9 +580,10 @@ def _detect_pipeline_class(model_name: str, mode: str):
             # this readable at all.
             if re.search(r'ltx[-_ ]?2|2\.[0-9]', n):
                 from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
-                return (LTX2ImageToVideoPipeline if mode in ('i2v', 'ti2v')
-                        else LTX2Pipeline)
-            return LTXImageToVideoPipeline if (mode in ('i2v', 'ti2v')) else LTXPipeline
+                return (LTX2ImageToVideoPipeline
+                        if mode in _IMAGE_CONDITIONED_MODES else LTX2Pipeline)
+            return (LTXImageToVideoPipeline
+                    if (mode in _IMAGE_CONDITIONED_MODES) else LTXPipeline)
         if 'svd' in n or 'stable-video-diffusion' in n:
             return StableVideoDiffusionPipeline
         if 'i2vgen' in n:
@@ -591,9 +601,22 @@ def _detect_pipeline_class(model_name: str, mode: str):
                     return WanVACEPipeline
                 except ImportError:
                     pass
+            # Wan has a dedicated video-to-video pipeline, and it is NOT VACE:
+            # WanVideoToVideoPipeline takes `video` + `strength` over exactly
+            # the components WanPipeline uses (tokenizer, text encoder,
+            # transformer, VAE, scheduler). Without this the mode fell through
+            # to the t2v/i2v classes, which take no video at all, and a v2v
+            # request on a plain Wan entry was refused for a capability the
+            # installed diffusers has had all along.
+            if mode == 'v2v':
+                try:
+                    from diffusers import WanVideoToVideoPipeline
+                    return WanVideoToVideoPipeline
+                except ImportError:
+                    pass
             # Wan ships separate t2v and i2v transformers; pick the i2v pipeline
             # for the keyframe bridge when an init image is supplied.
-            if mode in ('i2v', 'ti2v'):
+            if mode in _IMAGE_CONDITIONED_MODES:
                 try:
                     from diffusers import WanImageToVideoPipeline
                     return WanImageToVideoPipeline
@@ -3040,6 +3063,85 @@ def _wan_in_channels(pipe):
     return None
 
 
+def _wan_in_channels_on_disk(model_name: str, model_cfg: dict = None):
+    """The same 16-vs-36 answer as :func:`_wan_in_channels`, from the config file.
+
+    A transformer's ``in_channels`` is written in its ``config.json``, which is
+    a few hundred bytes next to many gigabytes of weights. Reading it is what
+    lets the grey-noise refusal (:func:`_refuse_t2v_on_an_i2v_model`) happen
+    before the load instead of after it: measured 2026-11-03, that refusal cost
+    a client **1394 s** on a cold Wan2.2-I2V-A14B, every second of it spent
+    loading weights for a request that was already known to be unserveable.
+
+    Returns None when the file cannot be found — a repo id that is not in the
+    cache yet, a single-file checkpoint, a layout without the subfolder — and
+    the post-load guard then answers as before. Never raises: a failure here
+    must cost nothing more than the old behaviour.
+    """
+    import json as _json
+    cands = []
+    _p = (model_cfg or {}).get('path') or model_name
+    for _base in (_p, model_name):
+        if not _base or not isinstance(_base, str):
+            continue
+        if os.path.isdir(_base):
+            cands.append(_base)
+    # A Hub id resolves to its snapshot only if it is already downloaded; asking
+    # must not reach the network (this runs on the request path).
+    for _base in (_p, model_name):
+        if not _base or not isinstance(_base, str) or os.path.isdir(_base):
+            continue
+        try:
+            from huggingface_hub import snapshot_download
+            cands.append(snapshot_download(_base, local_files_only=True))
+        except Exception:
+            pass
+    for _root in cands:
+        for _sub in ('transformer', 'transformer_2', ''):
+            try:
+                _f = os.path.join(_root, _sub, 'config.json') if _sub else \
+                    os.path.join(_root, 'config.json')
+                if not os.path.isfile(_f):
+                    continue
+                with open(_f, 'r') as fh:
+                    _ic = _json.load(fh).get('in_channels')
+                if _ic:
+                    return int(_ic)
+            except Exception:
+                continue
+    return None
+
+
+def _refuse_t2v_on_an_i2v_model_before_loading(model_name: str, mode: str,
+                                               model_cfg: dict = None):
+    """The pre-load half of :func:`_refuse_t2v_on_an_i2v_model`.
+
+    Returns a sentence when this is a Wan text-to-video request against
+    image-to-video weights, which is the one case where the class is right and
+    the checkpoint behind it is not. Answers only when the config file settles
+    it; silence here means the post-load guard decides, as it always did.
+    """
+    if _conditioning_kwarg_for(mode) == 'image':
+        return None  # a picture is coming — not this case
+    n = (model_name or '').lower()
+    if 'wan' not in n or 'vace' in n:
+        return None
+    if _wan_in_channels_on_disk(model_name, model_cfg) != 36:
+        return None
+    _extra = ("Video-to-video on Wan needs either the text-to-video "
+              "architecture (16 in-channels) or a VACE model, which conditions "
+              "on a control video. "
+              if mode == 'v2v' else
+              "Without one the clip comes out as grey noise, so it is refused "
+              "rather than served. ")
+    return (
+        f"this model needs an input picture: its transformer is the "
+        f"image-to-video one (36 in-channels), which cannot generate from a "
+        f"prompt alone, so mode {mode!r} cannot run on it. Send `init_image` "
+        f"(or `image`) with mode 'i2v'/'ti2v'. " + _extra +
+        f"Refused from the checkpoint's config, before the weights are loaded.")
+
+
 def _maybe_t2v_fallback(pipe, kw, mode):
     """If an image-to-video Wan pipeline is backed by a text-to-video transformer
     (16 in-channels), rebuild it as a plain WanPipeline that REUSES the same
@@ -3128,8 +3230,11 @@ def _require_video_conditioning(pipe, mode: str):
     raise VideoRequestMismatch(
         f"{type(pipe).__name__} takes no video, so a {mode} request cannot run "
         f"on it. This family's video-to-video work is done by a different "
-        f"pipeline (VACE for Wan); either this model is not one of them, or "
-        f"the installed diffusers has no video-to-video class for it.")
+        f"pipeline -- for Wan, WanVideoToVideoPipeline or a VACE model -- so "
+        f"either this model is not one of those, or the installed diffusers "
+        f"has no video-to-video class for this family at all (as for LTX-2.x, "
+        f"whose only classes are text-to-video, image-to-video and latent "
+        f"upsampling).")
 
 
 def _require_image_conditioning(pipe, mode: str):
@@ -3165,12 +3270,116 @@ def _pipeline_takes(pipe, name: str) -> bool:
     it has never heard of fails at call time rather than at setup — the most
     expensive moment possible, because the weights are already loaded.
     """
+    return _class_takes(type(pipe), name)
+
+
+def _class_takes(cls, name: str) -> bool:
+    """True when this pipeline CLASS accepts ``name`` as a call keyword.
+
+    The class answers the same question as :func:`_pipeline_takes` without an
+    instance, which is what lets the mode be checked against the class the
+    loader is ABOUT to build — before the weights, not after them. See
+    :func:`_mode_is_servable_by_class`.
+    """
     import inspect
     try:
-        params = inspect.signature(type(pipe).__call__).parameters
-    except (TypeError, ValueError):
+        params = inspect.signature(cls.__call__).parameters
+    except (TypeError, ValueError, AttributeError):
         return False
     return name in params
+
+
+def _conditioning_kwarg_for(mode: str):
+    """Which call keyword this mode is carried by, or None if it needs none."""
+    if mode in _IMAGE_CONDITIONED_MODES:
+        return 'image'
+    if mode == 'v2v':
+        return 'video'
+    return None
+
+
+def _mode_is_servable_by_class(model_name: str, mode: str):
+    """``None`` when this mode can run on the class chosen for it, else why not.
+
+    The same question :func:`_require_image_conditioning` and
+    :func:`_require_video_conditioning` answer, asked of the CLASS before the
+    load instead of the instance after it. Measured 2026-11-03 on a client
+    sweep: an LTX-2.5 video-to-video request was refused — correctly — after
+    **2099 s**, and an LTX-2.3 fine-tune after 1439 s, because the refusal
+    waited for an instance to inspect. The class is decided by
+    :func:`_detect_pipeline_class` from the name and the mode alone, so nothing
+    about those two refusals needed the weights: both are knowable in
+    microseconds.
+
+    Only answers for the families whose class this module picks itself. A
+    ``DiffusionPipeline`` fallback means the class is decided by the
+    checkpoint's own ``model_index.json`` at load time, which genuinely cannot
+    be read from here — those still fall through to the post-load guards.
+    """
+    need = _conditioning_kwarg_for(mode)
+    if not need:
+        return None
+    try:
+        cls = _detect_pipeline_class(model_name, mode)
+    except Exception:
+        return None
+    if cls is None:
+        return None
+    try:
+        from diffusers import DiffusionPipeline
+        if cls is DiffusionPipeline:
+            return None
+    except ImportError:
+        pass
+    if _class_takes(cls, need):
+        return None
+    return (
+        f"{cls.__name__} takes no {need}, so a {mode} request cannot run on "
+        f"'{model_name}'. That is the class this family uses for this mode, so "
+        f"no retry and no smaller size changes it — refused before loading the "
+        f"weights rather than after. "
+        + ("This family's video-to-video work is done by a different pipeline "
+           "-- for Wan, WanVideoToVideoPipeline or a VACE model -- so either "
+           "this model is not one of those, or the installed diffusers has no "
+           "video-to-video class for this family at all (as for LTX-2.x)."
+           if need == 'video' else
+           "Either the model has no image-to-video sibling in the installed "
+           "diffusers, or this checkpoint is not the one to send a keyframe to."))
+
+
+def _warm_pipe_cannot_serve(pipe, model_name: str, mode: str) -> bool:
+    """True when the RESIDENT pipeline is the wrong class for this request.
+
+    A loaded pipeline is cached under the model key alone — the mode is not
+    part of it — so the class that is up is whichever mode asked first. Wan
+    ships separate text-to-video and image-to-video transformers behind
+    separate pipeline classes, and the same catalogue entry serves both, so the
+    two modes genuinely need two different classes over the same weights.
+
+    Measured 2026-11-03, the sequence that made this visible: a text-to-video
+    request on Wan2.2-I2V-A14B loads ``WanPipeline``, is refused (its
+    transformer is the 36-channel image-to-video one — see
+    :func:`_refuse_t2v_on_an_i2v_model`) and leaves that pipeline warm on
+    purpose, because it is healthy. Every ``i2v`` request after it then reused
+    the warm ``WanPipeline`` without loading anything and was refused in 0 s
+    with "WanPipeline takes no image" — so one bad request made the model serve
+    nothing at all until something else evicted it. The picture was there and
+    the right class was installed; only the cache lookup was mode-blind.
+
+    Reload is the answer rather than refusal: the request is serveable, just
+    not by what happens to be resident.
+    """
+    need = _conditioning_kwarg_for(mode)
+    if not need or _pipeline_takes(pipe, need):
+        return False
+    try:
+        want = _detect_pipeline_class(model_name, mode)
+    except Exception:
+        return False
+    # Only when a DIFFERENT class exists that does take it. If the sibling
+    # cannot serve the mode either, this is a genuine mismatch and belongs to
+    # the guards above, which say so in a sentence.
+    return bool(want) and want is not type(pipe) and _class_takes(want, need)
 
 
 def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
@@ -3343,6 +3552,20 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
                     "decoded to no frames")
             kw['video'], kw['mask'] = _build_vace_control(_src, total, w, h)
             kw['num_frames'] = total
+            # How tightly to hold the control video. At VACE's default (1.0) the
+            # clip's structure wins where it conflicts with the prompt, which is
+            # the right default for "restyle this" and the wrong one for a
+            # prompt meant to change the scene: measured 2026-11-03, "make it a
+            # snowy winter day" restyled the people and kept the layout, with no
+            # snow on the ground. Lowering it gives the prompt more room, at the
+            # cost of following the original less closely.
+            _cs = getattr(request, 'control_strength', None)
+            if _cs is None:
+                _defaults = (model_cfg or {}).get('defaults')
+                if isinstance(_defaults, dict):
+                    _cs = _defaults.get('control_strength')
+            if _cs is not None and _pipeline_takes(pipe, 'conditioning_scale'):
+                kw['conditioning_scale'] = float(_cs)
         else:
             # Pure t2v on VACE: snap frame count, leave video/mask unset (free gen).
             kw['num_frames'] = _snap_wan_frames(new_frames)
@@ -3379,8 +3602,18 @@ def _generate_video(pipe, request: VideoGenerationRequest, model_name: str = "",
             raise VideoRequestMismatch(
                 "mode 'v2v' needs a readable video in `video`; this one "
                 "decoded to no frames")
-        if request.strength is not None:
+        if request.strength is not None and _pipeline_takes(pipe, 'strength'):
             kw['strength'] = request.strength
+        # A video-to-video pipeline takes its length from the clip it was given,
+        # and WanVideoToVideoPipeline -- the class that makes plain Wan v2v work
+        # at all -- has no `num_frames` argument. Passing it anyway is the
+        # unexpected-keyword failure this module keeps paying for, so the frame
+        # count is dropped where it means nothing. The frames themselves were
+        # already sampled across the whole clip above.
+        if 'num_frames' in kw and not _pipeline_takes(pipe, 'num_frames'):
+            print(f"  [video] {type(pipe).__name__} takes its length from the "
+                  f"input clip ({len(kw['video'])} frames) — dropping "
+                  f"num_frames={kw.pop('num_frames')}", flush=True)
 
     # Graceful pipeline/model fallbacks for Wan, in case the requested mode and the
     # model's actual capability disagree (selecting the pipeline class by request
@@ -5518,6 +5751,47 @@ async def video_generations(request: VideoGenerationRequest,
     # (where it used to be set) is skipped, which caused an UnboundLocalError
     # ("cannot access local variable 'device'") in the retry.
     device = _derive_device()
+
+    # Refuse what this model's class for this mode cannot serve BEFORE the
+    # weights. The post-load guards still stand (a checkpoint's own class, and
+    # the 36-channel transformer question, are only knowable with it up), but
+    # everything decided by the pipeline class is decided here, in microseconds,
+    # instead of after a 20-35 minute cold load.
+    _is_gguf_video = False
+    try:
+        from codai.api.images import _is_gguf_model as _igm
+        _is_gguf_video = bool(_igm(model_name))
+    except Exception:
+        _is_gguf_video = False
+    if not _is_gguf_video:
+        _why = _mode_is_servable_by_class(model_name, _effective_mode(request))
+        if _why:
+            raise HTTPException(status_code=400, detail=_why)
+        _why = _refuse_t2v_on_an_i2v_model_before_loading(
+            model_name, _effective_mode(request), _model_cfg)
+        if _why:
+            raise HTTPException(status_code=400, detail=_why)
+
+        # A resident pipeline is cached under the model alone, so the class that
+        # is up is whichever mode asked first. When it is the wrong one for this
+        # request and the right one exists, reload instead of refusing: see
+        # _warm_pipe_cannot_serve for the sequence that left three Wan entries
+        # serving nothing at all.
+        if pipe is not None and _warm_pipe_cannot_serve(
+                pipe, model_name, _effective_mode(request)):
+            print(f"  [video] resident {type(pipe).__name__} cannot serve mode "
+                  f"'{_effective_mode(request)}' — reloading "
+                  f"'{model_name}' with the class that can", flush=True)
+            multi_model_manager.models.pop(model_key, None)
+            multi_model_manager.model_pools.pop(model_key, None)
+            _stale = pipe
+            pipe = None
+            # Off the loop: freeing a video pipeline walks every component and
+            # can take minutes (the teardown note at the ladder below). On one
+            # line, because the no-teardown-on-the-loop guard in
+            # tests/test_video_mode_is_derived_once.py reads it line by line.
+            _ev_loop = asyncio.get_event_loop()
+            await _ev_loop.run_in_executor(None, _free_pipeline_vram, _stale)
 
     if pipe is None:
         _offload = _model_cfg.get('offload_strategy') or None

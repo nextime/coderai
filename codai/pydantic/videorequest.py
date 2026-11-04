@@ -89,6 +89,17 @@ class VideoGenerationRequest(BaseModel):
     end_image: Optional[str] = Field(None, description="Last frame, for 'interp' mode (base64 or URL).")
     video: Optional[str] = Field(None, description="Input video for v2v / audio manipulation (base64 or URL).")
     strength: Optional[float] = Field(None, description="Denoising strength for v2v (0–1).")
+    # How tightly a control video is followed, on the models that take one
+    # (VACE's `conditioning_scale`). 1.0 -- the pipeline default -- holds the
+    # input clip's structure so firmly that a prompt asking for a changed
+    # scene is outvoted by it: measured 2026-11-03, a winter prompt restyled
+    # the people in a summer clip and added no snow. Lower values hand the
+    # prompt more of the picture and follow the original less closely.
+    control_strength: Optional[float] = Field(None, description=(
+        "How closely a v2v/control run follows the input video, on models that "
+        "take a control video (VACE). 1.0 is the pipeline default and holds the "
+        "original's layout and motion tightly; lower it (e.g. 0.5-0.8) when the "
+        "prompt is meant to change the scene and not just restyle it."))
     # LongCat-Video's coarse-to-fine stages. The model generates in three passes — base
     # 480p, a distilled 16-step pass, then a 720p refinement that takes the earlier
     # frames as input — so a caller either picks a preset and lets the server run the
