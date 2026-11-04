@@ -112,7 +112,22 @@ def _get_swapper():
         _ensure_model()
         from insightface.model_zoo import get_model
         _swapper = get_model(_INSWAPPER_MODEL_PATH, download=False)
-        _swapper.prepare(ctx_id=0)
+        # INSwapper is NOT prepared the way a FaceAnalysis app is. `prepare()`
+        # belongs to FaceAnalysis; INSwapper builds its ONNX session in
+        # __init__ and is then used straight through
+        # `get(img, target_face, source_face, paste_back=True)`. Calling it
+        # here cost every face swap a 500 -- "'INSwapper' object has no
+        # attribute 'prepare'" (measured 2026-11-03, 34 s in, right after the
+        # model finally downloaded, so the fetch fix uncovered this one).
+        # insightface's other model_zoo classes DO have it, so call it only
+        # where it exists rather than dropping it outright.
+        _prepare = getattr(_swapper, 'prepare', None)
+        if callable(_prepare):
+            try:
+                _prepare(ctx_id=0)
+            except Exception as e:
+                print(f'[faceswap] {type(_swapper).__name__}.prepare() failed, '
+                      f'continuing without it: {e}', flush=True)
     return _swapper
 
 
