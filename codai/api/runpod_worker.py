@@ -3627,8 +3627,42 @@ class RunpodPodPool:
         try:
             narrow = narrow_gpu_choice(self.mcfg, **(self.client_gpu_narrow() or {}))
             want_gpus = list(narrow.get("gpu_types") or [])
+            allow_other = bool(narrow.get("allow_other_gpus"))
         except Exception:
             want_gpus = list(getattr(self.mcfg, "gpu_types", []) or [])
+            allow_other = bool(getattr(self.mcfg, "allow_other_gpus", False))
+        if allow_other and want_gpus:
+            # A POD ALREADY RENTED IS NOT A CARD CHOICE ANY MORE.
+            #
+            # The card check below asks "is this the card we prefer?", and for
+            # renting that is the right question. For ADOPTION the question is
+            # "would this configuration have taken this pod?" -- and with
+            # allow_other_gpus on, it already did: that is exactly how a pod
+            # ends up on a fallback card, rented by this pool when none of its
+            # preferred ones were free.
+            #
+            # Refusing it is expensive twice over. The survivor keeps billing
+            # outside the pool until the reaper's grace expires, and the pool
+            # rents a FRESH pod beside it in the meantime -- a 6-14 minute boot
+            # paid again, at double rate through the overlap, on every restart.
+            # Measured on the Digesta host 2026-11-04 across three restarts in
+            # one hour: "not adopting pod lc4uzl4h8ujhw5: it runs on RTX A6000,
+            # this pool asks for NVIDIA A40", repeating every 15s, for a pod
+            # that pool had rented itself.
+            #
+            # This is the same doctrine `_adopt_survivors` already applies to
+            # the floor and the cap -- "they are already paid for, so they are
+            # adopted whatever the floor or the cap say". The card is the same
+            # kind of fact, and it was the one exemption nobody made.
+            #
+            # With allow_other_gpus OFF the check stands: the operator said they
+            # would rather wait than take another card, and adopting one would
+            # quietly serve from hardware they refused.
+            print(f"[runpod] {self.model_key!r} accepts cards beyond its "
+                  f"preference, so adoption does not filter on the card: a "
+                  f"surviving pod on a fallback card is one this pool rented "
+                  f"and is already paying for", flush=True)
+            want_gpus = []
         with self._cv:
             held = {str(p.pod_id) for p in self.pods}
         shared_id, shared_url, shared_key, shared_rate = find_shared_pod(

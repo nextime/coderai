@@ -15,6 +15,21 @@ and nothing about what the pod was RUNNING, so two silent mistakes were possible
 
 So both are recorded at creation and both are checked before adopting, and an
 entry that records neither is refused rather than trusted.
+
+ONE EXCEPTION, added 2026-11-04. The card check is dropped when the pool's own
+config says `allow_other_gpus` -- because then the pod on the "fallback" card is
+one THIS pool rented, and the question for adoption is not "is this the card we
+prefer?" but "would this configuration have taken it?". Refusing cost real
+money: on the Digesta host a surviving qwen38 pod on an RTX A6000 was refused 86
+times in 19 minutes by the A40-preferring pool that had rented it, then reaped
+("billed ~$0.467 ... not tracked by any pool"), while the warm floor rented a
+fresh pod beside it.
+
+The protection in the second bullet is untouched, because it is about a LEASE
+that asked for an A40 and nothing else -- and a caller may turn
+`allow_other_gpus` off but never on (see `narrow_gpu_choice`), so exactly that
+lease still gets the strict filter. See
+tests/test_a_fallback_card_can_be_adopted_back.py.
 """
 import json
 import pathlib
@@ -129,9 +144,28 @@ def test_a_re_registration_keeps_them(monkeypatch, tmp_path):
 
 def test_the_pool_passes_both_when_it_adopts():
     """Pinned against the source: the checks are only worth anything if the one
-    caller actually uses them."""
-    src = (ROOT / "codai/api/runpod_worker.py").read_text()
-    blk = src.split("def _adopt_shared_pod")[1][:3500]
+    caller actually uses them.
+
+    Read with inspect rather than a byte window off the file. The window was
+    3500 characters and the call sits at 4384 now that the exception above is
+    explained next to it -- so the test failed while the call was intact, which
+    is the least useful way for a test to fail.
+    """
+    import inspect
+    blk = inspect.getsource(rw.RunpodPodPool._adopt_shared_pod)
     assert "image=want_image, gpus=want_gpus" in blk
     assert 'want_image = str(plan.get("image") or "")' in blk
     assert "narrow_gpu_choice(self.mcfg" in blk
+
+
+def test_the_card_check_is_dropped_only_when_other_cards_are_allowed():
+    """The exception, pinned the same way: it must be conditional on the
+    setting, not unconditional."""
+    import inspect
+    blk = inspect.getsource(rw.RunpodPodPool._adopt_shared_pod)
+    assert "if allow_other and want_gpus:" in blk, (
+        "the card filter must be dropped only when the pool allows other cards")
+    i = blk.index("if allow_other and want_gpus:")
+    assert "want_gpus = []" in blk[i:i + 2500]
+    # The image filter is NOT part of the exception.
+    assert "want_image = []" not in blk and "want_image = \"\"" not in blk[i:]
