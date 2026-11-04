@@ -159,10 +159,21 @@ def _is_gguf_value(v) -> bool:
 
 
 def _normalize_quant_mode(mode) -> Optional[str]:
-    """Normalize a quant mode string to '2bit' / '4bit' / '8bit' / None.
+    """Normalize a quant mode string to '2bit' / '4bit' / '8bit' / 'fp8' / None.
 
-    2-bit uses the quanto backend (optimum-quanto); 4/8-bit use bitsandbytes.
+    2-bit uses the quanto backend (optimum-quanto); 4/8-bit use bitsandbytes;
+    fp8 uses torchao weight-only float8.
     GGUF file values are handled separately (see build_gguf_pipeline_components).
+
+    ``fp8`` and ``8bit`` are deliberately NOT synonyms. 8-bit here means
+    bitsandbytes int8 -- integers with a per-channel scale. fp8 means
+    ``float8_e4m3fn``: an exponent and three mantissa bits, so it keeps dynamic
+    range where int8 keeps precision near zero. For a diffusion transformer,
+    whose activations span several orders of magnitude, that is usually the
+    better trade, and it is the format community fine-tunes are published in.
+    Spelling one as the other would silently load a different thing than the
+    operator asked for, so ``f8``/``float8``/``e4m3`` all mean fp8 and nothing
+    means int8 but int8.
     """
     if mode in (None, '', 'none', 'off', False):
         return None
@@ -175,6 +186,9 @@ def _normalize_quant_mode(mode) -> Optional[str]:
         return '4bit'
     if m in ('8bit', '8', 'int8', 'bnb8'):
         return '8bit'
+    if m in ('fp8', 'f8', 'float8', 'e4m3', 'fp8e4m3', 'float8e4m3',
+             'float8e4m3fn', 'fp8wo', 'float8wo'):
+        return 'fp8'
     return None
 
 
@@ -223,6 +237,7 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
     Supported per-component modes:
       - "4bit" / "8bit": bitsandbytes (default backend)
       - "2bit": optimum-quanto (int2) — requires `pip install optimum-quanto`
+      - "fp8": torchao weight-only float8_e4m3 — requires `pip install torchao`
       - a "*.gguf" path/URL: handled by build_gguf_pipeline_components, NOT here
     When the map is absent it falls back to the global ``load_in_4bit`` /
     ``load_in_8bit`` flag applied to all heavy components.
@@ -274,9 +289,65 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
             print(f"  2-bit (quanto) unavailable: {e}")
             return None
 
+    def _fp8_cfg(lib: str):
+        """torchao weight-only float8_e4m3, via the diffusers/transformers config.
+
+        WEIGHT-only on purpose. The activations stay in ``dtype``, the weights
+        are stored as ``float8_e4m3fn`` with a scale and upcast for the matmul.
+        On a card with fp8 tensor cores (Hopper, Blackwell, Ada) that is also
+        faster; on Ampere -- the 3090 this is mostly run on -- there is no fp8
+        matmul, so the win is VRAM and nothing else. Said here because "fp8"
+        sounds like a speed setting and on this hardware it is not one.
+
+        Roughly half of bf16: a 37.1 GB LTX-2.3 transformer becomes ~18.6 GB.
+        That is more than a Q4/Q5 GGUF of the same weights, not less -- a GGUF
+        component stays quantized in VRAM under GGUFQuantizationConfig and
+        dequantizes per forward. fp8 buys fidelity over a K-quant, not room.
+        """
+        import importlib.util
+        try:
+            if importlib.util.find_spec('torchao') is None:
+                raise ImportError('torchao is not installed')
+        except Exception as e:
+            print(f"  WARNING: fp8 requested but torchao is not available "
+                  f"({e}), so this component loads at FULL PRECISION. Install "
+                  f"torchao, or use '8bit' / a .gguf path instead.")
+            return None
+        try:
+            if lib == 'transformers':
+                from transformers import TorchAoConfig as TAC
+            else:
+                from diffusers import TorchAoConfig as TAC
+            # torchao >= 0.14 takes an AOBaseConfig INSTANCE and rejects the
+            # string spelling outright -- measured on torchao 0.17.0 in the
+            # shipped image: `TorchAoConfig('float8wo_e4m3')` raises
+            # "quant_type must be an AOBaseConfig instance, got str" from
+            # diffusers and "String-based quantization type ... is no longer
+            # supported" from transformers. Both are caught below, so the
+            # string form would not have crashed -- it would have printed a
+            # warning and loaded 37 GB of bf16, which is the one outcome this
+            # setting exists to prevent. The string stays as the fallback for
+            # an older torchao that only understands it.
+            try:
+                from torchao.quantization import Float8WeightOnlyConfig
+                return TAC(Float8WeightOnlyConfig())
+            except ImportError:
+                return TAC('float8wo_e4m3')
+        except Exception as e:
+            # Reported as loudly as an unrecognised mode, because the
+            # consequence is identical: the component loads full precision, and
+            # for a 37 GB transformer on a 24 GB card that is the stall this
+            # setting existed to avoid.
+            print(f"  WARNING: fp8 (torchao float8wo_e4m3) unavailable here "
+                  f"({e}), so this component loads at FULL PRECISION. Use "
+                  f"'8bit' or a .gguf path instead.")
+            return None
+
     def _mk(lib: str, mode: str):
         if mode == '2bit':
             return _quanto_cfg(lib)
+        if mode == 'fp8':
+            return _fp8_cfg(lib)
         BnB = TfBnb if lib == 'transformers' else DiffBnb
         # Importing BitsAndBytesConfig succeeds without bitsandbytes installed;
         # CONSTRUCTING one does not. transformers/diffusers check the installed
@@ -301,8 +372,8 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
             return None
 
     def _bnb_incompatible(name: str) -> bool:
-        # bitsandbytes (4/8-bit) and optimum-quanto (2-bit) only quantize
-        # nn.Linear. A fully-convolutional component (the VAE) has no Linear
+        # bitsandbytes (4/8-bit), optimum-quanto (2-bit) and torchao (fp8) only
+        # quantize nn.Linear. A fully-convolutional component (the VAE) has no Linear
         # layers, so applying them triggers a hard "no linear modules were found"
         # error. Such components must stay full precision (a smaller VAE comes
         # from a GGUF VAE instead, handled separately).
@@ -331,14 +402,15 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
                     print(f"  WARNING: component_quantization['{name}'] = "
                           f"{raw_mode!r} is not a quantization mode, so '{name}' "
                           f"loads at FULL PRECISION from the base repo. Use "
-                          f"'4bit'/'8bit'/'2bit' or a .gguf path here; to load "
-                          f"this component from that file, put it in "
+                          f"'4bit'/'8bit'/'2bit'/'fp8' or a .gguf path here; to "
+                          f"load this component from that file, put it in "
                           f"'component_models' instead.")
                 continue
             if _bnb_incompatible(name):
                 print(f"  Skipping {mode} for '{name}': it has no Linear layers "
-                      f"(conv-only) — bitsandbytes/quanto cannot quantize it; "
-                      f"leaving full precision (use a GGUF VAE to shrink the VAE).")
+                      f"(conv-only) — bitsandbytes/quanto/torchao cannot "
+                      f"quantize it; leaving full precision (use a GGUF VAE to "
+                      f"shrink the VAE).")
                 continue
             cfg_obj = _mk(comp_lib.get(name, 'diffusers'), mode)
             if cfg_obj is not None:
