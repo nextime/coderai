@@ -5537,6 +5537,53 @@ async def api_runpod_pod_logs(pod_id: str, tail: int = 200,
         return {"success": False, "error": str(exc), "console_url": pod_console_url(pod_id)}
 
 
+@router.post("/admin/api/runpod/pod-release",
+             summary="Terminate one RunPod pod by id, now")
+async def api_runpod_pod_release(payload: dict = Body(...),
+                                 username: str = Depends(require_admin)):
+    """Stop ONE pod from the admin page, whatever pool holds it and whether or
+    not any pool holds it at all.
+
+    This exists because the page already showed the rows that nothing else
+    could act on. A pod in the `unowned` or `parked` state belongs to no pool,
+    so there is no floor to lower and no scale-down that will ever reach it: it
+    simply bills until somebody opens the RunPod console. The table named that
+    condition in red and then offered the operator a link to the logs.
+
+    Unconditional on purpose -- this is the forced path. `shed_now` is the
+    graceful one (drain, then release when the last request finishes), and a
+    button an operator reaches for while a pod is wedged must not be refused by
+    the same in-flight counter that is wedged with it. The caller is told what
+    it cost: the reply carries the in-flight count at the moment it went, so a
+    discarded request is reported rather than silently dropped.
+
+    Not reversible, and not a scale-down: a pod under a `keep_warm` floor will
+    be re-rented by its own pool, at a fresh boot. The page says so before it
+    asks.
+    """
+    pod_id = str((payload or {}).get("pod_id") or "").strip()
+    if not pod_id:
+        raise HTTPException(status_code=400, detail="pod_id required")
+    reason = str((payload or {}).get("reason")
+                 or f"terminated from the admin page by {username}")
+    from codai.api import runpod_worker
+    from codai.api.thread_pool import run_on_control_pool
+    try:
+        out = await run_on_control_pool(runpod_worker.release_pod, pod_id, reason)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:                   # noqa: BLE001 - reported as-is
+        raise HTTPException(status_code=500, detail=f"release failed: {exc}")
+    # Its telemetry is about a pod that no longer exists; a stale row would
+    # otherwise draw bars for it until the 4s TTL expired.
+    try:
+        from codai.api import pod_telemetry
+        pod_telemetry.forget(pod_id)
+    except Exception:
+        pass
+    return {"success": True, **(out or {})}
+
+
 # =============================================================================
 # Archive management
 # =============================================================================

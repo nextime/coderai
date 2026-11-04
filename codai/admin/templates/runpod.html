@@ -36,9 +36,9 @@
   <div style="overflow-x:auto">
     <table class="table--dense" style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3);white-space:nowrap">
-        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>In flight</th><th>Served</th><th>$/hr</th><th>Uptime</th><th>Cost</th><th>Health</th><th>Logs</th>
+        <th>Model</th><th>GPU</th><th>Load</th><th>Memory</th><th>In flight</th><th>Served</th><th>$/hr</th><th>Uptime</th><th>Cost</th><th>Health</th><th>Logs</th><th></th>
       </tr></thead>
-      <tbody id="rp-pods"><tr><td colspan="11" class="dim">No pods running.</td></tr></tbody>
+      <tbody id="rp-pods"><tr><td colspan="12" class="dim">No pods running.</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -136,14 +136,26 @@ function _loadCell(p){
   }
   return bars.join('') + txt + pre;
 }
-/* Two bars, because they are two different ceilings and only one of them is a
-   warning sign. HOST RAM is the ceiling that actually bites -- an OCR pod was
-   OOM-killed at 128 in-flight with the GPU never the constraint -- so it keeps
-   the green/amber/red bands. VRAM is what the engine RESERVED, not what it is
-   using: vLLM claims its gpu_memory_utilization share at boot, so it reads ~90%
-   from the first second whether the pod serves one request or sixty-four. It
-   gets its own neutral bar and says "reserved" in the label, so the number is
-   there to read without pretending to be a load the operator can act on.
+/* Two bars, two different ceilings, both of which can end a pod.
+
+   HOST RAM is the one that bites quietest -- an OCR pod was OOM-killed at 128
+   in-flight with the GPU never the constraint -- so it carries the
+   green/amber/red bands.
+
+   VRAM is the card's real occupancy, read off the pod's own nvidia-smi
+   (total - free), and it is banded too: it is how much room is left on the
+   card, and an operator deciding whether a pod can take another model, a
+   longer context or a second engine is reading exactly that number. It used to
+   be drawn neutral and labelled "reserved" because on a vLLM pod most of it IS
+   a reservation -- vLLM claims its gpu_memory_utilization share at boot, so the
+   bar sits near the top from the first second whether the pod serves one
+   request or sixty-four. Hiding the colour did not make that clearer, it only
+   made the one number that says "this card is full" the one number on the page
+   with no band. So the band is back, and the caveat is written where it
+   belongs: on a pod that reports a KV cache, the label says the figure includes
+   the pre-claimed pool, and the KV bar in the Load column beside it is what
+   moves with load.
+
    Either bar is omitted when its telemetry is missing: a booting or unreachable
    pod has none, and an empty bar reads as "idle" when the truth is "unknown". */
 function _memCell(p){
@@ -154,9 +166,13 @@ function _memCell(p){
                      {tag: 'RAM'}));
   }
   if (p.vram_used_gb != null && p.vram_total_gb) {
+    // "incl. reserve" only where there IS a reserve to speak of. Saying it on
+    // every pod would attach a vLLM caveat to a diffusion or OCR pod whose
+    // VRAM figure is plain allocation, which is the opposite of informative.
+    const pre = (p.kv_cache_pct != null) ? ' incl. reserve' : '';
     bars.push(_meter(100 * p.vram_used_gb / p.vram_total_gb,
-                     `${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB reserved`,
-                     {tag: 'VRAM', band: false}));
+                     `${p.vram_used_gb.toFixed(1)}/${Math.round(p.vram_total_gb)} GB${pre}`,
+                     {tag: 'VRAM'}));
   }
   return bars.length ? bars.join('') : '<span class="dim">—</span>';
 }
@@ -212,6 +228,88 @@ function _healthCell(p){
                    : '<span style="color:#ef4444">down</span>';
 }
 
+/* The last snapshot's rows, by pod id, so an action can read the row it was
+   pressed on without that row being re-encoded into an HTML attribute. */
+const _rpRows = {};
+
+/* The button for the rows nothing else on this page could act on.
+
+   A pod in the `unowned` or `parked` state is held by no pool, so no
+   scale-down will ever reach it and there is no floor to lower: it bills until
+   somebody opens the RunPod console. This table named that in red and then
+   offered a link to the logs. A pod this process cannot see is precisely the
+   one that needs a button (the same reasoning that put /v1/runpod/release in
+   the API; this is that call, reachable without a terminal).
+
+   A pod with no id cannot be terminated -- the degraded rows this snapshot
+   emits when a pool lock is held carry an empty one -- so it gets no button
+   rather than a button that 400s. */
+function _killCell(p){
+  if (!p.pod_id) return '';
+  // The row is remembered by pod id rather than pasted into the onclick. A
+  // model name is operator-supplied text and an inline handler is a quoting
+  // problem waiting to happen: one apostrophe in an alias and the button
+  // becomes a syntax error, which is a broken button on exactly the page
+  // someone opens when a pod is already misbehaving.
+  _rpRows[p.pod_id] = p;
+  const loud = (p.state === 'unowned' || p.state === 'parked');
+  return `<button class="btn btn-secondary" style="font-size:11px;padding:.15rem .45rem;white-space:nowrap${
+    loud ? ';border-color:#ef4444;color:#ef4444' : ''}"
+    onclick="rpRelease('${p.pod_id}')"
+    title="Terminate this pod now. Not reversible.">Take down</button>`;
+}
+
+/* Terminate one pod, now, from here.
+
+   Confirmed in words rather than by a bare "are you sure", because the three
+   things that make this expensive are not visible in the button: it is not
+   reversible, it discards whatever is in flight, and on a pod under a
+   keep_warm floor the pool simply rents a replacement and pays the boot again
+   -- so an operator trying to SAVE money by pressing this on a floored pod
+   spends more. The in-flight count is read from the row the operator is
+   looking at, and the reply reports the count the server saw when the pod
+   actually went, which is the one that counts.
+
+   `already_gone` is success, said plainly: a pod reaped for idle a second
+   before the click has nothing left to terminate, and reporting that as a
+   failure would send the operator to the console to check on a pod that is
+   already not billing. */
+async function rpRelease(podId){
+  const p = _rpRows[podId] || {};
+  const model = p.model || '', inflight = p.inflight || 0, state = p.state || '';
+  const lines = [`Terminate pod ${podId}` + (model ? ` (${model})` : '') + ' now?',
+                 '', 'This cannot be undone.'];
+  if (inflight) lines.push(`${inflight} request(s) in flight will be discarded.`);
+  if (state !== 'unowned' && state !== 'parked') {
+    lines.push('If this pod is holding a keep_warm floor, its pool will rent a '
+               + 'replacement and pay the boot again.');
+  }
+  if (!confirm(lines.join('\n'))) return;
+  const el = document.getElementById('rp-updated');
+  el.textContent = 'terminating ' + podId + '…';
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/runpod/pod-release', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pod_id: podId, reason: 'taken down from the admin page'})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+    const bits = [];
+    if (d.already_gone) bits.push('was already gone');
+    else bits.push('terminated');
+    if (d.found_in_pool) bits.push(`released from pool ${d.found_in_pool}`);
+    if (d.inflight) bits.push(`${d.inflight} request(s) discarded`);
+    if (d.billed_usd != null) bits.push(_usd(d.billed_usd) + ' billed');
+    if (d.warning) bits.push('WARNING: ' + d.warning);
+    alert(`Pod ${podId}: ` + bits.join(' · '));
+  } catch(e){
+    alert('Could not terminate ' + podId + ': ' + e.message
+          + '\n\nIf the pod was dropped from its pool but RunPod did not '
+          + 'confirm, it may still be billing — check the RunPod console.');
+  }
+  rpRefresh();
+}
+
 async function rpRefresh(){
   let d;
   try {
@@ -251,7 +349,11 @@ async function rpRefresh(){
 
   // pods table
   const tb = document.getElementById('rp-pods');
-  if(!pods.length){ tb.innerHTML = '<tr><td colspan="11" class="dim">No pods running.</td></tr>'; }
+  // Forget the previous snapshot's rows before drawing this one, or a pod that
+  // has since been released stays addressable by a button that no longer
+  // exists -- and the map grows for as long as the tab is left open.
+  for (const k in _rpRows) delete _rpRows[k];
+  if(!pods.length){ tb.innerHTML = '<tr><td colspan="12" class="dim">No pods running.</td></tr>'; }
   else {
     tb.innerHTML = pods.map(p => `<tr>
       <td>${p.model||''}</td>
@@ -265,6 +367,7 @@ async function rpRefresh(){
       <td>${_usd(p.live_cost_usd)}</td>
       <td>${_healthCell(p)}</td>
       <td><a href="#" onclick="rpLogs('${p.pod_id}');return false">view</a>${p.console_url?` · <a href="${p.console_url}" target="_blank" rel="noopener">console</a>`:''}</td>
+      <td>${_killCell(p)}</td>
     </tr>`).join('');
   }
 
