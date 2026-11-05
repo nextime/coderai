@@ -286,10 +286,66 @@ function _killCell(p){
   _rpRows[p.pod_id] = p;
   const loud = (p.state === 'unowned' || p.state === 'parked'
                 || p.state === 'unmanaged');
-  return `<button class="btn btn-secondary" style="font-size:11px;padding:.15rem .45rem;white-space:nowrap${
+  // Take-over comes BEFORE take-down on an unmanaged row, because it is
+  // almost always the better answer: the pod is already rented and already
+  // billing, so terminating it throws away a card and a 6-14 minute boot that
+  // have both been paid for. Only this state gets it -- an `unowned` row is
+  // already in the registry and its pool's own survivor sweep will take it,
+  // and every other state is managed here already.
+  const adopt = (p.state === 'unmanaged')
+    ? `<button class="btn btn-secondary" style="font-size:11px;padding:.15rem .45rem;`
+      + `white-space:nowrap;border-color:#22c55e;color:#22c55e;margin-right:.25rem"`
+      + ` onclick="rpAdopt('${p.pod_id}')"`
+      + ` title="Take this pod under local management instead of destroying it.`
+      + ` It is already rented and already billing.">Adopt</button>`
+    : '';
+  return adopt + `<button class="btn btn-secondary" style="font-size:11px;padding:.15rem .45rem;white-space:nowrap${
     loud ? ';border-color:#ef4444;color:#ef4444' : ''}"
     onclick="rpRelease('${p.pod_id}')"
     title="Terminate this pod now. Not reversible.">Take down</button>`;
+}
+
+/* Take an unmanaged pod under local management.
+
+   The server refuses with 409 when the pod was rented by ANOTHER deployment,
+   because it may still be managed by the host that rented it -- and two
+   controllers on one pod each dispatch to it, each miscount its load, and
+   either may terminate it under the other. Nothing RunPod reports says who is
+   managing a pod, so the refusal is re-offered here as a decision only the
+   operator can make, with the server's own sentence shown verbatim rather than
+   summarised: the override is them asserting what the API cannot tell us.
+
+   Why no confirmation on the ordinary path: adopting a pod spends nothing and
+   is reversible by taking it down. The one irreversible button on this row
+   already asks. */
+async function rpAdopt(podId){
+  const el = document.getElementById('rp-updated');
+  const post = async (force) => {
+    const r = await fetch(ROOT_PATH + '/admin/api/runpod/pod-adopt', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pod_id: podId, force: !!force})
+    });
+    return [r, await r.json().catch(() => ({}))];
+  };
+  el.textContent = 'adopting ' + podId + '…';
+  try {
+    // `detail` is an object on a refusal: {needs_force, message}. Only the
+    // forceable one is re-offered -- the other 409 is a pod that answers
+    // nothing, and forcing it would adopt something that 401s every request.
+    const say = (d) => (d && d.detail && d.detail.message)
+                     || (d && d.detail) || '';
+    let [r, d] = await post(false);
+    if (r.status === 409 && d.detail && d.detail.needs_force) {
+      if (!confirm(say(d) + '\n\nAdopt it anyway?')) { rpRefresh(); return; }
+      el.textContent = 'adopting ' + podId + ' (forced)…';
+      [r, d] = await post(true);
+    }
+    if (!r.ok) throw new Error(say(d) || ('HTTP ' + r.status));
+    alert(`Pod ${podId}: ` + (d.detail || (d.adopted ? 'adopted' : 'recorded')));
+  } catch(e){
+    alert('Could not adopt ' + podId + ': ' + e.message);
+  }
+  rpRefresh();
 }
 
 /* Terminate one pod, now, from here.

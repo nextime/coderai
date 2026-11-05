@@ -5625,6 +5625,58 @@ async def api_runpod_pod_release(payload: dict = Body(...),
     return {"success": True, **(out or {})}
 
 
+@router.post("/admin/api/runpod/pod-adopt",
+             summary="Take an unmanaged RunPod pod under local management")
+async def api_runpod_pod_adopt(payload: dict = Body(...),
+                               username: str = Depends(require_admin)):
+    """Adopt a pod the account is billing that no pool here manages.
+
+    The counterpart to pod-release. The page shows `unmanaged` rows -- pods on
+    the same RunPod account rented by another host, or left behind by a process
+    whose registry entry was lost -- and the only action it offered on one was
+    to destroy it. For a pod that is healthy, already paid for and running the
+    model a pool here wants, that throws away a card and a 6-14 minute boot.
+
+    `force` is required for a pod named for another deployment, because it may
+    still be MANAGED by that deployment: two controllers on one pod each
+    dispatch to it, each miscount its load, and either may terminate it under
+    the other. Nothing RunPod reports says who is managing a pod, so the
+    override is the operator asserting what the API cannot tell us. A pod named
+    for this deployment -- our own survivor -- needs no override.
+    """
+    pod_id = str((payload or {}).get("pod_id") or "").strip()
+    if not pod_id:
+        raise HTTPException(status_code=400, detail="pod_id required")
+    pool_key = str((payload or {}).get("pool") or "").strip()
+    force = bool((payload or {}).get("force"))
+    from codai.api import runpod_worker
+    from codai.api.thread_pool import run_on_control_pool
+    try:
+        out = await run_on_control_pool(runpod_worker.adopt_account_pod,
+                                        pod_id, pool_key, force)
+    except runpod_worker.PodNotOursError as exc:
+        # The hazard the operator may override. Flagged structurally rather
+        # than left for the page to recognise by its wording: the other 409 on
+        # this endpoint must NOT be re-offered with force, because force does
+        # not make an unauthenticatable pod answer.
+        raise HTTPException(status_code=409,
+                            detail={"needs_force": True, "message": str(exc)})
+    except PermissionError as exc:
+        # Not adoptable at all: a 409 ("not this, and here is why"), not a
+        # server fault, and not something force can help with.
+        raise HTTPException(status_code=409,
+                            detail={"needs_force": False, "message": str(exc)})
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:                   # noqa: BLE001 - reported as-is
+        raise HTTPException(status_code=500, detail=f"adopt failed: {exc}")
+    print(f"[runpod] pod {pod_id} adopted from the admin page by {username}: "
+          f"{(out or {}).get('detail') or 'no detail'}", flush=True)
+    return {"success": True, **(out or {})}
+
+
 # =============================================================================
 # Archive management
 # =============================================================================

@@ -7463,6 +7463,291 @@ def account_only_pod_rows(known_ids) -> list:
     return out
 
 
+#: Where a pod's bearer token lives in its own environment, in the order
+#: `pod_plan` puts it there.
+_BEARER_ENV_NAMES = ("CODERAI_API_TOKEN", "VLLM_API_KEY", "OPENAI_API_KEY")
+
+
+def pod_bearer_from_launch(launch: dict) -> str:
+    """The token a pod was launched with, read out of how it was launched.
+
+    This is what makes a pod rented by ANOTHER HOST adoptable. Everything else
+    an adoption needs is already on the account listing -- the address, the
+    card, the image, the rate -- but a pod locked to a bearer answers 401 to
+    every request without it, so a pod whose token cannot be recovered can only
+    be terminated, never taken over.
+
+    Two places, because `pod_plan` writes it to two: a coderai pod reads it
+    from its environment, while vLLM and llama.cpp take it as `--api-key` and
+    it is therefore in the pod's ARGS. The args are searched with a regex and
+    not by splitting on spaces, because a staged pod's command is a `bash -c`
+    string with the whole server command nested inside one argument.
+
+    Returns "" when there is no token to find, which is not the same as
+    failure: a pool configured without one launches its pods open, and such a
+    pod is adopted with no token at all.
+    """
+    env = (launch or {}).get("env") or {}
+    if isinstance(env, dict):
+        for name in _BEARER_ENV_NAMES:
+            val = str(env.get(name) or "").strip()
+            if val:
+                return val
+    import re as _re
+    text = str((launch or {}).get("args") or "")
+    cmd = (launch or {}).get("cmd")
+    if isinstance(cmd, list):
+        text = text + " " + " ".join(str(c) for c in cmd)
+    # The optional opening quote matters: a quoted token made the character
+    # class match nothing at all, so a pod whose args read `--api-key 'tok'`
+    # looked like a pod with no token -- and was then refused as
+    # unauthenticatable.
+    m = _re.search(r"--api-key[=\s]+['\"]?([^\s'\"]+)", text)
+    return m.group(1) if m else ""
+
+
+class PodNotOursError(PermissionError):
+    """Adoption refused because another deployment rented this pod.
+
+    Its own class, not a bare PermissionError, because the caller has to tell
+    this refusal from the other one: this is the hazard an operator may
+    override, while "no token could be recovered" is a pod that would 401 every
+    request and overriding it achieves nothing. Matching on the message text
+    would work until somebody improves the wording.
+    """
+
+
+def _pod_name_owner(pod_name: str, acct) -> tuple:
+    """``(is_ours, claimed_pool_key)`` read off a pod's NAME.
+
+    `_provision_one` names every pod it rents
+    ``coderai-<deployment_tag>-<model key, 20 chars>-<6 hex>``, and the reaper
+    already treats that prefix as the mark of ownership. Read the other way it
+    answers the question an adoption has to ask first: was this pod rented by
+    THIS deployment (a survivor of our own restart, safe to take back) or by a
+    different one (another host, which may still be managing it)?
+
+    The key is truncated to 20 characters in the name, so it is a prefix to
+    match a configured pool against, never a pool key itself.
+    """
+    name = str(pod_name or "")
+    if not name.startswith("coderai-"):
+        return False, ""
+    prefix = f"coderai-{_deploy_tag(acct)}-"
+    if not name.startswith(prefix):
+        return False, ""
+    rest = name[len(prefix):]
+    # Drop the uuid suffix. Only when it looks like one: a pod renamed by hand
+    # should lose nothing.
+    head, _, tail = rest.rpartition("-")
+    if head and len(tail) == 6 and all(c in "0123456789abcdef" for c in tail):
+        rest = head
+    return True, rest
+
+
+def _pool_for_claimed_key(claimed: str) -> str:
+    """A LIVE pool whose key the pod's name claims, or "".
+
+    Adoption is driven through the registry, and only a pool that exists reads
+    it -- so matching against the live pools is not a shortcut, it is the
+    actual precondition. The name holds at most the first 20 characters of the
+    key, hence prefix matching; an exact hit always wins so a short key is not
+    shadowed by a longer one that starts the same way.
+    """
+    want = str(claimed or "")
+    if not want:
+        return ""
+    with _lock_for_read(_pools_lock) as got:
+        keys = list(_pools.keys()) if got else []
+    for key in keys:
+        if str(key) == want:
+            return str(key)
+    # `pool:` is dropped from the NAME but kept in the key.
+    for key in keys:
+        bare = str(key)[len("pool:"):] if str(key).startswith("pool:") else str(key)
+        if bare == want or bare[:20] == want:
+            return str(key)
+    return ""
+
+
+def adopt_account_pod(pod_id: str, pool_key: str = "", force: bool = False) -> dict:
+    """Take a pod the ACCOUNT is billing under local management.
+
+    The page can already see pods nothing here rented -- another host on the
+    same RunPod account, or a pod whose registry entry was lost -- and until
+    now the only thing it could do about one was terminate it. That is the
+    wrong answer for a pod that is healthy, already paid for, and serving the
+    model a pool here wants: it throws away a card and a 6-14 minute boot.
+
+    How it works, and why it is not a second adoption path: this writes the
+    pod into the shared registry as an entry with no live owner, and the pool's
+    own `_adopt_survivors` sweep then picks it up through `find_shared_pod`
+    like any survivor of a restart. So the image check, the card check, the
+    health probe and the bearer handling are the ones already in use, and an
+    adoption that should not happen is refused by the code that refuses it
+    everywhere else. The pool is nudged once here so the operator gets the
+    answer now rather than within the sweep interval.
+
+    THE HAZARD, and why `force` exists. A pod named for another deployment may
+    still be managed by that deployment, on a host this one cannot see. Two
+    controllers on one pod both dispatch to it, both count its in-flight work
+    wrongly, and either may terminate it under the other. Nothing on the RunPod
+    API reports who is managing a pod, so this cannot be detected -- it can
+    only be refused by default and reported plainly when overridden. A pod
+    named for THIS deployment is a survivor of our own restart and needs no
+    override.
+    """
+    pid = str(pod_id or "").strip()
+    if not pid:
+        raise LookupError("no pod id given")
+    from codai.models.manager import get_active_runpod_config
+    acct = get_active_runpod_config()
+    if acct is None or not getattr(acct, "enabled", False):
+        raise RuntimeError("RunPod is not enabled")
+    if not getattr(acct, "api_key", ""):
+        raise RuntimeError("RunPod has no API key configured")
+    out = {"pod_id": pid, "adopted": False, "pool": "", "offered": False}
+
+    # Already managed? Then there is nothing to adopt and saying so is the
+    # whole answer -- re-registering it would overwrite a live owner's entry.
+    with _lock_for_read(_pools_lock) as got:
+        for key, pool in (list(_pools.items()) if got else []):
+            if any(str(p.pod_id) == pid for p in list(pool.pods)):
+                out["detail"] = f"pod {pid} is already managed by pool {key!r}"
+                out["pool"] = str(key)
+                out["already"] = True
+                return out
+
+    from codai.api.runpod_client import RunpodClient, direct_tcp_url, pod_proxy_url
+    client = RunpodClient(acct)
+    live = client.get_pod(pid) or {}
+    status = str(live.get("status") or "").upper()
+    if status != "RUNNING":
+        raise LookupError(f"pod {pid} is {status or 'in an unreported state'}, "
+                          f"not RUNNING — there is nothing to adopt")
+    name = str(live.get("name") or "")
+    ours, claimed = _pod_name_owner(name, acct)
+    if not ours and not force:
+        raise PodNotOursError(
+            f"pod {pid} ({name or 'unnamed'}) was not rented by this "
+            f"deployment. It may still be managed by the host that rented it, "
+            f"and two controllers on one pod will each dispatch to it, "
+            f"miscount its load, and either may terminate it under the other. "
+            f"Nothing RunPod reports says who is managing a pod, so this "
+            f"cannot be checked — confirm the other host is not managing it "
+            f"and adopt it with force.")
+    target = str(pool_key or "").strip() or _pool_for_claimed_key(claimed)
+    if not target:
+        with _lock_for_read(_pools_lock) as got:
+            keys = sorted(str(k) for k in (_pools.keys() if got else []))
+        raise LookupError(
+            f"no pool here would take pod {pid}: its name claims "
+            f"{claimed or '(nothing)'!r} and the pools running now are "
+            f"{', '.join(keys) or '(none)'}. A pool only adopts for a model it "
+            f"is already serving, so load the model first or name the pool.")
+    out["pool"] = target
+    with _lock_for_read(_pools_lock) as got:
+        pool = (_pools.get(target) if got else None)
+
+    ports = live.get("ports") or []
+    if not ports:
+        raise LookupError(f"pod {pid} exposes no port yet (it is still "
+                          f"booting); there is no address to adopt")
+    # The PRIVATE port: that is what the pod's server listens on and what
+    # `direct_tcp_url` matches against, while the public one is random per pod.
+    # The adopting pool's own configured port is the authority, because that is
+    # the port it would have rented the pod on; the pod's own first exposed
+    # port is the fallback for adopting into a pool that is not up yet.
+    port = 0
+    if pool is not None:
+        port = int(getattr(pool.mcfg, "port", 0) or 0)
+    if not port:
+        for p in ports:
+            try:
+                port = int(p.get("privatePort") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if port:
+                break
+    port = port or 8000
+    url = direct_tcp_url(ports, port, tls=True) or pod_proxy_url(pid, port)
+
+    # The bearer, on its own path and never logged. A pod that cannot be
+    # authenticated cannot be served from, so this is the one hard failure.
+    bearer = ""
+    try:
+        bearer = pod_bearer_from_launch(client.get_pod_launch(pid))
+    except Exception as exc:
+        print(f"[runpod] could not read how pod {pid} was started ({exc}); "
+              f"adopting it without a token", flush=True)
+    if bearer:
+        print(f"[runpod] recovered pod {pid}'s own bearer from its launch — "
+              f"it will be served with the token it booted with, not this "
+              f"pool's", flush=True)
+    elif not (_pod_health_ok(url, path="/v1/models", timeout=15.0)
+              or _pod_health_ok(url, path="/healthz", timeout=15.0)):
+        # /healthz before refusing, for the reason `find_shared_pod` learned it:
+        # /v1/models goes through the pod's ENGINE, and a pod busy with work
+        # from before our restart answers it too slowly. Refusing an open pod
+        # as "unauthenticatable" because it was busy would be the same mistake
+        # that once left 29 pods billing outside their pool.
+        raise PermissionError(
+            f"pod {pid} answers neither /v1/models nor /healthz, and no token "
+            f"could be recovered from how it was launched. It is either locked "
+            f"to a bearer we cannot produce — every request would 401 — or it "
+            f"is not serving at all. Either way it is not adoptable; terminate "
+            f"it instead.")
+
+    register_pod(pid, target, url, bearer,
+                 hourly_usd=float(live.get("cost_per_hr") or 0.0),
+                 image=str(live.get("image") or ""),
+                 gpu=str(live.get("gpu") or live.get("gpu_display_name") or ""),
+                 vram_gb=float(live.get("vram_gb") or 0.0),
+                 gpu_count=int(live.get("gpu_count") or 1))
+
+    # Written as THIS process, which is how `touch_registered_pods` keeps it
+    # alive -- but `find_shared_pod` skips our own entries, because a pool
+    # handles its own. So the owner is cleared: the entry now describes a pod
+    # with no manager, which is exactly what it is until a pool takes it, and
+    # what makes it adoptable. If no pool ever does, the heartbeat goes stale
+    # and the reaper collects it like any other leftover, which is the right
+    # end for a pod nothing here can serve.
+    def _disown(d):
+        info = d.get(pid)
+        if not isinstance(info, dict):
+            return False
+        info["proc"] = "offered-for-adoption"
+        info["pid"] = 0
+        return True
+
+    _registry_update(_disown)
+    out["offered"] = True
+    # The page's row for it came from the account-listing cache, where it is
+    # still `unmanaged`. Dropped here rather than at the end, so the row is
+    # refreshed even when the pool is not up to take the pod yet -- the cache
+    # is up to ACCOUNT_LISTING_TTL_S stale, and a row that does not change
+    # after a successful action is indistinguishable from a broken button.
+    forget_account_listing()
+
+    if pool is None:
+        out["detail"] = (f"pod {pid} is recorded for pool {target!r}, which is "
+                         f"not running here; it will be adopted when that "
+                         f"model is next served")
+        return out
+    try:
+        out["adopted"] = bool(pool._adopt_shared_pod())
+    except Exception as exc:
+        out["detail"] = (f"pod {pid} is recorded for pool {target!r} but the "
+                         f"pool refused it now ({exc}); the next sweep will "
+                         f"try again")
+        return out
+    out["detail"] = (f"pod {pid} adopted into pool {target!r}"
+                     if out["adopted"] else
+                     f"pod {pid} is recorded for pool {target!r}; the pool did "
+                     f"not take it this pass — its log says why")
+    return out
+
+
 def pods_status() -> list:
     """Snapshot of all pods across pools for the stats/tasks pages.
 

@@ -440,6 +440,27 @@ _V2_STATUS = {"PROVISIONING": "RUNNING", "STARTING": "RUNNING", "RUNNING": "RUNN
               "EXITED": "EXITED", "ERROR": "FAILED", "TERMINATED": "TERMINATED"}
 
 
+def _env_map(raw) -> dict:
+    """A pod's environment as a dict, from any of the three shapes RunPod uses.
+
+    REST v2 answers with a map, GraphQL with a list of ``"KEY=VALUE"`` strings,
+    and a create request is BUILT from a list of ``{key, value}`` objects -- so
+    all three turn up depending on which end of the API you are standing on. A
+    value may itself contain "=", so the split is on the first one only.
+    """
+    out = {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("key") is not None:
+                out[str(item["key"])] = str(item.get("value") or "")
+            elif isinstance(item, str) and "=" in item:
+                k, v = item.split("=", 1)
+                out[k.strip()] = v
+    return out
+
+
 def _v2_pod_row(p: dict, pod_id: str = "", with_ports: bool = False) -> dict:
     """A REST v2 Pod in the shape get_pod / list_pods return from GraphQL."""
     p = p if isinstance(p, dict) else {}
@@ -1037,6 +1058,52 @@ class RunpodClient:
             # A pod is "ready" for us once its http proxy port is exposed.
             "ready": bool(ports),
         }
+
+    def get_pod_launch(self, pod_id: str) -> dict:
+        """How a RUNNING pod was started: ``{env: {...}, args: str, cmd: [...]}``.
+
+        This is the one lookup that can recover a pod's BEARER TOKEN, which is
+        what makes a pod rented by another host adoptable at all: without it the
+        pod answers 401 to everything and the only honest thing to do with it is
+        terminate it.
+
+        It is deliberately NOT part of `get_pod`/`list_pods`. Those rows are
+        rendered on the admin page and logged, and a token that reaches either is
+        a token leaked -- so it travels on a path of its own, with one caller.
+
+        Two shapes, because the token is put in two places (see `pod_plan`): a
+        coderai pod reads it from the environment, while vLLM and llama.cpp take
+        it as `--api-key` and it is therefore in the pod's ARGS. REST v2 names
+        those `env`/`args`/`cmd`; GraphQL has `env` as a list of "K=V" strings
+        and calls the args `dockerArgs`. All of it is normalised here so the
+        caller sees one shape.
+        """
+        out = {"env": {}, "args": "", "cmd": []}
+        try:
+            d = self._rest("GET", f"/pods/{pod_id}")
+            d = d if isinstance(d, dict) else {}
+            out["env"] = _env_map(d.get("env"))
+            out["args"] = str(d.get("args") or "")
+            cmd = d.get("cmd")
+            out["cmd"] = [str(c) for c in cmd] if isinstance(cmd, list) else []
+            if out["env"] or out["args"] or out["cmd"]:
+                return out
+        except (RunpodError, RunpodTransient) as exc:
+            if _gql_banned() or "HTTP 404" in str(exc):
+                raise
+            _say_once("v2-launch", f"[runpod] REST v2 could not report how a pod "
+                                   f"was started ({exc}); using GraphQL for it")
+        if _gql_banned():
+            return out
+        q = """
+        query Pod($input: PodFilter!) {
+          pod(input: $input) { id env dockerArgs }
+        }"""
+        data = self._gql(q, {"input": {"podId": pod_id}}, timeout=20.0)
+        p = (data.get("pod") or {}) if isinstance(data, dict) else {}
+        out["env"] = _env_map(p.get("env"))
+        out["args"] = str(p.get("dockerArgs") or "")
+        return out
 
     #: The state transitions REST v2 accepts on a pod. `restart` is the only
     #: one that keeps the machine: v2 documents it as restarting a RUNNING
