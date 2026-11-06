@@ -252,3 +252,62 @@ def test_maintain_checks_for_an_engine_before_counting_the_warm_floor():
     src = inspect.getsource(rw.RunpodPodPool.maintain)
     assert "_restart_engineless_pods" in src
     assert src.index("_restart_engineless_pods") < src.index("_scale_down")
+
+
+# --- cost of the check itself --------------------------------------------
+
+def test_the_sweep_probes_only_a_few_pods_per_pass_longest_idle_first():
+    """The probes run inline on the scaler thread, so the pass must be bounded.
+
+    An idle fleet all blackholing TCP would otherwise hold `maintain()` for one
+    timeout per pod -- nothing rents, nothing reaps and the registry heartbeat
+    does not get written, which is the exact shape of the inline-warm-boot stall
+    this file already paid for once. Longest-idle first so a truncated list
+    still covers the fleet across passes instead of starving whoever is last.
+    """
+    now = time.time()
+    pods = [_pod(pod_id=f"p{i}", last_used=now - (200.0 + i * 10.0),
+                 started_at=now - 5000.0) for i in range(9)]
+    asked = []
+
+    class _Counting(_Pool):
+        def _engine_state(self, pod):
+            asked.append(pod.pod_id)
+            return LIVE                    # healthy: nothing to restart
+
+    pool = _Counting(pods, {})
+    _run(pool, now)
+    assert len(asked) == rw.ENGINELESS_PROBES_PER_PASS
+    # p8 has been idle longest (now - 280), p5 the shortest of the four.
+    assert asked == ["p8", "p7", "p6", "p5"]
+    assert pool.restarted == []
+
+
+def test_the_engine_probe_cannot_hold_the_scaler_thread_for_long():
+    """A pod that needs more than a few seconds to read its own state has
+    nothing to say that this check should act on."""
+    from codai.api import pod_http
+    seen = {}
+
+    class _Reply:
+        status_code = 200
+        @staticmethod
+        def json():
+            return dict(LIVE)
+
+    def _get(url, headers=None, timeout=None):
+        seen.update(url=url, timeout=timeout)
+        return _Reply()
+
+    old = pod_http.get
+    pod_http.get = _get
+    try:
+        got = rw.RunpodPodPool._engine_state(
+            _Pool([], {}), _pod(url="https://pod.example/v1"))
+    finally:
+        pod_http.get = old
+    assert got == LIVE
+    assert seen["url"] == "https://pod.example/internal/engine-state"
+    assert 0 < seen["timeout"] <= 5.0
+    assert (rw.ENGINELESS_PROBES_PER_PASS
+            * rw.ENGINELESS_PROBE_TIMEOUT_S) <= 30.0

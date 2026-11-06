@@ -5136,7 +5136,7 @@ class RunpodPodPool:
             reply = pod_http.get(
                 base + "/internal/engine-state",
                 headers={"Authorization": f"Bearer {key}"} if key else {},
-                timeout=15)
+                timeout=ENGINELESS_PROBE_TIMEOUT_S)
             if int(getattr(reply, "status_code", 0) or 0) != 200:
                 return None
             got = reply.json()
@@ -5218,7 +5218,12 @@ class RunpodPodPool:
                     and p.last_used > 0
                     and (now - p.last_used) > ENGINELESS_IDLE_S
                     and (now - p.started_at) > ENGINELESS_BOOT_S]
-        for pod in cand:
+        # Longest-idle first and only a few per pass: see
+        # ENGINELESS_PROBES_PER_PASS. The order makes the coverage deterministic
+        # rather than whatever order the pool list happens to be in, so no pod
+        # can sit at the back of a truncated list forever.
+        cand.sort(key=lambda p: p.last_used)
+        for pod in cand[:ENGINELESS_PROBES_PER_PASS]:
             state = self._engine_state(pod)
             if state is None or not self._has_no_engine(state):
                 continue
@@ -6339,6 +6344,20 @@ ENGINELESS_IDLE_S = 120.0
 #: Restarts before the pod is given up on. A card that boots empty twice is
 #: broken, not unlucky.
 ENGINELESS_MAX_RESTARTS = 2
+
+#: Budget for the engine check, and it is a LATENCY budget, not a correctness
+#: one. The probes run inline on the scaler thread, so a fleet of idle pods all
+#: blackholing TCP would hold `maintain()` for one timeout each: at 15s across
+#: 11 pods that is 165s in which nothing rents, reaps, or writes the registry
+#: heartbeat, and this file already paid for exactly that mistake once with an
+#: inline warm boot (see `_grow_for_warm`). Capped instead: a few pods per pass
+#: at a short timeout, longest-idle first, so a fleet is still covered within a
+#: minute of 15s passes and the worst case is bounded at
+#: ENGINELESS_PROBES_PER_PASS * ENGINELESS_PROBE_TIMEOUT_S. A pod that needs
+#: more than five seconds to answer a local state read has nothing to say that
+#: this check should act on anyway.
+ENGINELESS_PROBE_TIMEOUT_S = 5.0
+ENGINELESS_PROBES_PER_PASS = 4
 
 #: How often a pool sweeps the registry for pods of its own that outlived a
 #: restart, and the most it takes per sweep.
