@@ -222,9 +222,25 @@ if ! flock -n 9; then
     exit 0
 fi
 
+# The version this image would install, read out of the image itself.
+#
+# --image-volume=ignore is NOT cosmetic. coderai:latest declares
+# VOLUME /cache /config /models, so an ordinary `run` creates three ANONYMOUS
+# volumes, and `--rm` does not take volumes with it. podman allocates one lock
+# per volume from a fixed pool (num_locks, default 2048) and reclaims it only on
+# removal, so this hourly probe leaked three locks an hour: on 2026-11-05, after
+# 99 days and 1858 orphaned volumes, the pool ran dry and EVERY `podman run`
+# that would create a volume began failing host-wide -- gitlab, nexus and the
+# rest, not only this. "ignore" gives the probe the image's filesystem without
+# materialising its volumes at all, which is all a `grep` ever needed.
+#
+# The flag is podman-only; docker has no equivalent and no such leak, since its
+# --rm does remove anonymous volumes.
 baked_version(){
-    "$ENGINE" run --rm --entrypoint grep "$IMAGE_TAG" -h "__version__" \
-        /opt/coderai/app/codai/__init__.py 2>/dev/null \
+    set -- --rm --entrypoint grep
+    [ "$ENGINE" = podman ] && set -- --image-volume=ignore "$@"
+    "$ENGINE" run "$@" "$IMAGE_TAG" -h "__version__" \
+        /opt/coderai/app/codai/__init__.py 2>"$STATE_DIR/baked_version.err" \
         | tr -d ' "' | cut -d= -f2 | head -1
 }
 
@@ -412,7 +428,19 @@ restart_and_verify(){
 
 # ------------------------------------------------------------------- the upgrade
 BEFORE="$(baked_version)"
-[ -n "$BEFORE" ] || { say "FAIL: cannot read the version from $IMAGE_TAG (wrong tag? engine '$ENGINE'?)"; exit 1; }
+if [ -z "$BEFORE" ]; then
+    # Say WHY. This used to report only "wrong tag?", which is what it looked
+    # like for a day while the real cause was podman's lock pool being full --
+    # a host-wide fault with nothing to do with the tag. The engine's own
+    # stderr names it in one line, so pass it on rather than guess.
+    say "FAIL: cannot read the version from $IMAGE_TAG"
+    if [ -s "$STATE_DIR/baked_version.err" ]; then
+        say "      $ENGINE said: $(head -1 "$STATE_DIR/baked_version.err")"
+    else
+        say "      $ENGINE said nothing (wrong tag? engine '$ENGINE'?)"
+    fi
+    exit 1
+fi
 
 # --force reaches the restart step too. A host whose upgrade has been sitting in
 # the image for days behind a deferral is exactly the case an operator types
