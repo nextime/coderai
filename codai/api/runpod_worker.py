@@ -1204,6 +1204,34 @@ def volume_env(mount: str) -> dict:
     }
 
 
+def _deliberate_zero(cfg, attr: str) -> bool:
+    """Is ``cfg.attr == 0`` the operator's SETTING, or just an unset field?
+
+    The pod-env seeding filters out zeros, because for most of these fields 0
+    is how "I did not configure this, use the pod's own default" is spelled.
+    For a field whose own default is non-zero that reading is backwards: 0 is
+    the operator switching the thing off, and dropping it hands the pod the
+    default they were trying to get rid of.
+
+    So ask the dataclass. A zero is deliberate exactly when the field's declared
+    default is not zero -- no list to maintain, and it is right for every field
+    added later. ``ocr.chandra_max_continuations = 0`` (default 8) travels;
+    ``ocr.chandra_max_tokens_floor = 0`` (default 0) stays home, because there
+    it really does mean "off, like everyone else".
+    """
+    try:
+        import dataclasses
+        for f in dataclasses.fields(type(cfg)):
+            if f.name == attr:
+                default = f.default
+                if default is dataclasses.MISSING:
+                    return False
+                return bool(default)          # non-zero default: 0 is a choice
+    except Exception:                          # noqa: BLE001 - not a dataclass
+        return False
+    return False
+
+
 def pod_ocr_engine(requested: str, image: str = "") -> str:
     """The OCR engine a pod will actually serve for a request naming ``requested``.
 
@@ -1655,7 +1683,18 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                             ("CODERAI_OCR_EARLY_LOOP_PERSISTENCE",
                              "early_loop_persistence")]:
             _val = getattr(_o, _attr, None) if _o is not None else None
-            if _val not in (None, "", 0, 0.0):
+            if _val in (0, 0.0) and _deliberate_zero(_o, _attr):
+                # A DELIBERATE zero, which this filter used to eat. `0` means
+                # "unset, let the pod decide" only for a field whose own default
+                # is 0; where the default is non-zero, 0 is the operator turning
+                # the thing OFF and is the one value that MUST travel. Measured
+                # 2026-11-06: ocr.chandra_max_continuations = 0 was dropped
+                # here, so every rented pod read pages with the default of 8
+                # continuations and a page could spend 8x its token budget --
+                # the setting was unreachable through config, exactly like the
+                # boolean case the loop below documents.
+                env[_var] = str(_val)
+            elif _val not in (None, "", 0, 0.0):
                 env[_var] = str(_val)
         for _var, _attr in (("CODERAI_OCR_SURYA_REPAIR_ACCENTS",
                              "surya_repair_accents"),
