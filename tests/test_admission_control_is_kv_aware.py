@@ -338,3 +338,165 @@ def test_the_gate_reports_both_numbers():
     assert m["max_parallel_requests"] == 40
     assert m["dynamic_cap"] == 9
     assert m["effective_parallel_limit"] == 9
+
+
+# --- the engine-side request gate (M5) ----------------------------------
+#
+# The path this gates had NO admission control. `queue_manager` bounds the
+# lease-taking paths; `acquire_model_instance` ref-counts without blocking; and
+# the front's per-model queue is in the front process, which a pod does not run.
+# So the controller had nothing to lower on the one path that matters most for a
+# VLM pod.
+
+def test_a_limit_of_zero_is_no_gate_at_all():
+    """The default. An install with the controller off must behave exactly as it
+    did before this existed, including taking no slot to release."""
+    s = admission.Slots()
+
+    async def _go():
+        held = await s.acquire()
+        assert held is False
+        s.release(held)                       # must not go negative
+        assert s.active == 0
+        for _ in range(100):
+            assert await s.acquire() is False
+
+    asyncio.run(_go())
+
+
+def test_it_admits_up_to_the_limit_and_then_waits():
+    s = admission.Slots()
+    s.set_limit(2)
+
+    async def _go():
+        assert await s.acquire() is True
+        assert await s.acquire() is True
+        assert s.active == 2
+        third = asyncio.ensure_future(s.acquire())
+        await asyncio.sleep(0)
+        assert not third.done(), "the third must wait, not be refused"
+        assert s.waiting == 1
+        s.release(True)
+        assert await asyncio.wait_for(third, timeout=1.0) is True
+        assert s.active == 2
+
+    asyncio.run(_go())
+
+
+def test_raising_the_limit_releases_waiters():
+    s = admission.Slots()
+    s.set_limit(1)
+
+    async def _go():
+        assert await s.acquire() is True
+        a = asyncio.ensure_future(s.acquire())
+        b = asyncio.ensure_future(s.acquire())
+        await asyncio.sleep(0)
+        assert not a.done() and not b.done()
+        s.set_limit(3)
+        assert await asyncio.wait_for(a, timeout=1.0) is True
+        assert await asyncio.wait_for(b, timeout=1.0) is True
+        assert s.active == 3
+
+    asyncio.run(_go())
+
+
+def test_removing_the_gate_releases_everyone():
+    s = admission.Slots()
+    s.set_limit(1)
+
+    async def _go():
+        await s.acquire()
+        waiter = asyncio.ensure_future(s.acquire())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        s.set_limit(0)
+        await asyncio.wait_for(waiter, timeout=1.0)
+
+    asyncio.run(_go())
+
+
+def test_lowering_the_limit_never_evicts_a_running_request():
+    """A request already generating must finish: cancelling it is the recompute
+    this whole subsystem exists to avoid."""
+    s = admission.Slots()
+    s.set_limit(4)
+
+    async def _go():
+        for _ in range(4):
+            await s.acquire()
+        s.set_limit(1)
+        assert s.active == 4, "running requests are not clawed back"
+        # ...and the gate closes as they drain, rather than admitting more.
+        s.release(True)
+        s.release(True)
+        s.release(True)
+        assert s.active == 1
+        nxt = asyncio.ensure_future(s.acquire())
+        await asyncio.sleep(0)
+        assert not nxt.done()
+        nxt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await nxt
+
+    asyncio.run(_go())
+
+
+def test_a_client_that_hangs_up_while_queued_leaks_no_slot():
+    s = admission.Slots()
+    s.set_limit(1)
+
+    async def _go():
+        await s.acquire()
+        gone = asyncio.ensure_future(s.acquire())
+        await asyncio.sleep(0)
+        gone.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await gone
+        assert s.waiting == 0
+        s.release(True)
+        assert s.active == 0
+        # the gate still works afterwards
+        assert await asyncio.wait_for(s.acquire(), timeout=1.0) is True
+
+    asyncio.run(_go())
+
+
+def test_the_controller_moves_both_gates():
+    qm = _FakeQM()
+    admission.request_slots.set_limit(0)
+    c = admission.AdmissionController(_pol(), queue_manager=qm)
+    c.state = State(limit=40, last=_read(preemptions=0))
+
+    async def _go():
+        c._read = lambda: _answer({"kv_cache_pct": 0.5, "preemptions": 1})
+        await c._tick()
+
+    try:
+        asyncio.run(_go())
+        assert qm.caps == [30]
+        assert admission.request_slots.limit == 30, (
+            "the inference path is the one that had no gate; a controller that "
+            "lowers only the lease gate moves a number this workload never reads")
+    finally:
+        admission.request_slots.set_limit(0)
+
+
+def test_the_text_path_holds_a_slot_across_the_whole_generation():
+    """Pinned as source: driving a real generation needs a model. What must be
+    true is that the slot is taken once, before either branch, and released in
+    BOTH -- beside `_release_instance`, whose pairing is already correct."""
+    import inspect
+    from codai.api import text
+    src = inspect.getsource(text)
+    acq = src.find("_admission.request_slots.acquire()")
+    assert acq > 0, "the inference path is ungated again"
+    stream = src.find("if request.stream:", acq)
+    assert 0 < stream, "the slot must be taken BEFORE the stream/non-stream branch"
+    rel = [i for i in range(len(src))
+           if src.startswith("_admission.request_slots.release(_adm_held)", i)]
+    assert len(rel) == 2, (
+        f"expected one release per branch, found {len(rel)}")
+    for i in rel:
+        before = src[max(0, i - 400):i]
+        assert "finally:" in before, "a release outside a finally leaks the slot"

@@ -1,8 +1,11 @@
 # Pod admission control: a KV-aware gate instead of a guessed batch width
 
-Status: **implemented** (M0-M3). `codai/api/admission.py`, with the gate in
-`codai/queue/manager.py` and the measurement in `codai/api/vllm_worker.py`.
-M4 and M5 below are not.
+Status: **implemented** (M0-M5). `codai/api/admission.py`, with the gates in
+`codai/queue/manager.py` and `codai/api/admission.Slots`, and the measurement in
+`codai/api/vllm_worker.py`.
+
+M4 and M5 were both written here from wrong premises. Both are corrected in
+place below, with what was actually true and what was actually built.
 
 ## The problem
 
@@ -127,16 +130,12 @@ off behaviour is byte-for-byte today's.
 **M3 — projected occupancy.** See its own section below; it is what takes
 steady-state preemptions from *small but nonzero* to zero.
 
-**M4 — the orchestrator learns to read `waiting`** so intentional queueing is not
-mistaken for overload (see failure mode 4). NOT DONE.
+**M4 — the orchestrator and intentional queueing.** DONE, but not as described:
+see *M4 corrected* below. There is no control change to make.
 
-**M5 — the text path.** The gate implemented here is the engine-side one
-(`queue_manager`), which is what governs OCR and the pipeline paths. Text
-generation is gated separately, at the front, by `_model_capacity` — and on a
-pod `models.max_model_instances` is left at its default, so a pod serving
-`/v1/chat/completions` is held at one request at a time regardless of
-`pod_max_parallel_requests`. Worth fixing, and a different change from this one.
-NOT DONE.
+**M5 — the inference path.** DONE, and the opposite of what was written here:
+see *M5 corrected* below. The path was not gated at one request; it was not
+gated at all.
 
 ## The controller
 
@@ -343,5 +342,103 @@ it.
 | `codai/config.py` | the `admission_*` settings, and the server env table |
 | `codai/api/app.py` | starts it; reports it on `/internal/engine-state` |
 | `codai/api/runpod_worker.py` | `_pod_admission_env()`, forwarded in `_plan` |
-| `tests/test_admission_control_is_kv_aware.py` | 27 tests |
-| `tests/test_the_pod_gate_env_is_actually_read.py` | 12 tests |
+| `codai/api/admission.py` | `Slots` — the inference gate (M5) |
+| `codai/api/text.py` | takes a slot across the generation, both branches |
+| `codai/api/pod_telemetry.py` | carries the pod's decision upward (M4) |
+| `tests/test_admission_control_is_kv_aware.py` | 35 tests |
+| `tests/test_the_pod_gate_env_is_actually_read.py` | 15 tests |
+
+## M4 corrected — the premise does not hold
+
+This was written as "the orchestrator may read intentional queueing as overload
+and rent a pod to solve a self-imposed limit". It cannot, and the reason is
+worth recording so nobody builds the fix:
+
+**The orchestrator's demand signal is its own outstanding count.** `_load(pod)`
+is `pod.inflight + pod.worker_inflight` — requests this side has SENT and not
+yet had back. A pod that queues internally does not change that number: the
+requests are still outstanding. So the view that drives `_grow_reason` is
+unaffected by how the pod schedules behind its own gate.
+
+And where the pod throttles because its cache really is full, that is genuine
+saturation, and another pod — with its own cache — is the correct answer.
+Growth was never wrong here.
+
+The interaction is in fact self-correcting: a controller lowers a limit, load
+spreads across more pods, each cache empties, each controller raises its limit
+again.
+
+**What was actually missing was the ability to tell the two apart.** From
+outside, a pod throttling and a pod saturated look identical — both answer
+slowly with requests outstanding — and "which is it" is the first question
+asked of a fleet that is growing. So the pod's decision now travels on the
+telemetry the orchestrator already collects: `admission_limit`,
+`admission_ceiling`, `admission_reason`, plus `kv_tokens` / `kv_gib` /
+`max_concurrency`.
+
+`kv_tokens` matters on its own account: `kv_cache_pct` was a percentage of a
+number nobody could see, and two cards of equal VRAM can leave different caches
+because a different attention backend reserves a different workspace. The
+absolute is the only honest basis for comparing one card with another.
+
+Pinned by a test, because the correctness of leaving growth alone depends on
+`_load` staying an outstanding count. If it ever becomes the pod's `running`,
+the original concern becomes real.
+
+## M5 corrected — the path had no gate at all
+
+This was written as "text is gated at the front by `_model_capacity`, and on a
+pod `max_model_instances` defaults to 1, so a pod serving chat is held at one
+request at a time". Every part of that is wrong, and the truth is worse.
+
+What the investigation found, in order:
+
+1. **A pod runs no front.** `boot.sh` execs `python -m uvicorn
+   codai.api.app:app` — the API app, not `codai/frontproxy`. So `FrontQueue` and
+   `_model_capacity` are not in the picture on a pod at all.
+2. **`queue_manager` does not gate inference.** Its `acquire`/`release` callers
+   are `compose`, `custom_pipelines` and `loras`. The text path calls only
+   `add_waiting` and `start_processing`/`finish_processing`, which are
+   bookkeeping — `start_processing` takes no lease and consults no limit.
+3. **`acquire_model_instance` does not block.** It ref-counts and picks the
+   least-busy instance. `max_model_instances` governs how many COPIES of a model
+   are loaded, not how many requests run at once.
+4. **OCR has its own semaphore**, `asyncio.Semaphore(ocr.max_concurrency)`,
+   independent of all of the above.
+
+So on a rented pod, every arriving generation went **straight through to the
+engine**, which admitted up to its own `max_num_seqs` and then preempted. There
+was no coderai-side limit on the inference path, and therefore nothing for the
+controller to lower — M0-M3 as first built moved a number that the workload most
+in need of it does not read.
+
+### What was built
+
+`admission.Slots`: a counting gate whose limit may change while requests wait,
+held across the whole generation and released in both the streaming and
+non-streaming branches, beside `_release_instance` (whose pairing was already
+correct). The controller now applies its decision to **both** gates.
+
+Three properties, each the answer to a way this would otherwise break:
+
+* **`limit = 0` is no gate.** The default. `acquire` returns `False`, `release`
+  does nothing, and an install with the controller off behaves exactly as
+  before — including taking no slot that could be mis-released.
+* **Raising the limit wakes waiters.** `release` hands a freed slot to one
+  waiter, so capacity added by a raise is held by nobody; queued requests would
+  wait for an unrelated request to finish, which looks exactly like a controller
+  that does not work.
+* **Lowering never claws back a running request.** Cancelling a generation to
+  enforce a new limit is the recompute this subsystem exists to avoid. The gate
+  closes as requests drain.
+
+Requests **wait** rather than being refused: a bounded queue here would
+reintroduce failure mode 2, and a client gives up on an error far faster than on
+latency. What bounds memory is the limit itself.
+
+### OCR is deliberately left alone
+
+`ocr.max_concurrency` already bounds the OCR path, and adding a second gate in
+series would be the "two queues" failure mode this document warns about — two
+owners, neither able to reason about the total latency. The OCR lever is its own
+setting. The controller's gate covers the inference path, which had none.

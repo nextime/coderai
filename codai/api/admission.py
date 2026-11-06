@@ -384,6 +384,12 @@ class AdmissionController:
         return out
 
     async def _apply(self, limit: int) -> None:
+        # BOTH gates, because they bound different paths of the same engine:
+        # `queue_manager` the lease-taking ones (compose, pipelines, training)
+        # and `request_slots` the inference path, which had no gate at all.
+        # Lowering one and not the other would leave the controller moving a
+        # number that the workload in question does not read.
+        request_slots.set_limit(int(limit))
         qm = self._qm
         if qm is None:
             from codai.queue.manager import queue_manager as qm
@@ -425,6 +431,107 @@ class AdmissionController:
                 print(f"[admission] tick skipped: {exc}", flush=True)
 
 
+class Slots:
+    """A counting admission gate whose limit may change while requests wait.
+
+    The engine's text path had NO admission gate at all. `queue_manager` bounds
+    the lease-taking paths (compose, pipelines, training);
+    `multi_model_manager.acquire_model_instance` ref-counts and selects an
+    instance but never blocks; and the front's per-model queue lives in the
+    front process, which a pod does not run -- its boot.sh execs uvicorn on the
+    API app directly. So on a rented pod every arriving generation went straight
+    through to the engine, which admitted up to its own `max_num_seqs` and then
+    preempted. There was nothing for a controller to lower.
+
+    `limit` of 0 means NO GATE, and then acquire returns immediately and release
+    does nothing: an install with the controller off behaves exactly as it did.
+
+    Requests WAIT rather than being refused. Narrowing a gate into rejections is
+    the failure this subsystem has already paid for once -- a client gives up on
+    an error far faster than on latency -- so the queue here is unbounded and the
+    caller's own timeout governs. What bounds memory is the limit itself.
+    """
+
+    def __init__(self):
+        self._limit = 0
+        self._active = 0
+        self._waiters: list = []
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    @property
+    def waiting(self) -> int:
+        return len(self._waiters)
+
+    def set_limit(self, limit: int) -> None:
+        """Move the gate, releasing anyone it now admits.
+
+        Waking on a RAISE is not optional: `release` hands a freed slot to one
+        waiter, so capacity added by a raise is held by nobody and queued
+        requests would sit there until an unrelated one finished -- which looks
+        exactly like a controller that does not work.
+        """
+        limit = max(0, int(limit or 0))
+        if limit == self._limit:
+            return
+        raised = limit == 0 or limit > self._limit
+        self._limit = limit
+        if raised:
+            self._wake()
+
+    def _wake(self) -> None:
+        while self._waiters and (self._limit <= 0 or self._active < self._limit):
+            fut = self._waiters.pop(0)
+            if fut.done():
+                continue
+            self._active += 1
+            fut.set_result(True)
+
+    async def acquire(self) -> bool:
+        """True = a slot is held and `release(True)` must be called for it."""
+        if self._limit <= 0:
+            return False
+        if self._active < self._limit:
+            self._active += 1
+            return True
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+        except BaseException:
+            # Cancelled while queued (a client that hung up). If the slot was
+            # granted in the race with cancellation it has to go back, or the
+            # gate leaks capacity one request at a time until it admits nothing.
+            if fut in self._waiters:
+                self._waiters.remove(fut)
+            elif fut.done() and not fut.cancelled() and fut.exception() is None:
+                self.release(True)
+            raise
+        return True
+
+    def release(self, held: bool = True) -> None:
+        if not held:
+            return
+        if self._active > 0:
+            self._active -= 1
+        self._wake()
+
+    def snapshot(self) -> dict:
+        return {"limit": self._limit, "active": self._active,
+                "waiting": len(self._waiters)}
+
+
+#: The engine-side gate for inference requests. Process-wide, because the thing
+#: it protects is process-wide: one engine, one KV cache, one limit.
+request_slots = Slots()
+
+
 #: The process's controller, once started. None = never started (and then
 #: nothing anywhere should behave differently from before this existed).
 controller: Optional[AdmissionController] = None
@@ -454,4 +561,8 @@ def start(cfg, queue_manager=None) -> Optional[AdmissionController]:
 
 def snapshot() -> dict:
     """The process controller's state, or {} when it never started."""
-    return controller.snapshot() if controller is not None else {}
+    if controller is None:
+        return {}
+    out = controller.snapshot()
+    out["slots"] = request_slots.snapshot()
+    return out

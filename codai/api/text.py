@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # Import from codai modules
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager, model_manager, multi_model_manager
 from codai.queue.manager import QueueManager, queue_manager
+from codai.api import admission as _admission
 from codai.tasks import task_registry
 from codai.api.prompt_cache import prompt_cache_manager
 from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
@@ -2650,6 +2651,22 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Compute prefix key for prompt-aggregation scheduling
     _prefix_key = prompt_cache_manager.get_prefix_key(messages_dict)
 
+    # KV-AWARE ADMISSION. Held across the whole generation, both branches, and
+    # released beside `_release_instance` -- which is why it is taken HERE, after
+    # the model is resolved and before either branch, rather than inside one of
+    # them.
+    #
+    # This path had no admission gate of any kind. The front's per-model queue
+    # lives in the front process, and a pod does not run one (its boot.sh execs
+    # uvicorn on this app); `acquire_model_instance` ref-counts and picks an
+    # instance but never blocks; and `queue_manager.start_processing` is
+    # bookkeeping, not a lease. So every arriving generation went straight to the
+    # engine, which admitted up to its own max_num_seqs and then preempted --
+    # evicting half-finished replies and recomputing them, with throughput
+    # collapsing while every counter looked busy. A limit of 0 (the default
+    # unless the controller is running) makes the next line a no-op.
+    _adm_held = await _admission.request_slots.acquire()
+
     if request.stream:
         async def _managed_stream():
             try:
@@ -2678,6 +2695,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 ):
                     yield chunk
             finally:
+                _admission.request_slots.release(_adm_held)
                 _release_instance()
 
         from fastapi.responses import StreamingResponse
@@ -2737,6 +2755,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 return await _generate(
                     _msgs2, _eff2 if _eff2 is not None else request.max_tokens)
         finally:
+            _admission.request_slots.release(_adm_held)
             _release_instance()
 
 

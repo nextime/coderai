@@ -171,3 +171,43 @@ def test_engine_state_reports_the_controller():
     assert '"admission": admission' in body, (
         "the controller's state must travel on the endpoint the orchestrator "
         "already polls, or the limit is only visible in the pod's own log")
+
+
+# --- 5. a throttling pod must be distinguishable from a saturated one ----
+#
+# From outside they look identical: both answer slowly with requests
+# outstanding. The orchestrator's own demand signal is its OUTSTANDING count
+# (`_load` = inflight + worker_inflight), which a pod's internal throttling does
+# not change -- so growth stays correct either way and no control change is
+# needed. What was missing is the ability to SAY which it is, which is the first
+# question asked of a fleet that is growing.
+
+def test_the_telemetry_carries_what_the_pod_decided():
+    from codai.api import pod_telemetry
+    import inspect
+    src = inspect.getsource(pod_telemetry._fetch)
+    for key in ("admission_limit", "admission_ceiling", "admission_reason",
+                "kv_tokens"):
+        assert key in src, f"{key} never reaches the orchestrator"
+
+
+def test_the_orchestrator_demand_signal_is_its_own_outstanding_count():
+    """Pinned because it is why M4 needs no control change: `_load` counts what
+    THIS side sent and has not got back, so a pod queueing internally does not
+    move it. If this ever becomes the pod's `running` instead, intentional
+    throttling would read as saturation and the pool would grow against it."""
+    import inspect
+    from codai.api import runpod_worker
+    src = inspect.getsource(runpod_worker._load)
+    assert "inflight" in src and "worker_inflight" in src
+    assert "running" not in src
+
+
+def test_a_pod_reports_its_cache_size_for_comparison():
+    """`kv_cache_pct` is a percentage of a number nobody could see. Two cards of
+    the same VRAM can leave different caches -- a different attention backend
+    reserves a different workspace -- so the absolute is the only honest basis
+    for comparing them."""
+    from codai.api import pod_telemetry
+    import inspect
+    assert "kv_gib" in inspect.getsource(pod_telemetry._fetch)

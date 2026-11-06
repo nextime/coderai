@@ -160,6 +160,27 @@ def _fetch(pod_id: str, url: str, key: str) -> dict:
                       "requests_done", "prompt_tokens", "generation_tokens"):
                 if isinstance(load.get(k), (int, float)):
                     out[k] = load[k]
+        # What the pod's own admission controller is doing, and the cache size it
+        # is doing it against. Reported, never acted on from here: the gate is on
+        # the pod because that is where the measurement is.
+        #
+        # Worth surfacing because without it a throttling pod and a saturated one
+        # look identical from outside -- both answer slowly with requests
+        # outstanding -- and the first question asked of a fleet that is growing
+        # is which of the two it is. `kv_tokens` is the absolute the page's
+        # `kv_cache_pct` is a percentage OF, and the only honest basis for
+        # comparing one card's cache with another's.
+        adm = state.get("admission")
+        if isinstance(adm, dict):
+            if isinstance(adm.get("limit"), (int, float)):
+                out["admission_limit"] = adm["limit"]
+            if isinstance(adm.get("ceiling"), (int, float)):
+                out["admission_ceiling"] = adm["ceiling"]
+            if isinstance(adm.get("reason"), str) and adm["reason"]:
+                out["admission_reason"] = adm["reason"][:160]
+            for k in ("kv_tokens", "kv_gib", "max_concurrency"):
+                if isinstance(adm.get(k), (int, float)):
+                    out[k] = adm[k]
         return out
     except Exception:
         # A pod that cannot be reached has no telemetry, which is not an error
