@@ -129,7 +129,24 @@ function _loadCell(p){
   if (p.running != null) bits.push(`${p.running} run`);
   if (p.waiting) bits.push(`<span style="color:#f59e0b">${p.waiting} wait</span>`);
   if (p.gpu_temp_c != null) bits.push(`${Math.round(p.gpu_temp_c)}°C`);
-  const pre = p.preemptions ? `<div style="font-size:10px;color:#ef4444">${p.preemptions} preempted — past the KV ceiling</div>` : '';
+  /* The TOTAL is history; the DELTA is the condition. `preemptions` is
+     cumulative and is carried across an engine restart on purpose, so a pod
+     that overflowed its cache once an hour ago reports that number for the
+     rest of its life. Painting the total red made every such pod permanently
+     "past the KV ceiling", which is both wrong and the kind of wrong that
+     teaches an operator to ignore the colour. Red is now reserved for a count
+     that has MOVED recently; the total stays visible, in muted type, as the
+     history it is. */
+  const preN = p.preemptions || 0;
+  const preHot = (p.preemptions_recent || 0) > 0 ||
+                 (p.preemptions_age_s != null && p.preemptions_age_s < 120);
+  const preAgo = p.preemptions_age_s == null ? ''
+    : p.preemptions_age_s < 90 ? ` ${Math.round(p.preemptions_age_s)}s ago`
+    : ` ${Math.round(p.preemptions_age_s / 60)}m ago`;
+  const pre = !preN ? ''
+    : preHot
+      ? `<div style="font-size:10px;color:#ef4444">${preN} preempted, still rising — past the KV ceiling now</div>`
+      : `<div style="font-size:10px;color:var(--text-3)">${preN} preempted earlier${preAgo} — not now</div>`;
   const txt = bits.length ? `<div style="font-size:10px;color:var(--text-3)">${bits.join(' · ')}</div>` : '';
   if (!bars.length) {
     return (bits.length ? `<span style="font-size:11px">${bits.join(' · ')}</span>` : '<span class="dim">—</span>') + pre;

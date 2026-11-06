@@ -45,6 +45,26 @@ TIMEOUT_S = 2.5
 _CACHE: Dict[str, Tuple[float, dict]] = {}
 _LOCK = threading.Lock()
 
+#: How recently the preemption counter must have MOVED for a pod to count as
+#: being past its cache ceiling now.
+#:
+#: ``preemptions`` is cumulative (see codai.api.serving_load._CUMULATIVE) and is
+#: deliberately carried across an engine restart, so it only ever goes up. A
+#: pod that preempted sixteen requests during one overload an hour ago reports
+#: sixteen for the rest of its life -- and a reader shown that total has no way
+#: to tell it from a pod preempting sixteen requests a minute. serving_load's
+#: own note says it plainly: "a RISING count is the clearest 'we are past the
+#: ceiling' signal". The total is history; the delta is the signal.
+#:
+#: A window rather than a bare per-poll delta because the page polls every few
+#: seconds: a delta alone would show the alarm on exactly the one poll the
+#: counter moved and hide it on the next, which reads as a glitch instead of a
+#: condition.
+PREEMPT_FRESH_S = 120.0
+
+#: pod_id -> (highest total seen, monotonic time it last increased).
+_PREEMPT: Dict[str, Tuple[float, float]] = {}
+
 
 def _root(url: str) -> str:
     """The pod's root URL, with the OpenAI `/v1` suffix removed if present.
@@ -198,7 +218,56 @@ def cached(pod_id: str) -> dict:
     return dict(data) if (time.time() - at) < TTL_S else {}
 
 
+def _note_preemptions(pod_id: str, data: dict) -> None:
+    """Turn the cumulative preemption counter into a usable signal.
+
+    Adds, when the pod reported a count at all:
+
+    ``preemptions_recent``
+        How many more than the last time this pod was asked. 0 means the cache
+        has not overflowed since, whatever the total says.
+    ``preemptions_age_s``
+        Seconds since the count last rose, or None if it has not risen while
+        this process has been watching. The caller decides what counts as
+        recent; :data:`PREEMPT_FRESH_S` is the default answer.
+
+    Caller must NOT hold ``_LOCK``.
+    """
+    total = data.get("preemptions")
+    if not isinstance(total, (int, float)):
+        return
+    total = float(total)
+    now = time.monotonic()
+    with _LOCK:
+        seen, rose_at = _PREEMPT.get(pod_id, (None, None))
+        if seen is None:
+            # First sighting. The total is whatever happened before we were
+            # watching, so it is history by definition: claiming it as "now"
+            # is the very bug this exists to fix.
+            delta = 0.0
+        elif total < seen:
+            # Lower than before, so this is a counter that restarted rather
+            # than work that un-happened. serving_load carries these across an
+            # engine restart, but a pod whose accumulator was lost would
+            # otherwise report a huge negative here. Re-baseline to the NEW
+            # value -- keeping the old high-water mark instead would swallow
+            # every real preemption until the fresh counter climbed past it.
+            delta = 0.0
+        else:
+            delta = total - seen
+            if delta > 0:
+                rose_at = now
+        _PREEMPT[pod_id] = (total, rose_at)
+        if len(_PREEMPT) > 512:
+            for k in list(_PREEMPT)[: len(_PREEMPT) - 384]:
+                _PREEMPT.pop(k, None)
+    data["preemptions_recent"] = int(delta)
+    data["preemptions_age_s"] = (None if rose_at is None
+                                 else round(max(0.0, now - rose_at), 1))
+
+
 def _store(pod_id: str, data: dict) -> None:
+    _note_preemptions(pod_id, data)
     with _LOCK:
         _CACHE[pod_id] = (time.time(), dict(data))
         if len(_CACHE) > 512:                 # a fleet is bounded; this is not
@@ -211,8 +280,13 @@ def forget(pod_id: Optional[str] = None) -> None:
     with _LOCK:
         if pod_id is None:
             _CACHE.clear()
+            _PREEMPT.clear()
         else:
             _CACHE.pop(pod_id, None)
+            # A terminated pod's id can be reused by nothing, but its baseline
+            # must go with it: a FRESH pod inheriting a stale high-water mark
+            # would report a negative delta and then re-baseline silently.
+            _PREEMPT.pop(pod_id, None)
 
 
 async def collect(endpoints: List[Tuple[str, str, str]],
