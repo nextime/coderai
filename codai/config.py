@@ -37,6 +37,39 @@ class ServerConfig:
     metrics_public: bool = False
     queue_max_size: int = 6
     max_parallel_requests: int = 2
+    # ─── KV-aware admission control ──────────────────────────────────────────
+    # A serving engine admits as many sequences as it is told to without checking
+    # whether its KV cache can hold them at the length they will REACH, then
+    # evicts half-generated requests and recomputes them. Throughput collapses
+    # while every counter still looks busy, and it is invisible in utilisation
+    # and VRAM alike (vLLM claims its gpu_memory_utilization share at boot, so a
+    # pod reads ~90% from the moment it starts).
+    #
+    # So `max_parallel_requests` above becomes a CEILING rather than a setpoint,
+    # and the controller moves the real limit underneath it from what the engine
+    # reports. Gating on cache OCCUPANCY rather than a request count is what
+    # makes this hardware-independent: a fraction means the same thing on every
+    # card, so there is no per-card table, nothing measured ahead of time and
+    # nothing remembered between pods. See codai/api/admission.py and
+    # docs/pod-admission-control-plan.md.
+    #
+    # `auto` = on wherever the engine reports cache occupancy (vLLM), off
+    # otherwise. `off` reproduces the behaviour this install had before the
+    # controller existed, exactly.
+    admission_control: str = "auto"          # auto | on | off
+    admission_kv_target_pct: float = 0.85    # raise the limit below this
+    admission_kv_ceiling_pct: float = 0.95   # lower it above this, preempted or not
+    admission_min_parallel: int = 4          # floor; never throttle below this
+    admission_interval_s: float = 5.0        # control period (metrics TTL is 2s)
+    admission_backoff: float = 0.75          # multiplicative decrease factor
+    admission_recover_after: int = 3         # quiet ticks before increasing again
+    # Tokens one request is expected to hold at its longest, for the projection
+    # that current occupancy cannot supply: a request admitted at 80% keeps
+    # GROWING, so the gate must count what is already committed, not what is
+    # held. 0 = derive it from the engine's own counters. Set it when the
+    # workload knows its own worst case — an OCR page is an image's tokens plus
+    # a generation cap, and a bound beats an average of what already happened.
+    admission_expected_tokens: int = 0
     # Per-engine overrides for max_parallel_requests, keyed by engine name
     # (e.g. {"nvidia": 4, "radeon": 1}). Each engine is a separate process and
     # enforces this on itself, so the default already applies per-engine; the
@@ -2189,6 +2222,14 @@ class ConfigManager:
                 "queue_max_size": self.config.server.queue_max_size,
                 "max_parallel_requests": self.config.server.max_parallel_requests,
                 "max_parallel_requests_overrides": self.config.server.max_parallel_requests_overrides,
+                "admission_control": self.config.server.admission_control,
+                "admission_kv_target_pct": self.config.server.admission_kv_target_pct,
+                "admission_kv_ceiling_pct": self.config.server.admission_kv_ceiling_pct,
+                "admission_min_parallel": self.config.server.admission_min_parallel,
+                "admission_interval_s": self.config.server.admission_interval_s,
+                "admission_backoff": self.config.server.admission_backoff,
+                "admission_recover_after": self.config.server.admission_recover_after,
+                "admission_expected_tokens": self.config.server.admission_expected_tokens,
                 "dpm_force_performance_level_overrides": self.config.server.dpm_force_performance_level_overrides,
                 "internal_port_base": self.config.server.internal_port_base,
                 "engines": self.config.server.engines,
@@ -2644,6 +2685,45 @@ class ConfigManager:
         def _flag(name: str) -> bool:
             return str(_os.environ.get(name, "")).strip().lower() in (
                 "1", "true", "yes", "on")
+
+        # --- the admission gate, and the controller that moves it ------------
+        #
+        # HERE rather than in codai/main.py, which is where the rest of the
+        # server's env overrides live, because A POD NEVER RUNS main.py: its
+        # boot.sh execs `python -m uvicorn codai.api.app:app` directly. Both
+        # `CODERAI_SERVER_MAX_PARALLEL_REQUESTS` and `..._QUEUE_MAX_SIZE` have
+        # been emitted by `pod_plan` since pods shipped and read only by
+        # main.py, so on a pod image they were set and then ignored -- the
+        # shared-workstation defaults stood, and the gate the comments say a
+        # rented A40 needs was never applied to one. ConfigManager.load() runs
+        # under BOTH entry points, so this reaches a pod and a workstation
+        # alike; main.py keeps its own copy for the config it had already
+        # applied by the time it gets there.
+        for _env, _attr, _cast in (
+                ("CODERAI_SERVER_MAX_PARALLEL_REQUESTS",
+                 "max_parallel_requests", int),
+                ("CODERAI_SERVER_QUEUE_MAX_SIZE", "queue_max_size", int),
+                ("CODERAI_ADMISSION_CONTROL", "admission_control", str),
+                ("CODERAI_ADMISSION_KV_TARGET_PCT",
+                 "admission_kv_target_pct", float),
+                ("CODERAI_ADMISSION_KV_CEILING_PCT",
+                 "admission_kv_ceiling_pct", float),
+                ("CODERAI_ADMISSION_MIN_PARALLEL",
+                 "admission_min_parallel", int),
+                ("CODERAI_ADMISSION_INTERVAL_S", "admission_interval_s", float),
+                ("CODERAI_ADMISSION_BACKOFF", "admission_backoff", float),
+                ("CODERAI_ADMISSION_RECOVER_AFTER",
+                 "admission_recover_after", int),
+                ("CODERAI_ADMISSION_EXPECTED_TOKENS",
+                 "admission_expected_tokens", int)):
+            _val = (_os.environ.get(_env) or "").strip()
+            if not _val:
+                continue
+            try:
+                setattr(self.config.server, _attr, _cast(_val))
+            except (TypeError, ValueError):
+                print(f"[config] {_env}={_val!r} is not a {_cast.__name__}; "
+                      f"leaving server.{_attr} alone", flush=True)
 
         if _flag("CODERAI_OCR_ENABLED"):
             self.config.ocr.enabled = True

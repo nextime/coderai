@@ -220,9 +220,30 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # KV-aware admission control. Started HERE, in the lifespan, for the same
+    # reason the seed registration is: a pod image runs uvicorn on this app
+    # directly and never executes codai/main.py, so anything started only there
+    # does not exist on a pod -- and a pod is the case this controller is for.
+    try:
+        from codai.api import admission
+        import codai.admin.routes as _ar
+        _cm = getattr(_ar, "config_manager", None)
+        _srv = getattr(getattr(_cm, "config", None), "server", None)
+        if _srv is not None:
+            admission.start(_srv)
+    except Exception as exc:
+        print(f"[admission] not started: {exc}", flush=True)
+
     boot_phase("startup complete — accepting requests")
 
     yield
+
+    try:
+        from codai.api import admission
+        if admission.controller is not None:
+            await admission.controller.stop()
+    except Exception:
+        pass
 
     if broker_service is not None:
         await broker_service.stop()
@@ -651,8 +672,19 @@ async def internal_engine_state():
         load = serving_load.snapshot(urls[0] if urls else "")
     except Exception:
         load = {}
+    # What the admission controller has decided, and the cache size it decided
+    # against. Reported rather than acted on from outside: the gate itself is on
+    # the pod, because that is where the measurement is.
+    admission = {}
+    try:
+        from codai.api import admission as _adm, vllm_worker as _vw2
+        admission = dict(_adm.snapshot())
+        for _k, _v in (_vw2.kv_capacity() or {}).items():
+            admission[_k] = _v
+    except Exception:
+        admission = {}
     return {"ok": True, "pid": _os.getpid(), "loaded_models": loaded,
-            "loaded_info": loaded_info, "load": load,
+            "loaded_info": loaded_info, "load": load, "admission": admission,
             "vram": vram, "tasks": tasks, "cooling": cooling, "paused": paused}
 
 

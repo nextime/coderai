@@ -50,6 +50,15 @@ class QueueManager:
         self.lock = asyncio.Lock()
         self.max_size: int = 6
         self.max_parallel_requests: int = 2
+        #: A ceiling BELOW `max_parallel_requests`, set at runtime by the KV-aware
+        #: admission controller (see codai/api/admission.py). 0 = none, and then
+        #: this class behaves exactly as it did before the controller existed.
+        #:
+        #: Deliberately a second number rather than a write to
+        #: `max_parallel_requests`: that field is the operator's stated maximum
+        #: and the controller must never be able to raise it or to lose it. The
+        #: effective limit is the smaller of the two.
+        self.dynamic_cap: int = 0
         self.waiting: Deque[WaitingRequest] = deque()
         self.waiting_by_id: Dict[str, WaitingRequest] = {}
         self.active_leases: Dict[str, SchedulerLease] = {}
@@ -86,6 +95,7 @@ class QueueManager:
         self._processing = False
         self._ready_request_ids.clear()
         self._last_prefix_key = ""
+        self.dynamic_cap = 0
 
     async def is_full(self) -> bool:
         async with self.lock:
@@ -203,6 +213,8 @@ class QueueManager:
             "active": len(self.active_leases),
             "waiting": len(self.waiting),
             "max_parallel_requests": self.max_parallel_requests,
+            "dynamic_cap": self.dynamic_cap,
+            "effective_parallel_limit": self.effective_parallel_limit(),
             "queue_max_size": self.max_size,
             "active_by_model": dict(self.active_by_model),
             "waiting_by_model": self._waiting_counts_locked(),
@@ -232,10 +244,38 @@ class QueueManager:
         self._processing = True
         return lease
 
+    def effective_parallel_limit(self) -> int:
+        """The limit actually enforced: the operator's maximum, lowered by the
+        admission controller if it has something to say. 0 = unlimited."""
+        stated = int(self.max_parallel_requests or 0)
+        cap = int(self.dynamic_cap or 0)
+        if cap <= 0:
+            return stated
+        return min(stated, cap) if stated > 0 else cap
+
+    async def set_dynamic_cap(self, limit: int) -> None:
+        """Move the runtime ceiling, and release anyone it now admits.
+
+        Waking waiters is not optional. `_release_locked` hands a freed slot to
+        exactly one waiter, so a RAISED limit frees capacity that nothing is
+        holding -- and queued requests would sit there until some unrelated
+        request happened to finish. That looks precisely like a controller that
+        is not working.
+        """
+        limit = max(0, int(limit or 0))
+        async with self.lock:
+            if limit == self.dynamic_cap:
+                return
+            raised = limit == 0 or limit > self.dynamic_cap
+            self.dynamic_cap = limit
+            if raised:
+                self._wake_waiters_locked()
+
     def _can_start_now(self, model_key: str) -> bool:
-        if self.max_parallel_requests > 0:
+        limit = self.effective_parallel_limit()
+        if limit > 0:
             in_flight = len(self.active_leases) + len(self._ready_request_ids)
-            if in_flight >= self.max_parallel_requests:
+            if in_flight >= limit:
                 return False
         if self.active_by_model.get(model_key, 0) > 0:
             return False

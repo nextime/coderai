@@ -186,6 +186,18 @@ def _default_detector():
 class StreamUnsupported(Exception):
     """The stream produced nothing usable, and NOTHING WAS CONSUMED.
 
+    ``capability`` is the second, independent question, and conflating it with
+    the first cost a production run its loop detection. This exception means
+    "safe to re-issue". It does NOT mean "this server cannot stream" -- a
+    connection reset, a timeout or a pod restarting raises it too, and a caller
+    that treated every one of them as a verdict about the SERVER put that
+    server in :data:`_NO_STREAM` for the rest of the process. One transient
+    blip early in a run then disabled early loop abort for every page after
+    it, and every looping page ran to its full token cap instead of being
+    cancelled after a few hundred characters -- announced in a single log line
+    that scrolled away. So the two are separate: ``capability`` is True only
+    when the server has said something about what it SUPPORTS.
+
     The distinction a retry depends on. A caller may safely re-issue the
     request as an ordinary blocking call only if the server never began
     answering -- a connection error, a refusal, a body in a shape this cannot
@@ -199,6 +211,14 @@ class StreamUnsupported(Exception):
     the first segment's text vanished and the continuation was returned in its
     place.
     """
+
+    def __init__(self, message: str = "", capability: bool = False):
+        super().__init__(message)
+        #: True = the server told us it does not support streaming (a 4xx to a
+        #: streaming request, or a reply that is neither a stream nor JSON).
+        #: False = this attempt failed for a reason that says nothing about the
+        #: server's capabilities, so it must not be remembered.
+        self.capability = bool(capability)
 
 
 #: Servers that have already proved they cannot stream, by base URL. One wasted
@@ -284,7 +304,8 @@ def stream_chat(post, url: str, payload: dict, headers: dict, timeout: float,
                 # without `stream_options`, or without streaming at all, says.
                 # Nothing was generated, so the blocking path can answer it.
                 raise StreamUnsupported(
-                    f"HTTP {code} to a streaming request: {text}")
+                    f"HTTP {code} to a streaming request: {text}",
+                    capability=True)
             # A 5xx is the server saying IT failed, not that the request was
             # wrong. Falling back would ask a broken server the same question
             # twice and report the second answer, hiding the first.
@@ -397,9 +418,11 @@ def _from_whole_body(resp, guard, want_logprobs) -> "StreamedReply":
     try:
         body = resp.json()
     except Exception as exc:
-        raise StreamUnsupported(f"not a stream and not JSON: {exc}")
+        raise StreamUnsupported(f"not a stream and not JSON: {exc}",
+                                capability=True)
     if not isinstance(body, dict):
-        raise StreamUnsupported("not a stream and not a JSON object")
+        raise StreamUnsupported("not a stream and not a JSON object",
+                                capability=True)
     out = StreamedReply()
     out.text = _text_of_body(body)
     reason, used_in, used_out = _usage_of_body(body)

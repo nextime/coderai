@@ -1343,6 +1343,49 @@ def _ocr_external_server(engine: str):
 _PLAN_SAID: dict = {}
 
 
+#: Admission-controller policy forwarded to a pod, as env (a pod has no
+#: config.json, so env is the only channel it has). Only what the operator SET
+#: travels: an unset knob must arrive as absent, not as the dataclass default
+#: restated, or a later change to that default would silently not reach pods.
+_POD_ADMISSION_ENV = (
+    ("admission_control", "CODERAI_ADMISSION_CONTROL", str),
+    ("admission_kv_target_pct", "CODERAI_ADMISSION_KV_TARGET_PCT", float),
+    ("admission_kv_ceiling_pct", "CODERAI_ADMISSION_KV_CEILING_PCT", float),
+    ("admission_min_parallel", "CODERAI_ADMISSION_MIN_PARALLEL", int),
+    ("admission_interval_s", "CODERAI_ADMISSION_INTERVAL_S", float),
+    ("admission_backoff", "CODERAI_ADMISSION_BACKOFF", float),
+    ("admission_recover_after", "CODERAI_ADMISSION_RECOVER_AFTER", int),
+    ("admission_expected_tokens", "CODERAI_ADMISSION_EXPECTED_TOKENS", int),
+)
+
+
+def _pod_admission_env(mcfg) -> dict:
+    """The admission policy this install runs, for the pod to run the same one.
+
+    Read from THIS install's `server` config rather than from the model entry:
+    the policy is how hard any engine may be driven before it starts evicting,
+    which is a property of the deployment, not of one model. The per-model knob
+    is `pod_max_parallel_requests`, which is the ceiling it works below.
+    """
+    out = {}
+    try:
+        from codai.admin.routes import config_manager as _cm
+        srv = getattr(getattr(_cm, "config", None), "server", None)
+        if srv is None:
+            return out
+        explicit = set(getattr(_cm, "explicit_server_keys", None) or ())
+        for attr, name, cast in _POD_ADMISSION_ENV:
+            if attr not in explicit:
+                continue
+            try:
+                out[name] = str(cast(getattr(srv, attr)))
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return {}
+    return out
+
+
 def _plan(engine, image, args, mcfg, api_key, entry, served,
           seed_entries: list = None, capability: str = "") -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the models it must serve."""
@@ -1357,6 +1400,15 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         env["CODERAI_SERVER_MAX_PARALLEL_REQUESTS"] = str(int(mcfg.pod_max_parallel_requests))
     if getattr(mcfg, "pod_queue_max_size", 0):
         env["CODERAI_SERVER_QUEUE_MAX_SIZE"] = str(int(mcfg.pod_queue_max_size))
+    # ...and the POLICY the pod's own admission controller works to. The gate
+    # above is a CEILING; the controller lowers the real limit beneath it from
+    # the cache occupancy its engine reports, which is why none of this needs to
+    # know what card the pod got. These are constants, so launch time is the
+    # right time for them -- it is the LIMIT that must not be fixed at launch.
+    # Omitted keys leave the pod on coderai's defaults, which is `auto`: on
+    # wherever the engine reports occupancy.
+    _adm = _pod_admission_env(mcfg)
+    env.update(_adm)
     # A pod has ONE client — the install that rented it — so per-IP rate limiting
     # throttles its owner and nobody else. The default 60 requests/min on
     # /v1/chat/completions is below what a single A40 serves, so it threw away

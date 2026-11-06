@@ -535,10 +535,24 @@ class OlmOcrEngine(OcrEngine):
                 # and not a second generation. Any other failure is re-raised:
                 # once the server has begun answering, the page has been
                 # generated and paid for, and re-issuing it would run it twice.
-                loopguard.mark_no_stream(url)
-                print(f"[olmocr] this server does not stream ({exc}) — early "
-                      f"loop detection is off for it; a looping page will run "
-                      f"to its token cap before being rejected", flush=True)
+                #
+                # Only a CAPABILITY verdict is remembered. This used to mark the
+                # server on any failure at all, so one connection reset or
+                # timeout turned early loop abort off for every later page in
+                # the process -- and a looping page then ran to its full token
+                # cap instead of being cancelled after a few hundred
+                # characters. A transient falls back for THIS page only.
+                if getattr(exc, "capability", False):
+                    loopguard.mark_no_stream(url)
+                    print(f"[olmocr] this server does not stream ({exc}) — early "
+                          f"loop detection is off for it; a looping page will "
+                          f"run to its token cap before being rejected",
+                          flush=True)
+                else:
+                    print(f"[olmocr] the streaming attempt for this page failed "
+                          f"({exc}); reading it without early loop detection "
+                          f"and keeping streaming on for the next page",
+                          flush=True)
             else:
                 if got.aborted:
                     print(f"[olmocr] {got.reason}", flush=True)

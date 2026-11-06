@@ -87,6 +87,20 @@ def _pump_logs(proc, tail, meta: dict = None):
                         meta["kv_tokens"] = int(m.group(1).replace(",", ""))
                     except Exception:
                         pass
+            # vLLM also divides the cache by the window it was given, which is
+            # the one concurrency figure that is guaranteed safe: at
+            # max_model_len per request, this many fit without a single
+            # eviction. Captured because it costs nothing and it is a floor
+            # nobody has to derive.
+            if meta is not None and "max_concurrency" not in meta:
+                m = _MAX_CONCURRENCY.search(line)
+                if m:
+                    try:
+                        meta["concurrency_at_tokens"] = int(
+                            m.group(1).replace(",", ""))
+                        meta["max_concurrency"] = float(m.group(2))
+                    except Exception:
+                        pass
             print(f"[vllm] {line}", flush=True)
 
 
@@ -101,6 +115,40 @@ def running_service_urls() -> list:
                 if isinstance(svc, dict) and svc.get("url")]
     except Exception:
         return []
+
+
+def kv_capacity() -> dict:
+    """``{kv_tokens, kv_gib, max_concurrency, concurrency_at_tokens}``, or {}.
+
+    Measured ONCE, as the engine booted, by :func:`_pump_logs` -- the figures
+    scroll out of the log tail behind vLLM's route listing long before the
+    server is ready, so there is no reading them later.
+
+    Local by design. The admission controller runs in this same process, on the
+    pod that holds the model, so the number never has to travel and nothing has
+    to be seeded, keyed or remembered between pods: whatever card this process
+    was given, this is what that card actually gave back. Reported upward only
+    so a human can see it.
+
+    The FIRST service, matching :func:`running_service_urls`. A process serving
+    two engines would need the figures per URL; no caller needs that yet, and
+    answering for the wrong one silently is worse than answering for the first.
+    """
+    try:
+        for svc in list(_services.values()):
+            if not isinstance(svc, dict):
+                continue
+            meta = svc.get("meta")
+            if not isinstance(meta, dict):
+                continue
+            out = {k: meta[k] for k in
+                   ("kv_tokens", "kv_gib", "max_concurrency",
+                    "concurrency_at_tokens") if k in meta}
+            if out:
+                return out
+    except Exception:
+        pass
+    return {}
 
 
 def _health_ok(url: str, timeout: float = 3) -> bool:
@@ -1171,6 +1219,12 @@ _KV_REPORT = re.compile(r"Available KV cache memory:\s*(-?[\d.]+)\s*GiB", re.IGN
 # window: bytes-per-token depends on the model's attention shape (this hybrid puts
 # linear attention on most layers) and cannot be derived from the config.
 _KV_TOKENS = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens", re.IGNORECASE)
+#: ...and vLLM's own division of the two: "Maximum concurrency for 32,768
+#: tokens per request: 12.33x". Both halves are kept: the figure means nothing
+#: without the request size it was computed for.
+_MAX_CONCURRENCY = re.compile(
+    r"Maximum concurrency for\s*([\d,]+)\s*tokens per request:\s*([\d.]+)",
+    re.IGNORECASE)
 # How much KV cache an instance should end up with, how much spare has to be on the table
 # before shrinking is worth a move, and the margin kept when proposing a smaller share.
 #
