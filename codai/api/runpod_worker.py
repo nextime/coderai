@@ -2835,6 +2835,14 @@ class PodHandle:
     #: Consecutive post-quarantine probes that found nothing. Only a pod that
     #: fails several of these, with no work on it, is treated as dead.
     probe_failures: int = 0
+    #: Set while a restart issued by `_restart_engineless_pods` is in flight.
+    #: The pod stays in the pool (so nothing adopts it twice) but unhealthy (so
+    #: nothing dispatches to it), and no probe counts against it until the card
+    #: has had a full boot to come back.
+    restarting_until: float = 0.0
+    #: Restarts this pod has been given for having no engine. Bounded: a card
+    #: that comes back empty twice is not going to come back.
+    engine_restarts: int = 0
     #: Last time this pod answered anything at all. A pod that completed a
     #: request a moment ago is not a candidate for "it must have vanished".
     last_ok: float = 0.0
@@ -5108,6 +5116,189 @@ class RunpodPodPool:
             return False
         return int(getattr(reply, "status_code", 0) or 0) > 0
 
+    def _engine_state(self, pod: PodHandle) -> Optional[dict]:
+        """The pod's own `/internal/engine-state`, or None if it did not answer.
+
+        None means "no opinion" on purpose. An unreachable pod is the quarantine
+        path's business (`discard`/`_recheck_quarantined`), not this one: a pod
+        that answers nothing may be booting, may be overloaded to the point of
+        refusing connections, and has already destroyed eight healthy A40s once
+        when a closed socket was read as a dead card.
+        """
+        base = str(getattr(pod, "url", "") or "").rstrip("/")
+        if not base:
+            return None
+        if base.endswith("/v1"):
+            base = base[:-3].rstrip("/")
+        key = str(getattr(pod, "api_key", "") or "") or str(self.api_key or "")
+        try:
+            from codai.api import pod_http
+            reply = pod_http.get(
+                base + "/internal/engine-state",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
+                timeout=15)
+            if int(getattr(reply, "status_code", 0) or 0) != 200:
+                return None
+            got = reply.json()
+        except Exception:                      # noqa: BLE001 - no opinion
+            return None
+        return got if isinstance(got, dict) else None
+
+    @staticmethod
+    def _has_no_engine(state: dict) -> bool:
+        """True when the pod is up but is serving NOTHING -- no model resident.
+
+        The discriminator is `loaded_models`, not idleness, and the difference
+        matters because the two look identical in every load figure: a warm pod
+        nobody has queried reports `running: 0` and `kv_cache_pct: 0` exactly
+        like a pod whose engine died. Measured 2026-11-06: an idle-but-healthy
+        qwen38 pod reported `loaded_models: ['Qwen3.8-27B-AWQ-INT4']` with
+        45.2 GB of VRAM in use, while the two chandra pods that had served
+        nothing at all since boot reported no model and no VRAM. Keying on
+        "has served nothing" alone would have restarted the healthy one every
+        scaler pass.
+        """
+        models = state.get("loaded_models")
+        if models is None or (isinstance(models, (list, tuple, dict)) and models):
+            # Either the pod does not report the field (an older image: say
+            # nothing rather than guess) or it has a model loaded.
+            return False
+        vram = state.get("vram")
+        if isinstance(vram, dict):
+            try:
+                if float(vram.get("used") or 0.0) >= 1.0:
+                    return False       # something IS resident on the card
+            except (TypeError, ValueError):
+                pass
+        load = state.get("load")
+        if isinstance(load, dict):
+            try:
+                if float(load.get("requests_done") or 0) > 0:
+                    return False       # it has served, so its engine worked
+            except (TypeError, ValueError):
+                pass
+        return True
+
+    def _restart_engineless_pods(self, now: float) -> None:
+        """Restart a pod that is UP, was given work, and has no engine at all.
+
+        This is the gap that cost ten pods' worth of fleet for an afternoon on
+        2026-11-06: two chandra pods came back from a re-image with their
+        vLLM never started, answered /healthz and `/internal/engine-state`
+        perfectly, counted toward the warm floor as "ready", and failed every
+        page sent to them with `Connection refused` on their own loopback. The
+        pool had no check that asked "is there an engine behind this address",
+        so nothing replaced them and nothing restarted them: they billed for
+        hours while four pods carried the whole corpus.
+
+        Deliberately narrow, because every mistake here is expensive:
+
+        * only pods the pool has ACTUALLY SENT work to (`last_used`). A pod
+          nobody has queried may legitimately hold nothing;
+        * only after a full boot window, and again after each restart;
+        * only with nothing in flight, so no page is thrown away;
+        * only when the pod ANSWERS and says it has no model. Silence is the
+          quarantine path's business, not this one;
+        * bounded restarts, then terminated -- a card that boots empty twice is
+          broken, and the warm floor rents a working one.
+
+        The pod is marked unhealthy for the restart, which is what makes the
+        floor count a deficit and rent a replacement: a pod with no engine was
+        never satisfying that floor, it only looked like it was.
+        """
+        if _share.is_follower():
+            # Workers report; the controller acts. N processes each able to
+            # restart the shared fleet is the same mistake as N able to kill it.
+            return
+        with self._cv:
+            cand = [p for p in self.pods
+                    if p.healthy and not p.draining and not p.quarantined_until
+                    and not p.restarting_until
+                    and _load(p) == 0
+                    and p.last_used > 0
+                    and (now - p.last_used) > ENGINELESS_IDLE_S
+                    and (now - p.started_at) > ENGINELESS_BOOT_S]
+        for pod in cand:
+            state = self._engine_state(pod)
+            if state is None or not self._has_no_engine(state):
+                continue
+            with self._cv:
+                if pod not in self.pods or _load(pod) > 0:
+                    continue           # work arrived while we were asking
+                pod.engine_restarts += 1
+                attempt = pod.engine_restarts
+                if attempt > ENGINELESS_MAX_RESTARTS:
+                    pod.healthy = False
+                    self.pods.remove(pod)
+                    self._bump_cards()
+                    doomed = pod
+                else:
+                    pod.healthy = False
+                    pod.restarting_until = now + ENGINELESS_BOOT_S
+                    pod.started_at = now
+                    doomed = None
+                self._cv.notify_all()
+            if doomed is not None:
+                print(f"[runpod] {self.model_key!r}: {pod.pod_id} came back with "
+                      f"no engine {ENGINELESS_MAX_RESTARTS} time(s) running — "
+                      f"giving up on it and letting the warm floor rent a card "
+                      f"that works", flush=True)
+                threading.Thread(target=self._terminate,
+                                 args=(doomed, "no engine after restarts"),
+                                 daemon=True).start()
+                continue
+            print(f"[runpod] {self.model_key!r}: {pod.pod_id} is UP but has no "
+                  f"model loaded and has served nothing since boot — restarting "
+                  f"it (attempt {attempt} of {ENGINELESS_MAX_RESTARTS}). It is "
+                  f"out of rotation until it answers with an engine; the warm "
+                  f"floor may rent a replacement meanwhile, which is correct: "
+                  f"it was never serving.", flush=True)
+            threading.Thread(target=self._restart_pod_now, args=(pod,),
+                             daemon=True).start()
+
+    def _restart_pod_now(self, pod: PodHandle) -> None:
+        """`restart`, never `stop`: stop hands the card back and a sold-out
+        card does not come back. Off the scaler thread -- the API call is
+        bounded but the scaler also carries the registry heartbeat."""
+        from codai.api.runpod_client import RunpodClient
+        try:
+            RunpodClient(self.account).pod_action(pod.pod_id, "restart")
+        except Exception as exc:               # noqa: BLE001
+            print(f"[runpod] {self.model_key!r}: restarting {pod.pod_id} failed: "
+                  f"{exc} — it stays out of rotation and will be retried",
+                  flush=True)
+            with self._cv:
+                pod.restarting_until = time.time() + 60.0
+
+    def _recheck_restarted_pods(self, now: float) -> None:
+        """Put a restarted pod back once it answers WITH an engine."""
+        if _share.is_follower():
+            return
+        with self._cv:
+            due = [p for p in self.pods
+                   if p.restarting_until and now >= p.restarting_until]
+        for pod in due:
+            state = self._engine_state(pod)
+            back = state is not None and not self._has_no_engine(state)
+            with self._cv:
+                if pod not in self.pods:
+                    continue
+                if back:
+                    pod.restarting_until = 0.0
+                    pod.healthy = True
+                    pod.probe_failures = 0
+                    pod.last_ok = now
+                    pod.last_used = now
+                    self._bump_cards()
+                    self._cv.notify_all()
+                else:
+                    # Still empty, or not answering yet. Leave it out of
+                    # rotation and let _restart_engineless_pods decide again.
+                    pod.restarting_until = 0.0
+            if back:
+                print(f"[runpod] {self.model_key!r}: {pod.pod_id} came back with "
+                      f"an engine after a restart — back in rotation", flush=True)
+
     def release(self, pod: PodHandle):
         if _share.is_follower():
             self._report_to_controller(time.time())
@@ -5843,6 +6034,13 @@ class RunpodPodPool:
         # pod is not healthy, so leaving it set aside inflates the warm-floor
         # deficit and rents a replacement for a card we are already paying for.
         self._recheck_quarantined(now)
+        # A pod can answer every probe and still be serving nothing: the
+        # engine behind the address is what matters, and two pods with no vLLM
+        # at all counted toward this pool's warm floor for hours on
+        # 2026-11-06. Checked BEFORE the floor is counted, so a pod with no
+        # engine registers as the deficit it is.
+        self._recheck_restarted_pods(now)
+        self._restart_engineless_pods(now)
         self._adopt_survivors(now)
         self._grow_for_workers()
         self._scale_down(now)
@@ -6126,6 +6324,21 @@ QUARANTINE_S = 45.0
 #: past that it is dead in every sense that matters and keeping it costs money
 #: for nothing. Fewer would start guessing again.
 QUARANTINE_STRIKES = 3
+
+#: How long a pod may run before "no engine" is a fault rather than a boot.
+#: These images need 6-14 minutes to have weights resident, so anything tighter
+#: restarts pods that are merely still starting.
+ENGINELESS_BOOT_S = 900.0
+
+#: How long after the pool last SENT it work a pod may report no engine before
+#: it is restarted. Requires that it was asked at all: a pod nobody has queried
+#: may legitimately have nothing loaded, and restarting those would churn every
+#: warm pod in the fleet.
+ENGINELESS_IDLE_S = 120.0
+
+#: Restarts before the pod is given up on. A card that boots empty twice is
+#: broken, not unlucky.
+ENGINELESS_MAX_RESTARTS = 2
 
 #: How often a pool sweeps the registry for pods of its own that outlived a
 #: restart, and the most it takes per sweep.
