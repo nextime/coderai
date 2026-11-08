@@ -1528,6 +1528,56 @@ def _scan_caches() -> dict:
             "configs": all_configs.get(path, []),
         })
 
+    # Configured models that run SOMEWHERE ELSE. A RunPod pool or an external
+    # host serves them, so there is no local file to hang a row on -- and their
+    # id is a name like "digesta-vision", not an `owner/repo` the HF scan would
+    # recognise, so `is_huggingface_model_id` rejects it and the evicted-model
+    # branch above skips it too. The result, measured on a RunPod-only install
+    # on 2026-11-08: SIX live models (digesta-vision, qwen38-vision,
+    # qwen38-awq, qwen38-extract, digesta-alpha, diogene-alpha) had no row at
+    # all on this page, while the single repo they share showed up as a base
+    # model to download with no configs attached. Their configs were correct
+    # and serving traffic the whole time; the page simply could not express a
+    # model with no bytes on this disk.
+    #
+    # `missing` is False and there is no `to_download`: nothing is absent. The
+    # pod fetches the weights, and offering a download button here would pull
+    # tens of GB onto an orchestrator that deliberately holds none.
+    _placed = ({m["id"] for m in result["hf"]}
+               | {m["path"] for m in result["gguf"]}
+               | {m["filename"] for m in result["gguf"]})
+    for path, (settings, mtype) in configured_settings.items():
+        if path in _placed:
+            continue
+        s = settings if isinstance(settings, dict) else {}
+        _rp = s.get("runpod") if isinstance(s.get("runpod"), dict) else {}
+        _host = s.get("host") if isinstance(s.get("host"), dict) else {}
+        if not (str(s.get("backend") or "").lower() in ("runpod", "host")
+                or _rp or _host):
+            continue
+        # A local file or a real repo id belongs to the scans above, which know
+        # its size, revisions and whether it is complete.
+        if (os.path.isabs(path) or path.endswith(".gguf")
+                or os.path.exists(path) or is_huggingface_model_id(path)):
+            continue
+        _caps = s.get("capabilities") or detect_model_capabilities(path).to_list()
+        result["hf"].append({
+            "id": path,
+            "size_gb": 0, "size_bytes": 0, "revision_count": 0,
+            "files": [], "file_count": 0,
+            "in_config": True, "missing": False, "remote_only": True,
+            # What it actually serves, so the row is identifiable: the repo the
+            # pod pulls, or the host it proxies.
+            "source_repo": (_rp.get("hf_repo") or _rp.get("model_url")
+                            or _host.get("url") or path),
+            "model_type": mtype if mtype and mtype != "gguf_models" else "text_models",
+            "settings": s,
+            "capabilities": _caps,
+            "incomplete": False,
+            "configs": all_configs.get(path, []),
+        })
+        _placed.add(path)
+
     # Surface "to download" wishlist entries: models the user wants listed for
     # later download but has NOT configured and are NOT on disk. They appear as
     # non-configured rows with a download button (in_config=False, missing=True).

@@ -3620,7 +3620,8 @@ async function _loadCachedModelsImpl(){
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
           defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config,
           capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[],
-          missing:!!m.missing, to_download:!!m.to_download, source_repo:m.source_repo||m.id});
+          missing:!!m.missing, to_download:!!m.to_download, remote_only:!!m.remote_only,
+          source_repo:m.source_repo||m.id});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
         const _hfLm = _localModels[idx];
@@ -3631,27 +3632,35 @@ async function _loadCachedModelsImpl(){
         const hlHf = _highlightCap && (m.capabilities||[]).includes(_highlightCap);
         const incompleteBadgeHf = m.incomplete ? '<span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px;margin-left:.3rem" title="Download may be incomplete — some files are missing or truncated">⚠ incomplete</span>' : '';
         const toDlHf = !!m.to_download;
+        // Served from a rented pod or an external host: there are no bytes on
+        // this disk by design, so the size/file columns would read "0" and the
+        // disk buttons would be actively harmful (a "Re-download" here pulls
+        // tens of GB onto an orchestrator that is meant to hold none).
+        const remoteHf = !!m.remote_only;
+        const remoteBadgeHf = remoteHf
+          ? ` <span class="badge" style="background:rgba(120,120,200,.18);color:#6a6ac7;font-size:10px" title="Served from ${esc(m.source_repo||'')} on a rented pod or remote host — no local files by design">☁ remote</span>`
+          : '';
         const missingBadgeHf = toDlHf
           ? ' <span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7;font-size:10px" title="Listed for download — not yet downloaded or configured">⬇ to download</span>'
           : (m.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="Files removed from disk to free space — re-download to restore">✕ on disk: freed</span>' : '');
         const _hfConfigCount = _hfConfigs.length;
         const rowBgHf = m.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px' : (m.incomplete?';background:rgba(255,160,0,.04)':'');
         return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${rowBgHf}">
-          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${missingBadgeHf}${incompleteBadgeHf}${_quantBadge(m.id)}${_hfConfigPills}</td>
-          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':fmtGB(m.size_gb)}</td>
-          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':m.file_count}</td>
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${remoteBadgeHf}${missingBadgeHf}${incompleteBadgeHf}${_quantBadge(m.id)}${_hfConfigPills}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${(m.missing||remoteHf)?'<span class="muted small">—</span>':fmtGB(m.size_gb)}</td>
+          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${(m.missing||remoteHf)?'<span class="muted small">—</span>':m.file_count}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
           <td style="text-align:center;padding:.4rem .25rem">${toDlHf?'<span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7">to download</span>':(m.in_config?`<span class="badge ${m.missing?'badge-err':'badge-ok'}">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>')}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${m.in_config&&!m.missing?(loaded
               ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
-            <button class="btn ${toDlHf?'btn-warn':'btn-ghost'} btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="${m.missing?'Re-download to restore this model':'Download from HuggingFace'}">⬇ ${toDlHf?'Download':'Re-download'}</button>
+            ${remoteHf?'':`<button class="btn ${toDlHf?'btn-warn':'btn-ghost'} btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="${m.missing?'Re-download to restore this model':'Download from HuggingFace'}">⬇ ${toDlHf?'Download':'Re-download'}</button>`}
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${m.in_config?'Configure':'Add'}</button>
             ${m.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
             ${toDlHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unmarkDownload(${idx})" title="Remove this model from the download list">✕ Remove from list</button>`:''}
-            ${!m.missing&&!toDlHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete files from disk to save space, but keep this model in the list so you can re-download it later">🗑 Free disk</button>`:''}
-            ${!m.missing&&!toDlHf?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
+            ${!m.missing&&!toDlHf&&!remoteHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete files from disk to save space, but keep this model in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!m.missing&&!toDlHf&&!remoteHf?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
