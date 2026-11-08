@@ -1932,11 +1932,23 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
         path = source
     elif volume_path:
         path = volume_path
-    elif (engine or engine_pod_backend(entry)) and path:
-        # An engine model named by a local file: the basename travels. ds4
+    elif (engine or engine_pod_backend(entry)) and path \
+            and not _looks_like_repo_id(path):
+        # An engine model named by a local FILE: the basename travels. ds4
         # resolves it against the pod's GGUF cache — where its own download
         # lands, or where a volume already holds it — and colibri/k3 say
         # plainly that they never download when nothing is there.
+        #
+        # A repo id is excluded because it is not a file name, and taking its
+        # basename destroys it: `Qwen/Qwen3-VL-32B-Instruct-FP8` left here as
+        # `Qwen3-VL-32B-Instruct-FP8`, which HuggingFace answers 404 for. The
+        # path that reaches this with a repo id in it is the SHARED POOL one:
+        # `_plan` seeds a sibling with `source=""` (it has no mcfg of its own to
+        # resolve), while `shared_pool_seed_entries` has already put the
+        # fetchable repo into its `path` for exactly that reason. Measured
+        # 2026-11-08: every pooled hf_repo model on a coderai engine image
+        # booted a pod that could never load it, and the only sign was a 503
+        # minutes into a rented machine.
         path = path.rsplit("/", 1)[-1]
     elif not path or path.startswith("/"):
         # A local path cannot be resolved on a rented machine, and nothing said
