@@ -4834,9 +4834,46 @@ class RunpodPodPool:
         threading.Thread(target=_run, daemon=True,
                          name=f"runpod-grow-{self.model_key}").start()
 
-    def acquire(self, timeout: float = 1200.0, affinity: str = "",
+    #: Added to a derived boot deadline so the waiter outlives the boot it
+    #: paid for rather than racing it by a second.
+    BOOT_DEADLINE_SLACK_S = 30.0
+
+    def boot_window_s(self) -> float:
+        """The longest a single cold pod may legitimately take, per this pool.
+
+        `_provision_one` spends these one after another on ONE candidate: the
+        image pull and container start (`boot_timeout_s`), then the model load
+        until the server answers (`load_timeout_s`), then the warm-up that
+        makes the weights resident (`warmup_timeout_s`, when `warmup_on_boot`).
+        A caller whose deadline is shorter than their sum cannot be handed the
+        pod it is paying to rent.
+        """
+        boot = float(getattr(self.mcfg, "boot_timeout_s", 0) or self.PORT_TIMEOUT_S)
+        load = float(getattr(self.mcfg, "load_timeout_s", 0) or self.HEALTH_TIMEOUT_S)
+        warm = 0.0
+        if getattr(self.mcfg, "warmup_on_boot", True):
+            warm = float(getattr(self.mcfg, "warmup_timeout_s", 0) or 0.0)
+        return boot + load + warm + self.BOOT_DEADLINE_SLACK_S
+
+    def acquire(self, timeout: float = None, affinity: str = "",
                 grow_inline: bool = True):
         """Return (PodHandle, url) for a ready pod, provisioning on demand.
+
+        ``timeout`` defaults to this pool's own `boot_window_s()` rather than a
+        flat number, because the flat number was wrong by construction. It was
+        1200 s while a pool configured `boot_timeout_s: 1800` +
+        `load_timeout_s: 900` needs up to 3600, so the caller that triggered a
+        cold rental was GUARANTEED a 500 -- measured in production on
+        2026-11-08: "no pod slot available for 'pool:qwen3vl30a3b' within
+        1200.0s", repeatedly, while the pod it had just paid to rent carried on
+        booting for nobody. `backends/runpod.py` calls this with no arguments,
+        so the default is the value that was actually in play.
+
+        An EXPLICIT timeout is still honoured exactly, on every path. That is a
+        contract, not an accident: `test_the_callers_timeout_is_honoured_while_
+        a_sibling_boots` exists because this method once ignored its deadline
+        while a sibling booted, and lengthening a caller's own deadline here
+        reintroduces that hang.
 
         Bumps in-flight; the caller MUST pair it with release(pod). Picks the pod
         holding this conversation's cache when ``affinity`` is given, else the
@@ -4859,6 +4896,8 @@ class RunpodPodPool:
         Waiting is free on an event loop and costs a whole thread here.
         """
         from codai.api.runpod_client import RunpodError
+        if timeout is None:
+            timeout = self.boot_window_s()
         deadline = time.time() + timeout
         while True:
             grow_now = False
@@ -4961,7 +5000,11 @@ class RunpodPodPool:
                         f"RunPod: no pod slot available for {self.model_key!r} "
                         f"(max_pods={self.effective_max_pods()}, "
                         f"max_inflight_per_pod={self.mcfg.max_inflight_per_pod}) "
-                        f"within {timeout}s.")
+                        f"within {timeout}s — this pool's own boot window is "
+                        f"{self.boot_window_s():.0f}s "
+                        f"(boot_timeout_s + load_timeout_s + warmup_timeout_s), "
+                        f"so a cold rental cannot land inside a shorter "
+                        f"deadline; raise the caller's timeout or lower those.")
                 self._waiting += 1
                 try:
                     self._cv.wait(min(remaining, 10.0))
