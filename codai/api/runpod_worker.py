@@ -3593,6 +3593,20 @@ class RunpodPodPool:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, f"{pod_id}.log")
 
+    def _append_pod_log(self, pod_id: str, text: str) -> None:
+        """Write something the ORCHESTRATOR learned into the pod's own log.
+
+        The drain copies what the pod says about itself, but a pod that dies
+        answering a request says the most important thing in that ANSWER, and
+        the answer never reaches the drain. A load failure is the case: the
+        engine's traceback arrives in a 503 body, the pod is terminated
+        seconds later, and its ring buffer dies with it. This puts that body
+        in the file that outlives the pod, next to its own lines.
+        """
+        path = self._pod_log_path(pod_id)
+        with open(path, "a") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+
     def _drain_pod_log(self, pod: "PodHandle") -> None:
         """Copy whatever the pod has said since last time into our own file.
 
@@ -3959,6 +3973,28 @@ class RunpodPodPool:
             fatal = warmup_fatal_reason(reply.status_code, str(reply.text))
             if fatal:
                 from codai.api.runpod_client import RunpodError
+                # The reason is bounded to 300 chars so it reads as one line
+                # in an exception. That bound threw away the only copy of a
+                # vLLM traceback once (2026-11-08: a Qwen3-VL MoE FP8
+                # checkpoint died with "size of tensor a (6) must match
+                # tensor b (16)", cut off mid-word at "| (APISe", and the pod
+                # was gone before anyone could ask it anything). The engine's
+                # own words are the whole diagnosis, and this is the last
+                # moment they exist, so the FULL body is recorded first.
+                body = " ".join(str(reply.text or "").split())
+                print(f"[runpod] pod {pod_id}: engine refused to load, full "
+                      f"answer follows ({len(body)} chars) — this is the "
+                      f"engine's own stderr and the only copy:\n"
+                      f"{body[:8000]}", flush=True)
+                try:
+                    self._append_pod_log(
+                        pod_id,
+                        f"\n=== warm-up HTTP {reply.status_code} after "
+                        f"{took:.0f}s: the model could not load ===\n"
+                        f"{body}\n")
+                except Exception as exc:                        # noqa: BLE001
+                    print(f"[runpod] pod {pod_id}: could not persist the load "
+                          f"failure to its pod log ({exc})", flush=True)
                 print(f"[runpod] pod {pod_id}: warm-up answered HTTP "
                       f"{reply.status_code} after {took:.0f}s and the model "
                       f"CANNOT LOAD — tearing the pod down rather than letting "

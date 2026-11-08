@@ -162,3 +162,74 @@ def test_an_unreachable_pod_is_still_not_killed_here(monkeypatch):
         served="x", model_key="x", entry={}, api_key="",
         pod_key=lambda _p: "", _pod_by_id=lambda _i: None)
     assert rw.RunpodPodPool._warmup(stub, "p", "http://pod:8000") is False
+
+
+# --------------------------------------------------------------------------- #
+# The traceback must survive the pod (added 2026-11-08, v0.6.16)
+# --------------------------------------------------------------------------- #
+# A Qwen3-VL MoE FP8 checkpoint died with "The size of tensor a (6) must match
+# the size of tensor b (16) at non-singleton dimension 1". The 300-char reason
+# bound cut the body off mid-word at "| (APISe", the pod was terminated six
+# seconds later, and its own log file was never written because the engine
+# never served a request. The only copy of the diagnosis was discarded by the
+# very code that correctly refused to pay for the dead pod.
+
+def test_the_full_engine_answer_is_kept_not_just_the_reason(monkeypatch, tmp_path,
+                                                            capsys):
+    """The whole 503 body is printed and persisted before the pod dies."""
+    long_tail = " | ".join(f"File \"/x/{i}.py\", line {i}, in load" for i in range(60))
+    body = ("{\"detail\":\"Model 'qwen3vl30a3b-fp8' failed to load: vLLM exited "
+            "(code 1) before becoming ready. Last output: RuntimeError: The size "
+            "of tensor a (6) must match the size of tensor b (16) at "
+            "non-singleton dimension 1 | " + long_tail + "\"}")
+    assert len(body) > 300          # the reason bound would truncate it
+
+    reply = types.SimpleNamespace(status_code=503, text=body)
+    stub, _sent = _pool(monkeypatch, reply)
+    written = {}
+    stub._append_pod_log = lambda pid, text: written.setdefault(pid, []).append(text)
+    stub._pod_log_path = lambda pid: str(tmp_path / f"{pid}.log")
+
+    with pytest.raises(Exception):
+        rw.RunpodPodPool._warmup(stub, "pod-dead", "http://pod:8000")
+
+    out = capsys.readouterr().out
+    # The tensor shapes AND a line from deep in the traceback both survive.
+    assert "size of tensor a (6)" in out
+    assert "File \"/x/59.py\"" in out
+    # ...and it is in the file that outlives the pod.
+    assert "pod-dead" in written
+    kept = "".join(written["pod-dead"])
+    assert "size of tensor a (6)" in kept
+    assert "could not load" in kept
+
+
+def test_a_pod_log_that_cannot_be_written_still_tears_the_pod_down(monkeypatch,
+                                                                   capsys):
+    """Persisting is best-effort: a full disk must not keep a dead pod alive."""
+    reply = types.SimpleNamespace(
+        status_code=503,
+        text="{\"detail\":\"Model 'x' failed to load: engine exited\"}")
+    stub, _sent = _pool(monkeypatch, reply)
+
+    def _boom(pid, text):
+        raise OSError("No space left on device")
+
+    stub._append_pod_log = _boom
+
+    with pytest.raises(Exception, match="cannot load"):
+        rw.RunpodPodPool._warmup(stub, "pod-dead", "http://pod:8000")
+    assert "could not persist" in capsys.readouterr().out
+
+
+def test_append_pod_log_writes_beside_the_registry(tmp_path, monkeypatch):
+    """The helper appends, so the engine's answer lands next to the pod's own
+    lines rather than replacing them."""
+    monkeypatch.setattr(rw, "_pod_registry_path",
+                        lambda: str(tmp_path / "runpod-pods.json"))
+    stub = types.SimpleNamespace(
+        _pod_log_path=lambda pid: rw.RunpodPodPool._pod_log_path(stub, pid))
+    rw.RunpodPodPool._append_pod_log(stub, "p1", "first")
+    rw.RunpodPodPool._append_pod_log(stub, "p1", "second\n")
+    body = (tmp_path / "pod-logs" / "p1.log").read_text()
+    assert body == "first\nsecond\n"
