@@ -86,11 +86,36 @@ def _global_field_refused(text: str) -> bool:
         "not in input schema" in t or "not allowed" in t or "Extra input keys" in t)
 
 
-def _global_field_refused_gql(text: str) -> bool:
+def _field_refused_gql(text: str, field: str) -> bool:
     """GraphQL's wording for an input field its schema does not define."""
     t = (text or "")
-    return GLOBAL_VOLUME_FIELD in t and (
+    return bool(field) and field in t and (
         "is not defined by type" in t or "invalid value" in t or "Unknown" in t)
+
+
+def _global_field_refused_gql(text: str) -> bool:
+    """GraphQL's wording for a global-volume field its schema does not define."""
+    return _field_refused_gql(text, GLOBAL_VOLUME_FIELD)
+
+
+#: Ask the host for a public IP whenever the pod is reached directly.
+#:
+#: Direct TCP connects to the pod's OWN ip:port, so the machine has to be able
+#: to publish one. Community-cloud hosts often cannot, and RunPod does not say
+#: so at create time: it takes the pod, publishes only its own agent port
+#: (``19123/http``) on a 100.64/10 carrier-grade-NAT address, and never
+#: publishes the declared port at all. The result is a pod that bills from the
+#: moment it is created and can never be reached, until the boot wait gives up
+#: and the next candidate is tried -- which draws from the same hosts.
+#:
+#: Measured 2026-11-08 on a pool restricted to five cards: ten pods rented in
+#: half an hour, nine terminated, $1.21 billed for nothing, every one of them
+#: "RunPod published 19123/http but NOT the declared port 8000". Asking for the
+#: capability turns that into a placement RunPod refuses up front.
+#:
+#: Secure cloud always has a public IP, so this only ever narrows community
+#: offers -- which is exactly the set that cannot serve a direct-TCP pod.
+PUBLIC_IP_FIELD = "supportPublicIp"
 
 
 def _warn_global_volume_unsupported(volume_id: str) -> None:
@@ -234,10 +259,18 @@ def classify_boot(info: dict, port: int, direct_tcp: bool = True,
     if not mine:
         others = ", ".join(f"{_priv(p)}/{p.get('type') or '?'}" for p in ports)
         if started:
+            # The create request asks for `supportPublicIp` on a direct-TCP
+            # pod (see PUBLIC_IP_FIELD), so a host that lands here anyway
+            # either ignored the ask or is a community host RunPod placed
+            # before honouring it. Say which, or the reader re-diagnoses the
+            # whole class from scratch — it took nine dead pods once already.
+            hint = (" — the pod asked for a public ip and this host still "
+                    "published only RunPod's own agent port, so it cannot "
+                    "serve a direct-TCP pod" if direct_tcp else
+                    " — this host does not expose it")
             return "unreachable", (
                 f"RunPod published {others} but NOT the declared port {port}, "
-                f"and the container has been running {uptime:.0f}s — this host "
-                f"does not expose it")
+                f"and the container has been running {uptime:.0f}s{hint}")
         return "pulling", (f"port {port} is not published yet (RunPod has "
                            f"{others} so far)")
 
@@ -904,6 +937,12 @@ class RunpodClient:
             common["networkVolumeId"] = network_volume_id
         if global_volume_id:
             common[GLOBAL_VOLUME_FIELD] = global_volume_id
+        # See PUBLIC_IP_FIELD: a direct-TCP pod on a host that cannot publish a
+        # public IP is unreachable from the moment it is created, and bills
+        # anyway. Confirmed on PodFindAndDeployOnDemandInput; the spot input
+        # could not be read, so a refusal there is caught below.
+        if direct_tcp:
+            common[PUBLIC_IP_FIELD] = True
         if is_spot:
             common["bidPerGpu"] = float(bid_per_gpu)
             mutation = "podRentInterruptable"
@@ -920,12 +959,26 @@ class RunpodClient:
         except RunpodError as exc:
             # Same guard as the REST path: GraphQL calls the global-volume field
             # an undefined input field, and a configured global volume must not
-            # fail every create while RunPod keeps it console-only.
-            if not (global_volume_id and GLOBAL_VOLUME_FIELD in common
+            # fail every create while RunPod keeps it console-only. The
+            # public-ip field gets the same treatment, because the spot input
+            # type could not be read from RunPod's published schema -- better a
+            # pod rented without the hint than no pod at all.
+            dropped = []
+            if (global_volume_id and GLOBAL_VOLUME_FIELD in common
                     and _global_field_refused_gql(str(exc))):
+                _warn_global_volume_unsupported(global_volume_id)
+                common.pop(GLOBAL_VOLUME_FIELD, None)
+                dropped.append(GLOBAL_VOLUME_FIELD)
+            if (PUBLIC_IP_FIELD in common
+                    and _field_refused_gql(str(exc), PUBLIC_IP_FIELD)):
+                print(f"[runpod] this API rejects {PUBLIC_IP_FIELD!r} on "
+                      f"{var_type}: renting without it, so the host may not "
+                      f"publish a public ip and a direct-TCP pod may be "
+                      f"unreachable", flush=True)
+                common.pop(PUBLIC_IP_FIELD, None)
+                dropped.append(PUBLIC_IP_FIELD)
+            if not dropped:
                 raise
-            _warn_global_volume_unsupported(global_volume_id)
-            common.pop(GLOBAL_VOLUME_FIELD, None)
             data = self._gql(q, {"input": common}, timeout=90.0)
         node = data.get(mutation) or {}
         pod_id = node.get("id")
@@ -957,6 +1010,10 @@ class RunpodClient:
             "ports": [f"{int(port)}/{'tcp' if direct_tcp else 'http'}"],
             "env": {str(k): str(v) for k, v in (env or {}).items()},
         }
+        # See PUBLIC_IP_FIELD. v2 documents this on PodCreateInput with no
+        # default, and "If null, the Pod might not have a public IP address".
+        if direct_tcp:
+            body[PUBLIC_IP_FIELD] = True
         if docker_args:
             body["args"] = docker_args
         if entrypoint:
