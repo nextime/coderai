@@ -3118,6 +3118,48 @@ def _pod_lora_args(entry: dict) -> list:
     return args
 
 
+#: What a pod says when the model it was rented for cannot be served at all.
+#: These are the pod front's OWN words (codai/api/text.py, codai/ocr/manager.py),
+#: not a vendor's, and each means the engine exited or never started -- not that
+#: the warm-up request had the wrong shape.
+_FATAL_LOAD_MARKERS = (
+    "failed to load",            # Model 'x' failed to load: <engine stderr>
+    "could not be loaded",       # …could not be loaded after waiting.
+    "error loading model",
+    "unknown backend",
+)
+
+
+def warmup_fatal_reason(status: int, body: str) -> str:
+    """Why this pod can never serve, or "" when the warm-up failure is benign.
+
+    A pod that answers HTTP at all is a machine already paid for, so the
+    warm-up forgives most errors on purpose: a 404 because we guessed the wrong
+    endpoint for an embedder, a 400 because the model wants another payload
+    shape. Those pods serve.
+
+    A load failure is the opposite case, and it used to be forgiven with them.
+    Measured 2026-11-08: a 32B FP8 vision model was rented an L40S, which
+    reports ~44.4 GiB where an RTX 6000 Ada of the same nominal 48 GB reports
+    47.5. At the same memory share that left 1.94 GiB for a KV cache needing
+    2.0, vLLM's engine core exited, and the pod went on answering /v1/models
+    with no engine behind it. The warm-up logged "HTTP 503 — serving anyway",
+    the pool took the pod, and a GPU 503'd every request for over an hour at
+    $0.79/hr. Nothing could reap it: the idle timer does not run on a pod the
+    pool believes in, and the boot teardown was already behind it.
+
+    Keyed on the message, not the status: 503 alone is ambiguous, because an
+    admission queue that is momentarily full answers 503 and that pod is fine.
+    """
+    if int(status or 0) < 500:
+        return ""
+    low = (body or "").lower()
+    for marker in _FATAL_LOAD_MARKERS:
+        if marker in low:
+            return " ".join((body or "").split())[:300]
+    return ""
+
+
 class RunpodPodPool:
     """A pool of coderai-managed RunPod pods for one model.
 
@@ -3858,11 +3900,16 @@ class RunpodPodPool:
         that can tell the difference between "the server is up" and "the model
         is resident" — /v1/models answers the moment the process starts.
 
-        Returns whether it worked. A failure is NOT fatal: the pod may still
-        serve (a model whose warm-up shape we guessed wrong, an engine that
-        does not take chat completions), and refusing to use a pod we have
-        already paid to boot over a diagnostic request would be worse than the
-        hidden latency this exists to remove.
+        Returns whether it worked. A failure is NOT fatal in itself: the pod
+        may still serve (a model whose warm-up shape we guessed wrong, an
+        engine that does not take chat completions), and refusing to use a pod
+        we have already paid to boot over a diagnostic request would be worse
+        than the hidden latency this exists to remove.
+
+        The one exception is an answer that says the MODEL COULD NOT LOAD --
+        see `warmup_fatal_reason`. That pod has no engine behind its HTTP, so
+        it raises and is terminated instead of entering the pool, where nothing
+        would ever reap it.
         """
         if not getattr(self.mcfg, "warmup_on_boot", True):
             return False
@@ -3903,6 +3950,23 @@ class RunpodPodPool:
             return False
         took = time.time() - t0
         if reply.status_code >= 400:
+            # A pod whose ENGINE could not start is not a warm-up that went
+            # wrong, it is a pod that will 503 forever, so it is torn down
+            # here instead of being handed to the pool. Raising puts it on
+            # _provision_one's boot-failure path, which already dumps the pod
+            # log, terminates the machine and retries on the next candidate --
+            # and the next card may be the bigger one that fits.
+            fatal = warmup_fatal_reason(reply.status_code, str(reply.text))
+            if fatal:
+                from codai.api.runpod_client import RunpodError
+                print(f"[runpod] pod {pod_id}: warm-up answered HTTP "
+                      f"{reply.status_code} after {took:.0f}s and the model "
+                      f"CANNOT LOAD — tearing the pod down rather than letting "
+                      f"it bill with a dead engine: {fatal}", flush=True)
+                raise RunpodError(
+                    f"pod {pod_id} rented for {self.model_key!r} answered "
+                    f"HTTP {reply.status_code}: the model cannot load on this "
+                    f"machine ({fatal})")
             print(f"[runpod] pod {pod_id}: warm-up answered HTTP "
                   f"{reply.status_code} after {took:.0f}s — serving anyway "
                   f"({str(reply.text)[:200]})", flush=True)
