@@ -197,7 +197,9 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
              "drops no in-flight request. Needs write access to auth.json in "
              "the config dir -- anyone who has that can already add an admin "
              "user, so this grants no privilege they lacked. Defaults to the "
-             "first admin user; name one to pick.",
+             "first admin user; name one to pick. Inside the OCI image call the "
+             "app, not the `coderai` wrapper on PATH: that wrapper is the "
+             "launcher, and before v0.6.21 it reaped the running server.",
     )
     parser.add_argument(
         "--tmp",

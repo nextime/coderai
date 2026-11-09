@@ -93,10 +93,25 @@ CODERAI_BIN="/opt/coderai/python/bin/python3 /opt/coderai/app/coderai"
 # phantom VRAM usage, evictions that free nothing, duplicated model workers).
 # At THIS point no coderai server process can legitimately exist yet, so reap
 # any survivor from a previous incarnation before starting.
-for _pat in 'coderai-front' 'coderai-nvidia' 'coderai-nvidia-gguf' \
-            'coderai-radeon' 'coderai-system' 'dinov2-embed'; do
-  pkill -9 -x "$_pat" 2>/dev/null || true
+#
+# NOT for a one-shot invocation. `coderai` on PATH in the image IS this script,
+# so `podman exec <container> coderai --admin-session` runs the sweep and SIGKILLs
+# the server that is already serving. Measured on a live orchestrator: six kills in
+# fifteen minutes, each one ~20 s of 502s for every client, with nothing in the
+# app's own log to show why. A flag that mints, prints or reports and exits never
+# starts a server, so it must never reap one.
+_oneshot=""
+for _a in "$@"; do
+  case "$_a" in
+    --admin-session|--admin-session=*|--version|-V|--help|-h) _oneshot=1 ;;
+  esac
 done
+if [ -z "$_oneshot" ]; then
+  for _pat in 'coderai-front' 'coderai-nvidia' 'coderai-nvidia-gguf' \
+              'coderai-radeon' 'coderai-system' 'dinov2-embed'; do
+    pkill -9 -x "$_pat" 2>/dev/null || true
+  done
+fi
 
 # Optional host-tailable file log. CODERAI_LOG_FILE should point under a mounted
 # volume (e.g. /cache/logs/coderai.log) so it's visible + tailable on the host.
