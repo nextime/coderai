@@ -414,6 +414,20 @@ a reason instead of failing or faking it. The response carries `status` (`comple
 
 ---
 
+## In production
+
+CoderAI runs a real pipeline that turns ~10 million Italian court documents into structured, page-cited records — without sending a single page to a third-party API.
+
+Rather than one frontier model, the pipeline is a **composition of small, self-hosted specialists**, each owning one stage and orchestrated by CoderAI: an OCR ensemble (`chandra`/`surya`/`olmOCR-2`), a vision model for layout, `bge-m3` for dense+sparse retrieval, and a fine-tuned QLoRA extraction model. Each specialist is trained on the pipeline's own output and promoted only after it matches a larger teacher model on a held-out blind set — the teacher never sees a production document. The result is the quality you would expect from a single large model, with full control of the data, on your own hardware, at a fraction of the cost.
+
+The whole pipeline is supervised visually — each stage rendered as a live decision tree — on top of CoderAI's RunPod control plane: live cost-against-budget and per-pod KV-cache, VRAM, temperature and health.
+
+- **Case study:** https://aisbf.cloud/coderai/use-cases/legal-document-pipeline.html
+- **Full write-up:** https://www.nexlab.net/articles/watching-ten-million-documents/
+- **Live monitor:** https://digesta.tech/alpha2run/
+
+---
+
 ## Quick Start
 
 The fastest way is the published image — nothing to build:
