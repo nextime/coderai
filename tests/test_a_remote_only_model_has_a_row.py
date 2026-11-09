@@ -24,21 +24,41 @@ from codai.admin import routes
 
 
 def _catalogue():
-    """A RunPod-only vision/text catalogue, shaped like the live one."""
+    """A RunPod-only catalogue: SEVEN aliases over one base repo, as live."""
+    REPO = "cyankiwi/Qwen3.8-27B-AWQ-INT4"
+    def _rp(**over):
+        base = {"mode": "pods", "hf_repo": REPO}
+        base.update(over)
+        return base
     return {
         "vision_models": [
             {"id": "digesta-vision", "enabled": True, "backend": "runpod",
              "n_ctx": 32768,
-             "runpod": {"mode": "pods", "hf_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
-                        "served_model": "digesta-vision", "pool": "digesta-vision",
-                        "pod_max_parallel_requests": 12, "cloud_types": ["SECURE"]},
+             "runpod": _rp(served_model="digesta-vision", pool="digesta-vision",
+                           ctx=32768, pod_max_parallel_requests=12,
+                           cloud_types=["SECURE", "COMMUNITY"]),
              "vllm": {"max_num_seqs": 12}},
+            {"id": "qwen38-vision", "enabled": True, "backend": "runpod",
+             "runpod": _rp(served_model="qwen38-vision", pool="digesta-qwen38",
+                           ctx=122880)},
         ],
         "text_models": [
             {"id": "qwen38-awq", "enabled": True, "backend": "runpod",
-             "runpod": {"mode": "pods", "hf_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
-                        "served_model": "qwen38-awq", "pool": "digesta-qwen38"}},
-            # An external OpenAI-compatible server: also no local bytes.
+             "runpod": _rp(served_model="qwen38-awq", pool="digesta-qwen38",
+                           ctx=122880)},
+            {"id": "digesta-extraction", "enabled": True, "backend": "runpod",
+             "n_ctx": 16384,
+             "runpod": _rp(served_model="digesta-extraction",
+                           pool="digesta-extraction", ctx=16384,
+                           pod_max_parallel_requests=16)},
+            {"id": "digesta-alpha", "enabled": True, "backend": "runpod",
+             "runpod": _rp(served_model="digesta-alpha", pool="digesta-qwen38",
+                           ctx=122880)},
+            {"id": "diogene-alpha", "enabled": True, "backend": "runpod",
+             "runpod": _rp(served_model="diogene-alpha", pool="digesta-qwen38",
+                           ctx=122880)},
+            # An external OpenAI-compatible server: also no local bytes, and a
+            # base of its own (its URL), so it must not be folded into the repo.
             {"id": "remote-host-model", "enabled": True, "backend": "host",
              "host": {"url": "https://example.invalid/v1"}},
             # A plain local HF model must keep going through the cache scan.
@@ -47,9 +67,25 @@ def _catalogue():
     }
 
 
+REPO = "cyankiwi/Qwen3.8-27B-AWQ-INT4"
+
+
 @pytest.fixture
-def scanned(monkeypatch, tmp_path):
-    """`_scan_caches` with the HF/GGUF scans empty, as on a weights-less box."""
+def scanned(monkeypatch):
+    """`_scan_caches` on a weights-less orchestrator -- the case under test.
+
+    The HF cache scan is stubbed EMPTY on purpose. A RunPod-only box holds no
+    weights at all, which is exactly why the base model has no row to hang its
+    configs on; leaving the real scan in place made this test pass or fail
+    depending on whether the developer's own machine happened to have the repo
+    cached (zeiss does, Aruba does not).
+    """
+    import huggingface_hub
+
+    def _empty_scan(_d=None):
+        return types.SimpleNamespace(repos=[], warnings=[])
+
+    monkeypatch.setattr(huggingface_hub, "scan_cache_dir", _empty_scan)
     monkeypatch.setattr(routes, "config_manager",
                         types.SimpleNamespace(models_data=_catalogue()),
                         raising=False)
@@ -60,61 +96,58 @@ def _by_id(rows):
     return {r["id"]: r for r in rows}
 
 
-def test_a_pod_served_model_gets_its_own_row(scanned):
+def _cfg_ids(row):
+    return sorted((c.get("settings") or {}).get("id") for c in row["configs"])
+
+
+def test_the_base_model_gets_one_row_not_seven(scanned):
     rows = _by_id(scanned["hf"])
-    assert "digesta-vision" in rows, (
-        "a configured, enabled, pod-served model must appear on the page; "
-        "rows were: %s" % sorted(rows))
-    row = rows["digesta-vision"]
-    assert row["in_config"] is True
-    assert row["model_type"] == "vision_models"
+    assert REPO in rows, "the base model needs a row; got %s" % sorted(rows)
+    for alias in ("digesta-extraction", "digesta-alpha", "diogene-alpha",
+                  "qwen38-awq", "qwen38-vision", "digesta-vision"):
+        assert alias not in rows, (
+            "%s is a CONFIG of %s, not a model of its own" % (alias, REPO))
 
 
-def test_the_row_carries_the_config_the_editor_needs(scanned):
-    row = _by_id(scanned["hf"])["digesta-vision"]
-    rp = (row["settings"] or {}).get("runpod") or {}
-    # The exact fields the RunPod panel populates from.
-    assert rp.get("pool") == "digesta-vision"
-    assert rp.get("pod_max_parallel_requests") == 12
-    assert rp.get("cloud_types") == ["SECURE"]
-    assert (row["settings"].get("vllm") or {}).get("max_num_seqs") == 12
-    # ...and the multi-config list the pills render from.
-    assert row["configs"], "the config list must not be empty"
+def test_every_alias_is_a_config_under_it(scanned):
+    row = _by_id(scanned["hf"])[REPO]
+    assert _cfg_ids(row) == sorted([
+        "digesta-alpha", "digesta-extraction", "digesta-vision",
+        "diogene-alpha", "qwen38-awq", "qwen38-vision"])
 
 
-def test_it_is_not_offered_as_a_download(scanned):
-    """Nothing is missing, so no download/re-download button."""
-    row = _by_id(scanned["hf"])["digesta-vision"]
+def test_each_config_keeps_its_own_settings(scanned):
+    """Two configs of one base model, differing exactly as configured."""
+    row = _by_id(scanned["hf"])[REPO]
+    by = {(c["settings"] or {}).get("id"): c["settings"] for c in row["configs"]}
+    assert by["digesta-extraction"]["runpod"]["ctx"] == 16384
+    assert by["digesta-alpha"]["runpod"]["ctx"] == 122880
+    assert by["digesta-extraction"]["runpod"]["pool"] == "digesta-extraction"
+    assert by["digesta-alpha"]["runpod"]["pool"] == "digesta-qwen38"
+
+
+def test_the_vision_config_is_grouped_with_the_text_ones(scanned):
+    """Same weights, so same base model, whatever section it lives in."""
+    row = _by_id(scanned["hf"])[REPO]
+    cats = {c.get("cat") for c in row["configs"]}
+    assert "vision_models" in cats and "text_models" in cats
+
+
+def test_the_base_model_is_not_offered_as_a_download(scanned):
+    """Nothing is missing: the pod fetches the weights."""
+    row = _by_id(scanned["hf"])[REPO]
     assert row["missing"] is False
     assert row.get("to_download") is not True
     assert row["remote_only"] is True
 
 
-def test_the_row_says_what_it_actually_serves(scanned):
+def test_a_host_backed_model_is_not_folded_into_a_repo(scanned):
     rows = _by_id(scanned["hf"])
-    assert rows["digesta-vision"]["source_repo"] == "cyankiwi/Qwen3.8-27B-AWQ-INT4"
-    assert rows["remote-host-model"]["source_repo"] == "https://example.invalid/v1"
-
-
-def test_several_ids_sharing_one_repo_each_get_their_own_row(scanned):
-    """The bug's visible symptom: one repo, many models, one row.
-
-    digesta-vision and qwen38-awq pull the SAME repo. Both are separately
-    configured models with different pools and limits, so both need a row.
-    """
-    rows = _by_id(scanned["hf"])
-    assert {"digesta-vision", "qwen38-awq"} <= set(rows)
-    assert rows["digesta-vision"]["settings"]["runpod"]["pool"] != \
-        rows["qwen38-awq"]["settings"]["runpod"]["pool"]
+    assert "https://example.invalid/v1" in rows
+    assert rows["https://example.invalid/v1"]["remote_only"] is True
 
 
 def test_a_local_model_is_left_to_the_cache_scan(scanned):
-    """An owner/repo id must not be duplicated by this branch.
-
-    `BAAI/bge-m3` has no `runpod` block here, and even if it had, the evicted
-    branch and the HF cache scan know its size and revisions. Only names that
-    cannot be a repo id belong to the new path.
-    """
     rows = [r for r in scanned["hf"] if r["id"] == "BAAI/bge-m3"]
     assert all(not r.get("remote_only") for r in rows)
     assert len(rows) <= 1, "no duplicate rows for a real repo id"

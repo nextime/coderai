@@ -3065,7 +3065,11 @@ function _renderConfigPills(idx, m) {
   const configs = m.configs || [];
   if (!configs.length) return '';
   const pills = configs.map((c, cfgIdx) => {
-    const label = (c.settings && (c.settings.config_name || c.settings.alias)) || `Config ${cfgIdx + 1}`;
+    // For a pod-served alias the `id` IS the name clients request
+    // (digesta-extraction, diogene-alpha), so it is the only useful label --
+    // without it seven configs of one base model all read "Config N".
+    const label = (c.settings && (c.settings.config_name || c.settings.alias
+                                  || c.settings.id)) || `Config ${cfgIdx + 1}`;
     return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>${_engineTagHtml(m, c.settings)}`;
   }).join('');
   const addPill = `<span class="badge" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem 0 0 0;background:var(--raised);border:1px dashed var(--border);color:var(--text-2)" onclick="openCfgModalNew(${idx})" title="Add another configuration for this model">+ Config</span>`;

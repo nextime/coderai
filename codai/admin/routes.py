@@ -1199,6 +1199,24 @@ def _backfill_vram_estimate(model_id: str, file_pattern: str = "") -> bool:
     return changed
 
 
+def _remote_base_of(settings: dict) -> str:
+    """The base model a pod/host-served entry is a CONFIG of, or "".
+
+    Only for entries with no local file of their own: a RunPod pool pulls
+    `runpod.hf_repo`, an external host answers at `host.url`. Returns "" for
+    anything that has bytes on this disk, which belongs to the cache scans.
+    """
+    if not isinstance(settings, dict) or settings.get("path"):
+        return ""
+    rp = settings.get("runpod") if isinstance(settings.get("runpod"), dict) else {}
+    host = settings.get("host") if isinstance(settings.get("host"), dict) else {}
+    backend = str(settings.get("backend") or "").lower()
+    if not (rp or host or backend in ("runpod", "host")):
+        return ""
+    return str(rp.get("hf_repo") or rp.get("model_url")
+               or host.get("url") or "").strip()
+
+
 def _is_model_configured(model_id: str) -> bool:
     """True if model_id is already a configured model (matched by id or basename)."""
     if config_manager is None:
@@ -1260,8 +1278,22 @@ def _scan_caches() -> dict:
                     # row as that file's config.
                     if _is_whisper_runner(m):
                         continue
-                    p = m.get("path") or m.get("id") or ""
                     s = m if isinstance(m, dict) else {}
+                    # An entry served from a pod or a remote host is not a model
+                    # of its own on this page -- it is one CONFIG of the base
+                    # model it pulls. digesta-extraction and digesta-alpha are
+                    # two configs of cyankiwi/Qwen3.8-27B-AWQ-INT4, differing in
+                    # context, pool and (soon) a QLoRA; so are qwen38-awq,
+                    # qwen38-extract, qwen38-vision, diogene-alpha and
+                    # digesta-vision. Keyed by their id they became seven
+                    # unrelated entries, none of which the page could place,
+                    # while the repo itself showed up as a base model to
+                    # download with no configs attached. Keyed by the REPO they
+                    # are what they are: one model, seven configs.
+                    #
+                    # Their `id` stays the name clients request -- this only
+                    # changes how the page GROUPS them, never how they serve.
+                    p = m.get("path") or _remote_base_of(s) or m.get("id") or ""
                 if not p:
                     continue
                 if p not in configured_settings:
@@ -1508,6 +1540,13 @@ def _scan_caches() -> dict:
         s = settings if isinstance(settings, dict) else {}
         if s.get("backend") == "whisper-server":
             continue
+        # A repo whose configs are all served from pods is not an EVICTED
+        # model: nothing was freed and nothing is missing. Marked missing here
+        # it grew a red "on disk: freed" badge and a Re-download button that
+        # would pull tens of GB onto an orchestrator holding none -- which is
+        # the "base model as to be downloaded" that started this.
+        if _remote_base_of(s):
+            continue
         # Only HF-style repo IDs (owner/repo) — skip local paths and GGUF files
         if os.path.isabs(path) or path.endswith('.gguf') or not is_huggingface_model_id(path):
             continue
@@ -1528,50 +1567,39 @@ def _scan_caches() -> dict:
             "configs": all_configs.get(path, []),
         })
 
-    # Configured models that run SOMEWHERE ELSE. A RunPod pool or an external
-    # host serves them, so there is no local file to hang a row on -- and their
-    # id is a name like "digesta-vision", not an `owner/repo` the HF scan would
-    # recognise, so `is_huggingface_model_id` rejects it and the evicted-model
-    # branch above skips it too. The result, measured on a RunPod-only install
-    # on 2026-11-08: SIX live models (digesta-vision, qwen38-vision,
-    # qwen38-awq, qwen38-extract, digesta-alpha, diogene-alpha) had no row at
-    # all on this page, while the single repo they share showed up as a base
-    # model to download with no configs attached. Their configs were correct
-    # and serving traffic the whole time; the page simply could not express a
-    # model with no bytes on this disk.
+    # The base models whose every config is served elsewhere. Grouping above
+    # keyed them by the repo a pod pulls, so `all_configs[repo]` already holds
+    # each alias as one config -- but on an orchestrator that holds no weights
+    # the repo appears in no cache scan, so without this the whole group has
+    # nowhere to live. Measured 2026-11-09: cyankiwi/Qwen3.8-27B-AWQ-INT4
+    # carries SEVEN configs (qwen38-awq, qwen38-extract, qwen38-vision,
+    # diogene-alpha, digesta-alpha, digesta-extraction, digesta-vision) and had
+    # no editable row at all.
     #
-    # `missing` is False and there is no `to_download`: nothing is absent. The
-    # pod fetches the weights, and offering a download button here would pull
-    # tens of GB onto an orchestrator that deliberately holds none.
+    # `missing` is False: nothing is absent. The pod fetches the weights, and a
+    # download button here would pull tens of GB onto a box meant to hold none.
     _placed = ({m["id"] for m in result["hf"]}
                | {m["path"] for m in result["gguf"]}
                | {m["filename"] for m in result["gguf"]})
     for path, (settings, mtype) in configured_settings.items():
         if path in _placed:
             continue
-        s = settings if isinstance(settings, dict) else {}
-        _rp = s.get("runpod") if isinstance(s.get("runpod"), dict) else {}
-        _host = s.get("host") if isinstance(s.get("host"), dict) else {}
-        if not (str(s.get("backend") or "").lower() in ("runpod", "host")
-                or _rp or _host):
+        s_ = settings if isinstance(settings, dict) else {}
+        if not _remote_base_of(s_):
             continue
-        # A local file or a real repo id belongs to the scans above, which know
+        # A local file or a cached repo belongs to the scans above, which know
         # its size, revisions and whether it is complete.
-        if (os.path.isabs(path) or path.endswith(".gguf")
-                or os.path.exists(path) or is_huggingface_model_id(path)):
+        if os.path.isabs(path) or path.endswith(".gguf") or os.path.exists(path):
             continue
-        _caps = s.get("capabilities") or detect_model_capabilities(path).to_list()
+        _caps = s_.get("capabilities") or detect_model_capabilities(path).to_list()
         result["hf"].append({
             "id": path,
             "size_gb": 0, "size_bytes": 0, "revision_count": 0,
             "files": [], "file_count": 0,
             "in_config": True, "missing": False, "remote_only": True,
-            # What it actually serves, so the row is identifiable: the repo the
-            # pod pulls, or the host it proxies.
-            "source_repo": (_rp.get("hf_repo") or _rp.get("model_url")
-                            or _host.get("url") or path),
+            "source_repo": path,
             "model_type": mtype if mtype and mtype != "gguf_models" else "text_models",
-            "settings": s,
+            "settings": s_,
             "capabilities": _caps,
             "incomplete": False,
             "configs": all_configs.get(path, []),
