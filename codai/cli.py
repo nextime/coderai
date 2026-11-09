@@ -185,6 +185,21 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         help=f"Configuration directory (default: {default_config})",
     )
     parser.add_argument(
+        "--admin-session",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="USER",
+        help="Mint an admin SESSION COOKIE for this install and exit, printing "
+             "it on stdout. For applying a hand edit to config.json or "
+             "models.json without restarting: POST the cookie to "
+             "/admin/api/system/reload, which re-reads both files in place and "
+             "drops no in-flight request. Needs write access to auth.json in "
+             "the config dir -- anyone who has that can already add an admin "
+             "user, so this grants no privilege they lacked. Defaults to the "
+             "first admin user; name one to pick.",
+    )
+    parser.add_argument(
         "--tmp",
         type=str,
         default=None,

@@ -4036,14 +4036,26 @@ async def api_reload_config(request: Request, username: str = Depends(require_ad
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"reload failed: {e}")
     md = getattr(mgr, "models_data", None) or {}
+    # Read defensively, and only fields ModelsConfig actually has. This block
+    # named `cfg.models.loaded` and `cfg.models.preload`, neither of which
+    # exists, so the endpoint raised AttributeError on every call -- AFTER the
+    # reload had already happened. The config was applied and the caller was
+    # told 500, which is the worst of both: on 2026-11-09 an operator read that
+    # as "reload is broken, restart instead" and nearly dropped 16 in-flight
+    # requests for a change that had in fact landed. It is the second time this
+    # endpoint has been silently broken (see the Request({}) note above), so
+    # nothing here may depend on a field name again.
+    print(f"[config] re-read from disk: "
+          f"{sum(len(v) for v in md.values() if isinstance(v, list))} model "
+          f"entries", flush=True)
     return {
         "success": True,
         "message": "Configuration reloaded",
         "models_reloaded": sum(len(v) for v in md.values() if isinstance(v, list)),
         "config": {
-            "loaded": cfg.models.loaded,
-            "preload": cfg.models.preload,
-            "load_mode": cfg.models.default_load_mode,
+            "load_mode": getattr(cfg.models, "default_load_mode", None),
+            "max_model_instances": getattr(cfg.models, "max_model_instances",
+                                           None),
         },
     }
 

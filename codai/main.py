@@ -383,6 +383,67 @@ def _set_proc_title():
         pass
 
 
+def _mint_admin_session(config_dir: str, want_user: str) -> int:
+    """Print an admin session cookie for this install, and exit.
+
+    Why this exists: `/admin/api/system/reload` is the only way to apply a
+    hand edit to config.json or models.json without restarting, and it takes
+    an admin SESSION -- by design, since re-reading the server's configuration
+    is an admin act. But a session could only be obtained through the browser
+    login form, so an operator on an ssh connection, a script or a CI job had
+    no way to reach it and had to restart the whole orchestrator instead,
+    dropping every in-flight request. Measured 2026-11-09: a change to
+    `allow_client_scale` sat unapplied on disk while the client collected 403s,
+    and the only alternative was a restart that would have discarded 16 queued
+    extraction requests and stranded the pod booting for them.
+
+    This grants no privilege: it needs write access to `auth.json`, and anyone
+    who has that can already add themselves an admin user. The cookie is an
+    ordinary session and expires like any other.
+
+    Usage:
+        coderai --admin-session                     # first admin user
+        coderai --admin-session alice               # a named one
+        C=$(coderai --admin-session) && curl -X POST \
+            -H "Cookie: session=$C" localhost:8777/admin/api/system/reload
+    """
+    from pathlib import Path
+    from codai.admin.auth import SessionManager
+
+    cfg = Path(config_dir).expanduser()
+    if not (cfg / "auth.json").exists():
+        print(f"no auth.json in {cfg} — is --config right for this install?",
+              file=sys.stderr)
+        return 2
+    sm = SessionManager(cfg)
+    users = [u for u in (sm._load_auth_data().get("users") or [])
+             if isinstance(u, dict)]
+    admins = [u for u in users if u.get("role") == "admin"]
+    if want_user:
+        admins = [u for u in admins if u.get("username") == want_user]
+        if not admins:
+            # Say whether the user is missing or merely not an admin: the
+            # difference decides what the operator does next.
+            exists = any(u.get("username") == want_user for u in users)
+            print(f"user {want_user!r} is "
+                  + ("not an admin" if exists else "not in auth.json"),
+                  file=sys.stderr)
+            return 3
+    if not admins:
+        print(f"no admin user in {cfg / 'auth.json'}", file=sys.stderr)
+        return 3
+    username = str(admins[0].get("username") or "")
+    cookie = sm.create_session(username)
+    # The cookie alone on stdout, so `$(...)` captures it; everything else on
+    # stderr. A session is a credential: it is printed because the operator
+    # asked for it, and nothing here logs it.
+    print(f"admin session for {username!r} (expires in "
+          f"{sm.session_timeout.days}d) — send as: Cookie: session=<value>",
+          file=sys.stderr)
+    print(cookie)
+    return 0
+
+
 def main():
     """Main entry point for the codai server."""
     # Suppress unraisable exceptions from LlamaModel.__del__
@@ -402,6 +463,10 @@ def main():
     
     # Initialize ConfigManager
     config_dir = args.config
+    # A one-shot utility, handled before anything heavy is initialised: it only
+    # needs the config dir, and it must not start a server.
+    if getattr(args, "admin_session", None) is not None:
+        sys.exit(_mint_admin_session(config_dir, str(args.admin_session or "")))
     config_mgr = ConfigManager(config_dir)
     config = config_mgr.load()
 
