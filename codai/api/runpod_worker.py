@@ -3834,7 +3834,11 @@ class RunpodPodPool:
             held = {str(p.pod_id) for p in self.pods}
         shared_id, shared_url, shared_key, shared_rate = find_shared_pod(
             str(self.model_key), self.health_path, self.api_key,
-            image=want_image, gpus=want_gpus, exclude=held)
+            image=want_image, gpus=want_gpus, exclude=held,
+            # Only the pool knows how long one of ITS boots may take, and that
+            # is what decides whether an addressless survivor is still worth
+            # waiting for or is already dead weight.
+            boot_window_s=self.boot_window_s())
         if not shared_url:
             return False
         if shared_key and shared_key != self.api_key:
@@ -8710,7 +8714,8 @@ def _gpu_name_matches(name: str, want: str) -> bool:
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
                     api_key: str = "", image: str = "",
                     gpus: Optional[list] = None,
-                    exclude: Optional[set] = None) -> tuple:
+                    exclude: Optional[set] = None,
+                    boot_window_s: float = 0.0) -> tuple:
     """A pod already running for this pool: (pod_id, url, key, hourly_usd).
 
     ``key`` is the token that pod was launched with, which is not necessarily
@@ -8770,9 +8775,36 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
             # ask RunPod where it is.
             url = _recover_pod_url(pod_id, info)
             if not url:
+                # Nothing can reach it YET. Two different situations hide here,
+                # and treating them alike cost real money on 2026-11-09: a pod
+                # mid-boot when its owner restarted is worth waiting for (two
+                # were, and both were adopted once RunPod published their
+                # ports), but a pod whose boot window has already expired will
+                # never publish one -- and until the reaper's 20-minute grace
+                # noticed, it billed with NOTHING owning it while the pool
+                # rented a replacement beside it.
+                #
+                # So the pool's own boot deadline decides, exactly as it would
+                # for a pod this process had rented itself: inside it, wait;
+                # past it, tear the pod down and close its bill rather than pay
+                # for an address that is not coming.
+                born = 0.0
+                try:
+                    born = float(info.get("created") or info.get("at") or 0.0)
+                except (TypeError, ValueError):
+                    born = 0.0
+                age = (time.time() - born) if born else 0.0
+                if boot_window_s > 0 and born and age > boot_window_s:
+                    print(f"[runpod] pod {pod_id} never published an address in "
+                          f"{age:.0f}s, past this pool's {boot_window_s:.0f}s "
+                          f"boot window — terminating it rather than leaving it "
+                          f"to bill unowned", flush=True)
+                    _terminate_unreachable_survivor(pod_id)
+                    continue
                 print(f"[runpod] not adopting pod {pod_id}: it has no address "
                       f"recorded and RunPod does not give one yet (it was "
-                      f"still booting when its owner stopped)", flush=True)
+                      f"still booting when its owner stopped, {age:.0f}s ago)",
+                      flush=True)
                 continue
             print(f"[runpod] pod {pod_id} was mid-boot when its owner stopped; "
                   f"recovered its address from RunPod: {url}", flush=True)
@@ -8814,6 +8846,35 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
               f"{health_path} at {url} (dead, still loading, or it wants a "
               f"token this pool does not have)", flush=True)
     return None, "", "", 0.0
+
+
+def _terminate_unreachable_survivor(pod_id: str) -> bool:
+    """Tear down a registered pod that can never be reached, and bill it.
+
+    Used for a survivor whose boot window expired without RunPod ever
+    publishing a port. The order matters: close the ledger from the registry
+    FIRST, because `unregister_pod` removes the only record of what it cost.
+    Best effort throughout -- a failure here must not stop the caller from
+    moving on to the next candidate, which is the pod that might actually
+    serve.
+    """
+    try:
+        from codai.models.manager import get_active_runpod_config
+        from codai.api.runpod_client import RunpodClient
+        acct = get_active_runpod_config()
+        if acct is None or not getattr(acct, "api_key", ""):
+            print(f"[runpod] cannot terminate pod {pod_id}: no RunPod account "
+                  f"configured in this process", flush=True)
+            return False
+        close_bill_from_registry(pod_id, "never published an address")
+        RunpodClient(acct).terminate_pod(str(pod_id))
+        unregister_pod(pod_id)
+        print(f"[runpod] pod {pod_id} terminated and unregistered", flush=True)
+        return True
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"[runpod] could not terminate unreachable pod {pod_id}: {exc}",
+              flush=True)
+        return False
 
 
 def _recover_pod_url(pod_id: str, info: dict) -> str:
