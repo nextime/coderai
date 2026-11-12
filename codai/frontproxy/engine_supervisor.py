@@ -171,8 +171,10 @@ class EngineSupervisor:
             k3 = getattr(self.config, "k3", None)
             kt = getattr(self.config, "ktransformers", None)
             vllm = getattr(self.config, "vllm", None)
+            llamasrv = getattr(self.config, "llamasrv", None)
             assignment = compute_assignment(engines, self.models_path,
-                                            default_engine, ds4, colibri, k3, kt, vllm)
+                                            default_engine, ds4, colibri, k3, kt,
+                                            vllm, llamasrv)
             for e in engines:
                 owned = assignment.get(e.name, [])
                 e.assigned_models = set(owned)   # the front's router enforces this
@@ -373,6 +375,25 @@ class EngineSupervisor:
             engines.append(Engine(
                 id=next_id, gpu=None, port=self._alloc_port(), primary=False,
                 name="vllm", backend="nvidia", env=venv, capabilities={"vllm"}))
+            next_id += 1
+
+        # A managed llama-server is an engine node for the same reasons vLLM is:
+        # its own process with its own CUDA context, so routing, VRAM accounting
+        # and thermal apply to it like any engine, and it gets a row on the
+        # engine/task page. The node is where the subprocess is OWNED -- the
+        # router sends it exactly the models pinned backend:llamasrv, and
+        # LlamaSrvBackend builds and launches the binary per served GGUF.
+        llamasrv_cfg = getattr(self.config, "llamasrv", None)
+        if llamasrv_cfg is not None and getattr(llamasrv_cfg, "enabled", False) \
+                and nvidia_gpus():
+            venv = vendor_env("nvidia", allow_cross=False)
+            sels = _gpu_selectors({"backend": "nvidia", "gpus": "nvidia"}, venv)
+            if sels:
+                venv["CODERAI_ENGINE_GPUS"] = ",".join(sels)
+            engines.append(Engine(
+                id=next_id, gpu=None, port=self._alloc_port(), primary=False,
+                name="llamasrv", backend="nvidia", env=venv,
+                capabilities={"llamasrv"}))
             next_id += 1
 
         self._set_cosited_urls(engines)
@@ -842,8 +863,10 @@ class EngineSupervisor:
                 k3 = getattr(self.config, "k3", None)
                 kt = getattr(self.config, "ktransformers", None)
                 vllm = getattr(self.config, "vllm", None)
+                llamasrv = getattr(self.config, "llamasrv", None)
                 assignment = compute_assignment(real, self.models_path,
-                                                default_engine, ds4, colibri, k3, kt, vllm)
+                                                default_engine, ds4, colibri, k3, kt,
+                                                vllm, llamasrv)
             except Exception as exc:
                 print(f"[front] live reassignment skipped: {exc}", flush=True)
                 assignment = {}

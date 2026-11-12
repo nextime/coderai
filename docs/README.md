@@ -13,6 +13,7 @@ reference; these are the deep dives.
 | [gguf-process-isolation.md](gguf-process-isolation.md) | Running GGUF models in isolated processes |
 | [process-isolation-plans.md](process-isolation-plans.md) | Design notes on isolation strategies |
 | [vllm.md](vllm.md) | vLLM as a first-class engine node (isolated venv, CUDA-only) |
+| [llama-server.md](llama-server.md) | `llama-server` as a backend: the alternative front end for a GGUF — speculative decoding and real slots, which the in-process bindings cannot reach |
 | [deepseek-ds4.md](deepseek-ds4.md) | DeepSeek-V4 via antirez's ds4 / DwarfStar |
 | [glm-colibri.md](glm-colibri.md) | GLM-5.2 (and DeepSeek-V4 / Kimi-K3) via the colibri C engine |
 | [kimi-k3.md](kimi-k3.md) | Kimi-K3 on CPU via kimi-k3-in-c |

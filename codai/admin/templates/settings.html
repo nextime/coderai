@@ -922,6 +922,84 @@
   </div>
 </div>
 
+<!-- llama-server: the alternative front end for a GGUF -->
+<div class="card">
+  <div class="card-title">llama-server (GGUF, alternative to the in-process path)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">coderai serves GGUF models <b>in-process</b> through llama-cpp-python, and that stays the default. This runs llama.cpp's own <code>llama-server</code> as a managed subprocess instead, for the two things the library cannot do: <b>speculative decoding</b> &mdash; the draft-and-verify loop lives in llama.cpp's <code>common/</code>, not in <code>libllama</code>, so it is reachable only by running the server &mdash; and <b>real slots with continuous batching</b> (<code>-np</code>), where the in-process path serialises on a per-instance lock. It serves the <em>same files</em>, so it is <b>never inferred</b>: a model reaches it only by a <code>backend: llamasrv</code> pin or the model id below.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-llamasrv-enabled" onchange="toggleLlamasrvFields()">
+      <span style="font-size:13px;font-weight:500">Enable llama-server</span>
+    </label>
+  </div>
+  <div id="llamasrv-fields" style="display:none">
+    <div class="form-group">
+      <label class="form-label">Model id / alias</label>
+      <input type="text" id="s-llamasrv-model-id" class="form-input" placeholder="(blank = per-model pin only)">
+      <span class="form-hint">Leave blank and tag models in the <b>Models</b> list with <code>backend: llamasrv</code>. Each pinned GGUF gets its own server process.</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Which llama.cpp to build</label>
+      <select id="s-llamasrv-tree" class="form-input" onchange="toggleLlamasrvTree()">
+        <option value="bindings">The tree llama-cpp-python was built from (recommended)</option>
+        <option value="repo">A git repository (a fork)</option>
+      </select>
+      <span class="form-hint"><b>bindings</b> builds the very llama.cpp the in-process path already runs, so the server and the library are one engine with two front ends and a GGUF behaves the same through either &mdash; the only difference is batching. Pick a repository for a tuned fork.</span>
+    </div>
+    <div id="llamasrv-repo-fields" style="display:none">
+      <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+        <div class="form-group" style="flex:2;min-width:240px"><label class="form-label">Repository URL</label><input type="text" id="s-llamasrv-repo-url" class="form-input" placeholder="https://github.com/owner/fork"></div>
+        <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Git ref (pin it)</label><input type="text" id="s-llamasrv-git-ref" class="form-input" placeholder="v0.0.0 or a full SHA"></div>
+      </div>
+      <span class="form-hint">Pin a tag or a SHA. A fork's branch moves under you, and the build that breaks next month will look like a broken fork rather than a moved ref &mdash; an empty ref is accepted but warns in the log.</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">CUDA architectures</label><input type="text" id="s-llamasrv-arch" class="form-input" placeholder="blank = this host's cards"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Context (-c)</label><input type="number" id="s-llamasrv-ctx" class="form-input" min="0" placeholder="0 = the model's own"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Slots (-np)</label><input type="number" id="s-llamasrv-parallel" class="form-input" min="0" placeholder="0 = auto"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">GPU layers</label><input type="number" id="s-llamasrv-ngl" class="form-input" placeholder="-1 = all"></div>
+    </div>
+    <div class="form-row">
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-llamasrv-require-arch" checked>
+        <span>Refuse to build when no local card matches those architectures</span>
+      </label>
+      <span class="form-hint">Leave this on. A tree tuned for one architecture, built for another, does not fail cleanly &mdash; it can compile, load and answer with degraded output.</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Flash attention</label>
+        <select id="s-llamasrv-fa" class="form-input"><option value="on">on</option><option value="off">off</option><option value="auto">auto</option></select></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">KV cache K (-ctk)</label><input type="text" id="s-llamasrv-ctk" class="form-input" placeholder="default"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">KV cache V (-ctv)</label><input type="text" id="s-llamasrv-ctv" class="form-input" placeholder="default"></div>
+      <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Port</label><input type="number" id="s-llamasrv-port" class="form-input" min="0" placeholder="0 = auto"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:2;min-width:180px"><label class="form-label">Speculative type</label><input type="text" id="s-llamasrv-spec-type" class="form-input" placeholder="blank = the tree's default"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Max draft tokens</label><input type="number" id="s-llamasrv-spec-n-max" class="form-input" min="0" placeholder="0 = default"></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Already running elsewhere (service URL)</label>
+      <input type="text" id="s-llamasrv-service-url" class="form-input" placeholder="blank = build and run it here">
+      <span class="form-hint">Point this at a <code>llama-server</code> on another host, in a container or on a rented pod and nothing is built or launched here. Set the API key below to the bearer that server requires.</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:200px"><label class="form-label">Extra flags</label><input type="text" id="s-llamasrv-extra-args" class="form-input" placeholder="--jinja --no-context-shift"></div>
+      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Extra cmake flags</label><input type="text" id="s-llamasrv-cmake" class="form-input" placeholder="-DGGML_CUDA_FA_ALL_QUANTS=ON"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Extra environment</label><input type="text" id="s-llamasrv-extra-env" class="form-input" placeholder="KEY=VALUE KEY2=VALUE2"></div>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">API key</label><input type="text" id="s-llamasrv-api-key" class="form-input" placeholder="blank = a new one each launch"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Load timeout (s)</label><input type="number" id="s-llamasrv-ready" class="form-input" min="60" placeholder="1800"></div>
+    </div>
+    <div class="form-row">
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-llamasrv-auto-build" checked>
+        <span>Build <code>llama-server</code> on first use if it is missing (needs cmake)</span>
+      </label>
+    </div>
+  </div>
+</div>
+
 <!-- Cluster: other coderai installs as engines of this one; RPC servers this machine lends -->
 <div class="card">
   <div class="card-title">Cluster</div>
@@ -1733,6 +1811,16 @@ function toggleVllmFields(){
   document.getElementById('vllm-fields').style.display =
     document.getElementById('s-vllm-enabled').checked ? 'block' : 'none';
 }
+function toggleLlamasrvFields(){
+  document.getElementById('llamasrv-fields').style.display =
+    document.getElementById('s-llamasrv-enabled').checked ? 'block' : 'none';
+  toggleLlamasrvTree();
+}
+function toggleLlamasrvTree(){
+  const el = document.getElementById('llamasrv-repo-fields');
+  if (el) el.style.display =
+    document.getElementById('s-llamasrv-tree').value === 'repo' ? 'block' : 'none';
+}
 function toggleRunpodFields(){
   document.getElementById('runpod-fields').style.display =
     document.getElementById('s-runpod-enabled').checked ? 'block' : 'none';
@@ -2309,6 +2397,32 @@ async function loadSettings(){
     toggleKtFields();
 
     // vLLM
+    const lsv = d.llamasrv || {};
+    document.getElementById('s-llamasrv-enabled').checked = !!lsv.enabled;
+    document.getElementById('s-llamasrv-model-id').value = lsv.model_id ?? '';
+    document.getElementById('s-llamasrv-tree').value = lsv.tree || 'bindings';
+    document.getElementById('s-llamasrv-repo-url').value = lsv.repo_url ?? '';
+    document.getElementById('s-llamasrv-git-ref').value = lsv.git_ref ?? '';
+    document.getElementById('s-llamasrv-arch').value = lsv.cuda_architectures ?? '';
+    document.getElementById('s-llamasrv-require-arch').checked = lsv.require_matching_arch !== false;
+    document.getElementById('s-llamasrv-cmake').value = lsv.extra_cmake_args ?? '';
+    document.getElementById('s-llamasrv-ctx').value = lsv.ctx ?? 0;
+    document.getElementById('s-llamasrv-ngl').value = lsv.n_gpu_layers ?? -1;
+    document.getElementById('s-llamasrv-parallel').value = lsv.parallel ?? 0;
+    document.getElementById('s-llamasrv-fa').value = lsv.flash_attn || 'on';
+    document.getElementById('s-llamasrv-ctk').value = lsv.cache_type_k ?? '';
+    document.getElementById('s-llamasrv-ctv').value = lsv.cache_type_v ?? '';
+    document.getElementById('s-llamasrv-spec-type').value = lsv.spec_type ?? '';
+    document.getElementById('s-llamasrv-spec-n-max').value = lsv.spec_draft_n_max ?? 0;
+    document.getElementById('s-llamasrv-port').value = lsv.port ?? 0;
+    document.getElementById('s-llamasrv-service-url').value = lsv.service_url ?? '';
+    document.getElementById('s-llamasrv-extra-args').value = lsv.extra_args ?? '';
+    document.getElementById('s-llamasrv-extra-env').value = lsv.extra_env ?? '';
+    document.getElementById('s-llamasrv-api-key').value = lsv.api_key ?? '';
+    document.getElementById('s-llamasrv-ready').value = lsv.ready_timeout_s ?? 1800;
+    document.getElementById('s-llamasrv-auto-build').checked = lsv.auto_build !== false;
+    toggleLlamasrvFields();
+
     const vll = d.vllm || {};
     document.getElementById('s-vllm-enabled').checked = !!vll.enabled;
     document.getElementById('s-vllm-model-id').value = vll.model_id ?? '';
@@ -2661,6 +2775,31 @@ async function saveSettings(silent){
       ray_port: parseInt(document.getElementById('s-vllm-ray-port').value) || 6379,
       nodes: document.getElementById('s-vllm-nodes').value,
       nodes_ready_timeout_s: parseInt(document.getElementById('s-vllm-nodes-timeout').value) || 600,
+    },
+    llamasrv:{
+      enabled: document.getElementById('s-llamasrv-enabled').checked,
+      model_id: document.getElementById('s-llamasrv-model-id').value.trim(),
+      tree: document.getElementById('s-llamasrv-tree').value,
+      repo_url: document.getElementById('s-llamasrv-repo-url').value.trim(),
+      git_ref: document.getElementById('s-llamasrv-git-ref').value.trim(),
+      cuda_architectures: document.getElementById('s-llamasrv-arch').value.trim(),
+      require_matching_arch: document.getElementById('s-llamasrv-require-arch').checked,
+      extra_cmake_args: document.getElementById('s-llamasrv-cmake').value.trim(),
+      ctx: parseInt(document.getElementById('s-llamasrv-ctx').value) || 0,
+      n_gpu_layers: (function(){ const v = parseInt(document.getElementById('s-llamasrv-ngl').value); return isNaN(v) ? -1 : v; })(),
+      parallel: parseInt(document.getElementById('s-llamasrv-parallel').value) || 0,
+      flash_attn: document.getElementById('s-llamasrv-fa').value,
+      cache_type_k: document.getElementById('s-llamasrv-ctk').value.trim(),
+      cache_type_v: document.getElementById('s-llamasrv-ctv').value.trim(),
+      spec_type: document.getElementById('s-llamasrv-spec-type').value.trim(),
+      spec_draft_n_max: parseInt(document.getElementById('s-llamasrv-spec-n-max').value) || 0,
+      port: parseInt(document.getElementById('s-llamasrv-port').value) || 0,
+      service_url: document.getElementById('s-llamasrv-service-url').value.trim(),
+      extra_args: document.getElementById('s-llamasrv-extra-args').value.trim(),
+      extra_env: document.getElementById('s-llamasrv-extra-env').value.trim(),
+      api_key: document.getElementById('s-llamasrv-api-key').value.trim(),
+      ready_timeout_s: parseInt(document.getElementById('s-llamasrv-ready').value) || 1800,
+      auto_build: document.getElementById('s-llamasrv-auto-build').checked,
     },
     remotes: _collectRemotes(),
     cluster: _collectCluster(),

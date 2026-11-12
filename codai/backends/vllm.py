@@ -225,6 +225,17 @@ class VllmBackend(ModelBackend):
             raise RuntimeError("vLLM service not started")
         return self._url
 
+    def _headers(self) -> Dict[str, str]:
+        """Extra headers for every call to the managed server.
+
+        Empty here: a vLLM this process launched listens on loopback and is
+        started without an API key. It is a hook because a subclass may drive a
+        server that does require a bearer (see LlamaSrvBackend), and auth that
+        only reaches some of the call sites is worse than none -- the model
+        answers until the first streamed request.
+        """
+        return {}
+
     def context_length(self):
         """The context window the SERVER reports, in tokens, or None.
 
@@ -244,7 +255,8 @@ class VllmBackend(ModelBackend):
         self._ctx_len = None
         try:
             import requests
-            r = requests.get(self._base() + "/v1/models", timeout=5)
+            r = requests.get(self._base() + "/v1/models", headers=self._headers(),
+                             timeout=5)
             for m in (r.json().get("data") or []):
                 if m.get("id") != getattr(self, "_served_name", None):
                     continue
@@ -439,7 +451,8 @@ class VllmBackend(ModelBackend):
                 payload["response_format"] = response_format
             if tools:
                 payload["tools"] = tools
-            r = requests.post(self._base() + "/v1/chat/completions", json=payload, timeout=3600)
+            r = requests.post(self._base() + "/v1/chat/completions", json=payload,
+                              headers=self._headers(), timeout=3600)
             self._raise_for_status(r, "chat/completions")
             data = r.json()
             self._store_usage(data.get("usage", {}))
@@ -607,7 +620,8 @@ class VllmBackend(ModelBackend):
         def _worker():
             import requests
             try:
-                with requests.post(url, json=payload, stream=True, timeout=3600) as r:
+                with requests.post(url, json=payload, stream=True,
+                                   headers=self._headers(), timeout=3600) as r:
                     self._raise_for_status(r, "streamed chat/completions")
                     buf = b""
                     done = False

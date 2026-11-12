@@ -1,0 +1,21 @@
+# llama.cpp's own `llama-server` as a coderai pod: the binary is compiled into
+# the image (Dockerfile.capability-llamasrv's toolchain stage — see the
+# `llamasrv.dockerfile` marker), and coderai drives it as a managed subprocess.
+#
+# Why this exists beside `llama`, which serves GGUF through llama-cpp-python
+# in-process: speculative decoding lives in llama.cpp's `common/`, not in
+# `libllama`, so the Python bindings cannot reach it at all — only the server
+# can. Real slots with continuous batching (`-np`) are the other half; the
+# in-process path serialises on a per-instance generation lock.
+#
+# LIGHT core: nothing on this path needs torch. The server binary links the CUDA
+# runtime and cuBLAS, which NVIDIA ships as wheels at the 12.8 it was built with,
+# and coderai's own card probe uses NVML (codai/backends/gpu_probe.py).
+#
+# No llama-cpp-python here on purpose: the binary IS the engine on this image,
+# and a second copy of ggml in the main venv would be 200 MB of nothing.
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cublas-cu12==12.8.4.1
+nvidia-ml-py>=12.0.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0

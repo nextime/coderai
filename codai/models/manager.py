@@ -93,6 +93,17 @@ def get_active_vllm_config():
     return None
 
 
+def get_active_llamasrv_config():
+    """Return the active LlamaSrvConfig from the server config, or None."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.llamasrv
+    except Exception:
+        pass
+    return None
+
+
 def get_active_runpod_config():
     """Return the active RunpodConfig from the server config, or None."""
     try:
@@ -260,7 +271,7 @@ _EVICT_HEADROOM_FRACTION_KEY = "evict_headroom_fraction"
 #: a hung generation rather than as an eviction that stopped responding.
 _WAIT_IDLE_SAY_EVERY_S = 15.0
 
-_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "runpod")
+_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv", "runpod")
 
 
 def _engine_config(engine: str):
@@ -271,6 +282,7 @@ def _engine_config(engine: str):
         "k3": get_active_k3_config,
         "kt": get_active_ktransformers_config,
         "vllm": get_active_vllm_config,
+        "llamasrv": get_active_llamasrv_config,
         "runpod": get_active_runpod_config,
     }.get(engine)
     return getter() if getter else None
@@ -474,6 +486,15 @@ def _vllm_name_claims(model_name: str) -> bool:
     return False
 
 
+def _llamasrv_name_claims(model_name: str) -> bool:
+    """llama-server serves any GGUF -- the very same files the in-process
+    llama-cpp-python path serves -- so it must NEVER auto-claim one. If it did,
+    enabling this backend would quietly move the whole local GGUF catalogue off
+    the default path. Routes ONLY via an explicit ``backend: "llamasrv"`` pin or
+    its configured ``model_id``."""
+    return False
+
+
 def _runpod_name_claims(model_name: str) -> bool:
     """RunPod can serve any model, so it must NEVER auto-claim by a name marker.
     Routes ONLY via an explicit ``backend: "runpod"`` pin on the model entry."""
@@ -486,6 +507,7 @@ _ENGINE_NAME_CLAIMS = {
     "k3": _k3_name_claims,
     "kt": _kt_name_claims,
     "vllm": _vllm_name_claims,
+    "llamasrv": _llamasrv_name_claims,
     "runpod": _runpod_name_claims,
 }
 
@@ -549,6 +571,11 @@ def kt_should_handle(model_name: str) -> bool:
 def vllm_should_handle(model_name: str) -> bool:
     """True when vllm is the resolved engine backend for ``model_name``."""
     return resolve_engine_backend(model_name) == "vllm"
+
+
+def llamasrv_should_handle(model_name: str) -> bool:
+    """True when llamasrv (a managed llama-server) is the resolved engine."""
+    return resolve_engine_backend(model_name) == "llamasrv"
 
 
 def runpod_should_handle(model_name: str) -> bool:
@@ -867,6 +894,20 @@ class ModelManager:
             print(f"Routing '{model_name}' to vLLM backend")
             self.backend_type = "vllm"
             self.backend = VllmBackend(get_active_vllm_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # llama.cpp's own llama-server, as a managed subprocess: the alternative
+        # to the in-process llama-cpp-python path for a GGUF that wants what only
+        # the server has — speculative decoding (the draft-and-verify loop is in
+        # llama.cpp's common/, not in libllama) and real slots with continuous
+        # batching. Pin-selected only, so the default GGUF path is untouched.
+        if llamasrv_should_handle(model_name):
+            from codai.backends.llamasrv import LlamaSrvBackend
+            print(f"Routing '{model_name}' to a managed llama-server")
+            self.backend_type = "llamasrv"
+            self.backend = LlamaSrvBackend(get_active_llamasrv_config())
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return

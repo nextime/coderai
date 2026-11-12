@@ -102,3 +102,39 @@ def free_memory_bytes(index: int = 0) -> Optional[int]:
         return int(nv.nvmlDeviceGetMemoryInfo(h).free)
     except Exception:
         return None
+
+
+def compute_capabilities() -> List[str]:
+    """Each card's CUDA compute capability as cmake writes it — ["86"], ["80","89"].
+
+    What a llama.cpp / ggml build needs for ``CMAKE_CUDA_ARCHITECTURES``: a tree
+    compiled for the wrong architecture either fails to build or falls back to
+    PTX JIT, and a tree *tuned* for one architecture must not be aimed at a card
+    it was never tested on. Returns [] when nothing can say, which callers must
+    treat as "unknown", never as "no CUDA" -- an empty list from a box that has
+    cards is a probe failure, not an absence.
+
+    Order matches the other probes here (device index order). Duplicates are
+    kept: two identical cards really are two entries, and the caller decides
+    whether to collapse them.
+    """
+    t = _torch()
+    if t is not None:
+        try:
+            return [f"{p.major}{p.minor}" for p in
+                    (t.cuda.get_device_properties(i)
+                     for i in range(t.cuda.device_count()))]
+        except Exception:
+            pass
+    nv = _nvml()
+    if nv is None:
+        return []
+    out: List[str] = []
+    try:
+        for i in range(nv.nvmlDeviceGetCount()):
+            h = nv.nvmlDeviceGetHandleByIndex(i)
+            major, minor = nv.nvmlDeviceGetCudaComputeCapability(h)
+            out.append(f"{int(major)}{int(minor)}")
+    except Exception:
+        pass
+    return out

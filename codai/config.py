@@ -995,6 +995,84 @@ class VllmConfig:
 
 
 @dataclass
+class LlamaSrvConfig:
+    """llama.cpp's ``llama-server`` binary, driven as a managed subprocess.
+
+    coderai's own GGUF path is llama-cpp-python: the library in-process, which
+    means one generation at a time per instance (a per-instance lock) and no
+    access to anything llama.cpp implements in ``common/`` rather than in
+    ``libllama`` -- speculative decoding above all, whose draft-and-verify loop
+    lives in ``common/speculative.cpp`` and is reachable only by running the
+    server binary.
+
+    This backend is the alternative, not a replacement: the bindings stay the
+    default and nothing changes for a model that does not ask for this. When a
+    model pins ``backend: "llamasrv"``, coderai builds ``llama-server`` from the
+    configured source tree, launches it on a free loopback port, and proxies
+    OpenAI requests to it. What that buys over the in-process path is continuous
+    batching with real slots (``-np``), and whatever the chosen tree adds.
+
+    ``tree`` picks WHICH llama.cpp is built. "bindings" (the default) builds the
+    very same llama.cpp the installed llama-cpp-python was compiled from, so the
+    server and the in-process path are one engine with two front ends and a GGUF
+    behaves identically either way. Any other value names a fork -- see
+    ``repo_url``/``git_ref``.
+    """
+    enabled: bool = False
+    # Point this at a llama-server running somewhere else (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building or
+    # launching anything locally. Blank = manage it here.
+    service_url: str = ""
+
+    # --- which llama.cpp to build -----------------------------------------
+    # "bindings" = the tree vendored in the installed llama-cpp-python sdist
+    # (exactly what packaging/build-rpc-server.sh uses, and for the same reason:
+    # one tree, no version skew). "repo" = clone repo_url at git_ref.
+    tree: str = "bindings"               # bindings|repo
+    repo_url: str = ""                   # git remote for tree="repo"
+    # PIN THE REF. A fork's `main` moves under you, and a build that silently
+    # follows it turns a working install into a broken one with no config
+    # change to point at. A tag or a full SHA; a branch name is accepted but
+    # warned about.
+    git_ref: str = ""
+    install_dir: Optional[str] = None    # None = ~/.coderai/llamasrv/<tree>
+    auto_build: bool = True              # clone+build the binary if it is missing
+    # CUDA compute capabilities to compile SASS for, as cmake wants them
+    # ("86", or "80;86;89"). Blank = detect the host's cards and build for
+    # exactly those. A tree tuned for one architecture (several forks are) must
+    # not be built for a card it was never tested on, so this is explicit.
+    cuda_architectures: str = ""
+    # Refuse to build/serve when no local card matches cuda_architectures.
+    # A tuned tree on the wrong card is the kind of failure that produces
+    # plausible-looking wrong output rather than an error, so the default is
+    # to fail closed.
+    require_matching_arch: bool = True
+    extra_cmake_args: str = ""           # appended to the cmake configure line
+
+    # --- how to run it -----------------------------------------------------
+    model_id: str = ""                   # a model id/alias that routes here (blank = pin only)
+    host: str = "127.0.0.1"
+    port: int = 0                        # 0 = auto-pick a free port
+    ctx: int = 0                         # -c; 0 = the per-model n_ctx, else llama-server's default
+    n_gpu_layers: int = -1               # -ngl; -1 = all
+    parallel: int = 0                    # -np server slots; 0 = llama-server's auto
+    flash_attn: str = "on"               # -fa on|off|auto
+    cache_type_k: str = ""               # -ctk (blank = llama-server's default)
+    cache_type_v: str = ""               # -ctv
+    # Speculative decoding. The whole reason this backend exists over the
+    # bindings: the draft-and-verify loop is in the server, not the library.
+    # Blank leaves the tree's own default (some forks draft by default).
+    spec_type: str = ""                  # --spec-type
+    spec_draft_n_max: int = 0            # --spec-draft-n-max (0 = default)
+    extra_args: str = ""                 # extra flags passed verbatim to llama-server
+    extra_env: str = ""                  # free-form KEY=VALUE env for the subprocess
+    # llama-server is told to require this bearer. Blank mints a random one per
+    # launch: the port is loopback, but a local process should not be able to
+    # drive another process's model by guessing a port.
+    api_key: str = ""
+    ready_timeout_s: int = 1800          # how long a cold load may take before we give up
+
+@dataclass
 class RunpodConfig:
     """RunPod remote-GPU backend — account-level settings.
 
@@ -1874,6 +1952,7 @@ class Config:
     remotes: RemotesConfig = field(default_factory=RemotesConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
+    llamasrv: LlamaSrvConfig = field(default_factory=LlamaSrvConfig)
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
     k3: K3Config = field(default_factory=K3Config)
     ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
@@ -2118,6 +2197,7 @@ class ConfigManager:
                 remotes=_dc(RemotesConfig, config_data.get("remotes", {})),
                 cluster=_dc(ClusterConfig, config_data.get("cluster", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
+                llamasrv=_dc(LlamaSrvConfig, config_data.get("llamasrv", {})),
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 k3=_dc(K3Config, config_data.get("k3", {})),
                 ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
@@ -2377,6 +2457,33 @@ class ConfigManager:
                 "kv_cache_cleanup_enabled": self.config.ds4.kv_cache_cleanup_enabled,
                 "kv_cache_max_age_hours": self.config.ds4.kv_cache_max_age_hours,
                 "kv_cache_cleanup_interval_minutes": self.config.ds4.kv_cache_cleanup_interval_minutes,
+            },
+            "llamasrv": {
+                "enabled": self.config.llamasrv.enabled,
+                "service_url": self.config.llamasrv.service_url,
+                "tree": self.config.llamasrv.tree,
+                "repo_url": self.config.llamasrv.repo_url,
+                "git_ref": self.config.llamasrv.git_ref,
+                "install_dir": self.config.llamasrv.install_dir,
+                "auto_build": self.config.llamasrv.auto_build,
+                "cuda_architectures": self.config.llamasrv.cuda_architectures,
+                "require_matching_arch": self.config.llamasrv.require_matching_arch,
+                "extra_cmake_args": self.config.llamasrv.extra_cmake_args,
+                "model_id": self.config.llamasrv.model_id,
+                "host": self.config.llamasrv.host,
+                "port": self.config.llamasrv.port,
+                "ctx": self.config.llamasrv.ctx,
+                "n_gpu_layers": self.config.llamasrv.n_gpu_layers,
+                "parallel": self.config.llamasrv.parallel,
+                "flash_attn": self.config.llamasrv.flash_attn,
+                "cache_type_k": self.config.llamasrv.cache_type_k,
+                "cache_type_v": self.config.llamasrv.cache_type_v,
+                "spec_type": self.config.llamasrv.spec_type,
+                "spec_draft_n_max": self.config.llamasrv.spec_draft_n_max,
+                "extra_args": self.config.llamasrv.extra_args,
+                "extra_env": self.config.llamasrv.extra_env,
+                "api_key": self.config.llamasrv.api_key,
+                "ready_timeout_s": self.config.llamasrv.ready_timeout_s,
             },
             "colibri": {
                 "enabled": self.config.colibri.enabled,
@@ -2906,7 +3013,8 @@ class ConfigManager:
         # anything. Where the binary lives is the image's business
         # (CODERAI_<ENGINE>_DIR, read by the worker itself), not this block's.
         for name, attr in (("ds4", "ds4"), ("colibri", "colibri"), ("k3", "k3"),
-                           ("kt", "ktransformers"), ("vllm", "vllm")):
+                           ("kt", "ktransformers"), ("vllm", "vllm"),
+                           ("llamasrv", "llamasrv")):
             if not _flag(f"CODERAI_{name.upper()}_ENABLED"):
                 continue
             eng = getattr(self.config, attr, None)
@@ -2926,7 +3034,17 @@ class ConfigManager:
                 continue
             for k, v in forwarded.items():
                 if k in ("enabled", "install_dir", "repo_url", "service_url",
-                         "host", "port", "model_path", "auto_build", "venv"):
+                         "host", "port", "model_path", "auto_build", "venv",
+                         # Which tree was built, and for which cards, is the
+                         # IMAGE's business: a capability image compiles its
+                         # engine at build time and carries no compiler, so
+                         # forwarding the renter's build settings would
+                         # describe a build the pod cannot perform -- and
+                         # would silently claim an architecture it was not
+                         # built for.
+                         "tree", "git_ref", "cuda_architectures",
+                         "extra_cmake_args", "require_matching_arch",
+                         "api_key"):
                     continue            # local to whichever machine set them
                 if hasattr(eng, k):
                     setattr(eng, k, v)

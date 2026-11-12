@@ -385,6 +385,13 @@ PUBLISHED_CAPABILITY_IMAGES = (
     # core, driven by coderai's vLLM proxy backend.
     "llama",
     "vllm",
+    # The same GGUF files as `llama`, served by llama.cpp's own `llama-server`
+    # binary rather than the in-process bindings: the image for a model that
+    # wants speculative decoding (whose draft-and-verify loop is in llama.cpp's
+    # common/, not in libllama, so the Python bindings cannot reach it) or real
+    # slots with continuous batching. The binary is compiled in the image's
+    # toolchain stage, so nothing is built on a rented pod.
+    "llamasrv",
     # The same vLLM pod pinned to 0.20.1 — the version `surya-ocr` spawns and
     # validates against — because serving surya-ocr-2 on 0.27.1 loses every
     # accented character while the model's own bytes decode cleanly. Rent it for
@@ -397,8 +404,9 @@ PUBLISHED_CAPABILITY_IMAGES = (
 #: and k3 are C binaries and share one image. ktransformers is a Python stack
 #: (kt-kernel + SGLang, pinning their own torch) that takes a venv of its own,
 #: so it has an image of its own rather than doubling the first.
-_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm")
-_ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm"}
+_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv")
+_ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm",
+                     "llamasrv": "llamasrv"}
 #: runpod-block `engine` values that mean "a coderai pod running THIS server",
 #: as opposed to `vllm`/`llamacpp`, which mean the upstream images.
 #:
@@ -408,8 +416,13 @@ _ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm"}
 #: while the model's own bytes decode cleanly — see
 #: packaging/runpod/profiles/vllm-ocr.txt for the measurement. Rent it for the
 #: OCR model only: everything else on that image would be pinned back with it.
+#: `coderai-llamasrv` is a coderai running llama.cpp's own `llama-server`
+#: subprocess rather than the in-process bindings `coderai-llama` uses: the
+#: image for a GGUF that wants speculative decoding (whose draft-and-verify
+#: loop is in llama.cpp's common/, not in libllama) or real slots.
 _CODERAI_SERVER_ENGINES = {"coderai-vllm": "vllm", "coderai-llama": "llama",
-                           "coderai-vllm-ocr": "vllm-ocr"}
+                           "coderai-vllm-ocr": "vllm-ocr",
+                           "coderai-llamasrv": "llamasrv"}
 
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {
@@ -709,6 +722,8 @@ def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
     want = str(getattr(mcfg, "engine", "") or "").strip().lower() if mcfg else ""
     if want in _ENGINE_POD_BACKENDS:
         return want
+    if want == "coderai-llamasrv":
+        return "llamasrv"
     if want in ("coderai-vllm", "coderai-vllm-ocr"):
         # Both are coderai's vLLM backend; they differ only in which vLLM the
         # image carries, which is the image's business and not the engine's.
@@ -1131,6 +1146,15 @@ _ENGINE_FORWARDED_FIELDS = {
              # A pod needs it to recover a byte-level vocabulary's characters from
              # the token ids (see VllmConfig.return_token_ids).
              "return_token_ids"),
+    # How to RUN the model, never how to BUILD the server: the tree, the git
+    # ref and the CUDA architectures are baked into the image's own toolchain
+    # stage, and a pod carries no compiler. Forwarding them would describe a
+    # build the pod cannot perform -- and `cuda_architectures` would claim a
+    # target the image was not compiled for.
+    "llamasrv": ("ctx", "n_gpu_layers", "parallel", "flash_attn",
+                 "cache_type_k", "cache_type_v", "spec_type",
+                 "spec_draft_n_max", "extra_args", "extra_env", "model_id",
+                 "ready_timeout_s"),
 }
 #: The config attribute behind each engine name (ktransformers is the odd one).
 _ENGINE_CONFIG_ATTR = {"kt": "ktransformers"}
@@ -1960,7 +1984,7 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
             # block — what makes the pod run ds4-server for it rather than try
             # to load a 154 GB GGUF with transformers. Other backend pins are
             # stripped below: vulkan/opencl say something about THIS machine.
-            "backend", "ds4", "colibri", "k3",
+            "backend", "ds4", "colibri", "k3", "llamasrv",
             # …and the vLLM block, for the same reason: tool-call syntax,
             # context and memory shape describe the MODEL, and a pod that does
             # not get them serves it differently from this install.

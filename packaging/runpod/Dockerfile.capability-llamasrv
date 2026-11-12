@@ -1,0 +1,161 @@
+# CoderAI llamasrv pod — llama.cpp's own `llama-server`, compiled in, driven by
+# coderai as a managed subprocess.
+#
+# How this differs from `coderai-llama`, which is the one to reach for first:
+# that image serves GGUF through llama-cpp-python, the library in-process. This
+# one serves the same files through llama.cpp's server binary, which buys the two
+# things the library cannot do — speculative decoding, whose draft-and-verify
+# loop lives in llama.cpp's `common/` rather than in `libllama` and so is
+# reachable only by running the server, and real slots with continuous batching,
+# where the in-process path serialises on a per-instance generation lock.
+#
+# It is still a coderai pod, not an upstream llama.cpp server image: TLS on the
+# direct-TCP path, a /boot record, seeding, local LoRA upload, the Tasks page.
+# The binary is compiled in a toolchain stage and the runtime carries no CUDA
+# compiler, so nothing is ever built on a rented pod.
+#
+# LIGHT core, like coderai-llama: nothing here needs torch. The GGUF path asks
+# NVML about the card (codai/backends/gpu_probe.py), and the server binary links
+# only the CUDA runtime.
+#
+# ---------------------------------------------------------------------------
+# Which llama.cpp gets compiled, and for which cards:
+#
+#   LLAMA_CPP_PYTHON  the bindings version whose VENDORED llama.cpp is built.
+#                     The default, and the one to keep: the server is then the
+#                     same tree coderai-llama's in-process path runs, so a GGUF
+#                     behaves identically on either image.
+#   LLAMASRV_REPO     set to a git URL to build a FORK instead, with
+#                     LLAMASRV_REF pinned to a tag or a SHA. An unpinned ref
+#                     makes the image unreproducible; the build warns.
+#   CUDA_ARCHS        the SASS targets. The default spans every pod GPU
+#                     generation. A tuned fork usually wants exactly one (e.g.
+#                     `86` for GA102 — RTX 30-series and the A40) and should be
+#                     published under its own tag, because an image built for
+#                     one architecture must not be rented onto another card.
+#
+# Build the generic image:
+#   packaging/runpod/build_capability_image.sh llamasrv
+# Build a fork variant:
+#   docker build -f packaging/runpod/Dockerfile.capability-llamasrv \
+#     --build-arg LLAMASRV_REPO=https://github.com/owner/fork \
+#     --build-arg LLAMASRV_REF=v1.2.3 --build-arg CUDA_ARCHS=86 \
+#     -t coderai-llamasrv-fork:latest .
+# ---------------------------------------------------------------------------
+
+ARG CORE_BASE=coderai-capability-base-light:latest
+ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04
+ARG LLAMA_CPP_PYTHON=0.3.30
+ARG CUDA_ARCHS=80;86;89;90;120
+ARG LLAMASRV_REPO=
+ARG LLAMASRV_REF=
+
+# ---------------------------------------------------------------- build stage
+FROM ${CUDA_DEVEL} AS server
+ARG LLAMA_CPP_PYTHON
+ARG CUDA_ARCHS
+ARG LLAMASRV_REPO
+ARG LLAMASRV_REF
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git python3 python3-pip python3-venv \
+        ca-certificates libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# The source tree: a pinned fork, or the bindings' own vendored llama.cpp.
+RUN set -eux; \
+    if [ -n "${LLAMASRV_REPO}" ]; then \
+        if [ -z "${LLAMASRV_REF}" ]; then \
+            echo "WARNING: LLAMASRV_REPO set with no LLAMASRV_REF — this image is" >&2; \
+            echo "         NOT reproducible: the branch moves under the tag." >&2; \
+        fi; \
+        git clone "${LLAMASRV_REPO}" /src; \
+        if [ -n "${LLAMASRV_REF}" ]; then \
+            git -C /src fetch --tags origin; \
+            git -C /src checkout --detach "${LLAMASRV_REF}"; \
+        fi; \
+    else \
+        python3 -m venv /bw; \
+        /bw/bin/pip install --no-cache-dir -U pip; \
+        cd /tmp; \
+        /bw/bin/pip download --no-deps --no-binary :all: \
+            "llama-cpp-python==${LLAMA_CPP_PYTHON}" -d /tmp/sd; \
+        tar -xzf /tmp/sd/llama_cpp_python-*.tar.gz -C /tmp; \
+        mv /tmp/llama_cpp_python-*/vendor/llama.cpp /src; \
+    fi; \
+    test -f /src/CMakeLists.txt; \
+    git -C /src rev-parse HEAD > /src-commit 2>/dev/null || echo "(sdist)" > /src-commit; \
+    cat /src-commit
+
+# GGML_NATIVE=OFF on purpose: a -march baked in from the builder would SIGILL on
+# an older pod CPU. AVX2 is the floor every rentable host clears.
+RUN --mount=type=cache,target=/root/.cache/ccache set -eux; \
+    cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DBUILD_SHARED_LIBS=OFF; \
+    cmake --build /build -j"$(nproc)" --target llama-server; \
+    find /build -name llama-server -type f -exec cp {} /llama-server \; ; \
+    test -x /llama-server; \
+    /llama-server --version 2>&1 | head -5 || true
+
+# -------------------------------------------------------------- runtime stage
+FROM ${CORE_BASE}
+
+ARG PROFILE=llamasrv
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ENV PROFILE=${PROFILE}
+ARG IMAGE_TAG=unknown
+ENV CODERAI_IMAGE_TAG=${IMAGE_TAG}
+
+WORKDIR /opt/coderai/app
+COPY packaging/runpod/profiles/ /tmp/profiles/
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
+    if python -c "import torch" 2>/dev/null; then \
+        echo "ERROR: llamasrv is a light-core image but torch reached its main venv" >&2; \
+        exit 1; \
+    fi; echo "main venv: no torch (light core, as intended)"; \
+    rm -rf /tmp/profiles
+
+COPY --from=server /llama-server /opt/coderai/llamasrv/bin/llama-server
+COPY --from=server /src-commit /opt/coderai/llamasrv/SOURCE_COMMIT
+RUN chmod 755 /opt/coderai/llamasrv/bin/llama-server
+
+# The worker reads this instead of deriving a path from the configured tree: the
+# binary was compiled at image build time, by build args this runtime cannot see.
+# With it set, a pod never fetches a source tree and never needs a compiler.
+ENV CODERAI_LLAMASRV_BIN=/opt/coderai/llamasrv/bin/llama-server
+ENV CODERAI_LLAMASRV_DIR=/opt/coderai/llamasrv
+
+# The CUDA runtime and cuBLAS the binary links, from NVIDIA's wheels. Fail the
+# BUILD if it cannot resolve them, rather than the pod at its first load.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}
+RUN set -eux; \
+    ldd /opt/coderai/llamasrv/bin/llama-server | tee /tmp/ldd.txt; \
+    if grep -q "not found" /tmp/ldd.txt; then \
+        echo "ERROR: llama-server has unresolved libraries (see above)" >&2; exit 1; \
+    fi; \
+    rm /tmp/ldd.txt; \
+    /opt/coderai/llamasrv/bin/llama-server --help >/dev/null 2>&1 \
+        || { echo "ERROR: llama-server will not run in this image" >&2; exit 1; }; \
+    echo "llama-server: links resolved and runs"
+
+COPY . /opt/coderai/app
+RUN python -c "import codai.api.app; print('coderai imports OK for profile ${PROFILE}')"
+RUN python -c "\
+import os;\
+from codai.api import llamasrv_worker as w;\
+from codai.config import LlamaSrvConfig;\
+b = w._server_bin(w._install_dir(LlamaSrvConfig()));\
+assert str(b) == os.environ['CODERAI_LLAMASRV_BIN'], b;\
+assert b.is_file(), b;\
+print('llamasrv worker resolves the compiled-in binary:', b)"
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || curl -fsSk https://127.0.0.1:8000/healthz || exit 1
+
+COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
+RUN chmod +x /opt/coderai/boot.sh
+CMD ["/opt/coderai/boot.sh"]

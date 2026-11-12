@@ -109,7 +109,9 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
                         kt_model_id: Optional[str] = None,
                         kt_enabled: bool = False,
                         vllm_model_id: Optional[str] = None,
-                        vllm_enabled: bool = False) -> Optional[str]:
+                        vllm_enabled: bool = False,
+                        llamasrv_model_id: Optional[str] = None,
+                        llamasrv_enabled: bool = False) -> Optional[str]:
     """The capability an engine must have to serve this request.
 
     * ``whisper``      — whisper.cpp STT (transcription endpoint or a
@@ -118,7 +120,11 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
     * ``colibri``      — GLM-5.2 / DeepSeek-V4 / Kimi-K3 via the native colibri C engine.
     * ``k3``           — Kimi-K3 via kimi-k3-in-c. CPU.
     * ``kt``           — many families via ktransformers/SGLang. CPU+GPU.
-    * ``gguf``         — llama.cpp model. Runs on CUDA or Vulkan.
+    * ``gguf``         — llama.cpp model, in-process through llama-cpp-python.
+                         Runs on CUDA or Vulkan.
+    * ``llamasrv``     — a GGUF served by a managed ``llama-server`` subprocess
+                         instead of in-process. Pin-only: it serves the SAME
+                         files as ``gguf``, so it must never be inferred.
     * ``transformers`` — safetensors/HF model. CUDA-only.
 
     This mirrors the in-process resolver (:func:`codai.models.manager.resolve_engine_backend`):
@@ -133,7 +139,7 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
         return "whisper"
     # 1. Explicit engine-backend pin wins (authoritative), like the manager resolver.
     b = (backend or "").lower()
-    if b in ("colibri", "ds4", "k3", "kt", "vllm", "runpod"):
+    if b in ("colibri", "ds4", "k3", "kt", "vllm", "llamasrv", "runpod"):
         return b
     m = (model or "").lower()
 
@@ -142,6 +148,8 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
         return bool(mid) and (m == mid or m.split("/")[-1] == mid)
 
     # 2. An enabled engine's model_id alias.
+    if llamasrv_enabled and _alias(llamasrv_model_id):
+        return "llamasrv"
     if vllm_enabled and _alias(vllm_model_id):
         return "vllm"
     if kt_enabled and _alias(kt_model_id):
