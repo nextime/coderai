@@ -7,7 +7,7 @@ public, pulled without credentials. There is nothing to build.
 
 | Package | What it is | Pull |
 |---|---|---|
-| `ghcr.io/nextime/coderai` | **The full CoderAI** — every capability, every engine, the Web Studio and admin UI, the cluster head/node, llama.cpp with the RPC backend and `rpc-server`. One layer, ~25 GB on disk (≈14 GB to pull). Tags: `latest`, `0.2.82`, … | `docker pull ghcr.io/nextime/coderai:latest` |
+| `ghcr.io/nextime/coderai` | **The full CoderAI** — every capability, every engine, the Web Studio and admin UI, the cluster head/node, llama.cpp with the RPC backend and `rpc-server`. One layer, ~25 GB on disk (≈14 GB to pull). Tags: `latest`, the release version, … | `docker pull ghcr.io/nextime/coderai:latest` |
 | `ghcr.io/nextime/coderai-images` | Image generation only (SDXL, Flux, Z-Image …) | `docker pull ghcr.io/nextime/coderai-images:latest` |
 | `ghcr.io/nextime/coderai-video` | Video generation (Wan, LTX-2 …), upscale, interpolation | `…/coderai-video:latest` |
 | `ghcr.io/nextime/coderai-text` | LLMs with transformers / llama.cpp, incl. local LoRA adapters | `…/coderai-text:latest` |
@@ -27,6 +27,9 @@ public, pulled without credentials. There is nothing to build.
 | `ghcr.io/nextime/coderai-voice` | Voice cloning and conversion | `…/coderai-voice:latest` |
 | `ghcr.io/nextime/coderai-audio` | Music / sound generation, stems | `…/coderai-audio:latest` |
 | `ghcr.io/nextime/coderai-faceswap` | Face swap | `…/coderai-faceswap:latest` |
+| `ghcr.io/nextime/coderai-vllm-ocr` | vLLM + the OCR pipeline on the pod itself (not just the model) | `…/coderai-vllm-ocr:latest` |
+| `ghcr.io/nextime/coderai-video-longcat` | LongCat-Video (continuation-native video, audio-driven avatars) | `…/coderai-video-longcat:latest` |
+| `ghcr.io/nextime/coderai-llamasrv` | llama.cpp's own `llama-server` compiled into the image — drafting and real slots for a GGUF (light core). **Built from `packaging/runpod/Dockerfile.capability-llamasrv`; not yet pushed to ghcr.** | `…/coderai-llamasrv:latest` |
 
 The capability images are the same codebase with only one capability's
 dependencies (5–12 GB). They are what a RunPod pod, a `host` machine or a
@@ -34,17 +37,26 @@ cluster node that only needs one thing runs; the full image is what a
 workstation runs. All of them expose the same API on port 8000 (capability
 images) or 8776 (full image), and all of them can be a cluster node.
 
-Every tag is also published with its version (`:0.2.82`); `:latest` moves
+Every tag is also published with its version (e.g. `:0.6.23`); `:latest` moves
 only after the image has completed a real request on real hardware.
 
 The capability images do not all move together: a profile is rebuilt when its
 own dependencies change, so `:latest` is the newest build *of that profile*,
-not of the release. At the time of writing the full image and most capability
-images are `0.2.82`/`0.2.80`, while `coderai-llama`, `coderai-vllm`,
-`coderai-engines`, `coderai-engines-kt`, `coderai-ocr-paddle`,
-`coderai-speaker`, `coderai-stt-crisper`, `coderai-stt-nemo` and
-`coderai-tts-xtts` are still `0.2.18`. Pull `:latest` and check the version
-the image reports on `/healthz` if it matters to you.
+not of the release, and the version a given profile carries can be well behind
+the repository's. That is deliberate — rebuilding an 11 GB image whose own
+dependencies did not change buys nothing — but it means **the published version
+of a profile is whatever that profile's `:latest` reports**, not a number this
+page can promise. Pull `:latest` and ask the image:
+
+```bash
+docker run --rm ghcr.io/nextime/coderai-text:latest \
+  python -c "import codai; print(codai.__version__)"
+# or ask a running one:
+curl -s http://127.0.0.1:8000/coderai/capabilities | jq .version
+```
+
+`/healthz` deliberately reports nothing but liveness — it must answer while the
+event loop is loading a model — so it is not where a version comes from.
 
 **Every published image is signed** with [cosign](https://github.com/sigstore/cosign)
 against the key pair in `packaging/cosign.pub` (the private half never
@@ -63,7 +75,7 @@ a `policy-controller` / `cosign` admission rule on a cluster, or simply the
 command above in whatever pulls.
 
 For an offline machine, pull the image where there is a connection and
-move it: `docker save ghcr.io/nextime/coderai:0.2.82 | gzip > coderai.tar.gz`
+move it: `docker save ghcr.io/nextime/coderai:latest | gzip > coderai.tar.gz`
 there, `docker load < coderai.tar.gz` here.
 
 ## Linux

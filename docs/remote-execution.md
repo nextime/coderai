@@ -291,13 +291,18 @@ so the toolchain never ships. `audio` does this for deepfilterlib's Rust
 extensions, and costs ~50 MB more than a profile that needs nothing.
 
 Profiles live in `packaging/runpod/profiles/` — `core.txt` (what any pod needs to
-boot) plus one file per capability. There are nineteen images, in three kinds:
+boot) plus one file per capability, in three kinds:
 
 | image | serves | core | size |
 |---|---|---|---|
-| `images`, `video`, `tts`, `stt`, `text`, `voice`, `audio`, `embeddings`, `ocr`, `faceswap` | one capability, in the main venv | full (torch + CUDA) | 9–10 GB |
+| `images`, `video`, `video-longcat`, `tts`, `stt`, `text`, `voice`, `audio`, `embeddings`, `ocr`, `faceswap` | one capability, in the main venv | full (torch + CUDA) | 9–10 GB |
 | `speaker`, `tts-xtts`, `stt-nemo`, `stt-crisper`, `ocr-paddle` | a stack that **cannot** share the main venv | light (no torch) + its own venv | 7–8 GB |
-| `llama`, `vllm`, `engines`, `engines-kt` | an LLM server or the native MoE engines as a coderai pod | light + a venv or C binaries | 2.4 / 5.3 / 11 / 12.4 GB |
+| `llama`, `llamasrv`, `vllm`, `vllm-ocr`, `engines`, `engines-kt` | an LLM server or the native MoE engines as a coderai pod | light + a venv or C binaries | 2.4 GB (`llama`) – 12.4 GB (`engines-kt`) |
+
+`codai/api/runpod_worker.PUBLISHED_CAPABILITY_IMAGES` is the authoritative list: a
+capability missing from it has no image of its own and needs `image` set explicitly, which
+is better than defaulting to a tag that does not exist and failing at pull time, minutes
+into a pod boot.
 
 RunPod refuses an image above a size it does not document; 12.4 GB has booted,
 14.5 GB was refused. A stack built on a recent torch (2.9+, cudnn 9) is about

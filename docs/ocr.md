@@ -550,6 +550,32 @@ GET  /v1/ocr/engines    what this install offers, and what each engine returns
 GET/POST/DELETE /v1/ocr/schemas[/{name}]   manage extraction schemas
 ```
 
+### What the status code means
+
+A document whose every readable page came back empty is **not** a `200`. The
+orchestrator has already measured ink on those pages and said there is something
+on them, so "no text" is that run failing, not the document being blank — and
+the two are identical in a `200` whose `text` is empty. A client that reads an
+empty answer as an unreadable scan then consumes the document from its queue and
+writes it off. That happened to roughly a thousand documents in one night behind
+a lost engine lease.
+
+| what the run produced | status | body |
+|---|---|---|
+| every page read | `200` | the document |
+| some pages read | `200` | the text, plus `unread_pages` naming the rest |
+| no page read, with ink measured | `502` | `error.type: "ocr_unread"`, plus the same `unread_pages` and `num_pages` |
+
+Only the all-or-nothing case changes status, and `ocr.unread_status` set to `0`
+restores the old always-`200` behaviour for a client that depends on it.
+
+This is the response-shape half of
+[An empty page and a 71-character page are the same bug](#an-empty-page-and-a-71-character-page-are-the-same-bug),
+which is the *causes* half: a page's `meta` carries `model_attempts` and
+`repeat_detected` on the VLM engines, which separate a page truncated by a token
+cap from one the model looped on from one that is genuinely blank — three causes
+needing opposite handling that a short page otherwise reports identically.
+
 ### How big a document may be
 
 | Limit | Default | Where |

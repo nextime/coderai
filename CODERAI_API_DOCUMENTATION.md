@@ -2,12 +2,25 @@
 
 This document describes the full HTTP API exposed by CoderAI, including OpenAI-compatible endpoints, native multimodal endpoints, profile/LoRA APIs, pipelines, admin APIs, examples, and end-to-end workflows.
 
-The API is implemented with FastAPI in `codai/api/app.py` and routers under `codai/api/`, with admin routes under `codai/admin/routes.py`.
+The API is implemented with FastAPI in `codai/api/app.py` and routers under `codai/api/`,
+with admin routes under `codai/admin/routes.py` and the front proxy's own routes under
+`codai/frontproxy/`. Which process answers matters when you are debugging: a request to a
+`/v1` generation route is accepted by the torch-free **front** and proxied to an **engine**
+subprocess, while the admin pages, `/metrics` and the cluster mesh are answered by the front
+itself — see [`docs/frontend-engine-split.md`](docs/frontend-engine-split.md). The
+[Endpoint Index](#endpoint-index) at the end names the owning module for every route.
 
 Interactive, always-up-to-date OpenAPI docs are served by the running server at
 `/docs` (Swagger UI, linked as **API Docs** in the admin nav) and `/redoc`, with the
 raw schema at `/openapi.json`. Every endpoint there carries a tag, summary, and
-per-field descriptions generated from the code.
+per-field descriptions generated from the code. Routes the code registers with
+`include_in_schema=False` — liveness probes, `/boot`, `/logs`, `/metrics`, the cluster and
+internal control planes — are **not** in that schema; they are documented here instead.
+
+The subsystems with a design of their own have a deep-dive guide in
+[`docs/`](docs/README.md): OCR, chunking, moderation, video composition, the engines,
+RunPod, the cluster, isolated worker environments. This document is the HTTP surface; those
+explain the behaviour behind it.
 
 ## Base URL
 
@@ -45,6 +58,15 @@ Notes:
 - If the admin/session manager is not initialized, API auth can be bypassed by the server.
 - Admin HTML/API routes use signed session cookies; many admin API routes require an admin role.
 - Some profile routes also enforce local API auth internally.
+- The telemetry and dashboard reads (`/admin/api/engines`, `/admin/api/gpu-stats`,
+  `/admin/api/system-stats`, `/admin/api/usage`, `/metrics`) take a *light* credential —
+  a session cookie or bearer that is present and well-formed — deliberately, so the
+  operator's view survives an engine that is busy generating.
+- `/metrics` is open to anyone when `server.metrics_public` is set.
+- `/cluster/*` is authenticated with the **shared cluster token**, not a user session.
+- `/internal/*` is the front↔engine control plane and is not meant for clients.
+- On a rented pod the bearer token (`CODERAI_API_TOKEN`) is required for `/boot` and
+  `/logs` too, so neither is a way to read an install's log without one.
 
 Example reusable shell variables:
 
@@ -811,6 +833,110 @@ Frame interpolation:
 }
 ```
 
+## Video Composition
+
+`POST /v1/video/compose` turns N pieces into one finished video. CoderAI could already
+make every piece of a short reel; nothing turned the pieces into a reel, because that step
+needs ffmpeg *and* facts only the server has — how long the narration it just synthesised
+actually is, and when each word falls. A client on another machine cannot know either, so
+composition lives here.
+
+A request is an ordered list of **scenes**. Each scene has narration (text to synthesise,
+or audio you already have) and one or more **visuals**; the scene lasts as long as its
+narration plus its padding, and its visuals split that time between them. Voice, music,
+captions, overlays and thumbnail are defaults you override per request.
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `scenes` | object[] | required | Ordered scenes (see below) |
+| `canvas` | object | `1080×1920@30` | `width`, `height`, `fps`, `background` |
+| `voice` | object | `engine: tts` | Default `VoiceSpec`: `engine` (`tts`/`clone`), `model`, `voice`, `voice_name`, `language`, `speed` |
+| `visual_fit` | string | `cover` | `cover`, `contain` or `blur_pad` |
+| `transition` | object | `{"type":"none","duration":0.3}` | Between scenes |
+| `music` | object/null | `null` | Bed track, ducked under narration |
+| `presenter` | object/null | `null` | A lip-synced presenter over the whole composition |
+| `captions` | object/null | `null` | Burned-in captions from the real word timings |
+| `overlays` | object[] | `[]` | Logos, lower thirds, text |
+| `thumbnail` | object/null | `null` | Still frame to emit alongside the video |
+| `output` | object | codec defaults | Container, codec, bitrate |
+| `outputs` | string[] | `["video"]` | Which artefacts to produce |
+| `async` | boolean | `true` | `true` queues and returns `202 {id, status}`; `false` blocks and returns the finished job |
+
+Scene fields: `text` or `audio` (narration), `duration` (required when there is no
+narration), `min_duration`, `padding`, `visuals[]`, `voice` (per-scene override — a second
+speaker), `words[]` (caller-supplied word timings), `speakers[]` (a multi-character dialog:
+who speaks when, each with their own voice and place on screen), `audio_mix`,
+`clip_volume`, `presenter`.
+
+Visual fields: `type` (`video`/`image`/`gradient`/`color`), `src`, `trim_start`,
+`ken_burns`, `colors`, `color`, `keep_audio`, `audio_src`, `volume`.
+
+Work is queued and rendered one at a time (a render is ffmpeg-bound; two at once are slower
+than one after the other). A visual that cannot be fetched or decoded never fails the job:
+it becomes a gradient and a line in `warnings`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/video/compose` | Submit a composition |
+| `GET` | `/v1/video/compose` | List composition jobs |
+| `GET` | `/v1/video/compose/{job_id}` | Job status: stage, percentage, outputs, `warnings` |
+| `GET` | `/v1/video/compose/{job_id}/log` | That job's own log |
+| `POST` | `/v1/video/compose/{job_id}/cancel` | Stop it |
+
+```bash
+curl -s "$CODERAI_URL/v1/video/compose" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "canvas": {"width": 1080, "height": 1920, "fps": 30},
+    "voice": {"engine": "tts", "model": "tts-1", "voice": "alloy"},
+    "captions": {"enabled": true},
+    "scenes": [
+      {"text": "First, the setup.",
+       "visuals": [{"type": "image", "src": "/v1/files/shot1.png",
+                    "ken_burns": "in"}]},
+      {"text": "Then the payoff.",
+       "visuals": [{"type": "video", "src": "/v1/files/clip.mp4"}]}
+    ]
+  }' | jq
+# → 202 {"id":"cmp_…","status":"queued"}
+```
+
+### Talking heads and presenters
+
+`POST /v1/video/talking-head` is the one-shot form: a character (a saved profile or an
+explicit portrait) saying one line, lip-synced — it IS a one-scene composition with a
+full-screen presenter, so it runs on exactly the same code. It takes `character` or
+`image`, `text` or `audio`, `voice`, `engine`, `motion` (`still` by default for a preview,
+`generate` or `src` otherwise), `canvas` (720×720@25) and `async`; a preview is capped at
+15 seconds. A `presenter` block on a compose request or scene is the same machinery inside
+a larger composition, laid out `full`, `pip` or `split`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/video/talking-head` | A character saying one line |
+| `GET` | `/v1/video/talking-head/{job_id}` | Job status |
+| `POST` | `/v1/video/talking-head/{job_id}/cancel` | Cancel it |
+| `GET` | `/v1/video/presenter/engines` | Which lip-sync engines are installed (`sadtalker`, `wav2lip`, …) |
+
+A lip-sync engine is an optional install, so ask `/v1/video/presenter/engines` before
+promising a presenter; `engine: "auto"` picks whatever is there.
+
+### Uploading media once
+
+A client that is not on this machine has media of its own: footage, a logo, a music bed.
+Inlining a 40 MB clip as base64 in each of ten renders is exactly the waste that makes an
+API unusable.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/files/upload` | Upload media; returns a `sha256:` id and a `/v1/files/...` URL |
+| `GET` | `/v1/files/blob/{hash}` | Does this content already exist here? (`200`/`404`) |
+
+Storage is content-addressed on the sha256 of the bytes, so re-uploading the same file is
+free and a client can ask before sending. Full detail in
+[`docs/video-compose.md`](docs/video-compose.md).
+
 ## Audio
 
 ### Transcriptions
@@ -1082,6 +1208,78 @@ Supported requested split modes include:
 }
 ```
 
+## Speaker Recognition and Diarization
+
+Diarization answers *who spoke when*; speaker recognition answers *who that is*. They are
+separate models and separate calls, and they compose: enroll a voiceprint once, then ask
+diarization to label the turns with the enrolled names instead of `SPEAKER_00`.
+
+### Diarization
+
+`POST /v1/audio/diarization` (multipart)
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `file` | file | required | The audio |
+| `model` | string/null | config default | Diarization model (pyannote-family) |
+| `num_speakers` | integer/null | `null` | Exact count, when you know it |
+| `min_speakers` / `max_speakers` | integer/null | `null` | Bounds, when you don't |
+| `response_format` | string | `json` | `json` or `verbose_json` |
+| `identify` | boolean | `false` | Relabel each turn with an enrolled speaker name |
+| `identify_backend` | string | `ecapa` | Voiceprint backend: `ecapa` (speechbrain ECAPA-TDNN, ungated, 192-d), `pyannote` (may be gated, uses `HF_TOKEN`), `wespeaker` |
+| `identify_threshold` | float | `0.25` | Cosine similarity below which a turn stays anonymous |
+
+The same work is available inline on transcription: `POST /v1/audio/transcriptions` with
+`diarize=true` (plus `num_speakers`, and `timestamp_granularities` for word timings)
+returns speaker-labelled segments instead of flat text.
+
+### Enrolled speakers
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/audio/speakers` | Enroll a voiceprint (`file`, `name`, `backend`, `model`) |
+| `GET` | `/v1/audio/speakers` | List enrolled speakers |
+| `DELETE` | `/v1/audio/speakers/{name}` | Delete one |
+| `POST` | `/v1/audio/speaker-identify` | Who is this? (`file`, `backend`, `threshold`) → best match or none |
+| `POST` | `/v1/audio/speaker-verify` | Is this `name`? (`file`, `name`, `threshold`) → accept/reject + score |
+| `POST` | `/v1/audio/speaker-embeddings` | The raw voiceprint vector(s) (`file`, `backend`, `model`, `window`, `step`) |
+
+`speaker-embeddings` is the building block: with `window`/`step` it returns a vector per
+window rather than one for the clip, which is what you want for your own clustering. All of
+these run in the isolated pyannote venv and share its worker — and its VRAM-eviction
+registration — with diarization, so enrolling and diarizing do not load two copies.
+
+```bash
+# enroll, then label a meeting's turns with real names
+curl -s "$CODERAI_URL/v1/audio/speakers" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -F "file=@alice.wav" -F "name=alice" | jq
+
+curl -s "$CODERAI_URL/v1/audio/diarization" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -F "file=@meeting.wav" -F "identify=true" -F "identify_threshold=0.3" | jq
+```
+
+An identification below the threshold is reported as unknown rather than as the nearest
+name: a wrong name on a turn is worse than no name.
+
+### Audio engine discovery
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/audio/speech/capabilities` | What a TTS model can steer (`?model=`): emotions, delivery styles, built-in voices, and whether its venv is ready |
+| `GET` | `/v1/audio/clone/engines` | Which cloning engines this install can actually run, and what each needs |
+| `POST` | `/v1/audio/watermark/detect` | `{"audio": "<base64 / data URI / URL>"}` — did this clip come out of this server? |
+
+Ask `speech/capabilities` instead of assuming: the emotion and style vocabularies differ
+per TTS family, and a parameter a model does not support is ignored rather than honoured.
+It answers without loading anything — an already-loaded model is asked directly, otherwise
+the answer is what was remembered from the last load, and `voices_source` says which. It
+also reports `needs_venv` / `env_ready`, so a client can tell "this will answer now" from
+"the first request spends minutes building an isolated venv". Note that
+`/v1/audio/speakers` means something else entirely: enrolled voiceprints for recognition,
+not a TTS model's built-in voices.
+
 ## Embeddings
 
 `POST /v1/embeddings`
@@ -1169,6 +1367,200 @@ curl -s "$CODERAI_URL/v1/embeddings" \
     "encoding_format": "base64"
   }' | jq
 ```
+
+## Reranking
+
+`POST /v1/rerank`
+
+Scores query↔document relevance with a cross-encoder (e.g. `BAAI/bge-reranker-v2-m3`).
+Embeddings retrieve candidates cheaply; a cross-encoder reads the query and the document
+*together* and reorders them. Loaded natively through transformers and VRAM-managed like
+every other model, so it takes part in eviction and thermal gating.
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `model` | string | required | Reranker model id |
+| `query` | string | required | The search query |
+| `documents` | string[] | required | Documents to score |
+| `top_n` | integer/null | `null` | Return only the best N |
+| `return_documents` | boolean/null | `false` | Echo the document text in each result |
+| `max_length` | integer/null | model default | Truncation length for each query+document pair |
+
+```bash
+curl -s "$CODERAI_URL/v1/rerank" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-reranker-v2-m3","query":"who pays the deductible?",
+       "documents":["art. 2054 c.c. …","the policy excess clause …"],
+       "top_n":1,"return_documents":true}' | jq
+```
+
+```json
+{
+  "object": "rerank.result",
+  "model": "bge-reranker-v2-m3",
+  "results": [{"index": 1, "relevance_score": 0.93, "document": "the policy excess clause …"}],
+  "usage": {"total_tokens": 42}
+}
+```
+
+`relevance_score` is the sigmoid of the cross-encoder logit, in `[0, 1]` and monotonic, so
+ranking order is preserved whatever threshold you pick. The response shape mirrors the
+common rerank APIs (Cohere / Jina).
+
+## Retrieval Chunking
+
+`POST /v1/chunk` splits a document into the pieces a retrieval index stores, with the
+document's structure decided **per request** by a named or inline *structure template*.
+
+This is not embedding windowing. Windowing makes one over-long input fit a model's context
+and pools the pieces into one vector; this produces many chunks, each separately indexable,
+each carrying its section, parent and references. Use both: chunk here, then embed each
+chunk.
+
+Length-only chunking cuts an argument wherever the character budget runs out, so a chunk
+can straddle a section boundary and a retrieved passage mixes what the parties alleged with
+what the court held. Sectioning first and length-chunking *inside* each section removes that
+class of error and gives every chunk a label and a recoverable parent.
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `text` | string | required | The document (or use `/v1/chunk/file`) |
+| `chunk_tokens` | integer/null | `800` | Target size in approximated tokens |
+| `overlap_tokens` | integer/null | `120` | Carried tail; `0` = no carry |
+| `chars_per_token` | integer/null | `4` | The approximation divisor; no tokenizer is loaded |
+| `structural` | boolean/null | `true` | `false` = flat length chunking, no sectioning |
+| `structure` | string/object/null | config default | Template name, or an inline template |
+| `extract_refs` | string/object/false | template default | Reference extractor: a name, an inline object, or `false` |
+| `require_text` | boolean/null | `true` | Refuse container bytes (a PDF, an OOXML zip) instead of chunking them |
+| `include_offsets` | boolean/null | `false` | Add char offsets into the normalised source |
+| `min_chunk_chars` | integer/null | template default | Absorb runt chunks below this |
+
+```jsonc
+{
+  "chunks": [
+    {"ord": 0, "text": "…", "n_chars": 2464,
+     "section": "motivazione",              // null when unlabelled
+     "parent": 2,                           // index into "sections", shared by its chunks
+     "norm_refs": ["art.2043 c.c."],
+     "start": 10433, "end": 12897}          // only with include_offsets
+  ],
+  "n_chunks": 37,
+  "sections": [{"parent": 0, "section": "intestazione", "n_chars": 1204}],
+  "structure": "it-legal",                  // the template actually applied
+  "structural_applied": true,               // false = fell back to flat
+  "params": {"chunk_tokens": 800, "overlap_tokens": 120,
+             "chars_per_token": 4, "min_chunk_chars": 0}
+}
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/chunk` | Chunk a document sent as JSON |
+| `POST` | `/v1/chunk/file` | Chunk an uploaded document (same fields as form fields) |
+| `GET` | `/v1/chunk/templates` | The structure templates on offer, with their section labels |
+
+`parent` is the index into `sections`, so a caller can retrieve a chunk and then pull the
+whole section it came from as context.
+
+`require_text` defaults to **on** because a chunker that accepts a PDF or an OOXML
+container embeds garbage the index cannot afterwards distinguish from content: on one
+production corpus 0.59% of chunks held control characters and 0.04% raw OOXML — documents
+whose container was chunked instead of its extracted text. Set it to `false` deliberately,
+or extract the text first. A document over `chunking.max_chars` (8 MB) is a `413`
+`too_large`, and an unknown `structure` name is an error, never a silent fallback to the
+default template: a caller who asked for their own template and silently got someone
+else's sectioning would index the wrong boundaries and never know.
+
+The defaults are a **format, not a preference** — changing `chunk_tokens`,
+`overlap_tokens` or `chars_per_token` moves every chunk boundary, which makes a re-chunked
+index incomparable with the one it replaces.
+
+A pure CPU text operation: token counts are characters divided by `chars_per_token`, so no
+tokenizer is loaded, no model is needed and no GPU or pod is involved. Every image that runs
+coderai serves this, including the light-core ones. Templates, the built-in `it-legal`
+structure and the fidelity tests are in [`docs/chunking.md`](docs/chunking.md).
+
+## Document OCR
+
+`POST /v1/ocr` (multipart) transcribes an image or PDF with a purpose-built OCR engine —
+PaddleOCR, docTR or Surya — returning faithful text plus per-line boxes and layout. Those
+three are **not** vision LLMs. Two document VLMs are available for pages the
+detector-based engines read badly: `engine=olmocr` (olmOCR-2, no boxes at all) and
+`engine=chandra` (asked for layout, so it returns boxes and labelled regions too).
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `file` | file | required | Image or PDF (`files[]` on `/v1/ocr/batch`) |
+| `engine` | string/null | config default | `paddle`, `doctr`, `surya`, `olmocr`, `chandra` |
+| `dpi` | integer/null | config default | PDF rasterisation DPI |
+| `lang` | string/null | `auto` | Document language; omit to let the engine decide |
+| `detect` | string/null | config default | `off`, `layout`, `detector`, `both` |
+| `layout` | boolean/null | config default | Run the layout pass (engines that hold a layout predictor) |
+| `structured` | boolean | `false` | Structured-JSON extraction with a text model |
+| `schema` | string/null | `null` | Extraction schema (a stored name, or inline JSON) |
+| `max_tokens` | integer/null | engine default | Cap on the model's reply for **one page** |
+| `max_continuations` | integer/null | engine default | Resumptions allowed for a page that hits the cap |
+| `native_dpi` | boolean/null | config default | Pass an embedded scan through at *its* resolution |
+| `page_image_format` | string/null | `auto` | `auto`, `png`, `jpeg` |
+| `max_dpi_factor` | float/null | config default | Passthrough ceiling, as a multiple of the target DPI |
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/ocr` | OCR one image or PDF |
+| `POST` | `/v1/ocr/batch` | OCR many files concurrently (`files[]`) |
+| `GET` | `/v1/ocr/engines` | Which OCR engines this install offers, and whether each is ready |
+| `GET` | `/v1/ocr/schemas` | List extraction schemas |
+| `GET` | `/v1/ocr/schemas/{name}` | One schema |
+| `POST` | `/v1/ocr/schemas` | Create or update a user schema |
+| `DELETE` | `/v1/ocr/schemas/{name}` | Delete a user schema |
+
+### A degraded read is not a successful one
+
+A document whose every readable page came back empty is **not** a `200`. The orchestrator
+has already measured ink on those pages, so "no text" is that run failing, not the document
+being blank — and the two are indistinguishable in a `200` whose `text` is empty. A client
+that treats an empty read as an unreadable scan then consumes the document from its queue
+and writes it off; that happened to roughly a thousand documents in one night behind a lost
+engine lease.
+
+So: a document that produced *some* text is still a `200`, with `unread_pages` naming the
+ones it did not read. A document that produced none is `502` with
+`error.type: "ocr_unread"` and the same body. Set `ocr.unread_status` to `0` for the old
+behaviour. On the VLM engines each page's `meta` also carries
+`model_attempts` and `repeat_detected`, which separate a page truncated by a token cap from
+one the model looped on, from one that is genuinely blank — three causes needing opposite
+handling that a short page otherwise reports identically. Full subsystem detail, including throughput and the fleet layout, is in
+[`docs/ocr.md`](docs/ocr.md).
+
+## Moderation
+
+`POST /v1/moderation` screens generated images and video before release — four independent
+checks over an image, or over frames sampled from a video.
+
+| Check | What it answers |
+|---|---|
+| `nsfw` | How explicit the picture is, with the classifier's own label scores passed through |
+| `faces` | Where the faces are, one entry per face per sampled frame |
+| `age` | An age estimate per face, as a point estimate **and** an interval |
+| `face_match` | Whether each face matches a reference set — the consenting performer — by cosine similarity |
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `input` | object[] | required | Items: `{type: "image"\|"video", src, sample_fps?}` |
+| `checks` | string[] | `["nsfw","age","faces"]` | Which checks to run |
+| `face_match` | object/null | `null` | `{reference: [...], threshold, character_profiles: [...]}` |
+| `nsfw_threshold` | float | `0.7` | Score at or above which a frame is flagged |
+
+`GET /v1/moderation/models` reports which moderation models are present and loadable.
+
+**It fails closed.** Every "safe" field in the response — `minor_detected: false`,
+`flagged: false`, `unmatched_faces: 0` — is a statement that a model actually examined the
+content and found nothing. If a model needed for a requested check is missing, broken or
+unsure, the call returns an error or flags for review; it never returns the reassuring value
+by default. The age interval, not the point estimate, is what decisions should be made on: a
+point estimate alone invites treating "19" as settled. See
+[`docs/moderation.md`](docs/moderation.md).
 
 ## Character Profiles
 
@@ -1775,6 +2167,193 @@ Current implementation returns a structured workflow with placeholder stages for
 }
 ```
 
+## Model and Weight Transfer
+
+A rented pod normally downloads its own weights — from Hugging Face, or from a URL — which
+costs nothing here and runs at datacenter speed. Some models have neither: a merge you made
+locally, a file from a host that is gone, weights you are not going to publish. For those
+the only way to get them onto another coderai is to send them.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/models/upload` | Stream weights to a coderai that cannot fetch them itself |
+| `GET` | `/v1/models/uploaded` | Is this file already there, at the right size? (`200`/`404`) |
+| `POST` | `/v1/models/register` | Teach a running instance about models it did not start with |
+| `POST` | `/v1/loras/upload` | Upload adapter weights (content-addressed) |
+| `GET` | `/v1/loras/blob/{hash}` | Does this adapter blob already exist here? |
+| `POST` | `/v1/loras/register` | Serve an uploaded adapter under its own name |
+| `GET` | `/v1/models/history` | Per-model load history and measured VRAM, merged across engines |
+
+```text
+POST /v1/models/upload?name=<file>&model_type=<section>[&alias=][&tar=1]
+     body: the raw file, or a tar stream with tar=1, streamed to disk
+GET  /v1/models/uploaded?name=<file>[&bytes=<n>]
+```
+
+The receiving side writes the bytes into its model directory and registers the entry, so
+the model becomes loadable exactly as if it had been downloaded there. Sending 30 GB is a
+real decision, not a default: coderai resolves a Hugging Face repo id or a URL first and
+uploads only when a model's `source` says `upload`. Ask `/v1/models/uploaded` (or
+`/v1/loras/blob/{hash}`) before sending — re-sending content that is already present is
+the waste these endpoints exist to avoid.
+
+`/v1/models/register` takes one model entry or a list of them, in the same shape
+`models.json` uses, each with a `path` the *receiver* can fetch (a Hugging Face repo id or
+a URL — a local path from another machine means nothing there). Registration is in memory
+only, like a pod's boot seed, because a pod is disposable; it is idempotent, so
+re-registering a known model never disturbs a loaded one. This is what makes a pod an
+extension of the local system rather than a box that answers "not available" for the rest
+of its life whenever a request names a model its owner had not thought of at boot.
+
+`GET /v1/models/history` is where `measured_vram_gb` comes from; see
+[`docs/memory-accounting.md`](docs/memory-accounting.md).
+
+## Test Runs
+
+`POST /v1/models/test`
+
+Placement has a lot of moving parts: a model may be served here, from a URL, or on a RunPod
+pod whose image, weights and adapters each have to resolve. Most of that fails minutes into
+a pod boot, in a log nobody is watching. This runs the smallest real request for the
+model's kind and reports what happened.
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `model` | string | required | The model to exercise |
+| `where` | string | `auto` | `auto`, `local` (ignore remote config), `runpod` (refuse to fall back) |
+
+It goes through the front like any client request, so it exercises the same routing, auth,
+pod provisioning and staging a real request would — a test that simulated the path would
+prove nothing about the path. `where: "runpod"` is the useful one: a pod that is not
+actually reachable then fails the test instead of quietly passing locally.
+
+`GET /v1/models/test/state` reports what this engine currently believes about the models it
+has tested. A few kinds have no honest synthetic input — a face swap needs real faces, stem
+separation needs audio worth separating — and those report a reachability check instead of a
+generation, saying so rather than implying more than was proven.
+
+## Remote GPUs: the Client API
+
+The orchestrator grows and shrinks a pod pool by itself. These endpoints are for a client
+that **knows what is coming** — a batch of a thousand documents — and would otherwise
+discover the pool one cold start at a time. They remove the ramp; they do not replace the
+autoscaler.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/runpod/scale` | Hold N pods warm for a model (a lease) |
+| `GET` | `/v1/runpod/scale/{request_id}` | How a scale request that was still finding capacity ended |
+| `GET` | `/v1/runpod/status` | Fleet status: pools, pods, per-pod state |
+| `GET` | `/v1/runpod/spend` | Spend and live cost |
+| `POST` | `/v1/runpod/release` | Terminate one pod by id |
+| `POST` | `/v1/runpod/repurpose` | Move a rented pod to another pool or image, in place |
+
+`POST /v1/runpod/scale`:
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `model` | string | required | Whose pod pool to scale |
+| `pods` | integer | required | A **floor**: how many to hold ready. `0` releases the lease |
+| `max_pods` | integer/null | `null` | How large the pool may *become* under load; may only narrow the operator's own number |
+| `teardown` | boolean | `false` | Shed the surplus now instead of waiting out `scale_down_after_s` |
+| `gpu_types` | string/string[]/null | `null` | Which cards this lease will accept; may only narrow the model's choice |
+| `allow_other_gpus` | boolean/null | `null` | Whether a fallback card is acceptable |
+| `wait_s` | float/null | config default | How long to block before answering "still finding capacity" |
+
+```bash
+# before a batch
+curl -s "$CODERAI_URL/v1/runpod/scale" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" -H "Content-Type: application/json" \
+  -d '{"model":"my-ocr-model","pods":8,"max_pods":32,"gpu_types":"NVIDIA A40"}' | jq
+# after it
+curl -s "$CODERAI_URL/v1/runpod/scale" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" -H "Content-Type: application/json" \
+  -d '{"model":"my-ocr-model","pods":0,"teardown":true}' | jq
+```
+
+A call that is still finding capacity after `wait_s` answers
+`{"accepted": true, "pending": true, "request_id": "…"}`, and
+`GET /v1/runpod/scale/{request_id}` says how it ended — the provisioning continues either
+way.
+
+These are deliberately **not** admin-scoped, and the guards are what makes that safe: the
+gate is per model (`allow_client_scale`), the number is clamped to the model's `max_pods`,
+`gpu_types` and `max_pods` may only ever narrow the operator's own configuration and die
+with the lease, the lease expires (`client_scale_ttl_s`, default 30 min) so a client that
+dies holding four A40s stops paying for them by itself, and the account's $/hr and spend
+caps still refuse to provision regardless of what is asked. There is deliberately no way
+for a request to change a model's configuration. A pod with requests on it drains rather
+than dying under them. See [`docs/runpod.md`](docs/runpod.md).
+
+## Service and Operational Endpoints
+
+Not in `/openapi.json` (they are registered with `include_in_schema=False`), but part of the
+HTTP surface and the ones an operator actually curls.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Cheap liveness: touches no torch or model state, so it answers the instant the event loop is free |
+| `GET` | `/health` | The same answer at the path stock vLLM uses, because clients hard-code it |
+| `GET` | `/v1/health` | The same answer under the `/v1` prefix |
+| `GET` | `/metrics` | Prometheus exposition |
+| `GET` | `/boot` | What this process did on the way up, with timings |
+| `GET` | `/logs` | This process's own output, from a cursor (`?since=&limit=`) |
+| `GET` | `/coderai/capabilities` | The broker capability document: version, transports, OpenAI-compat matrix, hardware summary |
+
+`/healthz` is how the front's engine supervisor distinguishes a *slow* engine (busy loading
+a model — the event loop may be blocked, so the answer can be late but will come) from a
+*dead* one (connection refused). It must stay trivial, which is why it reports nothing
+useful about models.
+
+`/boot` and `/logs` exist for rented pods, which are the one kind of machine whose logs
+cannot be read from outside: a boot that failed looked exactly like a boot that was merely
+slow, and the provider's log API answered HTTP 400 when we went looking. `/boot` is readable
+the instant the port opens — well before the pod is useful — and includes the container
+script's own phases; `/logs` covers the life after it, and the renting install drains it
+into a file it keeps after the pod is gone. On a pod the bearer token is required for both,
+so neither is a way to read an install's log without one.
+
+`/metrics` is open when `server.metrics_public` is set, and otherwise takes the same light
+credential as the other telemetry endpoints.
+
+## Cluster Endpoints
+
+The mesh between a head node and the machines it treats as engines. Authenticated with the
+shared cluster token, not a user session.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/cluster/state` | This node's aggregate state: models, engines, RPC peers |
+| `GET` | `/cluster/logs` | This node's log, for the head's cluster page |
+| `GET` | `/cluster/rpc-servers` | The llama.cpp RPC endpoints this node exposes |
+| `POST` | `/cluster/model-load` | The head tells this node to load a model |
+| `POST` | `/cluster/model-unload` | The head tells this node to unload one |
+| `POST` | `/cluster/reload-config` | The head tells this node which models it owns |
+
+`reload-config` is the interesting one: entries this node's own catalogue lacks are
+registered in memory on its primary engine, so the head can name a model this node never
+heard of and have it served. See [`docs/cluster.md`](docs/cluster.md).
+
+## Internal Endpoints
+
+The control plane between the front proxy and its engine subprocesses, and between engines
+that share a GPU. A client never calls these; they are documented because an operator
+debugging VRAM contention or a thermal pause will see them in the logs.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/internal/engine-state` | This engine's loaded models, VRAM and queue depth |
+| `POST` | `/internal/evict-vram` | A co-located sibling asks this engine to release VRAM it is holding |
+| `POST` | `/internal/gpu-reserve` | A sibling reserves the card for an exclusive op (so this engine will not load a model and contend with its training VRAM) |
+| `POST` | `/internal/gpu-release` | Lift that reservation |
+| `POST` | `/internal/thermal-pause` | Pause at the next safe point — request entry, or between tokens |
+| `POST` | `/internal/thermal-resume` | Lift the thermal pause once the hardware has cooled |
+| `POST` | `/internal/reload-config` | Re-read `config.json` / `models.json` after an admin edit |
+
+Temperatures are monitored centrally by the front's supervisor, which is why a thermal pause
+arrives as a request rather than being each engine's own decision. See
+[`docs/frontend-engine-split.md`](docs/frontend-engine-split.md).
+
 ## Admin HTML Routes
 
 Admin pages are session-cookie based.
@@ -1793,8 +2372,15 @@ Admin pages are session-cookie based.
 | `GET` | `/chat` | Chat UI | Logged-in |
 | `GET` | `/admin/settings` | Settings page | Admin |
 | `GET` | `/admin/archive` | Archive page | Admin |
+| `GET` | `/admin/tasks` | Tasks page: running jobs, engine tiles, logs | Admin |
+| `GET` | `/admin/cluster` | Cluster page: nodes, pools, reachability | Admin |
+| `GET` | `/admin/runpod` | RunPod page: pools, pods, spend | Admin |
 
 Static assets are mounted under `/static/admin/*`.
+
+These pages are rendered by the **front proxy** (`codai/frontproxy/ui_pages.py`), with
+sessions validated locally, so navigating the dashboard never waits on an engine that is
+busy generating. The engine serves generation; the pages live on the front.
 
 ## Admin API
 
@@ -1835,10 +2421,10 @@ curl -s "$CODERAI_URL/admin/api/tokens" \
 | `GET` | `/admin/api/hf-files` | `repo_id` | List HF repo files |
 | `GET` | `/admin/api/cached-models` | none | Local cache inventory |
 | `GET` | `/admin/api/cache-stats` | none | Disk/cache stats |
-| `DELETE` | `/admin/api/cache` | `cache_type=all|hf|gguf` | Clear cache |
+| `DELETE` | `/admin/api/cache` | `cache_type=all\|hf\|gguf` | Clear cache |
 | `DELETE` | `/admin/api/cached-models/{model_id:path}` | `cache_type` | Delete cached model |
-| `POST` | `/admin/api/model-enable` | `{path|model_id,model_type}` | Enable model in config |
-| `POST` | `/admin/api/model-disable` | `{path|model_id,config_id?}` | Disable model |
+| `POST` | `/admin/api/model-enable` | `{path\|model_id,model_type}` | Enable model in config |
+| `POST` | `/admin/api/model-disable` | `{path\|model_id,config_id?}` | Disable model |
 | `GET` | `/admin/api/model-loaded-status` | none | Loaded model / pool info |
 | `POST` | `/admin/api/model-load` | `{path}` | Load model now |
 | `POST` | `/admin/api/model-unload` | `{path}` | Unload model |
@@ -1904,6 +2490,106 @@ Logged-in users can access profile metadata through admin routes:
 | `GET` | `/admin/api/voices` | List voice profiles |
 | `GET` | `/admin/api/voices/{name}` | Voice detail |
 | `DELETE` | `/admin/api/voices/{name}` | Delete voice |
+
+### Machine, Engines and Tasks
+
+Everything on the dashboard and the tasks page. These take a *light* credential — a session
+cookie or bearer that is present and well-formed — rather than a full round-trip validation
+against the primary engine, because validating there would 401 exactly when an engine is
+busy generating, making the operator's tiles disappear when they most want to see them.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/system-stats` | Host CPU / RAM / disk / temperature |
+| `GET` | `/admin/api/gpu-stats` | Per-GPU utilisation, VRAM and temperature |
+| `GET` | `/admin/api/engines` | Engine nodes: name, health, VRAM, loaded models (the front's own registry) |
+| `POST` | `/admin/api/engines/{eid}/restart` | Restart one engine subprocess |
+| `GET` | `/admin/api/usage` | Requests, errors and time per API key / model / kind — the same numbers `/metrics` exports, as a table |
+| `GET` | `/admin/api/whoami` | Validate the current admin session |
+| `POST` | `/admin/api/batch` | Run several admin API calls in one request |
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/tasks` | Poll running and finished tasks across *all* engines |
+| `POST` | `/admin/api/tasks/{task_id}/cancel` | Cancel a task |
+| `POST` | `/admin/api/tasks/{task_id}/interrupt` | Interrupt a running task |
+| `POST` | `/admin/api/tasks/{task_id}/pause` | Pause it |
+| `POST` | `/admin/api/tasks/{task_id}/resume` | Resume it |
+| `POST` | `/admin/api/tasks/{task_id}/restart` | Restart a training task |
+| `DELETE` | `/admin/api/tasks/{task_id}` | Remove a finished task from the list |
+
+A per-task action has to reach the engine that *owns* the task, not whichever engine is
+primary, or the UI reads "Task not found"; the front routes these rather than proxying them.
+
+### Model Catalogue, Quantization and Engines
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/admin/api/model-add-known` | Add a known-but-not-downloaded reference to `models.json` |
+| `POST` | `/admin/api/model-mark-download` | List a model for later download |
+| `POST` | `/admin/api/model-unmark-download` | Take it off that list |
+| `POST` | `/admin/api/model-free-disk` | Reclaim disk: delete a model's files, keep its config entry |
+| `POST` | `/admin/api/download-cancel-all` | Cancel every active download |
+| `POST` | `/admin/api/model-quantize` | Quantize a model to fast-kernel 4-bit (GPTQ/AWQ) |
+| `GET` | `/admin/api/quantize-capabilities` | Whether GPTQ/AWQ quantization is available here |
+| `GET` | `/admin/api/quantize-status` | Quantization job status |
+| `GET` | `/admin/api/turboquant-info` | TurboQuant backend availability (`builtin` / `library`) |
+| `GET` | `/admin/api/accel-loras` | Cached distill-LoRA files for acceleration |
+| `GET` | `/admin/api/ds4/default-models` | Downloadable ds4 default models |
+| `GET` | `/admin/api/colibri/default-models` | Downloadable colibri default models |
+
+### Optional Subsystems and Isolated Venvs
+
+Several engines need an interpreter of their own. These build, inspect and remove those
+environments from the admin UI instead of leaving an operator to guess why a first request
+took twenty minutes.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/embedder-venvs` | Isolated embedder venv status |
+| `POST` | `/admin/api/embedder-venv-install` | Build one |
+| `POST` | `/admin/api/embedder-venv-remove` | Delete one |
+| `GET` | `/admin/api/lipsync-engines` | Lip-sync engine status |
+| `POST` | `/admin/api/lipsync-engine-install` | Install a lip-sync engine |
+| `POST` | `/admin/api/lipsync-engine-remove` | Remove one |
+| `POST` | `/admin/api/ocr/build-venv` | Build the Paddle / Surya isolated venv |
+| `GET` | `/admin/api/ocr/build-venv/status` | How that build is going |
+| `GET` | `/admin/api/ocr/schemas` | List OCR extraction schemas |
+| `GET` | `/admin/api/ocr/schemas/{name}` | One schema |
+| `POST` | `/admin/api/ocr/schemas` | Create or update a user schema |
+| `DELETE` | `/admin/api/ocr/schemas/{name}` | Delete one |
+
+See [`docs/isolated-worker-environments.md`](docs/isolated-worker-environments.md) for why
+these exist and what `env_ready` means.
+
+### RunPod Administration
+
+The operator's half of the RunPod subsystem; the client-facing half is
+[Remote GPUs: the Client API](#remote-gpus-the-client-api).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/runpod/status` | Account pods and live cost — **the account**, not just this install's pools |
+| `GET` | `/admin/api/runpod/stats` | Pod usage and spend history |
+| `GET` | `/admin/api/runpod/gpu-types` | GPU types and prices |
+| `GET` | `/admin/api/runpod/pod-logs` | A pod's container / engine logs (`?pod_id=&tail=`), plus a console deep-link |
+| `POST` | `/admin/api/runpod/pod-adopt` | Take an unmanaged pod under local management |
+| `POST` | `/admin/api/runpod/pod-release` | Terminate one pod by id, now |
+| `POST` | `/admin/api/runpod/seed-volumes` | Boot one pod per region so each regional volume gets a model's weights once |
+
+`runpod/status` reads the **account**, which is the point: a pool never probes its own pods,
+so a pod killed out of band can otherwise keep a warm floor "satisfied" forever, and a pod
+whose engine died keeps billing with nothing owning it. Reconcile from the account listing.
+
+### Cluster Administration
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/cluster` | Everything this front can send work to, with reachability |
+| `GET` | `/admin/api/cluster/logs` | Tail a cluster node's log |
+
+Front-native: answered from the registry and config without touching an engine, so the
+cluster page renders while every engine is mid-generation.
 
 ## Acceleration and Distillation
 
@@ -2364,134 +3050,300 @@ print(response.choices[0].message.content)
 
 ## Endpoint Index
 
-### Public `/v1` and Discovery
+Every HTTP route the server defines — **257** of them — generated from the
+decorators in `codai/` by [`tools/gen_endpoint_index.py`](tools/gen_endpoint_index.py).
+`Source` names the module(s) that own the route: one owned by `frontproxy/*` is served
+by the torch-free front, one owned by `api/*` by an engine process, and a route listed
+in both is proxied or aggregated by the front (see
+[`docs/frontend-engine-split.md`](docs/frontend-engine-split.md)).
 
-| Method | Path |
-|---|---|
-| `GET` | `/v1/models` |
-| `GET` | `/coderai/capabilities` |
-| `GET` | `/v1/files/{filename}` |
-| `GET` | `/v1/archive` |
-| `DELETE` | `/v1/archive/{filename}` |
-| `POST` | `/v1/chat/completions` |
-| `POST` | `/v1/completions` |
-| `GET` | `/v1/images/progress` |
-| `POST` | `/v1/images/generations` |
-| `POST` | `/v1/images/edits` |
-| `POST` | `/v1/images/inpaint` |
-| `POST` | `/v1/images/upscale` |
-| `POST` | `/v1/images/depth` |
-| `POST` | `/v1/images/segment` |
-| `POST` | `/v1/images/deblur` |
-| `POST` | `/v1/images/unpixelate` |
-| `POST` | `/v1/images/outfit` |
-| `POST` | `/v1/images/faceswap` |
-| `GET` | `/v1/video/progress` |
-| `POST` | `/v1/video/generations` |
-| `POST` | `/v1/video/upscale` |
-| `POST` | `/v1/video/subtitle` |
-| `POST` | `/v1/video/interpolate` |
-| `POST` | `/v1/video/dub` |
-| `POST` | `/v1/audio/transcriptions` |
-| `POST` | `/v1/audio/speech` |
-| `GET` | `/v1/audio/progress` |
-| `POST` | `/v1/audio/generate` |
-| `GET` | `/v1/audio/voices` |
-| `POST` | `/v1/audio/voices` |
-| `GET` | `/v1/audio/voices/{name}` |
-| `PATCH` | `/v1/audio/voices/{name}` |
-| `DELETE` | `/v1/audio/voices/{name}` |
-| `POST` | `/v1/audio/voices/extract` |
-| `POST` | `/v1/audio/clone` |
-| `POST` | `/v1/audio/convert` |
-| `POST` | `/v1/audio/stems` |
-| `POST` | `/v1/audio/cleanup` |
-| `POST` | `/v1/embeddings` |
-| `POST` | `/v1/characters` |
-| `GET` | `/v1/characters` |
-| `GET` | `/v1/characters/{name}` |
-| `PATCH` | `/v1/characters/{name}` |
-| `DELETE` | `/v1/characters/{name}` |
-| `POST` | `/v1/characters/generate` |
-| `POST` | `/v1/characters/extract` |
-| `POST` | `/v1/environments` |
-| `GET` | `/v1/environments` |
-| `GET` | `/v1/environments/{name}` |
-| `PATCH` | `/v1/environments/{name}` |
-| `DELETE` | `/v1/environments/{name}` |
-| `POST` | `/v1/environments/generate` |
-| `POST` | `/v1/environments/extract` |
-| `POST` | `/v1/loras/train` |
-| `GET` | `/v1/loras/progress` |
-| `GET` | `/v1/loras` |
-| `GET` | `/v1/loras/{name}` |
-| `DELETE` | `/v1/loras/{name}` |
-| `POST` | `/v1/images/to3d` |
-| `POST` | `/v1/images/from3d` |
-| `POST` | `/v1/video/to3d` |
-| `POST` | `/v1/video/from3d` |
-| `POST` | `/v1/3d/generate` |
-| `POST` | `/v1/pipelines/image-to-video` |
-| `POST` | `/v1/pipelines/video-dub` |
-| `POST` | `/v1/pipelines/story` |
-| `POST` | `/v1/pipelines/audio-dub` |
-| `GET` | `/v1/pipelines/custom` |
-| `GET` | `/v1/pipelines/step-types` |
-| `POST` | `/v1/pipelines/custom` |
-| `PUT` | `/v1/pipelines/custom/{pipeline_id}` |
-| `DELETE` | `/v1/pipelines/custom/{pipeline_id}` |
-| `POST` | `/v1/pipelines/custom/{pipeline_id}/run` |
-| `POST` | `/v1/pipelines/run` |
-| `POST` | `/v1/pipelines/audio-understand` |
-| `POST` | `/v1/pipelines/audio-music-dub` |
+Routes the code registers with `include_in_schema=False` are **not** in
+`/openapi.json` — the service, cluster and internal groups below are mostly those.
+They are still part of the HTTP surface, which is why they are listed here.
+
+### Public `/v1`
+
+| Method | Path | Purpose | Source |
+|---|---|---|---|
+| `POST` | `/v1/3d/generate` | Generate a 3D model from a prompt | `api/spatial` |
+| `GET` | `/v1/archive` | List archived generations | `api/app` |
+| `DELETE` | `/v1/archive/{filename}` | Delete an archived file | `api/app` |
+| `POST` | `/v1/audio/cleanup` | Clean / restore audio | `api/audio_clean` |
+| `POST` | `/v1/audio/clone` | Clone a voice / synthesize cloned speech | `api/voice_clone` |
+| `GET` | `/v1/audio/clone/engines` | List voice cloning engines | `api/voice_clone` |
+| `POST` | `/v1/audio/convert` | Voice conversion (speech-to-speech) | `api/voice_convert` |
+| `POST` | `/v1/audio/diarization` | Speaker diarization (who spoke when) | `api/transcriptions` |
+| `POST` | `/v1/audio/generate` | Generate audio, music or SFX | `api/audio_gen` |
+| `GET` | `/v1/audio/progress` | Audio generation progress | `api/audio_gen` |
+| `POST` | `/v1/audio/speaker-embeddings` | Extract a speaker embedding (voiceprint) | `api/transcriptions` |
+| `POST` | `/v1/audio/speaker-identify` | Identify the speaker in an audio clip | `api/transcriptions` |
+| `POST` | `/v1/audio/speaker-verify` | Verify a clip against an enrolled speaker | `api/transcriptions` |
+| `GET` | `/v1/audio/speakers` | List enrolled speakers | `api/transcriptions` |
+| `POST` | `/v1/audio/speakers` | Enroll a speaker voiceprint | `api/transcriptions` |
+| `DELETE` | `/v1/audio/speakers/{name}` | Delete an enrolled speaker | `api/transcriptions` |
+| `POST` | `/v1/audio/speech` | Text-to-speech synthesis | `api/tts` |
+| `GET` | `/v1/audio/speech/capabilities` | What a TTS model can steer | `api/tts` |
+| `POST` | `/v1/audio/stems` | Separate audio into stems | `api/audio_stems` |
+| `POST` | `/v1/audio/transcriptions` | Transcribe audio to text | `api/transcriptions` |
+| `GET` | `/v1/audio/voices` | List voice profiles | `api/voice_clone` |
+| `POST` | `/v1/audio/voices` | Create a voice profile | `api/voice_clone` |
+| `POST` | `/v1/audio/voices/extract` | Extract a voice profile from a sample | `api/voice_clone` |
+| `GET` | `/v1/audio/voices/{name}` | Get a voice profile | `api/voice_clone` |
+| `PATCH` | `/v1/audio/voices/{name}` | Update a voice profile | `api/voice_clone` |
+| `DELETE` | `/v1/audio/voices/{name}` | Delete a voice profile | `api/voice_clone` |
+| `POST` | `/v1/audio/watermark/detect` | Detect a coderai audio watermark | `api/voice_clone` |
+| `GET` | `/v1/characters` | List character profiles | `api/characters` |
+| `POST` | `/v1/characters` | Create or replace a character profile | `api/characters` |
+| `POST` | `/v1/characters/extract` | Extract a character from media | `api/characters` |
+| `POST` | `/v1/characters/generate` | Generate character reference images | `api/characters` |
+| `GET` | `/v1/characters/{name}` | Get a character profile | `api/characters` |
+| `PATCH` | `/v1/characters/{name}` | Update a character profile | `api/characters` |
+| `DELETE` | `/v1/characters/{name}` | Delete a character profile | `api/characters` |
+| `POST` | `/v1/chat/completions` | Chat completions | `api/text` |
+| `POST` | `/v1/chunk` | Split a document into retrieval chunks | `api/chunking` |
+| `POST` | `/v1/chunk/file` | Split an uploaded document into chunks | `api/chunking` |
+| `GET` | `/v1/chunk/templates` | List the structure templates on offer | `api/chunking` |
+| `POST` | `/v1/completions` | Legacy text completions | `api/text` |
+| `POST` | `/v1/embeddings` | Create embeddings | `api/embeddings` |
+| `GET` | `/v1/environments` | List environment profiles | `api/environments` |
+| `POST` | `/v1/environments` | Create or replace an environment profile | `api/environments` |
+| `POST` | `/v1/environments/extract` | Extract an environment from media | `api/environments` |
+| `POST` | `/v1/environments/generate` | Generate environment reference images | `api/environments` |
+| `GET` | `/v1/environments/{name}` | Get an environment profile | `api/environments` |
+| `PATCH` | `/v1/environments/{name}` | Update an environment profile | `api/environments` |
+| `DELETE` | `/v1/environments/{name}` | Delete an environment profile | `api/environments` |
+| `GET` | `/v1/files/blob/{hash}` | Check an uploaded file exists | `api/uploads` |
+| `POST` | `/v1/files/upload` | Upload media (content-addressed) | `api/uploads` |
+| `GET` | `/v1/files/{filename}` | Download a generated file | `api/app` |
+| `GET` | `/v1/health` | Liveness alias under the `/v1` prefix | `api/app` |
+| `POST` | `/v1/images/deblur` | Deblur an image | `api/images` |
+| `POST` | `/v1/images/depth` | Estimate a depth map | `api/images` |
+| `POST` | `/v1/images/edits` | Edit an image (instruction / img2img) | `api/images` |
+| `POST` | `/v1/images/faceswap` | Swap faces between images | `api/faceswap` |
+| `POST` | `/v1/images/from3d` | Render a 3D model to an image | `api/spatial` |
+| `POST` | `/v1/images/generations` | Generate images (text-to-image) | `api/images` |
+| `POST` | `/v1/images/inpaint` | Inpaint a masked region | `api/images` |
+| `POST` | `/v1/images/outfit` | Change outfit / clothing | `api/images` |
+| `GET` | `/v1/images/progress` | Image generation progress | `api/images` |
+| `POST` | `/v1/images/segment` | Segment an image | `api/images` |
+| `POST` | `/v1/images/to3d` | Image to 3D model | `api/spatial` |
+| `POST` | `/v1/images/unpixelate` | Restore a pixelated image | `api/images` |
+| `POST` | `/v1/images/upscale` | Upscale an image | `api/images` |
+| `GET` | `/v1/loras` | List registered LoRAs | `api/loras` |
+| `GET` | `/v1/loras/blob/{hash}` | Check an uploaded LoRA blob exists | `api/loras` |
+| `POST` | `/v1/loras/jobs/{job_id}/cancel` | Cancel a training job | `api/loras` |
+| `GET` | `/v1/loras/progress` | LoRA training progress | `api/loras` |
+| `POST` | `/v1/loras/register` | Serve an uploaded adapter under its own name | `api/loras` |
+| `POST` | `/v1/loras/train` | Train a new LoRA | `api/loras` |
+| `POST` | `/v1/loras/upload` | Upload LoRA weights (content-addressed) | `api/loras` |
+| `GET` | `/v1/loras/{name}` | Get a registered LoRA | `api/loras` |
+| `DELETE` | `/v1/loras/{name}` | Delete a registered LoRA | `api/loras` |
+| `GET` | `/v1/models` | List available models | `api/app`, `frontproxy/app`, `system_app` |
+| `GET` | `/v1/models/history` | Model load / eviction history | `api/app`, `frontproxy/app` |
+| `POST` | `/v1/models/register` | Register a model at runtime | `api/models_transfer` |
+| `POST` | `/v1/models/test` | Test run a model where it is configured | `api/model_test` |
+| `GET` | `/v1/models/test/state` | What this engine currently believes | `api/model_test` |
+| `POST` | `/v1/models/upload` | Upload model weights | `api/models_transfer` |
+| `GET` | `/v1/models/uploaded` | Check an uploaded model is present | `api/models_transfer` |
+| `POST` | `/v1/moderation` | Screen images and video before release | `api/moderation` |
+| `GET` | `/v1/moderation/models` | Moderation models and availability | `api/moderation` |
+| `POST` | `/v1/ocr` | OCR an image or PDF with a dedicated OCR engine | `api/ocr` |
+| `POST` | `/v1/ocr/batch` | OCR many images/PDFs concurrently | `api/ocr` |
+| `GET` | `/v1/ocr/engines` | List the OCR engines this install offers | `api/ocr` |
+| `GET` | `/v1/ocr/schemas` | List available extraction schemas | `api/ocr` |
+| `POST` | `/v1/ocr/schemas` | Create or update a user extraction schema | `api/ocr` |
+| `GET` | `/v1/ocr/schemas/{name}` | Get one extraction schema | `api/ocr` |
+| `DELETE` | `/v1/ocr/schemas/{name}` | Delete a user extraction schema | `api/ocr` |
+| `POST` | `/v1/pipelines/audio-dub` | Audio dubbing pipeline | `api/pipelines` |
+| `POST` | `/v1/pipelines/audio-music-dub` | Dub a song into another language | `api/custom_pipelines` |
+| `POST` | `/v1/pipelines/audio-understand` | Transcribe and analyze audio | `api/custom_pipelines` |
+| `GET` | `/v1/pipelines/custom` | List saved custom pipelines | `api/custom_pipelines` |
+| `POST` | `/v1/pipelines/custom` | Create a custom pipeline | `api/custom_pipelines` |
+| `PUT` | `/v1/pipelines/custom/{pipeline_id}` | Update a custom pipeline | `api/custom_pipelines` |
+| `DELETE` | `/v1/pipelines/custom/{pipeline_id}` | Delete a custom pipeline | `api/custom_pipelines` |
+| `POST` | `/v1/pipelines/custom/{pipeline_id}/run` | Run a saved custom pipeline | `api/custom_pipelines` |
+| `POST` | `/v1/pipelines/image-to-video` | Image-to-video pipeline | `api/pipelines` |
+| `POST` | `/v1/pipelines/run` | Run an inline pipeline definition | `api/custom_pipelines` |
+| `GET` | `/v1/pipelines/step-types` | List available pipeline step types | `api/custom_pipelines` |
+| `POST` | `/v1/pipelines/story` | Story pipeline (multi-scene) | `api/pipelines` |
+| `POST` | `/v1/pipelines/video-dub` | Video dubbing pipeline | `api/pipelines` |
+| `POST` | `/v1/rerank` | Rerank documents against a query (cross-encoder) | `api/rerank` |
+| `POST` | `/v1/runpod/release` | Terminate one pod by id | `api/app` |
+| `POST` | `/v1/runpod/repurpose` | Move a rented pod to another pool or image, in place | `api/app` |
+| `POST` | `/v1/runpod/scale` | Ask for warm pods on a model | `api/app` |
+| `GET` | `/v1/runpod/scale/{request_id}` | How a scale request ended | `api/app` |
+| `GET` | `/v1/runpod/spend` | RunPod spend and pod status | `api/app` |
+| `GET` | `/v1/runpod/status` | RunPod fleet status | `api/app` |
+| `GET` | `/v1/video/compose` | List composition jobs | `api/compose` |
+| `POST` | `/v1/video/compose` | Compose a finished video from scenes | `api/compose` |
+| `GET` | `/v1/video/compose/{job_id}` | Composition job status | `api/compose` |
+| `POST` | `/v1/video/compose/{job_id}/cancel` | Cancel a composition job | `api/compose` |
+| `GET` | `/v1/video/compose/{job_id}/log` | A composition job's own log | `api/compose` |
+| `POST` | `/v1/video/dub` | Dub a video | `api/video` |
+| `POST` | `/v1/video/from3d` | Render a 3D model to a video | `api/spatial` |
+| `POST` | `/v1/video/generations` | Generate video | `api/video` |
+| `POST` | `/v1/video/interpolate` | Interpolate video frames | `api/video` |
+| `GET` | `/v1/video/presenter/engines` | Installed lip-sync engines | `api/compose` |
+| `GET` | `/v1/video/progress` | Video generation progress | `api/video` |
+| `POST` | `/v1/video/subtitle` | Subtitle / caption a video | `api/video` |
+| `POST` | `/v1/video/talking-head` | A character saying one line | `api/compose` |
+| `GET` | `/v1/video/talking-head/{job_id}` | Talking-head job status | `api/compose` |
+| `POST` | `/v1/video/talking-head/{job_id}/cancel` | Cancel a talking-head job | `api/compose` |
+| `POST` | `/v1/video/to3d` | Video to 3D model | `api/spatial` |
+| `POST` | `/v1/video/upscale` | Upscale a video | `api/video` |
+
+### Service and operational
+
+| Method | Path | Purpose | Source |
+|---|---|---|---|
+| `GET` | `/boot` | What this process did on the way up, with timings and the container phases | `api/app` |
+| `GET` | `/chat` | Chat / Studio UI | `frontproxy/ui_pages` |
+| `GET` | `/coderai/capabilities` | Server capability document | `api/app` |
+| `GET` | `/favicon.ico` | Favicon | `api/app`, `frontproxy/ui_pages` |
+| `GET` | `/health` | vLLM-compatible liveness alias (clients hard-code this path) | `api/app` |
+| `GET` | `/healthz` | Cheap liveness probe touching no model state; the supervisor polls it | `api/app`, `frontproxy/app`, `system_app` |
+| `GET` | `/login` | Login page | `frontproxy/ui_pages` |
+| `POST` | `/login` | Authenticate admin login | `admin/routes` |
+| `GET` | `/logout` | Log out | `admin/routes` |
+| `GET` | `/logs` | This process's own output from a cursor — the only way to read a pod's log | `api/app` |
+| `GET` | `/metrics` | Prometheus exposition (open when `server.metrics_public`) | `frontproxy/app` |
+
+### Admin HTML
+
+| Method | Path | Purpose | Source |
+|---|---|---|---|
+| `GET` | `/admin` | Dashboard | `frontproxy/ui_pages` |
+| `GET` | `/admin/archive` | Generation archive page | `frontproxy/ui_pages` |
+| `GET` | `/admin/change-password` | Password change page | `frontproxy/ui_pages` |
+| `POST` | `/admin/change-password` | Change admin password | `admin/routes` |
+| `GET` | `/admin/cluster` | Cluster page (nodes, pools, reachability) | `frontproxy/ui_pages` |
+| `GET` | `/admin/models` | Model management page | `frontproxy/ui_pages` |
+| `GET` | `/admin/runpod` | RunPod page (pools, pods, spend) | `frontproxy/ui_pages` |
+| `GET` | `/admin/settings` | Settings page | `frontproxy/ui_pages` |
+| `GET` | `/admin/tasks` | Tasks page (running jobs, engine tiles, logs) | `frontproxy/ui_pages` |
+| `GET` | `/admin/tokens` | API token page | `frontproxy/ui_pages` |
+| `GET` | `/admin/users` | User page | `frontproxy/ui_pages` |
 
 ### Admin API
 
-| Method | Path |
-|---|---|
-| `GET` | `/admin/api/status` |
-| `POST` | `/admin/api/users` |
-| `DELETE` | `/admin/api/users/{user_id}` |
-| `GET` | `/admin/api/tokens` |
-| `POST` | `/admin/api/tokens` |
-| `DELETE` | `/admin/api/tokens/{token_id}` |
-| `GET` | `/admin/api/models` |
-| `POST` | `/admin/api/model-download` |
-| `GET` | `/admin/api/download-stream/{session_id}` |
-| `GET` | `/admin/api/downloads` |
-| `POST` | `/admin/api/download-cancel/{session_id}` |
-| `POST` | `/admin/api/model-upload` |
-| `DELETE` | `/admin/api/models/{model_identifier}` |
-| `GET` | `/admin/api/hf-files` |
-| `GET` | `/admin/api/cached-models` |
-| `GET` | `/admin/api/cache-stats` |
-| `DELETE` | `/admin/api/cache` |
-| `DELETE` | `/admin/api/cached-models/{model_id:path}` |
-| `POST` | `/admin/api/model-enable` |
-| `POST` | `/admin/api/model-disable` |
-| `GET` | `/admin/api/model-loaded-status` |
-| `POST` | `/admin/api/model-load` |
-| `POST` | `/admin/api/model-unload` |
-| `POST` | `/admin/api/model-configure` |
-| `POST` | `/admin/api/system/reload` |
-| `GET` | `/admin/api/settings` |
-| `POST` | `/admin/api/settings` |
-| `GET` | `/admin/api/archive` |
-| `GET` | `/admin/api/archive/{gen_id}` |
-| `DELETE` | `/admin/api/archive/{gen_id}` |
-| `GET` | `/admin/api/archive/{gen_id}/files/{filename}` |
-| `GET` | `/admin/api/archive-settings` |
-| `GET` | `/admin/api/hf-search` |
-| `GET` | `/admin/api/hf-model-files` |
-| `GET` | `/admin/api/hf-model-info` |
-| `GET` | `/admin/api/characters` |
-| `GET` | `/admin/api/characters/{name}` |
-| `GET` | `/admin/api/characters/{name}/thumbnail` |
-| `DELETE` | `/admin/api/characters/{name}` |
-| `GET` | `/admin/api/environments` |
-| `GET` | `/admin/api/environments/{name}` |
-| `GET` | `/admin/api/environments/{name}/thumbnail` |
-| `DELETE` | `/admin/api/environments/{name}` |
-| `GET` | `/admin/api/voices` |
-| `GET` | `/admin/api/voices/{name}` |
-| `DELETE` | `/admin/api/voices/{name}` |
+| Method | Path | Purpose | Source |
+|---|---|---|---|
+| `GET` | `/admin/api/accel-loras` | List cached distill-LoRA files for acceleration | `admin/routes` |
+| `GET` | `/admin/api/accel-presets` | List acceleration / distillation presets | `admin/routes` |
+| `GET` | `/admin/api/archive` | List archived generations | `frontproxy/admin_data` |
+| `GET` | `/admin/api/archive-settings` | Archive retention settings | `frontproxy/admin_data` |
+| `GET` | `/admin/api/archive/{gen_id}` | One archived generation | `frontproxy/admin_data` |
+| `DELETE` | `/admin/api/archive/{gen_id}` | Delete an archived generation | `frontproxy/admin_data` |
+| `GET` | `/admin/api/archive/{gen_id}/files/{filename}` | Fetch one file from an archived generation | `frontproxy/admin_data` |
+| `POST` | `/admin/api/batch` | Run several admin API calls in one request | `frontproxy/app` |
+| `DELETE` | `/admin/api/cache` | Clear the model cache | `admin/routes` |
+| `GET` | `/admin/api/cache-stats` | Model cache statistics | `admin/routes` |
+| `GET` | `/admin/api/cached-models` | List cached models | `admin/routes` |
+| `DELETE` | `/admin/api/cached-models/{model_id:path}` | Evict a cached model | `admin/routes` |
+| `GET` | `/admin/api/characters` | List characters | `admin/routes` |
+| `GET` | `/admin/api/characters/{name}` | Get a character | `admin/routes` |
+| `DELETE` | `/admin/api/characters/{name}` | Delete a character | `admin/routes` |
+| `GET` | `/admin/api/characters/{name}/thumbnail` | Character thumbnail | `admin/routes` |
+| `GET` | `/admin/api/cluster` | Everything this front can send work to, with reachability | `frontproxy/app` |
+| `GET` | `/admin/api/cluster/logs` | Tail a cluster node's log | `frontproxy/app` |
+| `GET` | `/admin/api/colibri/default-models` | List downloadable colibri default models | `admin/routes` |
+| `POST` | `/admin/api/download-cancel-all` | Cancel all active downloads | `admin/routes` |
+| `POST` | `/admin/api/download-cancel/{session_id}` | Cancel a download | `admin/routes` |
+| `GET` | `/admin/api/download-stream/{session_id}` | Stream model download progress | `admin/routes` |
+| `GET` | `/admin/api/downloads` | List active downloads | `admin/routes` |
+| `GET` | `/admin/api/ds4/default-models` | List downloadable ds4 default models | `admin/routes` |
+| `POST` | `/admin/api/embedder-venv-install` | Build an isolated embedder venv | `admin/routes` |
+| `POST` | `/admin/api/embedder-venv-remove` | Delete an isolated embedder venv | `admin/routes` |
+| `GET` | `/admin/api/embedder-venvs` | Isolated embedder venv status | `admin/routes` |
+| `GET` | `/admin/api/engines` | Engine nodes: name, health, VRAM, loaded models (front's own registry) | `frontproxy/app` |
+| `POST` | `/admin/api/engines/{eid}/restart` | Restart one engine subprocess | `frontproxy/app` |
+| `GET` | `/admin/api/environments` | List environments | `admin/routes` |
+| `GET` | `/admin/api/environments/{name}` | Get an environment | `admin/routes` |
+| `DELETE` | `/admin/api/environments/{name}` | Delete an environment | `admin/routes` |
+| `GET` | `/admin/api/environments/{name}/thumbnail` | Environment thumbnail | `admin/routes` |
+| `GET` | `/admin/api/gpu-stats` | Per-GPU utilisation, VRAM and temperature | `frontproxy/app` |
+| `GET` | `/admin/api/hf-files` | List files in a Hugging Face repo | `admin/routes` |
+| `GET` | `/admin/api/hf-model-files` | List Hugging Face model files | `admin/routes` |
+| `GET` | `/admin/api/hf-model-info` | Get Hugging Face model info | `admin/routes` |
+| `GET` | `/admin/api/hf-search` | Search Hugging Face models | `admin/routes` |
+| `POST` | `/admin/api/lipsync-engine-install` | Install a lip-sync engine | `admin/routes` |
+| `POST` | `/admin/api/lipsync-engine-remove` | Remove a lip-sync engine | `admin/routes` |
+| `GET` | `/admin/api/lipsync-engines` | Lip-sync engine status | `admin/routes` |
+| `POST` | `/admin/api/model-add-known` | Register a model in config without downloading | `admin/routes` |
+| `POST` | `/admin/api/model-configure` | Update a model's configuration | `admin/routes` |
+| `POST` | `/admin/api/model-disable` | Disable a model | `admin/routes` |
+| `POST` | `/admin/api/model-download` | Download a model | `admin/routes` |
+| `POST` | `/admin/api/model-enable` | Enable a model | `admin/routes` |
+| `POST` | `/admin/api/model-free-disk` | Delete a model's files but keep its config | `admin/routes` |
+| `POST` | `/admin/api/model-load` | Load a model into memory | `admin/routes`, `frontproxy/app` |
+| `GET` | `/admin/api/model-loaded-status` | Model load status | `admin/routes`, `frontproxy/app` |
+| `POST` | `/admin/api/model-mark-download` | List a model for later download | `admin/routes` |
+| `POST` | `/admin/api/model-quantize` | Quantize a model to fast-kernel 4-bit | `admin/routes` |
+| `POST` | `/admin/api/model-unload` | Unload a model | `admin/routes`, `frontproxy/app` |
+| `POST` | `/admin/api/model-unmark-download` | Remove a model from the download list | `admin/routes` |
+| `POST` | `/admin/api/model-upload` | Upload a model file | `admin/routes` |
+| `GET` | `/admin/api/models` | List configured models | `admin/routes` |
+| `DELETE` | `/admin/api/models/{model_identifier}` | Remove a configured model | `admin/routes` |
+| `POST` | `/admin/api/ocr/build-venv` | Build a Paddle/Surya isolated venv | `admin/routes` |
+| `GET` | `/admin/api/ocr/build-venv/status` | OCR isolated-venv build status | `admin/routes` |
+| `GET` | `/admin/api/ocr/schemas` | List OCR extraction schemas | `admin/routes` |
+| `POST` | `/admin/api/ocr/schemas` | Create/update a user OCR schema | `admin/routes` |
+| `GET` | `/admin/api/ocr/schemas/{name}` | Get one OCR extraction schema | `admin/routes` |
+| `DELETE` | `/admin/api/ocr/schemas/{name}` | Delete a user OCR schema | `admin/routes` |
+| `GET` | `/admin/api/quantize-capabilities` | GPTQ/AWQ quantization availability | `admin/routes` |
+| `GET` | `/admin/api/quantize-status` | Quantization job status | `admin/routes` |
+| `GET` | `/admin/api/runpod/gpu-types` | List RunPod GPU types + prices | `admin/routes` |
+| `POST` | `/admin/api/runpod/pod-adopt` | Take an unmanaged RunPod pod under local management | `admin/routes` |
+| `GET` | `/admin/api/runpod/pod-logs` | Fetch a RunPod pod's container/vLLM logs | `admin/routes` |
+| `POST` | `/admin/api/runpod/pod-release` | Terminate one RunPod pod by id, now | `admin/routes` |
+| `POST` | `/admin/api/runpod/seed-volumes` | Pre-fill a model's regional volumes | `admin/routes` |
+| `GET` | `/admin/api/runpod/stats` | RunPod pod usage + spend stats | `admin/routes` |
+| `GET` | `/admin/api/runpod/status` | RunPod account pods + live cost | `admin/routes` |
+| `GET` | `/admin/api/settings` | Current server settings | `frontproxy/admin_data` |
+| `POST` | `/admin/api/settings` | Update server settings | `admin/routes` |
+| `GET` | `/admin/api/status` | System, model, VRAM, queue and recent-activity status | `frontproxy/app` |
+| `GET` | `/admin/api/system-stats` | Host CPU / RAM / disk / temperature snapshot | `frontproxy/app` |
+| `POST` | `/admin/api/system/reload` | Reload server configuration | `admin/routes` |
+| `GET` | `/admin/api/tasks` | List active and recent tasks | `admin/routes`, `frontproxy/app` |
+| `DELETE` | `/admin/api/tasks/{task_id}` | Remove a finished task | `admin/routes`, `frontproxy/app` |
+| `POST` | `/admin/api/tasks/{task_id}/cancel` | Cancel a task | `admin/routes` |
+| `POST` | `/admin/api/tasks/{task_id}/interrupt` | Interrupt a running task | `admin/routes` |
+| `POST` | `/admin/api/tasks/{task_id}/pause` | Pause a running task | `admin/routes` |
+| `POST` | `/admin/api/tasks/{task_id}/restart` | Restart a training task | `admin/routes` |
+| `POST` | `/admin/api/tasks/{task_id}/resume` | Resume a paused task | `admin/routes` |
+| `GET` | `/admin/api/tokens` | List API tokens | `frontproxy/admin_data` |
+| `POST` | `/admin/api/tokens` | Create an API token | `frontproxy/admin_data` |
+| `PATCH` | `/admin/api/tokens/{token_id}` | Rename / re-scope a token | `frontproxy/admin_data` |
+| `DELETE` | `/admin/api/tokens/{token_id}` | Delete a token | `frontproxy/admin_data` |
+| `GET` | `/admin/api/turboquant-info` | TurboQuant backend availability | `admin/routes` |
+| `GET` | `/admin/api/usage` | Requests, errors and time per API key / model / kind | `frontproxy/app` |
+| `GET` | `/admin/api/users` | List users | `frontproxy/admin_data` |
+| `POST` | `/admin/api/users` | Create a user | `frontproxy/admin_data` |
+| `DELETE` | `/admin/api/users/{user_id}` | Delete a user | `frontproxy/admin_data` |
+| `GET` | `/admin/api/voices` | List voices | `admin/routes` |
+| `GET` | `/admin/api/voices/{name}` | Get a voice | `admin/routes` |
+| `DELETE` | `/admin/api/voices/{name}` | Delete a voice | `admin/routes` |
+| `GET` | `/admin/api/whoami` | Validate the current admin session | `admin/routes` |
+
+### Cluster (node ↔ head)
+
+| Method | Path | Purpose | Source |
+|---|---|---|---|
+| `GET` | `/cluster/logs` | This node's log, for the head's cluster page | `frontproxy/app` |
+| `POST` | `/cluster/model-load` | The head tells this node to load a model | `frontproxy/app` |
+| `POST` | `/cluster/model-unload` | The head tells this node to unload a model | `frontproxy/app` |
+| `POST` | `/cluster/reload-config` | The head tells this node which models it owns | `frontproxy/app` |
+| `GET` | `/cluster/rpc-servers` | The llama.cpp RPC endpoints this node exposes | `frontproxy/app` |
+| `GET` | `/cluster/state` | This node's aggregate state (models, engines, RPC peers) | `frontproxy/app` |
+
+### Internal (front ↔ engine)
+
+| Method | Path | Purpose | Source |
+|---|---|---|---|
+| `GET` | `/internal/engine-state` | This engine's loaded models, VRAM and queue depth | `api/app`, `system_app` |
+| `POST` | `/internal/evict-vram` | A co-located sibling asks this engine to release VRAM | `api/app` |
+| `POST` | `/internal/gpu-release` | Lift a sibling's GPU reservation | `api/app` |
+| `POST` | `/internal/gpu-reserve` | A sibling reserves the card for an exclusive op | `api/app` |
+| `POST` | `/internal/reload-config` | Re-read `config.json` / `models.json` after an admin edit | `api/app`, `system_app` |
+| `POST` | `/internal/thermal-pause` | Front-driven thermal pause at the next safe point | `api/app` |
+| `POST` | `/internal/thermal-resume` | Lift the thermal pause once the hardware cooled | `api/app` |

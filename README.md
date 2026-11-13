@@ -71,13 +71,15 @@ model can be served with far higher concurrency.
 | `k3` | [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) | Kimi-K3 (2.78T params) on **CPU**, streaming trunk + experts from disk in as little as ~8 GB RAM |
 | `kt` | [ktransformers](https://github.com/kvcache-ai/ktransformers) via SGLang | CPU+GPU heterogeneous MoE (DeepSeek / Kimi / Qwen / GLM / MiniMax) |
 | `vllm` | [vLLM](https://github.com/vllm-project/vllm) | continuous batching + paged KV for high aggregate throughput; runs in an isolated venv |
+| `llamasrv` | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s own `llama-server` | the **alternative front end for a GGUF**: speculative decoding and real slots (`-np`), which the in-process bindings cannot reach because the draft-and-verify loop lives in llama.cpp's `common/`. Pin-only; builds the bindings' own tree by default, or a pinned fork |
 | `runpod` | RunPod | a **remote rented GPU** — see below |
 | `host` | a machine you have | a capability image on **your own box** — always-on, or started by command |
 
 CoderAI owns the full lifecycle of each: build, weight download, process supervision,
-health, VRAM co-tenancy and teardown. `ds4`, `kt`, `vllm`, `runpod` and `host` are
-HTTP-proxy backends; `colibri` and `k3` are driven over a native wire protocol. `vllm` also appears as
-a **first-class engine node** on the engines/tasks pages, alongside `nvidia` and `radeon`.
+health, VRAM co-tenancy and teardown. `ds4`, `kt`, `vllm`, `llamasrv`, `runpod` and `host`
+are HTTP-proxy backends; `colibri` and `k3` are driven over a native wire protocol. `vllm`
+and `llamasrv` also appear as **first-class engine nodes** on the engines/tasks pages,
+alongside `nvidia` and `radeon`.
 
 See [`docs/`](docs/) for a per-engine guide.
 
@@ -280,6 +282,34 @@ model has always been one.
 documents in, `relevance_score` per document out. No extra dependency; rerankers are
 registered in the embedding model category.
 
+### Retrieval Chunking
+
+`POST /v1/chunk` splits a document into the pieces a retrieval index stores — and the
+document's **structure is decided per request** by a named or inline template, not baked in.
+
+Length-only chunking cuts an argument wherever the character budget runs out, so a chunk can
+straddle a section boundary and a retrieved passage mixes what the parties alleged with what
+the court held. Sectioning first and length-chunking *inside* each section removes that class
+of error: every chunk carries its `section`, a `parent` index into `sections` so the caller
+can pull the whole section back as context, and extracted `norm_refs`.
+
+It is a pure CPU text operation — token counts are characters over `chars_per_token`, so no
+tokenizer is loaded and no GPU or pod is involved. Every image that runs CoderAI serves it,
+including the light-core ones. `GET /v1/chunk/templates` lists what is on offer;
+`POST /v1/chunk/file` takes an upload instead of JSON.
+
+### Content Moderation
+
+`POST /v1/moderation` screens generated images and video before release: `nsfw`
+(explicitness, with the classifier's own label scores), `faces` (where they are, per sampled
+frame), `age` (a point estimate **and** an interval — the interval is what decisions should
+be made on) and `face_match` (does each face match the consenting performer's references).
+
+**It fails closed.** Every reassuring field — `minor_detected: false`, `flagged: false`,
+`unmatched_faces: 0` — means a model actually looked and found nothing. A model that is
+missing, broken or unsure produces an error or a review flag, never the safe-looking
+default. `GET /v1/moderation/models` says what is present before you depend on it.
+
 ### Document OCR
 
 A dedicated OCR subsystem (`/v1/ocr`) — real OCR engines, **not** a VLM prompted to read,
@@ -475,7 +505,7 @@ That's it. Open `http://127.0.0.1:8776/admin` and log in with `admin` / `admin`.
 **From the published packages (no build):** `docker pull ghcr.io/nextime/coderai:latest` and
 `packaging/linux/run_oci.sh --nvidia -d` on Linux; `CoderAI-Setup-<version>.exe` (Docker Desktop +
 WSL2, NVIDIA) on Windows — see [`docs/install-from-packages.md`](docs/install-from-packages.md)
-for every package (the full image and the nineteen capability images), the plain `docker run`,
+for every package (the full image and the capability images), the plain `docker run`,
 the offline tarball and the Windows notes. The rest of this section is the from-source install.
 
 ### Prerequisites
@@ -642,11 +672,18 @@ The [`docs/`](docs/) directory carries the deep dives — one per engine and sub
 | [`frontend-engine-split.md`](docs/frontend-engine-split.md) | Front proxy, engine subprocesses, routing |
 | [`runpod.md`](docs/runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper |
 | [`remote-execution.md`](docs/remote-execution.md) | Running any model type elsewhere: the capability gateway, per-model placement, weights and adapters on a pod, test runs |
-| [`install-from-packages.md`](docs/install-from-packages.md) | The published images (full + nineteen capability images), Linux and Windows installs, the offline tarball |
+| [`install-from-packages.md`](docs/install-from-packages.md) | The published images (full + one per capability), Linux and Windows installs, the offline tarball |
 | [`cluster.md`](docs/cluster.md) | Several machines as one: cluster nodes as engines, mDNS + shared token, one GGUF over llama.cpp RPC, vLLM/SGLang multi-node, prefix-cache routing, pools, Prometheus, node logs |
 | [`vllm.md`](docs/vllm.md) | vLLM as a first-class engine node |
+| [`llama-server.md`](docs/llama-server.md) | `llama-server` as a backend: drafting and slots for a GGUF, which tree gets built, the architecture gate, the dedicated pod |
 | [`deepseek-ds4.md`](docs/deepseek-ds4.md) · [`glm-colibri.md`](docs/glm-colibri.md) · [`kimi-k3.md`](docs/kimi-k3.md) · [`ktransformers.md`](docs/ktransformers.md) | The native MoE engines |
 | [`ocr.md`](docs/ocr.md) | The OCR subsystem and schema store |
+| [`chunking.md`](docs/chunking.md) | `POST /v1/chunk`: splitting a document for a retrieval index, structure decided per request |
+| [`moderation.md`](docs/moderation.md) | `POST /v1/moderation`: screening images and video before release, and why it fails closed |
+| [`video-compose.md`](docs/video-compose.md) | Scenes → a finished reel: narration timing, captions, presenters, `/v1/files/upload` |
+| [`memory-accounting.md`](docs/memory-accounting.md) | Where `measured_vram_gb` comes from, the host-RAM cap, idle unload |
+| [`isolated-worker-environments.md`](docs/isolated-worker-environments.md) | Engines that need an interpreter of their own, and what `env_ready` means |
+| [`orchestrator-runpod-guide.md`](docs/orchestrator-runpod-guide.md) | Running CoderAI as a **GPU-less** RunPod orchestrator |
 | [`zimage-lora-training.md`](docs/zimage-lora-training.md) | LoRA training |
 | [`expressive-tts.md`](docs/expressive-tts.md) · [`dtype-auto-selection.md`](docs/dtype-auto-selection.md) · [`gguf-process-isolation.md`](docs/gguf-process-isolation.md) | Subsystem notes |
 | [`reverse-proxy-nginx.md`](docs/reverse-proxy-nginx.md) | Deploying behind nginx |
@@ -670,9 +707,16 @@ Server starts on `http://127.0.0.1:8776` by default.
 | URL | Description |
 |---|---|
 | `http://127.0.0.1:8776/admin` | Admin dashboard |
+| `…/admin/models` · `…/admin/tasks` · `…/admin/cluster` · `…/admin/runpod` | Models, running tasks and engine tiles, cluster nodes, rented pods |
+| `…/admin/settings` · `…/admin/tokens` · `…/admin/users` · `…/admin/archive` | Settings, API tokens, users, generation archive |
 | `http://127.0.0.1:8776/chat` | Web Studio (generation UI) |
 | `http://127.0.0.1:8776/v1/*` | OpenAI-compatible API |
-| `http://127.0.0.1:8776/docs` | Interactive API docs |
+| `http://127.0.0.1:8776/docs` · `…/redoc` · `…/openapi.json` | Interactive API docs and the raw schema |
+| `http://127.0.0.1:8776/healthz` | Liveness, touching no model state |
+| `http://127.0.0.1:8776/metrics` | Prometheus exposition |
+
+The full HTTP surface, every route and which process owns it, is in
+[`CODERAI_API_DOCUMENTATION.md`](CODERAI_API_DOCUMENTATION.md#endpoint-index).
 
 Default credentials: `admin` / `admin` (prompted to change on first login).
 
@@ -755,7 +799,8 @@ Other top-level blocks, each with its own tab on the Settings page:
 | Block | Purpose |
 |---|---|
 | `server.engine_specs` / `engines` / `engine_gpus` | The front/engine split — how many engines, which GPU each owns, and their capabilities |
-| `ds4`, `colibri`, `k3`, `ktransformers`, `vllm` | Per-engine enablement, install dirs, model ids and build settings |
+| `ds4`, `colibri`, `k3`, `ktransformers`, `vllm`, `llamasrv` | Per-engine enablement, install dirs, model ids and build settings |
+| `chunking` | Retrieval chunk sizes (a **format**, not a preference), the default structure template and operator-supplied ones — see [`docs/chunking.md`](docs/chunking.md) |
 | `runpod` | RunPod account settings and global cost caps — see [`docs/runpod.md`](docs/runpod.md) |
 | `cluster` | Other installs used as engines (`nodes`), the shared `token`, mDNS `discovery` + `auto_join`, `prefix_affinity`, the `rpc_servers` this machine lends, `advertise_host` — see [`docs/cluster.md`](docs/cluster.md) |
 | `ocr` | OCR engines, DPI, concurrency, detection mode, structured-extraction model and venv paths |
@@ -940,7 +985,54 @@ validated rather than silently replaced. See
 | `POST /v1/ocr` | Transcribe one image or PDF — `engine`, `dpi`, `structured`, `schema`, `detect` |
 | `POST /v1/ocr/batch` | Same, for many files; per-file errors are reported inline |
 | `GET \| POST /v1/ocr/schemas` | List or create structured-extraction schemas |
-| `GET \| PUT \| DELETE /v1/ocr/schemas/{name}` | Read, replace or delete a schema |
+| `GET \| DELETE /v1/ocr/schemas/{name}` | Read or delete a schema (replace by re-`POST`ing the collection) |
+| `GET /v1/ocr/engines` | Which OCR engines this install offers, and whether each is ready |
+
+### Chunking and Moderation
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/chunk` | Split a document into retrieval chunks; structure from a named or inline template |
+| `POST /v1/chunk/file` | Same, for an uploaded document |
+| `GET /v1/chunk/templates` | The structure templates on offer |
+| `POST /v1/moderation` | Screen images/video: `nsfw`, `faces`, `age`, `face_match` — fails closed |
+| `GET /v1/moderation/models` | Which moderation models are present and loadable |
+
+### Models, Weights and Test Runs
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/models/history` | Per-model load history and `measured_vram_gb`, merged across engines |
+| `POST /v1/models/register` | Teach a running instance (or a pod) about models it did not start with |
+| `POST /v1/models/upload` | Stream weights to a CoderAI that cannot fetch them itself |
+| `GET /v1/models/uploaded` | Is that file already there, at the right size? |
+| `POST /v1/models/test` | Smallest real request for a model's kind, **where it is configured to run** (`where: auto\|local\|runpod`) |
+| `GET /v1/models/test/state` | What this engine currently believes about tested models |
+
+### Remote GPUs (client-facing)
+
+For a client that knows a batch is coming and would otherwise discover the pool one cold
+start at a time. Gated per model (`allow_client_scale`), clamped to the model's `max_pods`,
+and the lease expires by itself.
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/runpod/scale` | Hold N pods warm for a model; `pods: 0` releases the lease, `teardown` sheds the surplus now |
+| `GET /v1/runpod/scale/{id}` | How a request that was still finding capacity ended |
+| `GET /v1/runpod/status` | Fleet status |
+| `GET /v1/runpod/spend` | Spend and live cost |
+| `POST /v1/runpod/release` | Terminate one pod by id |
+| `POST /v1/runpod/repurpose` | Move a rented pod to another pool or image, in place |
+
+### Service and Operations
+
+| Endpoint | Description |
+|---|---|
+| `GET /healthz` · `GET /health` · `GET /v1/health` | Liveness, touching no model state (the second is the path stock vLLM uses, because clients hard-code it) |
+| `GET /metrics` | Prometheus exposition (open when `server.metrics_public`) |
+| `GET /boot` | What this process did on the way up, with timings — readable the instant the port opens |
+| `GET /logs` | This process's own output from a cursor; the only way to read a rented pod's log |
+| `GET /coderai/capabilities` | Capability document: version, transports, OpenAI-compat matrix, hardware |
 
 ### LoRA Training
 
