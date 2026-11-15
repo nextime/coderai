@@ -38,7 +38,7 @@ import json
 import os
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -3137,3 +3137,278 @@ async def delete_lora(name: str, _auth=Depends(_require_api_auth)):
     import shutil
     shutil.rmtree(d)
     return {"ok": True, "name": name}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Text (causal-LM) QLoRA
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Its own route rather than a `target: "text"` on the one above. The bodies have
+# almost nothing in common -- that one takes images, a resolution and a frame
+# count; this one takes a JSONL of chat examples -- and one model carrying both
+# would make every field conditional on the target, which is a schema that can
+# no longer tell a client what to send.
+#
+# What IS shared is everything underneath: the job record, the session that
+# survives a client restart, checkpoint resume, the Tasks page, cancellation and
+# the adapter registry. Those are above the diffusion/text split, so a second
+# subsystem would have been a second copy of them.
+
+class TextLoraTrainRequest(BaseModel):
+    """Train a LoRA on a causal LM from a JSONL of chat examples."""
+
+    name: str = Field(..., description="Output adapter name")
+    base_model: str = Field(..., description="Base model: a models.json key, an "
+                                             "HF repo id, or a local path")
+    # One of the two. A path for an install that has the file; an id for a
+    # client that uploaded it from another machine.
+    dataset: Optional[str] = Field(None, description="Server-side path to a JSONL")
+    dataset_id: Optional[str] = Field(None, description="'sha256:…' from "
+                                                        "POST /v1/loras/datasets")
+    #: Field renaming, so a dataset is not regenerated to be trainable. Maps
+    #: canonical name -> the name this file uses.
+    field_map: Optional[Dict[str, str]] = Field(
+        None, description='e.g. {"answer": "response", "weight": "w"}')
+
+    rank: Optional[int] = 16
+    alpha: Optional[int] = None            # None = 2x rank
+    dropout: Optional[float] = 0.05
+    learning_rate: Optional[float] = 1e-4
+    max_len: Optional[int] = 8192
+    accumulation_steps: Optional[int] = 8
+    epochs: Optional[float] = 1.0
+    enable_thinking: Optional[bool] = False
+    seed: Optional[int] = 42
+
+    #: Refuse rather than train on a dataset that turned out much smaller than
+    #: the caller thinks. Skips are legitimate (an example over max_len cannot
+    #: be trained) but a large fraction means the length limit, the template or
+    #: the field mapping is wrong, and "it ran" would hide it.
+    max_skipped_fraction: Optional[float] = 0.05
+    #: Stop after the dataset pass and report what WOULD be trained. The cheap
+    #: half of a run, and the one that catches a bad mask before a pod is rented.
+    dry_run: Optional[bool] = False
+
+    wait: Optional[bool] = False
+    session: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+
+
+@router.post("/v1/loras/datasets", summary="Upload a training dataset (content-addressed)")
+async def upload_text_dataset(request: Request, _auth=Depends(_require_api_auth)):
+    """Stream a JSONL training set into the content-addressed store.
+
+    The body is the file; it is hashed while being written, never held in
+    memory, because these run to hundreds of megabytes. Returns
+    ``{id, bytes, existed}``. The id is the plain sha256 of the file, so a
+    client can compute it locally and ask :func:`text_dataset_info` first
+    rather than send the bytes twice.
+    """
+    from codai.api import text_lora_dataset as tld
+
+    async def _chunks():
+        async for chunk in request.stream():
+            yield chunk
+
+    # Collected into the sync store writer; the stream is consumed once.
+    buf: List[bytes] = []
+    async for chunk in _chunks():
+        buf.append(chunk)
+    if not any(buf):
+        raise HTTPException(status_code=400, detail="empty upload")
+    try:
+        hexd, existed, total = tld.save_dataset_stream(buf)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"could not store dataset: {e}")
+    return {"id": f"sha256:{hexd}", "bytes": total, "existed": existed}
+
+
+@router.get("/v1/loras/datasets/{ident}", summary="Check an uploaded dataset exists")
+async def text_dataset_info(ident: str, _auth=Depends(_require_api_auth)):
+    """Existence check, so a client can skip re-sending a file already here."""
+    from codai.api import text_lora_dataset as tld
+    if not tld.dataset_exists(ident):
+        raise HTTPException(status_code=404, detail="dataset not found")
+    path = tld.dataset_path(ident)
+    return {"id": f"sha256:{tld.dataset_hex(ident)}", "exists": True,
+            "bytes": os.path.getsize(path)}
+
+
+@router.post("/v1/loras/train/text", summary="Train a text (causal-LM) LoRA")
+async def train_text_lora(req: TextLoraTrainRequest,
+                          _auth=Depends(_require_api_auth)):
+    """Train a QLoRA adapter on a causal LM from a JSONL of chat examples.
+
+    Each record carries the messages, the answer to learn, optional character
+    ranges of the answer NOT to learn, and an optional weight that scales the
+    example's loss. See :mod:`codai.api.text_lora_dataset`.
+
+    Returns a ``job_id`` immediately unless ``wait`` is set; poll
+    ``/v1/loras/progress?job=<id>``, or recover it with ``?session=<token>``
+    after a client restart. ``dry_run`` does the dataset pass and reports what
+    would be trained without touching a GPU.
+    """
+    import asyncio
+    import uuid
+    if not req.name or "/" in req.name or ".." in req.name:
+        raise HTTPException(status_code=400, detail="Invalid LoRA name")
+    if not req.base_model:
+        raise HTTPException(status_code=400, detail="base_model is required")
+
+    from codai.api import text_lora_dataset as tld
+    try:
+        dataset_path = tld.resolve_dataset(req.dataset or "", req.dataset_id or "")
+    except tld.DatasetError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    session = req.session or f"sess-{uuid.uuid4().hex[:12]}"
+    req.session = session
+    job_id = f"job-{uuid.uuid4().hex[:12]}"
+    _new_job(job_id, session=session, name=req.name, base_model=req.base_model,
+             target="text", status="queued", active=True, step=0, total=0,
+             message="queued", started_at=time.time(), path=None)
+    _save_job_request(job_id, req)
+
+    if not req.wait:
+        task = asyncio.create_task(_detached_text_train(req, job_id, dataset_path))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return {"ok": True, "async": True, "job_id": job_id, "session": session,
+                "status": "queued"}
+    try:
+        result = await _run_text_train_job(req, job_id, dataset_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LoRA training failed: {e}")
+    return {"ok": True, "job_id": job_id, "session": session, **result}
+
+
+async def _detached_text_train(req: TextLoraTrainRequest, job_id: str,
+                               dataset_path: str) -> None:
+    """Background runner: errors land on the job record, not on a caller."""
+    try:
+        await _run_text_train_job(req, job_id, dataset_path)
+    except TaskCancelled:
+        pass
+    except Exception as e:
+        _update_job(job_id, status="error", active=False, force=True,
+                    message=f"training failed: {e}"[:300])
+
+
+def _text_dataset_pass(req: TextLoraTrainRequest, dataset_path: str, tokenizer):
+    """Encode the dataset and decide whether it is fit to train on.
+
+    Split out from the training so it can run without a GPU (``dry_run``) and
+    be tested: this is where a bad mask, a wrong field name or a too-small
+    length limit shows up, and all three are cheaper to find here than after a
+    pod boots.
+    """
+    from codai.api import text_lora_dataset as tld
+    examples = tld.load_jsonl(dataset_path, field_map=req.field_map or None)
+    encoded, stats = tld.prepare(
+        tokenizer, examples, max_len=int(req.max_len or 8192),
+        enable_thinking=bool(req.enable_thinking))
+    total = stats.examples + len(stats.skipped)
+    if total == 0:
+        raise ValueError(f"{dataset_path} produced no usable examples")
+    frac = len(stats.skipped) / float(total)
+    limit = req.max_skipped_fraction
+    limit = 0.05 if limit is None else float(limit)
+    if frac > limit:
+        # The refusal exists because the alternative is a successful-looking run
+        # on a fraction of the data, which nothing downstream can detect.
+        worst = "; ".join(f"line {s.line}: {s.reason}" for s in stats.skipped[:5])
+        raise ValueError(
+            f"{len(stats.skipped)} of {total} examples were skipped "
+            f"({frac:.1%} > the {limit:.1%} limit). Raise max_skipped_fraction "
+            f"to train anyway, or fix the cause: {worst}")
+    return encoded, stats
+
+
+def _resolve_text_base(base_model: str) -> str:
+    """A loadable path or HF id for the base.
+
+    A models.json key is resolved to its path so the catalogue's copy is used
+    rather than a second download of the same weights into a different cache.
+    """
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(base_model) or {}
+        path = str(entry.get("path") or "").strip()
+        if path:
+            return os.path.expanduser(path)
+    except Exception:
+        pass
+    return base_model
+
+
+async def _run_text_train_job(req: TextLoraTrainRequest, job_id: str,
+                              dataset_path: str) -> dict:
+    """Admitted through the scheduler like any other GPU work, then run in a
+    thread: the training loop is blocking and must not sit on the event loop."""
+    import asyncio
+    _update_job(job_id, status="preparing", message="reading the dataset")
+    return await asyncio.to_thread(_text_train_blocking, req, job_id, dataset_path)
+
+
+def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
+                         dataset_path: str) -> dict:
+    """The dataset pass, then (unless dry_run) the QLoRA run itself.
+
+    ``_active_job_id`` is set for the duration so the shared
+    :func:`_check_train_cancel` applies here too -- which is what makes the
+    Tasks page's cancel AND pause work on a text job without a second
+    mechanism that would drift from the first.
+    """
+    global _active_job_id
+    from codai.api import text_lora_trainer as tlt
+    from transformers import AutoTokenizer
+
+    _active_job_id = job_id
+
+    base = _resolve_text_base(req.base_model)
+    tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
+
+    encoded, stats = _text_dataset_pass(req, dataset_path, tokenizer)
+    summary = {"examples": stats.examples, "skipped": len(stats.skipped),
+               "trained_tokens": stats.trained_tokens,
+               "masked_tokens": stats.masked_tokens}
+    _update_job(job_id, total=stats.examples,
+                message=f"prepared: {stats.describe()}")
+    print(f"[text-lora] {job_id}: {stats.describe()}", flush=True)
+    for s in stats.skipped[:20]:
+        print(f"[text-lora] skipped line {s.line}: {s.reason}", flush=True)
+
+    if req.dry_run:
+        _update_job(job_id, status="done", active=False, force=True,
+                    message=f"dry run: {stats.describe()}")
+        return {"dry_run": True, **summary}
+
+    st = tlt.QLoraSettings(
+        rank=int(req.rank or 16),
+        alpha=int(req.alpha or (2 * int(req.rank or 16))),
+        dropout=float(req.dropout if req.dropout is not None else 0.05),
+        learning_rate=float(req.learning_rate or 1e-4),
+        max_len=int(req.max_len or 8192),
+        accumulation_steps=int(req.accumulation_steps or 8),
+        enable_thinking=bool(req.enable_thinking),
+        seed=int(req.seed or 42))
+
+    out_dir = os.path.join(_loras_dir(), req.name)
+    try:
+        result = tlt.run_training(
+            base=base, encoded=encoded, settings=st, out_dir=out_dir,
+            on_progress=lambda **kw: _update_job(job_id, **kw),
+            # The shared per-step hook: raises TaskCancelled on a cancel and
+            # blocks while paused, exactly as the diffusion trainer does.
+            check=_check_train_cancel)
+    except TaskCancelled:
+        _update_job(job_id, status="cancelled", active=False, force=True,
+                    message="cancelled; the checkpoint is kept")
+        raise
+    finally:
+        _active_job_id = None
+    _update_job(job_id, status="done", active=False, force=True,
+                path=out_dir, message=f"saved {req.name}")
+    return {**summary, **result, "path": out_dir, "name": req.name}

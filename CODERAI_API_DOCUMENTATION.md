@@ -2207,6 +2207,105 @@ Current implementation returns a structured workflow with placeholder stages for
 }
 ```
 
+## Text LoRA Training
+
+`POST /v1/loras/train/text` trains a QLoRA adapter on a causal LM from a JSONL of chat
+examples. A sibling of `/v1/loras/train` rather than a target on it: that one takes images,
+a resolution and a frame count, and one body carrying both would make every field
+conditional on the target — a schema that can no longer tell a client what to send.
+
+Everything beneath the route is shared: the job record, the session that survives a client
+restart, checkpoint resume, cancel and pause through the Tasks page, and the adapter
+registry the serving pool reads.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/loras/train/text` | Start a job; returns a `job_id` unless `wait` is set |
+| `POST` | `/v1/loras/datasets` | Stream a JSONL into the content-addressed store |
+| `GET` | `/v1/loras/datasets/{id}` | Is this dataset already here? (`200`/`404`) |
+| `GET` | `/v1/loras/progress` | `?job=` or `?session=` — the same endpoint the diffusion trainer uses |
+
+### The dataset
+
+One JSON object per line:
+
+```json
+{"messages": [{"role": "system", "content": "…"}, {"role": "user", "content": "…"}],
+ "answer": "the text to learn",
+ "mask": [[12, 40]],
+ "weight": 0.3333}
+```
+
+`messages` is rendered with the base's chat template and `add_generation_prompt=true`, so
+training sees the string inference will see. **The loss is on `answer` only** — every prompt
+position is ignored, because the prompt is given at inference and learning to produce it
+spends the budget on the wrong tokens.
+
+`mask` holds **half-open character ranges** of `answer` *not* to learn — `[start, end)`,
+exactly a Python slice. They are mapped onto tokens after tokenization, and a token
+overlapping a range at all leaves the loss: over-excluding costs a little signal, while
+under-excluding costs the thing the mask was for. This is what a dataset uses to carry
+passages it could not verify, or a field that came from the wrong source, without having to
+cut them out of the text.
+
+`weight` **scales** the example's loss and never duplicates the example. A weight says what
+a lesson is worth, so a 40-token answer and a 4000-token one with the same weight count the
+same; duplicating to weight multiplies GPU hours for one lesson and cannot express 2.5 at
+all. A weight of `0` drops the example.
+
+`field_map` renames fields at load time (`{"answer": "response", "weight": "w"}`), so a
+dataset whose keys are called something else is not regenerated to be trainable — and a
+renaming pass over hundreds of megabytes is a chance to corrupt it.
+
+### Request fields
+
+| Field | Type | Default | Description |
+|---|---:|---:|---|
+| `name` | string | required | The adapter's name in the registry |
+| `base_model` | string | required | A models.json key, an HF repo id, or a path |
+| `dataset` / `dataset_id` | string | one required | A server path, or a `sha256:…` from the store |
+| `field_map` | object | `null` | Canonical field name → the name this file uses |
+| `rank` / `alpha` / `dropout` | int/int/float | `16` / `2×rank` / `0.05` | LoRA shape |
+| `learning_rate` | float | `1e-4` | |
+| `max_len` | int | `8192` | Sequence limit; a longer example is skipped |
+| `accumulation_steps` | int | `8` | The batch is made by accumulation, not padding |
+| `enable_thinking` | boolean | `false` | Passed to the chat template |
+| `max_skipped_fraction` | float | `0.05` | Refuse if more than this was skipped |
+| `dry_run` | boolean | `false` | Do the dataset pass, report, touch no GPU |
+
+### What it refuses, and why
+
+**More skips than `max_skipped_fraction`.** Skips are legitimate — an example over `max_len`
+cannot be trained — but a large fraction means the length limit, the chat template or the
+field names are wrong. Training anyway succeeds on a fraction of the data, and nothing
+downstream can detect that; the refusal names the first offenders so the cause is findable.
+Raise the fraction to proceed deliberately.
+
+**A mask range past the end of its answer**, rather than clamping it: the range was computed
+against different text, and clamping would mask the wrong characters silently.
+
+**An answer whose every token is masked.** The trailing end-of-text is still a trainable
+position, so such an example teaches exactly one thing — stop immediately after the prompt —
+which is how a model learns to answer with nothing.
+
+Over-long examples are **skipped, never truncated**: truncating the answer teaches a cut-off
+answer, and truncating the prompt teaches against a prompt inference will not send. Every
+skip is reported with its line and reason.
+
+### What is adapted
+
+Rank-16 adapters on the **language** projections only — attention and MLP. On a multimodal
+base the vision tower, the audio tower and the projector are left alone: a text LoRA that
+adapts them spends rank on an encoder that sees no images during training and degrades what
+the base already did well. Targets are chosen by **full module name**, because the usual
+suffix list (`["q_proj", …]`) matches the same names inside a vision encoder, and "text only"
+then silently becomes "everything". The count adapted and the count skipped are logged.
+
+The base loads in 4-bit NF4 with bf16 compute and double quantization, gradient checkpointing
+on, `use_cache` off. One example per forward — at 8192 tokens a 27B 4-bit base has no room
+for a padded batch — so the batch is accumulation, which also means no padding tokens exist
+to be masked wrongly.
+
 ## Model and Weight Transfer
 
 A rented pod normally downloads its own weights — from Hugging Face, or from a URL — which
@@ -3090,7 +3189,7 @@ print(response.choices[0].message.content)
 
 ## Endpoint Index
 
-Every HTTP route the server defines — **257** of them — generated from the
+Every HTTP route the server defines — **260** of them — generated from the
 decorators in `codai/` by [`tools/gen_endpoint_index.py`](tools/gen_endpoint_index.py).
 `Source` names the module(s) that own the route: one owned by `frontproxy/*` is served
 by the torch-free front, one owned by `api/*` by an engine process, and a route listed
@@ -3171,10 +3270,13 @@ They are still part of the HTTP surface, which is why they are listed here.
 | `POST` | `/v1/images/upscale` | Upscale an image | `api/images` |
 | `GET` | `/v1/loras` | List registered LoRAs | `api/loras` |
 | `GET` | `/v1/loras/blob/{hash}` | Check an uploaded LoRA blob exists | `api/loras` |
+| `POST` | `/v1/loras/datasets` | Upload a training dataset (content-addressed) | `api/loras` |
+| `GET` | `/v1/loras/datasets/{ident}` | Check an uploaded dataset exists | `api/loras` |
 | `POST` | `/v1/loras/jobs/{job_id}/cancel` | Cancel a training job | `api/loras` |
 | `GET` | `/v1/loras/progress` | LoRA training progress | `api/loras` |
 | `POST` | `/v1/loras/register` | Serve an uploaded adapter under its own name | `api/loras` |
 | `POST` | `/v1/loras/train` | Train a new LoRA | `api/loras` |
+| `POST` | `/v1/loras/train/text` | Train a text (causal-LM) LoRA | `api/loras` |
 | `POST` | `/v1/loras/upload` | Upload LoRA weights (content-addressed) | `api/loras` |
 | `GET` | `/v1/loras/{name}` | Get a registered LoRA | `api/loras` |
 | `DELETE` | `/v1/loras/{name}` | Delete a registered LoRA | `api/loras` |

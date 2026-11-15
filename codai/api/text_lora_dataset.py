@@ -333,3 +333,118 @@ def prepare(tokenizer, examples: Iterable[Example], *, max_len: int = 8192,
         st.masked_tokens += enc.n_masked
         st.weight_sum += enc.weight
     return out, st
+
+
+# --------------------------------------------------------------------------- #
+# the dataset store
+# --------------------------------------------------------------------------- #
+#
+# Content-addressed, like the adapter blobs, and for the same reason: a client
+# that already sent a 119 MB JSONL must not send it again, and it can compute
+# the id itself (plain sha256 of the file) to ask before uploading.
+#
+# Separate from the adapter store on purpose. That one names its files
+# ``<hash>.safetensors`` and unpacks tars, because what it holds is weights; a
+# training set stored there would be a JSONL called .safetensors, which is the
+# kind of small lie that costs someone an afternoon.
+#
+# Streamed to disk while hashing, never read whole: these files run to hundreds
+# of megabytes and the point of a store is that the server does not need them in
+# memory to accept them.
+
+def dataset_dir() -> str:
+    import os as _os
+    from codai.api.loras import _loras_dir
+    d = _os.path.join(_loras_dir(), "_datasets")
+    _os.makedirs(d, exist_ok=True)
+    return d
+
+
+def dataset_hex(ident: str) -> str:
+    """The bare lowercase hex of a dataset id (accepts an optional 'sha256:')."""
+    ident = (ident or "").strip()
+    if ident.lower().startswith("sha256:"):
+        ident = ident[7:]
+    ident = ident.lower()
+    if not re_fullmatch_hex(ident):
+        raise DatasetError(f"not a sha256 id: {ident!r}")
+    return ident
+
+
+def re_fullmatch_hex(s: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[0-9a-f]{64}", s or ""))
+
+
+def dataset_path(ident: str) -> str:
+    """Where a dataset with this id lives, whether or not it is there yet."""
+    import os as _os
+    return _os.path.join(dataset_dir(), f"{dataset_hex(ident)}.jsonl")
+
+
+def dataset_exists(ident: str) -> bool:
+    import os as _os
+    try:
+        return _os.path.isfile(dataset_path(ident))
+    except DatasetError:
+        return False
+
+
+def save_dataset_stream(chunks: Iterable[bytes]) -> Tuple[str, bool, int]:
+    """Stream a dataset into the store. Returns ``(hex, existed, bytes)``.
+
+    Written to a temp file and renamed only once the whole body has arrived, so
+    a connection that drops at 80 MB leaves nothing a later run can mistake for
+    a complete dataset. The id is the sha256 of the bytes as sent, which is what
+    a client can compute locally to skip the upload entirely.
+    """
+    import hashlib
+    import os as _os
+    import tempfile
+    h = hashlib.sha256()
+    total = 0
+    fd, tmp = tempfile.mkstemp(dir=dataset_dir(), suffix=".part")
+    try:
+        with _os.fdopen(fd, "wb") as fh:
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                h.update(chunk)
+                fh.write(chunk)
+                total += len(chunk)
+        hexd = h.hexdigest()
+        final = _os.path.join(dataset_dir(), f"{hexd}.jsonl")
+        if _os.path.isfile(final):
+            _os.unlink(tmp)
+            return hexd, True, total
+        _os.replace(tmp, final)
+        return hexd, False, total
+    except BaseException:
+        try:
+            _os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def resolve_dataset(dataset: str = "", dataset_id: str = "") -> str:
+    """A local path for either form, or raise with what is wrong.
+
+    Two ways in because they answer different situations: a path for an install
+    that already has the file on disk, an id for a client on another machine
+    that uploaded it.
+    """
+    import os as _os
+    if dataset_id:
+        path = dataset_path(dataset_id)
+        if not _os.path.isfile(path):
+            raise DatasetError(
+                f"dataset {dataset_id} is not in the store — upload it to "
+                f"POST /v1/loras/datasets first")
+        return path
+    ds = _os.path.expanduser((dataset or "").strip())
+    if not ds:
+        raise DatasetError("one of 'dataset' (a path) or 'dataset_id' is required")
+    if not _os.path.isfile(ds):
+        raise DatasetError(f"dataset file not found: {ds}")
+    return ds

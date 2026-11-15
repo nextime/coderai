@@ -270,3 +270,140 @@ def load_progress(directory: str) -> Progress:
         return Progress()
     known = {f.name for f in dataclasses.fields(Progress)}
     return Progress(**{k: v for k, v in data.items() if k in known})
+
+
+# --------------------------------------------------------------------------- #
+# the run
+# --------------------------------------------------------------------------- #
+
+def load_base_and_adapter(base: str, settings: QLoraSettings):
+    """The 4-bit base with a LoRA on its language projections.
+
+    Returns ``(peft_model, selection_line)``. Separated from the loop so the
+    loop can be exercised against a small real model, and so a failure to load
+    says which half failed.
+    """
+    import torch
+    from peft import get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base, quantization_config=bnb_config(settings),
+        dtype=getattr(torch, settings.compute_dtype),
+        device_map="auto", trust_remote_code=True)
+    model = prepare_model_for_kbit_training(model)
+    # Gradient checkpointing: a 27B base at 8192 tokens does not otherwise fit
+    # alongside its activations on one card, and recomputation is cheaper than
+    # the OOM it avoids.
+    model.config.use_cache = False
+    try:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+    except Exception:
+        pass
+
+    linears = linear_module_names(model)
+    targets = select_target_modules(linears)
+    if not targets:
+        raise RuntimeError(
+            f"no language projections found to adapt in {base!r}: "
+            f"{len(linears)} linear modules, none matching "
+            f"{', '.join(LANGUAGE_SUFFIXES[:4])}… — this base names its layers "
+            "differently and needs an explicit target list")
+    line = describe_selection(linears, targets)
+    print(f"[text-lora] {line}", flush=True)
+    peft_model = get_peft_model(model, lora_config(settings, targets))
+    try:
+        peft_model.print_trainable_parameters()
+    except Exception:
+        pass
+    return peft_model, line
+
+
+def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
+                 out_dir: str, on_progress=None, check=None,
+                 resume: bool = True) -> Dict[str, Any]:
+    """Train the adapter and save it. Returns a summary.
+
+    One example per forward: these sequences reach 8192 tokens and a 27B 4-bit
+    base has no room for a padded batch, so the batch is made by ACCUMULATION
+    rather than by padding. That also means no padding tokens exist to be
+    masked wrongly, and an example's loss is exactly its own.
+    """
+    import random
+
+    import torch
+
+    random.seed(settings.seed)
+    torch.manual_seed(settings.seed)
+
+    model, _line = load_base_and_adapter(base, settings)
+    progress = load_progress(out_dir) if resume else Progress()
+    if progress.step:
+        print(f"[text-lora] resuming from step {progress.step} "
+              f"({progress.examples_seen} examples already seen)", flush=True)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=settings.learning_rate)
+
+    order = list(range(len(encoded)))
+    random.Random(settings.seed).shuffle(order)
+    # Resume skips what was already seen rather than re-teaching it first: the
+    # order is seeded, so "already seen" means the same examples on every run.
+    order = order[progress.examples_seen:]
+
+    accum = max(1, int(settings.accumulation_steps))
+    losses: List[float] = []
+    model.train()
+    for i, idx in enumerate(order, 1):
+        if check is not None:
+            check()
+        ex = encoded[idx]
+        ids = torch.tensor([ex.input_ids], device=model.device)
+        labels = torch.tensor([ex.labels], device=model.device)
+
+        def _one():
+            out = model(input_ids=ids)
+            return scaled_backward(out.logits, labels, ex.weight, accum)
+
+        try:
+            loss = step_with_oom_guard(
+                _one, on_skip=lambda e: print(
+                    f"[text-lora] example (line {ex.line}, {len(ex.input_ids)} "
+                    f"tokens) did not fit; skipped", flush=True))
+        except OomSkipped:
+            progress.skipped_oom += 1
+            continue
+
+        losses.append(loss)
+        progress.examples_seen += 1
+        progress.loss_ema = (loss if progress.loss_ema is None
+                             else 0.98 * progress.loss_ema + 0.02 * loss)
+
+        if i % accum == 0:
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            progress.step += 1
+            if on_progress is not None and progress.step % 5 == 0:
+                on_progress(step=progress.step, status="training",
+                            message=(f"step {progress.step}, loss "
+                                     f"{progress.loss_ema:.4f}"))
+            # Checkpointed on a step boundary, so what is saved is a state the
+            # optimizer agreed with rather than a half-accumulated one.
+            if progress.step % 50 == 0:
+                save_checkpoint(out_dir, model, progress)
+
+    # Flush a partial accumulation: dropping it would silently discard the last
+    # few examples of every run, and of every shard in a distributed one.
+    if len(losses) % accum:
+        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        progress.step += 1
+
+    save_checkpoint(out_dir, model, progress)
+    mean = sum(losses) / len(losses) if losses else None
+    return {"steps": progress.step, "examples_trained": len(losses),
+            "skipped_oom": progress.skipped_oom,
+            "mean_loss": mean, "final_loss_ema": progress.loss_ema}
