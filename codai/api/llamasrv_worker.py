@@ -592,9 +592,24 @@ def ensure_service(cfg, model_file: Optional[str] = None,
         shown = " ".join("***" if i and cmd[i - 1] == "--api-key" else c
                          for i, c in enumerate(cmd))
         print(f"[llamasrv] launching: {shown}{note}", flush=True)
+        # PR_SET_PDEATHSIG: the kernel kills this server if the engine that owns
+        # it dies. VRAM eviction works through the owning engine -- it stops the
+        # service and the subprocess frees the card -- so an engine that is
+        # SIGKILLed (OOM killer, crash, `pkill`) would otherwise leave a
+        # llama-server holding the whole model's VRAM with nothing left that
+        # knows how to evict it, and the next load OOMs against a ghost.
+        # atexit covers a clean exit; only this covers the unclean one.
+        def _die_with_parent():
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 9)  # PR_SET_PDEATHSIG, SIGKILL
+            except Exception:
+                pass
+
         proc = subprocess.Popen(cmd, cwd=str(_install_dir(cfg)),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, env=env)
+                                text=True, bufsize=1, env=env,
+                                preexec_fn=_die_with_parent)
         tail = collections.deque(maxlen=20)
         threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()
         _services[svc_key] = {"proc": proc, "port": port, "url": url, "key": key}
@@ -620,11 +635,26 @@ def ensure_service(cfg, model_file: Optional[str] = None,
                        f"{timeout:.0f}s" + _tail_msg())
 
 
-def stop_service(svc_key: str) -> None:
+def stop_service(svc_key: str) -> bool:
+    """Stop the server for ``svc_key``; True if one was running.
+
+    This is the VRAM eviction path. The manager evicts a llamasrv-served model
+    by dropping the backend and calling its ``cleanup()``, which lands here, and
+    the card is only free once this process is GONE -- not once it has been
+    signalled. So the wait after kill is not a courtesy: eviction measures what
+    it freed and the next load starts immediately after, and both would race a
+    process that is still dying with the weights still mapped.
+    """
     with _lock:
         svc = _services.pop(svc_key, None)
     if not svc:
-        return
+        # Not nothing-to-do: the caller believes it evicted a model. A key that
+        # matches no service means the VRAM is still held by a server nobody is
+        # now tracking, which is worth a line in the log rather than silence.
+        if _services:
+            print(f"[llamasrv] stop_service({svc_key!r}) matched no running server; "
+                  f"running: {sorted(_services)}", flush=True)
+        return False
     proc = svc["proc"]
     if proc.poll() is None:
         try:
@@ -635,9 +665,17 @@ def stop_service(svc_key: str) -> None:
     if proc.poll() is None:
         try:
             proc.kill()
+            # Wait for the kill, too. Returning here with the process still
+            # dying is what makes an eviction look like it freed nothing.
+            proc.wait(timeout=10)
         except Exception:
             pass
+    if proc.poll() is None:
+        print(f"[llamasrv] WARNING: server for {os.path.basename(svc_key)} did not exit; "
+              "its VRAM is still held", flush=True)
+        return False
     print(f"[llamasrv] server for {os.path.basename(svc_key)} stopped", flush=True)
+    return True
 
 
 def stop_all() -> None:

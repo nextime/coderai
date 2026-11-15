@@ -170,6 +170,40 @@ would claim a target the image was not compiled for. Only the run-time settings 
 worker where its binary is through `CODERAI_LLAMASRV_BIN`; if that path is wrong the pod
 says so instead of failing later inside cmake.
 
+## VRAM eviction
+
+A `llama-server` holds the whole model in a **child process**, so it is the one engine whose
+VRAM coderai cannot free by dropping an object. It takes part in eviction anyway, through
+the same path as everything else and with no special case in the manager:
+
+```
+ensure_vram_for()        before the load, like any model: resident models are evicted
+                         (and co-located sibling engines asked) to make room first
+record_vram_delta()      after it: the footprint is the device's free-VRAM delta across
+                         the load, which sees a subprocess exactly as it sees tensors
+_evict_one()             later: drops the backend and calls cleanup() …
+  -> cleanup()           … which stops this model's server, and the card is free
+```
+
+Three properties make that honest rather than approximate:
+
+- **The card is free when the process is gone, not when it has been signalled.** `terminate`
+  is waited for, and so is `kill`. Returning in between is what makes an eviction appear to
+  free nothing — the manager measures no change, loads the next model anyway, and OOMs
+  against weights that are still mapped.
+- **A stop that matched nothing says so.** The service key includes the engine, and a key
+  that matches no running server means the VRAM is still held by something nobody is
+  tracking. That is logged, and `stop_service` returns `False`, instead of looking like
+  success.
+- **The server dies with its engine.** `PR_SET_PDEATHSIG` is set on the child, so an engine
+  that is SIGKILLed — the OOM killer, a crash, a stray `pkill` — does not leave a
+  `llama-server` holding a 16 GB model with nothing left that knows how to evict it. `atexit`
+  covers the clean exit; only this covers the unclean one.
+
+Because the footprint is measured from the device rather than from inside the process, an
+idle llamasrv model is as evictable as an idle in-process one, and a GGUF served through the
+server competes for the card on equal terms with a diffusers pipeline or a vLLM instance.
+
 ## Two engines: stock and a fork
 
 `llamasrv` runs **stock** llama.cpp's `llama-server`. `llamasrv_fork` runs the same server
@@ -269,14 +303,20 @@ docker run --rm -v $DIR:/work nvidia/cuda:12.6.3-devel-ubuntu24.04 bash -c '
   apt-get update -qq && apt-get install -y -qq cmake build-essential libcurl4-openssl-dev
   cmake -S /work/src -B /work/build -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+    -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \\
+    -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda"
   cmake --build /work/build -j "$(nproc)" --target llama-server
   chown -R '"$(id -u):$(id -g)"' /work/build'
 ```
 
-The flags are the ones `ensure_built` uses, so the result is the binary the engine would
-have produced. `GGML_NATIVE=OFF` matters: it keeps the build host's `-march` out of a binary
-that may run on an older CPU. Because the path is the one derived from `tree`/`git_ref`, no
+The flags are the ones `ensure_built` uses, plus one a **container** build cannot do
+without. A devel container has no driver: `libcuda.so.1` is injected by the container
+runtime at *run* time, so at *build* time ggml's calls into the CUDA driver API
+(`cuMemCreate`, `cuGetErrorString`, …) resolve to nothing and the link fails — after the
+entire compile has succeeded. The stub has to be **linked**, not merely searched:
+`-L …/stubs` on its own fails identically. Building on a host that has the driver installed
+needs none of this. `GGML_NATIVE=OFF` matters too: it keeps the build host's `-march` out of
+a binary that may run on an older CPU. Because the path is the one derived from `tree`/`git_ref`, no
 `CODERAI_*_BIN` variable is involved and the config still describes what is serving —
 bumping `git_ref` then builds beside it rather than over it, and a stale binary cannot be
 mistaken for the new ref.

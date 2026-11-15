@@ -161,9 +161,21 @@ class LlamaSrvBackend(VllmBackend):
         return None
 
     def cleanup(self) -> None:
+        """Stop this model's server. THIS is how llamasrv frees VRAM.
+
+        The manager evicts a llamasrv-served model the same way it evicts any
+        other -- it drops the backend and calls cleanup() -- so everything that
+        makes eviction work for an in-process model has to work here, and the
+        key has to be the one the service was registered under. The fallback is
+        engine-prefixed for that reason: an unprefixed key matches no service,
+        stop_service does nothing, and the manager goes on believing it freed
+        the whole model's VRAM while the server still holds it.
+        """
         from codai.api import llamasrv_worker
-        key = (getattr(self, "_svc_key", None)
-               or getattr(self._cfg, "model_id", "") or self._model_id)
+        key = getattr(self, "_svc_key", None)
+        if not key:
+            base = getattr(self._cfg, "model_id", "") or self._model_id
+            key = f"{llamasrv_worker.engine_key(self._cfg)}::{base}"
         llamasrv_worker.stop_service(key)
         self._url = None
         self._bearer = ""
