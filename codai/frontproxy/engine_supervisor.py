@@ -172,9 +172,10 @@ class EngineSupervisor:
             kt = getattr(self.config, "ktransformers", None)
             vllm = getattr(self.config, "vllm", None)
             llamasrv = getattr(self.config, "llamasrv", None)
+            llamasrv_fork = getattr(self.config, "llamasrv_fork", None)
             assignment = compute_assignment(engines, self.models_path,
                                             default_engine, ds4, colibri, k3, kt,
-                                            vllm, llamasrv)
+                                            vllm, llamasrv, llamasrv_fork)
             for e in engines:
                 owned = assignment.get(e.name, [])
                 e.assigned_models = set(owned)   # the front's router enforces this
@@ -383,17 +384,24 @@ class EngineSupervisor:
         # engine/task page. The node is where the subprocess is OWNED -- the
         # router sends it exactly the models pinned backend:llamasrv, and
         # LlamaSrvBackend builds and launches the binary per served GGUF.
-        llamasrv_cfg = getattr(self.config, "llamasrv", None)
-        if llamasrv_cfg is not None and getattr(llamasrv_cfg, "enabled", False) \
-                and nvidia_gpus():
+        # Two of them: stock llama.cpp and a fork are separate engines, each
+        # owning its own server processes, so both can serve at once and a fork
+        # can be measured rather than believed. Separate nodes also mean one can
+        # be restarted (or crash) without touching the other's models.
+        for _attr, _name in (("llamasrv", "llamasrv"),
+                             ("llamasrv_fork", "llamasrv_fork")):
+            _cfg = getattr(self.config, _attr, None)
+            if _cfg is None or not getattr(_cfg, "enabled", False) \
+                    or not nvidia_gpus():
+                continue
             venv = vendor_env("nvidia", allow_cross=False)
             sels = _gpu_selectors({"backend": "nvidia", "gpus": "nvidia"}, venv)
             if sels:
                 venv["CODERAI_ENGINE_GPUS"] = ",".join(sels)
             engines.append(Engine(
                 id=next_id, gpu=None, port=self._alloc_port(), primary=False,
-                name="llamasrv", backend="nvidia", env=venv,
-                capabilities={"llamasrv"}))
+                name=_name, backend="nvidia", env=venv,
+                capabilities={_name}))
             next_id += 1
 
         self._set_cosited_urls(engines)
@@ -864,9 +872,10 @@ class EngineSupervisor:
                 kt = getattr(self.config, "ktransformers", None)
                 vllm = getattr(self.config, "vllm", None)
                 llamasrv = getattr(self.config, "llamasrv", None)
+                llamasrv_fork = getattr(self.config, "llamasrv_fork", None)
                 assignment = compute_assignment(real, self.models_path,
                                                 default_engine, ds4, colibri, k3, kt,
-                                                vllm, llamasrv)
+                                                vllm, llamasrv, llamasrv_fork)
             except Exception as exc:
                 print(f"[front] live reassignment skipped: {exc}", flush=True)
                 assignment = {}

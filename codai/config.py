@@ -1017,7 +1017,20 @@ class LlamaSrvConfig:
     server and the in-process path are one engine with two front ends and a GGUF
     behaves identically either way. Any other value names a fork -- see
     ``repo_url``/``git_ref``.
+
+    A fork is NOT configured by flipping this object's ``tree``: that would move
+    every pinned model at once and leave no way to serve one model on stock
+    llama.cpp and another on a fork, which is the comparison anybody evaluating
+    a fork needs. The fork is a SECOND engine -- :class:`LlamaSrvForkConfig`,
+    engine key ``llamasrv_fork`` -- with its own enable flag, its own build
+    directory and its own server processes.
     """
+
+    #: Engine key. Not a dataclass field (no annotation), so it is never
+    #: written to config.json: it names the engine this object configures, and
+    #: derives the env var that points at a prebuilt binary.
+    ENGINE_KEY = "llamasrv"
+
     enabled: bool = False
     # Point this at a llama-server running somewhere else (another host, a
     # container, a rented pod) and coderai proxies to it instead of building or
@@ -1071,6 +1084,49 @@ class LlamaSrvConfig:
     # drive another process's model by guessing a port.
     api_key: str = ""
     ready_timeout_s: int = 1800          # how long a cold load may take before we give up
+
+def _dc_dict(obj) -> dict:
+    """A dataclass instance as a plain dict of its own fields, in declared order.
+
+    Used where a config block is saved: a hand-written key list drifts from the
+    dataclass the moment a field is added, and the failure is silent -- the
+    value loads, is used, and is dropped on the next save.
+    """
+    import dataclasses as _d
+    return {f.name: getattr(obj, f.name) for f in _d.fields(obj)}
+
+
+@dataclass
+class LlamaSrvForkConfig(LlamaSrvConfig):
+    """The same managed ``llama-server``, built from a FORK -- engine key ``llamasrv_fork``.
+
+    Two engines rather than one switch, because the reason to run a fork is to
+    find out whether it is actually better, and that needs both serving at once:
+    one model on stock llama.cpp, another on the fork, same card, same weights.
+    A single ``tree`` setting can only answer "which one is everything using".
+
+    Everything else is inherited, so the two behave identically where they
+    should (per-tree build directories, the architecture gate, the per-model
+    override list). Only the defaults differ: ``tree`` is ``repo``, and
+    ``repo_url``/``git_ref`` name the fork the published image compiles in --
+    llamAmpere, which targets Ampere (sm_86) and is why this exists on a 3090.
+
+    The defaults and the image's LLAMASRV_FORK_* build args MUST move together:
+    the image bakes a binary and this config describes it, and nothing at
+    runtime can tell that a prebuilt binary is not the tree named here. A test
+    pins them to each other.
+    """
+
+    ENGINE_KEY = "llamasrv_fork"
+
+    tree: str = "repo"
+    repo_url: str = "https://github.com/JakeATX/llamAmpere"
+    git_ref: str = "v0.6.4"
+    # The fork is Ampere-tuned, so unlike the stock tree this does not default
+    # to "whatever cards this host has": building it for an architecture its
+    # author never tested is how you get plausible output instead of an error.
+    cuda_architectures: str = "86"
+
 
 @dataclass
 class RunpodConfig:
@@ -1953,6 +2009,7 @@ class Config:
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
     llamasrv: LlamaSrvConfig = field(default_factory=LlamaSrvConfig)
+    llamasrv_fork: LlamaSrvForkConfig = field(default_factory=LlamaSrvForkConfig)
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
     k3: K3Config = field(default_factory=K3Config)
     ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
@@ -2198,6 +2255,7 @@ class ConfigManager:
                 cluster=_dc(ClusterConfig, config_data.get("cluster", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
                 llamasrv=_dc(LlamaSrvConfig, config_data.get("llamasrv", {})),
+                llamasrv_fork=_dc(LlamaSrvForkConfig, config_data.get("llamasrv_fork", {})),
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 k3=_dc(K3Config, config_data.get("k3", {})),
                 ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
@@ -2458,33 +2516,11 @@ class ConfigManager:
                 "kv_cache_max_age_hours": self.config.ds4.kv_cache_max_age_hours,
                 "kv_cache_cleanup_interval_minutes": self.config.ds4.kv_cache_cleanup_interval_minutes,
             },
-            "llamasrv": {
-                "enabled": self.config.llamasrv.enabled,
-                "service_url": self.config.llamasrv.service_url,
-                "tree": self.config.llamasrv.tree,
-                "repo_url": self.config.llamasrv.repo_url,
-                "git_ref": self.config.llamasrv.git_ref,
-                "install_dir": self.config.llamasrv.install_dir,
-                "auto_build": self.config.llamasrv.auto_build,
-                "cuda_architectures": self.config.llamasrv.cuda_architectures,
-                "require_matching_arch": self.config.llamasrv.require_matching_arch,
-                "extra_cmake_args": self.config.llamasrv.extra_cmake_args,
-                "model_id": self.config.llamasrv.model_id,
-                "host": self.config.llamasrv.host,
-                "port": self.config.llamasrv.port,
-                "ctx": self.config.llamasrv.ctx,
-                "n_gpu_layers": self.config.llamasrv.n_gpu_layers,
-                "parallel": self.config.llamasrv.parallel,
-                "flash_attn": self.config.llamasrv.flash_attn,
-                "cache_type_k": self.config.llamasrv.cache_type_k,
-                "cache_type_v": self.config.llamasrv.cache_type_v,
-                "spec_type": self.config.llamasrv.spec_type,
-                "spec_draft_n_max": self.config.llamasrv.spec_draft_n_max,
-                "extra_args": self.config.llamasrv.extra_args,
-                "extra_env": self.config.llamasrv.extra_env,
-                "api_key": self.config.llamasrv.api_key,
-                "ready_timeout_s": self.config.llamasrv.ready_timeout_s,
-            },
+            # Both llama-server engines, field-driven: enumerating them by hand
+            # meant a field added to LlamaSrvConfig could be saved for one
+            # engine and silently dropped for the other.
+            "llamasrv": _dc_dict(self.config.llamasrv),
+            "llamasrv_fork": _dc_dict(self.config.llamasrv_fork),
             "colibri": {
                 "enabled": self.config.colibri.enabled,
                 "service_url": self.config.colibri.service_url,

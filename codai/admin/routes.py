@@ -34,6 +34,17 @@ import uuid as _uuid
 import json as _j
 
 
+def _engine_block(cfg) -> dict:
+    """A llama-server engine's config as a flat dict, straight from its fields.
+
+    Hand-listing the keys is how a knob becomes unreadable in the UI while
+    appearing to save: the setter writes it, the getter never returns it, and
+    the form shows the default on reload. Two engines doubled that risk.
+    """
+    import dataclasses as _d
+    return {f.name: getattr(cfg, f.name) for f in _d.fields(cfg)}
+
+
 router = APIRouter()
 
 # Templates directory
@@ -4285,35 +4296,11 @@ def build_settings_dict(c, gpu_cards):
             "extra_args": c.longcat.extra_args,
             "extra_env": c.longcat.extra_env,
         },
-        # Generated from the dataclass: a knob the UI cannot READ looks exactly
+        # Both llama-server engines, generated from the dataclass (see
+        # _engine_block): a knob the UI cannot READ looks exactly
         # like one that did not save.
-        "llamasrv": {
-            "enabled": c.llamasrv.enabled,
-            "service_url": c.llamasrv.service_url,
-            "tree": c.llamasrv.tree,
-            "repo_url": c.llamasrv.repo_url,
-            "git_ref": c.llamasrv.git_ref,
-            "install_dir": c.llamasrv.install_dir,
-            "auto_build": c.llamasrv.auto_build,
-            "cuda_architectures": c.llamasrv.cuda_architectures,
-            "require_matching_arch": c.llamasrv.require_matching_arch,
-            "extra_cmake_args": c.llamasrv.extra_cmake_args,
-            "model_id": c.llamasrv.model_id,
-            "host": c.llamasrv.host,
-            "port": c.llamasrv.port,
-            "ctx": c.llamasrv.ctx,
-            "n_gpu_layers": c.llamasrv.n_gpu_layers,
-            "parallel": c.llamasrv.parallel,
-            "flash_attn": c.llamasrv.flash_attn,
-            "cache_type_k": c.llamasrv.cache_type_k,
-            "cache_type_v": c.llamasrv.cache_type_v,
-            "spec_type": c.llamasrv.spec_type,
-            "spec_draft_n_max": c.llamasrv.spec_draft_n_max,
-            "extra_args": c.llamasrv.extra_args,
-            "extra_env": c.llamasrv.extra_env,
-            "api_key": c.llamasrv.api_key,
-            "ready_timeout_s": c.llamasrv.ready_timeout_s,
-        },
+        "llamasrv": _engine_block(c.llamasrv),
+        "llamasrv_fork": _engine_block(c.llamasrv_fork),
         "vllm": {
             "enabled": c.vllm.enabled,
             "service_url": c.vllm.service_url,
@@ -5062,9 +5049,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 pass
         if lc.attention not in ("xformers", "flash", "sdpa"):
             lc.attention = "xformers"
-    if "llamasrv" in data:
-        d = data["llamasrv"]
-        v = c.llamasrv
+    for _ekey, v in (("llamasrv", c.llamasrv), ("llamasrv_fork", c.llamasrv_fork)):
+      if _ekey in data:
+        d = data[_ekey]
         v.enabled = bool(d.get("enabled", v.enabled))
         for key in ("service_url", "model_id", "repo_url", "git_ref",
                     "cuda_architectures", "extra_cmake_args", "cache_type_k",
@@ -5073,8 +5060,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             if key in d:
                 setattr(v, key, (d.get(key) or "").strip())
         if "tree" in d:
-            tree = (d.get("tree") or "bindings").strip().lower()
-            v.tree = tree if tree in ("bindings", "repo") else "bindings"
+            # Falls back to the engine's CURRENT tree, not to "bindings": the
+            # fork engine defaults to "repo", and a bad value must not quietly
+            # turn it into a second copy of the stock engine.
+            tree = (d.get("tree") or "").strip().lower()
+            v.tree = tree if tree in ("bindings", "repo") else v.tree
         if "host" in d:
             v.host = (d.get("host") or "127.0.0.1").strip() or "127.0.0.1"
         if "flash_attn" in d:

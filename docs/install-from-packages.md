@@ -78,6 +78,28 @@ For an offline machine, pull the image where there is a connection and
 move it: `docker save ghcr.io/nextime/coderai:latest | gzip > coderai.tar.gz`
 there, `docker load < coderai.tar.gz` here.
 
+### What the full image can and cannot build for itself
+
+The image carries CUDA *runtime* libraries, not a toolchain: no `nvcc`, no `cmake`. Anything
+that has to be compiled for your card is compiled at **image build** time, not on first use.
+
+That matters for the two `llama-server` engines. `llamasrv` serves a GGUF through stock
+llama.cpp's own server; `llamasrv_fork` serves one through a fork (for speculative decoding
+on Ampere). Neither can build its binary inside the runtime image, so the image ships both:
+
+| engine | binary |
+|---|---|
+| `llamasrv` | `/opt/coderai/llamasrv/bin/llama-server` — from the llama.cpp the image's `llama-cpp-python` was built from |
+| `llamasrv_fork` | `/opt/coderai/llamasrv-fork/bin/llama-server` — the fork, **sm_86** by default |
+
+Each carries a `BUILD_INFO` naming its repo and ref, and the launcher points each engine at
+its own. On another card, rebuild with `LLAMASRV_FORK_ARCHS=<your archs>`: a baked binary is
+used as-is and a mismatch surfaces as "no kernel image is available", not as a fallback.
+The same binaries are produced by the incremental overlay
+(`update_oci_image.sh REBUILD_LLAMA=1`), so an install that is updated rather than rebuilt
+gets them too. An install that bind-mounts a newer working tree into an older image can be
+handed a binary by hand; see [`llama-server.md`](llama-server.md).
+
 ## Linux
 
 Requirements: Docker (or Podman) and, for NVIDIA cards, the NVIDIA

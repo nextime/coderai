@@ -28,6 +28,23 @@ if [ -d "$NV" ]; then
 fi
 export LD_LIBRARY_PATH="$LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# llama-server for the `llamasrv` engine, compiled into this image (see
+# packaging/linux/Dockerfile.oci). The runtime image has no CUDA toolchain, so
+# the engine cannot build a fork here; it is told where the baked binary is.
+# ONLY this coderai-owned path is trusted: a `llama-server` found on PATH could
+# be any llama.cpp, and serving a different tree than the config pins is the
+# failure that looks like the fork working badly. Unset when the image was
+# built without it, so llamasrv reports itself unavailable rather than pointing
+# at a file that is not there. An explicit CODERAI_LLAMASRV_BIN always wins.
+if [ -z "${CODERAI_LLAMASRV_BIN:-}" ] && [ -x /opt/coderai/llamasrv/bin/llama-server ]; then
+  export CODERAI_LLAMASRV_BIN=/opt/coderai/llamasrv/bin/llama-server
+fi
+# The fork is a SECOND engine with its own binary and its own variable: one
+# variable for both would serve whichever was baked last to every pinned model.
+if [ -z "${CODERAI_LLAMASRV_FORK_BIN:-}" ] && [ -x /opt/coderai/llamasrv-fork/bin/llama-server ]; then
+  export CODERAI_LLAMASRV_FORK_BIN=/opt/coderai/llamasrv-fork/bin/llama-server
+fi
+
 mkdir -p "$CODERAI_CONFIG_DIR/coderai" "$CODERAI_MODELS_DIR/coderai" "$CODERAI_CACHE_DIR/coderai"
 CONFIG_DIR="$CODERAI_CONFIG_DIR/coderai"
 CONFIG_FILE="$CONFIG_DIR/config.json"

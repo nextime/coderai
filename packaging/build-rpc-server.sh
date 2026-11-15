@@ -17,12 +17,20 @@
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
-CUDA=""; VULKAN=""; DEST=""
+CUDA=""; VULKAN=""; DEST=""; LLAMA_SERVER_DEST=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --cuda) CUDA=1 ;;
         --vulkan) VULKAN=1 ;;
         --dest) DEST="$2"; shift ;;
+        # Also build llama-server from this SAME vendored tree and install it
+        # there. The `llamasrv` engine runs llama.cpp's own server binary, and
+        # its "bindings" tree means exactly this one -- the llama.cpp the
+        # installed llama-cpp-python was compiled from. Building it here reuses
+        # the sdist download and the cmake configure the rpc target already
+        # paid for, and guarantees the two come from one tree, which is the
+        # same reason rpc-server is built here at all.
+        --llama-server) LLAMA_SERVER_DEST="$2"; shift ;;
         -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
@@ -52,8 +60,14 @@ tar -xzf "$SDIST"
 SRC=$(ls -d llama_cpp_python-*/vendor/llama.cpp | head -1)
 [ -f "$SRC/CMakeLists.txt" ] || { echo "vendored llama.cpp not found in $SDIST" >&2; exit 1; }
 
+# LLAMA_BUILD_SERVER is OFF by default here: this script exists for rpc-server,
+# and configuring the server target costs build time nobody asked for. With
+# --llama-server it must be ON, or the target does not exist in this build dir
+# and cmake fails with "No rule to make target 'llama-server'".
+SERVER_FLAG=-DLLAMA_BUILD_SERVER=OFF
+[ -n "$LLAMA_SERVER_DEST" ] && SERVER_FLAG=-DLLAMA_BUILD_SERVER=ON
 CM=(-DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
-    -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON)
+    "$SERVER_FLAG" -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON)
 [ -n "$CUDA" ] && CM+=(-DGGML_CUDA=ON ${CMAKE_CUDA_ARCHITECTURES:+-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES"})
 [ -n "$VULKAN" ] && CM+=(-DGGML_VULKAN=ON)
 cmake -S "$SRC" -B build "${CM[@]}" ${EXTRA_CMAKE_ARGS:-} >/dev/null
@@ -95,3 +109,20 @@ BIN=$(find build -type f \( -name ggml-rpc-server -o -name rpc-server \) | head 
 install -m 755 "$BIN" "$DEST/rpc-server"
 echo "installed $DEST/rpc-server (from $RPC_TARGET)"
 "$DEST/rpc-server" --help 2>&1 | head -3 || true
+
+if [ -n "$LLAMA_SERVER_DEST" ]; then
+    # The runtime image has no CUDA toolchain, so a server binary cannot be
+    # built on the machine that runs it: if it is not baked here, the llamasrv
+    # engine has nothing to launch.
+    echo "building llama-server from the same vendored tree"
+    cmake --build build --target llama-server -j"$(nproc)"
+    LS=$(find build -type f -name llama-server | head -1)
+    [ -x "$LS" ] || { echo "llama-server did not build" >&2; exit 1; }
+    mkdir -p "$LLAMA_SERVER_DEST"
+    install -m 755 "$LS" "$LLAMA_SERVER_DEST/llama-server"
+    # What it is, beside it: nothing at runtime can tell which tree a prebuilt
+    # binary came from, and "the config says bindings" is not evidence.
+    printf 'repo=llama-cpp-python vendored llama.cpp\nref=llama-cpp-python==%s\ncuda_architectures=%s\n' \
+        "$VER" "${CMAKE_CUDA_ARCHITECTURES:-default}" > "$LLAMA_SERVER_DEST/../BUILD_INFO"
+    echo "installed $LLAMA_SERVER_DEST/llama-server"
+fi

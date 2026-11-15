@@ -101,6 +101,20 @@ def get_active_llamasrv_config():
             return config_manager.config.llamasrv
     except Exception:
         pass
+
+
+def get_active_llamasrv_fork_config():
+    """Return the active LlamaSrvForkConfig (the FORK engine), or None.
+
+    A separate engine from ``llamasrv`` on purpose: both can serve at once, so a
+    fork can be measured against stock llama.cpp on the same card instead of
+    being swapped in globally and compared from memory."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.llamasrv_fork
+    except Exception:
+        pass
     return None
 
 
@@ -271,7 +285,8 @@ _EVICT_HEADROOM_FRACTION_KEY = "evict_headroom_fraction"
 #: a hung generation rather than as an eviction that stopped responding.
 _WAIT_IDLE_SAY_EVERY_S = 15.0
 
-_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv", "runpod")
+_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv",
+                    "llamasrv_fork", "runpod")
 
 
 def _engine_config(engine: str):
@@ -283,6 +298,7 @@ def _engine_config(engine: str):
         "kt": get_active_ktransformers_config,
         "vllm": get_active_vllm_config,
         "llamasrv": get_active_llamasrv_config,
+        "llamasrv_fork": get_active_llamasrv_fork_config,
         "runpod": get_active_runpod_config,
     }.get(engine)
     return getter() if getter else None
@@ -495,6 +511,14 @@ def _llamasrv_name_claims(model_name: str) -> bool:
     return False
 
 
+def _llamasrv_fork_name_claims(model_name: str) -> bool:
+    """Same rule as the stock server, for the same reason: it can serve every
+    GGUF, so enabling a fork must not quietly move the catalogue onto it.
+    Routes ONLY via ``backend: "llamasrv_fork"`` or its configured
+    ``model_id``."""
+    return False
+
+
 def _runpod_name_claims(model_name: str) -> bool:
     """RunPod can serve any model, so it must NEVER auto-claim by a name marker.
     Routes ONLY via an explicit ``backend: "runpod"`` pin on the model entry."""
@@ -508,6 +532,7 @@ _ENGINE_NAME_CLAIMS = {
     "kt": _kt_name_claims,
     "vllm": _vllm_name_claims,
     "llamasrv": _llamasrv_name_claims,
+    "llamasrv_fork": _llamasrv_fork_name_claims,
     "runpod": _runpod_name_claims,
 }
 
@@ -576,6 +601,11 @@ def vllm_should_handle(model_name: str) -> bool:
 def llamasrv_should_handle(model_name: str) -> bool:
     """True when llamasrv (a managed llama-server) is the resolved engine."""
     return resolve_engine_backend(model_name) == "llamasrv"
+
+
+def llamasrv_fork_should_handle(model_name: str) -> bool:
+    """True when the FORK llama-server is the resolved engine."""
+    return resolve_engine_backend(model_name) == "llamasrv_fork"
 
 
 def runpod_should_handle(model_name: str) -> bool:
@@ -903,6 +933,14 @@ class ModelManager:
         # the server has — speculative decoding (the draft-and-verify loop is in
         # llama.cpp's common/, not in libllama) and real slots with continuous
         # batching. Pin-selected only, so the default GGUF path is untouched.
+        if llamasrv_fork_should_handle(model_name):
+            from codai.backends.llamasrv import LlamaSrvBackend
+            print(f"Routing '{model_name}' to a managed llama-server (fork)")
+            self.backend_type = "llamasrv_fork"
+            self.backend = LlamaSrvBackend(get_active_llamasrv_fork_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
         if llamasrv_should_handle(model_name):
             from codai.backends.llamasrv import LlamaSrvBackend
             print(f"Routing '{model_name}' to a managed llama-server")

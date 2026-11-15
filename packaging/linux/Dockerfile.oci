@@ -21,6 +21,24 @@ ARG BUILD_SAGEATTENTION=1
 ARG SAGEATTENTION_REF=main
 ARG SAGEATTENTION_ARCH=8.6
 
+# llama-server from a llama.cpp FORK, for the `llamasrv_fork` engine
+# (docs/llama-server.md). The STOCK engine's binary is built above, from the
+# very llama.cpp the installed llama-cpp-python was compiled from -- the two are
+# separate engines and the image carries a binary for each.
+# The runtime image carries no CUDA toolchain, so a fork cannot be compiled on the
+# machine that runs it -- `auto_build` fails there by design. Building it here is
+# what makes the engine usable from a published image.
+#
+# LLAMASRV_ARCHS is baked SASS: this binary is used AS-IS at runtime, with no
+# architecture gate, because nothing is built there to gate. An image built for
+# 86 and run on another card gets "no kernel image is available", so an operator
+# targeting different hardware must rebuild with their own archs rather than
+# expect a fallback.
+ARG BUILD_LLAMASRV_FORK=1
+ARG LLAMASRV_FORK_REPO=https://github.com/JakeATX/llamAmpere
+ARG LLAMASRV_FORK_REF=v0.6.4
+ARG LLAMASRV_FORK_ARCHS=86
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PIP_NO_CACHE_DIR=1 \
@@ -77,7 +95,38 @@ RUN set -eux; \
     uv pip install --python /opt/coderai/python/bin/python3 --find-links /opt/wheels --no-deps --no-index llama-cpp-python; \
     PYTHON=/opt/coderai/python/bin/python3 CMAKE_CUDA_ARCHITECTURES="80;86;89;90;120" \
       bash /tmp/build-rpc-server.sh --cuda --vulkan --dest /opt/coderai/python/bin \
+        --llama-server /opt/coderai/llamasrv/bin \
       || echo "WARNING: rpc-server not built; cluster RPC serving unavailable in this image"
+
+# The llamasrv fork. Installed at a dedicated, coderai-owned path with a marker
+# recording exactly what was built: the launcher exports CODERAI_LLAMASRV_BIN
+# only for THIS path, never for a `llama-server` that happens to be on PATH,
+# because the engine's whole contract is that a pinned tree is the tree serving
+# -- a stock binary picked up by accident would answer plausibly while being a
+# different llama.cpp than the config pins.
+# Non-fatal: a tree that fails to build must not cost a two-hour image build.
+# Without the binary the launcher exports nothing, so llamasrv simply reports
+# itself unavailable instead of pointing at a file that is not there.
+# LLAMA_CURL=OFF: coderai hands llama-server local file paths, never URLs, so
+# curl support would only add a build dependency this stage does not carry.
+RUN set -eux; \
+    if [ "${BUILD_LLAMASRV_FORK}" = "1" ]; then \
+      ( git clone --depth 1 --branch "${LLAMASRV_FORK_REF}" "${LLAMASRV_FORK_REPO}" /tmp/llamasrv-src \
+        && cmake -S /tmp/llamasrv-src -B /tmp/llamasrv-build \
+             -DCMAKE_BUILD_TYPE=Release \
+             -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+             -DLLAMA_CURL=OFF \
+             -DGGML_NATIVE=OFF -DGGML_AVX2=ON \
+             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${LLAMASRV_FORK_ARCHS}" \
+        && cmake --build /tmp/llamasrv-build -j "$(nproc)" --target llama-server \
+        && mkdir -p /opt/coderai/llamasrv-fork/bin \
+        && cp /tmp/llamasrv-build/bin/llama-server /opt/coderai/llamasrv-fork/bin/llama-server \
+        && printf 'repo=%s\nref=%s\ncuda_architectures=%s\n' \
+             "${LLAMASRV_FORK_REPO}" "${LLAMASRV_FORK_REF}" "${LLAMASRV_FORK_ARCHS}" \
+             > /opt/coderai/llamasrv-fork/BUILD_INFO \
+        && rm -rf /tmp/llamasrv-src /tmp/llamasrv-build ) \
+      || echo "WARNING: the fork llama-server was not built; the llamasrv_fork engine will be unavailable in this image"; \
+    fi
 
 RUN set -eux; \
     pkg="stable-diffusion-cpp-python${SD_CPP_PYTHON_VERSION:+==${SD_CPP_PYTHON_VERSION}}"; \

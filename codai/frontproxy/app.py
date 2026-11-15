@@ -1517,6 +1517,11 @@ class FrontProxy:
         k3 = getattr(self.config, "k3", None)
         kt = getattr(self.config, "ktransformers", None)
         vllm = getattr(self.config, "vllm", None)
+        # Both llama-server engines. These were missing, so a model routed by a
+        # configured `model_id` alias (rather than by an explicit backend pin)
+        # resolved to no capability here and was left unassigned.
+        lsrv = getattr(self.config, "llamasrv", None)
+        lsrv_fork = getattr(self.config, "llamasrv_fork", None)
         info = self._model_info(model)
         cap = _router.required_capability(
             model, path=path,
@@ -1530,7 +1535,13 @@ class FrontProxy:
             kt_model_id=getattr(kt, "model_id", None) if kt else None,
             kt_enabled=bool(getattr(kt, "enabled", False)) if kt else False,
             vllm_model_id=getattr(vllm, "model_id", None) if vllm else None,
-            vllm_enabled=bool(getattr(vllm, "enabled", False)) if vllm else False)
+            vllm_enabled=bool(getattr(vllm, "enabled", False)) if vllm else False,
+            llamasrv_model_id=getattr(lsrv, "model_id", None) if lsrv else None,
+            llamasrv_enabled=bool(getattr(lsrv, "enabled", False)) if lsrv else False,
+            llamasrv_fork_model_id=(getattr(lsrv_fork, "model_id", None)
+                                    if lsrv_fork else None),
+            llamasrv_fork_enabled=(bool(getattr(lsrv_fork, "enabled", False))
+                                   if lsrv_fork else False))
         # The name heuristic can't see that a bare alias (e.g. '…-q4_k_m', no
         # literal 'gguf') backs a .gguf file, so it falls through to
         # 'transformers' (CUDA-only) and the request never reaches a Vulkan/AMD

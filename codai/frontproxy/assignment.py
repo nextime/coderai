@@ -55,7 +55,7 @@ def _route_key(entry):
 
 
 def _required_cap(entry, ds4_cfg, colibri_cfg=None, k3_cfg=None, kt_cfg=None,
-                  vllm_cfg=None, llamasrv_cfg=None):
+                  vllm_cfg=None, llamasrv_cfg=None, llamasrv_fork_cfg=None):
     from codai.frontproxy.router import required_capability
     path = _entry_path(entry) or ""
     backend = entry.get("backend") if isinstance(entry, dict) else None
@@ -72,12 +72,16 @@ def _required_cap(entry, ds4_cfg, colibri_cfg=None, k3_cfg=None, kt_cfg=None,
         vllm_model_id=getattr(vllm_cfg, "model_id", None) if vllm_cfg else None,
         vllm_enabled=bool(getattr(vllm_cfg, "enabled", False)) if vllm_cfg else False,
         llamasrv_model_id=getattr(llamasrv_cfg, "model_id", None) if llamasrv_cfg else None,
-        llamasrv_enabled=bool(getattr(llamasrv_cfg, "enabled", False)) if llamasrv_cfg else False)
+        llamasrv_enabled=bool(getattr(llamasrv_cfg, "enabled", False)) if llamasrv_cfg else False,
+        llamasrv_fork_model_id=(getattr(llamasrv_fork_cfg, "model_id", None)
+                                if llamasrv_fork_cfg else None),
+        llamasrv_fork_enabled=(bool(getattr(llamasrv_fork_cfg, "enabled", False))
+                               if llamasrv_fork_cfg else False))
 
 
 def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
                        colibri_cfg=None, k3_cfg=None, kt_cfg=None, vllm_cfg=None,
-                       llamasrv_cfg=None):
+                       llamasrv_cfg=None, llamasrv_fork_cfg=None):
     """Return {engine_name: [model_identifiers]} — each model owned by one engine."""
     assignment = {e.name: [] for e in engines}
     if not engines or not models_path:
@@ -98,7 +102,7 @@ def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
             if not ident or ident in seen:
                 continue
             cap = _required_cap(entry, ds4_cfg, colibri_cfg, k3_cfg, kt_cfg,
-                                vllm_cfg, llamasrv_cfg)
+                                vllm_cfg, llamasrv_cfg, llamasrv_fork_cfg)
             candidates = [e for e in engines if e.can_serve(cap)]
             if not candidates:
                 continue   # nothing can run it — leave unassigned

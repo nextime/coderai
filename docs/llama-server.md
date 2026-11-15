@@ -170,6 +170,117 @@ would claim a target the image was not compiled for. Only the run-time settings 
 worker where its binary is through `CODERAI_LLAMASRV_BIN`; if that path is wrong the pod
 says so instead of failing later inside cmake.
 
+## Two engines: stock and a fork
+
+`llamasrv` runs **stock** llama.cpp's `llama-server`. `llamasrv_fork` runs the same server
+built from a **fork**. They are separate engines, each with its own enable flag, build
+directory, server processes and engine node.
+
+That is deliberate, and it is the whole point. The reason to run a fork is to find out
+whether it is actually faster, and that needs both serving **at once** — one model on stock
+llama.cpp, another on the fork, same card, same weights, measured against each other. A
+single `tree` setting could only ever answer "which one is everything using", which is a
+question nobody has.
+
+```json
+// config.json
+{
+  "llamasrv":      { "enabled": true, "tree": "bindings" },
+  "llamasrv_fork": { "enabled": true, "tree": "repo",
+                     "repo_url": "https://github.com/JakeATX/llamAmpere",
+                     "git_ref": "v0.6.4", "cuda_architectures": "86" }
+}
+```
+```json
+// models.json — the same weights, one on each engine
+{ "alias": "coder-stock", "path": "/AI/x.gguf", "backend": "llamasrv" }
+{ "alias": "coder-fork",  "path": "/AI/x.gguf", "backend": "llamasrv_fork" }
+```
+
+A model refines its engine with a block named after that engine — `llamasrv` or
+`llamasrv_fork` — so an override written for the fork cannot rewrite the stock engine's
+launch. The fork's defaults point at llamAmpere, which targets Ampere; its
+`cuda_architectures` deliberately does **not** default to "this host's cards", because
+building a tuned tree for hardware its author never tested yields plausible output rather
+than an error.
+
+The same GGUF on both engines is **two servers**: the running-server key carries the engine,
+not just the file. Keyed by path alone the second engine would be handed the first one's
+server, and a comparison between them would silently be a comparison of one with itself.
+
+## In the full image, and on a host that runs it
+
+The image ships CUDA *runtime* libraries and no toolchain — no `nvcc`, no `cmake` — so a
+server binary cannot be compiled on the machine that runs it. `auto_build` fails there, by
+design and with a message saying so.
+
+So the image bakes **one binary per engine**:
+
+| engine | path in the image | built from |
+|---|---|---|
+| `llamasrv` | `/opt/coderai/llamasrv/bin/llama-server` | the llama.cpp vendored in the installed `llama-cpp-python` — the same tree as `rpc-server`, so the server, the RPC server and the in-process path are one llama.cpp |
+| `llamasrv_fork` | `/opt/coderai/llamasrv-fork/bin/llama-server` | `LLAMASRV_FORK_REPO` at `LLAMASRV_FORK_REF` |
+
+Each has a `BUILD_INFO` beside it naming the repo, ref and architectures. The launcher
+exports `CODERAI_LLAMASRV_BIN` and `CODERAI_LLAMASRV_FORK_BIN` for those paths when the
+files are there, and exports nothing for one that is absent — so an engine without a binary
+reports itself unavailable instead of pointing at a file that does not exist. One variable
+for both engines would have served whichever binary was baked last to every pinned model.
+
+Both are built in `packaging/linux/Dockerfile.oci` (a from-scratch build) **and** in
+`packaging/linux/Dockerfile.update-llama`, the overlay driven by
+`update_oci_image.sh REBUILD_LLAMA=1`. The overlay matters: an install that only ever
+receives the app overlay never rebuilds the bundle, and the binaries are exactly the part
+the app overlay cannot refresh.
+
+| build arg | default | meaning |
+|---|---|---|
+| `BUILD_LLAMASRV_FORK` | `1` | compile the fork at all |
+| `LLAMASRV_FORK_REPO` | `https://github.com/JakeATX/llamAmpere` | which fork |
+| `LLAMASRV_FORK_REF` | `v0.6.4` | the pinned tag — never a branch |
+| `LLAMASRV_FORK_ARCHS` | `86` | baked SASS targets |
+
+Two things about a baked binary are worth being blunt about.
+
+**The architecture is not gated.** `require_matching_arch` guards a *build*, and with a
+prebuilt binary there is no build to guard. An image built for `86` and run on another card
+gets "no kernel image is available" from the CUDA runtime. Targeting other hardware means
+rebuilding with your own `LLAMASRV_FORK_ARCHS`, not expecting a fallback.
+
+**The `tree` / `repo_url` / `git_ref` settings are then not what is serving.** They describe
+a build that did not happen on this machine, and nothing can verify that a prebuilt binary
+is the tree they name — a stock llama.cpp and an Ampere fork both answer, one of them
+without the speculative decoding the pin was for. That is why the launcher trusts only its
+own paths and never a `llama-server` found on `PATH`, and why the worker logs the binary's
+`BUILD_INFO` on first use: the ref actually in play is printed rather than assumed.
+
+### Building a binary by hand for an existing install
+
+An install whose image predates this — or one that bind-mounts a newer working tree into an
+older image — can be handed a binary without rebuilding anything. Build it where the ABI
+matches the image (same Ubuntu, glibc and CUDA) and drop it at the path the worker derives
+from the config, `~/.coderai/llamasrv/<repo>-<ref>/build/bin/llama-server`:
+
+```bash
+REF=v0.6.4
+DIR=~/.coderai/llamasrv/llamAmpere-$REF
+git clone --depth 1 --branch $REF https://github.com/JakeATX/llamAmpere $DIR/src
+docker run --rm -v $DIR:/work nvidia/cuda:12.6.3-devel-ubuntu24.04 bash -c '
+  apt-get update -qq && apt-get install -y -qq cmake build-essential libcurl4-openssl-dev
+  cmake -S /work/src -B /work/build -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+  cmake --build /work/build -j "$(nproc)" --target llama-server
+  chown -R '"$(id -u):$(id -g)"' /work/build'
+```
+
+The flags are the ones `ensure_built` uses, so the result is the binary the engine would
+have produced. `GGML_NATIVE=OFF` matters: it keeps the build host's `-march` out of a binary
+that may run on an older CPU. Because the path is the one derived from `tree`/`git_ref`, no
+`CODERAI_*_BIN` variable is involved and the config still describes what is serving —
+bumping `git_ref` then builds beside it rather than over it, and a stale binary cannot be
+mistaken for the new ref.
+
 ## Choosing between the images
 
 | | `coderai-llama` | `coderai-llamasrv` |

@@ -114,7 +114,16 @@ def _tree_slug(cfg) -> str:
     return safe[:80]
 
 
-def _server_bin(install_dir: Path) -> Path:
+def bin_env_var(cfg) -> str:
+    """The env var naming a PREBUILT binary for this engine.
+
+    Per engine: an image bakes stock llama.cpp and a fork as two binaries, and
+    one variable for both would silently serve whichever was baked last to
+    every pinned model, defeating the split."""
+    return f"CODERAI_{engine_key(cfg).upper()}_BIN"
+
+
+def _server_bin(install_dir: Path, cfg=None) -> Path:
     """Where the binary is.
 
     ``CODERAI_LLAMASRV_BIN`` wins: a capability image compiles ``llama-server``
@@ -123,7 +132,11 @@ def _server_bin(install_dir: Path) -> Path:
     path from a tree slug the image's build args chose. With it set, nothing is
     ever fetched or built on the pod.
     """
-    env = (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip()
+    env = (os.environ.get(bin_env_var(cfg)) or "").strip() if cfg is not None else ""
+    if not env:
+        # Back-compat: the single-engine variable, which named the stock server.
+        env = (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip() \
+            if (cfg is None or engine_key(cfg) == "llamasrv") else ""
     if env:
         return Path(env).expanduser()
     return install_dir / "build" / "bin" / _TARGET
@@ -302,13 +315,48 @@ def ensure_source(cfg, tail=None) -> Path:
 # build
 # ---------------------------------------------------------------------------
 
+_PREBUILT_LOGGED = set()
+
+
+def _log_prebuilt_tree(binary: Path, cfg=None) -> None:
+    """Say which llama.cpp a PREBUILT binary came from, once per path.
+
+    When ``CODERAI_LLAMASRV_BIN`` is set, the ``tree``/``repo_url``/``git_ref``
+    config describes a build that did not happen here: the binary was compiled
+    into an image and nothing checks that it is the tree the config names. That
+    gap is invisible at runtime -- a stock llama.cpp and an Ampere fork both
+    answer, one of them without the speculative decoding the pin was for -- so
+    the marker written beside the binary at image build time is logged instead
+    of being left for someone to go and read.
+    """
+    var = bin_env_var(cfg) if cfg is not None else "CODERAI_LLAMASRV_BIN"
+    if not ((os.environ.get(var) or "").strip()
+            or (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip()):
+        return
+    key = str(binary)
+    if key in _PREBUILT_LOGGED:
+        return
+    _PREBUILT_LOGGED.add(key)
+    info = binary.parent.parent / "BUILD_INFO"
+    try:
+        detail = " ".join(info.read_text().split())
+    except Exception:
+        detail = "no BUILD_INFO beside it — which tree this is cannot be confirmed"
+    print(f"[{engine_key(cfg) if cfg is not None else 'llamasrv'}] using the prebuilt "
+          f"{_TARGET} at {binary} ({detail}); the tree/git_ref config is NOT what "
+          "is serving", flush=True)
+
+
 def ensure_built(cfg) -> Path:
     """cmake-build ``llama-server`` if it is missing. Returns the binary's path."""
     install_dir = _install_dir(cfg)
-    binary = _server_bin(install_dir)
+    binary = _server_bin(install_dir, cfg)
     if binary.is_file():
+        _log_prebuilt_tree(binary, cfg)
         return binary
-    env_bin = (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip()
+    env_bin = (os.environ.get(bin_env_var(cfg)) or "").strip() or (
+        (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip()
+        if engine_key(cfg) == "llamasrv" else "")
     if env_bin:
         # A prebuilt binary was promised and is not there. Building one here
         # would need a CUDA toolchain the runtime image does not carry, so say
@@ -404,14 +452,29 @@ def _health_ok(url: str, key: str = "") -> bool:
         return False
 
 
+def engine_key(cfg) -> str:
+    """Which llama-server engine this config object configures.
+
+    ``llamasrv`` (stock llama.cpp) and ``llamasrv_fork`` are separate engines
+    sharing this worker, so everything keyed per running server has to be keyed
+    per engine as well."""
+    return getattr(cfg, "ENGINE_KEY", "llamasrv") or "llamasrv"
+
+
 def resolve_service_key(cfg, model_file: Optional[str] = None):
-    """``(gguf_path, svc_key)`` -- which GGUF to serve and what to cache it under."""
+    """``(gguf_path, svc_key)`` -- which GGUF to serve and what to cache it under.
+
+    The key carries the ENGINE, not just the file. The whole point of a second
+    engine is serving one GGUF on stock llama.cpp and the same GGUF on a fork at
+    the same time; keyed by path alone the second request would be handed the
+    first engine's running server, and a comparison between them would silently
+    be a comparison of one with itself."""
     resolved = ""
     cand = os.path.expanduser((model_file or "").strip())
     if cand and os.path.isfile(cand):
         resolved = cand
-    svc_key = resolved or (getattr(cfg, "model_id", "") or "llamasrv")
-    return resolved, svc_key
+    base = resolved or (getattr(cfg, "model_id", "") or "llamasrv")
+    return resolved, f"{engine_key(cfg)}::{base}"
 
 
 def build_argv(cfg, binary, model_file: str, port: int, host: str, key: str,

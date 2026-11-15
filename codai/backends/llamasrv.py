@@ -74,9 +74,13 @@ class LlamaSrvBackend(VllmBackend):
         # This model's own `llamasrv` block over the global template, the same way
         # a model's `vllm` block refines the vLLM template: the tree to build, the
         # slot count, the KV cache types, the drafting flags.
-        blk = model_block(model_name, "llamasrv") or {}
+        # Under the ENGINE's own key: a model pinned to the fork refines it with
+        # a `llamasrv_fork` block. One shared key would mean a per-model override
+        # written for the fork also rewrote the stock engine's launch.
+        _key = llamasrv_worker.engine_key(self._cfg)
+        blk = model_block(model_name, _key) or {}
         if blk:
-            self._cfg = apply(self._cfg, blk, _LLAMASRV_FIELDS, "llamasrv")
+            self._cfg = apply(self._cfg, blk, _LLAMASRV_FIELDS, _key)
 
         # The window the model is SERVED with. A per-model n_ctx has to reach the
         # launch, or the number reported to clients and the one the server will
@@ -88,7 +92,7 @@ class LlamaSrvBackend(VllmBackend):
             blk_ctx = 0
         if not blk_ctx and _ctx > 0:
             try:
-                self._cfg = apply(self._cfg, {"ctx": _ctx}, _LLAMASRV_FIELDS, "llamasrv")
+                self._cfg = apply(self._cfg, {"ctx": _ctx}, _LLAMASRV_FIELDS, _key)
             except Exception:
                 pass
         try:
