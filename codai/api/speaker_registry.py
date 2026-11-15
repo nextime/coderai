@@ -164,3 +164,40 @@ def identify(embedding: list, backend: str, threshold: float = 0.25,
 def verify(embedding_a: list, embedding_b: list, threshold: float = 0.25) -> dict:
     score = _cosine(embedding_a, embedding_b)
     return {"same_speaker": score >= threshold, "score": score, "threshold": threshold}
+
+
+def parse_embedding(raw) -> list:
+    """Parse a caller-supplied reference voiceprint into a list of floats.
+
+    A client that keeps its own voiceprints has to send one back, and the three
+    shapes it plausibly has are all accepted: a bare JSON array, an object with
+    an ``embedding`` key, or the whole response ``/v1/audio/speaker-embeddings``
+    returned (``{"data": [{"embedding": [...]}]}``) — pasting that back unchanged
+    is the obvious thing to try, so it works.
+
+    Raises ``ValueError`` with a message meant for a 400 body.
+    """
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except Exception as e:
+            raise ValueError(f"reference is not valid JSON: {e}")
+    if isinstance(raw, dict):
+        if isinstance(raw.get("data"), list) and raw["data"]:
+            first = raw["data"][0]
+            raw = first.get("embedding") if isinstance(first, dict) else first
+        elif "embedding" in raw:
+            raw = raw["embedding"]
+        else:
+            raise ValueError(
+                "reference object has no 'embedding' (or 'data[0].embedding') key")
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("reference must be a JSON array of numbers")
+    if not raw:
+        raise ValueError("reference is an empty vector")
+    out = []
+    for i, v in enumerate(raw):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"reference[{i}] is not a number: {v!r}")
+        out.append(float(v))
+    return out

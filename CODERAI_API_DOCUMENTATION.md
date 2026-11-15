@@ -1241,7 +1241,7 @@ returns speaker-labelled segments instead of flat text.
 | `GET` | `/v1/audio/speakers` | List enrolled speakers |
 | `DELETE` | `/v1/audio/speakers/{name}` | Delete one |
 | `POST` | `/v1/audio/speaker-identify` | Who is this? (`file`, `backend`, `threshold`) → best match or none |
-| `POST` | `/v1/audio/speaker-verify` | Is this `name`? (`file`, `name`, `threshold`) → accept/reject + score |
+| `POST` | `/v1/audio/speaker-verify` | Is this the same speaker? (`file`, `name` **or** `reference`, `threshold`) → accept/reject + score |
 | `POST` | `/v1/audio/speaker-embeddings` | The raw voiceprint vector(s) (`file`, `backend`, `model`, `window`, `step`) |
 
 `speaker-embeddings` is the building block: with `window`/`step` it returns a vector per
@@ -1262,6 +1262,46 @@ curl -s "$CODERAI_URL/v1/audio/diarization" \
 
 An identification below the threshold is reported as unknown rather than as the nearest
 name: a wrong name on a turn is worse than no name.
+
+#### Verifying against a voiceprint you hold yourself
+
+`speaker-verify` names its reference one of two ways, and exactly one must be present:
+
+| Field | Type | Description |
+|---|---:|---|
+| `name` | string | An enrolled speaker. Looked up for the backend the clip was embedded with, so enrol and verify must pass the same `backend` |
+| `reference` | string (JSON) | A voiceprint the **client** holds: a bare array, `{"embedding": [...]}`, or the whole response `speaker-embeddings` returned |
+
+A caller that keeps its own voiceprints — because the speakers are its users, not this
+install's operators — should not have to enrol them here to compare one, nor reimplement
+cosine similarity and pick a threshold alone. With `reference` nothing is stored and
+nothing is enrolled; the answer adds `"reference": "vector"` (against `"enrolled"` for the
+`name` path) so a client can tell which comparison it got.
+
+```bash
+# keep the vector
+REF=$(curl -s "$CODERAI_URL/v1/audio/speaker-embeddings" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" -F "file=@alice.wav" | jq -c .)
+# compare a later clip against it, enrolling nothing
+curl -s "$CODERAI_URL/v1/audio/speaker-verify" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -F "file=@unknown.wav" -F "reference=$REF" -F "threshold=0.45" | jq
+```
+
+A `reference` carries no record of which model produced it. A dimension mismatch is
+refused with `400` naming both dimensions, because a 192-d ECAPA vector against a 512-d one
+is a different space rather than a near miss. Two **same**-dimension vectors from different
+backends cannot be caught that way and would compare as confident noise, so pairing the
+reference with the right `backend` is the caller's responsibility. A malformed `reference`
+is a `400` before the clip is embedded — a request that cannot succeed does not pay for a
+GPU round-trip.
+
+About the threshold: `0.25` is the shipped default and is deliberately permissive, which
+suits labelling a meeting where a missed name costs little. Access control is the opposite
+trade — a false accept is the expensive error — so raise it, and calibrate rather than
+guess: `speaker-identify` returns `score` and ranked `candidates`, so record clips of the
+target and of other people, look at the two score distributions, and put the threshold in
+the gap between them.
 
 ### Audio engine discovery
 
@@ -3077,7 +3117,7 @@ They are still part of the HTTP surface, which is why they are listed here.
 | `GET` | `/v1/audio/progress` | Audio generation progress | `api/audio_gen` |
 | `POST` | `/v1/audio/speaker-embeddings` | Extract a speaker embedding (voiceprint) | `api/transcriptions` |
 | `POST` | `/v1/audio/speaker-identify` | Identify the speaker in an audio clip | `api/transcriptions` |
-| `POST` | `/v1/audio/speaker-verify` | Verify a clip against an enrolled speaker | `api/transcriptions` |
+| `POST` | `/v1/audio/speaker-verify` | Verify a clip against an enrolled speaker or a reference voiceprint | `api/transcriptions` |
 | `GET` | `/v1/audio/speakers` | List enrolled speakers | `api/transcriptions` |
 | `POST` | `/v1/audio/speakers` | Enroll a speaker voiceprint | `api/transcriptions` |
 | `DELETE` | `/v1/audio/speakers/{name}` | Delete an enrolled speaker | `api/transcriptions` |

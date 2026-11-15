@@ -940,7 +940,7 @@ validated rather than silently replaced. See
 | `GET \| POST /v1/audio/speakers` | List or enrol named speakers |
 | `DELETE /v1/audio/speakers/{name}` | Remove an enrolled speaker |
 | `POST /v1/audio/speaker-identify` | Best-matching enrolled speaker, or `unknown` |
-| `POST /v1/audio/speaker-verify` | Verify a clip against one enrolled speaker |
+| `POST /v1/audio/speaker-verify` | Verify a clip against one enrolled speaker, or against a reference voiceprint the client holds |
 | `POST /v1/audio/stems` | Stem separation (Demucs) — vocals/instrumental or 4-stem |
 | `POST /v1/audio/cleanup` | Denoise / normalise / de-hum / de-click (DeepFilterNet) |
 | `POST /v1/audio/generate` | Music/SFX generation |

@@ -512,17 +512,66 @@ async def identify_speaker_endpoint(
                                      threshold=threshold if threshold is not None else 0.25)
 
 
-@router.post("/v1/audio/speaker-verify", summary="Verify a clip against an enrolled speaker")
+@router.post("/v1/audio/speaker-verify",
+             summary="Verify a clip against an enrolled speaker or a reference voiceprint")
 async def verify_speaker_endpoint(
     file: UploadFile = File(...),
-    name: str = Form(...),
+    name: Optional[str] = Form(None),
+    reference: Optional[str] = Form(None),
     backend: Optional[str] = Form("ecapa"),
     model: Optional[str] = Form(None),
     threshold: Optional[float] = Form(0.25),
 ):
-    """Verify whether the clip is the enrolled speaker ``name`` (same/different)."""
-    emb = await _embed_upload(file, backend, model)
+    """Verify whether the clip is the same speaker as a reference (same/different).
+
+    The reference is given one of two ways, exactly one of which must be present:
+
+    * ``name`` — an enrolled speaker (see ``POST /v1/audio/speakers``). The
+      voiceprint is looked up for the embedding backend the clip was embedded
+      with, so enrol and verify must use the same ``backend``.
+    * ``reference`` — a voiceprint the *client* holds, as JSON: a bare array, an
+      object with an ``embedding`` key, or the whole response
+      ``/v1/audio/speaker-embeddings`` gave. Nothing is stored and nothing needs
+      enrolling, which is what a caller keeping its own voiceprints wants.
+
+    A ``reference`` carries no record of which backend produced it, and vectors
+    from different backends are not comparable — a dimension mismatch is refused
+    with ``400``, but two same-dimension vectors from different models would
+    compare as noise, so the caller owns that pairing.
+    """
     from codai.api import speaker_registry
+    if (name is None or not name.strip()) and reference is None:
+        raise HTTPException(
+            status_code=400,
+            detail="one of 'name' (an enrolled speaker) or 'reference' "
+                   "(a voiceprint as JSON) is required")
+    if name is not None and name.strip() and reference is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="give either 'name' or 'reference', not both — they are two "
+                   "ways of naming the same reference voiceprint")
+
+    emb = await _embed_upload(file, backend, model)
+
+    if reference is not None:
+        try:
+            ref_vec = speaker_registry.parse_embedding(reference)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if len(ref_vec) != len(emb["embedding"]):
+            raise HTTPException(
+                status_code=400,
+                detail=f"reference has {len(ref_vec)} dimensions but backend "
+                       f"'{emb['backend']}' produced {len(emb['embedding'])} — the "
+                       f"reference was made by a different embedding model")
+        out = speaker_registry.verify(
+            emb["embedding"], ref_vec,
+            threshold=threshold if threshold is not None else 0.25)
+        out["reference"] = "vector"
+        out["backend"] = emb["backend"]
+        out["dim"] = len(ref_vec)
+        return out
+
     rec = speaker_registry.get(name, emb["backend"])
     if rec is None:
         raise HTTPException(status_code=404,
@@ -530,6 +579,8 @@ async def verify_speaker_endpoint(
     out = speaker_registry.verify(emb["embedding"], rec["embedding"],
                                   threshold=threshold if threshold is not None else 0.25)
     out["name"] = name
+    out["reference"] = "enrolled"
+    out["backend"] = emb["backend"]
     return out
 
 
