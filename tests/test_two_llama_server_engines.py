@@ -317,6 +317,27 @@ def test_the_build_script_passes_every_fork_arg():
     assert not [a for a in declared if f'{a}="${{{a}:-' not in sh]
 
 
+@pytest.mark.parametrize("flag,why", [
+    ('-DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda"',
+     "a devel container has no driver at BUILD time, so ggml's references to "
+     "the driver API are undefined and the link fails -- and -L alone is not "
+     "enough, the library has to be NAMED with -lcuda"),
+    ("-DBUILD_SHARED_LIBS=OFF",
+     "one file is copied into the image, so a shared build leaves "
+     "libggml-cuda.so behind and the baked binary dies on a missing library"),
+])
+def test_the_fork_build_carries_the_two_flags_it_cannot_work_without(flag, why):
+    """Both were learned the hard way, and both fail in ways that read as
+    success: the compile finishes and only the link dies, or the image builds
+    and the binary dies at startup. The fork build is non-fatal, so neither
+    would have failed an image build -- the engine would just have had no
+    binary."""
+    for df in (DOCKERFILE, UPDATE_LLAMA):
+        text = df.read_text()
+        i = text.index("BUILD_LLAMASRV_FORK}")
+        assert flag in text[i:i + 3000], f"{df.name} is missing {flag}: {why}"
+
+
 def test_each_baked_binary_carries_a_marker():
     for text in (DOCKERFILE.read_text(), UPDATE_LLAMA.read_text()):
         assert "BUILD_INFO" in text
