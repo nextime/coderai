@@ -170,6 +170,27 @@ would claim a target the image was not compiled for. Only the run-time settings 
 worker where its binary is through `CODERAI_LLAMASRV_BIN`; if that path is wrong the pod
 says so instead of failing later inside cmake.
 
+## Drafting: leave `spec_type` blank
+
+`spec_type` maps to `--spec-type`, and on llamAmpere **leaving it blank is the
+configuration**, not the absence of one. That tree's default is `auto`: it uses *the model's
+own built-in drafter with measured settings for its family*, and the help text is explicit
+that "any explicit value, including none, turns auto off".
+
+So for a GGUF that carries its own MTP head, setting `spec_type` to the thing you want
+*disables* the detection that would have chosen it. The accepted names are `draft-mtp`,
+`draft-mtp-adaptive`, `ngram-mod` and `none`; set one only to override what `auto` picked,
+or to turn drafting off.
+
+Whether a GGUF has that head is a property of the file, not of its name. The NextN block is
+the last layer's `nextn.*` tensors — for a 64-layer Qwen3.8-27B, `blk.64.nextn.eh_proj`,
+`enorm`, `hnorm` and `shared_head_norm` beside a full `blk.64` attention and FFN. A file
+whose publisher dropped it has no `blk.64` at all and drafts nothing, whatever the filename
+says; check the tensors.
+
+(`--mtp` is **not** this flag: in that tree it is a *download* option — fetch the MTP head
+if the repo has one — and is not accepted by the server.)
+
 ## VRAM eviction
 
 A `llama-server` holds the whole model in a **child process**, so it is the one engine whose
