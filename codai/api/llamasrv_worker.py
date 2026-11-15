@@ -478,7 +478,7 @@ def resolve_service_key(cfg, model_file: Optional[str] = None):
 
 
 def build_argv(cfg, binary, model_file: str, port: int, host: str, key: str,
-               ctx: Optional[int] = None) -> List[str]:
+               ctx: Optional[int] = None, mmproj: Optional[str] = None) -> List[str]:
     """The ``llama-server`` command line. Split out so a test can read it without
     building or launching anything."""
     cmd = [str(binary), "--host", host, "--port", str(port), "-m", model_file]
@@ -518,8 +518,23 @@ def build_argv(cfg, binary, model_file: str, port: int, host: str, key: str,
         cmd += ["--spec-draft-n-max", str(n_max)]
 
     extra = (getattr(cfg, "extra_args", "") or "").strip()
-    if extra:
-        cmd += shlex.split(extra)
+    extra_argv = shlex.split(extra) if extra else []
+
+    # The vision projector. A multimodal GGUF without it is a text model that
+    # accepts an image and describes nothing: the tower is a separate file, and
+    # llama-server loads it only when told. The model entry already names the
+    # file for the in-process path, so the same entry drives both and a model
+    # does not lose the ability to see by being pinned to this engine.
+    #
+    # Skipped when extra_args already names one, so an operator pointing at a
+    # different projector is not handed the flag twice -- llama-server takes the
+    # last one, which would silently beat the explicit override.
+    mm = (mmproj or "").strip()
+    if mm and not any(t in ("--mmproj", "-mm") for t in extra_argv):
+        cmd += ["--mmproj", mm]
+
+    if extra_argv:
+        cmd += extra_argv
     return cmd
 
 
@@ -533,7 +548,8 @@ def service_bearer(svc_key: str) -> str:
 def ensure_service(cfg, model_file: Optional[str] = None,
                    ctx: Optional[int] = None,
                    model_name: Optional[str] = None,
-                   ready_timeout: Optional[float] = None) -> Tuple[str, str]:
+                   ready_timeout: Optional[float] = None,
+                   mmproj: Optional[str] = None) -> Tuple[str, str]:
     """Build as needed, then start (or reuse) ``llama-server`` for this GGUF.
 
     Returns ``(base_url, bearer)``. The bearer is minted per launch unless one is
@@ -574,7 +590,7 @@ def ensure_service(cfg, model_file: Optional[str] = None,
         url = f"http://{connect_host}:{port}"
         key = (getattr(cfg, "api_key", "") or "").strip() or secrets.token_urlsafe(24)
 
-        cmd = build_argv(cfg, binary, resolved, port, host, key, ctx)
+        cmd = build_argv(cfg, binary, resolved, port, host, key, ctx, mmproj)
         env = os.environ.copy()
         applied = {}
         extra_env = (getattr(cfg, "extra_env", "") or "").strip()

@@ -107,7 +107,7 @@ class LlamaSrvBackend(VllmBackend):
             self._cfg, model_path)
         self._url, self._bearer = llamasrv_worker.ensure_service(
             self._cfg, model_file=model_path, ctx=(blk_ctx or _ctx or None),
-            model_name=model_name)
+            model_name=model_name, mmproj=self._resolve_mmproj(model_name))
 
     def _resolve_gguf(self, model_name: str) -> Optional[str]:
         """The local ``.gguf`` for this model, from the model list.
@@ -135,8 +135,22 @@ class LlamaSrvBackend(VllmBackend):
         direct = _usable(model_name)
         if direct:
             return direct
-        # Match the model-list entry by path/basename/alias/id, exactly as the
-        # vLLM proxy does, and take ITS path.
+        entry = self._entry_for(model_name)
+        if entry:
+            path = str(entry.get("path") or "").strip()
+            if path:
+                return _usable(path) or path
+        return None
+
+    def _entry_for(self, model_name: str) -> Optional[dict]:
+        """This model's models.json entry, matched by path/basename/alias/id.
+
+        Exactly the match the vLLM proxy does. Separated from the path lookup
+        because more than the path comes from the entry: the vision projector
+        does too, and deriving them from one matched entry is the only way they
+        cannot disagree about which model they describe.
+        """
+        import os
         try:
             from codai.admin.routes import config_manager
             md = getattr(config_manager, "models_data", {}) or {}
@@ -155,9 +169,35 @@ class LlamaSrvBackend(VllmBackend):
                              str(m.get("alias") or "").lower(),
                              str(m.get("id") or "").lower()}
                     if name_l in names:
-                        return _usable(path) or path
+                        return m
         except Exception:
             pass
+        return None
+
+    def _resolve_mmproj(self, model_name: str) -> Optional[str]:
+        """The vision projector for this model, if it has one that exists.
+
+        A multimodal GGUF whose projector is never loaded is a text model that
+        accepts an image and describes nothing -- it answers, plausibly, about
+        nothing it was shown. So this is read from the same entry the in-process
+        path reads, and a model keeps its sight when it is pinned here.
+
+        A declared-but-missing file is skipped with a line in the log rather than
+        passed through: llama-server refuses to start without it, which would
+        turn 'no vision' into 'no model'.
+        """
+        import os
+        entry = self._entry_for(model_name)
+        if not entry:
+            return None
+        mm = str(entry.get("mmproj") or "").strip()
+        if not mm:
+            return None
+        mm = os.path.expanduser(mm)
+        if os.path.isfile(mm):
+            return os.path.abspath(mm)
+        print(f"[llamasrv] {model_name}: mmproj {mm!r} is declared but not on disk; "
+              "serving without vision rather than refusing to start", flush=True)
         return None
 
     def cleanup(self) -> None:

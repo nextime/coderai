@@ -191,6 +191,34 @@ says; check the tensors.
 (`--mtp` is **not** this flag: in that tree it is a *download* option — fetch the MTP head
 if the repo has one — and is not accepted by the server.)
 
+## Vision: the projector comes from the model entry
+
+llama.cpp loads a vision tower only when told, so a multimodal GGUF served without
+`--mmproj` is a text model that accepts an image and describes **nothing** — it answers,
+plausibly, about nothing it was shown. The projector is therefore read from the model's own
+`mmproj` field, the same one the in-process path reads, and a model does not lose its sight
+by being pinned to this engine.
+
+- A declared-but-missing file is **skipped with a log line**, not passed through:
+  `llama-server` refuses to start without it, which would turn "no vision" into "no model".
+- An `--mmproj` (or `-mm`) already in `extra_args` wins, and ours is not added. The server
+  takes the last one it is given, so appending ours would silently beat the override.
+- **To serve a multimodal GGUF as text-only, clear the entry's `mmproj`** (and drop
+  `image_to_text` from its `capabilities`, or `/v1/models` keeps advertising a vision model
+  and clients will send images to it).
+
+That last one is a real decision on a 24 GB card, because the projector and the context
+window compete for the same memory. At `q8_0` KV a 27B Qwen3.8 costs ~36 KiB/token, so:
+
+| projector | VRAM | context it costs |
+|---|---:|---:|
+| f16, ~0.9 GB | 884 MiB | ~25,000 tokens |
+| F32, ~1.8 GB | 1757 MiB | ~50,000 tokens |
+
+A coding model at a long context is usually better served without the tower; a model that
+is actually sent images should give up the context instead. The same conversion at f16
+rather than F32 halves the cost, which is worth checking before giving up 50K tokens.
+
 ## VRAM eviction
 
 A `llama-server` holds the whole model in a **child process**, so it is the one engine whose
