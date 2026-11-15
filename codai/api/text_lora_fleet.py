@@ -76,6 +76,10 @@ class TrainerPodSpec:
     data_center_id: str = ""
     registry_auth_id: str = ""
     hourly_usd: float = 0.0          # estimate, for the cap arithmetic
+    #: Refuse any single pod priced above this. A per-POD ceiling: it is what
+    #: stops a capacity search from "helpfully" landing on an H100 at six times
+    #: the rate because the A40s were full.
+    max_pod_hourly_usd: float = 0.0  # 0 = no per-pod ceiling
     max_silence_s: float = DEFAULT_MAX_SILENCE_S
     max_lifetime_s: float = DEFAULT_MAX_LIFETIME_S
 
@@ -181,14 +185,21 @@ class TrainerFleet:
 
     def __init__(self, client, job_id: str, spec: TrainerPodSpec, *,
                  ledger_key: str = "text-lora", port: int = 8000,
+                 max_fleet_hourly_usd: float = 0.0,
                  budget_check: Optional[Callable[[float], str]] = None,
                  on_event: Optional[Callable[[str], None]] = None):
+        """``max_fleet_hourly_usd`` caps the WHOLE fleet's rate; the spec's
+        ``max_pod_hourly_usd`` caps each pod. They are different limits and a
+        run usually wants both: one bounds the bill, the other bounds the
+        surprise. Zero means no ceiling of that kind, and ``budget_check``
+        (the account-wide caps) is consulted on top of both."""
         self.client = client
         self.job_id = job_id
         self.spec = spec
         self.ledger_key = ledger_key
         self.port = int(port)
         self._budget_check = budget_check
+        self.max_fleet_hourly_usd = float(max_fleet_hourly_usd or 0.0)
         self._on_event = on_event
         self.pods: Dict[int, TrainerPod] = {}
         self._lock = threading.RLock()
@@ -240,16 +251,38 @@ class TrainerFleet:
             with self._lock:
                 if shard in self.pods:
                     continue
-            if self._budget_check is not None:
+            reason = self._refusal_for_one_more()
+            if not reason and self._budget_check is not None:
                 reason = self._budget_check(float(self.spec.hourly_usd or 0.0))
-                if reason:
-                    self._say(f"stopping at {len(started)} pod(s): {reason}")
-                    break
+            if reason:
+                self._say(f"stopping at {len(started)} pod(s): {reason}")
+                break
             pod = self._rent_one(shard)
             if pod is None:
                 break
             started.append(pod)
         return started
+
+    def _refusal_for_one_more(self) -> str:
+        """Why one more pod may not be rented, or ''.
+
+        Checked BEFORE the create call, because a cap discovered afterwards has
+        already been exceeded and the pod is already billing.
+        """
+        rate = float(self.spec.hourly_usd or 0.0)
+        pod_cap = float(self.spec.max_pod_hourly_usd or 0.0)
+        if pod_cap > 0 and rate > pod_cap + 1e-9:
+            return (f"a pod at ${rate:.2f}/hr is over the ${pod_cap:.2f}/hr "
+                    f"per-pod ceiling")
+        fleet_cap = self.max_fleet_hourly_usd
+        if fleet_cap > 0:
+            after = self.hourly_rate() + rate
+            if after > fleet_cap + 1e-9:
+                have = len(self.pods)
+                return (f"{have} pod(s) at ${self.hourly_rate():.2f}/hr; one more "
+                        f"would reach ${after:.2f}/hr, over the ${fleet_cap:.2f}/hr "
+                        f"fleet ceiling")
+        return ""
 
     def _rent_one(self, shard: int) -> Optional[TrainerPod]:
         env = dict(self.spec.env or {})

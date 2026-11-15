@@ -258,3 +258,93 @@ def test_the_cost_recorded_is_the_time_actually_rented():
     f.pods[0].started_at = _t.time() - 3600       # one hour ago
     cost = f.pods[0].cost_so_far()
     assert cost == pytest.approx(3.6, rel=0.01)
+
+
+# ------------------------------------------------- the two hourly ceilings ---
+#
+# They are different limits and a run wants both: one bounds the bill, the other
+# bounds the surprise. $0.90/hr means something quite different as a fleet total
+# (one or two A40s, a day-scale run) than as a per-pod maximum (as many pods as
+# the account caps allow), which is why neither is inferred from the other.
+
+def test_a_fleet_ceiling_bounds_the_whole_bill():
+    """0.90/hr total against 0.45/hr pods: two pods, and the third is refused
+    before it is rented."""
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc", _spec(hourly_usd=0.45),
+                         max_fleet_hourly_usd=0.90)
+    got = f.provision([0, 1, 2, 3])
+    assert len(got) == 2, "0.45 + 0.45 = 0.90 exactly; a third would exceed it"
+    assert len(c.created) == 2
+    assert f.hourly_rate() == pytest.approx(0.90)
+
+
+def test_the_fleet_ceiling_is_not_exceeded_by_a_rounding_error():
+    """Exactly reaching the cap is allowed; a cent over is not."""
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc", _spec(hourly_usd=0.30),
+                         max_fleet_hourly_usd=0.90)
+    assert len(f.provision([0, 1, 2, 3])) == 3
+    assert f.hourly_rate() == pytest.approx(0.90)
+
+
+def test_a_per_pod_ceiling_refuses_an_expensive_card():
+    """What stops a capacity search landing on an H100 at six times the rate
+    because the A40s were full."""
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc",
+                         _spec(hourly_usd=2.69, max_pod_hourly_usd=0.90))
+    assert f.provision([0]) == []
+    assert c.created == [], "refused before anything was rented"
+
+
+def test_a_per_pod_ceiling_allows_as_many_as_the_account_permits():
+    """The other reading of the same number: 0.90 per POD, no fleet total."""
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc",
+                         _spec(hourly_usd=0.45, max_pod_hourly_usd=0.90))
+    assert len(f.provision([0, 1, 2, 3, 4, 5])) == 6
+
+
+def test_both_ceilings_apply_together():
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc",
+                         _spec(hourly_usd=0.45, max_pod_hourly_usd=0.90),
+                         max_fleet_hourly_usd=0.90)
+    assert len(f.provision([0, 1, 2])) == 2
+
+
+def test_the_refusal_says_which_ceiling_and_what_the_numbers_were():
+    """A log line reading 'budget' tells an operator nothing about which knob
+    to turn."""
+    msgs = []
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc", _spec(hourly_usd=0.45),
+                         max_fleet_hourly_usd=0.90,
+                         on_event=msgs.append)
+    f.provision([0, 1, 2])
+    joined = " ".join(msgs)
+    assert "fleet ceiling" in joined and "$0.90" in joined and "$1.35" in joined
+
+
+def test_the_account_caps_still_apply_on_top():
+    """The per-fleet and per-pod ceilings are extra, not a replacement: the
+    account's own $/hr and spend caps refuse regardless of what a job asks."""
+    c = FakeClient()
+    f = flt.TrainerFleet(c, "job-abc", _spec(hourly_usd=0.10),
+                         max_fleet_hourly_usd=100.0,
+                         budget_check=lambda rate: "global spend cap reached")
+    assert f.provision([0]) == []
+
+
+def test_adopted_pods_count_against_the_fleet_ceiling():
+    """A restarted orchestrator must not rent a second fleet on top of the one
+    it already has running."""
+    c = FakeClient()
+    first = flt.TrainerFleet(c, "job-abc", _spec(hourly_usd=0.45),
+                             max_fleet_hourly_usd=0.90)
+    first.provision([0, 1])
+    second = flt.TrainerFleet(FakeClient(), "job-abc", _spec(hourly_usd=0.45),
+                              max_fleet_hourly_usd=0.90)
+    assert sorted(second.pods) == [0, 1]
+    assert second.provision([2, 3]) == [], "already at the ceiling on adoption"
