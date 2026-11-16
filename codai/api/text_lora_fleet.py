@@ -68,7 +68,11 @@ class TrainerPodSpec:
     """What a training pod is: an image, a command, and the money it may cost."""
 
     image: str
-    gpu_type_id: str
+    #: Ranked candidates, cheapest first. A list because RunPod capacity moves:
+    #: the card that was free when the catalogue was read is often gone by the
+    #: time the pod is requested, and a single choice turns that into a failed
+    #: job instead of the next-cheapest card.
+    gpu_types: List[str] = dataclasses.field(default_factory=list)
     start_cmd: Optional[List[str]] = None
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -317,10 +321,38 @@ class TrainerFleet:
         with self._lock:
             self.pods[shard] = placeholder
         self._flush()
-        try:
-            pod_id = self.client.create_pod(
+        pod_id = None
+        last_error = ""
+        for gpu in (self.spec.gpu_types or [""]):
+            try:
+                pod_id = self._create(shard, gpu, env)
+                break
+            except Exception as exc:
+                last_error = f"{gpu}: {exc}"
+                self._say(f"shard {shard}: {gpu} unavailable ({exc}); "
+                          f"trying the next card")
+        if pod_id is None:
+            with self._lock:
+                self.pods.pop(shard, None)
+            self._flush()
+            self._say(f"shard {shard}: no candidate card could be rented "
+                      f"({last_error})")
+            return None
+        with self._lock:
+            placeholder.pod_id = str(pod_id)
+            placeholder.secret = secret
+            pod = placeholder
+        self._flush()
+        self._say(f"shard {shard}: pod {pod_id} rented "
+                  f"(~${self.spec.hourly_usd:.2f}/hr)")
+        return pod
+
+    def _create(self, shard: int, gpu: str, env: Dict[str, str]) -> str:
+        """One create call for one candidate card."""
+        if True:
+            return self.client.create_pod(
                 name=f"coderai-train-{self.job_id}-s{shard}",
-                image=self.spec.image, gpu_type_id=self.spec.gpu_type_id,
+                image=self.spec.image, gpu_type_id=gpu,
                 port=self.port, cloud_type=self.spec.cloud_type,
                 container_disk_gb=self.spec.container_disk_gb,
                 volume_gb=self.spec.volume_gb,
@@ -333,20 +365,6 @@ class TrainerFleet:
                 # round, and the proxy hostname is behind Cloudflare with a
                 # 100 s idle limit and a body cap.
                 direct_tcp=True)
-        except Exception as exc:
-            with self._lock:
-                self.pods.pop(shard, None)
-            self._flush()
-            self._say(f"shard {shard}: RunPod refused the pod: {exc}")
-            return None
-        with self._lock:
-            placeholder.pod_id = str(pod_id)
-            placeholder.secret = secret
-            pod = placeholder
-        self._flush()
-        self._say(f"shard {shard}: pod {pod_id} rented "
-                  f"(~${self.spec.hourly_usd:.2f}/hr)")
-        return pod
 
     def address(self, shard: int, *, timeout: float = 1800.0) -> str:
         """Wait for this pod to publish its ip:port, and remember it.
@@ -479,10 +497,17 @@ class LoraTrainConfig:
     #: `lora_train_base_model` -- train against this, serve with that. Blank
     #: falls back to the entry's own path or id.
     base_model: str = ""
-    #: Which card, as RunPod names it ("NVIDIA A40"). Not a list: a fleet whose
-    #: pods are different cards averages rounds of unequal length, and the
-    #: slowest card then sets the pace for everyone.
-    gpu_type_id: str = ""
+    #: The floor, in GB. Any card with at least this much VRAM is acceptable,
+    #: and the cheapest eligible one is tried first. A fleet of unequal cards
+    #: is fine here precisely because of how rounds end: a round closes on its
+    #: deadline with whoever arrived, and the average is weighted by the
+    #: examples each pod actually trained -- so a slower card contributes less
+    #: rather than holding up everyone else.
+    min_vram_gb: float = 0.0
+    #: An optional allow-list, as RunPod names them, comma-separated. Empty
+    #: means "any card that meets the floor". Narrowing only: a card named here
+    #: that is under the floor or over the ceiling is still refused.
+    gpu_types: str = ""
     cloud_type: str = "SECURE"
     image: str = "ghcr.io/nextime/coderai-trainer-text:latest"
     pods: int = 1                     # how many shards the operator permits
@@ -521,7 +546,7 @@ def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
         try:
             if f.type is bool or f.name == "enabled":
                 setattr(cfg, f.name, bool(raw))
-            elif f.name in ("gpu_type_id", "cloud_type", "image",
+            elif f.name in ("gpu_types", "cloud_type", "image",
                             "network_volume_id", "base_model"):
                 setattr(cfg, f.name, str(raw or "").strip())
             elif f.name in ("pods", "rounds", "container_disk_gb", "rank",
@@ -728,3 +753,54 @@ class Stages:
                 # almost never the one anyone guessed.
                 "slowest": (max(self.rows, key=lambda r: r["seconds"])["stage"]
                             if self.rows else None)}
+
+
+def eligible_cards(client, cfg: LoraTrainConfig, *,
+                   ceiling: float = 0.0) -> List[Dict[str, Any]]:
+    """Cards that meet the VRAM floor and the price ceiling, cheapest first.
+
+    Read from RunPod's own catalogue, so the ceiling binds on what is actually
+    charged rather than on a number someone wrote down. Returned ranked because
+    capacity moves: the cheapest eligible card is frequently sold out, and the
+    next one down is a better answer than a failed job.
+
+    A card the catalogue does not price is EXCLUDED when a ceiling is set --
+    renting an unpriced card under a price ceiling is renting blind.
+    """
+    want_secure = (cfg.cloud_type or "SECURE").strip().upper() != "COMMUNITY"
+    allow = {c.strip().lower() for c in (cfg.gpu_types or "").split(",")
+             if c.strip()}
+    floor = float(cfg.min_vram_gb or 0.0)
+    out: List[Dict[str, Any]] = []
+    for g in (client.list_gpu_types() or []):
+        gid = str(g.get("id") or "").strip()
+        if not gid:
+            continue
+        if allow and gid.lower() not in allow:
+            continue
+        try:
+            vram = float(g.get("memory_gb") or 0)
+        except (TypeError, ValueError):
+            vram = 0.0
+        if floor > 0 and vram < floor:
+            continue
+        price = g.get("secure_price") if want_secure else g.get("community_price")
+        if price is None:
+            price = g.get("on_demand_price")
+        if price is None:
+            if ceiling > 0:
+                continue
+            price = 0.0
+        if ceiling > 0 and float(price) > ceiling + 1e-9:
+            continue
+        out.append({"id": gid, "vram_gb": vram, "hourly_usd": float(price)})
+    out.sort(key=lambda c: (c["hourly_usd"], -c["vram_gb"]))
+    return out
+
+
+def describe_cards(cards: Sequence[Dict[str, Any]]) -> str:
+    """One line naming what was chosen and what it costs."""
+    if not cards:
+        return "no eligible card"
+    return ", ".join(f"{c['id']} ({c['vram_gb']:.0f}GB ${c['hourly_usd']:.2f}/hr)"
+                     for c in cards[:6]) + ("…" if len(cards) > 6 else "")

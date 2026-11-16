@@ -168,7 +168,7 @@ def two_pods(monkeypatch, tmp_path):
     for p in pods:
         p.url = p.start()
     client = FakeRunpod(pods)
-    spec = flt.TrainerPodSpec(image="img", gpu_type_id="NVIDIA A40",
+    spec = flt.TrainerPodSpec(image="img", gpu_types=["NVIDIA A40"],
                               hourly_usd=0.45, max_pod_hourly_usd=0.90)
     fleet = flt.TrainerFleet(client, "job-p", spec)
     for pod in pods:
@@ -281,7 +281,7 @@ def test_a_failed_round_is_visible_in_status(two_pods):
     try:
         client = FakeRunpod(pods)
         fleet = flt.TrainerFleet(client, "job-f",
-                                 flt.TrainerPodSpec(image="i", gpu_type_id="g"))
+                                 flt.TrainerPodSpec(image="i", gpu_types=["g"]))
         fleet.provision([0])
         pods[0].secret = fleet.pods[0].secret
         fleet.address(0)
@@ -308,7 +308,7 @@ def test_a_pod_that_never_publishes_a_port_is_released_not_awaited(two_pods):
 
     client = Never(two_pods["pods"])
     fleet = flt.TrainerFleet(client, "job-n",
-                             flt.TrainerPodSpec(image="i", gpu_type_id="g"))
+                             flt.TrainerPodSpec(image="i", gpu_types=["g"]))
     fleet.provision([0])
     with pytest.raises(RuntimeError):
         fleet.address(0)

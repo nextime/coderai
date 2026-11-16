@@ -19,7 +19,7 @@ from codai.api import loras
 from codai.api import text_lora_fleet as flt
 
 
-BLOCK = {"enabled": True, "gpu_type_id": "NVIDIA A40", "cloud_type": "SECURE",
+BLOCK = {"enabled": True, "min_vram_gb": 48, "cloud_type": "SECURE",
          "image": "ghcr.io/nextime/coderai-trainer-text:v0.27.1",
          "pods": 4, "rounds": 6, "max_pod_hourly_usd": 0.90,
          "max_fleet_hourly_usd": 3.60, "container_disk_gb": 150}
@@ -29,7 +29,7 @@ BLOCK = {"enabled": True, "gpu_type_id": "NVIDIA A40", "cloud_type": "SECURE",
 
 def test_a_models_block_becomes_the_configuration():
     c = flt.parse_model_lora_train(BLOCK)
-    assert c.enabled and c.gpu_type_id == "NVIDIA A40" and c.pods == 4
+    assert c.enabled and c.min_vram_gb == 48 and c.pods == 4
     assert c.max_pod_hourly_usd == 0.90 and c.container_disk_gb == 150
     assert c.image.endswith(":v0.27.1")
 
@@ -49,7 +49,7 @@ def test_an_unknown_key_is_ignored_not_fatal():
 def test_a_malformed_value_keeps_the_default_rather_than_crashing():
     """An operator typo in one field must not make the model untrainable."""
     c = flt.parse_model_lora_train({**BLOCK, "pods": "four"})
-    assert c.pods == 1 and c.gpu_type_id == "NVIDIA A40"
+    assert c.pods == 1 and c.min_vram_gb == 48
 
 
 # ----------------------------------------------------------- the narrowing ---
@@ -103,7 +103,7 @@ def test_nothing_in_the_request_can_name_a_card_an_image_or_a_url():
     """The structural guarantee: those fields do not exist on the request, so
     no amount of client creativity reaches them."""
     fields = set(loras.TextLoraTrainRequest.model_fields)
-    for forbidden in ("gpu_type_id", "cloud_type", "pod_image", "image",
+    for forbidden in ("min_vram_gb", "gpu_types", "cloud_type", "image",
                       "callback_url", "network_volume_id", "container_disk_gb",
                       "pod_max_lifetime_s"):
         assert forbidden not in fields, f"{forbidden} is settable by a request"
@@ -179,7 +179,7 @@ def test_the_money_fields_are_on_the_page():
     """The whole point of moving this out of the request: an operator can see
     and set the ceiling."""
     keys = {key for _sfx, key in _lt_fields()}
-    assert {"max_pod_hourly_usd", "max_fleet_hourly_usd", "gpu_type_id",
+    assert {"max_pod_hourly_usd", "max_fleet_hourly_usd", "min_vram_gb",
             "image", "pods"} <= keys
 
 
@@ -187,3 +187,68 @@ def test_an_off_block_is_absent_rather_than_full_of_defaults():
     """An absent block is how a model says 'not trainable on rented GPUs'.
     Writing one full of zeros would make every model look configured."""
     assert "if (!enabled) return null;" in _models_html()
+
+
+# ------------------------------------------------- choosing a card by VRAM ---
+
+class _Catalogue:
+    def list_gpu_types(self):
+        return [{"id": "NVIDIA A40", "memory_gb": 48, "secure_price": 0.44,
+                 "community_price": 0.35},
+                {"id": "NVIDIA L40S", "memory_gb": 48, "secure_price": 0.86},
+                {"id": "NVIDIA RTX 6000 Ada", "memory_gb": 48, "secure_price": 0.77},
+                {"id": "NVIDIA H100 PCIe", "memory_gb": 80, "secure_price": 2.69},
+                {"id": "NVIDIA RTX 4090", "memory_gb": 24, "secure_price": 0.34},
+                {"id": "NVIDIA A100 40GB", "memory_gb": 40, "secure_price": 0.80},
+                {"id": "NVIDIA UNPRICED", "memory_gb": 48}]
+
+
+def _cards(**kw):
+    cfg = flt.LoraTrainConfig(**{"min_vram_gb": 48, **kw})
+    return flt.eligible_cards(_Catalogue(), cfg,
+                              ceiling=kw.pop("ceiling", 0.90)
+                              if "ceiling" in kw else 0.90)
+
+
+def test_a_vram_floor_excludes_smaller_cards():
+    ids = [c["id"] for c in _cards()]
+    assert "NVIDIA RTX 4090" not in ids, "24 GB is under the floor"
+    assert "NVIDIA A100 40GB" not in ids, "40 GB is under a 48 GB floor"
+
+
+def test_the_price_ceiling_excludes_the_expensive_ones():
+    ids = [c["id"] for c in _cards()]
+    assert "NVIDIA H100 PCIe" not in ids, "$2.69 is over a $0.90 ceiling"
+
+
+def test_the_cheapest_eligible_card_is_first():
+    """Ranked, not picked: capacity moves, and the next-cheapest card is a
+    better answer than a failed job."""
+    cards = _cards()
+    assert [c["id"] for c in cards] == ["NVIDIA A40", "NVIDIA RTX 6000 Ada",
+                                        "NVIDIA L40S"]
+    assert cards[0]["hourly_usd"] == 0.44
+
+
+def test_an_unpriced_card_is_excluded_when_a_ceiling_is_set():
+    """Renting a card the catalogue cannot price, under a price ceiling, is
+    renting blind."""
+    assert "NVIDIA UNPRICED" not in [c["id"] for c in _cards()]
+
+
+def test_an_allow_list_narrows_but_cannot_widen():
+    cfg = flt.LoraTrainConfig(min_vram_gb=48,
+                              gpu_types="NVIDIA L40S, NVIDIA RTX 4090, NVIDIA H100 PCIe")
+    ids = [c["id"] for c in flt.eligible_cards(_Catalogue(), cfg, ceiling=0.90)]
+    assert ids == ["NVIDIA L40S"], "the 4090 is under the floor, the H100 over the ceiling"
+
+
+def test_community_pricing_is_used_when_asked_for():
+    cfg = flt.LoraTrainConfig(min_vram_gb=48, cloud_type="COMMUNITY")
+    cards = flt.eligible_cards(_Catalogue(), cfg, ceiling=0.90)
+    assert cards[0]["id"] == "NVIDIA A40" and cards[0]["hourly_usd"] == 0.35
+
+
+def test_no_eligible_card_is_an_empty_list_not_a_guess():
+    cfg = flt.LoraTrainConfig(min_vram_gb=200)
+    assert flt.eligible_cards(_Catalogue(), cfg, ceiling=0.90) == []

@@ -3671,29 +3671,24 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
 
     n_shards = max(1, int(cfg.pods or 1))
     rounds = max(1, int(cfg.rounds or 1))
-    gpu = (cfg.gpu_type_id or "").strip()
-    if not gpu:
-        raise RuntimeError(
-            f"{req.base_model!r}: set lora_train.gpu_type_id on the Models "
-            "page (e.g. 'NVIDIA A40')")
     cloud = (cfg.cloud_type or "SECURE").strip().upper()
+    ceiling = float(cfg.max_pod_hourly_usd or 0.0)
 
     client = rpc.RunpodClient(account)
-    price = _price_for(client, gpu, cloud)
-    ceiling = float(cfg.max_pod_hourly_usd or 0.0)
-    if price is None:
-        if ceiling > 0:
-            raise RuntimeError(
-                f"the GPU catalogue did not price {gpu!r}, so the "
-                f"${ceiling:.2f}/hr per-pod ceiling cannot be enforced — "
-                "refusing rather than renting blind")
-        price = 0.0
-    elif ceiling > 0 and price > ceiling + 1e-9:
+    # Any card that meets the VRAM floor and the ceiling, cheapest first. A
+    # ranked list rather than one choice because capacity moves: the cheapest
+    # eligible card is often sold out by the time the pod is requested.
+    cards = flt.eligible_cards(client, cfg, ceiling=ceiling)
+    if not cards:
         raise RuntimeError(
-            f"{gpu} costs ${price:.2f}/hr {cloud}, over the ${ceiling:.2f}/hr "
-            f"per-pod ceiling — nothing was rented")
-    print(f"[text-lora] {job_id}: {gpu} at ${price:.2f}/hr {cloud}, "
-          f"{n_shards} pod(s), {rounds} round(s)", flush=True)
+            f"no RunPod card has >= {cfg.min_vram_gb:.0f} GB at or under "
+            f"${ceiling:.2f}/hr {cloud}"
+            + (f" within {cfg.gpu_types}" if cfg.gpu_types else "")
+            + " — raise the ceiling, lower the floor, or allow COMMUNITY")
+    price = cards[0]["hourly_usd"]
+    print(f"[text-lora] {job_id}: {n_shards} pod(s), {rounds} round(s), "
+          f"{cloud}, >= {cfg.min_vram_gb:.0f}GB at <= ${ceiling:.2f}/hr; "
+          f"candidates: {flt.describe_cards(cards)}", flush=True)
 
     out_dir = os.path.join(_loras_dir(), req.name)
     plan = tlr.RoundPlan(n_shards=n_shards, seed=settings.seed)
@@ -3702,7 +3697,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         min_fraction=0.75,
         deadline_s=max(60.0, float(cfg.poll_interval_s or 20.0) * 60))
     spec = flt.TrainerPodSpec(
-        image=cfg.image, gpu_type_id=gpu, cloud_type=cloud, hourly_usd=price,
+        image=cfg.image, gpu_types=[c["id"] for c in cards],
+        cloud_type=cloud, hourly_usd=price,
         max_pod_hourly_usd=ceiling,
         container_disk_gb=int(cfg.container_disk_gb or 120),
         network_volume_id=(cfg.network_volume_id or ""),
@@ -3833,7 +3829,7 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
               f"adapter at {adapter}", flush=True)
         stages.done("adapter", path=adapter)
         return {"rounds": rounds, "shards": n_shards,
-                "gpu": gpu, "hourly_usd": price,
+                "cards": [c["id"] for c in cards[:6]], "hourly_usd": price,
                 "examples": stats.examples, "path": out_dir,
                 "adapter": adapter, "test_run": bool(req.test_run),
                 # What the run cost in time, stage by stage. On a first run the

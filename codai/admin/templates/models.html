@@ -1846,11 +1846,20 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               else — an AWQ checkpoint or a pod-served model cannot be a QLoRA base.
               Blank trains this model's own path.</span>
           </div>
+          <div class="form-group" style="flex:1;min-width:150px">
+            <label class="form-label">Min VRAM (GB)</label>
+            <input type="number" id="cfg-lt-vram" class="form-input" min="0" placeholder="48">
+            <span class="form-hint">Any card with at least this much is accepted; the
+              cheapest eligible one is tried first, then the next — capacity moves.</span>
+          </div>
           <div class="form-group" style="flex:2;min-width:200px">
-            <label class="form-label">GPU type</label>
-            <input type="text" id="cfg-lt-gpu" class="form-input" placeholder="NVIDIA A40">
-            <span class="form-hint">As RunPod names it. One card, not a list: a fleet of
-              different cards averages rounds of unequal length and the slowest sets the pace.</span>
+            <label class="form-label">Allowed cards <span class="muted">(optional)</span></label>
+            <input type="text" id="cfg-lt-gputypes" class="form-input"
+              placeholder="(any that meets the floor)">
+            <span class="form-hint">Comma-separated, as RunPod names them. Narrowing only:
+              a card named here that is under the floor or over the ceiling is still refused.
+              Unequal cards are fine — a round closes on its deadline and the average is
+              weighted by what each pod actually trained.</span>
           </div>
           <div class="form-group" style="flex:1;min-width:140px">
             <label class="form-label">Cloud</label>
@@ -4860,7 +4869,8 @@ async //: The model's `lora_train` block. One prefix-driven pair, read and writt
 //: looks exactly like one that did not save.
 const _LT_FIELDS = [
   ['base',     'base_model',           'text',   ''],
-  ['gpu',      'gpu_type_id',          'text',   ''],
+  ['vram',     'min_vram_gb',          'float',  0],
+  ['gputypes', 'gpu_types',            'text',   ''],
   ['cloud',    'cloud_type',           'text',   'SECURE'],
   ['pods',     'pods',                 'int',    1],
   ['rounds',   'rounds',               'int',    1],

@@ -51,7 +51,7 @@ def _store(monkeypatch, tmp_path):
 
 
 def _spec(**kw):
-    base = dict(image="ghcr.io/x/trainer:v1", gpu_type_id="NVIDIA A40",
+    base = dict(image="ghcr.io/x/trainer:v1", gpu_types=["NVIDIA A40"],
                 start_cmd=["python3", "-m", "trainer"], hourly_usd=0.45)
     base.update(kw)
     return flt.TrainerPodSpec(**base)
