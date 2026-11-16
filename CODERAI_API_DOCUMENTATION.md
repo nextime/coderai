@@ -2257,6 +2257,31 @@ all. A weight of `0` drops the example.
 dataset whose keys are called something else is not regenerated to be trainable — and a
 renaming pass over hundreds of megabytes is a chance to corrupt it.
 
+### Distributed, on rented GPUs
+
+`lora_train` on the model's entry (the Models page) turns this on: card, image, pod count,
+rounds and the `$/hr` ceilings are the **operator's** configuration, not the request's — the
+same rule `/v1/runpod/scale` states for itself. A request may only narrow it: fewer pods, a
+lower ceiling, more or fewer rounds.
+
+The orchestrator **drives**. There is no callback URL and there are no pod-facing endpoints:
+a pod is rented with a direct TCP mapping, and coderai pushes the dataset once, pushes each
+round's slice and starting adapter, polls the pod's own `/status`, and pulls the finished
+adapter. Direct TCP rather than the RunPod proxy because that hostname is behind Cloudflare,
+with a 100 s idle limit and a body cap that a 160 MB adapter would meet.
+
+Each pod trains its own shard for a round and the rounds are averaged here, weighted by the
+examples each pod actually trained — periodic averaging (local SGD), not an all-reduce per
+step, because pods in different datacenters cannot address one another. Over a full cycle a
+pod sees its whole shard exactly once, so the round length is a throughput decision rather
+than a correctness one.
+
+Liveness is the work: `/status` reports the round and the step, so a pod stuck at step 40
+for an hour is distinguishable from one that is gone. A round still closes on its deadline
+with the shards that arrived, because waiting for every pod is how one dead pod stalls a
+fleet. Pod ids are written to disk before the pod exists and removed only once it is
+terminated, so a crashed orchestrator can still find what it left running.
+
 ### Request fields
 
 | Field | Type | Default | Description |
@@ -3189,7 +3214,7 @@ print(response.choices[0].message.content)
 
 ## Endpoint Index
 
-Every HTTP route the server defines — **265** of them — generated from the
+Every HTTP route the server defines — **260** of them — generated from the
 decorators in `codai/` by [`tools/gen_endpoint_index.py`](tools/gen_endpoint_index.py).
 `Source` names the module(s) that own the route: one owned by `frontproxy/*` is served
 by the torch-free front, one owned by `api/*` by an engine process, and a route listed
@@ -3272,16 +3297,11 @@ They are still part of the HTTP surface, which is why they are listed here.
 | `GET` | `/v1/loras/blob/{hash}` | Check an uploaded LoRA blob exists | `api/loras` |
 | `POST` | `/v1/loras/datasets` | Upload a training dataset (content-addressed) | `api/loras` |
 | `GET` | `/v1/loras/datasets/{ident}` | Check an uploaded dataset exists | `api/loras` |
-| `GET` | `/v1/loras/datasets/{ident}/content` | Fetch an uploaded dataset (pod-facing) | `api/loras` |
 | `POST` | `/v1/loras/jobs/{job_id}/cancel` | Cancel a training job | `api/loras` |
 | `GET` | `/v1/loras/progress` | LoRA training progress | `api/loras` |
 | `POST` | `/v1/loras/register` | Serve an uploaded adapter under its own name | `api/loras` |
 | `POST` | `/v1/loras/train` | Train a new LoRA | `api/loras` |
 | `POST` | `/v1/loras/train/text` | Train a text (causal-LM) LoRA | `api/loras` |
-| `POST` | `/v1/loras/train/text/{job_id}/round` | A training pod hands in its adapter (pod-facing) | `api/loras` |
-| `GET` | `/v1/loras/train/text/{job_id}/round/{rnd}/adapter` | A training pod fetches the averaged adapter (pod-facing) | `api/loras` |
-| `GET` | `/v1/loras/train/text/{job_id}/runner` | The script a training pod runs (pod-facing) | `api/loras` |
-| `GET` | `/v1/loras/train/text/{job_id}/shard` | A training pod asks what to train (pod-facing) | `api/loras` |
 | `POST` | `/v1/loras/upload` | Upload LoRA weights (content-addressed) | `api/loras` |
 | `GET` | `/v1/loras/{name}` | Get a registered LoRA | `api/loras` |
 | `DELETE` | `/v1/loras/{name}` | Delete a registered LoRA | `api/loras` |

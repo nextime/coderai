@@ -1839,6 +1839,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       </div>
       <div id="cfg-lora-train-fields" style="display:none">
         <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+          <div class="form-group" style="flex:2;min-width:240px">
+            <label class="form-label">Training base <span class="muted">(optional)</span></label>
+            <input type="text" id="cfg-lt-base" class="form-input" placeholder="e.g. Qwen/Qwen3.8-27B">
+            <span class="form-hint">What to TRAIN, when this entry serves something
+              else — an AWQ checkpoint or a pod-served model cannot be a QLoRA base.
+              Blank trains this model's own path.</span>
+          </div>
           <div class="form-group" style="flex:2;min-width:200px">
             <label class="form-label">GPU type</label>
             <input type="text" id="cfg-lt-gpu" class="form-input" placeholder="NVIDIA A40">
@@ -4852,6 +4859,7 @@ async //: The model's `lora_train` block. One prefix-driven pair, read and writt
 //: from the same field list, because a knob the form can SET and cannot READ
 //: looks exactly like one that did not save.
 const _LT_FIELDS = [
+  ['base',     'base_model',           'text',   ''],
   ['gpu',      'gpu_type_id',          'text',   ''],
   ['cloud',    'cloud_type',           'text',   'SECURE'],
   ['pods',     'pods',                 'int',    1],

@@ -3458,103 +3458,22 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Distributed text QLoRA: the pod-facing protocol
+# Distributed text QLoRA
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Every message here is a POD CALLING IN. That is not a style choice: rented
-# pods in different datacenters cannot address one another and nothing can
-# address them, so a design where the orchestrator initiates is a design that
-# does not run. It also means these three endpoints are the entire network
-# surface of a distributed run.
+# The orchestrator DRIVES. There are no pod-facing endpoints here and there is
+# no callback URL: coderai already addresses pods -- that is how it proxies
+# inference to them -- and a direct TCP mapping bypasses the RunPod proxy, so
+# the orchestrator pushes the dataset and each round's work, polls the pod's
+# own /status, and pulls the finished adapter.
 #
-# They are authenticated by the JOB's own secret, minted per job and handed to
-# each pod in its environment -- not by a user token. A training pod holds a
-# credential for as long as it lives; the blast radius of that credential should
-# be one job, not an install.
+# An earlier version of this had the pods calling in, on the belief that a pod
+# could not be addressed. It can, and this is both smaller and free of the one
+# configuration that could strand a whole fleet: a wrong callback URL meant
+# pods that booted, could not phone home, and billed until reaped.
 
 _train_coordinators: Dict[str, Any] = {}
 _coord_lock = threading.Lock()
-
-
-def _coordinator(job_id: str):
-    with _coord_lock:
-        return _train_coordinators.get(job_id)
-
-
-def _require_job_secret(job_id: str, request: Request):
-    """The pod's own credential for this job, or 401."""
-    coord = _coordinator(job_id)
-    if coord is None:
-        raise HTTPException(status_code=404, detail="no such training job")
-    sent = (request.headers.get("authorization") or "").strip()
-    if sent.lower().startswith("bearer "):
-        sent = sent[7:].strip()
-    if not sent or not secrets.compare_digest(sent, coord.secret):
-        # compare_digest, not ==: a per-round credential check is exactly the
-        # kind of loop a timing comparison leaks.
-        raise HTTPException(status_code=401, detail="bad job credential")
-    return coord
-
-
-@router.get("/v1/loras/train/text/{job_id}/shard",
-            summary="A training pod asks what to train (pod-facing)")
-async def text_train_shard(job_id: str, shard: int, request: Request):
-    """What this shard should do now: the round, its example indices, and where
-    to start from.
-
-    ``adapter`` is the blob id of the average everyone restarts from -- null on
-    round 0, when every pod starts from the base.
-    """
-    coord = _require_job_secret(job_id, request)
-    coord.fleet.note_checkin(shard)
-    return coord.assignment(int(shard))
-
-
-@router.post("/v1/loras/train/text/{job_id}/round",
-             summary="A training pod hands in its adapter (pod-facing)")
-async def text_train_round(job_id: str, request: Request,
-                           shard: int, round: int, examples: int = 0):
-    """Receive one shard's adapter for one round.
-
-    The body is the adapter itself, stored content-addressed in the same blob
-    store a serving LoRA uses -- so a re-send costs nothing and the average is
-    computed from files the registry already knows how to read.
-    """
-    coord = _require_job_secret(job_id, request)
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty adapter body")
-    h, _existed = save_lora_blob(data)
-    from codai.api import text_lora_rounds as tlr
-    try:
-        coord.submit(tlr.Submission(shard=int(shard), round=int(round),
-                                    path=_lora_blob_path(h),
-                                    examples=int(examples)))
-    except tlr.RoundError as e:
-        # 409, not 400: the submission is well-formed but out of step, and the
-        # pod should re-sync rather than retry the same body.
-        raise HTTPException(status_code=409, detail=str(e))
-    coord.fleet.note_checkin(int(shard), rounds_done=int(round) + 1)
-    return {"ok": True, "round": int(round), "shard": int(shard),
-            "adapter": f"sha256:{h}"}
-
-
-@router.get("/v1/loras/train/text/{job_id}/round/{rnd}/adapter",
-            summary="A training pod fetches the averaged adapter (pod-facing)")
-async def text_train_round_adapter(job_id: str, rnd: int, request: Request):
-    """The average for a finished round. 404 until that round has closed.
-
-    A pod polls this after handing in its own: it is how the next round starts
-    from everyone's work instead of only its own.
-    """
-    coord = _require_job_secret(job_id, request)
-    path = coord.average_path(int(rnd))
-    if not path or not os.path.isfile(path):
-        raise HTTPException(status_code=404,
-                            detail=f"round {rnd} has not been averaged yet")
-    from fastapi.responses import FileResponse
-    return FileResponse(path, media_type="application/octet-stream",
-                        filename=f"round{int(rnd)}.safetensors")
 
 
 class _TextTrainCoordinator:
@@ -3591,6 +3510,13 @@ class _TextTrainCoordinator:
 
     def finished(self) -> bool:
         return self.tracker.round >= self.total_rounds
+
+    def round_payload(self, shard: int) -> dict:
+        """What to POST to a pod's /round for the open round."""
+        a = self.assignment(int(shard))
+        return {"round": a["round"], "indices": a["indices"],
+                "settings": a["settings"], "base": self.base,
+                "field_map": self.field_map or None}
 
     def assignment(self, shard: int) -> dict:
         rnd = self.tracker.round
@@ -3669,54 +3595,6 @@ class _TextTrainCoordinator:
         return gone
 
 
-@router.get("/v1/loras/datasets/{ident}/content",
-            summary="Fetch an uploaded dataset (pod-facing)")
-async def text_dataset_content(ident: str, request: Request):
-    """Stream a stored dataset back.
-
-    A training pod fetches its dataset this way rather than having it baked into
-    an image or pushed to a volume: one file, one place, addressed by the hash
-    of its contents, so every pod in a fleet provably trains on the same bytes.
-
-    Authenticated by any live job's secret -- a pod has no user token, and the
-    thing it is allowed to read is the dataset it was rented to train on.
-    """
-    from codai.api import text_lora_dataset as tld
-    sent = (request.headers.get("authorization") or "").strip()
-    if sent.lower().startswith("bearer "):
-        sent = sent[7:].strip()
-    with _coord_lock:
-        ok = any(secrets.compare_digest(sent, c.secret)
-                 for c in _train_coordinators.values()) if sent else False
-    if not ok:
-        raise HTTPException(status_code=401, detail="bad job credential")
-    if not tld.dataset_exists(ident):
-        raise HTTPException(status_code=404, detail="dataset not found")
-    from fastapi.responses import FileResponse
-    return FileResponse(tld.dataset_path(ident), media_type="application/x-ndjson",
-                        filename="dataset.jsonl")
-
-
-@router.get("/v1/loras/train/text/{job_id}/runner",
-            summary="The script a training pod runs (pod-facing)")
-async def text_train_runner(job_id: str, request: Request):
-    """The pod-side runner's source.
-
-    Served rather than baked into the image for two reasons: the protocol can
-    change without republishing a 22 GB image, and a pod can never be running a
-    different version of it than the orchestrator it is talking to.
-    """
-    _require_job_secret(job_id, request)
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    path = os.path.join(here, "packaging", "runpod", "text_lora_pod_runner.py")
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=500,
-                            detail="the pod runner is missing from this install")
-    from fastapi.responses import PlainTextResponse
-    with open(path, "r", encoding="utf-8") as fh:
-        return PlainTextResponse(fh.read(), media_type="text/x-python")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Distributed text QLoRA: the coordinator loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3765,16 +3643,6 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     if account is None or not getattr(account, "api_key", ""):
         raise RuntimeError("distributed training needs the RunPod account "
                            "configured (runpod.api_key)")
-    # Install-level, not per model and not per request: it is how a pod
-    # reaches THIS install. A wrong value is a fleet that boots, cannot call
-    # home, and bills until the reaper notices.
-    callback = (getattr(account, "callback_url", "") or
-                os.environ.get("CODERAI_PUBLIC_URL") or "").strip().rstrip("/")
-    if not callback:
-        raise RuntimeError(
-            "set runpod.callback_url (or CODERAI_PUBLIC_URL) to a URL that "
-            "resolves from RunPod: a training pod reaches the orchestrator "
-            "outbound, so it has to be told where this install is")
 
     n_shards = max(1, int(cfg.pods or 1))
     rounds = max(1, int(cfg.rounds or 1))
@@ -3822,23 +3690,22 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     coord = _TextTrainCoordinator(
         job_id, plan=plan, tracker=tracker, fleet=fleet, encoded=encoded,
         out_dir=out_dir, settings=settings,
-        dataset_id=req.dataset_id or "", base=_resolve_text_base(req.base_model),
+        # What to TRAIN: the block's own base when it names one, because the
+        # entry may SERVE something that cannot be a QLoRA base (an AWQ
+        # checkpoint, or a pod-served model with no local path at all).
+        dataset_id=req.dataset_id or "",
+        base=_resolve_text_base(cfg.base_model or req.base_model),
         field_map=req.field_map, total_rounds=rounds)
 
-    # The pod fetches the runner with its own credential and executes it. The
-    # image's ENTRYPOINT is reset, so this is the whole command.
+    # The image runs the baked runner by default, so there is no start command
+    # and no URL of ours anywhere in the pod's environment. It is given only
+    # the bearer its own API requires.
+    # No URL and no credential here: the fleet mints a bearer per pod, and the
+    # image runs its baked runner by default.
     spec.env = {
-        "CODERAI_URL": callback,
-        "CODERAI_TRAIN_SECRET": coord.secret,
-        "CODERAI_TRAIN_BASE": coord.base,
         "CODERAI_TRAIN_WORKDIR": "/workspace/train",
         "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
     }
-    spec.start_cmd = [
-        "sh", "-lc",
-        'set -e; curl -fsS -H "Authorization: Bearer $CODERAI_TRAIN_SECRET" '
-        '"$CODERAI_URL/v1/loras/train/text/$CODERAI_TRAIN_JOB/runner" '
-        '-o /tmp/runner.py; exec python3 /tmp/runner.py']
 
     with _coord_lock:
         _train_coordinators[job_id] = coord
@@ -3847,10 +3714,74 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         started = fleet.provision(list(range(n_shards)))
         if not started and not fleet.pods:
             raise RuntimeError("no pods could be rented — nothing to train on")
+
+        # Wait for addresses and hand each pod the dataset. A pod that never
+        # publishes a port is released here rather than waited on: it is
+        # billing and it will never be useful.
+        ready = []
+        for shard in sorted(fleet.pods):
+            _check_train_cancel()
+            try:
+                url = fleet.address(shard, timeout=float(cfg.pod_boot_timeout_s
+                                                         or 1800.0))
+            except Exception as exc:
+                print(f"[text-lora] {job_id}: shard {shard} never came up: "
+                      f"{exc}", flush=True)
+                fleet.release(shard, "never published a port")
+                continue
+            if not url:
+                fleet.release(shard, "no address")
+                continue
+            flt.push_dataset(fleet.pods[shard], dataset_path)
+            fleet.note_checkin(shard)
+            ready.append(shard)
+        if not ready:
+            raise RuntimeError("no pod became reachable — nothing to train on")
         _update_job(job_id, status="training", total=rounds,
-                    message=f"{len(fleet.pods)} pod(s) training round 0")
+                    message=f"{len(ready)} pod(s) ready")
+
         while not coord.finished():
             _check_train_cancel()
+            rnd = coord.tracker.round
+            # Start the round on every pod that is idle and has not submitted.
+            for shard in sorted(fleet.pods):
+                pod = fleet.pods[shard]
+                if not pod.url or any(s.shard == shard
+                                      for s in coord.tracker.have(rnd)):
+                    continue
+                status = flt.poll_status(pod)
+                state = str(status.get("state") or "")
+                if state in ("training", "encoding", "loading-tokenizer"):
+                    fleet.note_checkin(shard)
+                    continue
+                if state == "done" and int(status.get("round", -1)) == rnd:
+                    # Finished: pull it and record the submission.
+                    dest = os.path.join(out_dir, f"r{rnd}-s{shard}.safetensors")
+                    flt.fetch_adapter(pod, dest)
+                    from codai.api import text_lora_rounds as _tlr
+                    coord.submit(_tlr.Submission(
+                        shard=shard, round=rnd, path=dest,
+                        examples=int(status.get("examples_trained") or 0)))
+                    fleet.note_checkin(shard, rounds_done=rnd + 1)
+                    continue
+                if state == "error":
+                    print(f"[text-lora] {job_id}: shard {shard} failed round "
+                          f"{rnd}: {status.get('error')}", flush=True)
+                    fleet.release(shard, f"round {rnd} failed")
+                    continue
+                if state == "unreachable":
+                    continue        # the silence window decides, not one poll
+                # idle, or done with an older round: give it this one.
+                if rnd > 0:
+                    prev = coord.average_path(rnd - 1)
+                    if prev:
+                        flt.push_start_adapter(pod, prev)
+                try:
+                    flt.start_round(pod, coord.round_payload(shard))
+                    fleet.note_checkin(shard)
+                except flt.PodBusy:
+                    pass
+
             closed = coord.close_round_if_ready()
             if closed is not None:
                 _update_job(job_id, step=closed + 1,

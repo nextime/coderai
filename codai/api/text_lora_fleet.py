@@ -22,13 +22,16 @@ probes. A training pod serves nothing and answers no probe, so that machinery
 would rent it and then kill it as unreachable -- which is why this is a separate
 fleet rather than a pool with a flag.
 
-What replaces the health probe is the work itself: a training pod CALLS IN at
-the end of every round to hand over its adapter (see
-:mod:`codai.api.text_lora_rounds`). That check-in is the liveness signal, and it
-is a better one than a probe -- a pod whose process is wedged still answers
-HTTP, while one that has stopped finishing rounds has stopped being useful by
-definition. It also means no pod ever has to be addressable, which is what makes
-this work across datacenters at all.
+The orchestrator DRIVES: it pushes the dataset once, pushes each round's work
+and starting adapter, polls the pod's ``/status``, and pulls the finished
+adapter. coderai already addresses pods -- that is how it proxies inference to
+them -- and ``wait_ready(..., direct_tcp=True)`` returns an ``ip:port`` that
+bypasses the RunPod proxy, so a 160 MB transfer meets neither the Cloudflare
+idle limit nor its body cap.
+
+Liveness is still the WORK, not a ping: ``/status`` reports the round and the
+step, so a pod stuck at step 40 for an hour is distinguishable from one that is
+gone. A plain health probe cannot tell those apart, and silence cannot either.
 
 THE RULE THIS MODULE EXISTS TO KEEP: nothing is left billing with nobody owning
 it. Every pod id is written to disk BEFORE it is rented and removed only once it
@@ -82,6 +85,9 @@ class TrainerPodSpec:
     max_pod_hourly_usd: float = 0.0  # 0 = no per-pod ceiling
     max_silence_s: float = DEFAULT_MAX_SILENCE_S
     max_lifetime_s: float = DEFAULT_MAX_LIFETIME_S
+    #: How long to wait for a pod to publish its port. A cold machine pulling
+    #: a 20 GB image is minutes; one that never publishes is released.
+    pod_boot_timeout_s: float = 1800.0
 
 
 @dataclasses.dataclass
@@ -94,6 +100,12 @@ class TrainerPod:
     hourly_usd: float = 0.0
     last_checkin: float = 0.0
     rounds_done: int = 0
+    #: Where to reach it. The orchestrator PULLS -- coderai already addresses
+    #: pods to proxy inference, and a direct TCP mapping bypasses the RunPod
+    #: proxy, so a 160 MB adapter meets no Cloudflare idle limit or body cap.
+    #: Empty until the runtime publishes the mapping.
+    url: str = ""
+    secret: str = ""
 
     def silent_for(self, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now
@@ -285,9 +297,16 @@ class TrainerFleet:
         return ""
 
     def _rent_one(self, shard: int) -> Optional[TrainerPod]:
+        import secrets as _secrets
+        # A credential PER POD, minted here rather than taken from the caller.
+        # Each pod's API is then reachable only with its own bearer, so one
+        # leaked pod is one pod -- and nothing upstream has to remember to
+        # supply it, which is the kind of omission that ships an open port.
+        secret = _secrets.token_urlsafe(32)
         env = dict(self.spec.env or {})
         env.update({"CODERAI_TRAIN_JOB": self.job_id,
-                    "CODERAI_TRAIN_SHARD": str(shard)})
+                    "CODERAI_TRAIN_SHARD": str(shard),
+                    "CODERAI_TRAIN_SECRET": secret})
         # Recorded BEFORE the create call: a create that succeeds and a process
         # that dies before writing is the one case that bills unnoticed, and the
         # id is predictable only afterwards -- so a placeholder goes down first
@@ -309,7 +328,11 @@ class TrainerFleet:
                 data_center_id=self.spec.data_center_id,
                 registry_auth_id=self.spec.registry_auth_id,
                 env=env, entrypoint=self.spec.entrypoint,
-                start_cmd=self.spec.start_cmd)
+                start_cmd=self.spec.start_cmd,
+                # Direct TCP: the orchestrator pulls a 160 MB adapter every
+                # round, and the proxy hostname is behind Cloudflare with a
+                # 100 s idle limit and a body cap.
+                direct_tcp=True)
         except Exception as exc:
             with self._lock:
                 self.pods.pop(shard, None)
@@ -318,11 +341,34 @@ class TrainerFleet:
             return None
         with self._lock:
             placeholder.pod_id = str(pod_id)
+            placeholder.secret = secret
             pod = placeholder
         self._flush()
         self._say(f"shard {shard}: pod {pod_id} rented "
                   f"(~${self.spec.hourly_usd:.2f}/hr)")
         return pod
+
+    def address(self, shard: int, *, timeout: float = 1800.0) -> str:
+        """Wait for this pod to publish its ip:port, and remember it.
+
+        Separate from renting because it is the slow half -- a cold machine
+        pulling a 20 GB image is minutes -- and because a pod that never
+        publishes a port has to be released rather than waited on forever.
+        """
+        with self._lock:
+            pod = self.pods.get(int(shard))
+        if pod is None:
+            return ""
+        if pod.url:
+            return pod.url
+        url = self.client.wait_ready(pod.pod_id, self.port,
+                                     ready_timeout=timeout, direct_tcp=True)
+        with self._lock:
+            pod.url = str(url or "")
+        self._flush()
+        if pod.url:
+            self._say(f"shard {shard}: pod {pod.pod_id} reachable")
+        return pod.url
 
     # -- liveness --------------------------------------------------------- #
 
@@ -426,6 +472,13 @@ class LoraTrainConfig:
     """A model's `lora_train` block: how THIS model is trained on rented GPUs."""
 
     enabled: bool = False
+    #: What to TRAIN, when that is not what this entry SERVES. A model served
+    #: from a pod as AWQ, or with no local path at all, cannot be the base of a
+    #: QLoRA: bitsandbytes quantizes an unquantized checkpoint, and there is
+    #: nothing on disk here to quantize. Same idea as the image trainer's
+    #: `lora_train_base_model` -- train against this, serve with that. Blank
+    #: falls back to the entry's own path or id.
+    base_model: str = ""
     #: Which card, as RunPod names it ("NVIDIA A40"). Not a list: a fleet whose
     #: pods are different cards averages rounds of unequal length, and the
     #: slowest card then sets the pace for everyone.
@@ -444,6 +497,7 @@ class LoraTrainConfig:
     pod_max_silence_s: float = 1800.0
     pod_max_lifetime_s: float = 86400.0
     poll_interval_s: float = 20.0
+    pod_boot_timeout_s: float = 1800.0
     #: Training defaults for this model; a request may override the ones that
     #: cost nothing to change (rank, lr, length) but not the ones that cost
     #: money (pods, rounds, cards, ceilings).
@@ -468,7 +522,7 @@ def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
             if f.type is bool or f.name == "enabled":
                 setattr(cfg, f.name, bool(raw))
             elif f.name in ("gpu_type_id", "cloud_type", "image",
-                            "network_volume_id"):
+                            "network_volume_id", "base_model"):
                 setattr(cfg, f.name, str(raw or "").strip())
             elif f.name in ("pods", "rounds", "container_disk_gb", "rank",
                             "alpha", "accumulation_steps", "max_len"):
@@ -520,3 +574,107 @@ def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
                   f"the model allows ${have:.2f} — using ${new:.2f}", flush=True)
         setattr(out, name, new)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# driving a pod
+# --------------------------------------------------------------------------- #
+#
+# The orchestrator's side of the pull: push the dataset once, push a round,
+# poll, fetch the adapter. Plain HTTP over the direct TCP mapping, with the
+# pod's own bearer.
+#
+# Timeouts are per call and generous on the bodies: a 119 MB dataset and a
+# 160 MB adapter over a datacenter link are tens of seconds, and a timeout
+# shorter than the transfer turns a working pod into a reaped one.
+
+class PodBusy(RuntimeError):
+    """The pod is already working; a second round was refused."""
+
+
+def push_dataset(pod: TrainerPod, path: str, *, timeout: float = 900.0) -> int:
+    """Upload the training set. Once per pod, not once per round."""
+    import requests
+    with open(path, "rb") as fh:
+        data = fh.read()
+    r = requests.post(pod.url.rstrip("/") + "/dataset", data=data,
+                      headers={"Authorization": f"Bearer {pod.secret}",
+                               "Content-Type": "application/x-ndjson"},
+                      timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"shard {pod.shard}: /dataset answered "
+                           f"{r.status_code}: {(r.text or '')[:200]}")
+    return len(data)
+
+
+def push_start_adapter(pod: TrainerPod, path: str, *,
+                       timeout: float = 900.0) -> int:
+    """Send the previous round's average for this pod to resume from."""
+    import requests
+    with open(path, "rb") as fh:
+        data = fh.read()
+    r = requests.put(pod.url.rstrip("/") + "/adapter/start", data=data,
+                     headers={"Authorization": f"Bearer {pod.secret}"},
+                     timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"shard {pod.shard}: /adapter/start answered "
+                           f"{r.status_code}: {(r.text or '')[:200]}")
+    return len(data)
+
+
+def start_round(pod: TrainerPod, payload: Dict[str, Any], *,
+                timeout: float = 60.0) -> None:
+    """Tell the pod to train one round. 409 means it is still on the last one."""
+    import requests
+    r = requests.post(pod.url.rstrip("/") + "/round", json=payload,
+                      headers={"Authorization": f"Bearer {pod.secret}"},
+                      timeout=timeout)
+    if r.status_code == 409:
+        raise PodBusy(f"shard {pod.shard} is still working: "
+                      f"{(r.text or '')[:200]}")
+    if r.status_code not in (200, 202):
+        raise RuntimeError(f"shard {pod.shard}: /round answered "
+                           f"{r.status_code}: {(r.text or '')[:200]}")
+
+
+def poll_status(pod: TrainerPod, *, timeout: float = 30.0) -> Dict[str, Any]:
+    """What the pod is doing. The liveness signal, and more honest than a ping.
+
+    Unreachable is reported rather than raised: one failed poll on a busy
+    machine is not a dead pod, and the fleet's silence window is what decides
+    that.
+    """
+    import requests
+    try:
+        r = requests.get(pod.url.rstrip("/") + "/status",
+                         headers={"Authorization": f"Bearer {pod.secret}"},
+                         timeout=timeout)
+        if r.status_code != 200:
+            return {"state": "unreachable", "http": r.status_code}
+        return dict(r.json() or {})
+    except Exception as exc:
+        return {"state": "unreachable", "error": str(exc)[:200]}
+
+
+def fetch_adapter(pod: TrainerPod, out_path: str, *,
+                  timeout: float = 1800.0) -> str:
+    """Pull the finished adapter, streamed, written atomically.
+
+    Streamed because it is ~160 MB and reading it into memory per pod per round
+    is pointless; renamed at the end so a transfer cut halfway cannot be
+    averaged as though it were an adapter.
+    """
+    import requests
+    tmp = out_path + ".part"
+    with requests.get(pod.url.rstrip("/") + "/adapter", stream=True,
+                      headers={"Authorization": f"Bearer {pod.secret}"},
+                      timeout=timeout) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"shard {pod.shard}: /adapter answered "
+                               f"{r.status_code}: {(r.text or '')[:200]}")
+        with open(tmp, "wb") as fh:
+            for chunk in r.iter_content(1 << 20):
+                if chunk:
+                    fh.write(chunk)
+    os.replace(tmp, out_path)
+    return out_path

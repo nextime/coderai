@@ -35,12 +35,23 @@ COPY codai/api/text_lora_trainer.py /opt/trainer/codai/api/text_lora_trainer.py
 RUN touch /opt/trainer/codai/__init__.py /opt/trainer/codai/api/__init__.py
 ENV PYTHONPATH=/opt/trainer
 
+# The runner, BAKED rather than fetched. The image tag then pins the runner
+# too, so there is one version to reason about instead of two, and a pod has no
+# boot-time dependency on anything outside itself -- fetching it would have
+# made an outage at the other end an outage here.
+COPY packaging/runpod/text_lora_pod_runner.py /opt/trainer/runner.py
+
 # The vLLM image's ENTRYPOINT is the server itself, which treats every argument
 # as a server argument -- so a pod told to run a training command would instead
 # start an OpenAI server with nonsense flags and look like a broken image. Reset
 # it: this pod runs whatever command it is given.
+# The vLLM image's ENTRYPOINT is the server itself, which treats every argument
+# as a server argument -- so a pod told to run a training command would instead
+# start an OpenAI server with nonsense flags and look like a broken image. Reset
+# it, and default to the runner: the orchestrator then needs no start command at
+# all, and cannot start a pod that serves nothing.
 ENTRYPOINT []
-CMD ["sleep", "infinity"]
+CMD ["python3", "/opt/trainer/runner.py"]
 
 # Deliberately NOT here:
 #   * the dataset -- it is content-addressed and fetched per job, so one image
