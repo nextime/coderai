@@ -7802,7 +7802,13 @@ def set_client_pods(model: str, pods: int, teardown: bool = False,
 
 
 def held_pod_endpoints() -> list:
-    """``[(pod_id, url, bearer)]`` for every pod a pool currently holds.
+    """``[(pod_id, url, bearer)]`` for every pod this deployment can ask.
+
+    Pools AND job fleets. It walked `_pools` only, so a training pod -- which
+    belongs to a job, never to a pool -- was never asked for telemetry, and
+    the page showed dashes for VRAM, RAM, GPU and CPU for the whole paid life
+    of a card. The fourth thing the trainer lost by not being a pool, after
+    cleanup, visibility and its label.
 
     Kept separate from :func:`pods_status` because a pod's bearer must never
     reach a browser: that snapshot is serialised into an admin page, this one
@@ -7826,6 +7832,24 @@ def held_pod_endpoints() -> list:
                 except Exception:
                     key = getattr(pool, "api_key", "") or ""
                 out.append((p.pod_id, url, key))
+    # The fleets' pods, from the registry: a job's pod has a url and its own
+    # bearer there once it is reachable. Only entries this process owns, and
+    # only with an address -- asking a pod that has not published one yet is a
+    # request that cannot succeed.
+    try:
+        data = _registry_update(lambda d: False) or {}
+    except Exception:
+        data = {}
+    seen = {str(row[0]) for row in out}
+    for pod_id, info in (data.items() if isinstance(data, dict) else []):
+        if not isinstance(info, dict) or str(pod_id) in seen:
+            continue
+        if not str(info.get("pool") or "").startswith(FLEET_POOL_PREFIX):
+            continue
+        url = str(info.get("url") or "").strip()
+        if not url or not _is_this_process(info):
+            continue
+        out.append((str(pod_id), url, str(info.get("api_key") or "")))
     return out
 
 

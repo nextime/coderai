@@ -3900,26 +3900,62 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             raise RuntimeError("no pods could be rented — nothing to train on")
         stages.done("rent", pods=len(fleet.pods), hourly_usd=price)
 
-        # Wait for addresses and hand each pod the dataset. A pod that never
-        # publishes a port is released here rather than waited on: it is
-        # billing and it will never be useful.
+        # Wait for every address AT ONCE. This used to be a `for` loop, so a
+        # four-pod job needed four CONSECUTIVE boots inside a budget sized for
+        # one: shard 0 was waited out to completion before shard 1 was even
+        # looked at, while shards 1..n sat booted and billing. Pods boot in
+        # parallel, so the wall clock is one boot, not n -- and the per-pod
+        # timeout now means what it says instead of being the nth share of a
+        # race nobody could win.
+        #
+        # A pod that never publishes a port is still released as soon as ITS
+        # own wait gives up, rather than at the end: it is billing and it will
+        # never be useful.
         ready = []
-        for shard in sorted(fleet.pods):
-            _check_train_cancel()
+        _boot_timeout = float(cfg.pod_boot_timeout_s or 1800.0)
+        _shards = sorted(fleet.pods)
+
+        def _bring_up(shard):
             try:
-                url = fleet.address(shard, timeout=float(cfg.pod_boot_timeout_s
-                                                         or 1800.0))
+                url = fleet.address(shard, timeout=_boot_timeout)
             except Exception as exc:
                 print(f"[text-lora] {job_id}: shard {shard} never came up: "
                       f"{exc}", flush=True)
                 fleet.release(shard, "never published a port")
-                continue
+                return None
             if not url:
                 fleet.release(shard, "no address")
-                continue
+                return None
+            return shard
+
+        if len(_shards) == 1:
+            got = _bring_up(_shards[0])
+            if got is not None:
+                ready.append(got)
+        else:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(
+                    max_workers=min(len(_shards), 32),
+                    thread_name_prefix=f"boot-{job_id}") as pool:
+                futures = {pool.submit(_bring_up, sh): sh for sh in _shards}
+                for fut in _cf.as_completed(futures):
+                    try:
+                        got = fut.result()
+                    except Exception as exc:
+                        print(f"[text-lora] {job_id}: shard "
+                              f"{futures[fut]} boot raised: {exc}", flush=True)
+                        continue
+                    if got is not None:
+                        ready.append(got)
+        # Cancel AFTER the waits, not inside them: a cancel mid-boot would
+        # leave a rented pod with nobody to release it, and release_all in the
+        # caller's finally is what guarantees the fleet goes away.
+        _check_train_cancel()
+        # The dataset goes out once the fleet is known, in shard order, so a
+        # failure names a shard rather than whichever thread got there first.
+        for shard in sorted(ready):
             flt.push_dataset(fleet.pods[shard], dataset_path)
             fleet.note_checkin(shard)
-            ready.append(shard)
         if not ready:
             stages.failed("reachable", "no pod published a port")
             raise RuntimeError("no pod became reachable — nothing to train on")

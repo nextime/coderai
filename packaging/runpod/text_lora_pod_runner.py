@@ -126,6 +126,109 @@ def _train(payload):
         traceback.print_exc()
 
 
+def _engine_state() -> dict:
+    """What `/internal/engine-state` means for a TRAINING pod.
+
+    The shape is the collector's, not a new one: `vram.devices[]` with FREE
+    and total per card (free, because that is what a context-free query
+    returns and the page derives used from the difference), plus a `load`
+    block for host RAM and CPU. Fields the collector does not find are simply
+    absent -- it draws a dash for what it was not told rather than inventing a
+    zero -- so a partial answer is better than none and an exception here must
+    never cost the training run.
+
+    `requests_done` and the queue counters have no meaning on a trainer, so
+    they are left out rather than reported as zero: zero served requests would
+    read as an idle serving pod, which is the opposite of the truth.
+    """
+    out: dict = {}
+    try:
+        import torch
+        if torch.cuda.is_available():
+            devs = []
+            for i in range(torch.cuda.device_count()):
+                try:
+                    free, total = torch.cuda.mem_get_info(i)
+                    # GIGABYTES, rounded, exactly as codai.api.app builds this
+                    # block. mem_get_info returns BYTES, and the collector's
+                    # fields are named *_gb and are not converted anywhere --
+                    # so reporting bytes put a number 1e9 too large on the
+                    # page under a GB label. Caught by feeding this payload
+                    # through the real collector rather than by reading it.
+                    d = {"index": i,
+                         "name": torch.cuda.get_device_name(i),
+                         "free": round(free / 1e9, 2),
+                         "total": round(total / 1e9, 2)}
+                    try:
+                        # Utilisation and temperature are best-effort: present
+                        # on a pod whose driver exposes them, absent otherwise,
+                        # which the page already handles.
+                        import pynvml
+                        pynvml.nvmlInit()
+                        h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                        d["util"] = int(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+                        d["temp"] = int(pynvml.nvmlDeviceGetTemperature(
+                            h, pynvml.NVML_TEMPERATURE_GPU))
+                    except Exception:
+                        pass
+                    devs.append(d)
+                except Exception:
+                    continue
+            if devs:
+                # The totals beside the devices, as the canonical block has
+                # them: a reader that looks at `vram.total` rather than
+                # walking `devices` gets the same answer.
+                out["vram"] = {
+                    "devices": devs, "device_count": len(devs),
+                    "free": round(sum(d["free"] for d in devs), 2),
+                    "total": round(sum(d["total"] for d in devs), 2),
+                    "used": round(sum(d["total"] - d["free"] for d in devs), 2),
+                    "gpu": (devs[0].get("name") if len(devs) == 1
+                            else f"{len(devs)}x GPU")}
+    except Exception:
+        pass
+    load: dict = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            mem = {}
+            for line in fh:
+                k, _, rest = line.partition(":")
+                mem[k.strip()] = float(rest.strip().split()[0]) * 1024.0
+        total = mem.get("MemTotal") or 0.0
+        avail = mem.get("MemAvailable") or 0.0
+        if total:
+            load["ram_total_gb"] = round(total / 1e9, 2)
+            load["ram_free_gb"] = round(avail / 1e9, 2)
+            load["ram_used_gb"] = round((total - avail) / 1e9, 2)
+    except Exception:
+        pass
+    try:
+        load["cpu_cores"] = int(os.cpu_count() or 0)
+        # From /proc/stat deltas against the last call, because a single read
+        # gives totals since boot and would report the same number forever.
+        global _CPU_LAST
+        with open("/proc/stat") as fh:
+            parts = fh.readline().split()[1:]
+        vals = [float(x) for x in parts[:8]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0.0)
+        busy = sum(vals) - idle
+        prev = _CPU_LAST
+        _CPU_LAST = (busy, idle)
+        if prev:
+            db, di = busy - prev[0], idle - prev[1]
+            if (db + di) > 0:
+                load["cpu_util"] = round(100.0 * db / (db + di), 1)
+    except Exception:
+        pass
+    if load:
+        out["load"] = load
+    return out
+
+
+#: Last (busy, idle) jiffies, for the CPU delta above.
+_CPU_LAST = None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -158,7 +261,8 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
-    # -- the API -------------------------------------------------------- #
+    
+# -- the API -------------------------------------------------------- #
 
     def do_GET(self):
         if self.path == "/healthz":
@@ -167,6 +271,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/status":
             return self._json(200, _snapshot())
+        if self.path == "/internal/engine-state":
+            # The SAME endpoint every coderai pod serves, because the admin
+            # page's telemetry is pulled from the pods themselves and asks for
+            # exactly this path. Without it a training pod showed dashes for
+            # VRAM, RAM, GPU and CPU for its whole paid life -- the operator
+            # could see a card costing money and not what it was doing.
+            return self._json(200, _engine_state())
         if self.path == "/adapter":
             snap = _snapshot()
             path = snap.get("adapter") or ""
