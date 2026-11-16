@@ -353,9 +353,50 @@ class TrainerFleet:
             placeholder.secret = secret
             pod = placeholder
         self._flush()
+        # INTO THE DEPLOYMENT REGISTRY, not only this fleet's own record file.
+        # A trainer pod used to be invisible to every cleanup path: it is named
+        # `coderai-train-job-…`, so the reaper's `coderai-<deployment>-` prefix
+        # does not match it, and it was absent from the registry that startup
+        # reclaim reads. While the job lived nothing noticed; when the process
+        # died -- a crash, or a forced upgrade -- the pod billed on with no
+        # owner and nothing to collect it.
+        #
+        # Registering fixes both ends with one mechanism: the entry has a live
+        # owner, so `_known_pod_ids` counts it and the admin page stops
+        # reporting a working training pod as unmanaged; and when the owner
+        # stops heartbeating, the same entry stops vouching after the reap
+        # grace and the pod is collected like any other leftover.
+        self._register(pod)
         self._say(f"shard {shard}: pod {pod_id} rented "
                   f"(~${self.spec.hourly_usd:.2f}/hr)")
         return pod
+
+    def _register(self, pod: "TrainerPod") -> None:
+        """Record this pod as the deployment's, owned by this job."""
+        try:
+            from codai.api import runpod_worker as rw
+            rw.register_pod(
+                str(pod.pod_id),
+                # Namespaced by JOB, so the page can say which run owns it and
+                # a stale entry names the job that died.
+                pool_key=f"{_fleet_pool_prefix()}{self.job_id}",
+                url=str(pod.url or ""),
+                api_key=str(pod.secret or ""),
+                hourly_usd=float(self.spec.hourly_usd or 0.0),
+                image=str(self.spec.image or ""))
+        except Exception as exc:
+            # Never fail a rental over bookkeeping -- but say so, because the
+            # consequence is a pod that leaks if this process dies.
+            print(f"[text-lora-fleet] {self.job_id}: could not register pod "
+                  f"{pod.pod_id} ({exc}); if this process dies the pod will "
+                  f"not be reclaimed or reaped automatically", flush=True)
+
+    def _unregister(self, pod_id: str) -> None:
+        try:
+            from codai.api import runpod_worker as rw
+            rw.unregister_pod(str(pod_id))
+        except Exception:
+            pass
 
     def _create(self, shard: int, gpu: str, env: Dict[str, str],
                 cloud_type: str = "") -> str:
@@ -454,6 +495,11 @@ class TrainerFleet:
                                         "pod_id": pod.pod_id, "reason": reason})
         except Exception:
             pass
+        # AFTER the terminate succeeded, and only then: a failed terminate
+        # returns above with the pod still in the record, and dropping its
+        # registry entry there would hide a pod that is still running from the
+        # one sweep meant to find it.
+        self._unregister(pod.pod_id)
         with self._lock:
             self.pods.pop(int(shard), None)
             empty = not self.pods
@@ -1094,3 +1140,16 @@ def redact(text: str, *secrets: str) -> str:
         if len(sec) >= 8:
             out = out.replace(sec, "<redacted>")
     return out
+
+
+def _fleet_pool_prefix() -> str:
+    """The registry prefix marking a pod as owned by a job's fleet.
+
+    Read from runpod_worker so the writer and the three readers cannot drift:
+    a prefix typed twice is a pod labelled "unowned" while a job is using it.
+    """
+    try:
+        from codai.api.runpod_worker import FLEET_POOL_PREFIX
+        return str(FLEET_POOL_PREFIX)
+    except Exception:
+        return "text-lora:"

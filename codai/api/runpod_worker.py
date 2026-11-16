@@ -8254,6 +8254,12 @@ def adopt_account_pod(pod_id: str, pool_key: str = "", force: bool = False) -> d
     return out
 
 
+#: Registry pool-key prefix for a pod owned by a JOB's fleet rather than a
+#: serving pool. Named once because three places key on it: the status row's
+#: label, the startup reclaim, and the reaper's reading of a stale entry.
+FLEET_POOL_PREFIX = "text-lora:"
+
+
 def pods_status() -> list:
     """Snapshot of all pods across pools for the stats/tasks pages.
 
@@ -8365,17 +8371,37 @@ def pods_status() -> list:
             continue                           # a live sibling is managing it
         born = float(info.get("created") or 0) or now
         rate = float(info.get("hourly_usd") or 0.0)
+        pool_key = str(info.get("pool") or "")
+        # A FLEET pod is owned by a JOB, not by a pool, so "held by no pool
+        # here" is true of it and tells the reader the opposite of the truth.
+        # Three healthy pods of three live training jobs were shown as
+        # abandoned, and acting on that label would have destroyed the run.
+        # While this process owns the entry, the job owns the pod.
+        fleet_job = pool_key.split(":", 1)[1] if pool_key.startswith(
+            FLEET_POOL_PREFIX) else ""
+        if fleet_job and mine:
+            state = "training"
+            note = (f"owned by {fleet_job} — "
+                    + ("booting (no address yet)" if not info.get("url")
+                       else "training")
+                    + "; it belongs to a job, not a pool")
+        else:
+            state = "unowned"
+            note = ("in the registry but held by no pool here — "
+                    + ("still booting (no address yet)"
+                       if not info.get("url") else "it answers but nothing "
+                       "routes to it")
+                    + ", and still billing")
+            if fleet_job:
+                # Not ours and past the grace: the job that rented it is gone.
+                note = (f"rented by {fleet_job}, whose process is gone — "
+                        f"nothing will release it, and it is still billing")
         out.append({
-            "model": str(info.get("pool") or ""), "pod_id": str(pod_id),
+            "model": pool_key, "pod_id": str(pod_id),
             "gpu": str(info.get("gpu") or ""), "healthy": False, "inflight": 0,
             "hourly_usd": rate, "uptime_s": int(now - born),
             "live_cost_usd": round((now - born) / 3600.0 * rate, 4),
-            "console_url": "", "state": "unowned",
-            "note": ("in the registry but held by no pool here — "
-                     + ("still booting (no address yet)"
-                        if not info.get("url") else "it answers but nothing "
-                        "routes to it")
-                     + ", and still billing"),
+            "console_url": "", "state": state, "note": note,
         })
     for row in parked_pods():
         born = row.get("created") or now
