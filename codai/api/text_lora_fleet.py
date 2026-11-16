@@ -535,6 +535,13 @@ class LoraTrainConfig:
     learning_rate: float = 1e-4
     max_len: int = 8192
     accumulation_steps: int = 8
+    #: A Hugging Face token for the pods to pull the base with. Empty means the
+    #: orchestrator's own environment is used instead (see hf_token_for_pods),
+    #: and empty in both places means every pod pulls anonymously -- which is a
+    #: gated-repo failure for some bases and a rate-limited one for the rest,
+    #: minutes into a paid boot. It is a SECRET: it reaches the pod env and is
+    #: never logged, never echoed in a job message, and never in a config dump.
+    hf_token: str = ""
 
 
 def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
@@ -984,3 +991,58 @@ def catalogue_source() -> str:
     else:
         parts.append(f"{path} — WHICH DOES NOT EXIST")
     return " and ".join(parts)
+
+
+#: Fallback names only, for the case where the install's own resolver cannot
+#: be imported. The resolver is the source of record: it reads these AND the
+#: token files, which is where this install keeps it.
+_HF_TOKEN_ENV = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
+
+
+def hf_token_for_pods(cfg: Optional["LoraTrainConfig"] = None) -> str:
+    """The token to give the pods: the block's, else the orchestrator's own.
+
+    There was no path for this at all -- a pod was created with three
+    CODERAI_TRAIN_* variables and nothing else, so every pod pulled the base
+    anonymously. That is a 404 on a gated repo and a rate-limit on an ungated
+    one, and either way it happens minutes into a boot that is already being
+    billed.
+
+    The block wins over the environment so one model can train from a repo the
+    rest of the install has no access to. Returns "" when neither has one; the
+    caller decides whether to warn or refuse, because an ungated base genuinely
+    does not need it.
+    """
+    tok = str(getattr(cfg, "hf_token", "") or "").strip()
+    if tok:
+        return tok
+    # The install's OWN resolver, not a second scan of the environment. It
+    # checks the same names and also the token FILES this install actually
+    # keeps the token in, and its docstring says why that matters: "two
+    # different answers to 'where is the token' is how one path authenticates
+    # and another does not". A private copy here would have been exactly that.
+    try:
+        from codai.hf_cache import configured_hf_token
+        return (configured_hf_token() or "").strip()
+    except Exception:
+        import os as _os
+        for name in _HF_TOKEN_ENV:
+            tok = (_os.environ.get(name) or "").strip()
+            if tok:
+                return tok
+        return ""
+
+
+def redact(text: str, *secrets: str) -> str:
+    """Replace each secret with a marker. For log lines built from a spec.
+
+    Cheap insurance: the pod env now carries a credential, and the fleet prints
+    what it is doing. One formatted line that happens to include the env is all
+    it takes to put a token in a log that gets pasted into a chat.
+    """
+    out = str(text or "")
+    for sec in secrets:
+        sec = str(sec or "").strip()
+        if len(sec) >= 8:
+            out = out.replace(sec, "<redacted>")
+    return out

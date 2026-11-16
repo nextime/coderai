@@ -3767,8 +3767,25 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         plan,
         min_fraction=0.75,
         deadline_s=max(60.0, float(cfg.poll_interval_s or 20.0) * 60))
+    # The base is pulled BY THE POD, so the token has to travel with it. A pod
+    # used to get three CODERAI_TRAIN_* variables and nothing else, which made
+    # every pull anonymous: a 404 on a gated repo, a rate-limit on the rest,
+    # discovered minutes into a boot that is already billing.
+    _hf = flt.hf_token_for_pods(cfg)
+    _pod_env = {}
+    if _hf:
+        # Both names: the hub library reads either, and which one an image
+        # honours is not worth finding out one failed rental at a time.
+        _pod_env = {"HF_TOKEN": _hf, "HUGGING_FACE_HUB_TOKEN": _hf}
+    else:
+        print(f"[text-lora] {job_id}: no Hugging Face token configured "
+              f"(lora_train.hf_token, or HF_TOKEN in the orchestrator's "
+              f"environment); pods will pull "
+              f"{_resolve_text_base(cfg.base_model or req.base_model)!r} "
+              f"anonymously, which fails "
+              f"outright for a gated repo", flush=True)
     spec = flt.TrainerPodSpec(
-        image=cfg.image, gpu_types=[c["id"] for c in cards],
+        image=cfg.image, gpu_types=[c["id"] for c in cards], env=_pod_env,
         cloud_type=cloud, hourly_usd=price,
         max_pod_hourly_usd=ceiling,
         container_disk_gb=int(cfg.container_disk_gb or 120),
