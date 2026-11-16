@@ -152,8 +152,8 @@ def _install(monkeypatch, fleet, *, pushes, stop_after=0.0, home=None):
         def finished(self):
             return (time.time() - self.born) >= stop_after
 
-        def cohort(self, rnd, live):
-            return list(live)
+        def cohort(self, rnd, live=None, *, grow=False):
+            return list(live or [])
 
         def round_payload(self, shard):
             return {}

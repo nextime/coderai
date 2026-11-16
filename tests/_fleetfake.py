@@ -187,8 +187,10 @@ def install(monkeypatch, fleet, *, home, pushes=None, finish_after=0.0,
         def finished(self):
             return (time.time() - self.born) >= float(finish_after)
 
-        def cohort(self, rnd, live):
-            return list(live)
+        def cohort(self, rnd, live=None, *, grow=False):
+            # `grow=True` is how an exchange gains contributors now, so the
+            # fake has to accept it or every run through here raises.
+            return list(live or [])
 
         def round_payload(self, shard):
             return {}

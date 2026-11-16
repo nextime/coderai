@@ -3807,6 +3807,15 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
 # configuration that could strand a whole fleet: a wrong callback URL meant
 # pods that booted, could not phone home, and billed until reaped.
 
+class RoundNotJoined(RuntimeError):
+    """A pod asked for work in a round it is not a member of.
+
+    Its own class because the caller's correct response is to leave the pod
+    alone until the next round -- not to retry, and emphatically not to fall
+    back to a default position, which is the bug this replaced.
+    """
+
+
 _train_coordinators: Dict[str, Any] = {}
 _coord_lock = threading.Lock()
 
@@ -3841,6 +3850,11 @@ class _TextTrainCoordinator:
         #: Which pods are in each round, by round number. Decided once per
         #: round, because the index lists handed out are derived from it.
         self._cohorts: Dict[int, list] = {}
+        #: round -> shard -> block number, so a retry is idempotent.
+        self._blocks: Dict[int, Dict[int, int]] = {}
+        #: The next unclaimed block, and blocks freed by pods that died.
+        self._next_block = 0
+        self._recycle: List[int] = []
         self._lock = threading.Lock()
         os.makedirs(out_dir, exist_ok=True)
 
@@ -3856,25 +3870,38 @@ class _TextTrainCoordinator:
                 "settings": a["settings"], "base": self.base,
                 "field_map": self.field_map or None}
 
-    def cohort(self, rnd: int, shards=None) -> list:
-        """Which pods are IN round ``rnd``, decided once when it opens.
+    def cohort(self, rnd: int, shards=None, *, grow: bool = False) -> list:
+        """Which pods are in exchange ``rnd``.
 
-        Fixed for the round because the index lists are derived from it: a pod
-        joining mid-round would change the divisor and make every list already
-        handed out wrong. A late pod therefore trains from the NEXT round,
-        which is also when the fleet's new size is picked up.
+        It used to be fixed the moment the round opened, and had to be: the
+        slice was `position in cohort`, so admitting a pod later changed the
+        divisor and invalidated every list already handed out. With work taken
+        from a queue nothing is derived from the membership, so ``grow=True``
+        lets an exchange gain contributors as pods become ready -- which is
+        the difference between thirteen pods idling through a round and
+        thirteen pods training.
+
+        Membership never SHRINKS here: a pod that died is removed by
+        :meth:`recycle`, which also returns its block to the queue.
         """
         r = int(rnd)
         with self._lock:
             have = self._cohorts.get(r)
+            incoming = sorted(int(x) for x in (shards or []))
             if have is not None:
-                return list(have)
-            members = sorted(int(x) for x in (shards or []))
-            if not members:
+                if not grow or not incoming:
+                    return list(have)
+                merged = sorted(set(have) | set(incoming))
+                if merged == have:
+                    return list(have)
+                self._cohorts[r] = merged
+                self.tracker.expect_shards(r, merged)
+                return list(merged)
+            if not incoming:
                 return []
-            self._cohorts[r] = members
-            self.tracker.expect(r, len(members))
-            return list(members)
+            self._cohorts[r] = incoming
+            self.tracker.expect_shards(r, incoming)
+            return list(incoming)
 
     def position_of(self, shard: int, rnd: int) -> int:
         """This pod's index within the round's cohort, or -1 if it is not in it.
@@ -3889,6 +3916,59 @@ class _TextTrainCoordinator:
         except ValueError:
             return -1
 
+    def block_for(self, shard: int, rnd: int) -> int:
+        """The block of examples this pod owns in this exchange.
+
+        TAKEN FROM A QUEUE, which is what lets a pod that becomes ready
+        halfway through an exchange do useful work instead of idling or
+        duplicating someone else's. The previous scheme derived a slice from
+        the pod's POSITION in a fixed cohort, so a pod outside that cohort had
+        no slice -- and `max(0, position_of(...))`, with -1 collapsing to 0,
+        handed it position 0's exact list. Measured on a live 16-pod run whose
+        exchange opened with three pods: thirteen pods trained the same 153
+        examples and the weighted average would have been seven eighths one
+        slice.
+
+        Idempotent per (shard, round): a retry after a `PodBusy` or a failed
+        push must not consume another block.
+        """
+        with self._lock:
+            mine = self._blocks.setdefault(int(rnd), {})
+            if int(shard) not in mine:
+                if self._recycle:
+                    mine[int(shard)] = self._recycle.pop(0)
+                else:
+                    mine[int(shard)] = self._next_block
+                    self._next_block += 1
+                # WHO is in this exchange, updated as pods join it. The
+                # readiness fraction and the miss counting both read this, and
+                # a round whose membership grows must raise what it waits for
+                # rather than close on a quarter of its contributors.
+                self.tracker.expect_shards(int(rnd), sorted(mine))
+            return mine[int(shard)]
+
+    def recycle(self, shards, rnd: Optional[int] = None) -> List[int]:
+        """Put the blocks of pods that died back on the queue.
+
+        A lost pod's examples are not trained by anyone otherwise: with a
+        partition they would come round again next epoch, and with a queue
+        they would simply never be issued. Returned to the FRONT, so the gap
+        is filled before the queue moves on.
+        """
+        r = self.tracker.round if rnd is None else int(rnd)
+        back: List[int] = []
+        with self._lock:
+            mine = self._blocks.get(int(r), {})
+            for sh in shards:
+                b = mine.pop(int(sh), None)
+                if b is not None:
+                    back.append(int(b))
+            if back:
+                self._recycle = sorted(back) + self._recycle
+                if mine:
+                    self.tracker.expect_shards(int(r), sorted(mine))
+        return back
+
     def assignment(self, shard: int) -> dict:
         rnd = self.tracker.round
         if self.finished():
@@ -3901,15 +3981,16 @@ class _TextTrainCoordinator:
             "finished": False, "rounds": self.total_rounds,
             "n_shards": max(1, len(self.cohort(rnd)) or self.plan.n_shards),
             "base": self.base, "field_map": self.field_map or None,
-            # The ROUND'S cohort decides both the divisor and this pod's
-            # position in it. Using the planned shard count would hand a
-            # two-pod round the slices of an eight-pod one, so six eighths of
-            # that round's examples would go to pods that do not exist.
-            "indices": self.plan.indices_for(
-                max(0, self.position_of(int(shard), rnd)),
-                len(self.encoded), round=rnd, rounds=self.total_rounds,
-                n_shards=max(1, len(self.cohort(rnd))
-                             or self.plan.n_shards)),
+            # ONE BLOCK OFF THE QUEUE. Sized so the planned fleet over the
+            # planned rounds covers the set exactly once, and handed out on
+            # demand -- so a pod that arrives mid-exchange gets distinct work
+            # and its adapter joins the same average, which is sound because
+            # every contributor started from the same adapter and trained
+            # examples no one else has.
+            "indices": self.plan.block_at(
+                len(self.encoded),
+                self.block_for(int(shard), rnd),
+                self.plan.block_size(len(self.encoded), self.total_rounds)),
             "dataset_id": self.dataset_id,
             # Where to start: the previous round's average, or the bare base on
             # round 0. Named as a round rather than a blob id so a pod that
@@ -3961,14 +4042,21 @@ class _TextTrainCoordinator:
     def reap_the_dead(self) -> List[int]:
         """Release pods that stopped checking in, and say which shards are free.
 
-        Their shards are not reassigned here: the round protocol averages what
-        arrives, so a lost shard costs its share of one round rather than the
-        run. Re-renting is a decision about money and belongs to the caller.
+        Re-renting is a decision about money and belongs to the caller, but
+        the dead pod's BLOCK comes back here: with work taken from a queue,
+        examples issued to a pod that never submitted are simply never trained
+        by anyone unless the block is returned. Under the old partition they
+        came round again next epoch; under a queue they would vanish.
         """
         gone = []
         for pod in self.fleet.to_reap():
             if self.fleet.release(pod.shard, "stopped checking in"):
                 gone.append(pod.shard)
+        if gone:
+            back = self.recycle(gone)
+            if back:
+                print(f"[text-lora] {self.job_id}: block(s) {back} returned "
+                      f"to the queue from shard(s) {gone}", flush=True)
         return gone
 
 
@@ -4524,11 +4612,18 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     print(f"[text-lora] {job_id}: shard {_late} joined "
                           f"({_up} pod(s) up)", flush=True)
             _live = [sh for sh in sorted(fleet.pods) if fleet.pods[sh].url]
-            _members = coord.cohort(rnd, _live)
+            # NOT FIXED WHEN THE EXCHANGE OPENS. It used to be, because the
+            # slice was derived from a pod's position in it -- so a pod that
+            # became ready a minute later had nowhere to stand. Work comes off
+            # a queue now, so the exchange simply has more contributors than
+            # it started with, and that is reported as it happens.
+            _members = coord.cohort(rnd, _live, grow=True)
             if _members and len(_members) != _last_cohort[0]:
+                _was = _last_cohort[0]
                 _last_cohort[0] = len(_members)
                 print(f"[text-lora] {job_id}: round {rnd} runs on "
-                      f"{len(_members)} pod(s)", flush=True)
+                      f"{len(_members)} pod(s)"
+                      + (f" (was {_was})" if _was else ""), flush=True)
                 _update_job(job_id,
                             message=f"round {rnd}: {len(_members)} pod(s)")
             # Start the round on every pod that is idle and has not submitted.

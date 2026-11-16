@@ -152,6 +152,61 @@ class RoundPlan:
     def shard_of(self, index: int) -> int:
         return index % max(1, int(self.n_shards))
 
+    # -- work as a QUEUE, not as a per-round partition ------------------- #
+    #
+    # The partition below (`indices_for`) cuts a round's chunk into one slice
+    # per pod in that round's cohort, which forces two things that cost real
+    # money: the cohort has to be fixed before any slice is handed out, and a
+    # pod arriving mid-round has no slice at all -- so it idles until the
+    # round closes, or (as happened) gets handed position 0's slice and
+    # duplicates another pod's work.
+    #
+    # Neither is necessary. What local SGD actually requires is that everyone
+    # whose adapter goes into one average STARTED FROM THE SAME ADAPTER and
+    # trained DISJOINT data. Which data, and how much of it each pod got, is
+    # free -- the average is weighted by examples trained, so a pod that
+    # managed one block and a pod that managed three both count correctly.
+    #
+    # So the dataset is cut into fixed-size BLOCKS of the seeded order and
+    # handed out on demand. A pod that becomes ready halfway through an
+    # exchange takes the next unclaimed block and its result joins that same
+    # exchange. More pods therefore means more of the dataset covered per
+    # exchange rather than the same work divided more finely, and no number
+    # anywhere depends on how many pods happened to be present when the
+    # exchange opened.
+
+    def block_size(self, n_examples: int, rounds: int,
+                   n_shards: Optional[int] = None) -> int:
+        """How many examples one handout is.
+
+        Chosen so that the PLANNED fleet over the PLANNED rounds covers the
+        set exactly once: `n / (rounds * n_shards)`. That keeps the totals a
+        caller already reasoned about when the fleet is the size it asked for,
+        and simply covers more ground when more pods turn up.
+        """
+        k = max(1, int(n_shards if n_shards is not None else self.n_shards))
+        r = max(1, int(rounds))
+        return max(1, -(-int(n_examples) // (r * k)))
+
+    def block_at(self, n_examples: int, block: int, per: int) -> List[int]:
+        """Block number ``block`` of the seeded order, wrapping by epoch.
+
+        Wrapping rather than running out: a fleet larger than planned consumes
+        blocks faster, and the honest answer to "we have covered the set" is
+        to start a second pass over the same shuffle, not to hand a pod an
+        empty slice it would report as zero work.
+        """
+        import random
+        n = max(0, int(n_examples))
+        if n == 0:
+            return []
+        per = max(1, int(per))
+        order = list(range(n))
+        random.Random(self.seed).shuffle(order)
+        blocks = max(1, -(-n // per))
+        b = int(block) % blocks
+        return order[b * per:(b + 1) * per]
+
     def indices_for(self, shard: int, n_examples: int, *,
                     round: int = -1, rounds: int = 1,
                     n_shards: Optional[int] = None) -> List[int]:
@@ -218,12 +273,29 @@ class RoundTracker:
         #: pods in it can never be complete -- it waits out the deadline every
         #: time, which is how a growing fleet crawls.
         self._expected: Dict[int, int] = {}
+        #: The actual shard ids in a round, when the caller knows them.
+        self._members: Dict[int, List[int]] = {}
 
     # -- submissions ------------------------------------------------------ #
 
     def expect(self, rnd: int, cohort: int) -> None:
         """Record how many pods are in round ``rnd``."""
         self._expected[int(rnd)] = max(1, int(cohort))
+
+    def expect_shards(self, rnd: int, shards: Sequence[int]) -> None:
+        """Record WHICH pods are in round ``rnd``, not just how many.
+
+        :meth:`missing` used to answer `range(expected())`, which is only the
+        right set when the shard ids happen to be 0..n-1. A fleet that grows
+        and loses pods has ids like {0, 1, 15}, so a three-pod round reported
+        shards 0, 1 and 2 as its members: shard 2 did not exist and accrued
+        misses, while shard 15 could never accrue any and so could never be
+        declared dead.
+        """
+        ids = sorted({int(x) for x in shards})
+        if ids:
+            self._members[int(rnd)] = ids
+            self._expected[int(rnd)] = len(ids)
 
     def expected(self, rnd: Optional[int] = None) -> int:
         """The cohort size for a round, falling back to the planned shape."""
@@ -283,9 +355,17 @@ class RoundTracker:
                 return True
         return False
 
+    def members(self, rnd: Optional[int] = None) -> List[int]:
+        """The shard ids in a round, falling back to 0..expected-1."""
+        r = self.round if rnd is None else int(rnd)
+        got = self._members.get(r)
+        if got:
+            return list(got)
+        return list(range(self.expected(r)))
+
     def missing(self) -> List[int]:
         present = set(self._subs.get(self.round, {}))
-        return [s for s in range(self.expected()) if s not in present]
+        return [s for s in self.members() if s not in present]
 
     def close_round(self) -> Tuple[List[Submission], List[int]]:
         """Finish the round: returns what will be averaged and who was absent.

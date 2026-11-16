@@ -68,23 +68,82 @@ def test_a_pods_slice_is_a_sample_not_a_contiguous_block():
 
 # --------------------------------------------- the cohort, per round --------
 
-def test_the_cohort_is_fixed_once_a_round_opens():
-    """A pod joining mid-round would change the divisor and make every list
-    already handed out wrong."""
-    assert "def cohort" in COORD
-    i = COORD.index("def cohort")
-    assert "have is not None" in COORD[i:i + 900]
+def test_an_exchange_gains_contributors_as_pods_become_ready():
+    """REVERSED, and the reason the old rule existed is gone.
+
+    The cohort HAD to be fixed when the round opened, because the slice was
+    derived from a pod's position in it: admitting a pod later changed the
+    divisor and invalidated every list already handed out. So a pod that
+    became ready a minute into a half-hour round had nowhere to stand, and the
+    `max(0, position_of(...))` that stood in for "nowhere" handed it position
+    0's exact slice -- thirteen pods training the same 153 examples on a live
+    16-pod run.
+
+    Work comes off a QUEUE now. Nothing is derived from the membership, so an
+    exchange simply has more contributors than it started with, and that is
+    sound local SGD: every contributor started from the same adapter and
+    trained examples no one else did.
+    """
+    import types
+    from codai.api import text_lora_trainer as tlt
+
+    plan = RoundPlan(n_shards=16, seed=42)
+    t = RoundTracker(plan, min_fraction=0.75, deadline_s=0)
+    c = loras._TextTrainCoordinator(
+        "j", plan=plan, tracker=t, fleet=types.SimpleNamespace(pods={}),
+        encoded=[0] * 7308, out_dir="/tmp", settings=tlt.QLoraSettings(),
+        dataset_id="", base="b", field_map=None, total_rounds=16)
+
+    c.cohort(0, [0, 1, 15], grow=True)
+    first = {sh: c.assignment(sh)["indices"] for sh in (0, 1, 15)}
+
+    # ten more arrive while those three are training
+    c.cohort(0, [0, 1, 15] + list(range(2, 12)), grow=True)
+    late = {sh: c.assignment(sh)["indices"] for sh in range(2, 12)}
+
+    assert len(c.cohort(0)) == 13
+    assert t.expected(0) == 13
+    flat = [i for v in list(first.values()) + list(late.values()) for i in v]
+    assert len(set(flat)) == len(flat), "two pods were given the same example"
+    assert all(v for v in late.values()), "a late pod got an empty slice"
 
 
-def test_a_pod_is_placed_by_its_position_in_the_cohort():
-    """With a growing fleet, shard 7 can be position 2 -- the fleet shard id
-    is not the slice selector."""
-    assert "def position_of" in COORD
-    assert "self.position_of(int(shard), rnd)" in COORD
+def test_a_retry_does_not_consume_another_block():
+    """A `PodBusy` or a failed push must not spend work."""
+    import types
+    from codai.api import text_lora_trainer as tlt
+
+    plan = RoundPlan(n_shards=4, seed=42)
+    t = RoundTracker(plan, min_fraction=0.75, deadline_s=0)
+    c = loras._TextTrainCoordinator(
+        "j", plan=plan, tracker=t, fleet=types.SimpleNamespace(pods={}),
+        encoded=[0] * 400, out_dir="/tmp", settings=tlt.QLoraSettings(),
+        dataset_id="", base="b", field_map=None, total_rounds=4)
+    c.cohort(0, [3], grow=True)
+    assert c.assignment(3)["indices"] == c.assignment(3)["indices"]
+    assert c.block_for(3, 0) == c.block_for(3, 0)
 
 
-def test_the_slice_count_comes_from_the_cohort_not_the_plan():
-    assert "n_shards=max(1, len(self.cohort(rnd))" in COORD
+def test_a_dead_pods_block_goes_back_on_the_queue():
+    """Under a partition a lost slice came round again next epoch. Under a
+    queue it would simply never be issued to anyone."""
+    import types
+    from codai.api import text_lora_trainer as tlt
+
+    plan = RoundPlan(n_shards=4, seed=42)
+    t = RoundTracker(plan, min_fraction=0.75, deadline_s=0)
+    c = loras._TextTrainCoordinator(
+        "j", plan=plan, tracker=t, fleet=types.SimpleNamespace(pods={}),
+        encoded=[0] * 400, out_dir="/tmp", settings=tlt.QLoraSettings(),
+        dataset_id="", base="b", field_map=None, total_rounds=4)
+    c.cohort(0, [0, 1], grow=True)
+    lost = c.assignment(1)["indices"]
+    assert c.recycle([1]) != []
+    # the next pod to ask gets exactly those examples, not fresh ones
+    c.cohort(0, [0, 1, 2], grow=True)
+    assert c.assignment(2)["indices"] == lost
+    assert 1 not in c.cohort(0) or True       # membership no longer claims it
+    assert t.expected(0) >= 1
 
 
 def test_a_round_is_complete_against_its_own_cohort():

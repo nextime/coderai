@@ -47,11 +47,52 @@ def test_a_released_shard_is_announced_not_fatal():
     assert "raise" not in block.split("if not fleet.pods:")[0]
 
 
-def test_a_lost_shard_costs_its_share_of_one_round():
-    """The protocol's own reasoning, kept where it is relied on."""
-    doc = loras._TextTrainCoordinator.reap_the_dead.__doc__ or ""
-    assert "averages what" in doc
-    assert "rather than the" in doc
+def test_a_lost_shard_costs_its_share_of_one_round_at_most():
+    """And now not even that: its examples go back on the queue.
+
+    This used to assert a sentence of `reap_the_dead`'s docstring. The claim
+    is unchanged -- losing a pod costs its share of one exchange, not the run
+    -- but it got STRONGER when work became a queue, and the way to show that
+    is to run it: under a partition a lost slice came round again next epoch,
+    and under a queue it would simply never be issued unless the block is
+    recycled.
+    """
+    import types
+    from codai.api.text_lora_rounds import RoundPlan, RoundTracker
+    from codai.api import text_lora_trainer as tlt
+
+    plan = RoundPlan(n_shards=4, seed=42)
+    t = RoundTracker(plan, min_fraction=0.75, deadline_s=0)
+    reaped = []
+
+    class _Fleet:
+        pods = {}
+
+        def to_reap(self):
+            return [types.SimpleNamespace(shard=1)]
+
+        def release(self, shard, reason=""):
+            reaped.append((shard, reason))
+            return True
+
+    c = loras._TextTrainCoordinator(
+        "j", plan=plan, tracker=t, fleet=_Fleet(), encoded=[0] * 400,
+        out_dir="/tmp", settings=tlt.QLoraSettings(), dataset_id="",
+        base="b", field_map=None, total_rounds=4)
+    c.cohort(0, [0, 1], grow=True)
+    kept = c.assignment(0)["indices"]
+    lost = c.assignment(1)["indices"]
+    assert lost and set(lost).isdisjoint(kept)
+
+    gone = c.reap_the_dead()
+    assert gone == [1]
+    assert reaped and "stopped checking in" in reaped[0][1]
+
+    # The run continues on shard 0, and the lost examples are handed to the
+    # next pod that asks rather than dropped.
+    c.cohort(0, [0, 2], grow=True)
+    assert c.assignment(2)["indices"] == lost
+    assert c.assignment(0)["indices"] == kept, "a survivor was re-tasked"
 
 
 # --------------------------------- a lost fleet keeps what it has earned ----
