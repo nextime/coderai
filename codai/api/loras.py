@@ -3325,8 +3325,14 @@ async def _detached_text_train(req: TextLoraTrainRequest, job_id: str,
     try:
         await _run_text_train_job(req, job_id, dataset_path)
     except TaskCancelled:
-        pass
+        print(f"[text-lora] {job_id}: cancelled", flush=True)
     except Exception as e:
+        # PRINTED as well as recorded. A job that dies before it rents anything
+        # wrote nothing to the log, so the only trace was a field on a record
+        # a client has to ask for -- which is how a silent fall-through took
+        # four queries to diagnose instead of one grep.
+        print(f"[text-lora] {job_id}: FAILED: {type(e).__name__}: {e}",
+              flush=True)
         _update_job(job_id, status="error", active=False, force=True,
                     message=f"training failed: {e}"[:300])
 
@@ -3402,7 +3408,36 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
 
     _active_job_id = job_id
 
-    base = _resolve_text_base(req.base_model)
+    from codai.api import text_lora_fleet as _flt
+    _train_cfg = _flt.narrow(
+        _flt.config_for_model(req.base_model),
+        pods=req.pods, max_pods=req.max_pods, rounds=req.rounds,
+        max_pod_hourly_usd=req.max_pod_hourly_usd,
+        max_fleet_hourly_usd=req.max_fleet_hourly_usd)
+    # Anything that ASKS for pods must refuse when the model has no block --
+    # not fall through to training here. That fall-through is what turned a
+    # test run into tens of gigabytes of download on a GPU-less orchestrator
+    # and a CUDA error twenty minutes later, and the request looked fine.
+    _asked_for_pods = any((req.distributed, req.test_run, req.pods,
+                           req.min_pods, req.max_pods))
+    if _asked_for_pods and not _train_cfg.enabled:
+        raise RuntimeError(
+            f"{req.base_model!r} has no `lora_train` block with enabled=true, "
+            "so there is nothing to rent pods with. Set it on the Models page "
+            "(card floor, pod ceiling, $/hr) for the model you want to train, "
+            "and name THAT entry as base_model — the block's own base_model "
+            "field is what gets trained, so an alias like 'qwen38' is right "
+            "even when the weights are 'Qwen/Qwen3.8-27B'.")
+
+    # What to TRAIN comes from the BLOCK, not from the request string. The
+    # request names the catalogue entry so the configuration can be found; that
+    # entry may serve something no QLoRA can start from (an AWQ checkpoint) or
+    # have no local path at all, and then the request string is not a loadable
+    # model at all. Resolved here rather than at the pod launch because the
+    # tokenizer and the dataset pass need it too -- reaching from_pretrained
+    # with a catalogue alias fails identically under dry_run, which is how this
+    # was found, on a run that cost nothing and told us everything.
+    base = _resolve_text_base(_train_cfg.base_model or req.base_model)
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
 
     encoded, stats = _text_dataset_pass(req, dataset_path, tokenizer)
@@ -3430,12 +3465,6 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         enable_thinking=bool(req.enable_thinking),
         seed=int(req.seed or 42))
 
-    from codai.api import text_lora_fleet as _flt
-    _train_cfg = _flt.narrow(
-        _flt.config_for_model(req.base_model),
-        pods=req.pods, max_pods=req.max_pods, rounds=req.rounds,
-        max_pod_hourly_usd=req.max_pod_hourly_usd,
-        max_fleet_hourly_usd=req.max_fleet_hourly_usd)
     if req.test_run:
         # One pod, one round, a handful of examples, and a short leash. The
         # point is to exercise every stage -- not to train anything -- so a
@@ -3452,11 +3481,6 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     _want_dist = (_train_cfg.enabled
                   and (_train_cfg.max_pods > 1 or req.test_run)
                   and req.distributed is not False)
-    if req.distributed and not _train_cfg.enabled:
-        raise RuntimeError(
-            f"{req.base_model!r} has no `lora_train` block with enabled=true in "
-            "models.json — the card, the image and the $/hr ceiling are the "
-            "model's configuration, set on the Models page, not this request's")
     if _want_dist:
         # Rent a fleet and drive the rounds. Everything above this point was
         # free; everything below it spends.
@@ -3469,6 +3493,20 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
             raise
         finally:
             _active_job_id = None
+
+    # Local training needs a local card. Checked BEFORE the base is fetched,
+    # because the failure otherwise arrives after tens of gigabytes of download
+    # as a CUDA error that names neither the cause nor the fix.
+    try:
+        import torch as _torch
+        _has_gpu = bool(_torch.cuda.is_available())
+    except Exception:
+        _has_gpu = False
+    if not _has_gpu:
+        raise RuntimeError(
+            "this install has no CUDA device, so a text LoRA cannot be trained "
+            "here. Configure `lora_train` on the model (Models page) and ask "
+            "for pods, or run the job on a machine with a card.")
 
     out_dir = os.path.join(_loras_dir(), req.name)
     try:

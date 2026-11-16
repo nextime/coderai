@@ -266,3 +266,131 @@ def test_community_pricing_is_used_when_asked_for():
 def test_no_eligible_card_is_an_empty_list_not_a_guess():
     cfg = flt.LoraTrainConfig(min_vram_gb=200)
     assert flt.eligible_cards(_Catalogue(), cfg, ceiling=0.90) == []
+
+
+# ------------------------------- the three defects a real run turned up ------
+#
+# A test_run was issued naming `Qwen/Qwen3.8-27B` -- the weights -- where the
+# block sits on the entry aliased `qwen38`. The lookup found nothing, the block
+# defaulted to DISABLED, and the job fell through to training LOCALLY on a
+# GPU-less orchestrator: tens of gigabytes of download, then a CUDA error, and
+# nothing in the log because the failure was only recorded on the job record.
+# Three separate faults, each tested here.
+
+class _CM:
+    def __init__(self, entries):
+        self.models_data = {"text_models": entries}
+
+
+@pytest.fixture
+def catalogue(monkeypatch):
+    def _install(entries):
+        import codai.admin.routes as ar
+        import codai.models.manager as mgr
+        cm = _CM(entries)
+        monkeypatch.setattr(ar, "config_manager", cm, raising=False)
+        monkeypatch.setattr(mgr, "config_manager", cm, raising=False)
+        return cm
+    return _install
+
+
+def test_the_block_is_found_by_the_catalogue_alias(catalogue):
+    catalogue([{"alias": "qwen38", "path": "", "lora_train": dict(BLOCK)}])
+    assert flt.config_for_model("qwen38").enabled is True
+
+
+def test_the_block_is_also_found_by_the_training_base(catalogue):
+    """The defect: 'qwen38' and 'Qwen/Qwen3.8-27B' are one model to a human and
+    two keys to code, and a request may reasonably say either."""
+    block = {**BLOCK, "base_model": "Qwen/Qwen3.8-27B"}
+    catalogue([{"alias": "qwen38", "path": "", "lora_train": block}])
+    cfg = flt.config_for_model("Qwen/Qwen3.8-27B")
+    assert cfg.enabled is True and cfg.max_pods == 4
+
+
+def test_an_ambiguous_training_base_is_refused_not_guessed(catalogue):
+    """Two models training the same base have two ceilings. Picking one
+    silently is how a run uses the wrong one."""
+    block = {**BLOCK, "base_model": "Qwen/Qwen3.8-27B"}
+    catalogue([{"alias": "qwen38", "lora_train": block},
+               {"alias": "qwen38-alt", "lora_train": {**block, "max_pods": 64}}])
+    with pytest.raises(ValueError) as e:
+        flt.config_for_model("Qwen/Qwen3.8-27B")
+    assert "more than one model" in str(e.value)
+    assert "qwen38" in str(e.value) and "qwen38-alt" in str(e.value)
+
+
+def test_an_unknown_model_still_returns_a_disabled_block(catalogue):
+    catalogue([{"alias": "something-else"}])
+    assert flt.config_for_model("nobody").enabled is False
+
+
+def test_asking_for_pods_without_a_block_refuses_rather_than_training_here():
+    """The fall-through that cost tens of gigabytes: test_run and a bare `pods`
+    did not take the explicit-distributed branch, so they trained locally."""
+    import inspect
+    src = inspect.getsource(loras)
+    i = src.index("_asked_for_pods = any(")
+    block = src[i:i + 500]
+    for field in ("req.distributed", "req.test_run", "req.pods", "req.min_pods",
+                  "req.max_pods"):
+        assert field in block, f"{field} can still fall through"
+    assert "nothing to rent pods with" in src
+
+
+def test_the_refusal_says_which_name_to_use():
+    """The error has to name the fix, or the next person passes the weights
+    again -- it is the natural thing to write."""
+    import inspect
+    src = inspect.getsource(loras)
+    assert "an alias like 'qwen38' is right" in src
+
+
+def test_local_training_refuses_before_downloading_on_a_gpuless_box():
+    """Checked before the base is fetched: otherwise the failure arrives after
+    the download as a CUDA error that names neither cause nor fix."""
+    import inspect
+    src = inspect.getsource(loras._text_train_blocking)
+    # The CONDITION, not just the message: blanking the test leaves the string
+    # in place, and an earlier version of this test passed on exactly that.
+    assert "if not _has_gpu:" in src, "the guard is not a live condition"
+    guard = src.index("if not _has_gpu:")
+    fetch = src.index("tlt.run_training(")
+    assert guard < fetch, "the GPU check must precede the load"
+    assert "cuda.is_available()" in src
+
+
+def test_a_failure_is_printed_and_not_only_recorded():
+    """A job that died before renting wrote nothing to the log, so the only
+    trace was a field a client had to ask for."""
+    import inspect
+    src = inspect.getsource(loras._detached_text_train)
+    assert "FAILED" in src and "print(" in src
+
+
+def test_the_request_string_never_reaches_from_pretrained_when_a_block_names_a_base():
+    """The defect digesta found, and the one my own docstring had promised was
+    fixed: the lookup worked, the SUBSTITUTION did not.
+
+    `base_model: "qwen38"` found the entry and then handed "qwen38" straight to
+    from_pretrained, which failed with "not a local folder and is not a valid
+    model identifier" -- identically under dry_run, which is what proved it was
+    resolution rather than training. So the order matters: the block has to be
+    resolved before the tokenizer, not at the pod launch.
+    """
+    import inspect
+    src = inspect.getsource(loras._text_train_blocking)
+    i_cfg = src.index("config_for_model")
+    i_base = src.index("base = _resolve_text_base")
+    i_tok = src.index("AutoTokenizer.from_pretrained")
+    assert i_cfg < i_base < i_tok, "the block must be read before the base loads"
+    assert "_train_cfg.base_model or req.base_model" in src, (
+        "the base must come from the block, falling back to the request")
+
+
+def test_the_refusal_happens_before_anything_is_downloaded():
+    """Asking for pods on a model with no block used to get as far as pulling
+    the weights. The refusal belongs before the tokenizer, not after it."""
+    import inspect
+    src = inspect.getsource(loras._text_train_blocking)
+    assert src.index("_asked_for_pods") < src.index("AutoTokenizer.from_pretrained")

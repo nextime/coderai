@@ -563,13 +563,57 @@ def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
 
 
 def config_for_model(model_key: str) -> LoraTrainConfig:
-    """The `lora_train` block of this model's entry, or defaults."""
+    """The `lora_train` block for this key, by entry name OR by training base.
+
+    Two names mean the same model to a human and different keys to code: the
+    catalogue entry is ``qwen38`` while the thing actually trained is
+    ``Qwen/Qwen3.8-27B``, and a request may reasonably say either. Looking only
+    at the entry's own names meant the second one found no block, defaulted to
+    disabled, and the job fell through to training locally -- on an
+    orchestrator with no GPU, which is tens of gigabytes of download and then
+    a CUDA error that names nothing.
+
+    So: the entry's names first, then any entry whose ``lora_train.base_model``
+    is this key. An ambiguous match is REFUSED rather than guessed, because
+    silently picking one of two configurations is how a run uses the wrong
+    ceiling.
+    """
     try:
         from codai.models.manager import _model_entry_for
         entry = _model_entry_for(model_key) or {}
-        return parse_model_lora_train(entry.get("lora_train"))
+        if entry.get("lora_train"):
+            return parse_model_lora_train(entry["lora_train"])
+    except Exception:
+        pass
+    want = (model_key or "").strip().lower()
+    if not want:
+        return LoraTrainConfig()
+    matches = []
+    try:
+        from codai.admin.routes import config_manager as cfg_mgr
+        md = getattr(cfg_mgr, "models_data", None) or {}
+        for lst in md.values():
+            if not isinstance(lst, list):
+                continue
+            for m in lst:
+                if not isinstance(m, dict):
+                    continue
+                blk = m.get("lora_train")
+                if not isinstance(blk, dict):
+                    continue
+                if str(blk.get("base_model") or "").strip().lower() == want:
+                    matches.append((str(m.get("alias") or m.get("id") or "?"), blk))
     except Exception:
         return LoraTrainConfig()
+    if len(matches) > 1:
+        names = ", ".join(n for n, _ in matches)
+        raise ValueError(
+            f"{model_key!r} is the training base of more than one model "
+            f"({names}) — name the catalogue entry instead, so the ceilings and "
+            f"pod count are not picked for you")
+    if matches:
+        return parse_model_lora_train(matches[0][1])
+    return LoraTrainConfig()
 
 
 def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
