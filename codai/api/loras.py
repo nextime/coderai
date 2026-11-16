@@ -3190,6 +3190,22 @@ class TextLoraTrainRequest(BaseModel):
     #: half of a run, and the one that catches a bad mask before a pod is rented.
     dry_run: Optional[bool] = False
 
+    # --- distributed ------------------------------------------------------
+    # The card, the image, the pod count and the money are the MODEL's
+    # configuration (`lora_train` in models.json, edited on the Models page),
+    # not this request's. Same rule /v1/runpod/scale states for itself: a
+    # request cannot change a model's configuration, which is what makes this
+    # route safe to expose. The three fields below may only NARROW it.
+    #: Run distributed at all. Requires the model's `lora_train.enabled`.
+    distributed: Optional[bool] = None
+    #: Fewer pods than the model permits, never more.
+    pods: Optional[int] = None
+    #: More or fewer averaging rounds: duration, not fleet size or price.
+    rounds: Optional[int] = None
+    #: A LOWER $/hr ceiling than the model's, never a higher one.
+    max_pod_hourly_usd: Optional[float] = None
+    max_fleet_hourly_usd: Optional[float] = None
+
     wait: Optional[bool] = False
     session: Optional[str] = None
     model_config = ConfigDict(extra="allow")
@@ -3395,6 +3411,32 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         accumulation_steps=int(req.accumulation_steps or 8),
         enable_thinking=bool(req.enable_thinking),
         seed=int(req.seed or 42))
+
+    from codai.api import text_lora_fleet as _flt
+    _train_cfg = _flt.narrow(
+        _flt.config_for_model(req.base_model),
+        pods=req.pods, rounds=req.rounds,
+        max_pod_hourly_usd=req.max_pod_hourly_usd,
+        max_fleet_hourly_usd=req.max_fleet_hourly_usd)
+    _want_dist = (_train_cfg.enabled and _train_cfg.pods > 1
+                  and req.distributed is not False)
+    if req.distributed and not _train_cfg.enabled:
+        raise RuntimeError(
+            f"{req.base_model!r} has no `lora_train` block with enabled=true in "
+            "models.json — the card, the image and the $/hr ceiling are the "
+            "model's configuration, set on the Models page, not this request's")
+    if _want_dist:
+        # Rent a fleet and drive the rounds. Everything above this point was
+        # free; everything below it spends.
+        try:
+            return {**summary, **_text_train_distributed(
+                req, job_id, dataset_path, encoded, stats, st, _train_cfg)}
+        except TaskCancelled:
+            _update_job(job_id, status="cancelled", active=False, force=True,
+                        message="cancelled; pods released")
+            raise
+        finally:
+            _active_job_id = None
 
     out_dir = os.path.join(_loras_dir(), req.name)
     try:
@@ -3673,3 +3715,177 @@ async def text_train_runner(job_id: str, request: Request):
     from fastapi.responses import PlainTextResponse
     with open(path, "r", encoding="utf-8") as fh:
         return PlainTextResponse(fh.read(), media_type="text/x-python")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distributed text QLoRA: the coordinator loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _price_for(client, gpu_type_id: str, cloud_type: str) -> Optional[float]:
+    """The catalogue's $/hr for this card, or None if it cannot be read.
+
+    The per-pod ceiling has to bind on the REAL price, not on a number the
+    caller guessed: a ceiling checked against an estimate is a ceiling that
+    agrees with whatever the request claimed.
+    """
+    want = (gpu_type_id or "").strip().lower()
+    try:
+        for g in client.list_gpu_types() or []:
+            if str(g.get("id") or "").strip().lower() != want:
+                continue
+            if (cloud_type or "").upper() == "COMMUNITY":
+                return g.get("community_price") or g.get("on_demand_price")
+            return g.get("secure_price") or g.get("on_demand_price")
+    except Exception as exc:
+        print(f"[text-lora] could not read the GPU catalogue: {exc}", flush=True)
+    return None
+
+
+def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
+                            dataset_path: str, encoded, stats, settings,
+                            cfg) -> dict:
+    """Rent a fleet, drive the rounds, release everything. The spending path.
+
+    ``cfg`` is the MODEL's ``lora_train`` block, already narrowed by whatever
+    the request asked for. Nothing here reads a card, an image or a price out
+    of the request: those are the operator's, set on the Models page, and
+    that is what makes this route safe for a client to call.
+
+    Structured so the release is in a ``finally`` that cannot be skipped: every
+    other failure mode here -- no capacity, a cancel, every pod dying, an
+    exception in the averaging -- ends with the pods terminated, because the one
+    outcome that is not acceptable is a fleet left running.
+    """
+    from codai.api import runpod_client as rpc
+    from codai.api import text_lora_fleet as flt
+    from codai.api import text_lora_rounds as tlr
+    from codai.models.manager import get_active_runpod_config
+
+    account = get_active_runpod_config()
+    if account is None or not getattr(account, "api_key", ""):
+        raise RuntimeError("distributed training needs the RunPod account "
+                           "configured (runpod.api_key)")
+    # Install-level, not per model and not per request: it is how a pod
+    # reaches THIS install. A wrong value is a fleet that boots, cannot call
+    # home, and bills until the reaper notices.
+    callback = (getattr(account, "callback_url", "") or
+                os.environ.get("CODERAI_PUBLIC_URL") or "").strip().rstrip("/")
+    if not callback:
+        raise RuntimeError(
+            "set runpod.callback_url (or CODERAI_PUBLIC_URL) to a URL that "
+            "resolves from RunPod: a training pod reaches the orchestrator "
+            "outbound, so it has to be told where this install is")
+
+    n_shards = max(1, int(cfg.pods or 1))
+    rounds = max(1, int(cfg.rounds or 1))
+    gpu = (cfg.gpu_type_id or "").strip()
+    if not gpu:
+        raise RuntimeError(
+            f"{req.base_model!r}: set lora_train.gpu_type_id on the Models "
+            "page (e.g. 'NVIDIA A40')")
+    cloud = (cfg.cloud_type or "SECURE").strip().upper()
+
+    client = rpc.RunpodClient(account)
+    price = _price_for(client, gpu, cloud)
+    ceiling = float(cfg.max_pod_hourly_usd or 0.0)
+    if price is None:
+        if ceiling > 0:
+            raise RuntimeError(
+                f"the GPU catalogue did not price {gpu!r}, so the "
+                f"${ceiling:.2f}/hr per-pod ceiling cannot be enforced — "
+                "refusing rather than renting blind")
+        price = 0.0
+    elif ceiling > 0 and price > ceiling + 1e-9:
+        raise RuntimeError(
+            f"{gpu} costs ${price:.2f}/hr {cloud}, over the ${ceiling:.2f}/hr "
+            f"per-pod ceiling — nothing was rented")
+    print(f"[text-lora] {job_id}: {gpu} at ${price:.2f}/hr {cloud}, "
+          f"{n_shards} pod(s), {rounds} round(s)", flush=True)
+
+    out_dir = os.path.join(_loras_dir(), req.name)
+    plan = tlr.RoundPlan(n_shards=n_shards, seed=settings.seed)
+    tracker = tlr.RoundTracker(
+        plan,
+        min_fraction=0.75,
+        deadline_s=max(60.0, float(cfg.poll_interval_s or 20.0) * 60))
+    spec = flt.TrainerPodSpec(
+        image=cfg.image, gpu_type_id=gpu, cloud_type=cloud, hourly_usd=price,
+        max_pod_hourly_usd=ceiling,
+        container_disk_gb=int(cfg.container_disk_gb or 120),
+        network_volume_id=(cfg.network_volume_id or ""),
+        max_silence_s=float(cfg.pod_max_silence_s or 1800.0),
+        max_lifetime_s=float(cfg.pod_max_lifetime_s or 86400.0))
+    fleet = flt.TrainerFleet(
+        client, job_id, spec, ledger_key=f"text-lora:{req.name}",
+        max_fleet_hourly_usd=float(cfg.max_fleet_hourly_usd or 0.0),
+        on_event=lambda m: _update_job(job_id, message=m[:200]))
+    coord = _TextTrainCoordinator(
+        job_id, plan=plan, tracker=tracker, fleet=fleet, encoded=encoded,
+        out_dir=out_dir, settings=settings,
+        dataset_id=req.dataset_id or "", base=_resolve_text_base(req.base_model),
+        field_map=req.field_map, total_rounds=rounds)
+
+    # The pod fetches the runner with its own credential and executes it. The
+    # image's ENTRYPOINT is reset, so this is the whole command.
+    spec.env = {
+        "CODERAI_URL": callback,
+        "CODERAI_TRAIN_SECRET": coord.secret,
+        "CODERAI_TRAIN_BASE": coord.base,
+        "CODERAI_TRAIN_WORKDIR": "/workspace/train",
+        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+    }
+    spec.start_cmd = [
+        "sh", "-lc",
+        'set -e; curl -fsS -H "Authorization: Bearer $CODERAI_TRAIN_SECRET" '
+        '"$CODERAI_URL/v1/loras/train/text/$CODERAI_TRAIN_JOB/runner" '
+        '-o /tmp/runner.py; exec python3 /tmp/runner.py']
+
+    with _coord_lock:
+        _train_coordinators[job_id] = coord
+    poll = max(5.0, float(cfg.poll_interval_s or 20.0))
+    try:
+        started = fleet.provision(list(range(n_shards)))
+        if not started and not fleet.pods:
+            raise RuntimeError("no pods could be rented — nothing to train on")
+        _update_job(job_id, status="training", total=rounds,
+                    message=f"{len(fleet.pods)} pod(s) training round 0")
+        while not coord.finished():
+            _check_train_cancel()
+            closed = coord.close_round_if_ready()
+            if closed is not None:
+                _update_job(job_id, step=closed + 1,
+                            message=f"round {closed} averaged; "
+                                    f"{len(fleet.pods)} pod(s) running")
+                continue
+            gone = coord.reap_the_dead()
+            if gone:
+                print(f"[text-lora] {job_id}: released silent shard(s) {gone}",
+                      flush=True)
+            if not fleet.pods:
+                raise RuntimeError(
+                    f"every pod is gone at round {coord.tracker.round} of "
+                    f"{rounds}; the last average is kept in {out_dir}")
+            time.sleep(poll)
+
+        final = coord.average_path(rounds - 1)
+        if not final or not os.path.isfile(final):
+            raise RuntimeError(f"the last round produced no average in {out_dir}")
+        import shutil
+        adapter = os.path.join(out_dir, "adapter_model.safetensors")
+        shutil.copyfile(final, adapter)
+        print(f"[text-lora] {job_id}: finished {rounds} round(s); "
+              f"adapter at {adapter}", flush=True)
+        return {"rounds": rounds, "shards": n_shards,
+                "gpu": gpu, "hourly_usd": price,
+                "examples": stats.examples, "path": out_dir,
+                "adapter": adapter}
+    finally:
+        # The guarantee. Not conditional on how we got here: a cancel, an
+        # exception, a fleet that died -- the pods stop billing.
+        released = fleet.release_all("training job ended")
+        leftover = [o for o in flt.orphans() if o.get("job") == job_id]
+        print(f"[text-lora] {job_id}: released {released} pod(s)"
+              + (f"; STILL RUNNING: {[o['pod_id'] for o in leftover]}"
+                 if leftover else ""), flush=True)
+        with _coord_lock:
+            _train_coordinators.pop(job_id, None)

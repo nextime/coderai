@@ -402,3 +402,121 @@ class TrainerFleet:
             if self.release(shard, reason):
                 n += 1
         return n
+
+
+# --------------------------------------------------------------------------- #
+# the per-model configuration
+# --------------------------------------------------------------------------- #
+#
+# Where the GPU, the image and the money live: the model's own entry in
+# models.json, edited on the Models page, exactly like its `runpod` block.
+#
+# NOT in the request. That is the same rule `/v1/runpod/scale` states for
+# itself -- "there is deliberately no way for a request to change a model's
+# configuration" -- and it is what makes the route safe to expose: a caller can
+# start a training run without being able to pick a bigger card, a different
+# image, or a higher price than the operator configured.
+#
+# A request may still NARROW what is configured (fewer pods, a lower ceiling),
+# because asking for less than you are allowed is always safe. The narrowing
+# dies with the request; it cannot raise anything.
+
+@dataclasses.dataclass
+class LoraTrainConfig:
+    """A model's `lora_train` block: how THIS model is trained on rented GPUs."""
+
+    enabled: bool = False
+    #: Which card, as RunPod names it ("NVIDIA A40"). Not a list: a fleet whose
+    #: pods are different cards averages rounds of unequal length, and the
+    #: slowest card then sets the pace for everyone.
+    gpu_type_id: str = ""
+    cloud_type: str = "SECURE"
+    image: str = "ghcr.io/nextime/coderai-trainer-text:latest"
+    pods: int = 1                     # how many shards the operator permits
+    rounds: int = 1
+    container_disk_gb: int = 120
+    network_volume_id: str = ""
+    #: The ceilings. Checked against the GPU catalogue's real price before
+    #: anything is rented, so they bind on what RunPod charges rather than on
+    #: what a request claimed.
+    max_pod_hourly_usd: float = 0.0
+    max_fleet_hourly_usd: float = 0.0
+    pod_max_silence_s: float = 1800.0
+    pod_max_lifetime_s: float = 86400.0
+    poll_interval_s: float = 20.0
+    #: Training defaults for this model; a request may override the ones that
+    #: cost nothing to change (rank, lr, length) but not the ones that cost
+    #: money (pods, rounds, cards, ceilings).
+    rank: int = 16
+    alpha: int = 0                    # 0 = 2x rank
+    dropout: float = 0.05
+    learning_rate: float = 1e-4
+    max_len: int = 8192
+    accumulation_steps: int = 8
+
+
+def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
+    """A models.json `lora_train` block to a config, unknown keys ignored."""
+    cfg = LoraTrainConfig()
+    if not isinstance(block, dict):
+        return cfg
+    for f in dataclasses.fields(cfg):
+        if f.name not in block:
+            continue
+        raw = block[f.name]
+        try:
+            if f.type is bool or f.name == "enabled":
+                setattr(cfg, f.name, bool(raw))
+            elif f.name in ("gpu_type_id", "cloud_type", "image",
+                            "network_volume_id"):
+                setattr(cfg, f.name, str(raw or "").strip())
+            elif f.name in ("pods", "rounds", "container_disk_gb", "rank",
+                            "alpha", "accumulation_steps", "max_len"):
+                setattr(cfg, f.name, int(raw))
+            else:
+                setattr(cfg, f.name, float(raw))
+        except (TypeError, ValueError):
+            continue        # a malformed value keeps the default, loudly below
+    return cfg
+
+
+def config_for_model(model_key: str) -> LoraTrainConfig:
+    """The `lora_train` block of this model's entry, or defaults."""
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(model_key) or {}
+        return parse_model_lora_train(entry.get("lora_train"))
+    except Exception:
+        return LoraTrainConfig()
+
+
+def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
+           rounds: Optional[int] = None,
+           max_pod_hourly_usd: Optional[float] = None,
+           max_fleet_hourly_usd: Optional[float] = None) -> LoraTrainConfig:
+    """Apply a request's narrowing. It can only ever ask for LESS.
+
+    Asking for more is not an error worth failing a job over -- it is a client
+    that does not know the operator's limit -- so it is clamped and said out
+    loud. What matters is that it cannot take effect.
+    """
+    out = dataclasses.replace(cfg)
+    if pods is not None and int(pods) > 0:
+        want = int(pods)
+        out.pods = min(want, cfg.pods)
+        if want > cfg.pods:
+            print(f"[text-lora] request asked for {want} pods; the model "
+                  f"permits {cfg.pods} — using {out.pods}", flush=True)
+    if rounds is not None and int(rounds) > 0:
+        out.rounds = int(rounds)        # rounds change duration, not the fleet
+    for name, want in (("max_pod_hourly_usd", max_pod_hourly_usd),
+                       ("max_fleet_hourly_usd", max_fleet_hourly_usd)):
+        if want is None or float(want) <= 0:
+            continue
+        have = float(getattr(cfg, name) or 0.0)
+        new = float(want) if have <= 0 else min(float(want), have)
+        if have > 0 and float(want) > have:
+            print(f"[text-lora] request asked for {name}=${float(want):.2f}; "
+                  f"the model allows ${have:.2f} — using ${new:.2f}", flush=True)
+        setattr(out, name, new)
+    return out
