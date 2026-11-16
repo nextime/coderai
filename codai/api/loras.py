@@ -3518,9 +3518,34 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         encoded = encoded[:n]
         print(f"[text-lora] {job_id}: TEST RUN — 1 pod, 1 round, "
               f"{len(encoded)} example(s)", flush=True)
+    # ASKING FOR A POD IS ASKING FOR A POD. This used to require
+    # `max_pods > 1 or test_run`, so a request for exactly ONE pod -- `pods: 1,
+    # min_pods: 1` -- fell through to the local path and tried to train on an
+    # orchestrator with no card. Seven submissions died that way, and the local
+    # fallback is the same failure a comment two screens up calls "a test run
+    # turned into tens of gigabytes of download on an orchestrator with no
+    # cards". `min_pods` was not even consulted, though it is the clearest
+    # signal a caller wants a fleet.
     _want_dist = (_train_cfg.enabled
-                  and (_train_cfg.max_pods > 1 or req.test_run)
+                  and (_train_cfg.max_pods > 1 or req.test_run
+                       or (req.pods or 0) >= 1 or (req.min_pods or 0) >= 1)
                   and req.distributed is not False)
+    if _asked_for_pods and not _want_dist:
+        # Belt and braces: whatever combination gets here asked for pods and
+        # would still train locally. Refusing is right even when the local host
+        # HAS a card -- someone who asks for a fleet and silently gets one
+        # machine has no way to tell, and finds out from the bill or the clock.
+        raise RuntimeError(
+            f"this request asks for pods (pods={req.pods!r}, "
+            f"min_pods={req.min_pods!r}, max_pods={req.max_pods!r}, "
+            f"distributed={req.distributed!r}, test_run={req.test_run!r}) but "
+            f"the job would train LOCALLY: "
+            + ("`distributed: false` was passed explicitly"
+               if req.distributed is False else
+               f"the model's lora_train block is "
+               + ("disabled" if not _train_cfg.enabled else
+                  f"max_pods={_train_cfg.max_pods}"))
+            + ". Refusing rather than training somewhere you did not ask for.")
     if _want_dist:
         # Rent a fleet and drive the rounds. Everything above this point was
         # free; everything below it spends.
