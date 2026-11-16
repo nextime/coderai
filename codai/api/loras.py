@@ -37,6 +37,7 @@ import io
 import json
 import os
 import secrets
+import dataclasses
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -3206,6 +3207,16 @@ class TextLoraTrainRequest(BaseModel):
     max_pod_hourly_usd: Optional[float] = None
     max_fleet_hourly_usd: Optional[float] = None
 
+    #: Prove the whole path for the price of a few minutes of one pod: rent,
+    #: boot, push, train a handful of examples, pull the adapter, average,
+    #: release -- reporting each stage with its timing, so a failure says
+    #: WHERE. `dry_run` proves the dataset and needs no GPU; this proves
+    #: everything a real run does except its duration.
+    test_run: Optional[bool] = False
+    #: How many examples the test trains on. Enough to exercise a step and an
+    #: optimizer update, few enough to cost nothing.
+    test_examples: Optional[int] = 8
+
     wait: Optional[bool] = False
     session: Optional[str] = None
     model_config = ConfigDict(extra="allow")
@@ -3418,7 +3429,21 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         pods=req.pods, rounds=req.rounds,
         max_pod_hourly_usd=req.max_pod_hourly_usd,
         max_fleet_hourly_usd=req.max_fleet_hourly_usd)
-    _want_dist = (_train_cfg.enabled and _train_cfg.pods > 1
+    if req.test_run:
+        # One pod, one round, a handful of examples, and a short leash. The
+        # point is to exercise every stage -- not to train anything -- so a
+        # failure is attributable in minutes rather than discovered hours into
+        # a real run.
+        _train_cfg = dataclasses.replace(
+            _train_cfg, pods=1, rounds=1,
+            pod_max_lifetime_s=min(float(_train_cfg.pod_max_lifetime_s or 0)
+                                   or 3600.0, 3600.0))
+        n = max(1, int(req.test_examples or 8))
+        encoded = encoded[:n]
+        print(f"[text-lora] {job_id}: TEST RUN — 1 pod, 1 round, "
+              f"{len(encoded)} example(s)", flush=True)
+    _want_dist = (_train_cfg.enabled
+                  and (_train_cfg.pods > 1 or req.test_run)
                   and req.distributed is not False)
     if req.distributed and not _train_cfg.enabled:
         raise RuntimeError(
@@ -3806,10 +3831,17 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         shutil.copyfile(final, adapter)
         print(f"[text-lora] {job_id}: finished {rounds} round(s); "
               f"adapter at {adapter}", flush=True)
+        stages.done("adapter", path=adapter)
         return {"rounds": rounds, "shards": n_shards,
                 "gpu": gpu, "hourly_usd": price,
                 "examples": stats.examples, "path": out_dir,
-                "adapter": adapter}
+                "adapter": adapter, "test_run": bool(req.test_run),
+                # What the run cost in time, stage by stage. On a first run the
+                # answer to "why did that take twenty minutes" is one stage,
+                # and rarely the one anyone guessed.
+                **stages.as_dict(),
+                "spend_usd": round(sum(p.cost_so_far()
+                                       for p in fleet.pods.values()), 4)}
     finally:
         # The guarantee. Not conditional on how we got here: a cancel, an
         # exception, a fleet that died -- the pods stop billing.

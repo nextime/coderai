@@ -678,3 +678,53 @@ def fetch_adapter(pod: TrainerPod, out_path: str, *,
                     fh.write(chunk)
     os.replace(tmp, out_path)
     return out_path
+
+
+# --------------------------------------------------------------------------- #
+# a staged timeline
+# --------------------------------------------------------------------------- #
+
+class Stages:
+    """What happened, in order, with how long each part took.
+
+    A distributed training run has eight or nine places it can fail and most of
+    them look the same from outside: the job errors, minutes in, having spent
+    money. A timeline turns "it failed" into "it rented in 4 s, became
+    reachable in 390 s, and then the tokenizer load timed out" -- which names
+    the cause and, as often, names the SLOW part that is not a failure at all.
+    """
+
+    def __init__(self):
+        self._t0 = time.time()
+        self._mark = self._t0
+        self.rows: List[Dict[str, Any]] = []
+
+    def done(self, name: str, **detail) -> None:
+        now = time.time()
+        self.rows.append({"stage": name, "seconds": round(now - self._mark, 1),
+                          "at": round(now - self._t0, 1), "ok": True, **detail})
+        self._mark = now
+        print(f"[stage] {name}: {self.rows[-1]['seconds']}s", flush=True)
+
+    def failed(self, name: str, error: str) -> None:
+        now = time.time()
+        self.rows.append({"stage": name, "seconds": round(now - self._mark, 1),
+                          "at": round(now - self._t0, 1), "ok": False,
+                          "error": str(error)[:300]})
+        self._mark = now
+        print(f"[stage] {name}: FAILED after {self.rows[-1]['seconds']}s — "
+              f"{error}", flush=True)
+
+    @property
+    def total(self) -> float:
+        return round(time.time() - self._t0, 1)
+
+    def as_dict(self) -> Dict[str, Any]:
+        bad = [r for r in self.rows if not r.get("ok")]
+        return {"stages": self.rows, "total_seconds": self.total,
+                "failed_at": bad[0]["stage"] if bad else None,
+                # The slowest stage, because on a first run the answer to "why
+                # did that take twenty minutes" is almost always one stage and
+                # almost never the one anyone guessed.
+                "slowest": (max(self.rows, key=lambda r: r["seconds"])["stage"]
+                            if self.rows else None)}

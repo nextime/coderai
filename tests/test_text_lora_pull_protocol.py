@@ -314,3 +314,59 @@ def test_a_pod_that_never_publishes_a_port_is_released_not_awaited(two_pods):
         fleet.address(0)
     assert fleet.release(0, "never published a port") is True
     assert client.terminated == ["pod1"]
+
+
+# ------------------------------------------------------------- the self-test --
+#
+# "Can coderai make a test?" -- yes, and it is the cheapest thing in the whole
+# path: one pod, one round, a handful of examples. It proves rent, boot,
+# dataset push, tokenizer, encode, train, pull, average and release for a few
+# minutes of GPU instead of discovering a broken stage hours into a real run.
+
+def test_a_test_run_is_one_pod_one_round_and_a_few_examples():
+    """Not a different code path -- the SAME one with everything turned down,
+    or the test would prove something other than what a real run does."""
+    import inspect
+    src = inspect.getsource(loras)
+    i = src.index("if req.test_run:")
+    block = src[i:i + 900]
+    assert "pods=1" in block and "rounds=1" in block
+    assert "encoded[:n]" in block, "it must shrink the work, not the pipeline"
+
+
+def test_a_test_run_shortens_the_leash():
+    """A smoke test that can bill for a day is not a smoke test."""
+    import inspect
+    src = inspect.getsource(loras)
+    i = src.index("if req.test_run:")
+    assert "pod_max_lifetime_s" in src[i:i + 900]
+
+
+def test_the_timeline_names_the_stage_that_failed():
+    """"It failed" after four minutes and $0.06 is not a diagnosis. Eight
+    stages look identical from outside unless each is timed."""
+    st = flt.Stages()
+    st.done("rent", pods=1)
+    st.failed("reachable", "Pod cannot be reached")
+    d = st.as_dict()
+    assert d["failed_at"] == "reachable"
+    assert [r["stage"] for r in d["stages"]] == ["rent", "reachable"]
+    assert d["stages"][0]["ok"] is True and d["stages"][1]["ok"] is False
+
+
+def test_the_timeline_names_the_slowest_stage():
+    """On a first run the answer to "why twenty minutes" is one stage, and
+    rarely the one anyone guessed -- usually the image pull or the weights."""
+    import time as _t
+    st = flt.Stages()
+    st.done("rent")
+    _t.sleep(0.05)
+    st.done("reachable")
+    assert st.as_dict()["slowest"] == "reachable"
+
+
+def test_a_clean_timeline_has_no_failure():
+    st = flt.Stages()
+    st.done("rent")
+    st.done("adapter")
+    assert st.as_dict()["failed_at"] is None
