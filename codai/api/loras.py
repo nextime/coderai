@@ -3855,6 +3855,9 @@ class _TextTrainCoordinator:
         #: The next unclaimed block, and blocks freed by pods that died.
         self._next_block = 0
         self._recycle: List[int] = []
+        #: round -> blocks already handed out in it, so no two pods in one
+        #: average ever train the same examples.
+        self._issued: Dict[int, set] = {}
         self._lock = threading.Lock()
         os.makedirs(out_dir, exist_ok=True)
 
@@ -3929,23 +3932,75 @@ class _TextTrainCoordinator:
         examples and the weighted average would have been seven eighths one
         slice.
 
-        Idempotent per (shard, round): a retry after a `PodBusy` or a failed
-        push must not consume another block.
+        Idempotent while the pod still HOLDS the block: a retry after a
+        `PodBusy` or a failed push must not consume another. Once the block is
+        submitted, :meth:`block_done` releases it and the next call hands out
+        a fresh one -- which is the point, because a pod that finished its
+        block while the exchange is still open would otherwise sit idle until
+        the slowest pod caught up.
+
+        Returns ``None`` when this exchange has no unissued block left: the
+        whole dataset is already being worked on by somebody, and handing out
+        a block twice in one average would double-count those examples.
         """
         with self._lock:
             mine = self._blocks.setdefault(int(rnd), {})
-            if int(shard) not in mine:
-                if self._recycle:
-                    mine[int(shard)] = self._recycle.pop(0)
-                else:
-                    mine[int(shard)] = self._next_block
+            if int(shard) in mine:
+                return mine[int(shard)]
+            issued = self._issued.setdefault(int(rnd), set())
+            per = self.plan.block_size(len(self.encoded), self.total_rounds)
+            total = max(1, -(-len(self.encoded) // max(1, per)))
+            b = None
+            while self._recycle:
+                cand = self._recycle.pop(0)
+                if cand not in issued:
+                    b = cand
+                    break
+            if b is None:
+                # NEVER THE SAME BLOCK TWICE IN ONE EXCHANGE. The counter wraps
+                # by epoch so a long-running fleet keeps finding work, and
+                # without this check a wrap inside one round would hand a
+                # second pod examples a first pod is already training -- the
+                # duplication this whole design replaced, reintroduced through
+                # the back door.
+                for _ in range(total):
+                    cand = self._next_block % total
                     self._next_block += 1
-                # WHO is in this exchange, updated as pods join it. The
-                # readiness fraction and the miss counting both read this, and
-                # a round whose membership grows must raise what it waits for
-                # rather than close on a quarter of its contributors.
-                self.tracker.expect_shards(int(rnd), sorted(mine))
-            return mine[int(shard)]
+                    if cand not in issued:
+                        b = cand
+                        break
+            if b is None:
+                return None
+            issued.add(b)
+            mine[int(shard)] = b
+            return b
+
+    def _indices_for_now(self, shard: int, rnd: int) -> List[int]:
+        """This pod's examples, or [] when the exchange has no block spare."""
+        b = self.block_for(int(shard), int(rnd))
+        if b is None:
+            return []
+        return self.plan.block_at(
+            len(self.encoded), b,
+            self.plan.block_size(len(self.encoded), self.total_rounds))
+
+    def block_done(self, shard: int, rnd: int) -> None:
+        """The pod submitted its block; it may be given another.
+
+        The block stays in this round's ISSUED set -- it has been trained and
+        must not be handed to anyone else in the same average -- but it is no
+        longer held by this pod.
+        """
+        with self._lock:
+            self._blocks.get(int(rnd), {}).pop(int(shard), None)
+
+    def blocks_left(self, rnd: Optional[int] = None) -> int:
+        """Unissued blocks in this exchange -- 0 means everyone has work."""
+        r = self.tracker.round if rnd is None else int(rnd)
+        per = self.plan.block_size(len(self.encoded), self.total_rounds)
+        total = max(1, -(-len(self.encoded) // max(1, per)))
+        with self._lock:
+            return max(0, total - len(self._issued.get(int(r), set())))
 
     def recycle(self, shards, rnd: Optional[int] = None) -> List[int]:
         """Put the blocks of pods that died back on the queue.
@@ -3965,6 +4020,13 @@ class _TextTrainCoordinator:
                     back.append(int(b))
             if back:
                 self._recycle = sorted(back) + self._recycle
+                # UN-ISSUED as well as returned: the issued set is what stops
+                # two pods training one block in the same average, and a block
+                # whose pod died was never trained at all.
+                iss = self._issued.get(int(r))
+                if iss:
+                    for b in back:
+                        iss.discard(int(b))
                 if mine:
                     self.tracker.expect_shards(int(r), sorted(mine))
         return back
@@ -3987,10 +4049,7 @@ class _TextTrainCoordinator:
             # and its adapter joins the same average, which is sound because
             # every contributor started from the same adapter and trained
             # examples no one else has.
-            "indices": self.plan.block_at(
-                len(self.encoded),
-                self.block_for(int(shard), rnd),
-                self.plan.block_size(len(self.encoded), self.total_rounds)),
+            "indices": self._indices_for_now(int(shard), rnd),
             "dataset_id": self.dataset_id,
             # Where to start: the previous round's average, or the bare base on
             # round 0. Named as a round rather than a blob id so a pod that
@@ -4034,6 +4093,18 @@ class _TextTrainCoordinator:
             tlr.average_adapter_files([s.path for s in subs], weights, out)
             self._averages[rnd] = out
             closed, absent = self.tracker.close_round()
+        # THE INPUTS ARE DEAD ONCE THE AVERAGE EXISTS. Each shard adapter is
+        # 318 MB on this base -- not the ~160 MB this module's docstring
+        # guessed -- so a 16-pod job leaves 5 GB per round, and four attempts
+        # at one adapter had accumulated 4.2 GB of `r0-s*.safetensors` that
+        # nothing would ever read again. The AVERAGE is what the next round
+        # starts from and what the run returns; these were only its operands.
+        for _s in subs:
+            try:
+                if os.path.isfile(_s.path):
+                    os.remove(_s.path)
+            except Exception:
+                pass            # disk hygiene must never fail a paid round
         print(f"[text-lora] {self.job_id}: round {rnd} averaged from "
               f"{len(subs)} shard(s) ({int(sum(weights))} examples)"
               + (f"; absent: {absent}" if absent else ""), flush=True)
@@ -4518,6 +4589,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         #: whole of it.
         _topup_at = [0.0]
         _topup_every = [_TOPUP_MIN_S]
+        #: Said once per round, not once per poll.
+        _no_work_said = [False]
 
         while not coord.finished():
             _check_train_cancel()
@@ -4549,6 +4622,7 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 _topped_up[0] = rnd
                 _topup_at[0] = 0.0
                 _topup_every[0] = _TOPUP_MIN_S
+                _no_work_said[0] = False
             if len(fleet.pods) < _target and time.time() >= _topup_at[0]:
                 # NOT ONCE PER ROUND. It used to be, and a round is half an
                 # hour: a pod lost in the first minute left the fleet short for
@@ -4629,9 +4703,14 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             # Start the round on every pod that is idle and has not submitted.
             for shard in sorted(fleet.pods):
                 pod = fleet.pods[shard]
-                if not pod.url or any(s.shard == shard
-                                      for s in coord.tracker.have(rnd)):
+                if not pod.url:
                     continue
+                # A POD THAT ALREADY SUBMITTED IS NOT SKIPPED. It used to be,
+                # so the first pod to finish its block sat idle -- billing --
+                # until the slowest pod in the exchange caught up, which on a
+                # fleet of unequal cards is most of the round. It takes
+                # another block instead, from the same pushed adapter, and
+                # that contribution is averaged in with its own weight.
                 status = flt.poll_status(pod)
                 state = str(status.get("state") or "")
                 if state in ("training", "encoding", "loading-tokenizer"):
@@ -4639,14 +4718,48 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     continue
                 if state == "done" and int(status.get("round", -1)) == rnd:
                     # Finished: pull it and record the submission.
-                    dest = os.path.join(out_dir, f"r{rnd}-s{shard}.safetensors")
+                    # PER BLOCK, not per shard: a pod may contribute more
+                    # than once to an exchange and the second file must not
+                    # land on top of the first -- which averaged one adapter
+                    # twice and lost the other's work entirely.
+                    dest = os.path.join(
+                        out_dir, f"r{rnd}-s{shard}-"
+                        f"b{coord.block_for(shard, rnd)}.safetensors")
                     flt.fetch_adapter(pod, dest)
                     from codai.api import text_lora_rounds as _tlr
                     coord.submit(_tlr.Submission(
                         shard=shard, round=rnd, path=dest,
                         examples=int(status.get("examples_trained") or 0)))
+                    coord.block_done(shard, rnd)
                     fleet.note_checkin(shard, rounds_done=rnd + 1)
                     continue
+                if state == "done" and 0 <= int(status.get("round", -1)) < rnd:
+                    # A ROUND THAT ARRIVED TOO LATE. The exchange it belongs
+                    # to has already been averaged, and folding a
+                    # round-behind adapter into the current average moves
+                    # everyone backwards -- that refusal is right and stands.
+                    #
+                    # What was wrong is that this branch did not exist: the
+                    # `done` test above requires the pod's round to BE the
+                    # open one, so a straggler fell through to "idle, give it
+                    # the current round" and its finished adapter was dropped
+                    # with no log line at all. Under the old partition its
+                    # examples came round again next epoch; under the work
+                    # queue the block was consumed and the examples were
+                    # simply never trained by anyone.
+                    #
+                    # So the adapter is still refused, and the BLOCK goes
+                    # back on the queue for someone to train from the current
+                    # average.
+                    _late = int(status.get("round", -1))
+                    _back = coord.recycle([shard], rnd=_late)
+                    print(f"[text-lora] {job_id}: shard {shard} finished "
+                          f"round {_late} after it closed — a round behind, "
+                          f"so it is not averaged in"
+                          + (f"; block(s) {_back} returned to the queue"
+                             if _back else "")
+                          + f"; starting it on round {rnd}", flush=True)
+                    # and fall through: it is idle now, so it gets this round
                 if state == "error":
                     stages.failed(f"train(shard {shard})",
                                   str(status.get("error") or "")[:200])
@@ -4659,8 +4772,21 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     prev = coord.average_path(rnd - 1)
                     if prev:
                         flt.push_start_adapter(pod, prev)
+                _payload = coord.round_payload(shard)
+                if not _payload.get("indices"):
+                    # Every block in this exchange is already being trained by
+                    # somebody. Handing this pod one of them would double-count
+                    # those examples in the average, so it waits for the
+                    # exchange to close -- the one case where an idle pod is
+                    # the correct answer.
+                    if not _no_work_said[0]:
+                        _no_work_said[0] = True
+                        print(f"[text-lora] {job_id}: round {rnd} is fully "
+                              f"claimed; pods that finish now wait for the "
+                              f"average rather than repeat work", flush=True)
+                    continue
                 try:
-                    flt.start_round(pod, coord.round_payload(shard))
+                    flt.start_round(pod, _payload)
                     fleet.note_checkin(shard)
                 except flt.PodBusy:
                     pass

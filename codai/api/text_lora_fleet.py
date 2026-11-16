@@ -357,18 +357,41 @@ class TrainerFleet:
     # -- renting ---------------------------------------------------------- #
 
     def provision(self, shards: Sequence[int]) -> List[TrainerPod]:
-        """Rent one pod per shard, trying EVERY shard.
+        """Bring the fleet UP TO ``len(shards)`` pods, trying every shortfall.
 
-        A partial fleet is a usable fleet -- the round protocol averages what
+        A partial fleet is a usable fleet -- the exchange averages what
         arrives -- so a budget ceiling reached halfway is reported and the job
-        continues with fewer shards rather than failing or, worse, renting past
+        continues with fewer pods rather than failing or, worse, renting past
         the cap.
+
+        FILL-TO-SIZE, not one-per-id. It used to rent a pod for each id in the
+        list that the fleet did not already hold, which made it idempotent:
+        `provision([0, 1])` twice rented two pods, not four. Dense ids removed
+        that guard -- ids no longer come from the caller, so "already have
+        this id" stopped meaning anything -- and a second call rented the
+        whole list again. That is a money bug and the suite caught it: what
+        the callers actually want is a fleet of a given size, which is also
+        what `top_up` wants, so the contract says that instead.
         """
+        want = len({int(x) for x in shards})
+        with self._lock:
+            need = max(0, want - len(self.pods))
         started: List[TrainerPod] = []
-        for shard in shards:
+        for _ in range(need):
+            # DENSE IDS, allocated here rather than taken from the caller's
+            # list. The caller passes plan indices -- `range(n_shards)` -- and
+            # when most of them have no capacity the survivors keep whatever
+            # indices happened to succeed: a four-pod fleet reported shards
+            # 17, 20, 24 and 25 out of a 32-shard plan, which reads as a bug
+            # in the numbering and is impossible to match against a pod list.
+            #
+            # Safe because a shard id is now only a handle. It used to select
+            # the slice -- position in the round's cohort -- so renumbering
+            # would have changed what a pod trained; work comes off a queue
+            # now and is claimed on demand, so the id names a pod and nothing
+            # more.
             with self._lock:
-                if shard in self.pods:
-                    continue
+                shard = next(i for i in range(10_000) if i not in self.pods)
             reason = self._refusal_for_one_more()
             if not reason and self._budget_check is not None:
                 reason = self._budget_check(float(self.spec.hourly_usd or 0.0))
@@ -384,8 +407,8 @@ class TrainerFleet:
                 # never tried for the rest.
                 continue
             started.append(pod)
-        if started and len(started) < len(list(shards)):
-            self._say(f"{len(started)} of {len(list(shards))} pod(s) rented; "
+        if started and len(started) < need:
+            self._say(f"{len(started)} of {need} pod(s) rented; "
                       f"the rest had no capacity and will be retried between "
                       f"rounds")
         return started
@@ -482,10 +505,9 @@ class TrainerFleet:
             want = min(want, int(cap))
         if len(have) >= want:
             return []
-        missing = [i for i in range(want) if i not in have]
-        if not missing:
-            return []
-        return self.provision(missing)
+        # The SIZE, not the gaps: `provision` fills to the size it is given,
+        # so handing it a list of missing ids would ask for that many MORE.
+        return self.provision(list(range(want)))
 
     def _refusal_for_one_more(self) -> str:
         """Why one more pod may not be rented, or ''.

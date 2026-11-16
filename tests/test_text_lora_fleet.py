@@ -348,3 +348,45 @@ def test_adopted_pods_count_against_the_fleet_ceiling():
                               max_fleet_hourly_usd=0.90)
     assert sorted(second.pods) == [0, 1]
     assert second.provision([2, 3]) == [], "already at the ceiling on adoption"
+
+
+def test_provisioning_twice_does_not_rent_twice_with_dense_ids():
+    """The regression dense ids introduced, pinned.
+
+    `provision` used to skip an id the fleet already held, which made it
+    idempotent for free. Once ids stopped coming from the caller that guard
+    meant nothing, and a second call rented the whole list again -- sixteen
+    extra pods on a sixteen-pod job. It fills TO a size now.
+    """
+    c = FakeClient()
+    f = _fleet(c)
+    assert len(f.provision([0, 1, 2])) == 3
+    assert f.provision([0, 1, 2]) == []
+    assert len(c.created) == 3
+    # ...and asking for more than it holds rents only the shortfall.
+    assert len(f.provision(list(range(5)))) == 2
+    assert len(c.created) == 5
+
+
+def test_a_topped_up_fleet_asks_for_a_size_not_for_the_gaps():
+    """`top_up(8)` on a fleet of 3 must rent 5, not 8."""
+    c = FakeClient()
+    f = _fleet(c)
+    f.provision(list(range(3)))
+    assert len(c.created) == 3
+    f.top_up(8, cap=8)
+    assert len(c.created) == 8, c.created
+    assert sorted(f.pods) == list(range(8)), "ids are not dense"
+
+
+def test_shard_ids_are_dense_even_when_capacity_is_patchy():
+    """A four-pod fleet out of a 32-shard plan reported shards 17, 20, 24, 25.
+
+    Legitimate plan indices, but unreadable and impossible to match against a
+    pod list -- and safe to renumber now that an id names a pod rather than
+    selecting its slice.
+    """
+    c = FakeClient()
+    f = _fleet(c)
+    f.provision(list(range(4)))
+    assert sorted(f.pods) == [0, 1, 2, 3]

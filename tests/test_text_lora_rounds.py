@@ -210,10 +210,41 @@ def test_a_stale_submission_is_refused_not_folded_in():
     assert "stale" in str(e.value)
 
 
-def test_a_submission_from_the_future_is_refused():
+def test_a_submission_from_the_future_is_held_not_refused():
+    """REVERSED. Early is not wrong, only early.
+
+    It used to raise, which was the one case where CORRECT work was thrown
+    away for being fast: the adapter was trained from a start this round has
+    not reached yet, so it is a valid operand of that round's average and
+    merely has to wait for it. It is handed over when the round opens.
+    """
     t = _tracker(2)
-    with pytest.raises(tlr.RoundError, match="ahead of"):
-        t.submit(_sub(0, rnd=5))
+    t.submit(_sub(0, rnd=5))
+    assert t.have(5) == []            # not in that round yet
+    assert t.contributors(5) == 0
+    t.round = 5
+    assert t.take_future(5) == 1
+    assert [s.shard for s in t.have(5)] == [0]
+
+
+def test_a_shard_may_contribute_several_blocks_to_one_round():
+    """A pod that finishes its block while the exchange is open takes another.
+
+    Every contribution started from the same pushed adapter and covers
+    examples no one else has, so they are all operands of the same average.
+    Keyed by shard alone this was a dict, and the second contribution
+    silently REPLACED the first -- a pod that got through four blocks counted
+    as having trained one.
+    """
+    t = _tracker(2)
+    t.submit(_sub(0, examples=29))
+    t.submit(_sub(0, examples=29))
+    t.submit(_sub(1, examples=29))
+    assert len(t.have()) == 3
+    # ...but readiness is judged on SHARDS, so one fast pod cannot close a
+    # round the slow ones are still working in.
+    assert t.contributors() == 2
+    assert sum(t.weights_for(t.have())) == 87
 
 
 def test_closing_a_round_reports_who_was_absent():

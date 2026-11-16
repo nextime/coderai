@@ -263,7 +263,16 @@ class RoundTracker:
         self.min_fraction = float(min_fraction)
         self.deadline_s = float(deadline_s)
         self.round = 0
-        self._subs: Dict[int, Dict[int, Submission]] = {}
+        #: round -> shard -> every submission that shard made for it. A LIST
+        #: because a pod that finishes its block while the exchange is still
+        #: open takes another one: each contribution starts from the same
+        #: pushed adapter and covers examples no one else has, so they are all
+        #: legitimate operands of the same average. Keyed by shard only, it
+        #: was a dict, and a second contribution silently REPLACED the first.
+        self._subs: Dict[int, Dict[int, List[Submission]]] = {}
+        #: Submissions for a round that has not opened yet, held rather than
+        #: refused.
+        self._future: Dict[int, Dict[int, List[Submission]]] = {}
         self._opened_at: Dict[int, float] = {}
         self._missed: Dict[int, int] = {}
         #: How many pods a given round actually HAS. `plan.n_shards` is the
@@ -320,15 +329,47 @@ class RoundTracker:
                 f"{self.round} is already open -- the result is stale and is "
                 f"not averaged in")
         if sub.round > self.round:
-            raise RoundError(
-                f"shard {sub.shard} submitted for round {sub.round}, ahead of "
-                f"the open round {self.round}")
+            # HELD, not refused. A result for a round that has not opened is
+            # not wrong, only early -- it was trained from an adapter this
+            # round will start from -- so it waits for its round instead of
+            # being thrown away. Refusing it was the one case where correct
+            # work was discarded for being fast.
+            self._future.setdefault(sub.round, {}).setdefault(
+                int(sub.shard), []).append(sub)
+            return
         self.open_round(sub.round)
-        self._subs.setdefault(sub.round, {})[int(sub.shard)] = sub
+        self._subs.setdefault(sub.round, {}).setdefault(
+            int(sub.shard), []).append(sub)
 
     def have(self, rnd: Optional[int] = None) -> List[Submission]:
+        """Every submission for a round, from every shard that made one."""
         r = self.round if rnd is None else rnd
-        return [self._subs.get(r, {})[k] for k in sorted(self._subs.get(r, {}))]
+        got = self._subs.get(r, {})
+        return [sub for k in sorted(got) for sub in got[k]]
+
+    def contributors(self, rnd: Optional[int] = None) -> int:
+        """How many SHARDS submitted, which is what readiness is judged on.
+
+        Not the number of submissions: one pod that got through four blocks
+        while three pods are still on their first must not make the round
+        look four-sevenths complete.
+        """
+        r = self.round if rnd is None else rnd
+        return len(self._subs.get(r, {}))
+
+    def take_future(self, rnd: Optional[int] = None) -> int:
+        """Move held early submissions into a round once it is open."""
+        r = self.round if rnd is None else int(rnd)
+        early = self._future.pop(r, None)
+        if not early:
+            return 0
+        dest = self._subs.setdefault(r, {})
+        n = 0
+        for sh, subs in early.items():
+            dest.setdefault(int(sh), []).extend(subs)
+            n += len(subs)
+        self.open_round(r)
+        return n
 
     # -- completion ------------------------------------------------------- #
 
@@ -340,7 +381,7 @@ class RoundTracker:
         fleet: the round proceeds with the survivors and the absent shard is
         reassigned.
         """
-        got = len(self._subs.get(self.round, {}))
+        got = self.contributors()
         if got == 0:
             return False
         want = self.expected()
@@ -383,6 +424,8 @@ class RoundTracker:
             self._missed[s] = 0
         self.round += 1
         self.open_round(self.round)
+        # Anything that arrived early for THIS round now counts as arrived.
+        self.take_future(self.round)
         return subs, absent
 
     def dead_shards(self, after_misses: int = 2) -> List[int]:
