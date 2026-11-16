@@ -3627,19 +3627,34 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     # with a catalogue alias fails identically under dry_run, which is how this
     # was found, on a run that cost nothing and told us everything.
     base = _resolve_text_base(_train_cfg.base_model or req.base_model)
-    tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
 
-    encoded, stats = _text_dataset_pass(req, dataset_path, tokenizer)
-    summary = {"examples": stats.examples, "skipped": len(stats.skipped),
-               "trained_tokens": stats.trained_tokens,
-               "masked_tokens": stats.masked_tokens}
-    _update_job(job_id, total=stats.examples,
-                message=f"prepared: {stats.describe()}")
-    print(f"[text-lora] {job_id}: {stats.describe()}", flush=True)
-    for s in stats.skipped[:20]:
-        print(f"[text-lora] skipped line {s.line}: {s.reason}", flush=True)
+    def _prepare():
+        """Load the tokenizer and encode the dataset. ~3 minutes, no GPU.
+
+        A FUNCTION rather than a statement, because for a distributed run it
+        is handed to :func:`_text_train_distributed` and executed WHILE the
+        pods are being rented and booted. Nothing about the fleet depends on
+        it -- the pod count comes from the config and the pods encode the
+        dataset themselves -- so running it first made every job wait three
+        minutes before asking for a card that then took another six to boot.
+        """
+        _tok = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
+        _enc, _st = _text_dataset_pass(req, dataset_path, _tok)
+        _sum = {"examples": _st.examples, "skipped": len(_st.skipped),
+                "trained_tokens": _st.trained_tokens,
+                "masked_tokens": _st.masked_tokens}
+        _update_job(job_id, total=_st.examples,
+                    message=f"prepared: {_st.describe()}")
+        print(f"[text-lora] {job_id}: {_st.describe()}", flush=True)
+        for _s in _st.skipped[:20]:
+            print(f"[text-lora] skipped line {_s.line}: {_s.reason}",
+                  flush=True)
+        return _enc, _st, _sum
 
     if req.dry_run:
+        # Inline: a dry run is the dataset pass and nothing else, and it must
+        # not rent anything to do it.
+        _, stats, summary = _prepare()
         _update_job(job_id, status="done", active=False, force=True,
                     message=f"dry run: {stats.describe()}")
         return {"dry_run": True, **summary}
@@ -3664,9 +3679,15 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
             pod_max_lifetime_s=min(float(_train_cfg.pod_max_lifetime_s or 0)
                                    or 3600.0, 3600.0))
         n = max(1, int(req.test_examples or 8))
-        encoded = encoded[:n]
+        # WRAPPED, not applied: the pass has not run yet -- it runs while the
+        # pod boots -- so the truncation travels with it.
+        _full_prepare = _prepare
+
+        def _prepare():                                  # noqa: F811
+            _enc, _st, _sum = _full_prepare()
+            return _enc[:n], _st, _sum
         print(f"[text-lora] {job_id}: TEST RUN — 1 pod, 1 round, "
-              f"{len(encoded)} example(s)", flush=True)
+              f"at most {n} example(s)", flush=True)
         # IN THE RECORD, not only the log. A reader seeing "step 0/1" on a
         # job that asked for 16 rounds concludes the request was ignored --
         # which is exactly what happened: a test run was read as a broken
@@ -3674,7 +3695,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # has to say which kind of run it is, next to the number it explains.
         _update_job(job_id, test_run=True, rounds=1,
                     rounds_note=(f"test run: rounds forced to 1 and the set "
-                                 f"truncated to {len(encoded)} example(s), "
+                                 f"truncated to at most {n} example(s), "
                                  f"whatever the request asked for"))
     # ASKING FOR A POD IS ASKING FOR A POD. This used to require
     # `max_pods > 1 or test_run`, so a request for exactly ONE pod -- `pods: 1,
@@ -3709,7 +3730,9 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # free; everything below it spends.
         try:
             _dist = _text_train_distributed(
-                req, job_id, dataset_path, encoded, stats, st, _train_cfg)
+                req, job_id, dataset_path, None, None, st, _train_cfg,
+                prepare=_prepare)
+            summary = _dist.pop("_summary", {})
             # TERMINAL, here. The local path below marks the record done after
             # it trains; this one returned straight to the caller and left the
             # record saying `training` forever. That is not cosmetic: the
@@ -3731,6 +3754,10 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
             raise
         finally:
             _active_job_id = None
+
+    # Local training: the pass has to happen now, since there is no boot to
+    # overlap it with.
+    encoded, stats, summary = _prepare()
 
     # Local training needs a local card. Checked BEFORE the base is fetched,
     # because the failure otherwise arrives after tens of gigabytes of download
@@ -3971,7 +3998,7 @@ def _price_for(client, gpu_type_id: str, cloud_type: str) -> Optional[float]:
 
 def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                             dataset_path: str, encoded, stats, settings,
-                            cfg) -> dict:
+                            cfg, prepare=None) -> dict:
     """Rent a fleet, drive the rounds, release everything. The spending path.
 
     ``cfg`` is the MODEL's ``lora_train`` block, already narrowed by whatever
@@ -4101,15 +4128,52 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         on_event=lambda m: _update_job(
             job_id, message=str(m)[:200],
             **({"last_error": str(m)[:2000]} if _looks_like_error(m) else {})))
-    coord = _TextTrainCoordinator(
-        job_id, plan=plan, tracker=tracker, fleet=fleet, encoded=encoded,
-        out_dir=out_dir, settings=settings,
-        # What to TRAIN: the block's own base when it names one, because the
-        # entry may SERVE something that cannot be a QLoRA base (an AWQ
-        # checkpoint, or a pod-served model with no local path at all).
-        dataset_id=req.dataset_id or "",
-        base=_resolve_text_base(cfg.base_model or req.base_model),
-        field_map=req.field_map, total_rounds=rounds)
+    # THE DATASET PASS RUNS WHILE THE PODS BOOT. It is three minutes of CPU
+    # with no GPU and no network, and NOTHING about the fleet depends on it:
+    # the pod count comes from the config, the pods are sent the raw dataset
+    # file and encode it themselves, and this pass exists to refuse a bad
+    # dataset rather than to produce anything a pod needs. Running it first
+    # made every job sit for three minutes before asking for a card that then
+    # took another six to boot -- nine minutes to the first trained example,
+    # of which three were avoidable.
+    #
+    # Started here, before the rental below, and joined just before the
+    # coordinator needs the example count. If it RAISES, the job fails as it
+    # always did -- a few pod-minutes later, which is the price of the
+    # overlap and is bounded by this one pass.
+    _prep_box: Dict[str, Any] = {}
+    #: The pass's summary, once it has joined. Named out here because the
+    #: success return reads it and the join happens inside the try.
+    _summary: Dict[str, Any] = {}
+
+    def _run_prepare():
+        try:
+            _prep_box["got"] = prepare()
+        except BaseException as exc:          # re-raised on the join
+            _prep_box["exc"] = exc
+
+    _prep_thread = None
+    if prepare is not None:
+        _prep_thread = threading.Thread(
+            target=_run_prepare, daemon=True, name=f"dataset-{job_id}")
+        _prep_thread.start()
+
+    def _join_prepare():
+        """Block until the dataset is encoded, then return what it produced."""
+        nonlocal encoded, stats
+        if _prep_thread is None:
+            return {}
+        _t0 = time.time()
+        _prep_thread.join()
+        if "exc" in _prep_box:
+            raise _prep_box["exc"]
+        encoded, stats, _summary = _prep_box["got"]
+        _waited = time.time() - _t0
+        print(f"[text-lora] {job_id}: dataset ready "
+              + (f"(waited {_waited:.0f}s for it after the pods)"
+                 if _waited > 1.0 else
+                 "— it finished while the pods were booting"), flush=True)
+        return _summary
 
     # The image runs the baked runner by default, so there is no start command
     # and no URL of ours anywhere in the pod's environment. It is given only
@@ -4121,8 +4185,10 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
     }
 
-    with _coord_lock:
-        _train_coordinators[job_id] = coord
+    #: Built AFTER the dataset pass joins, because it needs the example count
+    #: -- which is the whole reason the pass can overlap the boot: nothing
+    #: before this point does.
+    coord = None
     poll = max(5.0, float(cfg.poll_interval_s or 20.0))
     stages = flt.Stages()
     #: Set in the finally, and declared OUT HERE because the finally reads it:
@@ -4305,6 +4371,20 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         print(f"[text-lora] {job_id}: shard {ready[0]} is up with the dataset "
               f"— starting now, {len(_shards) - 1} pod(s) still booting",
               flush=True)
+        # NOW the example count is needed, and not before. On a cold fleet this
+        # join returns instantly: the pass ran during the boot.
+        _summary.update(_join_prepare() or {})
+        coord = _TextTrainCoordinator(
+            job_id, plan=plan, tracker=tracker, fleet=fleet, encoded=encoded,
+            out_dir=out_dir, settings=settings,
+            # What to TRAIN: the block's own base when it names one, because
+            # the entry may SERVE something that cannot be a QLoRA base (an
+            # AWQ checkpoint, or a pod-served model with no local path).
+            dataset_id=req.dataset_id or "",
+            base=_resolve_text_base(cfg.base_model or req.base_model),
+            field_map=req.field_map, total_rounds=rounds)
+        with _coord_lock:
+            _train_coordinators[job_id] = coord
         floor = max(0, int(req.min_pods or 0))
         if floor and len(ready) < floor:
             # NOT a refusal any more, and the reason it was one is gone. It
@@ -4435,8 +4515,14 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     break
                 if _late not in ready:
                     ready.append(_late)
+                    # THE FLEET'S count, not this queue's. `ready` holds only
+                    # the pods that came through the initial boot; a pod the
+                    # top-up rented arrives through the grow path and never
+                    # touches the queue, so reporting `len(ready)` printed
+                    # "2 pod(s) up" one line after "round 0 runs on 3 pod(s)".
+                    _up = sum(1 for _p in fleet.pods.values() if _p.url)
                     print(f"[text-lora] {job_id}: shard {_late} joined "
-                          f"({len(ready)} pod(s) up)", flush=True)
+                          f"({_up} pod(s) up)", flush=True)
             _live = [sh for sh in sorted(fleet.pods) if fleet.pods[sh].url]
             _members = coord.cohort(rnd, _live)
             if _members and len(_members) != _last_cohort[0]:
@@ -4532,6 +4618,10 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         return {"rounds": rounds, "shards": n_shards,
                 "cards": [c["id"] for c in cards[:6]], "hourly_usd": price,
                 "examples": stats.examples, "path": out_dir,
+                # The pass ran in here, so its summary goes back out: the
+                # caller used to compute it before dispatching and no longer
+                # has it.
+                "_summary": _summary,
                 "adapter": adapter, "test_run": bool(req.test_run),
                 # What the run cost in time, stage by stage. On a first run the
                 # answer to "why did that take twenty minutes" is one stage,

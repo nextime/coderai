@@ -28,6 +28,8 @@ from contextlib import asynccontextmanager
 from typing import List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -934,6 +936,89 @@ async def bad_request_says_why(request: Request, exc: HTTPException):
           f"peer {getattr(getattr(request, 'client', None), 'host', '-')})",
           flush=True)
     return JSONResponse(status_code=400, content={"detail": detail or "bad request"})
+
+
+#: Field names whose VALUE is never logged, matched case-insensitively as a
+#: substring. A rejected body is diagnostic material, not a place to find a
+#: credential, and a client that puts one in the wrong field must not have it
+#: copied into a log that outlives the request.
+_NEVER_LOG = ("token", "key", "secret", "password", "authorization", "bearer",
+              "credential", "cookie")
+
+#: How much of a long string value is shown. Enough to recognise a wrong
+#: format, far too little to be a copy of the content.
+_VALUE_CLIP = 80
+
+
+def _loggable(name: str, value):
+    """One field, reduced to what names the mistake and nothing more.
+
+    A 422 body is the only thing that can say WHICH field a client got wrong,
+    and on this install a training body carries dataset rows -- legal
+    documents. So the shape is logged rather than the content: scalars in
+    full, because `pods: "8"` versus `pods: 8` is exactly the kind of thing
+    that gets rejected, and anything long or nested as a type and a size.
+    """
+    if any(w in str(name).lower() for w in _NEVER_LOG):
+        return "<redacted>"
+    if isinstance(value, bool) or value is None:
+        return repr(value)
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        if len(value) <= _VALUE_CLIP:
+            return repr(value)
+        return f"<str, {len(value)} chars, starts {value[:_VALUE_CLIP]!r}>"
+    if isinstance(value, (list, tuple)):
+        return f"<{type(value).__name__}, {len(value)} item(s)>"
+    if isinstance(value, dict):
+        return f"<object, keys {sorted(map(str, value))[:12]}>"
+    return f"<{type(value).__name__}>"
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_says_which_field(request: Request,
+                                            exc: RequestValidationError):
+    """Log WHICH field a 422 rejected, then answer it unchanged.
+
+    A 422 is raised by the framework before any handler runs, so the only
+    record was the access line: `POST /v1/loras/train/text 422`. Measured
+    cost: a client was rejected twice in thirty seconds and neither side could
+    say what was wrong with the body -- the client had the body and not the
+    rule, this side had the rule and logged neither.
+
+    The errors themselves are logged in full (they name the field and the
+    rule), and the body is logged as SHAPE rather than content -- see
+    :func:`_loggable`. Behaviour is unchanged; the response is the one FastAPI
+    would have sent.
+    """
+    try:
+        errs = exc.errors()
+    except Exception:
+        errs = []
+    where = f"{request.method} {request.url.path}"
+    peer = getattr(getattr(request, "client", None), "host", "-")
+    lines = []
+    for e in errs[:20]:
+        loc = ".".join(str(x) for x in (e.get("loc") or ()))
+        lines.append(f"{loc or '<body>'}: {e.get('msg') or e.get('type')}")
+    print(f"[http] 422 on {where} (peer {peer}): "
+          + ("; ".join(lines) if lines else "no detail"), flush=True)
+    # The body's SHAPE, which is what says whether a field was missing, misnamed
+    # or the wrong type.
+    try:
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            shape = ", ".join(f"{k}={_loggable(k, v)}"
+                              for k, v in sorted(body.items())[:40])
+            print(f"[http] 422 body shape: {shape}", flush=True)
+        elif body is not None:
+            print(f"[http] 422 body was {type(body).__name__}, not an object",
+                  flush=True)
+    except Exception as exc2:
+        print(f"[http] 422 body could not be described: {exc2}", flush=True)
+    return JSONResponse(status_code=422,
+                        content={"detail": jsonable_encoder(errs)})
 
 
 @app.exception_handler(StarletteHTTPException)

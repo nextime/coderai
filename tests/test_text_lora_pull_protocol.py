@@ -331,7 +331,12 @@ def test_a_test_run_is_one_pod_one_round_and_a_few_examples():
     i = src.index("if req.test_run:")
     block = src[i:i + 900]
     assert "pods=1" in block and "rounds=1" in block
-    assert "encoded[:n]" in block, "it must shrink the work, not the pipeline"
+    # It truncates the ENCODED SET, so a test run exercises every stage on a
+    # handful of examples rather than taking a shortcut through the pipeline.
+    # Spelled `_enc[:n]` now because the dataset pass is deferred -- it runs
+    # while the pods boot -- so the truncation travels with the pass instead
+    # of being applied to a variable that does not exist yet.
+    assert "[:n]" in block, "it must shrink the work, not the pipeline"
 
 
 def test_a_test_run_shortens_the_leash():

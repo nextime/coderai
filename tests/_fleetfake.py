@@ -227,7 +227,7 @@ def req(name="adapter-fake", **kw):
 
 
 def run(monkeypatch, *, fleet, home, job="job-fake", name="adapter-fake",
-        request=None, config=None, dataset=None, **install_kw):
+        request=None, config=None, dataset=None, prepare=None, **install_kw):
     """Drive the real `_text_train_distributed` against `fleet`."""
     from codai.api import loras
     from codai.api import text_lora_trainer as tlt
@@ -238,9 +238,19 @@ def run(monkeypatch, *, fleet, home, job="job-fake", name="adapter-fake",
         dataset = os.path.join(str(home), "ds.jsonl")
         with open(dataset, "w") as fh:
             fh.write('{"a":1}\n')
+    if prepare is None:
+        # The default stands in for the deferred pass: the run now receives a
+        # callable and encodes while the pods boot, so a test that does not
+        # care about that still has to give it one.
+        def prepare():
+            return ([object()],
+                    types.SimpleNamespace(examples=1, skipped=[],
+                                          trained_tokens=1, masked_tokens=0,
+                                          describe=lambda: "1 example"),
+                    {"examples": 1})
     return loras._text_train_distributed(
         request if request is not None else req(name),
-        job, str(dataset), [object()],
-        types.SimpleNamespace(examples=1, skipped=[]),
+        job, str(dataset), None, None,
         tlt.QLoraSettings(),
-        config if config is not None else cfg())
+        config if config is not None else cfg(),
+        prepare=prepare)
