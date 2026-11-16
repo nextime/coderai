@@ -3061,6 +3061,12 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # rest runs bf16).
                 "call_kwargs", "component_dtype",
                 "lora_train_base_model", "lora_train_nodes",
+                # Text QLoRA on rented pods: the card, the image, the pod
+                # count and the $/hr ceilings. Deliberately HERE and not on
+                # the training request -- a client may start a run and may
+                # ask for less, but it cannot pick a bigger card or a higher
+                # price than the operator set. See codai/api/text_lora_fleet.py.
+                "lora_train",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 # Store the weights narrow, compute at full width. For the
                 # community fine-tunes published in fp8, where loading at the

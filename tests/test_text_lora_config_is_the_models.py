@@ -121,3 +121,69 @@ def test_asking_for_distributed_on_an_unconfigured_model_says_where_to_set_it():
     request schema for a field that deliberately is not there."""
     cfg = flt.config_for_model("a-model-with-no-block")
     assert cfg.enabled is False
+
+
+# ------------------------------------------------- the Models page edits it --
+#
+# "It should be a configuration in the model page like all the others" -- so it
+# has to survive the round trip through that page, and the admin save path is a
+# WHITELIST: a key not on it is dropped silently, which is the precise shape of
+# a knob that appears to save and does not.
+
+def test_the_admin_save_path_accepts_the_block():
+    """It is a whitelist. Without the key, every field on the page would look
+    like it saved, reload as empty, and no error would appear anywhere."""
+    import pathlib
+    src = (pathlib.Path(loras.__file__).parent.parent / "admin" / "routes.py").read_text()
+    assert '"lora_train",' in src
+
+
+def _models_html():
+    import pathlib
+    return (pathlib.Path(loras.__file__).parent.parent / "admin" / "templates"
+            / "models.html").read_text()
+
+
+def _lt_fields():
+    """The entries of _LT_FIELDS only -- the page has other arrays of its own,
+    and a regex over the whole template matches them too."""
+    import re
+    html = _models_html()
+    block = html[html.index("const _LT_FIELDS = ["):]
+    block = block[:block.index("];")]
+    return re.findall(r"\['([a-z-]+)',\s*'([a-z_]+)',", block)
+
+
+def test_the_models_page_can_read_every_field_it_can_write():
+    """A knob the form can SET and cannot READ is indistinguishable from one
+    that did not save. Both directions come from one field list."""
+    import re
+    html = _models_html()
+    assert "_populateLoraTrain" in html and "_collectLoraTrain" in html
+    assert "lora_train: _collectLoraTrain()" in html, "never written on save"
+    ids = set(re.findall(r'id="cfg-lt-([a-z-]+)"', html))
+    listed = {sfx for sfx, _key in _lt_fields()}
+    assert listed, "the field list is empty"
+    assert listed <= ids, f"no input on the page for {sorted(listed - ids)}"
+
+
+def test_every_configurable_field_is_a_real_config_field():
+    """A page offering a knob the parser ignores is worse than no knob."""
+    import dataclasses
+    keys = {key for _sfx, key in _lt_fields()}
+    known = {f.name for f in dataclasses.fields(flt.LoraTrainConfig)}
+    assert keys and keys <= known, f"not in LoraTrainConfig: {sorted(keys - known)}"
+
+
+def test_the_money_fields_are_on_the_page():
+    """The whole point of moving this out of the request: an operator can see
+    and set the ceiling."""
+    keys = {key for _sfx, key in _lt_fields()}
+    assert {"max_pod_hourly_usd", "max_fleet_hourly_usd", "gpu_type_id",
+            "image", "pods"} <= keys
+
+
+def test_an_off_block_is_absent_rather_than_full_of_defaults():
+    """An absent block is how a model says 'not trainable on rented GPUs'.
+    Writing one full of zeros would make every model look configured."""
+    assert "if (!enabled) return null;" in _models_html()

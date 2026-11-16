@@ -1821,6 +1821,100 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           against, while generation still uses this model. Leave empty to train on this model.
         </div>
       </div>
+      <!-- Text QLoRA on RENTED pods. Here rather than in the request on purpose:
+           a client may start a run and may ask for LESS, but the card, the image
+           and the price are the operator's. -->
+      <div class="form-row" style="border-top:1px solid var(--border);padding-top:.75rem;margin-top:.75rem">
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+          <input type="checkbox" id="cfg-lt-enabled" onchange="toggleLoraTrainFields()">
+          <span><b>Text QLoRA on rented GPUs</b> <span class="muted">(train an adapter for this model on RunPod pods)</span></span>
+        </label>
+        <div class="muted small" style="margin-top:.25rem">
+          <code>POST /v1/loras/train/text</code> shards the dataset across pods, each training
+          its own slice and handing in its adapter at the end of every round; the rounds are
+          averaged here. Pods never talk to each other or listen — every message is a pod
+          calling in — which is why this works across datacenters. A request can ask for fewer
+          pods or a lower ceiling, never a bigger card or a higher price.
+        </div>
+      </div>
+      <div id="cfg-lora-train-fields" style="display:none">
+        <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+          <div class="form-group" style="flex:2;min-width:200px">
+            <label class="form-label">GPU type</label>
+            <input type="text" id="cfg-lt-gpu" class="form-input" placeholder="NVIDIA A40">
+            <span class="form-hint">As RunPod names it. One card, not a list: a fleet of
+              different cards averages rounds of unequal length and the slowest sets the pace.</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:140px">
+            <label class="form-label">Cloud</label>
+            <select id="cfg-lt-cloud" class="form-input">
+              <option value="SECURE">SECURE</option>
+              <option value="COMMUNITY">COMMUNITY</option>
+            </select>
+          </div>
+          <div class="form-group" style="flex:1;min-width:110px">
+            <label class="form-label">Pods</label>
+            <input type="number" id="cfg-lt-pods" class="form-input" min="1" placeholder="1">
+            <span class="form-hint">Shards. The most a request may use.</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:110px">
+            <label class="form-label">Rounds</label>
+            <input type="number" id="cfg-lt-rounds" class="form-input" min="1" placeholder="1">
+            <span class="form-hint">Averaging rounds; pick from measured tokens/s.</span>
+          </div>
+        </div>
+        <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+          <div class="form-group" style="flex:1;min-width:150px">
+            <label class="form-label">Max $/hr per pod</label>
+            <input type="number" step="0.01" id="cfg-lt-pod-cap" class="form-input" placeholder="0 = account caps only">
+            <span class="form-hint">Checked against RunPod's catalogue price <b>before</b> renting.</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:150px">
+            <label class="form-label">Max $/hr, whole fleet</label>
+            <input type="number" step="0.01" id="cfg-lt-fleet-cap" class="form-input" placeholder="0 = no fleet ceiling">
+            <span class="form-hint">Bounds the bill; the per-pod one bounds the surprise.</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:130px">
+            <label class="form-label">Disk (GB)</label>
+            <input type="number" id="cfg-lt-disk" class="form-input" min="20" placeholder="120">
+          </div>
+        </div>
+        <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+          <div class="form-group" style="flex:2;min-width:240px">
+            <label class="form-label">Pod image</label>
+            <input type="text" id="cfg-lt-image" class="form-input"
+              placeholder="ghcr.io/nextime/coderai-trainer-text:latest">
+            <span class="form-hint">Needs peft + bitsandbytes and <b>no tilelang</b> (its kernels
+              do not build on CUDA 13, and it fails at import, minutes into a rented pod).</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:180px">
+            <label class="form-label">Network volume id <span class="muted">(optional)</span></label>
+            <input type="text" id="cfg-lt-volume" class="form-input" placeholder="(none)">
+            <span class="form-hint">Where the base weights live, so a cold pod does not pull 30 GB.</span>
+          </div>
+        </div>
+        <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
+          <div class="form-group" style="flex:1;min-width:150px">
+            <label class="form-label">Reap after silence (s)</label>
+            <input type="number" id="cfg-lt-silence" class="form-input" min="60" placeholder="1800">
+            <span class="form-hint">A pod's round upload is its heartbeat: it serves nothing to probe.</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:150px">
+            <label class="form-label">Hard max lifetime (s)</label>
+            <input type="number" id="cfg-lt-lifetime" class="form-input" min="600" placeholder="86400">
+            <span class="form-hint">Kills a pod that keeps reporting progress forever.</span>
+          </div>
+          <div class="form-group" style="flex:1;min-width:130px">
+            <label class="form-label">LoRA rank</label>
+            <input type="number" id="cfg-lt-rank" class="form-input" min="1" placeholder="16">
+          </div>
+          <div class="form-group" style="flex:1;min-width:130px">
+            <label class="form-label">Max sequence</label>
+            <input type="number" id="cfg-lt-maxlen" class="form-input" min="256" placeholder="8192">
+            <span class="form-hint">A longer example is skipped, never truncated.</span>
+          </div>
+        </div>
+      </div>
       <div class="form-row">
         <label class="form-label">LoRA training nodes <span class="muted">(optional — cluster nodes that train alongside this machine)</span></label>
         <input type="text" id="cfg-lora-train-nodes" class="form-input" placeholder="box2, box3">
@@ -4603,6 +4697,7 @@ function openCfgModal(idx, cfgIdx){
   _setCompField('lora',       s.lora_path       || '');
   document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
   document.getElementById('cfg-lora-scale').value = s.lora_scale != null ? s.lora_scale : '';
+  _populateLoraTrain(s.lora_train);
   document.getElementById('cfg-lora-train-base').value = s.lora_train_base_model || '';
   document.getElementById('cfg-lora-train-nodes').value = Array.isArray(s.lora_train_nodes) ? s.lora_train_nodes.join(', ') : (s.lora_train_nodes || '');
   _populateAccel(s.acceleration);
@@ -4753,7 +4848,60 @@ function _syncAccelDistillFromFields(){
     }
   }
 }
-async function _populateAccel(a){
+async //: The model's `lora_train` block. One prefix-driven pair, read and written
+//: from the same field list, because a knob the form can SET and cannot READ
+//: looks exactly like one that did not save.
+const _LT_FIELDS = [
+  ['gpu',      'gpu_type_id',          'text',   ''],
+  ['cloud',    'cloud_type',           'text',   'SECURE'],
+  ['pods',     'pods',                 'int',    1],
+  ['rounds',   'rounds',               'int',    1],
+  ['pod-cap',  'max_pod_hourly_usd',   'float',  0],
+  ['fleet-cap','max_fleet_hourly_usd', 'float',  0],
+  ['disk',     'container_disk_gb',    'int',    120],
+  ['image',    'image',                'text',   ''],
+  ['volume',   'network_volume_id',    'text',   ''],
+  ['silence',  'pod_max_silence_s',    'float',  1800],
+  ['lifetime', 'pod_max_lifetime_s',   'float',  86400],
+  ['rank',     'rank',                 'int',    16],
+  ['maxlen',   'max_len',              'int',    8192],
+];
+
+function toggleLoraTrainFields(){
+  document.getElementById('cfg-lora-train-fields').style.display =
+    document.getElementById('cfg-lt-enabled').checked ? 'block' : 'none';
+}
+
+function _populateLoraTrain(lt){
+  lt = lt || {};
+  document.getElementById('cfg-lt-enabled').checked = !!lt.enabled;
+  for (const [sfx, key, , dflt] of _LT_FIELDS) {
+    const el = document.getElementById('cfg-lt-' + sfx);
+    if (el) el.value = (lt[key] !== undefined && lt[key] !== null) ? lt[key] : '';
+  }
+  toggleLoraTrainFields();
+}
+
+function _collectLoraTrain(){
+  const enabled = document.getElementById('cfg-lt-enabled').checked;
+  // Nothing at all when it is off, rather than a block of zeros: an absent
+  // block is how a model says "not trainable on rented GPUs", and writing one
+  // full of defaults would make every model look configured.
+  if (!enabled) return null;
+  const out = {enabled: true};
+  for (const [sfx, key, kind, dflt] of _LT_FIELDS) {
+    const el = document.getElementById('cfg-lt-' + sfx);
+    if (!el) continue;
+    const raw = (el.value || '').trim();
+    if (!raw) { out[key] = dflt; continue; }
+    out[key] = (kind === 'int') ? parseInt(raw, 10)
+             : (kind === 'float') ? parseFloat(raw)
+             : raw;
+  }
+  return out;
+}
+
+function _populateAccel(a){
   await _loadAccelPresets();
   await _loadAccelLoras();
   _refreshAccelVisibility();
@@ -5692,6 +5840,7 @@ async function saveModelConfig(){
     lora_path:         _readCompField('lora')        || null,
     lora_model_dir:    document.getElementById('cfg-lora-dir').value.trim() || null,
     lora_scale:        parseFloat(document.getElementById('cfg-lora-scale').value) || null,
+    lora_train: _collectLoraTrain(),
     lora_train_base_model: document.getElementById('cfg-lora-train-base').value.trim() || null,
     lora_train_nodes: document.getElementById('cfg-lora-train-nodes').value.trim() || null,
     max_vram:          parseFloat(document.getElementById('cfg-max-vram').value) || 0,
