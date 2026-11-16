@@ -3518,6 +3518,15 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         encoded = encoded[:n]
         print(f"[text-lora] {job_id}: TEST RUN — 1 pod, 1 round, "
               f"{len(encoded)} example(s)", flush=True)
+        # IN THE RECORD, not only the log. A reader seeing "step 0/1" on a
+        # job that asked for 16 rounds concludes the request was ignored --
+        # which is exactly what happened: a test run was read as a broken
+        # real run, and the rounds path was investigated instead. The record
+        # has to say which kind of run it is, next to the number it explains.
+        _update_job(job_id, test_run=True, rounds=1,
+                    rounds_note=(f"test run: rounds forced to 1 and the set "
+                                 f"truncated to {len(encoded)} example(s), "
+                                 f"whatever the request asked for"))
     # ASKING FOR A POD IS ASKING FOR A POD. This used to require
     # `max_pods > 1 or test_run`, so a request for exactly ONE pod -- `pods: 1,
     # min_pods: 1` -- fell through to the local path and tried to train on an
@@ -3781,6 +3790,14 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
 
     n_shards = max(1, int(cfg.max_pods or 1))
     rounds = max(1, int(cfg.rounds or 1))
+    # Recorded so "step x/y" has a stated source. A request may RAISE rounds
+    # (narrow() passes it through: rounds change duration, not fleet size or
+    # price), so when y is not what was asked for, the record should say what
+    # it is and why rather than leaving it to be inferred.
+    _update_job(job_id, test_run=False, rounds=rounds,
+                rounds_note=(f"{rounds} averaging round(s); each one is a "
+                             f"checkpoint, so an interruption costs at most "
+                             f"1/{rounds} of the work"))
     _clouds = flt.clouds_for(cfg)
     # The FIRST is what a single-cloud create falls back to; the candidates
     # carry their own. "SECURE+COMMUNITY" in a log line is the honest
