@@ -585,14 +585,22 @@ def config_for_model(model_key: str) -> LoraTrainConfig:
             return parse_model_lora_train(entry["lora_train"])
     except Exception:
         pass
+    # Not found in memory -- which does not mean not configured. Both that
+    # helper and the scan below read the catalogue a PROCESS happens to hold
+    # (codai.admin.routes.config_manager.models_data), and an engine process
+    # where the admin module was never initialised holds nothing. The block is
+    # then invisible while being right there in models.json, and the honest
+    # report of that is "I could not see the catalogue", not "there is no
+    # block". So the file is the fallback, and the file is the truth.
+    for name_match in _entry_from_disk(model_key):
+        if name_match.get("lora_train"):
+            return parse_model_lora_train(name_match["lora_train"])
     want = (model_key or "").strip().lower()
     if not want:
         return LoraTrainConfig()
     matches = []
     try:
-        from codai.admin.routes import config_manager as cfg_mgr
-        md = getattr(cfg_mgr, "models_data", None) or {}
-        for lst in md.values():
+        for lst in _catalogue().values():
             if not isinstance(lst, list):
                 continue
             for m in lst:
@@ -862,3 +870,76 @@ def describe_cards(cards: Sequence[Dict[str, Any]]) -> str:
         return "no eligible card"
     return ", ".join(f"{c['id']} ({c['vram_gb']:.0f}GB ${c['hourly_usd']:.2f}/hr)"
                      for c in cards[:6]) + ("…" if len(cards) > 6 else "")
+
+
+def _models_json_path() -> str:
+    """models.json, from the environment the launcher sets or the default."""
+    import os as _os
+    env = (_os.environ.get("CODERAI_CONFIG_DIR") or "").strip()
+    if env:
+        return _os.path.join(env, "models.json")
+    try:
+        from codai.platform_paths import default_config_dir
+        return str(default_config_dir() / "models.json")
+    except Exception:
+        return _os.path.expanduser("~/.coderai/models.json")
+
+
+def _catalogue() -> Dict[str, Any]:
+    """The model catalogue: in-memory if a process has it, else from disk.
+
+    Two sources because they fail differently. The in-memory one is current
+    but only exists where the admin module was initialised; the file is always
+    there but may trail an unsaved edit. Preferring memory and falling back to
+    the file means a lookup answers correctly in both the front and an engine.
+    """
+    try:
+        from codai.admin.routes import config_manager as cfg_mgr
+        md = getattr(cfg_mgr, "models_data", None)
+        if isinstance(md, dict) and md:
+            return md
+    except Exception:
+        pass
+    try:
+        with open(_models_json_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _entry_from_disk(model_key: str) -> List[Dict[str, Any]]:
+    """Entries matching this key by alias, id, path or basename, from the file."""
+    import os as _os
+    want = (model_key or "").strip().lower()
+    if not want:
+        return []
+    out = []
+    for lst in _catalogue().values():
+        if not isinstance(lst, list):
+            continue
+        for m in lst:
+            if not isinstance(m, dict):
+                continue
+            path = str(m.get("path") or "")
+            names = {path.lower(), _os.path.basename(path.rstrip("/")).lower(),
+                     str(m.get("alias") or "").lower(),
+                     str(m.get("id") or "").lower()}
+            if want in names:
+                out.append(m)
+    return out
+
+
+def catalogue_source() -> str:
+    """Where a lookup would read the catalogue from, for an error message."""
+    try:
+        from codai.admin.routes import config_manager as cfg_mgr
+        md = getattr(cfg_mgr, "models_data", None)
+        if isinstance(md, dict) and md:
+            return "the in-memory catalogue"
+    except Exception:
+        pass
+    path = _models_json_path()
+    import os as _os
+    return (f"{path} (on disk)" if _os.path.isfile(path)
+            else f"{path} — WHICH DOES NOT EXIST")

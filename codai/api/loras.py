@@ -3421,13 +3421,25 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     _asked_for_pods = any((req.distributed, req.test_run, req.pods,
                            req.min_pods, req.max_pods))
     if _asked_for_pods and not _train_cfg.enabled:
-        raise RuntimeError(
-            f"{req.base_model!r} has no `lora_train` block with enabled=true, "
-            "so there is nothing to rent pods with. Set it on the Models page "
-            "(card floor, pod ceiling, $/hr) for the model you want to train, "
-            "and name THAT entry as base_model — the block's own base_model "
-            "field is what gets trained, so an alias like 'qwen38' is right "
-            "even when the weights are 'Qwen/Qwen3.8-27B'.")
+        # Name WHERE it looked. "There is no block" was technically true of the
+        # lookup and false of the disk, which sent someone to check a file that
+        # was already correct.
+        where = _flt.catalogue_source()
+        msg = (f"{req.base_model!r} has no `lora_train` block with "
+               f"enabled=true — read from {where}. Set it on the Models page "
+               "(card floor, pod ceiling, $/hr) for the model you want to "
+               "train, and name THAT entry as base_model: the block's own "
+               "base_model field is what gets trained, so an alias like "
+               "'qwen38' is right even when the weights are "
+               "'Qwen/Qwen3.8-27B'.")
+        if req.dry_run:
+            # A dry run rents nothing, so this must not stop it: the dataset
+            # pass is free and is exactly what someone is trying to get an
+            # answer from. Reported, not fatal.
+            print(f"[text-lora] {job_id}: {msg}", flush=True)
+            _update_job(job_id, message="dry run: no lora_train block"[:200])
+        else:
+            raise RuntimeError(msg)
 
     # What to TRAIN comes from the BLOCK, not from the request string. The
     # request names the catalogue entry so the configuration can be found; that

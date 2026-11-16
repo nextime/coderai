@@ -335,7 +335,7 @@ def test_asking_for_pods_without_a_block_refuses_rather_than_training_here():
     for field in ("req.distributed", "req.test_run", "req.pods", "req.min_pods",
                   "req.max_pods"):
         assert field in block, f"{field} can still fall through"
-    assert "nothing to rent pods with" in src
+    assert "has no `lora_train` block with " in src
 
 
 def test_the_refusal_says_which_name_to_use():
@@ -343,7 +343,7 @@ def test_the_refusal_says_which_name_to_use():
     again -- it is the natural thing to write."""
     import inspect
     src = inspect.getsource(loras)
-    assert "an alias like 'qwen38' is right" in src
+    assert "an alias like " in src and "'qwen38' is right" in src
 
 
 def test_local_training_refuses_before_downloading_on_a_gpuless_box():
@@ -394,3 +394,76 @@ def test_the_refusal_happens_before_anything_is_downloaded():
     import inspect
     src = inspect.getsource(loras._text_train_blocking)
     assert src.index("_asked_for_pods") < src.index("AutoTokenizer.from_pretrained")
+
+
+# ------------- the catalogue a process holds is not the configuration --------
+#
+# digesta's second report: the error changed from "not a valid model
+# identifier" to "has no lora_train block", while the block was right there in
+# models.json -- read inside the production container, by a process started
+# AFTER the file was written. Their hypothesis was exact: the lookup reads
+# `codai.admin.routes.config_manager.models_data`, and an engine process where
+# the admin module was never initialised holds nothing. The block was invisible
+# while being correct, and my message asserted the opposite of the truth.
+
+@pytest.fixture
+def on_disk(monkeypatch, tmp_path):
+    """A models.json on disk, and NO in-memory catalogue -- an engine process."""
+    import json as _json
+    entry = {"alias": "qwen38", "id": "qwen38-awq", "path": "",
+             "lora_train": {"enabled": True, "base_model": "Qwen/Qwen3.8-27B",
+                            "max_pods": 32, "min_vram_gb": 48,
+                            "max_pod_hourly_usd": 0.9}}
+    (tmp_path / "models.json").write_text(_json.dumps({"text_models": [entry]}))
+    monkeypatch.setenv("CODERAI_CONFIG_DIR", str(tmp_path))
+    import codai.admin.routes as ar
+    monkeypatch.setattr(ar, "config_manager", None, raising=False)
+    return tmp_path
+
+
+@pytest.mark.parametrize("name", ["qwen38", "qwen38-awq", "Qwen/Qwen3.8-27B"])
+def test_the_block_is_found_with_no_in_memory_catalogue(on_disk, name):
+    """All three names, from the file, in a process that holds no catalogue."""
+    cfg = flt.config_for_model(name)
+    assert cfg.enabled is True, f"{name} did not resolve from disk"
+    assert cfg.base_model == "Qwen/Qwen3.8-27B" and cfg.max_pods == 32
+
+
+def test_memory_is_preferred_when_a_process_has_it(on_disk, monkeypatch):
+    """The file is the fallback, not the source of record: an unsaved edit in
+    the admin UI must still win for the process holding it."""
+    import codai.admin.routes as ar
+
+    class CM:
+        models_data = {"text_models": [{"alias": "qwen38",
+                                        "lora_train": {"enabled": True,
+                                                       "max_pods": 7}}]}
+
+    monkeypatch.setattr(ar, "config_manager", CM, raising=False)
+    assert flt.config_for_model("qwen38").max_pods == 7
+
+
+def test_the_error_names_where_it_looked(on_disk):
+    """"There is no block" was true of the lookup and false of the disk, and it
+    sent someone to check a file that was already right."""
+    src = flt.catalogue_source()
+    assert "models.json" in src and "on disk" in src
+
+
+def test_a_missing_models_json_says_so_rather_than_implying_a_missing_block(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("CODERAI_CONFIG_DIR", str(tmp_path / "nowhere"))
+    import codai.admin.routes as ar
+    monkeypatch.setattr(ar, "config_manager", None, raising=False)
+    assert "DOES NOT EXIST" in flt.catalogue_source()
+
+
+def test_a_dry_run_is_never_blocked_by_a_missing_block():
+    """A dry run rents nothing. Refusing it withheld the one answer that is
+    free -- and that free answer is what found all of these."""
+    import inspect
+    src = inspect.getsource(loras._text_train_blocking)
+    i = src.index("_asked_for_pods and not _train_cfg.enabled")
+    block = src[i:i + 1200]
+    assert "if req.dry_run:" in block
+    assert "Reported, not fatal" in block
