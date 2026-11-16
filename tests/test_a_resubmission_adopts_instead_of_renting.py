@@ -232,3 +232,68 @@ def _bring_up_body():
     i = src.index("def _bring_up")
     j = src.index("if len(_shards) == 1", i)
     return src[i:j]
+
+
+# --------- the join path, EXECUTED rather than read -------------------------
+#
+# Every test above checks the source text, and source text cannot catch an
+# unbound local. The join branch read `_flt` while the import sat further down
+# the function -- and a name assigned anywhere in a function is local
+# throughout it, so the reference raised UnboundLocalError instead of falling
+# back to the module global. Production found it four minutes after the
+# deploy:
+#
+#     job-93b4994e0a96: FAILED: UnboundLocalError: cannot access local
+#     variable '_flt' where it is not associated with a value
+#
+# This test calls the function.
+
+def test_the_join_path_runs(monkeypatch, tmp_path):
+    import types
+
+    monkeypatch.setattr(loras, "_jobs",
+                        {"job-live": {"target": "text",
+                                      "name": "adapter-j",
+                                      "status": "training"}})
+    monkeypatch.setattr(loras, "_jobs_lock", __import__("threading").Lock())
+    recorded = {}
+    monkeypatch.setattr(loras, "_update_job",
+                        lambda jid, **kw: recorded.update(kw))
+    loras._forget_train_lease("job-live")
+
+    req = types.SimpleNamespace(
+        name="adapter-j", base_model="qwen38-train", pods=4, max_pods=8,
+        min_pods=1, rounds=16, test_run=False, distributed=True,
+        dataset_id="", field_map=None, dry_run=False)
+
+    got = loras._text_train_blocking(req, "job-new", str(tmp_path / "ds.jsonl"))
+
+    assert got["joined"] == "job-live"
+    assert got["name"] == "adapter-j"
+    assert isinstance(got["pods_target"], int)
+    assert "already training" in got["detail"]
+    # and the new job's own record says what became of it
+    assert recorded.get("status") == "done"
+    assert "joined job-live" in str(recorded.get("message"))
+    loras._forget_train_lease("job-live")
+
+
+def test_the_join_path_does_not_need_the_dataset(monkeypatch, tmp_path):
+    """It returns before reading anything: the point of joining is that the
+    work is already running elsewhere, and a missing file must not turn a join
+    into a failure."""
+    import types
+
+    monkeypatch.setattr(loras, "_jobs",
+                        {"job-live": {"target": "text", "name": "adapter-k",
+                                      "status": "preparing"}})
+    monkeypatch.setattr(loras, "_jobs_lock", __import__("threading").Lock())
+    monkeypatch.setattr(loras, "_update_job", lambda jid, **kw: None)
+    req = types.SimpleNamespace(
+        name="adapter-k", base_model="qwen38-train", pods=1, max_pods=2,
+        min_pods=1, rounds=1, test_run=False, distributed=None,
+        dataset_id="", field_map=None, dry_run=False)
+    got = loras._text_train_blocking(
+        req, "job-new2", "/nonexistent/path/does-not-exist.jsonl")
+    assert got["joined"] == "job-live"
+    loras._forget_train_lease("job-live")

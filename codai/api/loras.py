@@ -3531,6 +3531,13 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     # double. Refused here rather than deduplicated silently, because the
     # caller needs to know its job was not started -- and which one is
     # already running, so it can watch that instead.
+    # Imported BEFORE the join check, which reads it. It used to be imported
+    # further down, so the join branch raised UnboundLocalError on the first
+    # request that hit it -- in production, within four minutes of the deploy.
+    # A local name assigned anywhere in a function is local THROUGHOUT it, so
+    # the later `import ... as _flt` made this reference unbound rather than
+    # falling back to a module global.
+    from codai.api import text_lora_fleet as _flt
     _already = _active_text_job_for(getattr(req, "name", ""), exclude=job_id)
     if _already:
         # JOIN IT, the way a serving pool takes a repeat request: "asking for
@@ -3569,7 +3576,6 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
 
     _active_job_id = job_id
 
-    from codai.api import text_lora_fleet as _flt
     _train_cfg = _flt.narrow(
         _flt.config_for_model(req.base_model),
         pods=req.pods, max_pods=req.max_pods, rounds=req.rounds,
