@@ -3199,8 +3199,15 @@ class TextLoraTrainRequest(BaseModel):
     # route safe to expose. The three fields below may only NARROW it.
     #: Run distributed at all. Requires the model's `lora_train.enabled`.
     distributed: Optional[bool] = None
-    #: Fewer pods than the model permits, never more.
+    #: How many pods this job wants. Clamped by the model's `max_pods`, the
+    #: same way a scale request may only narrow a model's pool.
     pods: Optional[int] = None
+    #: A ceiling this job accepts, narrowing the model's own.
+    max_pods: Optional[int] = None
+    #: Refuse to START below this many. Training a job that asked for sixteen
+    #: pods on two is usually worse than not training: it bills for a result
+    #: nobody wanted, and the round length was chosen for the fleet size.
+    min_pods: Optional[int] = None
     #: More or fewer averaging rounds: duration, not fleet size or price.
     rounds: Optional[int] = None
     #: A LOWER $/hr ceiling than the model's, never a higher one.
@@ -3426,7 +3433,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     from codai.api import text_lora_fleet as _flt
     _train_cfg = _flt.narrow(
         _flt.config_for_model(req.base_model),
-        pods=req.pods, rounds=req.rounds,
+        pods=req.pods, max_pods=req.max_pods, rounds=req.rounds,
         max_pod_hourly_usd=req.max_pod_hourly_usd,
         max_fleet_hourly_usd=req.max_fleet_hourly_usd)
     if req.test_run:
@@ -3435,7 +3442,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # failure is attributable in minutes rather than discovered hours into
         # a real run.
         _train_cfg = dataclasses.replace(
-            _train_cfg, pods=1, rounds=1,
+            _train_cfg, max_pods=1, rounds=1,
             pod_max_lifetime_s=min(float(_train_cfg.pod_max_lifetime_s or 0)
                                    or 3600.0, 3600.0))
         n = max(1, int(req.test_examples or 8))
@@ -3443,7 +3450,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         print(f"[text-lora] {job_id}: TEST RUN — 1 pod, 1 round, "
               f"{len(encoded)} example(s)", flush=True)
     _want_dist = (_train_cfg.enabled
-                  and (_train_cfg.pods > 1 or req.test_run)
+                  and (_train_cfg.max_pods > 1 or req.test_run)
                   and req.distributed is not False)
     if req.distributed and not _train_cfg.enabled:
         raise RuntimeError(
@@ -3669,7 +3676,7 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         raise RuntimeError("distributed training needs the RunPod account "
                            "configured (runpod.api_key)")
 
-    n_shards = max(1, int(cfg.pods or 1))
+    n_shards = max(1, int(cfg.max_pods or 1))
     rounds = max(1, int(cfg.rounds or 1))
     cloud = (cfg.cloud_type or "SECURE").strip().upper()
     ceiling = float(cfg.max_pod_hourly_usd or 0.0)
@@ -3731,10 +3738,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     with _coord_lock:
         _train_coordinators[job_id] = coord
     poll = max(5.0, float(cfg.poll_interval_s or 20.0))
+    stages = flt.Stages()
     try:
         started = fleet.provision(list(range(n_shards)))
         if not started and not fleet.pods:
+            stages.failed("rent", "no pods could be rented")
             raise RuntimeError("no pods could be rented — nothing to train on")
+        stages.done("rent", pods=len(fleet.pods), hourly_usd=price)
 
         # Wait for addresses and hand each pod the dataset. A pod that never
         # publishes a port is released here rather than waited on: it is
@@ -3757,7 +3767,21 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             fleet.note_checkin(shard)
             ready.append(shard)
         if not ready:
+            stages.failed("reachable", "no pod published a port")
             raise RuntimeError("no pod became reachable — nothing to train on")
+        floor = max(0, int(req.min_pods or 0))
+        if floor and len(ready) < floor:
+            # Refused rather than quietly scaled down: the round length was
+            # chosen for a fleet of n, and training a 16-pod job on 2 bills for
+            # a result nobody asked for. The finally below releases them.
+            stages.failed("min_pods",
+                          f"{len(ready)} of at least {floor} pods came up")
+            raise RuntimeError(
+                f"only {len(ready)} pod(s) became ready and this job requires "
+                f"at least {floor} — released rather than training on "
+                f"{len(ready)}")
+        stages.done("reachable", pods=len(ready))
+        stages.done("dataset", bytes=os.path.getsize(dataset_path))
         _update_job(job_id, status="training", total=rounds,
                     message=f"{len(ready)} pod(s) ready")
 
@@ -3786,8 +3810,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     fleet.note_checkin(shard, rounds_done=rnd + 1)
                     continue
                 if state == "error":
-                    print(f"[text-lora] {job_id}: shard {shard} failed round "
-                          f"{rnd}: {status.get('error')}", flush=True)
+                    stages.failed(f"train(shard {shard})",
+                                  str(status.get("error") or "")[:200])
                     fleet.release(shard, f"round {rnd} failed")
                     continue
                 if state == "unreachable":
@@ -3805,6 +3829,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
 
             closed = coord.close_round_if_ready()
             if closed is not None:
+                stages.done(f"round {closed}",
+                            shards=len(coord.tracker.have(closed)))
                 _update_job(job_id, step=closed + 1,
                             message=f"round {closed} averaged; "
                                     f"{len(fleet.pods)} pod(s) running")

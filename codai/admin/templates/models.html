@@ -1869,9 +1869,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </select>
           </div>
           <div class="form-group" style="flex:1;min-width:110px">
-            <label class="form-label">Pods</label>
+            <label class="form-label">Max pods</label>
             <input type="number" id="cfg-lt-pods" class="form-input" min="1" placeholder="1">
-            <span class="form-hint">Shards. The most a request may use.</span>
+            <span class="form-hint">The most one job may rent. A request may ask for fewer, or insist on a minimum.</span>
           </div>
           <div class="form-group" style="flex:1;min-width:110px">
             <label class="form-label">Rounds</label>
@@ -4872,7 +4872,7 @@ const _LT_FIELDS = [
   ['vram',     'min_vram_gb',          'float',  0],
   ['gputypes', 'gpu_types',            'text',   ''],
   ['cloud',    'cloud_type',           'text',   'SECURE'],
-  ['pods',     'pods',                 'int',    1],
+  ['pods',     'max_pods',             'int',    1],
   ['rounds',   'rounds',               'int',    1],
   ['pod-cap',  'max_pod_hourly_usd',   'float',  0],
   ['fleet-cap','max_fleet_hourly_usd', 'float',  0],

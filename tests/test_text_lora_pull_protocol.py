@@ -370,3 +370,17 @@ def test_a_clean_timeline_has_no_failure():
     st.done("rent")
     st.done("adapter")
     assert st.as_dict()["failed_at"] is None
+
+
+def test_a_job_refuses_to_start_below_its_minimum_pods():
+    """min_pods is a floor the CLIENT sets: training a job that asked for
+    sixteen pods on two bills for a result nobody wanted, and the round length
+    was chosen for the fleet size. The refusal releases what it rented."""
+    import inspect
+    src = inspect.getsource(loras._text_train_distributed)
+    i = src.index("floor = max(0, int(req.min_pods or 0))")
+    block = src[i:i + 700]
+    assert "len(ready) < floor" in block
+    assert "released rather than training" in block
+    # and the release is the finally, not a special case here
+    assert "release_all" in src[src.index("finally:"):]

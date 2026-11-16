@@ -510,7 +510,10 @@ class LoraTrainConfig:
     gpu_types: str = ""
     cloud_type: str = "SECURE"
     image: str = "ghcr.io/nextime/coderai-trainer-text:latest"
-    pods: int = 1                     # how many shards the operator permits
+    #: The operator's ceiling on how many pods one job may rent. Named like the
+    #: serving block's `max_pods` because it means the same thing and a request
+    #: may only ever narrow it.
+    max_pods: int = 1
     rounds: int = 1
     container_disk_gb: int = 120
     network_volume_id: str = ""
@@ -549,7 +552,7 @@ def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
             elif f.name in ("gpu_types", "cloud_type", "image",
                             "network_volume_id", "base_model"):
                 setattr(cfg, f.name, str(raw or "").strip())
-            elif f.name in ("pods", "rounds", "container_disk_gb", "rank",
+            elif f.name in ("max_pods", "rounds", "container_disk_gb", "rank",
                             "alpha", "accumulation_steps", "max_len"):
                 setattr(cfg, f.name, int(raw))
             else:
@@ -570,22 +573,33 @@ def config_for_model(model_key: str) -> LoraTrainConfig:
 
 
 def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
+           max_pods: Optional[int] = None,
            rounds: Optional[int] = None,
            max_pod_hourly_usd: Optional[float] = None,
            max_fleet_hourly_usd: Optional[float] = None) -> LoraTrainConfig:
     """Apply a request's narrowing. It can only ever ask for LESS.
 
-    Asking for more is not an error worth failing a job over -- it is a client
-    that does not know the operator's limit -- so it is clamped and said out
-    loud. What matters is that it cannot take effect.
+    ``pods`` is how many this job wants, ``max_pods`` a ceiling it will accept;
+    both are clamped by the operator's ``max_pods``, the same way a scale
+    request may only narrow a model's pool. Asking for more is not worth
+    failing a job over -- it is a client that does not know the limit -- so it
+    is clamped and said out loud. What matters is that it cannot take effect.
     """
     out = dataclasses.replace(cfg)
+    ceiling = int(cfg.max_pods or 1)
+    if max_pods is not None and int(max_pods) > 0:
+        want = int(max_pods)
+        ceiling = min(want, ceiling)
+        if want > cfg.max_pods:
+            print(f"[text-lora] request allowed up to {want} pods; the model "
+                  f"permits {cfg.max_pods} — using {ceiling}", flush=True)
+    out.max_pods = ceiling
     if pods is not None and int(pods) > 0:
         want = int(pods)
-        out.pods = min(want, cfg.pods)
-        if want > cfg.pods:
-            print(f"[text-lora] request asked for {want} pods; the model "
-                  f"permits {cfg.pods} — using {out.pods}", flush=True)
+        out.max_pods = min(want, ceiling)
+        if want > ceiling:
+            print(f"[text-lora] request asked for {want} pods; the ceiling is "
+                  f"{ceiling} — using {out.max_pods}", flush=True)
     if rounds is not None and int(rounds) > 0:
         out.rounds = int(rounds)        # rounds change duration, not the fleet
     for name, want in (("max_pod_hourly_usd", max_pod_hourly_usd),
