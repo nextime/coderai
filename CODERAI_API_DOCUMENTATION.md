@@ -3189,7 +3189,7 @@ print(response.choices[0].message.content)
 
 ## Endpoint Index
 
-Every HTTP route the server defines — **260** of them — generated from the
+Every HTTP route the server defines — **263** of them — generated from the
 decorators in `codai/` by [`tools/gen_endpoint_index.py`](tools/gen_endpoint_index.py).
 `Source` names the module(s) that own the route: one owned by `frontproxy/*` is served
 by the torch-free front, one owned by `api/*` by an engine process, and a route listed
@@ -3277,6 +3277,9 @@ They are still part of the HTTP surface, which is why they are listed here.
 | `POST` | `/v1/loras/register` | Serve an uploaded adapter under its own name | `api/loras` |
 | `POST` | `/v1/loras/train` | Train a new LoRA | `api/loras` |
 | `POST` | `/v1/loras/train/text` | Train a text (causal-LM) LoRA | `api/loras` |
+| `POST` | `/v1/loras/train/text/{job_id}/round` | A training pod hands in its adapter (pod-facing) | `api/loras` |
+| `GET` | `/v1/loras/train/text/{job_id}/round/{rnd}/adapter` | A training pod fetches the averaged adapter (pod-facing) | `api/loras` |
+| `GET` | `/v1/loras/train/text/{job_id}/shard` | A training pod asks what to train (pod-facing) | `api/loras` |
 | `POST` | `/v1/loras/upload` | Upload LoRA weights (content-addressed) | `api/loras` |
 | `GET` | `/v1/loras/{name}` | Get a registered LoRA | `api/loras` |
 | `DELETE` | `/v1/loras/{name}` | Delete a registered LoRA | `api/loras` |

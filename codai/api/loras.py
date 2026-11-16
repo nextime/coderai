@@ -36,9 +36,10 @@ import base64
 import io
 import json
 import os
+import secrets
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -3412,3 +3413,198 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     _update_job(job_id, status="done", active=False, force=True,
                 path=out_dir, message=f"saved {req.name}")
     return {**summary, **result, "path": out_dir, "name": req.name}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distributed text QLoRA: the pod-facing protocol
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every message here is a POD CALLING IN. That is not a style choice: rented
+# pods in different datacenters cannot address one another and nothing can
+# address them, so a design where the orchestrator initiates is a design that
+# does not run. It also means these three endpoints are the entire network
+# surface of a distributed run.
+#
+# They are authenticated by the JOB's own secret, minted per job and handed to
+# each pod in its environment -- not by a user token. A training pod holds a
+# credential for as long as it lives; the blast radius of that credential should
+# be one job, not an install.
+
+_train_coordinators: Dict[str, Any] = {}
+_coord_lock = threading.Lock()
+
+
+def _coordinator(job_id: str):
+    with _coord_lock:
+        return _train_coordinators.get(job_id)
+
+
+def _require_job_secret(job_id: str, request: Request):
+    """The pod's own credential for this job, or 401."""
+    coord = _coordinator(job_id)
+    if coord is None:
+        raise HTTPException(status_code=404, detail="no such training job")
+    sent = (request.headers.get("authorization") or "").strip()
+    if sent.lower().startswith("bearer "):
+        sent = sent[7:].strip()
+    if not sent or not secrets.compare_digest(sent, coord.secret):
+        # compare_digest, not ==: a per-round credential check is exactly the
+        # kind of loop a timing comparison leaks.
+        raise HTTPException(status_code=401, detail="bad job credential")
+    return coord
+
+
+@router.get("/v1/loras/train/text/{job_id}/shard",
+            summary="A training pod asks what to train (pod-facing)")
+async def text_train_shard(job_id: str, shard: int, request: Request):
+    """What this shard should do now: the round, its example indices, and where
+    to start from.
+
+    ``adapter`` is the blob id of the average everyone restarts from -- null on
+    round 0, when every pod starts from the base.
+    """
+    coord = _require_job_secret(job_id, request)
+    coord.fleet.note_checkin(shard)
+    return coord.assignment(int(shard))
+
+
+@router.post("/v1/loras/train/text/{job_id}/round",
+             summary="A training pod hands in its adapter (pod-facing)")
+async def text_train_round(job_id: str, request: Request,
+                           shard: int, round: int, examples: int = 0):
+    """Receive one shard's adapter for one round.
+
+    The body is the adapter itself, stored content-addressed in the same blob
+    store a serving LoRA uses -- so a re-send costs nothing and the average is
+    computed from files the registry already knows how to read.
+    """
+    coord = _require_job_secret(job_id, request)
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty adapter body")
+    h, _existed = save_lora_blob(data)
+    from codai.api import text_lora_rounds as tlr
+    try:
+        coord.submit(tlr.Submission(shard=int(shard), round=int(round),
+                                    path=_lora_blob_path(h),
+                                    examples=int(examples)))
+    except tlr.RoundError as e:
+        # 409, not 400: the submission is well-formed but out of step, and the
+        # pod should re-sync rather than retry the same body.
+        raise HTTPException(status_code=409, detail=str(e))
+    coord.fleet.note_checkin(int(shard), rounds_done=int(round) + 1)
+    return {"ok": True, "round": int(round), "shard": int(shard),
+            "adapter": f"sha256:{h}"}
+
+
+@router.get("/v1/loras/train/text/{job_id}/round/{rnd}/adapter",
+            summary="A training pod fetches the averaged adapter (pod-facing)")
+async def text_train_round_adapter(job_id: str, rnd: int, request: Request):
+    """The average for a finished round. 404 until that round has closed.
+
+    A pod polls this after handing in its own: it is how the next round starts
+    from everyone's work instead of only its own.
+    """
+    coord = _require_job_secret(job_id, request)
+    path = coord.average_path(int(rnd))
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404,
+                            detail=f"round {rnd} has not been averaged yet")
+    from fastapi.responses import FileResponse
+    return FileResponse(path, media_type="application/octet-stream",
+                        filename=f"round{int(rnd)}.safetensors")
+
+
+class _TextTrainCoordinator:
+    """The orchestrator's side of a distributed run.
+
+    Holds the shard plan, the round tracker and the fleet, and is what the three
+    pod-facing endpoints reach. It initiates nothing over the network: pods ask
+    for work, hand in adapters and fetch averages, and this decides when a round
+    is done.
+    """
+
+    def __init__(self, job_id: str, *, plan, tracker, fleet, encoded,
+                 out_dir: str, settings, dataset_id: str = ""):
+        from codai.api import text_lora_rounds as tlr
+        self.job_id = job_id
+        self.plan = plan
+        self.tracker = tracker
+        self.fleet = fleet
+        self.encoded = encoded
+        self.out_dir = out_dir
+        self.settings = settings
+        self.dataset_id = dataset_id
+        self.secret = secrets.token_urlsafe(32)
+        self._averages: Dict[int, str] = {}
+        self._lock = threading.Lock()
+        os.makedirs(out_dir, exist_ok=True)
+
+    # -- what a pod is told ---------------------------------------------- #
+
+    def assignment(self, shard: int) -> dict:
+        rnd = self.tracker.round
+        return {
+            "job": self.job_id, "shard": int(shard), "round": rnd,
+            "n_shards": self.plan.n_shards,
+            "indices": self.plan.indices_for(int(shard), len(self.encoded)),
+            "dataset_id": self.dataset_id,
+            # Where to start: the previous round's average, or the bare base on
+            # round 0. Named as a round rather than a blob id so a pod that
+            # restarts mid-round fetches the same thing its siblings did.
+            "resume_round": (rnd - 1) if rnd > 0 else None,
+            "settings": {"rank": self.settings.rank, "alpha": self.settings.alpha,
+                         "dropout": self.settings.dropout,
+                         "learning_rate": self.settings.learning_rate,
+                         "max_len": self.settings.max_len,
+                         "accumulation_steps": self.settings.accumulation_steps,
+                         "enable_thinking": self.settings.enable_thinking,
+                         "seed": self.settings.seed},
+        }
+
+    def submit(self, sub) -> None:
+        with self._lock:
+            self.tracker.submit(sub)
+
+    def average_path(self, rnd: int) -> str:
+        with self._lock:
+            return self._averages.get(int(rnd), "")
+
+    # -- the round boundary ----------------------------------------------- #
+
+    def close_round_if_ready(self) -> Optional[int]:
+        """Average and advance when the round is done. Returns the round closed.
+
+        The average is written BEFORE the tracker advances, so a pod that asks
+        for round k's adapter the instant k+1 opens gets the file rather than a
+        404 -- the two are not atomic from the pod's side and the ordering is
+        what makes the gap harmless.
+        """
+        from codai.api import text_lora_rounds as tlr
+        with self._lock:
+            if not self.tracker.ready():
+                return None
+            rnd = self.tracker.round
+            subs = self.tracker.have()
+            weights = self.tracker.weights_for(subs)
+            out = os.path.join(self.out_dir, f"round{rnd}.safetensors")
+            tlr.average_adapter_files([s.path for s in subs], weights, out)
+            self._averages[rnd] = out
+            closed, absent = self.tracker.close_round()
+        print(f"[text-lora] {self.job_id}: round {rnd} averaged from "
+              f"{len(subs)} shard(s) ({int(sum(weights))} examples)"
+              + (f"; absent: {absent}" if absent else ""), flush=True)
+        return rnd
+
+    def reap_the_dead(self) -> List[int]:
+        """Release pods that stopped checking in, and say which shards are free.
+
+        Their shards are not reassigned here: the round protocol averages what
+        arrives, so a lost shard costs its share of one round rather than the
+        run. Re-renting is a decision about money and belongs to the caller.
+        """
+        gone = []
+        for pod in self.fleet.to_reap():
+            if self.fleet.release(pod.shard, "stopped checking in"):
+                gone.append(pod.shard)
+        return gone
