@@ -3598,6 +3598,18 @@ class RunpodPodPool:
                 return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()
+                # A 422 is NOT a capacity miss. It was reported as one --
+                # "<card> unavailable, trying the next candidate" -- for every
+                # card in the list, so a body the API rejects looked exactly
+                # like an empty market from outside. Say which it is.
+                if "http 422" in msg or "validation failed" in msg:
+                    print(f"[runpod] {sel['display_name']} "
+                          f"({sel['cloud_type']}): the REQUEST BODY was "
+                          f"rejected (422), which is not a capacity problem — "
+                          f"trying the next candidate will not help until the "
+                          f"body is fixed: {exc}", flush=True)
+                    last = exc
+                    continue
                 if "no longer any instances" in msg or "no instances" in msg or "capacity" in msg:
                     # Shared, so the other boot threads skip it instead of each
                     # discovering the same shortage. See `_unavail`.

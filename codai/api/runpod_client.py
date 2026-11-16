@@ -742,8 +742,19 @@ class RunpodClient:
             cls = (RunpodTransient
                    if r.status_code >= 500 or r.status_code in (408, 425, 429)
                    else RunpodError)
+            body = r.text or ""
+            # A VALIDATION failure is a different problem from a full market,
+            # and 300 characters cut the `errors` array off exactly where the
+            # field name lives -- so four rentals were reported as cards being
+            # "unavailable" when the body was being rejected, and the reason
+            # was unrecoverable once the log rotated. The whole body goes to
+            # the log once, immediately, because the caller's own message is
+            # truncated further down the line.
+            if r.status_code == 422:
+                print(f"[runpod] REST {method} {path} REJECTED THE BODY "
+                      f"(422, not capacity): {body}", flush=True)
             raise cls(f"RunPod REST v2 {method} {path} HTTP {r.status_code}: "
-                      f"{(r.text or '')[:300]}")
+                      f"{body[:2000]}")
         if not r.content:
             return {}
         try:

@@ -4150,9 +4150,27 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 print(f"[text-lora] {job_id}: released silent shard(s) {gone}",
                       flush=True)
             if not fleet.pods:
+                # KEEP WHAT WAS EARNED. Every round is a checkpoint, so losing
+                # the fleet at round 9 of 16 is nine rounds of averaging
+                # already paid for -- raising here marked the job failed and
+                # handed back nothing, which is the worst reading of a partial
+                # result. A run that completed no round at all still fails:
+                # there is nothing to keep.
+                _done = coord.tracker.round
+                _last = coord.average_path(_done - 1) if _done > 0 else ""
+                if _last and os.path.isfile(_last):
+                    print(f"[text-lora] {job_id}: every pod is gone at round "
+                          f"{_done} of {rounds} — finishing with the average "
+                          f"from round {_done - 1} rather than discarding "
+                          f"{_done} completed round(s)", flush=True)
+                    _update_job(job_id, message=(
+                        f"fleet lost at round {_done}/{rounds}; kept the "
+                        f"adapter from round {_done - 1}"))
+                    rounds = _done        # what was actually completed
+                    break
                 raise RuntimeError(
-                    f"every pod is gone at round {coord.tracker.round} of "
-                    f"{rounds}; the last average is kept in {out_dir}")
+                    f"every pod is gone at round {_done} of {rounds} and no "
+                    f"round had been averaged — nothing to keep")
             time.sleep(poll)
 
         final = coord.average_path(rounds - 1)
