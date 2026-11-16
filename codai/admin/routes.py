@@ -4365,6 +4365,12 @@ def build_settings_dict(c, gpu_cards):
             "default_gpu_type": c.runpod.default_gpu_type,
             "data_center": c.runpod.data_center,
             "registry_auth_id": c.runpod.registry_auth_id,
+            # Both halves or neither: this serialiser is hand-listed just like
+            # the save merge, so a field added to one and not the other is a
+            # knob that saves and then shows blank on reload -- which is what
+            # happened to this one, and exactly what the helper at the top of
+            # this module warns about.
+            "port_publish_grace_s": c.runpod.port_publish_grace_s,
             "network_volume_id": c.runpod.network_volume_id,
             "network_volumes": dict(c.runpod.network_volumes or {}),
             "volume_mount_path": c.runpod.volume_mount_path,

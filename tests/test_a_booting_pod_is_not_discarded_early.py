@@ -143,3 +143,24 @@ def test_the_hint_tells_the_operator_what_it_costs():
     i = html.index("s-runpod-port-grace")
     hint = html[i:i + 700]
     assert "already paid for" in hint
+
+
+def test_the_settings_getter_returns_it():
+    """The SETTER alone is not enough, and I shipped only the setter once.
+
+    Both the GET payload and the save merge are hand-listed in routes.py. A
+    field in the merge but not the payload is a knob that appears to save and
+    comes back blank on reload -- and a blank numeric input then saves 0 over
+    the real value on the next submit.
+    """
+    src = (ROOT / "codai/admin/routes.py").read_text()
+    i = src.index('"registry_auth_id": c.runpod.registry_auth_id')
+    block = src[i:i + 900]
+    assert '"port_publish_grace_s": c.runpod.port_publish_grace_s' in block
+
+
+def test_both_halves_exist_for_this_field():
+    """Stated as one assertion so neither half can be removed alone."""
+    src = (ROOT / "codai/admin/routes.py").read_text()
+    assert '"port_publish_grace_s": c.runpod.port_publish_grace_s' in src   # GET
+    assert '"port_publish_grace_s" in d' in src                             # POST
