@@ -3844,7 +3844,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         raise RuntimeError("distributed training needs the RunPod account "
                            "configured (runpod.api_key)")
 
-    n_shards = max(1, int(cfg.max_pods or 1))
+    # START at `pods_start` and be MAINTAINED at `max_pods`. The two were one
+    # number, so a request for "8 now, up to 16" could never exceed 8.
+    _ceiling = max(1, int(cfg.max_pods or 1))
+    n_shards = max(1, int(cfg.pods_start or 0) or _ceiling)
+    if n_shards < _ceiling:
+        print(f"[text-lora] {job_id}: starting on {n_shards} pod(s), "
+              f"maintained at up to {_ceiling}", flush=True)
     rounds = max(1, int(cfg.rounds or 1))
     # Recorded so "step x/y" has a stated source. A request may RAISE rounds
     # (narrow() passes it through: rounds change duration, not fleet size or
@@ -4017,15 +4023,31 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             raise RuntimeError("no pod became reachable — nothing to train on")
         floor = max(0, int(req.min_pods or 0))
         if floor and len(ready) < floor:
-            # Refused rather than quietly scaled down: the round length was
-            # chosen for a fleet of n, and training a 16-pod job on 2 bills for
-            # a result nobody asked for. The finally below releases them.
-            stages.failed("min_pods",
-                          f"{len(ready)} of at least {floor} pods came up")
-            raise RuntimeError(
-                f"only {len(ready)} pod(s) became ready and this job requires "
-                f"at least {floor} — released rather than training on "
-                f"{len(ready)}")
+            # NOT a refusal any more, and the reason it was one is gone. It
+            # existed because the partition was fixed at the start: with
+            # `shard = index % max_pods` decided up front, training a 16-shard
+            # job on 2 pods left fourteen sixteenths of the data untouched, so
+            # refusing was the only honest answer.
+            #
+            # Round-first slicing removed that: every round's content is a
+            # function of (seed, round, rounds) alone and is split across
+            # whatever cohort is present, so a run on 1 pod trains the whole
+            # dataset -- more slowly, and with less averaging, but completely.
+            # Meanwhile the fleet tops up toward the target between rounds.
+            #
+            # So the floor is now a TARGET, not a gate. Enforcing it was
+            # destroying pods that had booted and been paid for -- measured
+            # today: "only 1 pod(s) became ready and this job requires at
+            # least 2 -- released rather than training on 1", repeatedly, which
+            # is the behaviour that made a large fleet impossible to assemble
+            # in the first place.
+            print(f"[text-lora] {job_id}: starting on {len(ready)} pod(s) "
+                  f"although {floor} were asked for — the fleet grows toward "
+                  f"{_ceiling} between rounds, and every round trains the "
+                  f"whole dataset whatever its size", flush=True)
+            _update_job(job_id,
+                        message=(f"started on {len(ready)} of {floor} "
+                                 f"requested pod(s); growing"))
         stages.done("reachable", pods=len(ready))
         stages.done("dataset", bytes=os.path.getsize(dataset_path))
         _update_job(job_id, status="training", total=rounds,
@@ -4049,13 +4071,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             # only safe moment: the cohort for the open round is already fixed,
             # so a pod that arrives now joins the next one. Bounded by the
             # operator's ceiling, and it rents only what is missing.
-            if rnd != _topped_up[0] and len(fleet.pods) < n_shards:
+            if rnd != _topped_up[0] and len(fleet.pods) < _ceiling:
                 _topped_up[0] = rnd
                 try:
-                    grew = fleet.top_up(n_shards, cap=int(cfg.max_pods or 0))
+                    grew = fleet.top_up(_ceiling, cap=_ceiling)
                     if grew:
                         print(f"[text-lora] {job_id}: grew to "
-                              f"{len(fleet.pods)} pod(s) of {n_shards} at "
+                              f"{len(fleet.pods)} pod(s) of {_ceiling} at "
                               f"round {rnd}", flush=True)
                         for _sh in sorted(p.shard for p in grew):
                             try:

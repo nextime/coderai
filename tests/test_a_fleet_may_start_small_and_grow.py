@@ -166,16 +166,17 @@ def test_top_up_respects_the_operator_cap(monkeypatch):
 def test_growth_happens_at_a_round_boundary_only():
     """The open round's cohort is already fixed, so a pod arriving now joins
     the next one -- growing mid-round would invalidate handed-out slices."""
-    assert "fleet.top_up(n_shards" in DIST
+    assert "fleet.top_up(_ceiling" in DIST
     assert "_topped_up[0] = rnd" in DIST
 
 
 def test_growth_is_bounded_by_the_configured_ceiling():
-    assert "cap=int(cfg.max_pods or 0)" in DIST
+    assert "cap=_ceiling" in DIST
+    assert "_ceiling = max(1, int(cfg.max_pods or 1))" in DIST
 
 
 def test_a_failed_growth_does_not_end_the_run():
-    i = DIST.index("fleet.top_up(n_shards")
+    i = DIST.index("fleet.top_up(_ceiling")
     block = DIST[max(0, i - 400):i + 900]
     assert "could not grow the fleet" in block
     assert "continuing with" in block
@@ -183,3 +184,106 @@ def test_a_failed_growth_does_not_end_the_run():
 
 def test_the_cohort_size_is_reported_when_it_changes():
     assert "runs on " in DIST and "_last_cohort" in DIST
+
+
+# ------------------------- min_pods is a target, not a gate -----------------
+#
+# The floor refused to start and RELEASED the pods that had booted:
+#
+#     only 1 pod(s) became ready and this job requires at least 2 --
+#     released rather than training on 1
+#
+# It existed because the partition was fixed at the start: with
+# `shard = index % max_pods` decided up front, running a 16-shard job on 2
+# pods left fourteen sixteenths of the data untouched, and refusing was the
+# only honest answer. Round-first slicing removed that reason, so enforcing it
+# was destroying booted, paid-for pods to prevent something that can no longer
+# happen -- and it is the behaviour that made a large fleet impossible to
+# assemble, because the first arrivals were always thrown away.
+
+def test_a_short_fleet_starts_instead_of_being_released():
+    assert "released rather than training on " not in _raise_lines(DIST)
+
+
+def _raise_lines(src):
+    """Only the raise statements, so a comment quoting the old message does
+    not look like the behaviour."""
+    return "\n".join(l for l in src.splitlines()
+                     if "raise " in l or "RuntimeError(" in l)
+
+
+def test_it_says_what_it_is_doing_and_why():
+    i = DIST.index("floor and len(ready) < floor")
+    block = DIST[i:i + 1800]
+    assert "starting on " in block and "although" in block
+    assert "grows toward" in block
+
+
+def test_the_job_record_says_it_is_short_and_growing():
+    i = DIST.index("floor and len(ready) < floor")
+    block = DIST[i:i + 1800]
+    assert "requested pod(s); growing" in block
+
+
+def test_zero_pods_is_still_a_failure():
+    """A target is not a licence to train on nothing."""
+    assert "no pod became reachable" in DIST
+    i = DIST.index("if not ready:")
+    assert "raise RuntimeError" in DIST[i:i + 300]
+
+
+def test_the_comment_records_why_the_gate_went():
+    """So it is not restored by someone who sees an unused min_pods."""
+    i = DIST.index("floor and len(ready) < floor")
+    block = DIST[i:i + 1800]
+    assert "the partition was fixed" in block
+    assert "Round-first slicing removed that" in block
+
+
+# ------------- `pods` is where it starts; `max_pods` is where it is kept ----
+#
+# They were ONE field: `narrow()` wrote the request's `pods` into max_pods, so
+# "pods: 8, max_pods: 16" meant the fleet could never exceed 8 however much
+# capacity turned up -- the starting number silently became the limit, and the
+# ceiling the client had asked for was unreachable.
+
+def test_the_starting_size_does_not_lower_the_ceiling():
+    block = flt.LoraTrainConfig(enabled=True, max_pods=32)
+    out = flt.narrow(block, pods=8, max_pods=16)
+    assert out.max_pods == 16, "the ceiling was overwritten by the start size"
+    assert out.pods_start == 8
+
+
+def test_no_starting_size_means_start_at_the_ceiling():
+    block = flt.LoraTrainConfig(enabled=True, max_pods=32)
+    out = flt.narrow(block, max_pods=16)
+    assert out.max_pods == 16 and out.pods_start == 0
+
+
+def test_a_starting_size_above_the_ceiling_is_clamped():
+    block = flt.LoraTrainConfig(enabled=True, max_pods=32)
+    out = flt.narrow(block, pods=99, max_pods=16)
+    assert out.pods_start == 16 and out.max_pods == 16
+
+
+def test_the_operators_block_still_binds_above_the_request():
+    """A request may narrow and must not widen -- the ceiling is still the
+    operator's."""
+    block = flt.LoraTrainConfig(enabled=True, max_pods=4)
+    out = flt.narrow(block, pods=8, max_pods=16)
+    assert out.max_pods == 4 and out.pods_start == 4
+
+
+def test_the_job_starts_at_the_start_size():
+    assert "int(cfg.pods_start or 0) or _ceiling" in DIST
+
+
+def test_growth_targets_the_ceiling_not_the_start_size():
+    """"Maintain the pool at max 16": the top-up reaches for the ceiling, not
+    for the eight it began with."""
+    assert "fleet.top_up(_ceiling, cap=_ceiling)" in DIST
+
+
+def test_it_says_both_numbers_when_they_differ():
+    i = DIST.index("int(cfg.pods_start or 0) or _ceiling")
+    assert "maintained at up to" in DIST[i:i + 500]

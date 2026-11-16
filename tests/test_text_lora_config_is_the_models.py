@@ -54,14 +54,19 @@ def test_a_malformed_value_keeps_the_default_rather_than_crashing():
 
 # ----------------------------------------------------------- the narrowing ---
 
-def test_a_request_may_ask_for_fewer_pods():
+def test_a_request_may_ask_to_start_on_fewer_pods():
+    """`pods` is the STARTING size now, not the ceiling. Writing it to
+    max_pods meant "pods: 8, max_pods: 16" could never exceed 8 -- the number
+    a client began with silently became its limit."""
     c = flt.narrow(flt.parse_model_lora_train(BLOCK), pods=2)
-    assert c.max_pods == 2
+    assert c.pods_start == 2
+    assert c.max_pods == 4, "the operator's ceiling is unchanged by a start size"
 
 
 def test_a_request_cannot_ask_for_more_pods(capsys):
     c = flt.narrow(flt.parse_model_lora_train(BLOCK), pods=99)
-    assert c.max_pods == 4, "clamped to what the operator permits"
+    assert c.pods_start == 4, "clamped to what the operator permits"
+    assert c.max_pods == 4
     assert "the ceiling is 4" in capsys.readouterr().out
 
 

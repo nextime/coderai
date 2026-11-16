@@ -706,6 +706,12 @@ class LoraTrainConfig:
     #: serving block's `max_pods` because it means the same thing and a request
     #: may only ever narrow it.
     max_pods: int = 1
+    #: How many pods to rent AT THE START. `max_pods` is the ceiling the fleet
+    #: may be maintained at; this is where it begins. They were one field, so
+    #: `pods: 8, max_pods: 16` set the ceiling to 8 and the pool could never
+    #: reach 16 however much capacity appeared -- the request's own starting
+    #: number silently became its limit. 0 = start at the ceiling.
+    pods_start: int = 0
     rounds: int = 1
     container_disk_gb: int = 120
     network_volume_id: str = ""
@@ -855,10 +861,13 @@ def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
     out.max_pods = ceiling
     if pods is not None and int(pods) > 0:
         want = int(pods)
-        out.max_pods = min(want, ceiling)
+        # The STARTING size, not the ceiling. Writing it to max_pods made a
+        # request for "8 now, up to 16" mean "8, ever".
+        out.pods_start = min(want, ceiling)
         if want > ceiling:
-            print(f"[text-lora] request asked for {want} pods; the ceiling is "
-                  f"{ceiling} — using {out.max_pods}", flush=True)
+            print(f"[text-lora] request asked to start on {want} pods; the "
+                  f"ceiling is {ceiling} — starting on {out.pods_start}",
+                  flush=True)
     if rounds is not None and int(rounds) > 0:
         out.rounds = int(rounds)        # rounds change duration, not the fleet
     for name, want in (("max_pod_hourly_usd", max_pod_hourly_usd),

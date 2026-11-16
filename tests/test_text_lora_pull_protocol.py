@@ -372,15 +372,34 @@ def test_a_clean_timeline_has_no_failure():
     assert st.as_dict()["failed_at"] is None
 
 
-def test_a_job_refuses_to_start_below_its_minimum_pods():
-    """min_pods is a floor the CLIENT sets: training a job that asked for
-    sixteen pods on two bills for a result nobody wanted, and the round length
-    was chosen for the fleet size. The refusal releases what it rented."""
+def test_a_job_starts_below_its_minimum_pods_and_grows():
+    """REVERSED, because the reason for the refusal is gone.
+
+    min_pods was a gate: with `shard = index % max_pods` fixed at the start,
+    running a sixteen-shard job on two pods left fourteen sixteenths of the
+    data untouched, so refusing was the only honest answer and releasing what
+    it had rented was the right follow-through.
+
+    Round-first slicing changed the premise -- each round's content depends on
+    (seed, round, rounds) alone and is split across whatever cohort is present
+    -- so a run on one pod trains the whole dataset, more slowly and with less
+    averaging. Enforcing the gate after that was destroying booted, paid-for
+    pods to prevent something that can no longer happen, and it was why a
+    large fleet could never be assembled: the early arrivals were always
+    thrown away while the rest were hunted.
+
+    min_pods is now the target the fleet grows toward between rounds.
+    """
     import inspect
     src = inspect.getsource(loras._text_train_distributed)
     i = src.index("floor = max(0, int(req.min_pods or 0))")
-    block = src[i:i + 700]
+    block = src[i:i + 1800]
     assert "len(ready) < floor" in block
-    assert "released rather than training" in block
-    # and the release is the finally, not a special case here
+    assert "starting on " in block and "grows toward" in block
+    # No raise in that branch any more -- the quoted old message in the
+    # comment does not count.
+    raises = [l for l in block.splitlines() if "raise " in l]
+    assert raises == [], raises
+    # Zero pods is still fatal, and the release is still the finally.
+    assert "no pod became reachable" in src
     assert "release_all" in src[src.index("finally:"):]
