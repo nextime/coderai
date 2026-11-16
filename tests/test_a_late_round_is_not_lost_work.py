@@ -86,13 +86,13 @@ def test_recycling_names_the_round_so_the_open_one_is_untouched():
     """It must reclaim the CLOSED round's block, not the pod's current one."""
     c, t = _coord()
     c.cohort(0, [0], grow=True)
-    old = c.block_for(0, 0)
+    old = c.blocks_for(0, 0)
     t.round = 1
     c.cohort(1, [0], grow=True)
-    now = c.block_for(0, 1)
+    now = c.blocks_for(0, 1)
     assert now != old
-    assert c.recycle([0], rnd=0) == [old]
-    assert c.block_for(0, 1) == now, "the open round's assignment moved"
+    assert c.recycle([0], rnd=0) == old
+    assert c.blocks_for(0, 1) == now, "the open round's assignment moved"
 
 
 def test_the_loop_has_a_branch_for_it_at_all():

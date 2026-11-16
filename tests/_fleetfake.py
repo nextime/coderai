@@ -179,6 +179,11 @@ def install(monkeypatch, fleet, *, home, pushes=None, finish_after=0.0,
 
     class _Coord:
         def __init__(self, *a, **k):
+            self.plan = types.SimpleNamespace(
+                block_size=lambda *a, **k: 1)
+            self.encoded = []
+            self.total_rounds = 1
+            self.planned_pods = 1
             self.tracker = types.SimpleNamespace(
                 round=0, have=lambda rnd=None: [],
                 expect=lambda r, c: None)
@@ -200,6 +205,15 @@ def install(monkeypatch, fleet, *, home, pushes=None, finish_after=0.0,
 
         def reap_the_dead(self):
             return []
+
+        def coverage(self):
+            # The run reports progress as blocks covered now, so a fake that
+            # lacks this breaks every run through the loop.
+            return (0, 1)
+
+        @property
+        def epochs(self):
+            return 1.0
 
         def average_path(self, rnd):
             p = os.path.join(str(home), f"avg{rnd}.safetensors")

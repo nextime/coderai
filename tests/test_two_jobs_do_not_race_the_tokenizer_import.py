@@ -59,8 +59,11 @@ def test_the_lock_is_not_held_for_the_work():
 def test_the_reason_is_recorded_where_the_lock_is_taken():
     """Otherwise the next person removes it as pointless ceremony."""
     src = inspect.getsource(loras._text_train_blocking)
-    i = src.index("UNDER A LOCK")
-    note = src[i:i + 700]
+    # The note travelled with the import when it moved INSIDE the deferred
+    # dataset pass -- it had to move, because sitting before the distributed
+    # dispatch it made the rental wait minutes for torch to load.
+    i = src.index("_TRANSFORMERS_IMPORT_LOCK")
+    note = src[max(0, i - 900):i + 200]
     assert "lazily" in note
     assert "two threads" in note
     assert "cannot import name" in note

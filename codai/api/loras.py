@@ -97,8 +97,18 @@ _JOB_ACTIVE_STATES = ("queued", "preparing", "training", "saving")
 # files). A removed job is deleted outright (remove_job); this just bounds the
 # slow accumulation of finished ones nobody removed by hand.
 _JOB_HISTORY_MAX = 200
+#: Fields copied into the SHARED progress blob as well as the job record, so
+#: a client polling without a job id still sees them. The distributed text
+#: trainer's own numbers are here because `step`/`total` stopped being a
+#: position once a run began ending on dataset coverage rather than on a
+#: round count: a caller needs blocks and a percentage, not a round index
+#: against a planned total it may never reach.
 _MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
-                  "started_at", "path")
+                  "started_at", "path",
+                  "blocks_done", "blocks_total", "percent",
+                  "examples_done", "examples_total",
+                  "exchange", "epochs",
+                  "pods", "pods_target", "pods_ceiling", "hourly_usd")
 _last_job_persist = 0.0
 
 
@@ -3572,16 +3582,6 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
                            f"request raised its pod target to {_now} instead "
                            f"of starting a second run")}
     from codai.api import text_lora_trainer as tlt
-    # UNDER A LOCK. transformers imports its public names lazily, and that
-    # machinery is not safe against two threads taking it at once: each text
-    # job runs in its own thread, so two submitted together raced on the FIRST
-    # import and both died with "cannot import name 'AutoTokenizer' from
-    # 'transformers'" -- in the same second, on a package that imports
-    # perfectly a moment later. Serialising the first import costs one lock
-    # acquisition per job and removes a failure that looked like a broken
-    # install.
-    with _TRANSFORMERS_IMPORT_LOCK:
-        from transformers import AutoTokenizer
 
     _active_job_id = job_id
 
@@ -3638,6 +3638,22 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         dataset themselves -- so running it first made every job wait three
         minutes before asking for a card that then took another six to boot.
         """
+        # THE IMPORT BELONGS HERE, with the work that needs it. It sat before
+        # the distributed dispatch, so the rental waited for it -- and on a
+        # freshly restarted container the first `from transformers import ...`
+        # drags in torch and takes MINUTES. Measured tonight: a request
+        # accepted at 22:15:18 did not reach `eligible_cards` until 22:18:16,
+        # three minutes in which nothing had been asked of RunPod. Exactly the
+        # gap 0.6.71 set out to close, hiding one frame further up.
+        #
+        # Still under the lock: transformers imports its public names lazily
+        # and that machinery is not safe against two threads taking it at
+        # once. Two jobs submitted together both died reporting
+        # "cannot import name 'AutoTokenizer' from 'transformers'",
+        # in the same second, on a package that imports perfectly a moment
+        # later.
+        with _TRANSFORMERS_IMPORT_LOCK:
+            from transformers import AutoTokenizer
         _tok = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
         _enc, _st = _text_dataset_pass(req, dataset_path, _tok)
         _sum = {"examples": _st.examples, "skipped": len(_st.skipped),
@@ -3832,7 +3848,8 @@ class _TextTrainCoordinator:
     def __init__(self, job_id: str, *, plan, tracker, fleet, encoded,
                  out_dir: str, settings, dataset_id: str = "",
                  base: str = "", field_map: Optional[dict] = None,
-                 total_rounds: int = 1):
+                 total_rounds: int = 1, planned_pods: int = 0,
+                 epochs: float = 1.0):
         from codai.api import text_lora_rounds as tlr
         self.job_id = job_id
         self.plan = plan
@@ -3850,8 +3867,24 @@ class _TextTrainCoordinator:
         #: Which pods are in each round, by round number. Decided once per
         #: round, because the index lists handed out are derived from it.
         self._cohorts: Dict[int, list] = {}
-        #: round -> shard -> block number, so a retry is idempotent.
-        self._blocks: Dict[int, Dict[int, int]] = {}
+        #: How many pods the job was PLANNED for, which is what sizes a
+        #: handout: a smaller fleet takes proportionally more blocks each, so
+        #: an exchange covers about `n/rounds` whatever the fleet size.
+        self.planned_pods = max(1, int(planned_pods or plan.n_shards or 1))
+        #: How many times to walk the dataset. The request has carried this
+        #: since the route was written and NOTHING read it: `finished()` was
+        #: `round >= total_rounds`, so a run stopped after a fixed number of
+        #: exchanges whatever it had covered. On a fleet smaller than planned
+        #: that is simply less training -- measured: three pods of a planned
+        #: sixteen would have finished 16 exchanges having seen 1,392 of 7,308
+        #: examples, 19% of the epoch the caller asked for, and reported
+        #: success.
+        self.epochs = max(0.01, float(epochs or 1.0))
+        #: round -> shard -> the blocks it holds, so a retry is idempotent.
+        self._blocks: Dict[int, Dict[int, List[int]]] = {}
+        #: Every block whose adapter has been submitted, across all exchanges.
+        #: This is the progress measure and the terminating condition.
+        self._covered: set = set()
         #: The next unclaimed block, and blocks freed by pods that died.
         self._next_block = 0
         self._recycle: List[int] = []
@@ -3863,8 +3896,30 @@ class _TextTrainCoordinator:
 
     # -- what a pod is told ---------------------------------------------- #
 
+    def total_blocks(self) -> int:
+        per = self.plan.block_size(len(self.encoded), self.total_rounds,
+                                   self.planned_pods)
+        return max(1, -(-len(self.encoded) // max(1, per)))
+
     def finished(self) -> bool:
-        return self.tracker.round >= self.total_rounds
+        """Done when the DATASET has been covered, not after N exchanges.
+
+        `round >= total_rounds` stood here, and `epochs` -- which the request
+        has always carried -- was read by nothing. So a run stopped after a
+        fixed number of averages whatever it had actually trained on, which on
+        a fleet smaller than planned is simply less training: three pods of a
+        planned sixteen would have closed 16 exchanges having seen 1,392 of
+        7,308 examples and reported success.
+        """
+        want = int(self.total_blocks() * self.epochs)
+        with self._lock:
+            return len(self._covered) >= max(1, want)
+
+    def coverage(self) -> tuple:
+        """(blocks trained, blocks wanted) -- what progress actually means."""
+        with self._lock:
+            return len(self._covered), max(
+                1, int(self.total_blocks() * self.epochs))
 
     def round_payload(self, shard: int) -> dict:
         """What to POST to a pod's /round for the open round."""
@@ -3919,8 +3974,8 @@ class _TextTrainCoordinator:
         except ValueError:
             return -1
 
-    def block_for(self, shard: int, rnd: int) -> int:
-        """The block of examples this pod owns in this exchange.
+    def blocks_for(self, shard: int, rnd: int) -> Optional[List[int]]:
+        """The blocks of examples this pod owns in this exchange.
 
         TAKEN FROM A QUEUE, which is what lets a pod that becomes ready
         halfway through an exchange do useful work instead of idling or
@@ -3946,43 +4001,64 @@ class _TextTrainCoordinator:
         with self._lock:
             mine = self._blocks.setdefault(int(rnd), {})
             if int(shard) in mine:
-                return mine[int(shard)]
+                return list(mine[int(shard)])
             issued = self._issued.setdefault(int(rnd), set())
-            per = self.plan.block_size(len(self.encoded), self.total_rounds)
-            total = max(1, -(-len(self.encoded) // max(1, per)))
-            b = None
-            while self._recycle:
-                cand = self._recycle.pop(0)
-                if cand not in issued:
-                    b = cand
-                    break
-            if b is None:
-                # NEVER THE SAME BLOCK TWICE IN ONE EXCHANGE. The counter wraps
-                # by epoch so a long-running fleet keeps finding work, and
-                # without this check a wrap inside one round would hand a
-                # second pod examples a first pod is already training -- the
-                # duplication this whole design replaced, reintroduced through
-                # the back door.
-                for _ in range(total):
-                    cand = self._next_block % total
-                    self._next_block += 1
+            total = self.total_blocks()
+            # HOW MANY AT ONCE. The granularity is fixed -- block boundaries
+            # must never move, or "already covered" stops meaning anything --
+            # but the SHARE is not: a fleet of three where sixteen were
+            # planned takes five blocks each, so an exchange still covers
+            # about `n/rounds` and the 318 MB adapter exchange stays a
+            # rounding error against the training between them. With 29
+            # examples a block, one block per pod would have averaged 84
+            # times over an epoch and moved 80 GB of adapters.
+            # THE STORED COHORT, read directly. `self.cohort()` takes this
+            # same lock and `threading.Lock` is not reentrant, so calling it
+            # from in here deadlocks the whole run -- which it did, on the
+            # first handout, before any pod was touched.
+            live = max(1, len(self._cohorts.get(int(rnd)) or ()) or 1)
+            want_n = max(1, -(-self.planned_pods // live))
+            got: List[int] = []
+            while len(got) < want_n:
+                b = None
+                while self._recycle:
+                    cand = self._recycle.pop(0)
                     if cand not in issued:
                         b = cand
                         break
-            if b is None:
+                if b is None:
+                    # NEVER THE SAME BLOCK TWICE IN ONE EXCHANGE. The
+                    # counter wraps by epoch so a long fleet keeps finding
+                    # work, and without this check a wrap inside one round
+                    # would hand a second pod examples a first pod is already
+                    # training -- the duplication this design replaced,
+                    # through the back door.
+                    for _ in range(total):
+                        cand = self._next_block % total
+                        self._next_block += 1
+                        if cand not in issued:
+                            b = cand
+                            break
+                if b is None:
+                    break               # nothing unclaimed left this exchange
+                issued.add(b)
+                got.append(b)
+            if not got:
                 return None
-            issued.add(b)
-            mine[int(shard)] = b
-            return b
+            mine[int(shard)] = got
+            return list(got)
 
     def _indices_for_now(self, shard: int, rnd: int) -> List[int]:
         """This pod's examples, or [] when the exchange has no block spare."""
-        b = self.block_for(int(shard), int(rnd))
-        if b is None:
+        bs = self.blocks_for(int(shard), int(rnd))
+        if not bs:
             return []
-        return self.plan.block_at(
-            len(self.encoded), b,
-            self.plan.block_size(len(self.encoded), self.total_rounds))
+        per = self.plan.block_size(len(self.encoded), self.total_rounds,
+                                   self.planned_pods)
+        out: List[int] = []
+        for b in bs:
+            out.extend(self.plan.block_at(len(self.encoded), b, per))
+        return out
 
     def block_done(self, shard: int, rnd: int) -> None:
         """The pod submitted its block; it may be given another.
@@ -3992,13 +4068,17 @@ class _TextTrainCoordinator:
         longer held by this pod.
         """
         with self._lock:
-            self._blocks.get(int(rnd), {}).pop(int(shard), None)
+            done = self._blocks.get(int(rnd), {}).pop(int(shard), None) or []
+            # COVERED, which is what ends the run. Marked on submission
+            # rather than on handout: a block handed to a pod that dies was
+            # never trained, and counting it would cut the run short.
+            for b in done:
+                self._covered.add(int(b))
 
     def blocks_left(self, rnd: Optional[int] = None) -> int:
         """Unissued blocks in this exchange -- 0 means everyone has work."""
         r = self.tracker.round if rnd is None else int(rnd)
-        per = self.plan.block_size(len(self.encoded), self.total_rounds)
-        total = max(1, -(-len(self.encoded) // max(1, per)))
+        total = self.total_blocks()
         with self._lock:
             return max(0, total - len(self._issued.get(int(r), set())))
 
@@ -4015,8 +4095,8 @@ class _TextTrainCoordinator:
         with self._lock:
             mine = self._blocks.get(int(r), {})
             for sh in shards:
-                b = mine.pop(int(sh), None)
-                if b is not None:
+                bs = mine.pop(int(sh), None) or []
+                for b in bs:
                     back.append(int(b))
             if back:
                 self._recycle = sorted(back) + self._recycle
@@ -4036,8 +4116,15 @@ class _TextTrainCoordinator:
         if self.finished():
             # The pod's exit signal. Without it a pod polls forever on a job
             # that is over, which is a pod billing for nothing.
+            # `indices` IS PRESENT, empty. `round_payload` reads it by
+            # subscript, so a run that finished between the loop's
+            # `while not finished()` and this call raised KeyError inside the
+            # money path -- a race that got likelier once the terminating
+            # condition became coverage, which a submission can satisfy at
+            # any moment rather than only at a round boundary.
             return {"job": self.job_id, "shard": int(shard), "round": rnd,
-                    "finished": True, "rounds": self.total_rounds}
+                    "finished": True, "rounds": self.total_rounds,
+                    "indices": [], "settings": {}}
         return {
             "job": self.job_id, "shard": int(shard), "round": rnd,
             "finished": False, "rounds": self.total_rounds,
@@ -4541,7 +4628,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             # AWQ checkpoint, or a pod-served model with no local path).
             dataset_id=req.dataset_id or "",
             base=_resolve_text_base(cfg.base_model or req.base_model),
-            field_map=req.field_map, total_rounds=rounds)
+            field_map=req.field_map, total_rounds=rounds,
+            # What the job was PLANNED for, which sizes a handout -- not what
+            # it happens to have running.
+            planned_pods=n_shards,
+            # Carried on the request since the route was written and read by
+            # nothing until now.
+            epochs=float(getattr(req, "epochs", None) or 1.0))
         with _coord_lock:
             _train_coordinators[job_id] = coord
         floor = max(0, int(req.min_pods or 0))
@@ -4698,7 +4791,12 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 print(f"[text-lora] {job_id}: round {rnd} runs on "
                       f"{len(_members)} pod(s)"
                       + (f" (was {_was})" if _was else ""), flush=True)
-                _update_job(job_id,
+                _dn, _wt = coord.coverage()
+                _update_job(job_id, exchange=rnd, blocks_done=_dn,
+                            blocks_total=_wt,
+                            percent=round(100.0 * _dn / max(1, _wt), 1),
+                            pods=len(_members), pods_target=_target,
+                            pods_ceiling=_ceiling,
                             message=f"round {rnd}: {len(_members)} pod(s)")
             # Start the round on every pod that is idle and has not submitted.
             for shard in sorted(fleet.pods):
@@ -4724,7 +4822,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     # twice and lost the other's work entirely.
                     dest = os.path.join(
                         out_dir, f"r{rnd}-s{shard}-"
-                        f"b{coord.block_for(shard, rnd)}.safetensors")
+                        f"b{(coord.blocks_for(shard, rnd) or [0])[0]}"
+                        f".safetensors")
                     flt.fetch_adapter(pod, dest)
                     from codai.api import text_lora_rounds as _tlr
                     coord.submit(_tlr.Submission(
@@ -4795,9 +4894,35 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             if closed is not None:
                 stages.done(f"round {closed}",
                             shards=len(coord.tracker.have(closed)))
-                _update_job(job_id, step=closed + 1,
-                            message=f"round {closed} averaged; "
-                                    f"{len(fleet.pods)} pod(s) running")
+                _done_b, _want_b = coord.coverage()
+                _pct = (100.0 * _done_b / max(1, _want_b))
+                _per = coord.plan.block_size(
+                    len(coord.encoded), coord.total_rounds,
+                    coord.planned_pods)
+                # STRUCTURED, not just a sentence. A client polling
+                # /v1/loras/progress had `step`/`total` -- which were the
+                # ROUND number against the planned round count, and now that
+                # a run ends on coverage rather than on a round count those
+                # two numbers no longer say how far along it is. These do,
+                # and a client should not have to parse the message to get
+                # them.
+                _update_job(
+                    job_id, step=_done_b, total=_want_b,
+                    blocks_done=_done_b, blocks_total=_want_b,
+                    percent=round(_pct, 1),
+                    examples_done=_done_b * _per,
+                    examples_total=_want_b * _per,
+                    exchange=closed + 1, epochs=coord.epochs,
+                    pods=len(fleet.pods), pods_target=_target,
+                    pods_ceiling=_ceiling,
+                    hourly_usd=round(sum(p.hourly_usd or 0.0
+                                         for p in fleet.pods.values()), 4),
+                    message=(f"round {closed} averaged; "
+                             f"{_done_b}/{_want_b} blocks "
+                             f"({_pct:.0f}%) on {len(fleet.pods)} pod(s)"))
+                print(f"[text-lora] {job_id}: {_done_b}/{_want_b} blocks "
+                      f"trained ({_pct:.0f}% of {coord.epochs:g} epoch(s))",
+                      flush=True)
                 continue
             gone = coord.reap_the_dead()
             if gone:
@@ -4820,20 +4945,32 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     _update_job(job_id, message=(
                         f"fleet lost at round {_done}/{rounds}; kept the "
                         f"adapter from round {_done - 1}"))
-                    rounds = _done        # what was actually completed
                     break
                 raise RuntimeError(
                     f"every pod is gone at round {_done} of {rounds} and no "
                     f"round had been averaged — nothing to keep")
             time.sleep(poll)
 
-        final = coord.average_path(rounds - 1)
-        if not final or not os.path.isfile(final):
-            raise RuntimeError(f"the last round produced no average in {out_dir}")
+        # THE LAST AVERAGE ACTUALLY WRITTEN, not `rounds - 1`. The run ends on
+        # coverage now, which on a fleet smaller than planned takes MORE
+        # exchanges than `rounds` and on a larger one fewer -- so indexing by
+        # the planned count would look for a file that was never written (and
+        # raise "the last round produced no average") or, worse, pick up an
+        # older one and ship it as the result.
+        final = ""
+        for _r in range(coord.tracker.round, -1, -1):
+            _p = coord.average_path(_r)
+            if _p and os.path.isfile(_p):
+                final = _p
+                break
+        if not final:
+            raise RuntimeError(f"no round produced an average in {out_dir}")
         import shutil
         adapter = os.path.join(out_dir, "adapter_model.safetensors")
         shutil.copyfile(final, adapter)
-        print(f"[text-lora] {job_id}: finished {rounds} round(s); "
+        _cov, _cwant = coord.coverage()
+        print(f"[text-lora] {job_id}: finished {coord.tracker.round} "
+              f"exchange(s), {_cov}/{_cwant} blocks trained; "
               f"adapter at {adapter}", flush=True)
         stages.done("adapter", path=adapter)
         return {"rounds": rounds, "shards": n_shards,

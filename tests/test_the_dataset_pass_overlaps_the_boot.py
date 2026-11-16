@@ -193,3 +193,38 @@ def _stats():
     return types.SimpleNamespace(examples=8, skipped=[], trained_tokens=1,
                                  masked_tokens=0,
                                  describe=lambda: "8 examples")
+
+
+def test_the_transformers_import_does_not_delay_the_rental():
+    """It sat before the dispatch, so the rental waited MINUTES for it.
+
+    On a freshly restarted container the first `from transformers import ...`
+    drags in torch. Measured on the live install: a request accepted at
+    22:15:18 did not reach `eligible_cards` until 22:18:16 -- three minutes in
+    which nothing had been asked of RunPod, which is exactly the gap 0.6.71
+    set out to close, hiding one frame further up.
+
+    It belongs with the work that needs it, which runs in the thread that
+    overlaps the boot.
+    """
+    import inspect
+    src = inspect.getsource(loras._text_train_blocking)
+    i = src.index("def _prepare()")
+    j = src.index("if req.dry_run:", i)
+    inside = src[i:j]
+    # the import is INSIDE the deferred pass...
+    assert "from transformers import AutoTokenizer" in inside
+    assert "_TRANSFORMERS_IMPORT_LOCK" in inside
+    # ...and nowhere before the dispatch, where it would block the rental.
+    before = src[:i]
+    assert "from transformers import AutoTokenizer" not in before
+
+
+def test_the_import_is_still_serialised():
+    """Two jobs submitted together raced on the first lazy import and both
+    died with "cannot import name 'AutoTokenizer'" on a package that imports
+    perfectly a moment later. Moving it must not drop the lock."""
+    import inspect
+    src = inspect.getsource(loras._text_train_blocking)
+    i = src.index("from transformers import AutoTokenizer")
+    assert "_TRANSFORMERS_IMPORT_LOCK" in src[max(0, i - 400):i]

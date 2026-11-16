@@ -121,7 +121,7 @@ def test_a_retry_does_not_consume_another_block():
         dataset_id="", base="b", field_map=None, total_rounds=4)
     c.cohort(0, [3], grow=True)
     assert c.assignment(3)["indices"] == c.assignment(3)["indices"]
-    assert c.block_for(3, 0) == c.block_for(3, 0)
+    assert c.blocks_for(3, 0) == c.blocks_for(3, 0)
 
 
 def test_a_dead_pods_block_goes_back_on_the_queue():

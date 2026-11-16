@@ -111,10 +111,21 @@ def test_the_record_says_which_round_it_kept():
     assert "kept the " in block and "round " in block
 
 
-def test_rounds_is_corrected_to_what_completed():
-    """Otherwise the adapter is read as the 16th round's when it is the 9th."""
-    i = DIST.index("if not fleet.pods:")
-    assert "rounds = _done" in DIST[i:i + 1400]
+def test_the_final_adapter_is_the_last_average_actually_written():
+    """REPLACED. `rounds = _done` corrected a count that no longer decides.
+
+    The run used to read its result from `average_path(rounds - 1)`, so a
+    fleet lost at round 9 of 16 had to rewrite `rounds` or the lookup would
+    miss. Now that a run ends on dataset COVERAGE, the number of exchanges is
+    emergent -- more than `rounds` on a small fleet, fewer on a large one --
+    so indexing by any planned count is wrong in both directions. It searches
+    back from the last round for the newest average that exists.
+    """
+    i = DIST.index("final = \"\"")
+    block = DIST[i:i + 700]
+    assert "for _r in range(coord.tracker.round, -1, -1)" in block
+    assert "os.path.isfile(_p)" in block
+    assert "no round produced an average" in block
 
 
 def test_a_fleet_lost_before_any_round_still_fails():

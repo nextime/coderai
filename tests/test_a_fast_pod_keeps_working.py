@@ -48,13 +48,14 @@ from codai.api import text_lora_rounds as tlr
 from codai.api import text_lora_trainer as tlt
 
 
-def _coord(n=400, n_shards=4, rounds=4):
+def _coord(n=400, n_shards=4, rounds=4, epochs=1.0):
     plan = tlr.RoundPlan(n_shards=n_shards, seed=42)
     t = tlr.RoundTracker(plan, min_fraction=0.75, deadline_s=0)
     c = loras._TextTrainCoordinator(
         "j", plan=plan, tracker=t, fleet=types.SimpleNamespace(pods={}),
         encoded=[0] * n, out_dir="/tmp", settings=tlt.QLoraSettings(),
-        dataset_id="", base="b", field_map=None, total_rounds=rounds)
+        dataset_id="", base="b", field_map=None, total_rounds=rounds,
+        planned_pods=n_shards, epochs=epochs)
     return c, t
 
 
@@ -82,7 +83,7 @@ def test_a_held_block_is_handed_back_unchanged_on_a_retry():
     c.cohort(0, [1], grow=True)
     first = c.assignment(1)["indices"]
     assert c.assignment(1)["indices"] == first
-    assert c.block_for(1, 0) == c.block_for(1, 0)
+    assert c.blocks_for(1, 0) == c.blocks_for(1, 0)
 
 
 def test_one_fast_pod_cannot_close_a_round_on_its_own():
@@ -112,16 +113,38 @@ def test_every_contribution_is_averaged_with_its_own_weight():
 
 
 def test_an_exhausted_exchange_hands_out_nothing():
-    """Better an idle pod than the same examples twice in one average."""
-    c, t = _coord(n=100, n_shards=4, rounds=4)
+    """Better an idle pod than the same examples twice in one average.
+
+    `epochs=2`, deliberately: with one epoch, consuming every block in an
+    exchange also COMPLETES the run, and then the empty handout proves the
+    run ended rather than that the exchange was full. Two epochs separates
+    the two conditions.
+    """
+    c, t = _coord(n=100, n_shards=4, rounds=4, epochs=2.0)
     c.cohort(0, [0], grow=True)
     n = 0
     while c.blocks_left(0):
         _finish(c, t, 0)
         n += 1
     assert n > 0
+    assert c.finished() is False, "the run ended; this tests the exchange"
     assert c.assignment(0)["indices"] == []
     assert c.blocks_left(0) == 0
+
+
+def test_a_finished_run_still_answers_with_an_empty_slice():
+    """`round_payload` reads `indices` by subscript, so a run that finished
+    between the loop's check and this call used to raise KeyError in the
+    money path -- likelier now that coverage can complete at any moment
+    rather than only at a round boundary."""
+    c, t = _coord(n=58, n_shards=1, rounds=1)
+    c.cohort(0, [0], grow=True)
+    while not c.finished():
+        _finish(c, t, 0)
+    a = c.assignment(0)
+    assert a["finished"] is True
+    assert a["indices"] == []
+    assert c.round_payload(0)["indices"] == []
 
 
 def test_a_recycled_block_can_be_issued_again_in_the_same_exchange():
@@ -138,7 +161,7 @@ def test_the_submission_file_is_named_per_block():
     import inspect
     src = inspect.getsource(loras._text_train_distributed)
     assert 'f"r{rnd}-s{shard}-"' in src
-    assert "b{coord.block_for(shard, rnd)}.safetensors" in src
+    assert "b{(coord.blocks_for(shard, rnd) or [0])[0]}" in src
 
 
 def test_the_loop_no_longer_skips_a_pod_that_submitted():

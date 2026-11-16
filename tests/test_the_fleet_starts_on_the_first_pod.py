@@ -145,6 +145,11 @@ def _install(monkeypatch, fleet, *, pushes, stop_after=0.0, home=None):
         """Finishes on a wall clock, so the test bounds its own runtime."""
 
         def __init__(self, *a, **k):
+            self.plan = types.SimpleNamespace(
+                block_size=lambda *a, **k: 1)
+            self.encoded = []
+            self.total_rounds = 1
+            self.planned_pods = 1
             self.tracker = types.SimpleNamespace(
                 round=0, have=lambda rnd=None: [], expect=lambda r, c: None)
             self.born = time.time()
@@ -163,6 +168,15 @@ def _install(monkeypatch, fleet, *, pushes, stop_after=0.0, home=None):
 
         def reap_the_dead(self):
             return []
+
+        def coverage(self):
+            # The run reports progress as blocks covered now, so a fake that
+            # lacks this breaks every run through the loop.
+            return (0, 1)
+
+        @property
+        def epochs(self):
+            return 1.0
 
         def average_path(self, rnd):
             # A real file: the run copies the last round's average into the
