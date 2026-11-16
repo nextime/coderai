@@ -79,6 +79,11 @@ class TrainerPodSpec:
     #: rate, which is how a price ceiling gets quietly exceeded. Empty means
     #: ``cloud_type`` for every candidate, which is the old behaviour.
     gpu_clouds: List[str] = dataclasses.field(default_factory=list)
+    #: Each candidate's hourly price, same order. ``hourly_usd`` below is one
+    #: ESTIMATE for the whole list, which is what made a pod report $0.33/hr
+    #: while RunPod charged $0.59: the page, the ledger and the fleet ceiling
+    #: were all reasoning about a number no card actually cost.
+    gpu_prices: List[float] = dataclasses.field(default_factory=list)
     start_cmd: Optional[List[str]] = None
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -116,6 +121,10 @@ class TrainerPod:
     #: Empty until the runtime publishes the mapping.
     url: str = ""
     secret: str = ""
+    #: The card this pod actually got, for the page and the record. A fleet
+    #: tries candidates in order, so which one it landed on is not knowable
+    #: from the spec afterwards.
+    gpu: str = ""
 
     def silent_for(self, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now
@@ -331,11 +340,16 @@ class TrainerFleet:
         last_error = ""
         _cands = list(self.spec.gpu_types or [""])
         _clouds = list(self.spec.gpu_clouds or [])
+        _prices = list(self.spec.gpu_prices or [])
+        won_gpu, won_price = "", float(self.spec.hourly_usd or 0.0)
         for _i, gpu in enumerate(_cands):
             cloud = (_clouds[_i] if _i < len(_clouds) else "") \
                 or self.spec.cloud_type
             try:
                 pod_id = self._create(shard, gpu, env, cloud)
+                won_gpu = str(gpu)
+                if _i < len(_prices) and float(_prices[_i]) > 0:
+                    won_price = float(_prices[_i])
                 break
             except Exception as exc:
                 last_error = f"{gpu} [{cloud.lower()}]: {exc}"
@@ -351,6 +365,10 @@ class TrainerFleet:
         with self._lock:
             placeholder.pod_id = str(pod_id)
             placeholder.secret = secret
+            # The CARD's price, not the list's estimate: the page, the ledger
+            # and the fleet ceiling are only as honest as this number.
+            placeholder.hourly_usd = won_price
+            placeholder.gpu = won_gpu
             pod = placeholder
         self._flush()
         # INTO THE DEPLOYMENT REGISTRY, not only this fleet's own record file.
@@ -367,8 +385,8 @@ class TrainerFleet:
         # stops heartbeating, the same entry stops vouching after the reap
         # grace and the pod is collected like any other leftover.
         self._register(pod)
-        self._say(f"shard {shard}: pod {pod_id} rented "
-                  f"(~${self.spec.hourly_usd:.2f}/hr)")
+        self._say(f"shard {shard}: pod {pod_id} rented — {won_gpu or '?'} "
+                  f"at ${won_price:.2f}/hr")
         return pod
 
     def _register(self, pod: "TrainerPod") -> None:
@@ -382,7 +400,8 @@ class TrainerFleet:
                 pool_key=f"{_fleet_pool_prefix()}{self.job_id}",
                 url=str(pod.url or ""),
                 api_key=str(pod.secret or ""),
-                hourly_usd=float(self.spec.hourly_usd or 0.0),
+                hourly_usd=float(pod.hourly_usd or self.spec.hourly_usd or 0.0),
+                gpu=str(pod.gpu or ""),
                 image=str(self.spec.image or ""))
         except Exception as exc:
             # Never fail a rental over bookkeeping -- but say so, because the
@@ -438,6 +457,10 @@ class TrainerFleet:
             pod.url = str(url or "")
         self._flush()
         if pod.url:
+            # Re-registered WITH the address. A pool's pod becomes reachable in
+            # the registry the same way, which is how one row renderer serves
+            # both without knowing what a trainer is.
+            self._register(pod)
             self._say(f"shard {shard}: pod {pod.pod_id} reachable")
         return pod.url
 

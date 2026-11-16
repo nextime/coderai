@@ -3832,6 +3832,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         image=cfg.image, gpu_types=[c["id"] for c in cards], env=_pod_env,
         # Same order as gpu_types: each offer keeps the cloud it was priced in.
         gpu_clouds=[str(c.get("cloud_type") or cloud) for c in cards],
+        # Each offer's real price, so a rented pod reports what it costs.
+        gpu_prices=[float(c.get("hourly_usd") or 0.0) for c in cards],
         cloud_type=cloud, hourly_usd=price,
         max_pod_hourly_usd=ceiling,
         container_disk_gb=int(cfg.container_disk_gb or 120),

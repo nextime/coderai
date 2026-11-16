@@ -8367,26 +8367,42 @@ def pods_status() -> list:
             continue                           # already listed above
         mine = _is_this_process(info)
         fresh = (now - float(info.get("at") or 0)) < REAP_GRACE_SECONDS
-        if not mine and fresh:
+        pool_key = str(info.get("pool") or "")
+        fleet_job = pool_key.split(":", 1)[1] if pool_key.startswith(
+            FLEET_POOL_PREFIX) else ""
+        # A sibling's POOL pod is skipped because that sibling's pool reports
+        # it in the pools section above. A FLEET pod is reported by nothing:
+        # it joins no pool, and registering it (so it would stop being called
+        # unmanaged) also took it out of the account-only rows. The result was
+        # a live training pod that appeared NOWHERE on the page -- strictly
+        # worse than the mislabelling it replaced, because a pod you cannot
+        # see is one you cannot stop.
+        if not mine and fresh and not fleet_job:
             continue                           # a live sibling is managing it
         born = float(info.get("created") or 0) or now
         rate = float(info.get("hourly_usd") or 0.0)
-        pool_key = str(info.get("pool") or "")
         # A FLEET pod is owned by a JOB, not by a pool, so "held by no pool
         # here" is true of it and tells the reader the opposite of the truth.
         # Three healthy pods of three live training jobs were shown as
         # abandoned, and acting on that label would have destroyed the run.
         # While this process owns the entry, the job owns the pod.
-        fleet_job = pool_key.split(":", 1)[1] if pool_key.startswith(
-            FLEET_POOL_PREFIX) else ""
-        if fleet_job and mine:
-            state = "training"
-            note = (f"owned by {fleet_job} — "
-                    + ("booting (no address yet)" if not info.get("url")
-                       else "training")
-                    + "; it belongs to a job, not a pool")
+        if fleet_job and (mine or fresh):
+            # DERIVED FROM THE SAME FIELD A POOL USES: an address in the
+            # registry means the pod answered, so it reads "ready"; no address
+            # means it is still coming up, so it reads "booting". It used to
+            # report state "training" with healthy=False for both, which the
+            # page drew as DOWN -- an alarm for a pod doing exactly what it
+            # should. The trainer now reports what a pool reports, and one row
+            # renderer serves both.
+            has_url = bool(info.get("url"))
+            state = "ready" if has_url else "booting"
+            healthy = has_url
+            note = (f"training job {fleet_job}"
+                    + ("" if mine else " (another engine process)")
+                    + ("" if has_url else " — waiting for its address"))
         else:
             state = "unowned"
+            healthy = False
             note = ("in the registry but held by no pool here — "
                     + ("still booting (no address yet)"
                        if not info.get("url") else "it answers but nothing "
@@ -8396,12 +8412,21 @@ def pods_status() -> list:
                 # Not ours and past the grace: the job that rented it is gone.
                 note = (f"rented by {fleet_job}, whose process is gone — "
                         f"nothing will release it, and it is still billing")
+        # The console link too: a row about a pod that is costing money has to
+        # be actionable, and "" meant the one place you could go look was the
+        # only thing the row did not give you.
+        try:
+            from codai.api.runpod_client import pod_console_url
+            console = pod_console_url(str(pod_id))
+        except Exception:
+            console = ""
         out.append({
             "model": pool_key, "pod_id": str(pod_id),
-            "gpu": str(info.get("gpu") or ""), "healthy": False, "inflight": 0,
+            "gpu": str(info.get("gpu") or ""), "healthy": healthy,
+            "inflight": 0,
             "hourly_usd": rate, "uptime_s": int(now - born),
             "live_cost_usd": round((now - born) / 3600.0 * rate, 4),
-            "console_url": "", "state": state, "note": note,
+            "console_url": console, "state": state, "note": note,
         })
     for row in parked_pods():
         born = row.get("created") or now

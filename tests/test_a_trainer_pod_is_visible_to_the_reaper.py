@@ -144,18 +144,24 @@ def test_the_prefix_is_defined_once():
     assert _fleet_pool_prefix() == rw.FLEET_POOL_PREFIX
 
 
-def test_a_live_fleet_pod_is_labelled_training():
+def test_a_live_fleet_pod_reads_like_a_pool_pod():
+    """The point of the consolidation: state and health come from the SAME
+    field a pool uses -- an address in the registry -- so "booting" and
+    "ready" mean the same thing for a trainer as for chandra. It previously
+    reported state "training" with healthy=False in both cases, which the page
+    drew as DOWN for a pod doing exactly what it should."""
     src = inspect.getsource(rw.pods_status)
-    i = src.index("fleet_job and mine")
-    block = src[i:i + 500]
-    assert 'state = "training"' in block
-    assert "belongs to a job, not a pool" in block
+    i = src.index("fleet_job and (mine or fresh)")
+    block = src[i:i + 900]
+    assert 'state = "ready" if has_url else "booting"' in block
+    assert "healthy = has_url" in block
+    assert "one row\n            # renderer serves both" in block
 
 
 def test_a_live_fleet_pod_is_not_called_still_billing():
     """That phrase is what made three working pods look like a leak."""
     src = inspect.getsource(rw.pods_status)
-    i = src.index("fleet_job and mine")
+    i = src.index("fleet_job and (mine or fresh)")
     assert "still billing" not in src[i:i + 500]
 
 
@@ -172,3 +178,71 @@ def test_a_non_fleet_registry_pod_keeps_the_old_wording():
     way."""
     src = inspect.getsource(rw.pods_status)
     assert "in the registry but held by no pool here" in src
+
+
+# ------------------------- and it has to be VISIBLE, not merely correct -----
+#
+# Registering fixed the label and broke the visibility. A sibling's POOL pod is
+# skipped in the registry rows because that sibling's pool reports it above; a
+# FLEET pod is reported by nothing -- it joins no pool, and being registered
+# took it out of the account-only rows too. Two live training pods appeared
+# NOWHERE on the RunPod page, which is worse than the wrong label it replaced:
+# a pod you cannot see is one you cannot stop.
+
+def test_a_fleet_pod_is_not_skipped_as_a_siblings_business():
+    src = inspect.getsource(rw.pods_status)
+    assert "if not mine and fresh and not fleet_job:" in src
+
+
+def test_the_skip_explains_why_a_fleet_pod_is_different():
+    src = inspect.getsource(rw.pods_status)
+    i = src.index("a live sibling is managing it")
+    block = src[max(0, i - 1400):i]
+    assert "reported by nothing" in block
+    assert "NOWHERE on the page" in block
+
+
+def test_a_live_fleet_pod_in_another_process_is_still_training():
+    """`mine` is false for a pod rented in an engine while the page is served
+    by the front -- which is the normal arrangement, not an edge case."""
+    src = inspect.getsource(rw.pods_status)
+    assert "if fleet_job and (mine or fresh):" in src
+
+
+def test_the_note_says_when_another_process_owns_it():
+    src = inspect.getsource(rw.pods_status)
+    assert "(another engine process)" in src
+
+
+def test_the_row_carries_a_console_link():
+    """A row about a pod costing money must be actionable; this one passed ""
+    for the one place you could go and look."""
+    src = inspect.getsource(rw.pods_status)
+    assert "pod_console_url(str(pod_id))" in src
+    assert '"console_url": console' in src
+
+
+def test_the_price_is_the_cards_not_the_lists_estimate():
+    """A pod reported $0.33/hr while RunPod charged $0.59, because the spec
+    carried one estimate for the whole candidate list."""
+    import dataclasses
+    from codai.api import text_lora_fleet as f
+    assert any(x.name == "gpu_prices" for x in dataclasses.fields(f.TrainerPodSpec))
+    src = inspect.getsource(f.TrainerFleet._rent_one)
+    assert "placeholder.hourly_usd = won_price" in src
+
+
+def test_the_address_is_reported_when_it_appears():
+    """Without this the registry never learns the pod answered, and the row
+    stays "booting" for the whole run."""
+    from codai.api import text_lora_fleet as f
+    src = inspect.getsource(f.TrainerFleet.address)
+    assert "self._register(pod)" in src
+
+
+def test_a_stale_fleet_entry_is_still_reported_as_a_leak():
+    """The whole point of registering: once the owner stops heartbeating the
+    pod must read as abandoned, naming the job that died."""
+    src = inspect.getsource(rw.pods_status)
+    i = src.index("Not ours and past the grace")
+    assert "whose process is gone" in src[i:i + 400]
