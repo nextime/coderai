@@ -163,11 +163,19 @@ def test_top_up_respects_the_operator_cap(monkeypatch):
     assert len(f.pods) <= 3
 
 
-def test_growth_happens_at_a_round_boundary_only():
-    """The open round's cohort is already fixed, so a pod arriving now joins
-    the next one -- growing mid-round would invalidate handed-out slices."""
-    assert "fleet.top_up(_ceiling" in DIST
-    assert "_topped_up[0] = rnd" in DIST
+def test_growth_is_attempted_whenever_the_fleet_is_short():
+    """It used to be attempted once per ROUND, and a round is tens of minutes.
+
+    The cohort for the OPEN round is still fixed -- a pod that arrives now
+    joins the next one, so handed-out slices stay valid -- but the RENTING no
+    longer waits for a boundary. Capacity comes back in minutes, and a run
+    that started on 3 of 8 used to stay on 3 until the round closed. The
+    round number now only resets the backoff.
+    """
+    assert "fleet.top_up(_target, cap=_ceiling)" in DIST
+    assert "if len(fleet.pods) < _target and time.time() >= _topup_at[0]:" in DIST
+    i = DIST.index("if rnd != _topped_up[0]:")
+    assert "_topup_at[0] = 0.0" in DIST[i:i + 700]
 
 
 def test_growth_is_bounded_by_the_configured_ceiling():
@@ -176,8 +184,8 @@ def test_growth_is_bounded_by_the_configured_ceiling():
 
 
 def test_a_failed_growth_does_not_end_the_run():
-    i = DIST.index("fleet.top_up(_ceiling")
-    block = DIST[max(0, i - 400):i + 900]
+    i = DIST.index("fleet.top_up(_target")
+    block = DIST[max(0, i - 400):i + 1600]
     assert "could not grow the fleet" in block
     assert "continuing with" in block
 
@@ -214,9 +222,11 @@ def _raise_lines(src):
 
 def test_it_says_what_it_is_doing_and_why():
     i = DIST.index("floor and len(ready) < floor")
-    block = DIST[i:i + 1800]
+    block = DIST[i:i + 2600]
     assert "starting on " in block and "although" in block
-    assert "grows toward" in block
+    # It names the aim rather than "grows toward the ceiling", which is no
+    # longer what happens: the fleet is held at what the job asked for.
+    assert "the fleet is held at" in block
 
 
 def test_the_job_record_says_it_is_short_and_growing():
@@ -278,12 +288,20 @@ def test_the_job_starts_at_the_start_size():
     assert "int(cfg.pods_start or 0) or _ceiling" in DIST
 
 
-def test_growth_targets_the_ceiling_not_the_start_size():
-    """"Maintain the pool at max 16": the top-up reaches for the ceiling, not
-    for the eight it began with."""
-    assert "fleet.top_up(_ceiling, cap=_ceiling)" in DIST
+def test_growth_targets_WHAT_THE_JOB_ASKED_FOR():
+    """CORRECTED. It used to reach for the operator's ceiling.
+
+    "Maintain the pool at max 16" was read as "always try to be 16", so a job
+    that asked for eight against a ceiling of sixteen crept toward sixteen it
+    had never asked for. The ceiling bounds the aim; it is not the aim. What
+    the fleet is held at is `pods` -- and the ceiling is the headroom a
+    joining request's lease may raise that aim into.
+    """
+    assert "fleet.top_up(_target, cap=_ceiling)" in DIST
+    assert "_target = n_shards" in DIST
 
 
 def test_it_says_both_numbers_when_they_differ():
     i = DIST.index("int(cfg.pods_start or 0) or _ceiling")
-    assert "maintained at up to" in DIST[i:i + 500]
+    assert "aiming for" in DIST[i:i + 1400]
+    assert "ceiling" in DIST[i:i + 1400]

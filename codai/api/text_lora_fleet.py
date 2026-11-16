@@ -794,6 +794,11 @@ class LoraTrainConfig:
     #: reach 16 however much capacity appeared -- the request's own starting
     #: number silently became its limit. 0 = start at the ceiling.
     pods_start: int = 0
+    #: The fewest pods a job will tolerate, from a request's `min_pods`. It is
+    #: NOT a target and NOT a gate -- a run that can only get one pod runs on
+    #: one, because every round trains the whole dataset whatever the cohort
+    #: size. Recorded so the run can say how far below the aim it started.
+    min_pods: int = 0
     rounds: int = 1
     container_disk_gb: int = 120
     network_volume_id: str = ""
@@ -920,6 +925,7 @@ def config_for_model(model_key: str) -> LoraTrainConfig:
 
 
 def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
+           min_pods: Optional[int] = None,
            max_pods: Optional[int] = None,
            rounds: Optional[int] = None,
            max_pod_hourly_usd: Optional[float] = None,
@@ -931,6 +937,10 @@ def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
     request may only narrow a model's pool. Asking for more is not worth
     failing a job over -- it is a client that does not know the limit -- so it
     is clamped and said out loud. What matters is that it cannot take effect.
+
+    ``min_pods`` is the floor the job TOLERATES, not a size it asks for: a
+    request for `pods: 8, min_pods: 1` wants eight and accepts one. It is
+    recorded and gates nothing. What the fleet is held at is ``pods``.
     """
     out = dataclasses.replace(cfg)
     ceiling = int(cfg.max_pods or 1)
@@ -950,6 +960,21 @@ def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
             print(f"[text-lora] request asked to start on {want} pods; the "
                   f"ceiling is {ceiling} — starting on {out.pods_start}",
                   flush=True)
+    if min_pods is not None and int(min_pods) > 0:
+        # RECORDED, and the aim ONLY WHEN `pods` names no number. `min_pods`
+        # is how few this job will put up with, not how many it wants: a
+        # client sending `pods: 8, min_pods: 1` is saying "eight please, and
+        # one is better than nothing", so it must not drag the aim down to
+        # one. But a request that asks for `min_pods: 4` and nothing else has
+        # said the only number it is going to say, and treating that as "no
+        # preference, use the operator's ceiling" ignores it.
+        out.min_pods = min(int(min_pods), ceiling)
+        if not (pods is not None and int(pods or 0) > 0):
+            # It is then the only number this request named, and it stands in
+            # for `pods` exactly as `pods` would -- including raising the
+            # block's own starting size, which a request may do up to the
+            # ceiling.
+            out.pods_start = out.min_pods
     if rounds is not None and int(rounds) > 0:
         out.rounds = int(rounds)        # rounds change duration, not the fleet
     for name, want in (("max_pod_hourly_usd", max_pod_hourly_usd),

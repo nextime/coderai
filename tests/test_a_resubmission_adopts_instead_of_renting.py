@@ -230,7 +230,11 @@ def _bring_up_body():
     """
     src = DIST
     i = src.index("def _bring_up")
-    j = src.index("if len(_shards) == 1", i)
+    # The first statement AFTER the function. It was `if len(_shards) == 1`,
+    # which went away when the fleet-wide boot barrier did: the boots are now
+    # submitted to a pool that is never joined, so there is no single-pod
+    # special case to bound on.
+    j = src.index("import concurrent.futures as _cf", i)
     return src[i:j]
 
 

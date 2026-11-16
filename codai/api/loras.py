@@ -3481,6 +3481,15 @@ def _forget_train_lease(job_id: str) -> None:
 #: wait_ready polls every 5s whatever this is.
 _SLICE_S = 20.0
 
+#: How often a short fleet may try to top up, and the cap the backoff reaches.
+#: Not once per round: a round is tens of minutes and RunPod capacity returns
+#: in minutes, so a job that started on 3 of 8 used to stay on 3 for the whole
+#: round even after the cards came back. Not every poll either -- one attempt
+#: walks every candidate card for every missing shard, measured at 110 GraphQL
+#: calls for a 13-shard shortfall against a 1,500/hour account budget.
+_TOPUP_MIN_S = 180.0
+_TOPUP_MAX_S = 900.0
+
 #: Serialises the FIRST `from transformers import ...` across job threads.
 #: Held only for the import, never for the work.
 _TRANSFORMERS_IMPORT_LOCK = threading.Lock()
@@ -3549,7 +3558,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # Refusing it, which is what I did first, stopped the duplicate fleets
         # and also threw away the only signal the caller had.
         _blk = _flt.config_for_model(req.base_model)
-        _want = int(_flt.narrow(_blk, pods=req.pods,
+        _want = int(_flt.narrow(_blk, pods=req.pods, min_pods=req.min_pods,
                                 max_pods=req.max_pods).max_pods or 0)
         _now = note_train_lease(_already, _want)
         print(f"[text-lora] {job_id}: {req.name!r} is already being trained "
@@ -3578,7 +3587,8 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
 
     _train_cfg = _flt.narrow(
         _flt.config_for_model(req.base_model),
-        pods=req.pods, max_pods=req.max_pods, rounds=req.rounds,
+        pods=req.pods, min_pods=req.min_pods, max_pods=req.max_pods,
+        rounds=req.rounds,
         max_pod_hourly_usd=req.max_pod_hourly_usd,
         max_fleet_hourly_usd=req.max_fleet_hourly_usd)
     # Anything that ASKS for pods must refuse when the model has no block --
@@ -3988,9 +3998,23 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     # number, so a request for "8 now, up to 16" could never exceed 8.
     _ceiling = max(1, int(cfg.max_pods or 1))
     n_shards = max(1, int(cfg.pods_start or 0) or _ceiling)
-    if n_shards < _ceiling:
-        print(f"[text-lora] {job_id}: starting on {n_shards} pod(s), "
-              f"maintained at up to {_ceiling}", flush=True)
+    # WHAT TO AIM FOR. `pods` is the number the job wants, and the fleet is
+    # both STARTED and HELD there -- it used to be held at the operator's
+    # `max_pods` instead, so a job asking for eight against a ceiling of
+    # sixteen crept toward sixteen it had not asked for, while a job that got
+    # three of its eight was not brought back up to eight either.
+    #
+    # `min_pods` is NOT this number: a client sends `pods: 8, min_pods: 1`
+    # meaning "eight please, one is better than nothing", so the floor is
+    # tolerated and the aim is eight. The ceiling still bounds everything, and
+    # it is what a joining request's lease may raise the aim to.
+    _target = n_shards
+    _floor = max(0, int(cfg.min_pods or 0) or int(req.min_pods or 0))
+    if _target < _ceiling:
+        print(f"[text-lora] {job_id}: aiming for {_target} pod(s), kept there "
+              f"as capacity allows (ceiling {_ceiling}"
+              + (f", runs on as few as {_floor}" if _floor else "")
+              + ")", flush=True)
     rounds = max(1, int(cfg.rounds or 1))
     # Recorded so "step x/y" has a stated source. A request may RAISE rounds
     # (narrow() passes it through: rounds change duration, not fleet size or
@@ -4101,6 +4125,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         _train_coordinators[job_id] = coord
     poll = max(5.0, float(cfg.poll_interval_s or 20.0))
     stages = flt.Stages()
+    #: Set in the finally, and declared OUT HERE because the finally reads it:
+    #: a failure before the boots start (no capacity at all) would otherwise
+    #: raise NameError from the cleanup and hide the real error. A boot thread
+    #: can outlive the run -- a pod still booting when the last round closes --
+    #: and must not then push a dataset to a pod the release has terminated.
+    _run_over = threading.Event()
+    _boot_pools: List[Any] = []
     try:
         # ADOPT FIRST, then rent the shortfall. A previous attempt's pods are
         # already paid for and already booted -- renting beside them is the
@@ -4132,6 +4163,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         ready = []
         _boot_timeout = float(cfg.pod_boot_timeout_s or 1800.0)
         _shards = sorted(fleet.pods)
+        #: Pods announce themselves here the moment they are usable, so the
+        #: run can begin on the first one instead of on the last.
+        import queue as _queue_mod
+        _ready_q: "_queue_mod.Queue" = _queue_mod.Queue()
+        #: Set when no further pod can arrive from the INITIAL rental -- the
+        #: only thing the main loop cannot work out from the fleet itself.
+        _boot_done = threading.Event()
 
         def _bring_up(shard):
             # IN SLICES, so a cancel is honoured while the pod is booting. The
@@ -4143,6 +4181,12 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             # after being cancelled, and 17 pods had to be terminated by hand.
             _deadline = time.time() + _boot_timeout
             while True:
+                if _run_over.is_set():
+                    # The run ended while this pod was still booting. Its
+                    # release is the caller's `finally`, which has either
+                    # already happened or is about to; doing anything else
+                    # here races it.
+                    return None
                 if _train_cancelled(job_id):
                     fleet.release(shard, "cancelled while booting")
                     print(f"[text-lora] {job_id}: shard {shard} released — "
@@ -4180,39 +4224,87 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     fleet.release(shard, "never published a port")
                     return None
                 if url:
+                    # THE DATASET GOES NOW, not after the fleet is assembled.
+                    # It used to be pushed in shard order once every boot had
+                    # finished, which made the slowest pod -- or one that never
+                    # published a port at all and burned its whole timeout --
+                    # the start time for every pod that was already up and
+                    # billing. Measured: three pods reachable at 18:13, 18:14
+                    # and 18:15, round 0 starting at 18:17 behind a grow
+                    # attempt, with a 600s budget that a single dead shard
+                    # would have spent in full.
+                    #
+                    # A failure here is this shard's alone: the pod is released
+                    # and the rest of the fleet is unaffected, where raising
+                    # would have taken down a run that has working pods.
+                    if _run_over.is_set() or shard not in fleet.pods:
+                        return None
+                    try:
+                        flt.push_dataset(fleet.pods[shard], dataset_path)
+                    except Exception as exc:
+                        print(f"[text-lora] {job_id}: shard {shard} could not "
+                              f"take the dataset ({exc}); released",
+                              flush=True)
+                        fleet.release(shard, "dataset push failed")
+                        return None
+                    fleet.note_checkin(shard)
+                    _ready_q.put(shard)
                     return shard
 
-        if len(_shards) == 1:
-            got = _bring_up(_shards[0])
-            if got is not None:
-                ready.append(got)
-        else:
-            import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(
-                    max_workers=min(len(_shards), 32),
-                    thread_name_prefix=f"boot-{job_id}") as pool:
-                futures = {pool.submit(_bring_up, sh): sh for sh in _shards}
-                for fut in _cf.as_completed(futures):
+        # THE BOOTS ARE NOT JOINED. Each `_bring_up` takes its own pod, pushes
+        # the dataset to it and announces it; the run proceeds as soon as the
+        # FIRST pod answers and the others arrive while it is already
+        # training. Joining them was a barrier the size of the slowest boot:
+        # a fleet of sixteen waited for all sixteen -- or for the full
+        # per-pod timeout of whichever one never published a port -- with
+        # every pod that was already up billing and idle. Nothing downstream
+        # needed that barrier: the round loop reads each pod's address every
+        # poll and the cohort is recomputed per round, which is exactly the
+        # machinery that lets a run start on one pod and reach sixteen.
+        import concurrent.futures as _cf
+        _boot_pool = _cf.ThreadPoolExecutor(
+            max_workers=min(len(_shards), 32),
+            thread_name_prefix=f"boot-{job_id}")
+        _boot_pools.append(_boot_pool)
+        _boot_futs = {_boot_pool.submit(_bring_up, sh): sh for sh in _shards}
+
+        def _watch_boots():
+            """Drain the futures so a raise is logged, then say boots are over.
+
+            In a thread of its own because the point of this change is that
+            nothing in the training path waits on it: `_boot_done` is only
+            consulted to decide that NO pod is coming, which is the one
+            question the main loop cannot answer by itself.
+            """
+            try:
+                for _f in _cf.as_completed(list(_boot_futs)):
                     try:
-                        got = fut.result()
+                        _f.result()
                     except Exception as exc:
                         print(f"[text-lora] {job_id}: shard "
-                              f"{futures[fut]} boot raised: {exc}", flush=True)
-                        continue
-                    if got is not None:
-                        ready.append(got)
-        # Cancel AFTER the waits, not inside them: a cancel mid-boot would
-        # leave a rented pod with nobody to release it, and release_all in the
-        # caller's finally is what guarantees the fleet goes away.
-        _check_train_cancel()
-        # The dataset goes out once the fleet is known, in shard order, so a
-        # failure names a shard rather than whichever thread got there first.
-        for shard in sorted(ready):
-            flt.push_dataset(fleet.pods[shard], dataset_path)
-            fleet.note_checkin(shard)
+                              f"{_boot_futs[_f]} boot raised: {exc}",
+                              flush=True)
+            finally:
+                _boot_done.set()
+        threading.Thread(target=_watch_boots, daemon=True,
+                         name=f"bootwatch-{job_id}").start()
+
+        # Wait for ONE pod, not for the fleet. A cancel is honoured here and
+        # the boot threads release their own pods, so a cancel during this
+        # wait costs nothing.
+        while not ready:
+            try:
+                ready.append(_ready_q.get(timeout=2.0))
+            except _queue_mod.Empty:
+                _check_train_cancel()
+                if _boot_done.is_set():
+                    break
         if not ready:
             stages.failed("reachable", "no pod published a port")
             raise RuntimeError("no pod became reachable — nothing to train on")
+        print(f"[text-lora] {job_id}: shard {ready[0]} is up with the dataset "
+              f"— starting now, {len(_shards) - 1} pod(s) still booting",
+              flush=True)
         floor = max(0, int(req.min_pods or 0))
         if floor and len(ready) < floor:
             # NOT a refusal any more, and the reason it was one is gone. It
@@ -4234,9 +4326,10 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             # is the behaviour that made a large fleet impossible to assemble
             # in the first place.
             print(f"[text-lora] {job_id}: starting on {len(ready)} pod(s) "
-                  f"although {floor} were asked for — the fleet grows toward "
-                  f"{_ceiling} between rounds, and every round trains the "
-                  f"whole dataset whatever its size", flush=True)
+                  f"although {floor} were asked for — the rest are still "
+                  f"booting or waiting on capacity, the fleet is held at "
+                  f"{_target}, and every round trains the whole dataset "
+                  f"whatever its size", flush=True)
             _update_job(job_id,
                         message=(f"started on {len(ready)} of {floor} "
                                  f"requested pod(s); growing"))
@@ -4247,9 +4340,16 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         #: Last reported cohort size, so a change is announced once rather
         #: than every poll.
         _last_cohort = [0]
-        #: The last round a top-up was attempted in, so it is tried once per
-        #: round rather than on every poll of the loop.
+        #: The last round a top-up was attempted in. It no longer gates the
+        #: attempt -- it only resets the backoff, so a new round tries again
+        #: immediately whatever the previous round's refusals earned.
         _topped_up = [-1]
+        #: When the next top-up may run, and the current interval. Capacity
+        #: comes back on the scale of minutes and a round lasts half an hour,
+        #: so waiting for a round boundary meant running short-handed for the
+        #: whole of it.
+        _topup_at = [0.0]
+        _topup_every = [_TOPUP_MIN_S]
 
         while not coord.finished():
             _check_train_cancel()
@@ -4271,13 +4371,37 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 print(f"[text-lora] {job_id}: target raised to {_leased} "
                       f"pod(s) by a later request", flush=True)
                 _ceiling = _leased
-            if rnd != _topped_up[0] and len(fleet.pods) < _ceiling:
+                _target = min(_leased, _ceiling)
+            if rnd != _topped_up[0]:
+                # A ROUND BOUNDARY MAKES IT EAGER AGAIN. The backoff below is
+                # for capacity that is simply absent; a new round is new
+                # information (pods were released, the shape changed), so the
+                # next attempt should not be sitting out a 15-minute wait
+                # earned during the previous one.
                 _topped_up[0] = rnd
+                _topup_at[0] = 0.0
+                _topup_every[0] = _TOPUP_MIN_S
+            if len(fleet.pods) < _target and time.time() >= _topup_at[0]:
+                # NOT ONCE PER ROUND. It used to be, and a round is half an
+                # hour: a pod lost in the first minute left the fleet short for
+                # the whole of it, and a job that started on 3 of 8 because
+                # capacity was gone stayed on 3 until the round closed even
+                # though the cards came back. Capacity moves on the scale of
+                # minutes, so the retry has to as well.
+                #
+                # Rate-limited rather than continuous, because each attempt
+                # walks the candidate cards for every missing shard: a 13-shard
+                # shortfall measured 110 GraphQL calls against a 1,500/hour
+                # budget, so retrying on every 20s poll would spend the account
+                # in minutes. Fruitless attempts back off and a round boundary
+                # resets that.
+                _before = len(fleet.pods)
                 try:
-                    grew = fleet.top_up(_ceiling, cap=_ceiling)
+                    grew = fleet.top_up(_target, cap=_ceiling)
                     if grew:
+                        _topup_every[0] = _TOPUP_MIN_S
                         print(f"[text-lora] {job_id}: grew to "
-                              f"{len(fleet.pods)} pod(s) of {_ceiling} at "
+                              f"{len(fleet.pods)} pod(s) of {_target} at "
                               f"round {rnd}", flush=True)
                         for _sh in sorted(p.shard for p in grew):
                             try:
@@ -4286,10 +4410,33 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                                                      dataset_path)
                             except Exception:
                                 pass      # it will be picked up when it boots
+                    else:
+                        _topup_every[0] = min(_TOPUP_MAX_S,
+                                              _topup_every[0] * 2)
                 except Exception as exc:
+                    _topup_every[0] = min(_TOPUP_MAX_S, _topup_every[0] * 2)
                     print(f"[text-lora] {job_id}: could not grow the fleet "
                           f"({exc}); continuing with {len(fleet.pods)}",
                           flush=True)
+                _topup_at[0] = time.time() + _topup_every[0]
+                if len(fleet.pods) == _before:
+                    print(f"[text-lora] {job_id}: still {_before} of "
+                          f"{_target} pod(s); no capacity, retrying in "
+                          f"{_topup_every[0]:.0f}s", flush=True)
+            # LATER ARRIVALS. A pod that finished booting since the last
+            # poll announced itself on the queue; it is already in the fleet
+            # with its dataset, so this only records and reports it. The
+            # cohort below picks it up on the next round whatever happens
+            # here, which is why draining is safe to miss.
+            while True:
+                try:
+                    _late = _ready_q.get_nowait()
+                except _queue_mod.Empty:
+                    break
+                if _late not in ready:
+                    ready.append(_late)
+                    print(f"[text-lora] {job_id}: shard {_late} joined "
+                          f"({len(ready)} pod(s) up)", flush=True)
             _live = [sh for sh in sorted(fleet.pods) if fleet.pods[sh].url]
             _members = coord.cohort(rnd, _live)
             if _members and len(_members) != _last_cohort[0]:
@@ -4393,6 +4540,17 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 "spend_usd": round(sum(p.cost_so_far()
                                        for p in fleet.pods.values()), 4)}
     finally:
+        # BOOT THREADS FIRST. They hold shard numbers and push datasets; told
+        # to stop before the release, they cannot touch a pod that is being
+        # terminated. Not waited on -- a thread mid-`wait_ready` would hold
+        # this up for a slice -- which is safe because `_run_over` is what
+        # they check and they own nothing else.
+        try:
+            _run_over.set()
+            for _bp in _boot_pools:
+                _bp.shutdown(wait=False)
+        except Exception:
+            pass
         # The guarantee. Not conditional on how we got here: a cancel, an
         # exception, a fleet that died -- the pods stop billing.
         released = fleet.release_all("training job ended")

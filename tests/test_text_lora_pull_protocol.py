@@ -388,14 +388,18 @@ def test_a_job_starts_below_its_minimum_pods_and_grows():
     large fleet could never be assembled: the early arrivals were always
     thrown away while the rest were hunted.
 
-    min_pods is now the target the fleet grows toward between rounds.
+    min_pods is now the floor the run TOLERATES: a client sends
+    `pods: 8, min_pods: 1` meaning "eight please, one is better than nothing",
+    so it gates nothing and aims at nothing. What the fleet is held at is
+    `pods`, and it is topped up toward that whenever it is short rather than
+    once per round.
     """
     import inspect
     src = inspect.getsource(loras._text_train_distributed)
     i = src.index("floor = max(0, int(req.min_pods or 0))")
-    block = src[i:i + 1800]
+    block = src[i:i + 2600]
     assert "len(ready) < floor" in block
-    assert "starting on " in block and "grows toward" in block
+    assert "starting on " in block and "the fleet is held at" in block
     # No raise in that branch any more -- the quoted old message in the
     # comment does not count.
     raises = [l for l in block.splitlines() if "raise " in l]
