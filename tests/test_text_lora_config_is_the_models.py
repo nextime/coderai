@@ -447,7 +447,7 @@ def test_the_error_names_where_it_looked(on_disk):
     """"There is no block" was true of the lookup and false of the disk, and it
     sent someone to check a file that was already right."""
     src = flt.catalogue_source()
-    assert "models.json" in src and "on disk" in src
+    assert "models.json" in src and "entries" in src
 
 
 def test_a_missing_models_json_says_so_rather_than_implying_a_missing_block(
@@ -485,3 +485,73 @@ def test_an_alias_resolves_to_its_path_with_no_in_memory_catalogue(on_disk):
     assert loras._resolve_text_base("qwen38-train") == "Qwen/Qwen3.8-27B"
     # and an HF id that is nobody's alias passes through untouched
     assert loras._resolve_text_base("Qwen/Qwen3.8-27B") == "Qwen/Qwen3.8-27B"
+
+
+# ---- a populated catalogue is not a complete one ---------------------------
+#
+# The third report in a row, and the one my own tests could not have caught:
+# they covered an EMPTY in-memory catalogue, and the real failure was a
+# populated one. The loader excludes parked (enabled: false) entries, and a
+# training-only entry is naturally parked -- nothing should serve it. So memory
+# answered "no such entry", `if md: return md` treated that as authoritative,
+# and the file holding the right answer was never opened.
+#
+# Found because catalogue_source() printed "read from the in-memory catalogue".
+# A message that names where it looked is worth the line it costs.
+
+@pytest.fixture
+def parked(monkeypatch, tmp_path):
+    """Production's exact shape: a parked training entry on disk, and an
+    in-memory catalogue that has filtered it out."""
+    import json as _json
+    (tmp_path / "models.json").write_text(_json.dumps({"text_models": [
+        {"alias": "qwen38", "id": "qwen38-awq", "enabled": True},
+        {"alias": "qwen38-train", "id": "qwen38-train",
+         "path": "Qwen/Qwen3.8-27B", "enabled": False,
+         "lora_train": {"enabled": True, "base_model": "Qwen/Qwen3.8-27B",
+                        "max_pods": 32, "min_vram_gb": 48}},
+    ]}))
+    monkeypatch.setenv("CODERAI_CONFIG_DIR", str(tmp_path))
+
+    class CM:          # the loader's view: the parked entry is simply absent
+        models_data = {"text_models": [{"alias": "qwen38", "id": "qwen38-awq",
+                                        "enabled": True}]}
+
+    import codai.admin.routes as ar
+    monkeypatch.setattr(ar, "config_manager", CM, raising=False)
+    return tmp_path
+
+
+def test_a_parked_entrys_block_is_found_though_memory_filtered_it_out(parked):
+    cfg = flt.config_for_model("qwen38-train")
+    assert cfg.enabled is True, "a populated catalogue masked the file"
+    assert cfg.base_model == "Qwen/Qwen3.8-27B" and cfg.max_pods == 32
+
+
+def test_a_parked_entry_still_resolves_to_its_path(parked):
+    """The resolver has the same two sources and needed the same fix."""
+    assert loras._resolve_text_base("qwen38-train") == "Qwen/Qwen3.8-27B"
+
+
+def test_the_training_entry_need_not_be_servable_to_be_configured(parked):
+    """Why this is a code fix and not `enabled: true` on the entry: flipping
+    that switch would offer a 55GB base to the serving path to keep a lookup
+    happy. A config-only entry stays unservable."""
+    import json as _json
+    entry = _json.loads((parked / "models.json").read_text())["text_models"][1]
+    assert entry["enabled"] is False
+    assert flt.config_for_model("qwen38-train").enabled is True
+
+
+def test_the_source_line_names_both_places(parked):
+    """It said "the in-memory catalogue" while the file held the answer: true
+    of what the lookup did, useless for working out why."""
+    src = flt.catalogue_source()
+    assert "in-memory" in src and "models.json" in src
+    assert "parked ones excluded" in src
+
+
+def test_a_block_is_found_by_training_base_from_the_file_too(parked):
+    """The by-base scan reads both sources, so naming the weights still works."""
+    cfg = flt.config_for_model("Qwen/Qwen3.8-27B")
+    assert cfg.enabled is True and cfg.max_pods == 32

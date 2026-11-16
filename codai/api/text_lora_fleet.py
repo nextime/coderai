@@ -600,7 +600,11 @@ def config_for_model(model_key: str) -> LoraTrainConfig:
         return LoraTrainConfig()
     matches = []
     try:
-        for lst in _catalogue().values():
+        # Memory merged with the FILE: a parked training entry exists only in
+        # the latter, and it is exactly the kind of entry this scan is for.
+        sources = [_catalogue(), _file_catalogue()]
+        seen_ids = set()
+        for lst in [l for src in sources for l in src.values()]:
             if not isinstance(lst, list):
                 continue
             for m in lst:
@@ -610,7 +614,11 @@ def config_for_model(model_key: str) -> LoraTrainConfig:
                 if not isinstance(blk, dict):
                     continue
                 if str(blk.get("base_model") or "").strip().lower() == want:
-                    matches.append((str(m.get("alias") or m.get("id") or "?"), blk))
+                    key = str(m.get("alias") or m.get("id") or id(m))
+                    if key in seen_ids:
+                        continue      # the same entry from both sources
+                    seen_ids.add(key)
+                    matches.append((key, blk))
     except Exception:
         return LoraTrainConfig()
     if len(matches) > 1:
@@ -908,14 +916,32 @@ def _catalogue() -> Dict[str, Any]:
         return {}
 
 
+def _file_catalogue() -> Dict[str, Any]:
+    """The catalogue as models.json has it -- every entry, parked or not."""
+    try:
+        with open(_models_json_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _entry_from_disk(model_key: str) -> List[Dict[str, Any]]:
-    """Entries matching this key by alias, id, path or basename, from the file."""
+    """Entries matching this key by alias, id, path or basename, FROM THE FILE.
+
+    From the file unconditionally, which is the whole point and was the bug:
+    this used to read the merged catalogue, which prefers the in-memory one --
+    and the in-memory catalogue EXCLUDES parked entries. A training-only entry
+    is naturally parked (nothing should serve it), so a populated-but-filtered
+    memory view answered "no such entry" and the file was never consulted. A
+    non-empty catalogue is not the same as a complete one.
+    """
     import os as _os
     want = (model_key or "").strip().lower()
     if not want:
         return []
     out = []
-    for lst in _catalogue().values():
+    for lst in _file_catalogue().values():
         if not isinstance(lst, list):
             continue
         for m in lst:
@@ -931,15 +957,30 @@ def _entry_from_disk(model_key: str) -> List[Dict[str, Any]]:
 
 
 def catalogue_source() -> str:
-    """Where a lookup would read the catalogue from, for an error message."""
+    """Where a lookup read the catalogue, for an error message.
+
+    Names BOTH, because naming one was misleading: the message said "the
+    in-memory catalogue" while the file held the answer, which is true of what
+    the lookup did and useless for working out why.
+    """
+    import os as _os
+    parts = []
     try:
         from codai.admin.routes import config_manager as cfg_mgr
         md = getattr(cfg_mgr, "models_data", None)
         if isinstance(md, dict) and md:
-            return "the in-memory catalogue"
+            n = sum(len(v) for v in md.values() if isinstance(v, list))
+            parts.append(f"the in-memory catalogue ({n} entries, parked ones "
+                         f"excluded)")
+        else:
+            parts.append("the in-memory catalogue (empty in this process)")
     except Exception:
-        pass
+        parts.append("the in-memory catalogue (unavailable)")
     path = _models_json_path()
-    import os as _os
-    return (f"{path} (on disk)" if _os.path.isfile(path)
-            else f"{path} — WHICH DOES NOT EXIST")
+    if _os.path.isfile(path):
+        n = sum(len(v) for v in _file_catalogue().values()
+                if isinstance(v, list))
+        parts.append(f"{path} ({n} entries)")
+    else:
+        parts.append(f"{path} — WHICH DOES NOT EXIST")
+    return " and ".join(parts)
