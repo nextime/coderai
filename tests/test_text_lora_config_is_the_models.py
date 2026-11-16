@@ -207,14 +207,14 @@ def test_an_off_block_is_absent_rather_than_full_of_defaults():
 
 class _Catalogue:
     def list_gpu_types(self):
-        return [{"id": "NVIDIA A40", "memory_gb": 48, "secure_price": 0.44,
+        return [{"id": "NVIDIA A40", "display_name": "NVIDIA A40", "memory_gb": 48, "secure_price": 0.44,
                  "community_price": 0.35},
-                {"id": "NVIDIA L40S", "memory_gb": 48, "secure_price": 0.86},
-                {"id": "NVIDIA RTX 6000 Ada", "memory_gb": 48, "secure_price": 0.77},
-                {"id": "NVIDIA H100 PCIe", "memory_gb": 80, "secure_price": 2.69},
-                {"id": "NVIDIA RTX 4090", "memory_gb": 24, "secure_price": 0.34},
-                {"id": "NVIDIA A100 40GB", "memory_gb": 40, "secure_price": 0.80},
-                {"id": "NVIDIA UNPRICED", "memory_gb": 48}]
+                {"id": "NVIDIA L40S", "display_name": "NVIDIA L40S", "memory_gb": 48, "secure_price": 0.86},
+                {"id": "NVIDIA RTX 6000 Ada", "display_name": "NVIDIA RTX 6000 Ada", "memory_gb": 48, "secure_price": 0.77},
+                {"id": "NVIDIA H100 PCIe", "display_name": "NVIDIA H100 PCIe", "memory_gb": 80, "secure_price": 2.69},
+                {"id": "NVIDIA RTX 4090", "display_name": "NVIDIA RTX 4090", "memory_gb": 24, "secure_price": 0.34},
+                {"id": "NVIDIA A100 40GB", "display_name": "NVIDIA A100 40GB", "memory_gb": 40, "secure_price": 0.80},
+                {"id": "NVIDIA UNPRICED", "display_name": "NVIDIA UNPRICED", "memory_gb": 48}]
 
 
 def _cards(**kw):

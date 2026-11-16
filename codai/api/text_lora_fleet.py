@@ -929,46 +929,75 @@ def eligible_cards(client, cfg: LoraTrainConfig, *,
     A card the catalogue does not price is EXCLUDED when a ceiling is set --
     renting an unpriced card under a price ceiling is renting blind.
     """
-    clouds = clouds_for(cfg)
-    allow = {c.strip().lower() for c in (cfg.gpu_types or "").split(",")
-             if c.strip()}
-    floor = float(cfg.min_vram_gb or 0.0)
+    # THE POOL'S OWN RANKER, not a second implementation of it. This used to
+    # re-derive "which card, which cloud, under what ceiling" in parallel with
+    # `_rank_gpus`, which is how a trainer ended up with its own answers to
+    # questions the serving fleets had already settled: preference versus hard
+    # filter, multi-GPU pods counted per pod rather than per card, spot, the
+    # cheaper/faster criteria, and the per-cloud pricing this file had to grow
+    # by hand. One ranker means the trainer inherits all of it, and the next
+    # improvement to it, instead of needing the same fix twice.
+    #
+    # The shape returned here is unchanged, because callers and the UI read it:
+    # {id, vram_gb, hourly_usd, cloud_type}.
+    try:
+        from codai.api import runpod_worker as rw
+    except Exception as exc:                      # pragma: no cover
+        raise FleetError(f"cannot rank cards: {exc}") from exc
+    mcfg = training_mcfg(cfg, ceiling=ceiling)
+    try:
+        ranked = rw._rank_gpus(client, mcfg, getattr(client, "_cfg", None))
+    except Exception as exc:
+        # The ranker raises when nothing fits, with the constraints spelled
+        # out. That message is better than an empty list, but an empty list is
+        # what this function has always returned, and `eligible_cards` is
+        # called where "none" is a decision rather than an error.
+        print(f"[text-lora] no eligible card: {exc}", flush=True)
+        return []
     out: List[Dict[str, Any]] = []
-    for g in (client.list_gpu_types() or []):
-        gid = str(g.get("id") or "").strip()
-        if not gid:
-            continue
-        if allow and gid.lower() not in allow:
-            continue
-        try:
-            vram = float(g.get("memory_gb") or 0)
-        except (TypeError, ValueError):
-            vram = 0.0
-        if floor > 0 and vram < floor:
-            continue
-        # One candidate PER CLOUD, each at that cloud's real price. The same
-        # card is usually cheaper on community and more available there, while
-        # secure is the one with the stronger isolation -- so with both
-        # allowed, which to try is a price question the ranking answers, not a
-        # choice to make up front.
-        for cloud in clouds:
-            price = (g.get("secure_price") if cloud == "SECURE"
-                     else g.get("community_price"))
-            if price is None:
-                price = g.get("on_demand_price")
-            if price is None:
-                if ceiling > 0:
-                    continue       # unpriced under a ceiling is renting blind
-                price = 0.0
-            if ceiling > 0 and float(price) > ceiling + 1e-9:
-                continue
-            out.append({"id": gid, "vram_gb": vram, "hourly_usd": float(price),
-                        "cloud_type": cloud})
-    # Cheapest first, and for one price the bigger card; the cloud is the last
-    # tiebreak so a tie is spent on SECURE rather than silently on community.
-    out.sort(key=lambda c: (c["hourly_usd"], -c["vram_gb"],
-                            0 if c.get("cloud_type") == "SECURE" else 1))
+    for c in ranked:
+        out.append({"id": str(c.get("gpu_type_id") or ""),
+                    "vram_gb": float(c.get("memory_gb") or 0.0),
+                    "hourly_usd": float(c.get("price") or 0.0),
+                    "cloud_type": str(c.get("cloud_type") or ""),
+                    "display_name": str(c.get("display_name") or ""),
+                    "gpu_count": int(c.get("gpu_count") or 1),
+                    "is_spot": bool(c.get("is_spot"))})
     return out
+
+
+def training_mcfg(cfg: "LoraTrainConfig", ceiling: float = 0.0):
+    """A ``RunpodModelConfig`` describing what this training job may rent.
+
+    The adapter between a `lora_train` block and the config every serving pool
+    is already described by, so one ranker can answer for both. Nothing here
+    is new policy -- it is the same floor, ceiling and clouds the block always
+    meant, said in the vocabulary the rest of the RunPod code speaks.
+    """
+    from codai.api.runpod_worker import RunpodModelConfig
+    m = RunpodModelConfig()
+    m.cloud_types = list(clouds_for(cfg))
+    m.min_vram_gb = float(cfg.min_vram_gb or 0.0)
+    m.max_hourly_usd = float(ceiling or cfg.max_pod_hourly_usd or 0.0)
+    # An ALLOW-LIST when the block names cards, not a preference. For a pool,
+    # `gpu_types` is a preference and `allow_other_gpus` opens the rest -- the
+    # right default there, because a named card being busy should not fail a
+    # request. Here the list is the OPERATOR's, on a route a client can call,
+    # so it has the same standing as max_pods and the price ceiling: a request
+    # may narrow it and must not widen it. Treating it as a preference would
+    # have let a job rent cards the operator never listed, which is why the
+    # test for it is called "narrows but cannot widen".
+    #
+    # With no list, anything meeting the floor and the ceiling is fair game.
+    m.gpu_types = [c.strip() for c in (cfg.gpu_types or "").split(",")
+                   if c.strip()]
+    m.allow_other_gpus = not m.gpu_types
+    # Never spot for training: an interrupted pod loses the round, and a round
+    # is the unit of progress here.
+    m.allow_spot = False
+    m.selection_criteria = "cheaper"
+    m.gpu_count = 1
+    return m
 
 
 #: What `cloud_type` may say to mean "try both". A single value still means

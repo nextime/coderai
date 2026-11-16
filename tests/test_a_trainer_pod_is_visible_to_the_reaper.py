@@ -36,6 +36,24 @@ class Client:
         self.terminated.append(pod_id)
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_registry(monkeypatch, tmp_path):
+    """Point the registry at a temp dir for EVERY test in this file.
+
+    Without this, a test that rents a pod writes into the developer's own
+    ~/.config/coderai/runpod-pods.json -- which is exactly what happened: five
+    fake trainer pods landed there and broke an unrelated test
+    (test_a_truly_empty_fleet_is_still_empty) in a way that survived the run,
+    because the file persists. A test that writes outside its tmp_path is a
+    test that fails somebody else's.
+    """
+    monkeypatch.setenv("CODERAI_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    import codai.api.runpod_worker as rw
+    monkeypatch.setattr(rw, "_pod_registry_path",
+                        lambda: str(tmp_path / "runpod-pods.json"))
+
+
 @pytest.fixture
 def registry(monkeypatch):
     """Capture what the fleet writes to the deployment registry."""
