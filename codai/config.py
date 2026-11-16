@@ -1161,6 +1161,19 @@ class RunpodConfig:
     # private registry (your own coderai image, typically). Per-model/capability
     # `registry_auth_id` overrides this. Blank = public images only.
     registry_auth_id: str = ""
+    # How long after a pod's CONTAINER STARTS to keep waiting for RunPod to
+    # publish the declared port, before concluding the host cannot serve it.
+    #
+    # This is the knob that decides whether a slow boot is waited out or thrown
+    # away. It was a module constant at 120s, below the only successful boot
+    # ever measured here (397.9s), so ordinary pods were discarded about a
+    # minute before they were ready -- and each one was already being billed.
+    # Raising it costs nothing on success, because the card bills while it
+    # boots either way; what it costs is giving up later on a host that will
+    # never publish the port.
+    #
+    # 0 uses the built-in default (CODERAI_RUNPOD_PORT_GRACE, else 600s).
+    port_publish_grace_s: float = 600.0
     # A RunPod network volume (created by hand in the RunPod console) that pods
     # attach at launch. Weights downloaded onto it survive the pod, so the second
     # pod does not re-download a 30 GB model — and it doubles as the place to put

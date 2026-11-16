@@ -61,7 +61,7 @@ from codai.api.runpod_client import RunpodClient, RunpodError, classify_boot
 
 
 #: Exactly what RunPod answered for the pod that cost $0.846 twice.
-_PRO6000 = {"status": "RUNNING", "uptime_s": 209.0, "published_ports": [
+_PRO6000 = {"status": "RUNNING", "uptime_s": rc.PORT_PUBLISH_GRACE_S + 89.0, "published_ports": [
     {"ip": "100.65.33.207", "privatePort": 19123, "publicPort": 60595,
      "type": "http"}]}
 
@@ -130,7 +130,7 @@ def test_the_grace_covers_a_mapping_that_arrives_just_after_the_container():
 
 def test_no_mapping_at_all_past_the_grace_is_unreachable():
     verdict, why = classify_boot(
-        {"status": "RUNNING", "uptime_s": 600.0, "published_ports": []}, 8000)
+        {"status": "RUNNING", "uptime_s": rc.PORT_PUBLISH_GRACE_S + 480.0, "published_ports": []}, 8000)
     assert verdict == "unreachable"
     assert "no port mapping at all" in why
 
@@ -139,7 +139,7 @@ def test_the_declared_port_on_a_cgnat_address_is_unreachable():
     """The other shape of the same failure: the port IS published, just
     somewhere nothing can reach. A direct-TCP pod there is a dead end."""
     verdict, why = classify_boot(
-        {"status": "RUNNING", "uptime_s": 600.0, "published_ports": [
+        {"status": "RUNNING", "uptime_s": rc.PORT_PUBLISH_GRACE_S + 480.0, "published_ports": [
             {"ip": "100.65.4.4", "privatePort": 8000, "publicPort": 41000,
              "type": "tcp"}]}, 8000)
     assert verdict == "unreachable"
@@ -150,7 +150,7 @@ def test_a_proxied_pod_does_not_need_a_routable_address():
     """A non-direct-TCP pod is reached through RunPod's own proxy, so the
     mapping's address is none of our business -- condemning it for being
     private would break every proxied pod."""
-    info = {"status": "RUNNING", "uptime_s": 600.0, "published_ports": [
+    info = {"status": "RUNNING", "uptime_s": rc.PORT_PUBLISH_GRACE_S + 480.0, "published_ports": [
         {"ip": "100.65.4.4", "privatePort": 8000, "publicPort": 41000,
          "type": "http"}]}
     assert classify_boot(info, 8000, direct_tcp=False)[0] == "starting"
@@ -172,7 +172,7 @@ def test_an_unreadable_uptime_is_treated_as_not_started():
 def test_it_falls_back_to_ports_when_published_ports_is_absent():
     """The GraphQL path and `get_pod` carry `ports` and no `published_ports`."""
     verdict, _ = classify_boot(
-        {"status": "RUNNING", "uptime_s": 600.0, "ports": [
+        {"status": "RUNNING", "uptime_s": rc.PORT_PUBLISH_GRACE_S + 480.0, "ports": [
             {"ip": "1.2.3.4", "privatePort": 8000, "publicPort": 9}]}, 8000)
     assert verdict == "starting"
 
@@ -188,7 +188,7 @@ def test_the_boot_state_keeps_the_published_ports_even_when_not_ready():
     c = RunpodClient.__new__(RunpodClient)
     c._rest = lambda *a, **k: {
         "id": "p1", "status": "RUNNING", "gpu": {"id": "NVIDIA A40", "count": 1},
-        "runtime": {"uptime": 300, "ports": [
+        "runtime": {"uptime": rc.PORT_PUBLISH_GRACE_S + 180, "ports": [
             {"ip": "100.65.1.1", "private": 19123, "public": 5000,
              "type": "http"}]}}
     row = c._rest_boot_state("p1", 8000)

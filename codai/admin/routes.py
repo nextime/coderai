@@ -5243,6 +5243,16 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             rp.data_center = (d.get("data_center") or "").strip()
         if "registry_auth_id" in d:
             rp.registry_auth_id = (d.get("registry_auth_id") or "").strip()
+        if "port_publish_grace_s" in d:
+            # This merge is hand-listed, so a field missing HERE saves in the
+            # form and comes back as the default on reload -- the exact failure
+            # the helper at the top of this module warns about. 0 is kept as
+            # "use the built-in default" rather than clamped to a minimum.
+            try:
+                rp.port_publish_grace_s = max(
+                    0.0, float(d.get("port_publish_grace_s") or 0))
+            except (TypeError, ValueError):
+                pass
         if "network_volume_id" in d:
             rp.network_volume_id = (d.get("network_volume_id") or "").strip()
         if "network_volumes" in d:

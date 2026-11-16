@@ -198,7 +198,22 @@ def pod_console_url(pod_id: str) -> str:
 #: Generous: the evidence for the opposite verdict was a pod that reached 578s
 #: of container uptime with no mapping, and a host that is going to publish one
 #: does it at container start.
-PORT_PUBLISH_GRACE_S = float(os.environ.get("CODERAI_RUNPOD_PORT_GRACE", "120"))
+#: How long after the container starts to keep waiting for RunPod to publish
+#: the declared port before calling the HOST unable to serve it.
+#:
+#: 120s was below the only successful observation there was. Measured on this
+#: install: the single pod that ever became reachable took 397.9s, while a
+#: 120s grace aborted at ~360s (pull, container start, grace, give up) -- so
+#: normal boots were discarded a minute before they were ready, systematically,
+#: and each discarded pod was ALREADY PAID FOR. Raising it costs nothing on
+#: success, because the card bills while it boots either way.
+#:
+#: 600s because the operator states a pod can take up to 15 minutes and the
+#: evidence says a good one takes 6-7. The grace still exists, and still earns
+#: its keep: a host that publishes only RunPod's own agent port is given up on
+#: at ~10 minutes instead of waiting out a 1800s boot budget (measured
+#: 2026-11-08: nine such pods, $1.21).
+PORT_PUBLISH_GRACE_S = float(os.environ.get("CODERAI_RUNPOD_PORT_GRACE", "600"))
 
 
 def _is_routable(ip: str) -> bool:
@@ -1510,7 +1525,22 @@ class RunpodClient:
             # right for a pull and for a server still binding; it is pure waste
             # for a host that will not publish the port, and that one used to be
             # indistinguishable -- a full boot_timeout_s of it, per attempt.
-            verdict, why = classify_boot(info, port, direct_tcp)
+            # From the ACCOUNT CONFIG, so the operator can change it on the
+            # settings page instead of editing code or an env var: a timeout
+            # that decides whether a paid boot is kept or binned belongs in the
+            # interface. 0/unset falls back to the module default.
+            _grace = 0.0
+            try:
+                # getattr on SELF too: a subclass or a harness that bypasses
+                # __init__ has no _cfg, and a missing config must fall back to
+                # the default rather than abort a boot wait with AttributeError.
+                _grace = float(getattr(getattr(self, "_cfg", None),
+                                       "port_publish_grace_s", 0) or 0)
+            except (TypeError, ValueError):
+                _grace = 0.0
+            verdict, why = classify_boot(info, port, direct_tcp,
+                                         grace_s=(_grace if _grace > 0
+                                                  else None))
             if verdict == "unreachable":
                 raise RunpodError(
                     f"Pod {pod_id} cannot be reached and more waiting will not "

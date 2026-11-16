@@ -1172,6 +1172,11 @@
         <input type="text" id="s-runpod-dc" class="form-input" placeholder="(any)">
       </div>
       <div class="form-group" style="flex:1;min-width:180px">
+        <label class="form-label">Port-publish grace <span class="muted">(seconds)</span></label>
+        <input type="number" id="s-runpod-port-grace" class="form-input" min="0" step="30" placeholder="600">
+        <span class="form-hint" style="font-size:11px">How long after a pod's container starts to keep waiting for RunPod to publish the port. Too low and normal boots are thrown away a moment before they are ready — already paid for. Measured here: a good boot takes 6–7 minutes, and a pod can take up to 15. 0 = built-in default (600s).</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:180px">
         <label class="form-label">Network volume id <span class="muted">(optional)</span></label>
         <input type="text" id="s-runpod-volume" class="form-input" placeholder="blank = none (create it in the RunPod console)">
         <span class="form-hint" style="font-size:11px">Pods attach it at launch, so downloaded weights, uploaded models and LoRA adapters survive the pod — the second pod does not re-download. Secure Cloud only, and pods are pinned to the volume's data center.</span>
@@ -2557,6 +2562,7 @@ async function loadSettings(){
     document.getElementById('s-runpod-default-gpu').value = rp.default_gpu_type ?? '';
     document.getElementById('s-runpod-budget').value = rp.global_max_hourly_usd ?? 0;
     document.getElementById('s-runpod-registry-auth').value = rp.registry_auth_id ?? '';
+    document.getElementById('s-runpod-port-grace').value = rp.port_publish_grace_s ?? '';
     document.getElementById('s-runpod-volume').value = rp.network_volume_id ?? '';
     document.getElementById('s-runpod-volume-mount').value = rp.volume_mount_path ?? '';
     // Shown in the same "REGION=id" form it is typed in; the server takes
@@ -2917,6 +2923,7 @@ async function saveSettings(silent){
       default_gpu_type: document.getElementById('s-runpod-default-gpu').value.trim(),
       global_max_hourly_usd: parseFloat(document.getElementById('s-runpod-budget').value) || 0,
       registry_auth_id: document.getElementById('s-runpod-registry-auth').value.trim(),
+      port_publish_grace_s: parseFloat(document.getElementById('s-runpod-port-grace').value) || 0,
       network_volume_id: document.getElementById('s-runpod-volume').value.trim(),
       network_volumes: document.getElementById('s-runpod-volumes').value.trim(),
       volume_mount_path: document.getElementById('s-runpod-volume-mount').value.trim(),
