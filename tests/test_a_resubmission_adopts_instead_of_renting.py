@@ -119,15 +119,53 @@ def test_the_job_adopts_before_renting():
 
 # --------------------------------------------- 2. one run per adapter -------
 
-def test_a_second_job_for_the_same_adapter_is_refused():
+def test_a_second_request_joins_the_run_instead_of_starting_one():
+    """REVISED. Refusing a repeat request stopped the duplicate fleets and
+    also threw away the only signal the caller had. A serving pool treats the
+    same thing as a LEASE -- "asking for warm pods cancels a pending release:
+    the client changed its mind" -- so a repeat request carries into the same
+    pool and raises its target. A second RUN would still be wrong: two fleets
+    averaging into one adapter directory, last round wins."""
     src = inspect.getsource(loras._text_train_blocking)
     assert "_active_text_job_for(" in src
-    assert "is already training" in src
+    assert "carrying this request into that run" in src
+    assert "note_train_lease(" in src
 
 
-def test_the_refusal_names_the_job_to_watch_and_how_to_cancel():
+def test_the_answer_names_the_job_that_is_training():
     src = inspect.getsource(loras._text_train_blocking)
-    assert "Watch " in src and "/cancel" in src
+    assert '"joined": _already' in src
+    assert "pods_target" in src
+
+
+def test_the_lease_only_ever_raises_the_target():
+    """A later request asking for fewer must not shrink a fleet the earlier
+    one is relying on."""
+    loras._forget_train_lease("j-x")
+    assert loras.note_train_lease("j-x", 4) == 4
+    assert loras.note_train_lease("j-x", 2) == 4
+    assert loras.note_train_lease("j-x", 8) == 8
+    loras._forget_train_lease("j-x")
+
+
+def test_the_round_loop_reads_the_lease_every_round():
+    assert "train_lease(job_id)" in DIST
+    assert "target raised to " in DIST
+
+
+def test_the_lease_dies_with_its_job():
+    """Otherwise a finished run's target is handed to whatever reuses the
+    id."""
+    assert "_forget_train_lease(job_id)" in DIST
+
+
+def test_the_operators_block_still_bounds_the_lease():
+    """The lease is computed by narrowing the BLOCK, so a client cannot raise
+    the target past what the operator allows."""
+    src = inspect.getsource(loras._text_train_blocking)
+    i = src.index("note_train_lease(")
+    before = src[max(0, i - 400):i]
+    assert "_flt.narrow(_blk" in before
 
 
 @pytest.mark.parametrize("status,expected", [
@@ -159,23 +197,20 @@ def test_a_non_text_job_does_not_block(monkeypatch):
 # ------------------------------------- 3. cancel during the boot wait -------
 
 def test_the_boot_wait_checks_for_cancellation():
-    i = DIST.index("def _bring_up")
-    block = DIST[i:i + 1600]
+    block = _bring_up_body()
     assert "_train_cancelled(job_id)" in block
     assert "cancelled while booting" in block
 
 
 def test_the_boot_wait_is_sliced_so_the_check_runs():
-    i = DIST.index("def _bring_up")
-    block = DIST[i:i + 1600]
-    assert "min(20.0, _left)" in block
+    block = _bring_up_body()
+    assert "min(_SLICE_S, _left)" in block
 
 
 def test_the_pod_is_released_before_giving_up():
     """The reason the check used to sit after the waits: cancelling mid-boot
     would abandon a rented pod. The answer is to release it here."""
-    i = DIST.index("_train_cancelled(job_id)")
-    block = DIST[i:i + 300]
+    block = _bring_up_body()
     assert 'fleet.release(shard, "cancelled while booting")' in block
 
 
@@ -185,3 +220,15 @@ def test_the_probe_does_not_raise():
     doc = loras._train_cancelled.__doc__ or ""
     assert "not raise" in doc.lower()
     assert loras._train_cancelled("") is False
+
+def _bring_up_body():
+    """The whole `_bring_up` body, bounded by the statement after it.
+
+    Bounded by a marker rather than a character count: three assertions in
+    this file broke on the body growing, which tests where the text happened
+    to end rather than what the code does.
+    """
+    src = DIST
+    i = src.index("def _bring_up")
+    j = src.index("if len(_shards) == 1", i)
+    return src[i:j]

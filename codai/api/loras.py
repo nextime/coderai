@@ -3438,6 +3438,49 @@ async def _run_text_train_job(req: TextLoraTrainRequest, job_id: str,
     return await asyncio.to_thread(_text_train_blocking, req, job_id, dataset_path)
 
 
+#: Per-job pod targets asked for by LATER requests, the way a serving pool
+#: takes a client lease: asking again is a signal to keep the fleet and to
+#: carry the new request into the SAME pool, not to start a second one.
+#:
+#: No TTL, unlike `set_client_floor`: a training job is finite and ends by
+#: itself, so there is nothing for a lapsing lease to release. What the lease
+#: does is raise the target the round loop grows toward.
+_train_leases: dict = {}
+_train_leases_lock = threading.Lock()
+
+
+def note_train_lease(job_id: str, ceiling: int) -> int:
+    """Record that a request asked this job to run up to ``ceiling`` pods.
+
+    Only ever RAISES the target: a later request asking for fewer must not
+    shrink a fleet the earlier one is relying on, and the operator's block has
+    already bound `ceiling` before it gets here.
+    """
+    jid, want = str(job_id or ""), max(0, int(ceiling or 0))
+    if not jid or want <= 0:
+        return 0
+    with _train_leases_lock:
+        now = int(_train_leases.get(jid) or 0)
+        if want > now:
+            _train_leases[jid] = want
+        return int(_train_leases.get(jid) or 0)
+
+
+def train_lease(job_id: str) -> int:
+    with _train_leases_lock:
+        return int(_train_leases.get(str(job_id)) or 0)
+
+
+def _forget_train_lease(job_id: str) -> None:
+    with _train_leases_lock:
+        _train_leases.pop(str(job_id), None)
+
+
+#: How long each slice of a boot wait is. Short enough that a cancel is acted
+#: on promptly, long enough that the surrounding loop costs nothing:
+#: wait_ready polls every 5s whatever this is.
+_SLICE_S = 20.0
+
 #: Serialises the FIRST `from transformers import ...` across job threads.
 #: Held only for the import, never for the work.
 _TRANSFORMERS_IMPORT_LOCK = threading.Lock()
@@ -3490,11 +3533,28 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     # already running, so it can watch that instead.
     _already = _active_text_job_for(getattr(req, "name", ""), exclude=job_id)
     if _already:
-        raise RuntimeError(
-            f"{_already} is already training {req.name!r} and has not "
-            f"finished; two jobs writing one adapter average into each other "
-            f"and rent two fleets. Watch {_already}, or cancel it first "
-            f"(POST /v1/loras/jobs/{_already}/cancel).")
+        # JOIN IT, the way a serving pool takes a repeat request: "asking for
+        # warm pods cancels a pending release -- the client changed its mind".
+        # A second RUN of the same adapter would be wrong (two fleets
+        # averaging into one directory, last round wins), but a second REQUEST
+        # is a client saying "still want this, and I will take more pods" --
+        # so it carries into the SAME pool and raises that job's target.
+        # Refusing it, which is what I did first, stopped the duplicate fleets
+        # and also threw away the only signal the caller had.
+        _blk = _flt.config_for_model(req.base_model)
+        _want = int(_flt.narrow(_blk, pods=req.pods,
+                                max_pods=req.max_pods).max_pods or 0)
+        _now = note_train_lease(_already, _want)
+        print(f"[text-lora] {job_id}: {req.name!r} is already being trained "
+              f"by {_already}; carrying this request into that run — target "
+              f"now {_now} pod(s)", flush=True)
+        _update_job(job_id, status="done", active=False,
+                    message=(f"joined {_already}, which is already training "
+                             f"{req.name!r}; its pod target is now {_now}"))
+        return {"joined": _already, "name": req.name, "pods_target": _now,
+                "detail": (f"{_already} is already training {req.name!r}; this "
+                           f"request raised its pod target to {_now} instead "
+                           f"of starting a second run")}
     from codai.api import text_lora_trainer as tlt
     # UNDER A LOCK. transformers imports its public names lazily, and that
     # machinery is not safe against two threads taking it at once: each text
@@ -4071,12 +4131,29 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 if _left <= 0:
                     fleet.release(shard, "no address")
                     return None
+                _slice = min(_SLICE_S, _left)
                 try:
                     # A slice, not the whole budget: the loop is what makes the
-                    # cancel responsive. 20s keeps the polling cost the same as
-                    # before (wait_ready polls every 5s regardless).
-                    url = fleet.address(shard, timeout=min(20.0, _left))
+                    # cancel responsive. wait_ready polls every 5s regardless,
+                    # so slicing costs nothing extra.
+                    url = fleet.address(shard, timeout=_slice)
                 except Exception as exc:
+                    # A SLICE EXPIRING IS NOT A FAILURE. wait_ready RAISES at
+                    # its deadline ("did not expose port 8000 within 20.0s"),
+                    # so the first version of this loop treated every slice as
+                    # the pod never coming up: it released the card after 20
+                    # seconds and failed the job, turning a 1800s budget into
+                    # one slice. Only a verdict that more waiting cannot change
+                    # -- an unreachable host, a container that exited -- ends
+                    # the wait here.
+                    _m = str(exc)
+                    _fatal = ("cannot be reached" in _m
+                              or "EXITED on boot" in _m
+                              or "entered status" in _m)
+                    if not _fatal and f"within {_slice}" in _m:
+                        continue          # the slice ran out; keep waiting
+                    if not _fatal and (time.time() < _deadline):
+                        continue
                     print(f"[text-lora] {job_id}: shard {shard} never came "
                           f"up: {exc}", flush=True)
                     fleet.release(shard, "never published a port")
@@ -4165,6 +4242,14 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             # only safe moment: the cohort for the open round is already fixed,
             # so a pod that arrives now joins the next one. Bounded by the
             # operator's ceiling, and it rents only what is missing.
+            # The lease, re-read every round: a request that arrived after
+            # this job started raises the target, and the growth it asks for
+            # happens here rather than in a second fleet.
+            _leased = train_lease(job_id)
+            if _leased > _ceiling:
+                print(f"[text-lora] {job_id}: target raised to {_leased} "
+                      f"pod(s) by a later request", flush=True)
+                _ceiling = _leased
             if rnd != _topped_up[0] and len(fleet.pods) < _ceiling:
                 _topped_up[0] = rnd
                 try:
@@ -4296,3 +4381,6 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                  if leftover else ""), flush=True)
         with _coord_lock:
             _train_coordinators.pop(job_id, None)
+        # The lease dies with the job it raised: leaving it would hand a target
+        # from a finished run to a future job that happens to reuse the id.
+        _forget_train_lease(job_id)
