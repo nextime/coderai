@@ -3525,7 +3525,9 @@ class _TextTrainCoordinator:
     """
 
     def __init__(self, job_id: str, *, plan, tracker, fleet, encoded,
-                 out_dir: str, settings, dataset_id: str = ""):
+                 out_dir: str, settings, dataset_id: str = "",
+                 base: str = "", field_map: Optional[dict] = None,
+                 total_rounds: int = 1):
         from codai.api import text_lora_rounds as tlr
         self.job_id = job_id
         self.plan = plan
@@ -3535,6 +3537,9 @@ class _TextTrainCoordinator:
         self.out_dir = out_dir
         self.settings = settings
         self.dataset_id = dataset_id
+        self.base = base
+        self.field_map = dict(field_map or {})
+        self.total_rounds = max(1, int(total_rounds))
         self.secret = secrets.token_urlsafe(32)
         self._averages: Dict[int, str] = {}
         self._lock = threading.Lock()
@@ -3542,12 +3547,24 @@ class _TextTrainCoordinator:
 
     # -- what a pod is told ---------------------------------------------- #
 
+    def finished(self) -> bool:
+        return self.tracker.round >= self.total_rounds
+
     def assignment(self, shard: int) -> dict:
         rnd = self.tracker.round
+        if self.finished():
+            # The pod's exit signal. Without it a pod polls forever on a job
+            # that is over, which is a pod billing for nothing.
+            return {"job": self.job_id, "shard": int(shard), "round": rnd,
+                    "finished": True, "rounds": self.total_rounds}
         return {
             "job": self.job_id, "shard": int(shard), "round": rnd,
+            "finished": False, "rounds": self.total_rounds,
             "n_shards": self.plan.n_shards,
-            "indices": self.plan.indices_for(int(shard), len(self.encoded)),
+            "base": self.base, "field_map": self.field_map or None,
+            "indices": self.plan.indices_for(int(shard), len(self.encoded),
+                                             round=rnd,
+                                             rounds=self.total_rounds),
             "dataset_id": self.dataset_id,
             # Where to start: the previous round's average, or the bare base on
             # round 0. Named as a round rather than a blob id so a pod that
@@ -3608,3 +3625,51 @@ class _TextTrainCoordinator:
             if self.fleet.release(pod.shard, "stopped checking in"):
                 gone.append(pod.shard)
         return gone
+
+
+@router.get("/v1/loras/datasets/{ident}/content",
+            summary="Fetch an uploaded dataset (pod-facing)")
+async def text_dataset_content(ident: str, request: Request):
+    """Stream a stored dataset back.
+
+    A training pod fetches its dataset this way rather than having it baked into
+    an image or pushed to a volume: one file, one place, addressed by the hash
+    of its contents, so every pod in a fleet provably trains on the same bytes.
+
+    Authenticated by any live job's secret -- a pod has no user token, and the
+    thing it is allowed to read is the dataset it was rented to train on.
+    """
+    from codai.api import text_lora_dataset as tld
+    sent = (request.headers.get("authorization") or "").strip()
+    if sent.lower().startswith("bearer "):
+        sent = sent[7:].strip()
+    with _coord_lock:
+        ok = any(secrets.compare_digest(sent, c.secret)
+                 for c in _train_coordinators.values()) if sent else False
+    if not ok:
+        raise HTTPException(status_code=401, detail="bad job credential")
+    if not tld.dataset_exists(ident):
+        raise HTTPException(status_code=404, detail="dataset not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(tld.dataset_path(ident), media_type="application/x-ndjson",
+                        filename="dataset.jsonl")
+
+
+@router.get("/v1/loras/train/text/{job_id}/runner",
+            summary="The script a training pod runs (pod-facing)")
+async def text_train_runner(job_id: str, request: Request):
+    """The pod-side runner's source.
+
+    Served rather than baked into the image for two reasons: the protocol can
+    change without republishing a 22 GB image, and a pod can never be running a
+    different version of it than the orchestrator it is talking to.
+    """
+    _require_job_secret(job_id, request)
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(here, "packaging", "runpod", "text_lora_pod_runner.py")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=500,
+                            detail="the pod runner is missing from this install")
+    from fastapi.responses import PlainTextResponse
+    with open(path, "r", encoding="utf-8") as fh:
+        return PlainTextResponse(fh.read(), media_type="text/x-python")

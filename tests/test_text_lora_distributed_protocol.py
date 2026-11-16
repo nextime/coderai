@@ -62,7 +62,8 @@ def run(monkeypatch, tmp_path):
         "job-d", plan=plan, tracker=tracker, fleet=fleet,
         encoded=[Enc(i) for i in range(30)],
         out_dir=str(tmp_path / "out"), settings=tlt.QLoraSettings(),
-        dataset_id="sha256:" + "a" * 64)
+        dataset_id="sha256:" + "a" * 64, base="Qwen/Qwen3.8-27B",
+        total_rounds=3)
     fleet.provision([0, 1, 2])
     with loras._coord_lock:
         loras._train_coordinators["job-d"] = coord
@@ -113,16 +114,24 @@ def test_a_pod_is_told_its_shard_round_and_indices(run):
                             headers=_hdr(run["coord"])).json()
     assert got["shard"] == 1 and got["round"] == 0 and got["n_shards"] == 3
     assert got["resume_round"] is None, "round 0 starts from the base"
-    assert len(got["indices"]) == 10
+    # A per-ROUND slice, not the whole shard: ten examples per shard over three
+    # rounds is four, four, two.
+    assert len(got["indices"]) == 4
+    assert got["base"] == "Qwen/Qwen3.8-27B"
     assert got["settings"]["rank"] == 16 and got["settings"]["max_len"] == 8192
 
 
-def test_the_shards_cover_the_dataset_exactly_once_over_the_wire(run):
+def test_every_example_is_trained_exactly_once_across_shards_and_rounds(run):
+    """The property that matters, over the wire rather than in the planner: no
+    example is trained twice and none is skipped. An overlap wastes GPU hours
+    on a lesson already learned; a gap silently drops data."""
     c, coord = run["client"], run["coord"]
     seen = []
-    for s in range(3):
-        seen += c.get(f"/v1/loras/train/text/job-d/shard?shard={s}",
-                      headers=_hdr(coord)).json()["indices"]
+    for rnd in range(3):
+        for s in range(3):
+            seen += c.get(f"/v1/loras/train/text/job-d/shard?shard={s}",
+                          headers=_hdr(coord)).json()["indices"]
+        coord.tracker.round = rnd + 1
     assert sorted(seen) == list(range(30))
 
 
@@ -249,3 +258,58 @@ def test_a_silent_pod_is_released_and_its_shard_reported(run):
     assert sorted(gone) == [0, 1, 2]
     assert sorted(runpod.terminated) == ["pod1", "pod2", "pod3"]
     assert flt.orphans() == [], "released means no longer billing and no longer listed"
+
+
+# -------------------------------------------------- the pod's exit signal ----
+
+def test_a_finished_job_tells_the_pod_to_stop(run):
+    """Without this a pod polls forever on a job that is over -- which is a pod
+    billing for nothing, the exact failure the fleet's reaper exists to catch
+    and the one it should never have to."""
+    c, coord, tmp = run["client"], run["coord"], run["tmp"]
+    for rnd in range(3):
+        for s in range(3):
+            c.post(f"/v1/loras/train/text/job-d/round?shard={s}&round={rnd}"
+                   f"&examples=10", headers=_hdr(coord),
+                   content=_adapter_bytes(tmp, s + rnd, f"f{rnd}{s}.safetensors"))
+        assert coord.close_round_if_ready() == rnd
+    got = c.get("/v1/loras/train/text/job-d/shard?shard=0",
+                headers=_hdr(coord)).json()
+    assert got["finished"] is True
+    assert "indices" not in got, "no work is handed out after the last round"
+
+
+def test_a_round_slice_is_a_third_of_the_shard_over_three_rounds(run):
+    """Round length is chosen from measured throughput, so a shard is cut into
+    per-round slices -- and over a full cycle a pod still sees its whole shard
+    exactly once."""
+    c, coord = run["client"], run["coord"]
+    seen = []
+    for rnd in range(3):
+        got = c.get("/v1/loras/train/text/job-d/shard?shard=0",
+                    headers=_hdr(coord)).json()
+        assert len(got["indices"]) <= 4, "a third of ten, rounded up"
+        seen += got["indices"]
+        coord.tracker.round = rnd + 1          # pretend the round closed
+    whole = coord.plan.indices_for(0, 30)
+    assert sorted(seen) == sorted(whole), "the full shard, once, across rounds"
+
+
+def test_the_pod_runner_is_served_to_an_authenticated_pod(run):
+    """Served rather than baked, so the protocol can change without
+    republishing the image and the two can never disagree."""
+    c, coord = run["client"], run["coord"]
+    assert c.get("/v1/loras/train/text/job-d/runner").status_code == 401
+    got = c.get("/v1/loras/train/text/job-d/runner", headers=_hdr(coord))
+    assert got.status_code == 200
+    assert "CODERAI_TRAIN_SHARD" in got.text and "def main" in got.text
+
+
+def test_the_dataset_is_fetchable_by_a_pod_but_not_anonymously(run, tmp_path):
+    from codai.api import text_lora_dataset as tld
+    body = b'{"messages": [{"role": "user", "content": "q"}], "answer": "a"}\n'
+    hexd, _existed, _n = tld.save_dataset_stream([body])
+    c, coord = run["client"], run["coord"]
+    assert c.get(f"/v1/loras/datasets/sha256:{hexd}/content").status_code == 401
+    got = c.get(f"/v1/loras/datasets/sha256:{hexd}/content", headers=_hdr(coord))
+    assert got.status_code == 200 and got.content == body

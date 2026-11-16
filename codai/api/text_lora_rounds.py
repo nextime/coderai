@@ -152,12 +152,27 @@ class RoundPlan:
     def shard_of(self, index: int) -> int:
         return index % max(1, int(self.n_shards))
 
-    def indices_for(self, shard: int, n_examples: int) -> List[int]:
+    def indices_for(self, shard: int, n_examples: int, *,
+                    round: int = -1, rounds: int = 1) -> List[int]:
+        """This shard's examples, or just this ROUND's slice of them.
+
+        With ``round`` given, the shard's own list is cut into ``rounds`` equal
+        chunks and one is returned, so over a full cycle a pod sees its whole
+        shard exactly once. That is what lets the round LENGTH be chosen from
+        measured throughput -- short rounds exchange adapters more often, long
+        rounds spend less time transferring -- without changing what any pod
+        eventually trains on.
+        """
         import random
         order = list(range(n_examples))
         random.Random(self.seed).shuffle(order)
-        return [idx for i, idx in enumerate(order)
+        mine = [idx for i, idx in enumerate(order)
                 if self.shard_of(i) == int(shard)]
+        if round is None or int(round) < 0 or int(rounds) <= 1:
+            return mine
+        r = int(round) % max(1, int(rounds))
+        per = -(-len(mine) // int(rounds))        # ceil, so nothing is dropped
+        return mine[r * per:(r + 1) * per]
 
 
 class RoundTracker:

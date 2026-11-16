@@ -322,7 +322,7 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
 
 def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
                  out_dir: str, on_progress=None, check=None,
-                 resume: bool = True) -> Dict[str, Any]:
+                 resume: bool = True, init_adapter: str = "") -> Dict[str, Any]:
     """Train the adapter and save it. Returns a summary.
 
     One example per forward: these sequences reach 8192 tokens and a 27B 4-bit
@@ -338,6 +338,25 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
     torch.manual_seed(settings.seed)
 
     model, _line = load_base_and_adapter(base, settings)
+    if init_adapter:
+        # A distributed round starts from the PREVIOUS round's average, not from
+        # a fresh adapter: that is the whole mechanism. Loaded into the existing
+        # LoRA modules by name, and a key that does not fit is fatal rather than
+        # skipped -- silently starting from random weights would look exactly
+        # like a round that trained badly.
+        from safetensors.torch import load_file
+        incoming = load_file(init_adapter)
+        own = dict(model.state_dict())
+        missing = [k for k in incoming if k not in own]
+        if missing:
+            raise RuntimeError(
+                f"{init_adapter} has {len(missing)} key(s) this model has no "
+                f"place for, e.g. {missing[:3]} -- it was trained against a "
+                f"different base or target set")
+        loaded = model.load_state_dict(incoming, strict=False)
+        print(f"[text-lora] resumed from {os.path.basename(init_adapter)} "
+              f"({len(incoming)} tensors)", flush=True)
+        del incoming, own, loaded
     progress = load_progress(out_dir) if resume else Progress()
     if progress.step:
         print(f"[text-lora] resuming from step {progress.step} "
