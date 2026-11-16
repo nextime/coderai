@@ -170,3 +170,49 @@ def test_the_loop_no_longer_skips_a_pod_that_submitted():
     assert "any(s.shard == shard\n                                      for s in coord.tracker.have(rnd))" \
         not in src
     assert "A POD THAT ALREADY SUBMITTED IS NOT SKIPPED" in src
+
+
+def test_every_pod_gets_the_same_size_unit_of_work():
+    """The straggler bug, pinned.
+
+    A handout used to be `ceil(planned / live)` blocks, and `live` was the
+    cohort AT THAT MOMENT -- so the first pod into an exchange got sixteen
+    blocks and the sixteenth got one. On the first exchange that ever closed,
+    six pods were still training when the deadline fired and their adapters
+    were refused: twenty minutes of six cards, discarded, and the average
+    weighted by 297 examples of the ~2000 handed out.
+
+    Equal units, and a fast pod simply takes more of them.
+    """
+    c, t = _coord(n=7308, n_shards=16, rounds=16)
+    # a pod arriving when it is alone must not be handed the whole exchange
+    c.cohort(0, [0], grow=True)
+    alone = c.assignment(0)["indices"]
+    _finish(c, t, 0)
+    # ...and one arriving into a full cohort gets the same amount
+    c.cohort(0, list(range(16)), grow=True)
+    crowded = c.assignment(9)["indices"]
+    assert len(alone) == len(crowded), (len(alone), len(crowded))
+    # which is ONE block
+    per = c.plan.block_size(len(c.encoded), c.total_rounds, c.planned_pods)
+    assert len(alone) == per
+
+
+def test_a_deadline_costs_at_most_one_block_per_pod():
+    """The consequence that makes equal units the right call: whatever a pod
+    is holding when an exchange closes is what gets discarded."""
+    c, t = _coord(n=7308, n_shards=16, rounds=16)
+    c.cohort(0, list(range(16)), grow=True)
+    per = c.plan.block_size(len(c.encoded), c.total_rounds, c.planned_pods)
+    for sh in range(16):
+        held = c.assignment(sh)["indices"]
+        assert len(held) == per, "a pod holds more than one block"
+
+
+def test_the_averaging_line_separates_submissions_from_pods():
+    """"averaged from 22 shard(s)" was 22 SUBMISSIONS across fewer pods, which
+    reads as a fleet larger than the one that exists."""
+    import inspect
+    src = inspect.getsource(loras._TextTrainCoordinator.close_round_if_ready)
+    assert "submission(s) across" in src
+    assert "{_pods} pod(s)" in src

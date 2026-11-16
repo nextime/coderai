@@ -40,7 +40,12 @@ DATASET = os.path.join(WORK, "dataset.jsonl")
 
 _lock = threading.Lock()
 _state = {"state": "idle", "round": -1, "step": 0, "examples_trained": 0,
-          "error": "", "adapter": ""}
+          "error": "", "adapter": "",
+          #: How many examples THIS POD encoded, and how many it was asked
+          #: for. The orchestrator cannot otherwise tell whether a slice
+          #: landed: it sends indices into its own ordering and had no way to
+          #: check that the pod's ordering is the same length.
+          "encoded": 0, "asked": 0}
 _worker = None
 #: The encoded dataset, kept between rounds: encoding 7000 examples takes
 #: minutes and the file never changes, so paying it once matters when a round
@@ -97,17 +102,45 @@ def _train(payload):
                                      max_len=settings.max_len,
                                      enable_thinking=settings.enable_thinking)
             _cache["examples"] = enc
+            _set(encoded=len(enc))
             print(f"[pod] encoded: {stats.describe()}", flush=True)
 
-        mine = [_cache["examples"][i] for i in payload.get("indices") or []
-                if i < len(_cache["examples"])]
+        # REFUSED, NOT FILTERED. This was a comprehension with
+        # `if i < len(_cache["examples"])`, which dropped every index past
+        # the end of this pod's own encoding SILENTLY: the pod then trained
+        # whatever survived and reported that as `examples_trained`, so a pod
+        # whose encoded set disagreed with the orchestrator's looked like a
+        # pod that had simply done less work. Measured on a live run: an
+        # exchange averaged 297 examples where ~2000 had been handed out, and
+        # nothing anywhere said why.
+        #
+        # The two sides must agree on the ordering or the indices mean
+        # nothing, so a disagreement is fatal and says both counts.
+        _want = list(payload.get("indices") or [])
+        _have = len(_cache["examples"])
+        _out = [i for i in _want if i >= _have]
+        if _out:
+            raise RuntimeError(
+                f"this round asked for {len(_want)} example(s) but "
+                f"{len(_out)} of them are past the end of this pod's "
+                f"encoded set ({_have} examples, highest index asked for "
+                f"{max(_want)}): the orchestrator and this pod disagree "
+                f"about the dataset, so the indices do not mean the same "
+                f"thing on both sides")
+        mine = [_cache["examples"][i] for i in _want]
         if not mine:
             raise RuntimeError("no examples in this round's slice")
+        # SAID OUT LOUD, every round. Pod stdout is not collected, so this is
+        # also reported through /status below: the pod's own example count is
+        # the only way to tell "trained its slice" from "trained a tenth of
+        # it", and it was the one number that never reached the orchestrator.
+        print(f"[pod] round {rnd}: {len(mine)} example(s) of this pod's "
+              f"{_have} encoded", flush=True)
 
         out_dir = os.path.join(WORK, f"round{rnd}")
         start = os.path.join(WORK, "start.safetensors")
         _set(state="training", round=rnd, step=0, examples_trained=0,
-             adapter="", error="")
+             adapter="", error="", encoded=_have, asked=len(mine))
         result = tlt.run_training(
             base=base, encoded=mine, settings=settings, out_dir=out_dir,
             resume=False,

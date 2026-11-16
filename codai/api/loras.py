@@ -4004,20 +4004,27 @@ class _TextTrainCoordinator:
                 return list(mine[int(shard)])
             issued = self._issued.setdefault(int(rnd), set())
             total = self.total_blocks()
-            # HOW MANY AT ONCE. The granularity is fixed -- block boundaries
-            # must never move, or "already covered" stops meaning anything --
-            # but the SHARE is not: a fleet of three where sixteen were
-            # planned takes five blocks each, so an exchange still covers
-            # about `n/rounds` and the 318 MB adapter exchange stays a
-            # rounding error against the training between them. With 29
-            # examples a block, one block per pod would have averaged 84
-            # times over an epoch and moved 80 GB of adapters.
-            # THE STORED COHORT, read directly. `self.cohort()` takes this
-            # same lock and `threading.Lock` is not reentrant, so calling it
-            # from in here deadlocks the whole run -- which it did, on the
-            # first handout, before any pod was touched.
-            live = max(1, len(self._cohorts.get(int(rnd)) or ()) or 1)
-            want_n = max(1, -(-self.planned_pods // live))
+            # ONE BLOCK AT A TIME, and the sizing cleverness that used to be
+            # here is gone. It handed out `ceil(planned / live)` blocks, and
+            # `live` is whatever the cohort happened to be AT THE MOMENT OF
+            # THE HANDOUT -- so the first pod into an exchange got eight or
+            # sixteen blocks while the sixteenth got one. Wildly unequal work
+            # inside a single exchange, and the early pods could not possibly
+            # finish before the round's deadline.
+            #
+            # Measured on the first exchange that ever closed: six pods were
+            # still training when the 1200s deadline fired, their adapters
+            # refused as a round behind, and the average weighted by 297
+            # examples of the ~2000 handed out. Twenty minutes of six cards,
+            # thrown away.
+            #
+            # A fast pod taking ANOTHER block does the adaptation instead, and
+            # does it fairly: every pod holds the same small unit, quick cards
+            # get through more of them, and a deadline costs at most one block
+            # per pod. Coverage per exchange is then whatever the fleet gets
+            # through before the deadline -- self-balancing, and it needs no
+            # estimate of anything.
+            want_n = 1
             got: List[int] = []
             while len(got) < want_n:
                 b = None
@@ -4192,8 +4199,10 @@ class _TextTrainCoordinator:
                     os.remove(_s.path)
             except Exception:
                 pass            # disk hygiene must never fail a paid round
+        _pods = len({int(s.shard) for s in subs})
         print(f"[text-lora] {self.job_id}: round {rnd} averaged from "
-              f"{len(subs)} shard(s) ({int(sum(weights))} examples)"
+              f"{len(subs)} submission(s) across {_pods} pod(s) "
+              f"({int(sum(weights))} examples)"
               + (f"; absent: {absent}" if absent else ""), flush=True)
         return rnd
 
@@ -4684,6 +4693,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         _topup_every = [_TOPUP_MIN_S]
         #: Said once per round, not once per poll.
         _no_work_said = [False]
+        #: Shards already reported for an encode-count disagreement.
+        _warned_encode: set = set()
 
         while not coord.finished():
             _check_train_cancel()
@@ -4859,6 +4870,26 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                              if _back else "")
                           + f"; starting it on round {rnd}", flush=True)
                     # and fall through: it is idle now, so it gets this round
+                # THE TWO COUNTS, COMPARED. The pod now reports how many
+                # examples IT encoded, and a disagreement with this side's
+                # count means the indices do not refer to the same thing on
+                # both ends -- which produced an exchange averaged from 297
+                # examples where ~2000 had been handed out, with nothing
+                # anywhere saying why. Reported once per pod, loudly, because
+                # the pod's own refusal arrives as a generic round failure.
+                _penc = int(status.get("encoded") or 0)
+                if _penc and _penc != len(coord.encoded) \
+                        and shard not in _warned_encode:
+                    _warned_encode.add(shard)
+                    print(f"[text-lora] {job_id}: shard {shard} encoded "
+                          f"{_penc} example(s) but this side has "
+                          f"{len(coord.encoded)} — the indices do not mean "
+                          f"the same thing on both ends; its rounds will be "
+                          f"refused rather than silently trained short",
+                          flush=True)
+                    _update_job(job_id, last_error=(
+                        f"shard {shard} encoded {_penc} examples, "
+                        f"orchestrator has {len(coord.encoded)}"))
                 if state == "error":
                     stages.failed(f"train(shard {shard})",
                                   str(status.get("error") or "")[:200])
