@@ -153,26 +153,44 @@ class RoundPlan:
         return index % max(1, int(self.n_shards))
 
     def indices_for(self, shard: int, n_examples: int, *,
-                    round: int = -1, rounds: int = 1) -> List[int]:
-        """This shard's examples, or just this ROUND's slice of them.
+                    round: int = -1, rounds: int = 1,
+                    n_shards: Optional[int] = None) -> List[int]:
+        """One position's examples for one round.
 
-        With ``round`` given, the shard's own list is cut into ``rounds`` equal
-        chunks and one is returned, so over a full cycle a pod sees its whole
-        shard exactly once. That is what lets the round LENGTH be chosen from
-        measured throughput -- short rounds exchange adapters more often, long
-        rounds spend less time transferring -- without changing what any pod
-        eventually trains on.
+        ROUND FIRST, then the split across positions. The order used to be the
+        other way -- the shard's own list cut into ``rounds`` chunks -- which
+        gives each pod its whole shard over a full cycle, but ONLY while the
+        number of shards never changes. The moment a fleet grows or shrinks
+        between rounds, the union across rounds both repeats some examples and
+        misses others, silently: coverage is a property of a fixed partition,
+        and the fleet is not fixed.
+
+        Slicing the global order by round first makes every round's content a
+        function of (seed, round, rounds) alone -- the same 1/rounds of the
+        dataset whatever the fleet size -- and then splits THAT chunk among
+        however many pods are present. So a run can start on one pod and reach
+        eight without training some examples twice and others never, which is
+        what makes scaling up safe rather than merely possible.
+
+        ``n_shards`` overrides the plan's own count, because the number that
+        matters is how many pods are in THIS round's cohort.
         """
         import random
+        k = int(n_shards if n_shards is not None else self.n_shards)
+        k = max(1, k)
+        pos = int(shard) % k
         order = list(range(n_examples))
         random.Random(self.seed).shuffle(order)
-        mine = [idx for i, idx in enumerate(order)
-                if self.shard_of(i) == int(shard)]
         if round is None or int(round) < 0 or int(rounds) <= 1:
-            return mine
-        r = int(round) % max(1, int(rounds))
-        per = -(-len(mine) // int(rounds))        # ceil, so nothing is dropped
-        return mine[r * per:(r + 1) * per]
+            chunk = order
+        else:
+            r = int(round) % max(1, int(rounds))
+            per = -(-len(order) // int(rounds))   # ceil, so nothing is dropped
+            chunk = order[r * per:(r + 1) * per]
+        # Round-robin within the round's chunk: contiguous blocks would hand a
+        # pod a run of adjacent examples from the shuffle, and with a
+        # fleet-sized block that is a correlated slice rather than a sample.
+        return [idx for j, idx in enumerate(chunk) if j % k == pos]
 
 
 class RoundTracker:
@@ -193,8 +211,25 @@ class RoundTracker:
         self._subs: Dict[int, Dict[int, Submission]] = {}
         self._opened_at: Dict[int, float] = {}
         self._missed: Dict[int, int] = {}
+        #: How many pods a given round actually HAS. `plan.n_shards` is the
+        #: shape the job was planned at; a fleet that starts on one pod and
+        #: grows to eight has a different number in every round, and judging
+        #: "enough arrived" against the planned number means a round with two
+        #: pods in it can never be complete -- it waits out the deadline every
+        #: time, which is how a growing fleet crawls.
+        self._expected: Dict[int, int] = {}
 
     # -- submissions ------------------------------------------------------ #
+
+    def expect(self, rnd: int, cohort: int) -> None:
+        """Record how many pods are in round ``rnd``."""
+        self._expected[int(rnd)] = max(1, int(cohort))
+
+    def expected(self, rnd: Optional[int] = None) -> int:
+        """The cohort size for a round, falling back to the planned shape."""
+        r = self.round if rnd is None else int(rnd)
+        got = self._expected.get(r)
+        return int(got) if got else max(1, int(self.plan.n_shards))
 
     def open_round(self, rnd: int, now: Optional[float] = None) -> None:
         self._opened_at.setdefault(rnd, now if now is not None else time.time())
@@ -236,9 +271,10 @@ class RoundTracker:
         got = len(self._subs.get(self.round, {}))
         if got == 0:
             return False
-        if got >= self.plan.n_shards:
+        want = self.expected()
+        if got >= want:
             return True
-        if got / float(self.plan.n_shards) >= self.min_fraction:
+        if got / float(want) >= self.min_fraction:
             return True
         if self.deadline_s > 0:
             opened = self._opened_at.get(self.round)
@@ -249,7 +285,7 @@ class RoundTracker:
 
     def missing(self) -> List[int]:
         present = set(self._subs.get(self.round, {}))
-        return [s for s in range(self.plan.n_shards) if s not in present]
+        return [s for s in range(self.expected()) if s not in present]
 
     def close_round(self) -> Tuple[List[Submission], List[int]]:
         """Finish the round: returns what will be averaged and who was absent.

@@ -270,7 +270,7 @@ class TrainerFleet:
     # -- renting ---------------------------------------------------------- #
 
     def provision(self, shards: Sequence[int]) -> List[TrainerPod]:
-        """Rent one pod per shard, stopping at the first refusal.
+        """Rent one pod per shard, trying EVERY shard.
 
         A partial fleet is a usable fleet -- the round protocol averages what
         arrives -- so a budget ceiling reached halfway is reported and the job
@@ -290,9 +290,41 @@ class TrainerFleet:
                 break
             pod = self._rent_one(shard)
             if pod is None:
-                break
+                # NOT a break. Capacity is per CARD: shard 3 failing to find
+                # an A40 says nothing about shard 4 getting an A6000, and
+                # stopping here abandoned every remaining shard on one
+                # refusal -- so a job that asked for eight often got two and
+                # never tried for the rest.
+                continue
             started.append(pod)
+        if started and len(started) < len(list(shards)):
+            self._say(f"{len(started)} of {len(list(shards))} pod(s) rented; "
+                      f"the rest had no capacity and will be retried between "
+                      f"rounds")
         return started
+
+    def top_up(self, want: int, *, cap: int = 0) -> List[TrainerPod]:
+        """Try to reach ``want`` pods, renting only what is missing.
+
+        Called between rounds. Waiting for a full fleet before starting is
+        what made a large job impossible: the pods that arrive first bill
+        while the others are hunted, and the bigger the fleet the less likely
+        it ever assembles. Starting small and growing costs nothing extra --
+        every pod is paid by the second either way -- and the round protocol
+        re-partitions per round, so a pod that joins at round 5 simply takes a
+        share of round 5.
+        """
+        with self._lock:
+            have = set(self.pods)
+        want = max(0, int(want))
+        if cap > 0:
+            want = min(want, int(cap))
+        if len(have) >= want:
+            return []
+        missing = [i for i in range(want) if i not in have]
+        if not missing:
+            return []
+        return self.provision(missing)
 
     def _refusal_for_one_more(self) -> str:
         """Why one more pod may not be rented, or ''.

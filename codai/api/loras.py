@@ -3647,6 +3647,9 @@ class _TextTrainCoordinator:
         self.total_rounds = max(1, int(total_rounds))
         self.secret = secrets.token_urlsafe(32)
         self._averages: Dict[int, str] = {}
+        #: Which pods are in each round, by round number. Decided once per
+        #: round, because the index lists handed out are derived from it.
+        self._cohorts: Dict[int, list] = {}
         self._lock = threading.Lock()
         os.makedirs(out_dir, exist_ok=True)
 
@@ -3662,6 +3665,39 @@ class _TextTrainCoordinator:
                 "settings": a["settings"], "base": self.base,
                 "field_map": self.field_map or None}
 
+    def cohort(self, rnd: int, shards=None) -> list:
+        """Which pods are IN round ``rnd``, decided once when it opens.
+
+        Fixed for the round because the index lists are derived from it: a pod
+        joining mid-round would change the divisor and make every list already
+        handed out wrong. A late pod therefore trains from the NEXT round,
+        which is also when the fleet's new size is picked up.
+        """
+        r = int(rnd)
+        with self._lock:
+            have = self._cohorts.get(r)
+            if have is not None:
+                return list(have)
+            members = sorted(int(x) for x in (shards or []))
+            if not members:
+                return []
+            self._cohorts[r] = members
+            self.tracker.expect(r, len(members))
+            return list(members)
+
+    def position_of(self, shard: int, rnd: int) -> int:
+        """This pod's index within the round's cohort, or -1 if it is not in it.
+
+        The cohort position -- not the fleet shard id -- is what selects a
+        slice, because the slice count is the cohort size. With a fleet that
+        grows, shard 7 can be position 2.
+        """
+        members = self.cohort(rnd)
+        try:
+            return members.index(int(shard))
+        except ValueError:
+            return -1
+
     def assignment(self, shard: int) -> dict:
         rnd = self.tracker.round
         if self.finished():
@@ -3672,11 +3708,17 @@ class _TextTrainCoordinator:
         return {
             "job": self.job_id, "shard": int(shard), "round": rnd,
             "finished": False, "rounds": self.total_rounds,
-            "n_shards": self.plan.n_shards,
+            "n_shards": max(1, len(self.cohort(rnd)) or self.plan.n_shards),
             "base": self.base, "field_map": self.field_map or None,
-            "indices": self.plan.indices_for(int(shard), len(self.encoded),
-                                             round=rnd,
-                                             rounds=self.total_rounds),
+            # The ROUND'S cohort decides both the divisor and this pod's
+            # position in it. Using the planned shard count would hand a
+            # two-pod round the slices of an eight-pod one, so six eighths of
+            # that round's examples would go to pods that do not exist.
+            "indices": self.plan.indices_for(
+                max(0, self.position_of(int(shard), rnd)),
+                len(self.encoded), round=rnd, rounds=self.total_rounds,
+                n_shards=max(1, len(self.cohort(rnd))
+                             or self.plan.n_shards)),
             "dataset_id": self.dataset_id,
             # Where to start: the previous round's average, or the bare base on
             # round 0. Named as a round rather than a blob id so a pod that
@@ -3974,10 +4016,52 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         stages.done("dataset", bytes=os.path.getsize(dataset_path))
         _update_job(job_id, status="training", total=rounds,
                     message=f"{len(ready)} pod(s) ready")
+        #: Last reported cohort size, so a change is announced once rather
+        #: than every poll.
+        _last_cohort = [0]
+        #: The last round a top-up was attempted in, so it is tried once per
+        #: round rather than on every poll of the loop.
+        _topped_up = [-1]
 
         while not coord.finished():
             _check_train_cancel()
             rnd = coord.tracker.round
+            # THIS ROUND'S COHORT: the pods that have an address right now.
+            # Fixed for the round, so the slices handed out stay consistent,
+            # and recomputed at the next one -- which is how a run that
+            # started on one pod uses eight when eight exist, without
+            # training some examples twice and others never.
+            # GROW TOWARD THE TARGET between rounds. A round boundary is the
+            # only safe moment: the cohort for the open round is already fixed,
+            # so a pod that arrives now joins the next one. Bounded by the
+            # operator's ceiling, and it rents only what is missing.
+            if rnd != _topped_up[0] and len(fleet.pods) < n_shards:
+                _topped_up[0] = rnd
+                try:
+                    grew = fleet.top_up(n_shards, cap=int(cfg.max_pods or 0))
+                    if grew:
+                        print(f"[text-lora] {job_id}: grew to "
+                              f"{len(fleet.pods)} pod(s) of {n_shards} at "
+                              f"round {rnd}", flush=True)
+                        for _sh in sorted(p.shard for p in grew):
+                            try:
+                                if fleet.address(_sh, timeout=0.1):
+                                    flt.push_dataset(fleet.pods[_sh],
+                                                     dataset_path)
+                            except Exception:
+                                pass      # it will be picked up when it boots
+                except Exception as exc:
+                    print(f"[text-lora] {job_id}: could not grow the fleet "
+                          f"({exc}); continuing with {len(fleet.pods)}",
+                          flush=True)
+            _live = [sh for sh in sorted(fleet.pods) if fleet.pods[sh].url]
+            _members = coord.cohort(rnd, _live)
+            if _members and len(_members) != _last_cohort[0]:
+                _last_cohort[0] = len(_members)
+                print(f"[text-lora] {job_id}: round {rnd} runs on "
+                      f"{len(_members)} pod(s)", flush=True)
+                _update_job(job_id,
+                            message=f"round {rnd}: {len(_members)} pod(s)")
             # Start the round on every pod that is idle and has not submitted.
             for shard in sorted(fleet.pods):
                 pod = fleet.pods[shard]
