@@ -344,19 +344,32 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
         # LoRA modules by name, and a key that does not fit is fatal rather than
         # skipped -- silently starting from random weights would look exactly
         # like a round that trained badly.
+        #
+        # THROUGH PEFT, not torch's load_state_dict, because the two naming
+        # conventions are not the same one. An adapter ON DISK has no adapter
+        # name in its keys -- `...lora_A.weight`, which is what
+        # `save_pretrained` writes -- while the LIVE module's state dict does:
+        # `...lora_A.default.weight`. `set_peft_model_state_dict` inserts that
+        # name on the way in; comparing the file's keys against
+        # `model.state_dict()` cannot ever match, so the check below reported
+        # EVERY key missing and raised. Measured in production: 512 of 512 keys
+        # "this model has no place for", on an adapter this very function had
+        # just saved, which killed all four surviving pods at round 1 of a
+        # 16-round run while round 0 had looked perfect. A distributed run
+        # could not pass its first exchange at all.
+        from peft import set_peft_model_state_dict
         from safetensors.torch import load_file
         incoming = load_file(init_adapter)
-        own = dict(model.state_dict())
-        missing = [k for k in incoming if k not in own]
-        if missing:
+        res = set_peft_model_state_dict(model, incoming)
+        unexpected = sorted(getattr(res, "unexpected_keys", None) or [])
+        if unexpected:
             raise RuntimeError(
-                f"{init_adapter} has {len(missing)} key(s) this model has no "
-                f"place for, e.g. {missing[:3]} -- it was trained against a "
-                f"different base or target set")
-        loaded = model.load_state_dict(incoming, strict=False)
+                f"{init_adapter} has {len(unexpected)} key(s) this model has "
+                f"no place for, e.g. {unexpected[:3]} -- it was trained "
+                f"against a different base or target set")
         print(f"[text-lora] resumed from {os.path.basename(init_adapter)} "
               f"({len(incoming)} tensors)", flush=True)
-        del incoming, own, loaded
+        del incoming, res
     progress = load_progress(out_dir) if resume else Progress()
     if progress.step:
         print(f"[text-lora] resuming from step {progress.step} "

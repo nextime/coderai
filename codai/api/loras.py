@@ -3698,8 +3698,23 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # Rent a fleet and drive the rounds. Everything above this point was
         # free; everything below it spends.
         try:
-            return {**summary, **_text_train_distributed(
-                req, job_id, dataset_path, encoded, stats, st, _train_cfg)}
+            _dist = _text_train_distributed(
+                req, job_id, dataset_path, encoded, stats, st, _train_cfg)
+            # TERMINAL, here. The local path below marks the record done after
+            # it trains; this one returned straight to the caller and left the
+            # record saying `training` forever. That is not cosmetic: the
+            # one-run-per-adapter check reads exactly this field, so a finished
+            # run stayed "already being trained by job-X" and every later
+            # request for that adapter was folded into a job that had ended --
+            # eleven of them in production, each answering "carrying this
+            # request into that run" and renting nothing. An adapter became
+            # permanently untrainable until the process restarted.
+            _update_job(job_id, status="done", active=False, force=True,
+                        path=_dist.get("path") or "",
+                        message=(f"trained {req.name} on "
+                                 f"{_dist.get('shards') or '?'} pod(s) over "
+                                 f"{_dist.get('rounds') or '?'} round(s)"))
+            return {**summary, **_dist}
         except TaskCancelled:
             _update_job(job_id, status="cancelled", active=False, force=True,
                         message="cancelled; pods released")
