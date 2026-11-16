@@ -97,10 +97,15 @@ def test_create_goes_to_v2_during_a_graphql_ban(monkeypatch):
     assert pid == "new1"
     m, path, body = calls[0]
     assert (m, path) == ("POST", "/pods")
-    assert body["gpu"] == {"id": "NVIDIA A40", "count": 1}
-    assert body["ports"] == ["8000/tcp"] and body["cloud"] == "SECURE"
+    # These assertions used to describe an INVENTED body -- `gpu: {id, count}`,
+    # `cloud`, a `mounts` tree -- and passing made the shape look verified
+    # while RunPod rejected it outright (HTTP 400 on a probe, 422 in
+    # production). The names below are RunPod's published PodCreateInput.
+    assert body["gpuTypeIds"] == ["NVIDIA A40"] and body["gpuCount"] == 1
+    assert body["ports"] == ["8000/tcp"] and body["cloudType"] == "SECURE"
+    assert body["imageName"] == "img"
     assert body["dataCenterIds"] == ["EU-SE-1"]
-    assert body["mounts"]["network"] == [{"volumeId": "vol1", "path": "/workspace"}]
+    assert body["networkVolumeId"] == "vol1"
 
 
 def test_v2_will_not_rent_spot(monkeypatch):

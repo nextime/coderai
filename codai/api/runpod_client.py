@@ -17,6 +17,7 @@ This module is pure transport: no scaling/policy logic (that lives in
 NEVER logged — only masked in error strings.
 """
 
+import shlex
 import os
 import threading
 import time
@@ -116,6 +117,25 @@ def _global_field_refused_gql(text: str) -> bool:
 #: Secure cloud always has a public IP, so this only ever narrows community
 #: offers -- which is exactly the set that cannot serve a direct-TCP pod.
 PUBLIC_IP_FIELD = "supportPublicIp"
+
+
+def _global_field_refused_rest(msg: str) -> bool:
+    """Whether a REST error is about the global-volume field specifically.
+
+    Keyed on the field name and on the shapes RunPod's validator uses for an
+    unknown property. Matching the bare word "global" would also swallow a
+    capacity message that happens to contain it, turning a real failure into a
+    silent retry.
+    """
+    low = str(msg or "").lower()
+    if GLOBAL_VOLUME_FIELD.lower() not in low:
+        return False
+    # 'recogni' rather than 'unrecogni': RunPod has used both spellings and
+    # both polarities ('unrecognized', 'not a recognised field'). Safe to
+    # broaden because the FIELD NAME must appear in the same message.
+    return ("additional propert" in low or "not allowed" in low
+            or "unknown" in low or "recogni" in low or "invalid" in low
+            or "validation" in low or "no such" in low)
 
 
 def _warn_global_volume_unsupported(volume_id: str) -> None:
@@ -895,22 +915,20 @@ class RunpodClient:
         argument as the server's own. Only the REST API accepts those, so the
         request goes there when they are given and stays on GraphQL otherwise.
         """
-        # DIRECT TCP GOES REST. A direct-TCP pod is only reachable with a
-        # public ip, and GraphQL now rejects the field that asks for one
-        # (`supportPublicIp` on PodFindAndDeployOnDemandInput) -- so every
-        # direct-TCP pod rented there is born unreachable and paid for until
-        # the boot timeout gives up. Measured: four trainer rentals in a row,
-        # each ~$0.45 for nothing, plus a vision pool re-renting in a circle
-        # every 17 seconds for the same reason. REST documents the field on
-        # PodCreateInput and publishes `<port>/tcp`, so it is not a preference
-        # but the only path that works.
-        # `and not is_spot` because REST v2 has no interruptible bidding: a
-        # spot request routed here would be refused outright, and the GraphQL
-        # refusal below -- which explains precisely why a direct-TCP spot pod
-        # cannot be rented reachable at all right now -- would never be
-        # reached. Route to REST only where REST can serve the request.
-        if ((entrypoint or start_cmd) or (direct_tcp and not is_spot)
-                or _gql_banned()):
+        # GraphQL stays the default, INCLUDING for direct TCP. I routed
+        # direct-TCP rentals here and it broke every new rental on the install:
+        # this body was built from an invented schema, RunPod answered 422, and
+        # the pods already running kept serving so it looked fine until
+        # something needed a new one. The serving pools had been renting
+        # direct-TCP pods on GraphQL for months and getting public ips; the
+        # missing `supportPublicIp` costs placement odds, not reachability, so
+        # the path I replaced was not broken and the replacement was.
+        #
+        # REST is still taken where GraphQL genuinely cannot serve the request
+        # -- entrypoint/cmd overrides, and while GraphQL is rate-limited --
+        # which is what it was for before. Its body is now RunPod's published
+        # PodCreateInput, so those two paths work for the first time.
+        if (entrypoint or start_cmd) or _gql_banned():
             # REST too while GraphQL is rate-limited: RunPod's bans have been
             # hours long, and REST kept answering through them.
             return self._create_pod_rest(
@@ -1030,53 +1048,67 @@ class RunpodClient:
         if is_spot:
             raise RunpodError("REST v2 cannot rent an interruptible (spot) pod; "
                               "that needs GraphQL")
+        # EVERY NAME HERE IS FROM RunPod's PUBLISHED SCHEMA (PodCreateInput,
+        # POST /v1/pods). The previous body was invented from a different
+        # shape -- `image`, `gpu: {id, count}`, `cloud`, `disk`, `registry`,
+        # `mounts` -- and the API rejected it outright (measured: HTTP 400 on
+        # a probe, and a 422 "additional properties" in production). Since
+        # this path was only taken for entrypoint/cmd overrides and while
+        # GraphQL was rate-limited, the breakage sat unseen behind a default
+        # that worked.
         body = {
             "name": name,
-            "image": image,
-            "gpu": {"id": gpu_type_id, "count": int(gpu_count)},
-            "cloud": (cloud_type or "SECURE").upper(),
-            "disk": int(container_disk_gb),
+            "imageName": image,
+            "gpuTypeIds": [gpu_type_id],
+            "gpuCount": int(gpu_count),
+            "cloudType": (cloud_type or "SECURE").upper(),
+            "containerDiskInGb": int(container_disk_gb),
+            # Array of strings, as the schema declares its items. (Its own
+            # `default` is written as one comma-joined string, which does not
+            # match the declared type -- so the declared type is what this
+            # sends.)
             "ports": [f"{int(port)}/{'tcp' if direct_tcp else 'http'}"],
             "env": {str(k): str(v) for k, v in (env or {}).items()},
         }
-        # See PUBLIC_IP_FIELD. v2 documents this on PodCreateInput with no
-        # default, and "If null, the Pod might not have a public IP address".
+        # Documented as: needed on COMMUNITY to expose a public ip, while on
+        # SECURE the pod always has one. Sent for a direct-TCP pod because the
+        # cloud may be either, and harmless where it is implied.
         if direct_tcp:
             body[PUBLIC_IP_FIELD] = True
+        if int(volume_gb or 0) > 0:
+            body["volumeInGb"] = int(volume_gb)
+            body["volumeMountPath"] = volume_mount_path or "/workspace"
         if docker_args:
-            body["args"] = docker_args
+            # No `args` field exists; a start command is dockerStartCmd, and
+            # it is an ARRAY. A bare string would be rejected or, worse,
+            # accepted as a single argv element.
+            body["dockerStartCmd"] = shlex.split(docker_args)
         if entrypoint:
-            body["entrypoint"] = list(entrypoint)
+            body["dockerEntrypoint"] = list(entrypoint)
         if start_cmd:
-            body["cmd"] = list(start_cmd)
+            body["dockerStartCmd"] = list(start_cmd)
         if data_center_id:
             body["dataCenterIds"] = [data_center_id]
         if registry_auth_id:
-            body["registry"] = registry_auth_id
-        mounts = {}
-        if int(volume_gb or 0) > 0:
-            mounts["persistent"] = {"size": int(volume_gb),
-                                    "path": volume_mount_path or "/workspace"}
+            body["containerRegistryAuthId"] = registry_auth_id
         if network_volume_id:
-            mounts["network"] = [{"volumeId": network_volume_id,
-                                  "path": volume_mount_path or "/workspace"}]
+            body["networkVolumeId"] = network_volume_id
         if global_volume_id:
-            mounts["global"] = [{"volumeId": global_volume_id}]
-        if mounts:
-            body["mounts"] = mounts
+            # Not in PodCreateInput at all. Kept behind the same guard the
+            # GraphQL path uses: sent so a future server can honour it, and
+            # dropped rather than failing the create when it will not.
+            body[GLOBAL_VOLUME_FIELD] = global_volume_id
         try:
             d = self._rest("POST", "/pods", body=body, timeout=90.0)
         except RunpodError as exc:
             # v2 documents global volumes as a mount, but a refused one must not
             # fail every create: rent without it (the weights download instead)
             # and say so once -- the same guard the GraphQL path keeps.
-            if not (global_volume_id and "global" in str(exc).lower()
-                    and (body.get("mounts") or {}).get("global")):
+            if not (global_volume_id and body.get(GLOBAL_VOLUME_FIELD)
+                    and _global_field_refused_rest(str(exc))):
                 raise
             _warn_global_volume_unsupported(global_volume_id)
-            body["mounts"].pop("global", None)
-            if not body["mounts"]:
-                body.pop("mounts")
+            body.pop(GLOBAL_VOLUME_FIELD, None)
             d = self._rest("POST", "/pods", body=body, timeout=90.0)
         pod_id = (d or {}).get("id") if isinstance(d, dict) else None
         if not pod_id:

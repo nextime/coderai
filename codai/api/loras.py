@@ -3367,6 +3367,20 @@ def _text_dataset_pass(req: TextLoraTrainRequest, dataset_path: str, tokenizer):
     return encoded, stats
 
 
+def _looks_like_error(msg: object) -> bool:
+    """Whether a fleet event is a failure worth keeping in full.
+
+    Deliberately broad: the cost of keeping a long line that turns out to be
+    progress is a few hundred bytes, and the cost of truncating a real one is
+    somebody guessing a field name from half a message.
+    """
+    low = str(msg or "").lower()
+    return any(w in low for w in (
+        "http 4", "http 5", "error", "failed", "refus", "reject", "invalid",
+        "could not", "cannot", "no candidate", "unavailable", "validation",
+        "timeout", "timed out", "unreachable"))
+
+
 def _resolve_text_base(base_model: str) -> str:
     """A loadable path or HF id for the base.
 
@@ -3802,7 +3816,15 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     fleet = flt.TrainerFleet(
         client, job_id, spec, ledger_key=f"text-lora:{req.name}",
         max_fleet_hourly_usd=float(cfg.max_fleet_hourly_usd or 0.0),
-        on_event=lambda m: _update_job(job_id, message=m[:200]))
+        # 200 characters fits a progress line and HALVES a validation error.
+        # A reader then has to guess which field an API rejected -- which
+        # happened: "additional properties 's…" was all that survived, and the
+        # guess was wrong. Progress stays short; an error keeps enough to name
+        # the cause, in a field of its own so it is not overwritten by the
+        # next heartbeat.
+        on_event=lambda m: _update_job(
+            job_id, message=str(m)[:200],
+            **({"last_error": str(m)[:2000]} if _looks_like_error(m) else {})))
     coord = _TextTrainCoordinator(
         job_id, plan=plan, tracker=tracker, fleet=fleet, encoded=encoded,
         out_dir=out_dir, settings=settings,

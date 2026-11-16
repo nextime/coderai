@@ -9305,6 +9305,50 @@ def reap_orphans() -> int:
     return reaped
 
 
+def _offer_shared_for_adoption(pool_key: str, data: dict) -> int:
+    """Clear the dead owner on this shared pool's registry entries.
+
+    Returns how many were offered. The pod keeps its registry entry (so the
+    reaper's "known" shield still applies for the grace period) but no longer
+    claims a living owner, which is the one condition `find_shared_pod`
+    requires before a pool may take it.
+
+    Deliberately NOT a health probe: a pod still booting must be offered too,
+    or a restart during a 6-14 minute image pull loses exactly the pod whose
+    boot has already been paid for.
+    """
+    want = str(pool_key or "")
+    targets = [str(pid) for pid, info in (data or {}).items()
+               if isinstance(info, dict) and str(info.get("pool") or "") == want
+               and not _is_this_process(info)]
+    if not targets:
+        return 0
+
+    def _disown(d):
+        changed = False
+        for pid in targets:
+            info = d.get(pid)
+            if not isinstance(info, dict):
+                continue
+            info["proc"] = "offered-for-adoption"
+            info["pid"] = 0
+            changed = True
+        return changed
+
+    try:
+        _registry_update(_disown)
+    except Exception as exc:
+        print(f"[runpod] reclaim: could not offer {want!r} for adoption "
+              f"({exc}); those pods stay owned by a dead process and the "
+              f"reaper will collect them", flush=True)
+        return 0
+    try:
+        forget_account_listing()
+    except Exception:
+        pass
+    return len(targets)
+
+
 def reclaim_registered_pods() -> int:
     """Take this deployment's surviving pods back into their pools, at startup.
 
@@ -9392,9 +9436,31 @@ def reclaim_registered_pods() -> int:
     taken = 0
     for key in keys:
         if key.startswith("pool:"):
-            print(f"[runpod] reclaim: leaving shared pool {key!r} to the "
-                  f"on-demand path — its shape comes from whichever model "
-                  f"loads first, not from the registry", flush=True)
+            # A shared pool's SHAPE still cannot be rebuilt from the registry
+            # -- it comes from whichever model loads first -- so this does not
+            # build the pool. What it must not do is leave the entry OWNED by
+            # the process that died: `find_shared_pod` skips our own entries
+            # ("a pool handles its own"), so a pod owned by a dead process is
+            # invisible to the on-demand path this branch was handing it to.
+            # Neither side claimed it and it billed until the reaper's grace
+            # expired. Measured on this install: three pods across two
+            # restarts, all `pool:digesta-vision`, ~$2.25/hr of a $8.28/hr
+            # fleet -- 27% of the bill doing nothing.
+            #
+            # So: disown them. The entry then describes a pod with no manager,
+            # which is what it is, and that is exactly what makes it adoptable
+            # the moment the pool materialises -- adopting instead of renting a
+            # second card beside the one already paid for. Verified by hand
+            # first: offering two such pods for adoption got both claimed by
+            # their pool, while a third left alone was still unmanaged two
+            # hours later.
+            offered = _offer_shared_for_adoption(key, data)
+            if offered:
+                print(f"[runpod] reclaim: shared pool {key!r} cannot be "
+                      f"rebuilt from the registry, so {offered} pod(s) are "
+                      f"OFFERED FOR ADOPTION — the pool will take them when "
+                      f"that model is next served, instead of renting beside "
+                      f"them", flush=True)
             continue
         entry = _model_entry(key)
         if not entry:

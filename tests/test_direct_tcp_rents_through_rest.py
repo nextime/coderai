@@ -50,17 +50,22 @@ def _create(c, **kw):
 
 # ------------------------------------------------------------- the routing --
 
-def test_a_direct_tcp_pod_is_created_through_rest():
+def test_a_direct_tcp_pod_is_rented_on_graphql():
+    """REVERTED, and this is the lesson. I routed direct TCP to REST because
+    GraphQL rejects `supportPublicIp`; that broke EVERY new rental on the
+    install, because the REST body was an invented schema answering 422, while
+    the GraphQL path had been renting reachable direct-TCP pods for months.
+    The missing field costs placement odds, not reachability."""
     c = Client()
-    assert _create(c, direct_tcp=True) == "pod-rest"
-    assert c.gql_calls == [], "a direct-TCP pod must not be rented on GraphQL"
-    assert c.rest_calls and c.rest_calls[0][1] == "/pods"
+    assert _create(c, direct_tcp=True) == "pod-gql"
+    assert c.rest_calls == []
 
 
 def test_the_rest_body_asks_for_a_public_ip_and_a_tcp_port():
-    """The two things the GraphQL path could not express."""
+    """When REST IS taken -- an entrypoint override, or a GraphQL ban -- the
+    body must still be right."""
     c = Client()
-    _create(c, direct_tcp=True)
+    _create(c, direct_tcp=True, entrypoint=["/bin/sh"])
     body = c.rest_calls[0][2]
     assert body[PUBLIC_IP_FIELD] is True
     assert body["ports"] == ["8000/tcp"]
@@ -74,9 +79,11 @@ def test_a_proxied_pod_still_uses_graphql():
     assert c.rest_calls == []
 
 
-def test_the_source_routes_on_direct_tcp():
+def test_the_source_does_NOT_route_on_direct_tcp():
+    """The condition that broke the install must not come back."""
     src = inspect.getsource(RunpodClient.create_pod)
-    assert "(direct_tcp and not is_spot)" in src
+    assert "direct_tcp and not is_spot" not in src
+    assert "(entrypoint or start_cmd) or _gql_banned()" in src
 
 
 # ------------------------------------------------------------- the refusal --
@@ -100,10 +107,6 @@ def test_a_proxied_pod_keeps_the_lenient_behaviour():
 
 
 def test_a_direct_tcp_spot_pod_stays_on_graphql():
-    """REST v2 has no interruptible bidding, so routing a spot request there
-    would refuse it outright and never reach the GraphQL refusal that explains
-    why a reachable direct-TCP spot pod cannot be rented at all right now.
-    REST is taken only where REST can serve the request."""
     c = Client()
     assert _create(c, direct_tcp=True, is_spot=True,
                    bid_per_gpu=0.2) == "pod-gql"

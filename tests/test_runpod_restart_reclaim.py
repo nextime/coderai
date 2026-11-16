@@ -131,14 +131,35 @@ def test_reclaim_runs_before_the_reaper_can_kill_them():
     assert body.index("reclaim_registered_pods") < body.index("reap_orphans")
 
 
-def test_reclaim_leaves_a_shared_pool_alone(registry, monkeypatch, capsys):
-    """A `pool:` key has no single model entry to rebuild its shape from."""
-    registry["p1"] = _entry(pool="pool:shared")
-    import codai.models.manager as mgr
-    monkeypatch.setattr(mgr, "get_active_runpod_config", lambda: _acct())
-    assert rw.reclaim_registered_pods() == 0
-    assert "leaving shared pool" in capsys.readouterr().out
+def test_reclaim_offers_a_shared_pools_pods_for_adoption(tmp_path, monkeypatch):
+    """REPLACES test_reclaim_leaves_a_shared_pool_alone.
 
+    "Leaving it to the on-demand path" was not neutral: `find_shared_pod`
+    skips our own registry entries, so a pod still owned by the process that
+    died is invisible to that path too. Neither side claimed it and it billed
+    until the reaper's grace expired -- three pods across two restarts on this
+    install, all `pool:digesta-vision`, ~$2.25/hr of a $8.28/hr fleet.
+
+    The pool's SHAPE still is not rebuilt here (it comes from whichever model
+    loads first). Only the dead owner is cleared, which is the one condition
+    adoption needs.
+    """
+    from codai.api import runpod_worker as rw
+
+    state = {"pod-a": {"pool": "pool:shared", "pid": 999999, "proc": "dead"},
+             "pod-b": {"pool": "pool:shared", "pid": 999999, "proc": "dead"}}
+
+    def _update(fn):
+        fn(state)
+        return dict(state)
+
+    monkeypatch.setattr(rw, "_registry_update", _update)
+    monkeypatch.setattr(rw, "forget_account_listing", lambda: None)
+    assert rw._offer_shared_for_adoption("pool:shared", dict(state)) == 2
+    for k in ("pod-a", "pod-b"):
+        assert state[k]["pid"] == 0
+        assert state[k]["proc"] == "offered-for-adoption"
+        assert state[k]["pool"] == "pool:shared"   # entry kept, shield intact
 
 def test_reclaim_says_when_a_model_is_gone(registry, monkeypatch, capsys):
     registry["p1"] = _entry(pool="retired-model")

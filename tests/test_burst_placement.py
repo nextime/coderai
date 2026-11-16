@@ -1068,10 +1068,10 @@ def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
     assert rc.direct_tcp_url([{**ports[0], "isIpPublic": False}], 8000) == ""
     assert rc.pod_proxy_url("abc", 8000) == "https://abc-8000.proxy.runpod.net"
 
-    # create_pod asks for the tcp mapping only when told to. A proxied pod is
-    # rented on GraphQL; a direct-TCP one goes through REST, because GraphQL
-    # now rejects the field that asks the host for a public ip and REST
-    # documents it -- so the two cases are checked on the path each takes.
+    # create_pod asks for the tcp mapping only when told to. Both cases are
+    # rented on GraphQL: routing direct TCP to REST was tried and reverted --
+    # it broke every new rental, because that body was an invented schema,
+    # while GraphQL had been renting reachable direct-TCP pods for months.
     seen = {}
 
     class _C(rc.RunpodClient):
@@ -1088,6 +1088,11 @@ def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
     _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000)
     assert seen["ports"] == "8000/http"
     _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000, direct_tcp=True)
+    assert seen["ports"] == "8000/tcp"
+    # REST is reached by an entrypoint override, and there the body carries the
+    # public-ip ask under RunPod's documented name.
+    _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000,
+                    direct_tcp=True, entrypoint=["/bin/sh"])
     assert seen["ports"] == ["8000/tcp"]
     assert seen["public_ip"] is True
 
