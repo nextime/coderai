@@ -1068,16 +1068,28 @@ def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
     assert rc.direct_tcp_url([{**ports[0], "isIpPublic": False}], 8000) == ""
     assert rc.pod_proxy_url("abc", 8000) == "https://abc-8000.proxy.runpod.net"
 
-    # create_pod asks for the tcp mapping only when told to.
+    # create_pod asks for the tcp mapping only when told to. A proxied pod is
+    # rented on GraphQL; a direct-TCP one goes through REST, because GraphQL
+    # now rejects the field that asks the host for a public ip and REST
+    # documents it -- so the two cases are checked on the path each takes.
     seen = {}
+
     class _C(rc.RunpodClient):
         def __init__(self): pass
         def _gql(self, q, v, timeout=30.0):
-            seen["ports"] = v["input"]["ports"]; return {"podFindAndDeployOnDemand": {"id": "p1"}}
+            seen["ports"] = v["input"]["ports"]
+            return {"podFindAndDeployOnDemand": {"id": "p1"}}
+
+        def _rest(self, method, path, body=None, timeout=30.0):
+            seen["ports"] = body["ports"]
+            seen["public_ip"] = body.get(rc.PUBLIC_IP_FIELD)
+            return {"id": "p1"}
+
     _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000)
     assert seen["ports"] == "8000/http"
     _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000, direct_tcp=True)
-    assert seen["ports"] == "8000/tcp"
+    assert seen["ports"] == ["8000/tcp"]
+    assert seen["public_ip"] is True
 
     # wait_ready keeps waiting until the runtime reports the public mapping.
     infos = iter([{"status": "RUNNING", "ready": True, "ports": [], "uptime_s": 1},

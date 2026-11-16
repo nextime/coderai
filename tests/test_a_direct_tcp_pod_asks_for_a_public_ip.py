@@ -70,11 +70,14 @@ def test_the_field_name_is_the_one_runpod_documents():
 
 
 def test_a_direct_tcp_pod_asks_for_a_public_ip(monkeypatch):
+    """Still the contract -- but through REST now, because GraphQL REJECTS the
+    field as of 2026-11-16 and a pod rented there is born unreachable."""
     cli, seen = _client(monkeypatch)
     assert cli.create_pod(direct_tcp=True, **_args()) == "pod-1"
-    sent = seen["gql"][0]["variables"]["input"]
-    assert sent[rc.PUBLIC_IP_FIELD] is True
-    assert sent["ports"] == "8000/tcp"
+    assert not seen["gql"], "direct TCP must not be rented on GraphQL"
+    body = seen["rest"][0]["body"]
+    assert body[rc.PUBLIC_IP_FIELD] is True
+    assert body["ports"] == ["8000/tcp"]
 
 
 def test_a_proxied_pod_does_not(monkeypatch):
@@ -105,11 +108,18 @@ def test_the_rest_path_leaves_it_out_when_proxied(monkeypatch):
 
 
 def test_a_graphql_schema_that_refuses_the_field_still_rents(monkeypatch):
-    """The spot input type could not be read from RunPod's published schema.
+    """The original contract, kept after a wrong turn.
 
-    If it has no such field, GraphQL answers "is not defined by type" -- and
-    the pod must still be rented, without the hint, rather than the create
-    failing outright.
+    I briefly made this REFUSE, reasoning that a direct-TCP pod with no public
+    ip can never be reached. That is not what happens: the field is a hint, and
+    most hosts publish a public ip regardless -- this install has direct-TCP
+    pods serving tens of concurrent requests that were rented exactly this way.
+    Refusing threw away capacity that works.
+
+    What the missing hint costs is placement odds (measured 2026-11-08: nine
+    pods on hosts that published only their agent port, $1.21). Non-spot direct
+    TCP now avoids the dice roll by going through REST; spot has no REST path,
+    so it still rents here, asks, and proceeds without.
     """
     calls = []
 
@@ -121,7 +131,7 @@ def test_a_graphql_schema_that_refuses_the_field_still_rents(monkeypatch):
                 '"PodRentInterruptableInput".')
         return {"podRentInterruptable": {"id": "pod-spot"}}
 
-    cli, seen = _client(monkeypatch, gql=_gql)
+    cli, _seen = _client(monkeypatch, gql=_gql)
     assert cli.create_pod(direct_tcp=True, is_spot=True, bid_per_gpu=0.3,
                           **_args()) == "pod-spot"
     assert calls[0][rc.PUBLIC_IP_FIELD] is True   # asked once
@@ -135,8 +145,9 @@ def test_an_unrelated_graphql_error_is_not_swallowed(monkeypatch):
         raise rc.RunpodError("There are no longer any instances available")
 
     cli, _seen = _client(monkeypatch, gql=_gql)
+    # Proxied, to stay on the GraphQL path this test is about.
     with pytest.raises(rc.RunpodError, match="no longer any instances"):
-        cli.create_pod(direct_tcp=True, **_args())
+        cli.create_pod(direct_tcp=False, **_args())
 
 
 def test_the_refusal_guard_needs_the_field_named(monkeypatch):
@@ -163,8 +174,7 @@ def test_the_global_volume_guard_still_works(monkeypatch):
         return {"podFindAndDeployOnDemand": {"id": "pod-2"}}
 
     cli, _seen = _client(monkeypatch, gql=_gql)
-    assert cli.create_pod(direct_tcp=True, global_volume_id="vol-9",
+    # Proxied: a direct-TCP pod no longer takes this path at all.
+    assert cli.create_pod(direct_tcp=False, global_volume_id="vol-9",
                           **_args()) == "pod-2"
     assert rc.GLOBAL_VOLUME_FIELD not in calls[1]
-    # ...and the public-ip ask survives a global-volume refusal.
-    assert calls[1][rc.PUBLIC_IP_FIELD] is True

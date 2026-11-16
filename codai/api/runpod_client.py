@@ -895,7 +895,22 @@ class RunpodClient:
         argument as the server's own. Only the REST API accepts those, so the
         request goes there when they are given and stays on GraphQL otherwise.
         """
-        if (entrypoint or start_cmd) or _gql_banned():
+        # DIRECT TCP GOES REST. A direct-TCP pod is only reachable with a
+        # public ip, and GraphQL now rejects the field that asks for one
+        # (`supportPublicIp` on PodFindAndDeployOnDemandInput) -- so every
+        # direct-TCP pod rented there is born unreachable and paid for until
+        # the boot timeout gives up. Measured: four trainer rentals in a row,
+        # each ~$0.45 for nothing, plus a vision pool re-renting in a circle
+        # every 17 seconds for the same reason. REST documents the field on
+        # PodCreateInput and publishes `<port>/tcp`, so it is not a preference
+        # but the only path that works.
+        # `and not is_spot` because REST v2 has no interruptible bidding: a
+        # spot request routed here would be refused outright, and the GraphQL
+        # refusal below -- which explains precisely why a direct-TCP spot pod
+        # cannot be rented reachable at all right now -- would never be
+        # reached. Route to REST only where REST can serve the request.
+        if ((entrypoint or start_cmd) or (direct_tcp and not is_spot)
+                or _gql_banned()):
             # REST too while GraphQL is rate-limited: RunPod's bans have been
             # hours long, and REST kept answering through them.
             return self._create_pod_rest(
@@ -971,10 +986,24 @@ class RunpodClient:
                 dropped.append(GLOBAL_VOLUME_FIELD)
             if (PUBLIC_IP_FIELD in common
                     and _field_refused_gql(str(exc), PUBLIC_IP_FIELD)):
+                # Renting WITHOUT it, deliberately. The field is a hint, not
+                # a precondition: most hosts publish a public ip anyway, and
+                # this install has direct-TCP pods serving tens of concurrent
+                # requests that were rented on this path with the field
+                # dropped. Refusing here was tried and was wrong -- it threw
+                # away capacity that demonstrably works. What the missing hint
+                # costs is placement ODDS: RunPod may put the pod on a host
+                # that publishes only its own agent port on carrier-grade NAT
+                # (measured 2026-11-08: nine such pods, $1.21). The non-spot
+                # path avoids the dice roll entirely by using REST.
                 print(f"[runpod] this API rejects {PUBLIC_IP_FIELD!r} on "
-                      f"{var_type}: renting without it, so the host may not "
-                      f"publish a public ip and a direct-TCP pod may be "
-                      f"unreachable", flush=True)
+                      f"{var_type}: renting without it"
+                      + (" — this pod needs a public ip, so if the host does "
+                         "not publish one the boot will fail; REST is used for "
+                         "non-spot direct-TCP pods for that reason"
+                         if direct_tcp else
+                         " — this pod reaches its port through RunPod's proxy "
+                         "and needs no public ip"), flush=True)
                 common.pop(PUBLIC_IP_FIELD, None)
                 dropped.append(PUBLIC_IP_FIELD)
             if not dropped:
