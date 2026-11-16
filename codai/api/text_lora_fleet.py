@@ -73,6 +73,12 @@ class TrainerPodSpec:
     #: time the pod is requested, and a single choice turns that into a failed
     #: job instead of the next-cheapest card.
     gpu_types: List[str] = dataclasses.field(default_factory=list)
+    #: The cloud to rent each of ``gpu_types`` in, same order. A card eligible
+    #: in both clouds appears twice at two prices, so the cloud belongs to the
+    #: CANDIDATE: renting a community-priced offer on secure charges the secure
+    #: rate, which is how a price ceiling gets quietly exceeded. Empty means
+    #: ``cloud_type`` for every candidate, which is the old behaviour.
+    gpu_clouds: List[str] = dataclasses.field(default_factory=list)
     start_cmd: Optional[List[str]] = None
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -323,14 +329,18 @@ class TrainerFleet:
         self._flush()
         pod_id = None
         last_error = ""
-        for gpu in (self.spec.gpu_types or [""]):
+        _cands = list(self.spec.gpu_types or [""])
+        _clouds = list(self.spec.gpu_clouds or [])
+        for _i, gpu in enumerate(_cands):
+            cloud = (_clouds[_i] if _i < len(_clouds) else "") \
+                or self.spec.cloud_type
             try:
-                pod_id = self._create(shard, gpu, env)
+                pod_id = self._create(shard, gpu, env, cloud)
                 break
             except Exception as exc:
-                last_error = f"{gpu}: {exc}"
-                self._say(f"shard {shard}: {gpu} unavailable ({exc}); "
-                          f"trying the next card")
+                last_error = f"{gpu} [{cloud.lower()}]: {exc}"
+                self._say(f"shard {shard}: {gpu} unavailable in "
+                          f"{cloud.lower()} ({exc}); trying the next card")
         if pod_id is None:
             with self._lock:
                 self.pods.pop(shard, None)
@@ -347,13 +357,15 @@ class TrainerFleet:
                   f"(~${self.spec.hourly_usd:.2f}/hr)")
         return pod
 
-    def _create(self, shard: int, gpu: str, env: Dict[str, str]) -> str:
-        """One create call for one candidate card."""
+    def _create(self, shard: int, gpu: str, env: Dict[str, str],
+                cloud_type: str = "") -> str:
+        """One create call for one candidate card, in that candidate's cloud."""
         if True:
             return self.client.create_pod(
                 name=f"coderai-train-{self.job_id}-s{shard}",
                 image=self.spec.image, gpu_type_id=gpu,
-                port=self.port, cloud_type=self.spec.cloud_type,
+                port=self.port,
+                cloud_type=(cloud_type or self.spec.cloud_type),
                 container_disk_gb=self.spec.container_disk_gb,
                 volume_gb=self.spec.volume_gb,
                 network_volume_id=self.spec.network_volume_id,
@@ -848,7 +860,7 @@ def eligible_cards(client, cfg: LoraTrainConfig, *,
     A card the catalogue does not price is EXCLUDED when a ceiling is set --
     renting an unpriced card under a price ceiling is renting blind.
     """
-    want_secure = (cfg.cloud_type or "SECURE").strip().upper() != "COMMUNITY"
+    clouds = clouds_for(cfg)
     allow = {c.strip().lower() for c in (cfg.gpu_types or "").split(",")
              if c.strip()}
     floor = float(cfg.min_vram_gb or 0.0)
@@ -865,26 +877,62 @@ def eligible_cards(client, cfg: LoraTrainConfig, *,
             vram = 0.0
         if floor > 0 and vram < floor:
             continue
-        price = g.get("secure_price") if want_secure else g.get("community_price")
-        if price is None:
-            price = g.get("on_demand_price")
-        if price is None:
-            if ceiling > 0:
+        # One candidate PER CLOUD, each at that cloud's real price. The same
+        # card is usually cheaper on community and more available there, while
+        # secure is the one with the stronger isolation -- so with both
+        # allowed, which to try is a price question the ranking answers, not a
+        # choice to make up front.
+        for cloud in clouds:
+            price = (g.get("secure_price") if cloud == "SECURE"
+                     else g.get("community_price"))
+            if price is None:
+                price = g.get("on_demand_price")
+            if price is None:
+                if ceiling > 0:
+                    continue       # unpriced under a ceiling is renting blind
+                price = 0.0
+            if ceiling > 0 and float(price) > ceiling + 1e-9:
                 continue
-            price = 0.0
-        if ceiling > 0 and float(price) > ceiling + 1e-9:
-            continue
-        out.append({"id": gid, "vram_gb": vram, "hourly_usd": float(price)})
-    out.sort(key=lambda c: (c["hourly_usd"], -c["vram_gb"]))
+            out.append({"id": gid, "vram_gb": vram, "hourly_usd": float(price),
+                        "cloud_type": cloud})
+    # Cheapest first, and for one price the bigger card; the cloud is the last
+    # tiebreak so a tie is spent on SECURE rather than silently on community.
+    out.sort(key=lambda c: (c["hourly_usd"], -c["vram_gb"],
+                            0 if c.get("cloud_type") == "SECURE" else 1))
     return out
+
+
+#: What `cloud_type` may say to mean "try both". A single value still means
+#: only that one, so an install that chose SECURE deliberately keeps it.
+_ANY_CLOUD = ("ANY", "BOTH", "SECURE,COMMUNITY", "COMMUNITY,SECURE", "*")
+
+
+def clouds_for(cfg: "LoraTrainConfig") -> List[str]:
+    """The clouds to consider, in preference order.
+
+    SECURE first when both are allowed: for a tie in price it is the better
+    place to run, and for a dataset of court documents that preference is not
+    a detail. Community is reached when it is cheaper or when secure has no
+    capacity, which is the whole reason for allowing both.
+    """
+    raw = (getattr(cfg, "cloud_type", "") or "SECURE").strip().upper()
+    if raw in _ANY_CLOUD:
+        return ["SECURE", "COMMUNITY"]
+    return ["COMMUNITY"] if raw == "COMMUNITY" else ["SECURE"]
 
 
 def describe_cards(cards: Sequence[Dict[str, Any]]) -> str:
     """One line naming what was chosen and what it costs."""
     if not cards:
         return "no eligible card"
-    return ", ".join(f"{c['id']} ({c['vram_gb']:.0f}GB ${c['hourly_usd']:.2f}/hr)"
-                     for c in cards[:6]) + ("…" if len(cards) > 6 else "")
+    def _one(c):
+        # The cloud is part of the identity of an offer, not decoration: the
+        # same card at two prices is two different rentals.
+        tag = str(c.get("cloud_type") or "")
+        return (f"{c['id']} ({c['vram_gb']:.0f}GB ${c['hourly_usd']:.2f}/hr"
+                + (f" {tag.lower()}" if tag else "") + ")")
+
+    return ", ".join(_one(c) for c in cards[:6]) + ("…" if len(cards) > 6 else "")
 
 
 def _models_json_path() -> str:

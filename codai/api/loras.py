@@ -3742,7 +3742,12 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
 
     n_shards = max(1, int(cfg.max_pods or 1))
     rounds = max(1, int(cfg.rounds or 1))
-    cloud = (cfg.cloud_type or "SECURE").strip().upper()
+    _clouds = flt.clouds_for(cfg)
+    # The FIRST is what a single-cloud create falls back to; the candidates
+    # carry their own. "SECURE+COMMUNITY" in a log line is the honest
+    # description of a ranking that spans both.
+    cloud = _clouds[0]
+    cloud_label = "+".join(c.lower() for c in _clouds)
     ceiling = float(cfg.max_pod_hourly_usd or 0.0)
 
     client = rpc.RunpodClient(account)
@@ -3753,12 +3758,12 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     if not cards:
         raise RuntimeError(
             f"no RunPod card has >= {cfg.min_vram_gb:.0f} GB at or under "
-            f"${ceiling:.2f}/hr {cloud}"
+            f"${ceiling:.2f}/hr {cloud_label}"
             + (f" within {cfg.gpu_types}" if cfg.gpu_types else "")
             + " — raise the ceiling, lower the floor, or allow COMMUNITY")
     price = cards[0]["hourly_usd"]
     print(f"[text-lora] {job_id}: {n_shards} pod(s), {rounds} round(s), "
-          f"{cloud}, >= {cfg.min_vram_gb:.0f}GB at <= ${ceiling:.2f}/hr; "
+          f"{cloud_label}, >= {cfg.min_vram_gb:.0f}GB at <= ${ceiling:.2f}/hr; "
           f"candidates: {flt.describe_cards(cards)}", flush=True)
 
     out_dir = os.path.join(_loras_dir(), req.name)
@@ -3786,6 +3791,8 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
               f"outright for a gated repo", flush=True)
     spec = flt.TrainerPodSpec(
         image=cfg.image, gpu_types=[c["id"] for c in cards], env=_pod_env,
+        # Same order as gpu_types: each offer keeps the cloud it was priced in.
+        gpu_clouds=[str(c.get("cloud_type") or cloud) for c in cards],
         cloud_type=cloud, hourly_usd=price,
         max_pod_hourly_usd=ceiling,
         container_disk_gb=int(cfg.container_disk_gb or 120),
