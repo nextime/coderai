@@ -294,6 +294,7 @@ class TrainerFleet:
     """Rents, watches and releases the pods of one training job."""
 
     def __init__(self, client, job_id: str, spec: TrainerPodSpec, *,
+                 pool_name: str = "",
                  ledger_key: str = "text-lora", port: int = 8000,
                  max_fleet_hourly_usd: float = 0.0,
                  budget_check: Optional[Callable[[float], str]] = None,
@@ -305,6 +306,13 @@ class TrainerFleet:
         (the account-wide caps) is consulted on top of both."""
         self.client = client
         self.job_id = job_id
+        #: What the fleet's pods are registered UNDER. The job id changes on
+        #: every resubmission, so keying the pool to it meant each attempt
+        #: rented a brand-new fleet while the previous one kept billing --
+        #: measured: eleven pools, 35 pods, $21.25/hr for a job using five.
+        #: A caller passes something that SURVIVES a resubmission (the adapter
+        #: name), and then an attempt can adopt what the last one left.
+        self.pool_name = str(pool_name or job_id)
         self.spec = spec
         self.ledger_key = ledger_key
         self.port = int(port)
@@ -381,6 +389,80 @@ class TrainerFleet:
                       f"the rest had no capacity and will be retried between "
                       f"rounds")
         return started
+
+    def adopt_existing(self, *, probe: bool = True) -> List[TrainerPod]:
+        """Take over pods a previous attempt at THIS pool left running.
+
+        The point of a pool name that outlives the job id: an attempt that
+        failed, or a process that restarted, leaves rented pods behind, and
+        the next attempt should use them rather than rent beside them. This is
+        what the serving pools have always done -- "a surviving pod on a
+        fallback card is one this pool rented and is already paying for".
+
+        Shard numbers are assigned in order rather than restored. Since the
+        partition is decided per ROUND from the cohort's positions, a shard id
+        is only a handle; what must be preserved is the pod's url and its own
+        bearer, both of which are in the registry.
+
+        ``probe`` asks each pod whether it is alive before adopting it. A
+        registry entry can outlive its pod, and adopting a corpse would fill a
+        shard slot with something that never submits -- worse than renting,
+        because it looks like progress.
+        """
+        try:
+            from codai.api import runpod_worker as rw
+            data = rw._registry_update(lambda d: False) or {}
+        except Exception as exc:
+            print(f"[text-lora-fleet] {self.job_id}: cannot read the registry "
+                  f"to adopt ({exc})", flush=True)
+            return []
+        want_key = f"{_fleet_pool_prefix()}{self.pool_name}"
+        with self._lock:
+            have = {p.pod_id for p in self.pods.values()}
+            used = set(self.pods)
+        found = []
+        for pod_id, info in (data.items() if isinstance(data, dict) else []):
+            if not isinstance(info, dict) or str(pod_id) in have:
+                continue
+            if str(info.get("pool") or "") != want_key:
+                continue
+            url = str(info.get("url") or "").strip()
+            if not url:
+                continue          # never became reachable; nothing to adopt
+            found.append((str(pod_id), info, url))
+        if not found:
+            return []
+        taken: List[TrainerPod] = []
+        for pod_id, info, url in sorted(found, key=lambda x: x[0]):
+            shard = next(i for i in range(10_000) if i not in used)
+            pod = TrainerPod(
+                pod_id=pod_id, shard=shard, started_at=float(
+                    info.get("created") or time.time()),
+                hourly_usd=float(info.get("hourly_usd") or 0.0),
+                url=url, secret=str(info.get("api_key") or ""),
+                gpu=str(info.get("gpu") or ""))
+            if probe:
+                try:
+                    st = poll_status(pod)
+                    if not isinstance(st, dict) or not st:
+                        raise RuntimeError("no status")
+                except Exception as exc:
+                    print(f"[text-lora-fleet] {self.job_id}: not adopting "
+                          f"{pod_id} — it does not answer ({exc}); leaving it "
+                          f"to the sweep", flush=True)
+                    continue
+            used.add(shard)
+            with self._lock:
+                self.pods[shard] = pod
+            pod.last_checkin = time.time()
+            taken.append(pod)
+            self._register(pod)
+            self._say(f"adopted pod {pod_id} as shard {shard} from an earlier "
+                      f"attempt at {self.pool_name!r} (~${pod.hourly_usd:.2f}"
+                      f"/hr, already paid for)")
+        if taken:
+            self._flush()
+        return taken
 
     def top_up(self, want: int, *, cap: int = 0) -> List[TrainerPod]:
         """Try to reach ``want`` pods, renting only what is missing.
@@ -508,7 +590,7 @@ class TrainerFleet:
                 str(pod.pod_id),
                 # Namespaced by JOB, so the page can say which run owns it and
                 # a stale entry names the job that died.
-                pool_key=f"{_fleet_pool_prefix()}{self.job_id}",
+                pool_key=f"{_fleet_pool_prefix()}{self.pool_name}",
                 url=str(pod.url or ""),
                 api_key=str(pod.secret or ""),
                 hourly_usd=float(pod.hourly_usd or self.spec.hourly_usd or 0.0),

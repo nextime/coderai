@@ -679,6 +679,23 @@ def _set_progress(**kw):
             task_registry.update(job_id, message=str(kw["message"])[:200])
 
 
+def _train_cancelled(job_id: str = "") -> bool:
+    """Whether this job has been cancelled. Does NOT raise and does not pause.
+
+    For use inside a boot wait, where raising would abandon a pod that has
+    just been rented. `_check_train_cancel` is the right call on the training
+    path; a thread holding a rented card needs to release it first and then
+    report, which it cannot do if the check throws.
+    """
+    jid = str(job_id or _active_job_id or "")
+    if not jid:
+        return False
+    try:
+        return jid in _cancel_requested or task_registry.is_cancelled(jid)
+    except Exception:
+        return False
+
+
 def _check_train_cancel() -> None:
     """Raise TaskCancelled if the running training job was cancelled, or block
     while it is paused. Called each training step; the task id is the active job
@@ -3426,6 +3443,36 @@ async def _run_text_train_job(req: TextLoraTrainRequest, job_id: str,
 _TRANSFORMERS_IMPORT_LOCK = threading.Lock()
 
 
+def _active_text_job_for(name: str, *, exclude: str = "") -> Optional[str]:
+    """An already-running text job writing the same adapter, if there is one.
+
+    Two jobs with the same `name` average into the SAME adapter directory from
+    two independent fleets, which is wrong however it is paid for: whichever
+    round lands last wins and the other's work is overwritten. It also
+    multiplies the fleet -- measured: eleven concurrent runs of one task, 35
+    pods at $21.25/hr for a job that uses five, because a resubmission makes a
+    new job id and therefore a new pool.
+    """
+    want = str(name or "").strip().lower()
+    if not want:
+        return None
+    with _jobs_lock:
+        items = list(_jobs.items())
+    for jid, rec in items:
+        if str(jid) == str(exclude):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("target") or "") != "text":
+            continue
+        if str(rec.get("status") or "") in ("done", "error", "cancelled",
+                                            "interrupted"):
+            continue
+        if str(rec.get("name") or "").strip().lower() == want:
+            return str(jid)
+    return None
+
+
 def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
                          dataset_path: str) -> dict:
     """The dataset pass, then (unless dry_run) the QLoRA run itself.
@@ -3436,6 +3483,18 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     mechanism that would drift from the first.
     """
     global _active_job_id
+    # ONE RUN PER ADAPTER. A resubmission used to start a second job writing
+    # the same adapter from its own fleet: the averages collide and the pods
+    # double. Refused here rather than deduplicated silently, because the
+    # caller needs to know its job was not started -- and which one is
+    # already running, so it can watch that instead.
+    _already = _active_text_job_for(getattr(req, "name", ""), exclude=job_id)
+    if _already:
+        raise RuntimeError(
+            f"{_already} is already training {req.name!r} and has not "
+            f"finished; two jobs writing one adapter average into each other "
+            f"and rent two fleets. Watch {_already}, or cancel it first "
+            f"(POST /v1/loras/jobs/{_already}/cancel).")
     from codai.api import text_lora_trainer as tlt
     # UNDER A LOCK. transformers imports its public names lazily, and that
     # machinery is not safe against two threads taking it at once: each text
@@ -3920,7 +3979,13 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         max_silence_s=float(cfg.pod_max_silence_s or 1800.0),
         max_lifetime_s=float(cfg.pod_max_lifetime_s or 86400.0))
     fleet = flt.TrainerFleet(
-        client, job_id, spec, ledger_key=f"text-lora:{req.name}",
+        client, job_id, spec,
+        # The ADAPTER NAME, not the job id: it survives a resubmission, so the
+        # next attempt adopts this fleet instead of renting beside it. The job
+        # id changing on every submission is what turned "keep trying until it
+        # starts" into a fleet per attempt.
+        pool_name=str(req.name or job_id),
+        ledger_key=f"text-lora:{req.name}",
         max_fleet_hourly_usd=float(cfg.max_fleet_hourly_usd or 0.0),
         # 200 characters fits a progress line and HALVES a validation error.
         # A reader then has to guess which field an API rejected -- which
@@ -3956,6 +4021,16 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     poll = max(5.0, float(cfg.poll_interval_s or 20.0))
     stages = flt.Stages()
     try:
+        # ADOPT FIRST, then rent the shortfall. A previous attempt's pods are
+        # already paid for and already booted -- renting beside them is the
+        # expensive way to get a smaller fleet.
+        adopted = fleet.adopt_existing()
+        if adopted:
+            print(f"[text-lora] {job_id}: adopted {len(adopted)} pod(s) from "
+                  f"an earlier attempt at {req.name!r}; renting only what is "
+                  f"missing", flush=True)
+            _update_job(job_id, message=(f"adopted {len(adopted)} existing "
+                                         f"pod(s)"))
         started = fleet.provision(list(range(n_shards)))
         if not started and not fleet.pods:
             stages.failed("rent", "no pods could be rented")
@@ -3978,17 +4053,36 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         _shards = sorted(fleet.pods)
 
         def _bring_up(shard):
-            try:
-                url = fleet.address(shard, timeout=_boot_timeout)
-            except Exception as exc:
-                print(f"[text-lora] {job_id}: shard {shard} never came up: "
-                      f"{exc}", flush=True)
-                fleet.release(shard, "never published a port")
-                return None
-            if not url:
-                fleet.release(shard, "no address")
-                return None
-            return shard
+            # IN SLICES, so a cancel is honoured while the pod is booting. The
+            # cancel check used to sit after all the waits, on the reasoning
+            # that cancelling mid-boot would leave a rented pod with nobody to
+            # release it -- true, and the answer is to release it HERE rather
+            # than to ignore the cancel. Measured cost of ignoring it: ten
+            # cancelled jobs kept their fleets, one grew back to five pods
+            # after being cancelled, and 17 pods had to be terminated by hand.
+            _deadline = time.time() + _boot_timeout
+            while True:
+                if _train_cancelled(job_id):
+                    fleet.release(shard, "cancelled while booting")
+                    print(f"[text-lora] {job_id}: shard {shard} released — "
+                          f"cancelled while booting", flush=True)
+                    return None
+                _left = _deadline - time.time()
+                if _left <= 0:
+                    fleet.release(shard, "no address")
+                    return None
+                try:
+                    # A slice, not the whole budget: the loop is what makes the
+                    # cancel responsive. 20s keeps the polling cost the same as
+                    # before (wait_ready polls every 5s regardless).
+                    url = fleet.address(shard, timeout=min(20.0, _left))
+                except Exception as exc:
+                    print(f"[text-lora] {job_id}: shard {shard} never came "
+                          f"up: {exc}", flush=True)
+                    fleet.release(shard, "never published a port")
+                    return None
+                if url:
+                    return shard
 
         if len(_shards) == 1:
             got = _bring_up(_shards[0])

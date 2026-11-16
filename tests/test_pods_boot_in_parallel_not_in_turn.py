@@ -43,7 +43,8 @@ def test_a_pod_that_never_publishes_is_released_in_its_own_wait():
     """Not at the end of the round: it is billing, and the other waits may
     have minutes left to run."""
     i = SRC.index("def _bring_up")
-    block = SRC[i:i + 700]
+    # The body grew when the wait was sliced to honour a cancel mid-boot.
+    block = SRC[i:i + 1700]
     assert 'fleet.release(shard, "never published a port")' in block
     assert 'fleet.release(shard, "no address")' in block
 
