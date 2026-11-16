@@ -467,3 +467,21 @@ def test_a_dry_run_is_never_blocked_by_a_missing_block():
     block = src[i:i + 1200]
     assert "if req.dry_run:" in block
     assert "Reported, not fatal" in block
+
+
+def test_an_alias_resolves_to_its_path_with_no_in_memory_catalogue(on_disk):
+    """The same fault, one layer down, caught by a probe rather than by them.
+
+    Once the training entry's own `path` is the base, resolution depends
+    entirely on finding that entry -- and the resolver read only the catalogue
+    a process holds. In an engine with none, the alias went to from_pretrained
+    verbatim: exactly the failure that had just been fixed one level up.
+    """
+    import json as _json
+    entry = {"alias": "qwen38-train", "id": "qwen38-train",
+             "path": "Qwen/Qwen3.8-27B", "enabled": False,
+             "lora_train": {"enabled": True, "max_pods": 32}}
+    (on_disk / "models.json").write_text(_json.dumps({"text_models": [entry]}))
+    assert loras._resolve_text_base("qwen38-train") == "Qwen/Qwen3.8-27B"
+    # and an HF id that is nobody's alias passes through untouched
+    assert loras._resolve_text_base("Qwen/Qwen3.8-27B") == "Qwen/Qwen3.8-27B"

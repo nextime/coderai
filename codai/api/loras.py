@@ -3381,6 +3381,20 @@ def _resolve_text_base(base_model: str) -> str:
             return os.path.expanduser(path)
     except Exception:
         pass
+    # Same fallback as the config lookup, and for the same reason: that helper
+    # reads the catalogue a PROCESS holds, and an engine where the admin module
+    # was never initialised holds none -- so an alias came back unresolved and
+    # went to from_pretrained verbatim. Caught by a probe that set
+    # config_manager to None deliberately; it would otherwise have reappeared
+    # the moment the training entry's own path became the base.
+    try:
+        from codai.api import text_lora_fleet as _flt
+        for entry in _flt._entry_from_disk(base_model):
+            path = str(entry.get("path") or "").strip()
+            if path:
+                return os.path.expanduser(path)
+    except Exception:
+        pass
     return base_model
 
 
