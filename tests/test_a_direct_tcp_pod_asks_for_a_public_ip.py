@@ -70,14 +70,23 @@ def test_the_field_name_is_the_one_runpod_documents():
 
 
 def test_a_direct_tcp_pod_asks_for_a_public_ip(monkeypatch):
-    """Still the contract -- but through REST now, because GraphQL REJECTS the
-    field as of 2026-11-16 and a pod rented there is born unreachable."""
+    """On GRAPHQL, which is where direct-TCP pods are rented.
+
+    I briefly routed them to REST because GraphQL rejects the field, and that
+    broke every new rental on the install -- the REST body was an invented
+    schema answering 422 -- while GraphQL had been renting reachable
+    direct-TCP pods for months. Reverted; this test followed the routing out
+    and had to be brought back with it.
+
+    Asking is still right: the field is a hint that improves placement, and
+    the retry below drops it when a schema refuses it.
+    """
     cli, seen = _client(monkeypatch)
     assert cli.create_pod(direct_tcp=True, **_args()) == "pod-1"
-    assert not seen["gql"], "direct TCP must not be rented on GraphQL"
-    body = seen["rest"][0]["body"]
-    assert body[rc.PUBLIC_IP_FIELD] is True
-    assert body["ports"] == ["8000/tcp"]
+    assert not seen["rest"], "a plain rental must not spend REST's quota"
+    sent = seen["gql"][0]["variables"]["input"]
+    assert sent[rc.PUBLIC_IP_FIELD] is True
+    assert sent["ports"] == "8000/tcp"
 
 
 def test_a_proxied_pod_does_not(monkeypatch):

@@ -170,8 +170,8 @@ def test_a_live_fleet_pod_reads_like_a_pool_pod():
     drew as DOWN for a pod doing exactly what it should."""
     src = inspect.getsource(rw.pods_status)
     i = src.index("fleet_job and (mine or fresh)")
-    block = src[i:i + 900]
-    assert 'state = "ready" if has_url else "booting"' in block
+    block = src[i:i + 2000]      # the comment above the assignment is long
+    assert 'state = "ready" if has_url else "provisioning"' in block
     assert "healthy = has_url" in block
     assert "one row\n            # renderer serves both" in block
 
@@ -264,3 +264,26 @@ def test_a_stale_fleet_entry_is_still_reported_as_a_leak():
     src = inspect.getsource(rw.pods_status)
     i = src.index("Not ours and past the grace")
     assert "whose process is gone" in src[i:i + 400]
+
+
+def test_the_state_is_one_the_page_already_renders():
+    """I invented "booting". The page's renderer handles `unowned`,
+    `provisioning` and `quarantined` and then falls through to
+    `healthy ? 'healthy' : 'down'`, so an unknown state is drawn in red as
+    DOWN -- which is what an operator saw for two pods coming up normally.
+
+    Asserted against the template so the two cannot drift: a state the page
+    cannot draw is a state that lies.
+    """
+    from pathlib import Path
+    tmpl = (Path(__file__).resolve().parents[1]
+            / "codai/admin/templates/runpod.html").read_text()
+    src = inspect.getsource(rw.pods_status)
+    i = src.index("fleet_job and (mine or fresh)")
+    emitted = src[i:i + 2000]
+    for state in ("ready", "provisioning"):
+        assert f'"{state}"' in emitted
+        assert state in tmpl, f"the page has no case for {state!r}"
+    # The ASSIGNMENT, not the prose: the comment above it explains the word
+    # "booting" precisely because that one was wrong.
+    assert 'else "booting"' not in emitted, "an invented state is drawn as down"

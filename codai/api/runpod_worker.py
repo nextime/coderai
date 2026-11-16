@@ -8395,7 +8395,14 @@ def pods_status() -> list:
             # should. The trainer now reports what a pool reports, and one row
             # renderer serves both.
             has_url = bool(info.get("url"))
-            state = "ready" if has_url else "booting"
+            # "provisioning", which the page ALREADY renders (amber,
+            # "provisioning…"), not a new word. I invented "booting", the
+            # renderer had no case for it, and it fell through to
+            # `healthy ? healthy : down` -- so a pod coming up normally was
+            # drawn in red as DOWN. Reusing the existing state is the same
+            # lesson as reusing the ranker: a vocabulary of one is the whole
+            # reason these rows kept reading wrong.
+            state = "ready" if has_url else "provisioning"
             healthy = has_url
             note = (f"training job {fleet_job}"
                     + ("" if mine else " (another engine process)")

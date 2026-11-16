@@ -204,3 +204,31 @@ def _no_call_sink_carryover():
     _base._CALL_SINK.set(None)
     yield
     _base._CALL_SINK.set(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_test_writes_the_real_runpod_registry(monkeypatch, tmp_path):
+    """Pin the RunPod pod registry into tmp_path for EVERY test.
+
+    The registry is a real file in the developer's config dir, and it persists
+    between runs. When `TrainerFleet._rent_one` started registering its pods,
+    two existing test files began writing fake trainer pods into it -- six
+    entries -- which then made an unrelated test
+    (test_a_truly_empty_fleet_is_still_empty) fail in a way that survived the
+    run and looked like a product bug.
+
+    Per-file fixtures were not enough: any test that rents a pod through the
+    normal path writes there, and the next one to do so will be a file nobody
+    thought to guard. So it is done once, here, for all of them.
+    """
+    # The ENVIRONMENT, not a stub of `_pod_registry_path`. Replacing that
+    # function broke the tests that are ABOUT it -- the resolver's own
+    # behaviour (XDG awareness, the logged path, the config-dir fallback) is
+    # something the suite checks, and a blanket patch tests the stub instead.
+    # Pointing the environment at tmp_path lets the real resolver run and
+    # still land inside the test's own directory.
+    monkeypatch.setenv("CODERAI_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # NOT HOME. Moving HOME for the whole suite broke tests that resolve real
+    # paths under it (a portrait lookup, a config load) -- a guard against one
+    # side effect must not introduce a wider one.
