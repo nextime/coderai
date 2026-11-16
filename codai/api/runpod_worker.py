@@ -2799,6 +2799,23 @@ def _weight_for(weights: dict, card: str):
     return None
 
 
+def _adopted_last_used(pod_id: str) -> float:
+    """When this pod was last sent work, from the registry, else now.
+
+    `now` is the safe fallback rather than 0: zero means "never used" to the
+    engineless sweep, which would make a freshly adopted pod a candidate for
+    retirement on the grounds that it has no engine yet.
+    """
+    try:
+        data = _registry_update(lambda d: False) or {}
+        got = (data.get(str(pod_id)) or {}).get("used")
+        if isinstance(got, (int, float)) and float(got) > 0:
+            return float(got)
+    except Exception:
+        pass
+    return time.time()
+
+
 def _adopted_card(account_cfg, pod_id: str) -> dict:
     """``{gpu, gpu_count, vram_gb}`` for a pod we are taking over.
 
@@ -3925,7 +3942,11 @@ class RunpodPodPool:
                            # knows otherwise.
                            **_adopted_card(self.account, shared_id),
                            api_key=_use_key,
-                           healthy=True, last_used=time.time())
+                           healthy=True,
+                           # Same reason as the reclaim path: a pod adopted
+                           # into a pool keeps the last time it was USED, so
+                           # the idle clock continues rather than restarting.
+                           last_used=_adopted_last_used(shared_id))
         self._remember_pod_key(shared_id, _use_key)
         added = self._add_pod(handle)
         register_pod(shared_id, str(self.model_key), shared_url, _use_key,
@@ -5211,7 +5232,17 @@ class RunpodPodPool:
                         started_at=float(info.get("created") or now),
                         gpu=str(info.get("gpu") or ""),
                         api_key=str(info.get("key") or ""),
-                        healthy=True, last_used=now))
+                        healthy=True,
+                        # THE RECORDED value, not `now`. Resetting it here gave
+                        # every adopted pod a fresh idle lease, and adoption
+                        # runs on every restart -- so on a day with ten
+                        # restarts an idle pod never reached idle_timeout_s and
+                        # never retired. Measured: six idle embedding pods, one
+                        # of them 611 minutes old against a 900s timeout,
+                        # $2.24/hr between them. The registry has carried this
+                        # value all along (see the "used" field written beside
+                        # it); nothing read it back.
+                        last_used=float(info.get("used") or 0.0) or now))
                 else:
                     pod.url = str(info.get("url"))
                     if info.get("key"):
@@ -9579,6 +9610,19 @@ def _scaler_loop():
         reclaim_registered_pods()
     except Exception as exc:
         print(f"[runpod] reclaim: startup: {exc}", flush=True)
+    # A JOB FLEET's leftovers, before the generic reaper and without its
+    # grace. `text_lora_fleet.orphans()` has always been able to find these --
+    # its docstring calls itself "the answer to the orchestrator restarted
+    # mid-training" -- and nothing called it, so a restart left training pods
+    # rented until the reaper's 1200s grace expired: about $0.20 a pod, every
+    # restart. The reaper has to wait because it cannot tell a sibling's live
+    # pod from an abandoned one; this can, because a fleet record only exists
+    # while a job owns it and no job is running yet.
+    try:
+        from codai.api import text_lora_fleet as _tlf
+        _tlf.sweep_orphans()
+    except Exception as exc:
+        print(f"[text-lora-fleet] startup sweep: {exc}", flush=True)
     # Reap once promptly on start to catch orphans left by a crash/restart.
     try:
         reap_orphans()

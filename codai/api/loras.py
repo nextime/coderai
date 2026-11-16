@@ -3421,6 +3421,11 @@ async def _run_text_train_job(req: TextLoraTrainRequest, job_id: str,
     return await asyncio.to_thread(_text_train_blocking, req, job_id, dataset_path)
 
 
+#: Serialises the FIRST `from transformers import ...` across job threads.
+#: Held only for the import, never for the work.
+_TRANSFORMERS_IMPORT_LOCK = threading.Lock()
+
+
 def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
                          dataset_path: str) -> dict:
     """The dataset pass, then (unless dry_run) the QLoRA run itself.
@@ -3432,7 +3437,16 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     """
     global _active_job_id
     from codai.api import text_lora_trainer as tlt
-    from transformers import AutoTokenizer
+    # UNDER A LOCK. transformers imports its public names lazily, and that
+    # machinery is not safe against two threads taking it at once: each text
+    # job runs in its own thread, so two submitted together raced on the FIRST
+    # import and both died with "cannot import name 'AutoTokenizer' from
+    # 'transformers'" -- in the same second, on a package that imports
+    # perfectly a moment later. Serialising the first import costs one lock
+    # acquisition per job and removes a failure that looked like a broken
+    # install.
+    with _TRANSFORMERS_IMPORT_LOCK:
+        from transformers import AutoTokenizer
 
     _active_job_id = job_id
 

@@ -178,6 +178,85 @@ def _read_state(job_id: str) -> List[dict]:
         return []
 
 
+def sweep_orphans(client=None) -> dict:
+    """Terminate every pod a dead fleet left behind. Call this at STARTUP.
+
+    `orphans()` has always been able to find these -- its docstring calls
+    itself "the answer to the orchestrator restarted mid-training" -- and
+    nothing called it. So a restart or a crash left the fleet's pods rented
+    with nobody to release them, and they survived until the GENERIC reaper
+    noticed, 1200 seconds later: about $0.20 a pod, every restart, every
+    failure. With several restarts in a day and fleets of four to eight, that
+    is the systematic bleed, not an accident.
+
+    No grace is needed here, unlike the generic reaper. That one must wait,
+    because it cannot tell a sibling process's live pod from an abandoned one.
+    This can: a fleet record only exists while a job owns it, `forget()`
+    removes it when the fleet empties, and at startup no job is running in
+    this process. A record that is still on disk is therefore a pod whose
+    owner is definitively gone.
+
+    Returns {"pods": n, "jobs": n, "failed": n}. Terminate failures leave the
+    record alone so the next sweep tries again -- dropping it would be how a
+    pod becomes invisible AND billing.
+    """
+    rows = orphans()
+    out = {"pods": 0, "jobs": 0, "failed": 0}
+    if not rows:
+        return out
+    if client is None:
+        try:
+            from codai.models.manager import get_active_runpod_config
+            from codai.api.runpod_client import RunpodClient
+            acct = get_active_runpod_config()
+            if acct is None or not getattr(acct, "enabled", False):
+                return out
+            client = RunpodClient(acct)
+        except Exception as exc:
+            print(f"[text-lora-fleet] sweep: no RunPod client ({exc}); "
+                  f"{len(rows)} recorded pod(s) left for the reaper",
+                  flush=True)
+            return out
+    jobs = {}
+    for row in rows:
+        jobs.setdefault(str(row.get("job") or ""), []).append(row)
+    for job, pods in jobs.items():
+        kept = []
+        for row in pods:
+            pid = str(row.get("pod_id") or "")
+            if not pid or pid.startswith("pending-"):
+                continue
+            try:
+                client.terminate_pod(pid)
+            except Exception as exc:
+                out["failed"] += 1
+                kept.append(row)
+                print(f"[text-lora-fleet] sweep: could not terminate {pid} "
+                      f"from {job} ({exc}) — LEFT IN THE RECORD for the next "
+                      f"sweep", flush=True)
+                continue
+            out["pods"] += 1
+            rate = float(row.get("hourly_usd") or 0.0)
+            print(f"[text-lora-fleet] sweep: terminated {pid}, left by "
+                  f"{job} (~${rate:.2f}/hr)", flush=True)
+            try:
+                from codai.api import runpod_worker as rw
+                rw.unregister_pod(pid)
+            except Exception:
+                pass
+        if kept:
+            _write_state(job, kept)
+        else:
+            forget(job)
+            out["jobs"] += 1
+    if out["pods"] or out["failed"]:
+        print(f"[text-lora-fleet] sweep: {out['pods']} pod(s) from "
+              f"{out['jobs']} abandoned job(s) terminated"
+              + (f", {out['failed']} could not be" if out["failed"] else ""),
+              flush=True)
+    return out
+
+
 def orphans() -> List[dict]:
     """Every pod any fleet recorded and did not release.
 
