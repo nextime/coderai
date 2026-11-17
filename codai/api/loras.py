@@ -5099,7 +5099,21 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     dest = os.path.join(
                         out_dir,
                         f"r{rnd}-s{shard}-b{_held[0]}.safetensors")
-                    flt.fetch_adapter(pod, dest)
+                    try:
+                        flt.fetch_adapter(pod, dest)
+                    except flt.PodUnreachable as exc:
+                        # ITS WORK IS GONE, so its block has to come back.
+                        # Dropping through without recycling would mark the
+                        # examples claimed by a pod that no longer exists.
+                        _back = coord.recycle([shard], rnd=rnd)
+                        print(f"[text-lora] {job_id}: shard {shard} went "
+                              f"dark while its adapter was being collected "
+                              f"({exc})"
+                              + (f"; block(s) {_back} returned to the queue"
+                                 if _back else "")
+                              + "; released", flush=True)
+                        fleet.release(shard, "adapter fetch failed")
+                        continue
                     from codai.api import text_lora_rounds as _tlr
                     _trained = int(status.get("examples_trained") or 0)
                     _asked = coord.examples_in(_held)
@@ -5186,7 +5200,18 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 if rnd > 0:
                     prev = coord.average_path(rnd - 1)
                     if prev:
-                        flt.push_start_adapter(pod, prev)
+                        try:
+                            flt.push_start_adapter(pod, prev)
+                        except flt.PodUnreachable as exc:
+                            # THE ONE THAT KILLED A RUN. This raised
+                            # ConnectionError after blocking 900s on a pod
+                            # that had stopped answering, and took 21 healthy
+                            # pods and 39 paid minutes with it.
+                            print(f"[text-lora] {job_id}: shard {shard} "
+                                  f"would not take round {rnd - 1}'s average "
+                                  f"({exc}); released", flush=True)
+                            fleet.release(shard, "start adapter push failed")
+                            continue
                 _payload = coord.round_payload(shard)
                 if not _payload.get("indices"):
                     # Every block in this exchange is already being trained by
@@ -5212,6 +5237,12 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     fleet.note_checkin(shard)
                 except flt.PodBusy:
                     pass
+                except flt.PodUnreachable as exc:
+                    print(f"[text-lora] {job_id}: shard {shard} could not be "
+                          f"started on round {rnd} ({exc}); released",
+                          flush=True)
+                    fleet.release(shard, "round dispatch failed")
+                    continue
 
             closed = coord.close_round_if_ready()
             if closed is not None:

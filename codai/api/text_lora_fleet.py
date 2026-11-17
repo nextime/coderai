@@ -43,6 +43,7 @@ money is not a crash -- it is a training loop that keeps checking in forever.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -1170,6 +1171,41 @@ def narrow(cfg: LoraTrainConfig, *, pods: Optional[int] = None,
 # 160 MB adapter over a datacenter link are tens of seconds, and a timeout
 # shorter than the transfer turns a working pod into a reaped one.
 
+class PodUnreachable(FleetError):
+    """A per-pod HTTP call failed at the transport. NEVER fatal to the job.
+
+    These helpers let `requests` exceptions straight through, and three of
+    them are called from the round loop with no guard, so one pod going dark
+    at a round boundary killed the whole run. Measured: a `push_start_adapter`
+    to a pod that had stopped answering blocked for its full 900s timeout and
+    then raised ConnectionError, which released 21 HEALTHY pods and discarded
+    39 minutes of a paid fleet at 7/731 blocks.
+
+    `push_dataset`'s call site already had the right answer, and said so --
+    "the rest of the fleet is unaffected, where raising would have taken down
+    a run that has working pods". This makes that reachable for the rest: a
+    dead pod is a routine event in a rented fleet, so it is reported as one
+    and the pod is replaced.
+    """
+
+
+@contextlib.contextmanager
+def _transport(pod: "TrainerPod", what: str):
+    """Turn a transport failure on `pod` into :class:`PodUnreachable`.
+
+    Only `requests.RequestException` -- an OSError from the local disk while
+    streaming an adapter is a real error and must not be relabelled as the
+    pod being unreachable.
+    """
+    import requests
+    try:
+        yield
+    except requests.RequestException as exc:
+        raise PodUnreachable(
+            f"shard {pod.shard}: {what} failed at the transport: "
+            f"{type(exc).__name__}: {exc}") from exc
+
+
 class PodBusy(RuntimeError):
     """The pod is already working; a second round was refused."""
 
@@ -1179,7 +1215,8 @@ def push_dataset(pod: TrainerPod, path: str, *, timeout: float = 900.0) -> int:
     import requests
     with open(path, "rb") as fh:
         data = fh.read()
-    r = requests.post(pod.url.rstrip("/") + "/dataset", data=data,
+    with _transport(pod, "/dataset"):
+        r = requests.post(pod.url.rstrip("/") + "/dataset", data=data,
                       headers={"Authorization": f"Bearer {pod.secret}",
                                "Content-Type": "application/x-ndjson"},
                       timeout=timeout)
@@ -1190,14 +1227,15 @@ def push_dataset(pod: TrainerPod, path: str, *, timeout: float = 900.0) -> int:
 
 
 def push_start_adapter(pod: TrainerPod, path: str, *,
-                       timeout: float = 900.0) -> int:
+                       timeout: float = 300.0) -> int:
     """Send the previous round's average for this pod to resume from."""
     import requests
     with open(path, "rb") as fh:
         data = fh.read()
-    r = requests.put(pod.url.rstrip("/") + "/adapter/start", data=data,
-                     headers={"Authorization": f"Bearer {pod.secret}"},
-                     timeout=timeout)
+    with _transport(pod, "/adapter/start"):
+        r = requests.put(pod.url.rstrip("/") + "/adapter/start", data=data,
+                         headers={"Authorization": f"Bearer {pod.secret}"},
+                         timeout=timeout)
     if r.status_code != 200:
         raise RuntimeError(f"shard {pod.shard}: /adapter/start answered "
                            f"{r.status_code}: {(r.text or '')[:200]}")
@@ -1208,9 +1246,10 @@ def start_round(pod: TrainerPod, payload: Dict[str, Any], *,
                 timeout: float = 60.0) -> None:
     """Tell the pod to train one round. 409 means it is still on the last one."""
     import requests
-    r = requests.post(pod.url.rstrip("/") + "/round", json=payload,
-                      headers={"Authorization": f"Bearer {pod.secret}"},
-                      timeout=timeout)
+    with _transport(pod, "/round"):
+        r = requests.post(pod.url.rstrip("/") + "/round", json=payload,
+                          headers={"Authorization": f"Bearer {pod.secret}"},
+                          timeout=timeout)
     if r.status_code == 409:
         raise PodBusy(f"shard {pod.shard} is still working: "
                       f"{(r.text or '')[:200]}")
@@ -1239,7 +1278,7 @@ def poll_status(pod: TrainerPod, *, timeout: float = 30.0) -> Dict[str, Any]:
 
 
 def fetch_adapter(pod: TrainerPod, out_path: str, *,
-                  timeout: float = 1800.0) -> str:
+                  timeout: float = 900.0) -> str:
     """Pull the finished adapter, streamed, written atomically.
 
     Streamed because it is ~160 MB and reading it into memory per pod per round
@@ -1248,7 +1287,8 @@ def fetch_adapter(pod: TrainerPod, out_path: str, *,
     """
     import requests
     tmp = out_path + ".part"
-    with requests.get(pod.url.rstrip("/") + "/adapter", stream=True,
+    with _transport(pod, "/adapter"), \
+            requests.get(pod.url.rstrip("/") + "/adapter", stream=True,
                       headers={"Authorization": f"Bearer {pod.secret}"},
                       timeout=timeout) as r:
         if r.status_code != 200:
