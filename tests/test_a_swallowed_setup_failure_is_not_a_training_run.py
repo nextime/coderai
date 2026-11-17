@@ -67,6 +67,9 @@ class _Model:
     def named_modules(self):
         return []
 
+    def parameters(self):
+        return []
+
     def print_trainable_parameters(self):
         pass
 
@@ -177,3 +180,60 @@ def test_the_guard_only_catches_oom():
             _s.modules.pop("torch", None)
         else:
             _s.modules["torch"] = orig
+
+# --------------------------------------------------------------------- #
+# and what the card is actually holding
+# --------------------------------------------------------------------- #
+
+def test_the_loaded_base_is_described(fake_libs, capsys):
+    """A base that silently failed to quantize, or spilled to the CPU, shows
+    up only as a pod that trains a fraction of its slice -- because the loop
+    turns an OOM into a skip. So setup has to say what it loaded."""
+    _load(fake_libs)
+    said = capsys.readouterr().out
+    assert "base loaded:" in said, said
+    assert "GB of parameters" in said, said
+    assert "4-bit=" in said, said
+
+
+def test_an_unquantized_base_says_so_loudly(fake_libs):
+    """`4-bit=NO` is the line that would have ended a four-hour run early."""
+    import inspect
+    src = inspect.getsource(tlt.load_base_and_adapter)
+    assert "the base is NOT quantized" in src, src[-900:]
+
+
+def test_a_base_split_onto_the_cpu_is_a_warning(fake_libs, capsys):
+    """device_map='auto' spills rather than failing, which reads as success."""
+    import types as _t
+
+    class _P:
+        def __init__(self, dev):
+            self.device = dev
+            self.dtype = "torch.uint8"
+
+        def numel(self):
+            return 1000
+
+        def element_size(self):
+            return 1
+
+    model = fake_libs["model"] = _Model()
+    model.parameters = lambda: [_P("cuda:0"), _P("cpu"), _P("cpu")]
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+    said = capsys.readouterr().out
+    assert "did not fit on the card" in said, said
+    assert "SKIPS an OOM" in said, said
+
+
+def test_the_report_failing_does_not_stop_training(fake_libs, capsys):
+    """Instrumentation must never be the reason a run refuses to start."""
+    model = fake_libs["model"] = _Model()
+
+    def _boom():
+        raise RuntimeError("no parameters here")
+    model.parameters = _boom
+
+    got = tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+    assert got is not None
+    assert "could not describe the loaded base" in capsys.readouterr().out

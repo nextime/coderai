@@ -306,11 +306,26 @@ class Stats:
     trained_tokens: int = 0
     masked_tokens: int = 0
     weight_sum: float = 0.0
+    #: SEQUENCE length, which is neither of the two above. `trained_tokens`
+    #: counts answer positions in the loss and `masked_tokens` counts answer
+    #: positions excluded from it -- the PROMPT is in neither, so a summary
+    #: made of those two says nothing about how long the sequences are. That
+    #: is the number which decides whether a step fits in VRAM, and leaving
+    #: it out is how a set whose examples are ~5,000 tokens long was read as
+    #: "397 tokens per example" and an OOM theory dismissed on the strength
+    #: of it. One forward of 5,000 tokens over a 152k vocab is several GB of
+    #: logits alone.
+    seq_tokens: int = 0
+    seq_tokens_max: int = 0
 
     def describe(self) -> str:
         parts = [f"{self.examples} examples",
                  f"{self.trained_tokens} trained tokens",
                  f"{self.masked_tokens} masked away"]
+        if self.examples and self.seq_tokens:
+            parts.append(f"{self.seq_tokens // max(1, self.examples)} tokens "
+                         f"per sequence on average, longest "
+                         f"{self.seq_tokens_max}")
         if self.skipped:
             parts.append(f"{len(self.skipped)} SKIPPED")
         return ", ".join(parts)
@@ -331,6 +346,8 @@ def prepare(tokenizer, examples: Iterable[Example], *, max_len: int = 8192,
         st.examples += 1
         st.trained_tokens += enc.n_trained
         st.masked_tokens += enc.n_masked
+        st.seq_tokens += len(enc.input_ids)
+        st.seq_tokens_max = max(st.seq_tokens_max, len(enc.input_ids))
         st.weight_sum += enc.weight
     return out, st
 

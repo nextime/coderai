@@ -181,11 +181,37 @@ def masked_cross_entropy(logits, labels):
     """
     import torch
     import torch.nn.functional as F
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1), ignore_index=-100, reduction="mean")
+    shift_logits = logits[..., :-1, :]
+    shift_labels = labels[..., 1:]
+
+    # THE KEPT POSITIONS ARE GATHERED FIRST, and this is a memory fix, not a
+    # tidying one. The arithmetic is identical -- `ignore_index=-100` with
+    # `reduction="mean"` is a mean over exactly these positions -- but the
+    # cost is not. This used to `.contiguous()` the whole logits tensor and
+    # hand all of it to cross_entropy, which upcasts to fp32 internally and
+    # keeps that for the backward.
+    #
+    # On this workload the prompt is masked and the answer is not, so of a
+    # ~5,000-token sequence about 392 positions are trained: the full-width
+    # form paid for 5,000. At a 151,936-token vocabulary that is a 1.5 GB
+    # copy, ~3 GB of fp32 log-softmax, ~3 GB saved for backward and ~3 GB of
+    # gradient -- about 10 GB of transients per example, to produce a loss
+    # over 7% of them. Measured consequence: 13 of 16 examples raised
+    # OutOfMemoryError on a 48 GB card and the loop SKIPS an OOM, so the pod
+    # reported `done` having trained 3, and the run called that 100%.
+    #
+    # Gathering with a boolean mask produces a compact [kept, vocab] tensor
+    # directly, so nothing of full width is ever materialised or upcast.
+    keep = shift_labels != -100
+    if not bool(keep.any()):
+        # No trainable position. Returning a plain zero would detach the
+        # graph and make `backward()` raise; this keeps it and contributes
+        # nothing. `encode` already refuses such an example, so this is a
+        # guard rather than a path.
+        return (shift_logits.sum() * 0.0).to(torch.float32)
+    picked = shift_logits[keep]                  # [kept, vocab]
+    target = shift_labels[keep]                  # [kept]
+    return F.cross_entropy(picked.float(), target, reduction="mean")
 
 
 def scaled_backward(logits, labels, weight: float, accumulation_steps: int):
@@ -325,6 +351,45 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
             "differently and needs an explicit target list")
     line = describe_selection(linears, targets)
     print(f"[text-lora] {line}", flush=True)
+
+    # WHAT THE CARD IS ACTUALLY HOLDING, said once at setup. The loop turns
+    # an OutOfMemoryError into a skipped example, so a base that failed to
+    # quantize -- or landed partly on the CPU because it did not fit -- does
+    # not announce itself: it shows up as a pod that trained 3 of the 16
+    # examples it was asked for and still reported `done`. Measured before
+    # this line existed, that took two 16-pod runs and a one-pod probe to
+    # see at all, and the quantization could still only be inferred.
+    try:
+        import collections
+        _bits = collections.Counter()
+        _bytes = 0
+        for _p in model.parameters():
+            _bits[str(_p.dtype)] += 1
+            _bytes += _p.numel() * _p.element_size()
+        _devs = collections.Counter(str(_p.device) for _p in model.parameters())
+        _quant = any("uint8" in d or "int8" in d or "Params4bit" in d
+                     for d in _bits)
+        _vram = ""
+        if torch.cuda.is_available():
+            _vram = (f", card has "
+                     f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}"
+                     f"GB and {torch.cuda.memory_allocated() / 1e9:.1f}GB is "
+                     f"allocated")
+        print(f"[text-lora] base loaded: {_bytes / 1e9:.1f}GB of parameters "
+              f"across {dict(_devs)}, dtypes {dict(_bits)}, "
+              f"4-bit={'yes' if _quant else 'NO — the base is NOT quantized'}"
+              f"{_vram}", flush=True)
+        if "cpu" in _devs and len(_devs) > 1:
+            print(f"[text-lora] WARNING: {_devs['cpu']} parameter tensor(s) "
+                  f"are on the CPU, so the base did not fit on the card. "
+                  f"Every long example will OOM and the loop SKIPS an OOM, "
+                  f"so the round will report success having trained almost "
+                  f"nothing", flush=True)
+    except Exception as exc:
+        # Never fatal: this is instrumentation, and refusing to train because
+        # the report failed would be worse than training without it.
+        print(f"[text-lora] (could not describe the loaded base: {exc})",
+              flush=True)
     peft_model = get_peft_model(model, lora_config(settings, targets))
     try:
         peft_model.print_trainable_parameters()
