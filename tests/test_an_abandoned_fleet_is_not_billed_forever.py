@@ -264,6 +264,30 @@ def test_an_empty_stale_record_is_forgotten(home):
     assert not os.path.isfile(path)
 
 
+def test_forgetting_records_is_reported(home, capsys):
+    """A silent cleanup cannot be told from one that never ran."""
+    for job in ("job-a", "job-b"):
+        flt._write_state(job, [])
+        path = flt._state_path(job)
+        with open(path, encoding="utf-8") as fh:
+            env = json.load(fh)
+        env["at"] = time.time() - flt.ABANDONED_AFTER_S - 1
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(env, fh)
+
+    flt.sweep_abandoned(client=FakeClient())
+
+    said = capsys.readouterr().out
+    assert "forgot 2 empty" in said, said
+
+
+def test_a_quiet_sweep_says_nothing(home, capsys):
+    """Every two minutes forever: it must only speak when it acted."""
+    flt._write_state("job-live", [])
+    flt.sweep_abandoned(client=FakeClient())
+    assert "forgot" not in capsys.readouterr().out
+
+
 def test_a_fresh_empty_record_is_left_alone(home):
     """A job between its first record and its first rental is empty."""
     flt._write_state("job-starting", [])

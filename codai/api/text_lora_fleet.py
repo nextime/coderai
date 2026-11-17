@@ -313,6 +313,13 @@ def _forget_stale_empty(ttl_s: float = ABANDONED_AFTER_S) -> int:
             continue
         forget(job)
         gone += 1
+    if gone:
+        # SAID, because a silent cleanup is indistinguishable from one that
+        # never ran: the first production sweep cleared 83 records and left
+        # no trace of having done so, which cost ten minutes of wondering
+        # whether the timer fired at all.
+        print(f"[text-lora-fleet] abandoned sweep: forgot {gone} empty "
+              f"fleet record(s) whose pods were all released", flush=True)
     return gone
 
 
