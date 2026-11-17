@@ -242,3 +242,41 @@ def test_the_sweep_runs_on_a_timer():
 
 def test_the_fleet_can_say_it_is_alive():
     assert hasattr(flt.TrainerFleet, "heartbeat")
+
+
+# --------------------------------------------------------------------- #
+# the records a finished fleet leaves behind
+# --------------------------------------------------------------------- #
+
+def test_an_empty_stale_record_is_forgotten(home):
+    """83 of these had piled up in a day. No pods, but no bound either."""
+    flt._write_state("job-emptied", [])
+    path = flt._state_path("job-emptied")
+    with open(path, encoding="utf-8") as fh:
+        env = json.load(fh)
+    env["at"] = time.time() - flt.ABANDONED_AFTER_S - 1
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(env, fh)
+
+    out = flt.sweep_abandoned(client=FakeClient())
+
+    assert out["forgotten"] == 1
+    assert not os.path.isfile(path)
+
+
+def test_a_fresh_empty_record_is_left_alone(home):
+    """A job between its first record and its first rental is empty."""
+    flt._write_state("job-starting", [])
+    out = flt.sweep_abandoned(client=FakeClient())
+    assert out["forgotten"] == 0
+    assert os.path.isfile(flt._state_path("job-starting"))
+
+
+def test_forgetting_empties_does_not_touch_a_record_with_pods(home):
+    _record("job-dead", ["p1"], age_s=flt.ABANDONED_AFTER_S + 1)
+    client = FakeClient(fail=["p1"])
+
+    flt.sweep_abandoned(client=client)
+
+    assert flt._read_state("job-dead"), \
+        "a pod that would not die must not be forgotten as an empty record"

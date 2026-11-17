@@ -281,8 +281,39 @@ def sweep_abandoned(client=None, ttl_s: float = ABANDONED_AFTER_S) -> dict:
     Without it the bleed had no upper bound but the next restart. With it the
     worst case is `ttl_s`.
     """
-    return _terminate_recorded(abandoned(ttl_s), client=client,
-                               why="abandoned sweep")
+    out = _terminate_recorded(abandoned(ttl_s), client=client,
+                              why="abandoned sweep")
+    out["forgotten"] = _forget_stale_empty(ttl_s)
+    return out
+
+
+def _forget_stale_empty(ttl_s: float = ABANDONED_AFTER_S) -> int:
+    """Drop records that hold no pods and have not been touched.
+
+    A fleet that released everything leaves `{"pods": []}` behind, and
+    nothing removed it: 83 such files had accumulated in a day. Harmless --
+    there is no pod in them to bill -- but they grow without bound and every
+    sweep reads all of them. Only the STALE ones go, because a job between
+    its first record and its first rental is legitimately empty.
+    """
+    cut = time.time() - max(1.0, float(ttl_s))
+    gone = 0
+    try:
+        names = sorted(os.listdir(_state_dir()))
+    except OSError:
+        return 0
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        job = name[:-5]
+        env = _read_envelope(job)
+        if env.get("pods"):
+            continue
+        if float(env.get("at") or 0.0) > cut:
+            continue
+        forget(job)
+        gone += 1
+    return gone
 
 
 def _terminate_recorded(rows: List[dict], *, client=None,
