@@ -372,6 +372,37 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
         dtype=getattr(torch, settings.compute_dtype),
         device_map="auto", trust_remote_code=True)
     model = prepare_model_for_kbit_training(model)
+    # PUT THE BIG TENSORS BACK IN THE COMPUTE DTYPE. `prepare_model_for_kbit_
+    # training` does, in its own words, "cast all non INT8 parameters to
+    # fp32" -- every parameter that is not a `Params4bit`, whatever its size.
+    # Upcasting the NORMS is the point of that and they are kept: 1-D, a few
+    # MB, and fp32 is what makes layer norm stable in a 4-bit run. Upcasting
+    # `embed_tokens` and `lm_head` is collateral, and at a 151,936-token
+    # vocabulary it is ruinous twice over:
+    #
+    #   * the weights go from 3.1 GB to 6.2 GB -- measured, a 27B base that
+    #     should occupy ~14 GB reported 22.68 GB with 867 fp32 tensors;
+    #   * and an fp32 `lm_head` produces fp32 LOGITS. At 4,703 tokens that is
+    #     [1, 4703, 151936] = 2.86 GB for one forward and as much again for
+    #     its gradient, against 1.43 GB apiece in bf16, while an fp32
+    #     residual stream doubles every checkpointed activation besides.
+    #
+    # On a 48 GB card that was the difference between fitting and not: with
+    # 23.09 GB resident, 12 of every 16 examples raised OutOfMemoryError --
+    # and the loop SKIPS an OOM, so the pod answered `done` having trained 4
+    # and the run called it 100%. The loss is still computed in fp32 (the
+    # gathered logits are cast in `masked_cross_entropy`), so this costs no
+    # precision where precision is load-bearing.
+    _compute = getattr(torch, settings.compute_dtype)
+    _recast = 0
+    for _name, _p in model.named_parameters():
+        if _p.dtype == torch.float32 and _p.ndim > 1:
+            _p.data = _p.data.to(_compute)
+            _recast += 1
+    if _recast:
+        print(f"[text-lora] put {_recast} parameter tensor(s) back in "
+              f"{settings.compute_dtype} after the kbit prepare upcast them "
+              f"to fp32 (norms left in fp32)", flush=True)
     # Gradient checkpointing: a 27B base at 8192 tokens does not otherwise fit
     # alongside its activations on one card, and recomputation is cheaper than
     # the OOM it avoids.

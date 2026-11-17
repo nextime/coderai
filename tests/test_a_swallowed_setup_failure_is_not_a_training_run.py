@@ -67,8 +67,18 @@ class _Model:
     def named_modules(self):
         return []
 
+    #: Held explicitly, so a test can break `parameters` (what the footprint
+    #: report reads) without also breaking `named_parameters` (what the
+    #: load-bearing recast reads). Delegating one to the other conflated two
+    #: failures that must behave differently.
+    _params: list = []
+
     def parameters(self):
-        return []
+        return list(self._params)
+
+    def named_parameters(self):
+        return [(p.name if hasattr(p, "name") else f"p{i}", p)
+                for i, p in enumerate(self._params)]
 
     def print_trainable_parameters(self):
         pass
@@ -227,13 +237,141 @@ def test_a_base_split_onto_the_cpu_is_a_warning(fake_libs, capsys):
 
 
 def test_the_report_failing_does_not_stop_training(fake_libs, capsys):
-    """Instrumentation must never be the reason a run refuses to start."""
+    """Instrumentation must never be the reason a run refuses to start.
+
+    Only the REPORT is guarded. The fp32 recast below it is not
+    instrumentation -- it is the difference between fitting on the card and
+    OOM-ing on 12 of every 16 examples -- so `named_parameters` is left
+    working here and its own failure is covered separately.
+    """
     model = fake_libs["model"] = _Model()
 
     def _boom():
         raise RuntimeError("no parameters here")
-    model.parameters = _boom
+    model.parameters = _boom                    # the report's source only
 
     got = tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
     assert got is not None
     assert "could not describe the loaded base" in capsys.readouterr().out
+
+
+def test_the_recast_failing_is_fatal(fake_libs):
+    """Deliberately NOT guarded. A run that silently skipped the recast would
+    train on an fp32 lm_head, OOM on nearly every example, skip them, and
+    report success -- which is the failure this whole change exists to end."""
+    model = fake_libs["model"] = _Model()
+
+    def _boom():
+        raise RuntimeError("cannot enumerate parameters")
+    model.named_parameters = _boom
+
+    with pytest.raises(RuntimeError, match="cannot enumerate parameters"):
+        tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+
+# --------------------------------------------------------------------- #
+# the kbit prepare's fp32 upcast, undone for the tensors that matter
+# --------------------------------------------------------------------- #
+
+class _Param:
+    """A parameter whose dtype can be moved, like torch's."""
+
+    def __init__(self, dtype, ndim, name=""):
+        self.dtype = dtype
+        self.ndim = ndim
+        self.name = name
+        self.data = self
+        self.requires_grad = False
+        self.moved_to = None
+
+    def to(self, dtype):
+        self.moved_to = dtype
+        self.dtype = dtype
+        return self
+
+
+def _model_with(params):
+    m = _Model()
+    m._params = list(params)
+    return m
+
+
+def test_the_big_fp32_tensors_go_back_to_the_compute_dtype(fake_libs, monkeypatch):
+    """peft casts EVERY non-4bit parameter to fp32. At a 151,936-token
+    vocabulary that doubles embed_tokens and lm_head AND makes the logits
+    fp32, which is 2.86GB a forward at 4,703 tokens instead of 1.43GB."""
+    import torch
+    lm_head = _Param(torch.float32, 2, "lm_head.weight")
+    embed = _Param(torch.float32, 2, "model.embed_tokens.weight")
+    params = [lm_head, embed]
+    fake_libs["model"] = _model_with(params)
+
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+
+    assert lm_head.moved_to == torch.bfloat16, "an fp32 lm_head means fp32 logits"
+    assert embed.moved_to == torch.bfloat16
+
+
+def test_the_norms_are_left_in_fp32(fake_libs):
+    """That upcast is the POINT of the kbit prepare: 1-D, a few MB, and fp32
+    is what keeps layer norm stable in a 4-bit run."""
+    import torch
+    norm = _Param(torch.float32, 1, "model.layers.0.input_layernorm.weight")
+    fake_libs["model"] = _model_with([norm])
+
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+
+    assert norm.moved_to is None, "a 1-D fp32 parameter must stay fp32"
+    assert norm.dtype == torch.float32
+
+
+def test_the_quantized_weights_are_not_touched(fake_libs):
+    """They are `Params4bit`/uint8 and recasting them would undo the whole
+    point of loading in 4-bit."""
+    import torch
+    quant = _Param(torch.uint8, 2, "model.layers.0.self_attn.q_proj.weight")
+    fake_libs["model"] = _model_with([quant])
+
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+
+    assert quant.moved_to is None
+    assert quant.dtype == torch.uint8
+
+
+def test_already_bf16_tensors_are_not_moved(fake_libs):
+    """Nothing to do, and a needless copy of a 3GB tensor is not free."""
+    import torch
+    p = _Param(torch.bfloat16, 2, "lm_head.weight")
+    fake_libs["model"] = _model_with([p])
+
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+
+    assert p.moved_to is None
+
+
+def test_the_recast_follows_the_configured_compute_dtype(fake_libs):
+    """float16 is a legitimate setting and must not be silently bf16."""
+    import torch
+    import dataclasses
+    p = _Param(torch.float32, 2, "lm_head.weight")
+    fake_libs["model"] = _model_with([p])
+    st = dataclasses.replace(tlt.QLoraSettings(), compute_dtype="float16")
+
+    tlt.load_base_and_adapter("some/base", st)
+
+    assert p.moved_to == torch.float16
+
+
+def test_the_recast_is_reported(fake_libs, capsys):
+    """Silent, it cannot be told from a run where the upcast never happened."""
+    import torch
+    fake_libs["model"] = _model_with([_Param(torch.float32, 2, "lm_head.weight")])
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+    said = capsys.readouterr().out
+    assert "back in bfloat16" in said, said
+
+
+def test_nothing_to_recast_says_nothing(fake_libs, capsys):
+    import torch
+    fake_libs["model"] = _model_with([_Param(torch.uint8, 2, "q_proj.weight")])
+    tlt.load_base_and_adapter("some/base", tlt.QLoraSettings())
+    assert "back in" not in capsys.readouterr().out
