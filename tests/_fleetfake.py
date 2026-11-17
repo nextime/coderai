@@ -39,6 +39,32 @@ from typing import Dict, List, Optional
 from codai.api import text_lora_fleet as flt
 
 
+def _write_tiny_adapter(path: str, *, rank: int = 16) -> str:
+    """A real, minimal LoRA safetensors file: header plus zeroed tensors.
+
+    The run derives `adapter_config.json` from the averaged tensors' KEYS, so
+    anything standing in for an average has to carry lora_A/lora_B names.
+    """
+    import json
+    import struct
+    hdr, off = {}, 0
+    for name, shape in (
+            ("base_model.model.model.layers.0.self_attn.q_proj."
+             "lora_A.weight", [rank, 8]),
+            ("base_model.model.model.layers.0.self_attn.q_proj."
+             "lora_B.weight", [8, rank])):
+        n = shape[0] * shape[1] * 4
+        hdr[name] = {"dtype": "F32", "shape": shape,
+                     "data_offsets": [off, off + n]}
+        off += n
+    blob = json.dumps(hdr).encode("utf-8")
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(blob)))
+        fh.write(blob)
+        fh.write(b"\0" * off)
+    return path
+
+
 class Pod:
     """Enough of a :class:`TrainerPod` for the run to drive it."""
 
@@ -215,11 +241,22 @@ def install(monkeypatch, fleet, *, home, pushes=None, finish_after=0.0,
         def epochs(self):
             return 1.0
 
+        #: The run writes `adapter_config.json` from the averaged tensors, so
+        #: the fake has to supply both: a 1-byte stand-in was correctly
+        #: refused as "not a LoRA adapter".
+        base = "stub-base"
+
+        @property
+        def settings(self):
+            return types.SimpleNamespace(alpha=32, dropout=0.0, rank=16)
+
+        def blocks_held(self, shard, rnd):
+            return []
+
         def average_path(self, rnd):
             p = os.path.join(str(home), f"avg{rnd}.safetensors")
             if not os.path.isfile(p):
-                with open(p, "wb") as fh:
-                    fh.write(b"\0")
+                _write_tiny_adapter(p)
             return p
     monkeypatch.setattr(loras, "_TextTrainCoordinator", _Coord)
 

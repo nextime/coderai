@@ -158,10 +158,29 @@ def test_a_recycled_block_can_be_issued_again_in_the_same_exchange():
 
 
 def test_the_submission_file_is_named_per_block():
+    """Two blocks from one pod in one exchange must not overwrite each other.
+
+    This used to assert the exact source line, INCLUDING the
+    `coord.blocks_for(...)` call that named the file through the handout --
+    so the string test passed while every poll of an already-submitted pod
+    consumed a fresh block and marked it covered untrained. The property is
+    that the name follows the block, and that reading the name costs nothing.
+    """
     import inspect
     src = inspect.getsource(loras._text_train_distributed)
-    assert 'f"r{rnd}-s{shard}-"' in src
-    assert "b{(coord.blocks_for(shard, rnd) or [0])[0]}" in src
+    assert "b{_held[0]}" in src, \
+        "the adapter is named after the block the pod actually holds"
+    assert "blocks_for(shard, rnd)" not in src, \
+        "naming a file must never go through the handout"
+
+    # And the numbers it is named after really are distinct per block.
+    c, _t = _coord()
+    c.cohort(0, [0], grow=True)
+    first = c.blocks_for(0, 0)
+    c.block_done(0, 0, examples=29)
+    second = c.blocks_for(0, 0)
+    assert first and second and first != second, \
+        "a pod taking another block gets a different one"
 
 
 def test_the_loop_no_longer_skips_a_pod_that_submitted():

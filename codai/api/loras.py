@@ -4068,18 +4068,46 @@ class _TextTrainCoordinator:
             out.extend(self.plan.block_at(len(self.encoded), b, per))
         return out
 
-    def block_done(self, shard: int, rnd: int) -> None:
+    def blocks_held(self, shard: int, rnd: int) -> List[int]:
+        """What this pod is holding right now. A QUERY: it hands out nothing.
+
+        Split off from :meth:`blocks_for` because the poll loop needed the
+        block number to name the adapter it was about to fetch, and reached
+        for the handout to get it. A pod that has already submitted holds
+        nothing, so that call consumed a FRESH block, the identical adapter
+        was fetched again, and :meth:`block_done` marked the new block
+        covered -- examples no gradient step ever saw. On the 16-pod run that
+        first reached the end it logged 97 submissions from 8 pods in round 0
+        and 252/252 blocks covered, against 859 examples actually trained.
+        """
+        with self._lock:
+            return list(self._blocks.get(int(rnd), {}).get(int(shard)) or [])
+
+    def block_done(self, shard: int, rnd: int,
+                   examples: Optional[int] = None) -> None:
         """The pod submitted its block; it may be given another.
 
-        The block stays in this round's ISSUED set -- it has been trained and
-        must not be handed to anyone else in the same average -- but it is no
-        longer held by this pod.
+        A block is COVERED only if the submission carried training. That is
+        what ends the run, so it is counted on work done and not on a handout
+        or a bare reply: a block handed to a pod that died was never trained,
+        and a pod that answered with zero examples trained nothing either.
+        Either way it goes back on the FRONT of the queue, exactly as a dead
+        pod's does, and comes out un-issued so the next handout can give it to
+        somebody who will train it.
+
+        ``examples=None`` means the caller does not know, and is trusted --
+        every caller inside this module passes the count.
         """
         with self._lock:
             done = self._blocks.get(int(rnd), {}).pop(int(shard), None) or []
-            # COVERED, which is what ends the run. Marked on submission
-            # rather than on handout: a block handed to a pod that dies was
-            # never trained, and counting it would cut the run short.
+            if examples is not None and int(examples) <= 0:
+                if done:
+                    self._recycle = sorted(int(b) for b in done) + self._recycle
+                    iss = self._issued.get(int(rnd))
+                    if iss:
+                        for b in done:
+                            iss.discard(int(b))
+                return
             for b in done:
                 self._covered.add(int(b))
 
@@ -4201,9 +4229,10 @@ class _TextTrainCoordinator:
             except Exception:
                 pass            # disk hygiene must never fail a paid round
         _pods = len({int(s.shard) for s in subs})
+        _ex = int(sum(weights))
         print(f"[text-lora] {self.job_id}: round {rnd} averaged from "
               f"{len(subs)} submission(s) across {_pods} pod(s) "
-              f"({int(sum(weights))} examples)"
+              f"({_ex} examples)"
               + (f"; absent: {absent}" if absent else ""), flush=True)
         return rnd
 
@@ -4850,22 +4879,38 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 if state in ("training", "encoding", "loading-tokenizer"):
                     fleet.note_checkin(shard)
                     continue
-                if state == "done" and int(status.get("round", -1)) == rnd:
+                _held = coord.blocks_held(shard, rnd)
+                if state == "done" and int(status.get("round", -1)) == rnd \
+                        and _held:
                     # Finished: pull it and record the submission.
                     # PER BLOCK, not per shard: a pod may contribute more
                     # than once to an exchange and the second file must not
                     # land on top of the first -- which averaged one adapter
                     # twice and lost the other's work entirely.
+                    #
+                    # GATED ON HOLDING A BLOCK, and the name comes from a
+                    # query. A pod keeps reporting done@rnd until something
+                    # starts it on new work, so this branch sees the same
+                    # status on every slice; naming the file through the
+                    # HANDOUT consumed a block each time and marked it
+                    # covered untrained. Collect once, then fall through to
+                    # the dispatch below, which is what gives it more work.
                     dest = os.path.join(
-                        out_dir, f"r{rnd}-s{shard}-"
-                        f"b{(coord.blocks_for(shard, rnd) or [0])[0]}"
-                        f".safetensors")
+                        out_dir,
+                        f"r{rnd}-s{shard}-b{_held[0]}.safetensors")
                     flt.fetch_adapter(pod, dest)
                     from codai.api import text_lora_rounds as _tlr
+                    _trained = int(status.get("examples_trained") or 0)
                     coord.submit(_tlr.Submission(
                         shard=shard, round=rnd, path=dest,
-                        examples=int(status.get("examples_trained") or 0)))
-                    coord.block_done(shard, rnd)
+                        examples=_trained))
+                    coord.block_done(shard, rnd, examples=_trained)
+                    if _trained <= 0:
+                        print(f"[text-lora] {job_id}: shard {shard} "
+                              f"reported round {rnd} done having trained "
+                              f"NOTHING; block {_held[0]} goes back on the "
+                              f"queue and this reply is not coverage",
+                              flush=True)
                     fleet.note_checkin(shard, rounds_done=rnd + 1)
                     continue
                 if state == "done" and 0 <= int(status.get("round", -1)) < rnd:
@@ -5024,6 +5069,17 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         import shutil
         adapter = os.path.join(out_dir, "adapter_model.safetensors")
         shutil.copyfile(final, adapter)
+        # AND THE CONFIG, or this directory is not an adapter. The averaging
+        # path only ever wrote tensors, so every distributed run produced a
+        # directory that PEFT and vLLM both refuse to load -- invisible until
+        # one of them reached the end. Derived from the tensors because the
+        # pod picks its own target modules from the base model's layer names.
+        _acfg = tlr.write_adapter_config(
+            out_dir, adapter, base=coord.base,
+            alpha=getattr(coord.settings, "alpha", None),
+            dropout=getattr(coord.settings, "dropout", None))
+        print(f"[text-lora] {job_id}: wrote {os.path.basename(_acfg)}",
+              flush=True)
         _cov, _cwant = coord.coverage()
         print(f"[text-lora] {job_id}: finished {coord.tracker.round} "
               f"exchange(s), {_cov}/{_cwant} blocks trained; "

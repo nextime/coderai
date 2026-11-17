@@ -435,3 +435,116 @@ class RoundTracker:
     def weights_for(self, subs: Sequence[Submission]) -> List[float]:
         """The averaging weights: examples actually trained this round."""
         return [float(max(0, s.examples)) for s in subs]
+
+
+# --------------------------------------------------------------------------- #
+# what makes the averaged tensors loadable
+# --------------------------------------------------------------------------- #
+
+#: Keys a PEFT loader reads that this module can state truthfully. Deliberately
+#: not the whole of `LoraConfig`: a field guessed here would be a claim about
+#: how the pods trained, and the ones below are either read off the tensors or
+#: taken from the settings the pods were given.
+_LORA_KEY = "lora_A"
+
+
+def _safetensors_header(path: str) -> Dict[str, Any]:
+    """The file's header dict, without importing safetensors.
+
+    Eight bytes of little-endian length, then that many bytes of JSON. Done by
+    hand because this runs on the orchestrator purely to read shapes, and
+    pulling torch in to list key names would be absurd.
+    """
+    import json
+    import struct
+    with open(path, "rb") as fh:
+        raw = fh.read(8)
+        if len(raw) < 8:
+            raise ValueError(f"{path} is too short to be safetensors")
+        n = struct.unpack("<Q", raw)[0]
+        if n <= 0 or n > 100 * 1024 * 1024:
+            raise ValueError(f"{path} has an implausible header length {n}")
+        return json.loads(fh.read(n).decode("utf-8"))
+
+
+def adapter_config_for(adapter_path: str, *, base: str,
+                       alpha: Optional[float] = None,
+                       dropout: Optional[float] = None,
+                       task_type: str = "CAUSAL_LM") -> Dict[str, Any]:
+    """The ``adapter_config.json`` body for an averaged adapter.
+
+    WHY THIS IS DERIVED AND NOT COPIED. The distributed run's result is a
+    weighted mean of tensors; the only thing it ever wrote was
+    `adapter_model.safetensors`, and a directory with no `adapter_config.json`
+    is not an adapter -- PEFT and vLLM both refuse it. The first distributed
+    run that reached the end produced exactly that and nothing noticed,
+    because no distributed run had ever finished before.
+
+    The ranks and the adapted modules are READ OFF THE TENSORS rather than
+    inferred from the request, because the pod chooses its own targets: it
+    lists the base model's Linear modules and keeps the language projections
+    by name, which the orchestrator cannot reproduce without loading the base.
+    The keys are therefore the only truthful source, and they are also exactly
+    what a loader has to match.
+
+    `lora_alpha` is the one thing the tensors do not carry; it comes from the
+    settings the pods were handed, and a caller that cannot supply it gets
+    PEFT's own convention of alpha == r rather than a silent zero, which would
+    scale the adapter to nothing.
+    """
+    hdr = _safetensors_header(adapter_path)
+    mods: set = set()
+    rank = 0
+    for key in hdr:
+        if key == "__metadata__":
+            continue
+        if f".{_LORA_KEY}." not in f".{key}.":
+            continue
+        head, _, _tail = key.partition(f".{_LORA_KEY}")
+        name = head
+        for prefix in ("base_model.model.", "base_model."):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        if name:
+            mods.add(name)
+        shape = (hdr[key] or {}).get("shape") or []
+        if len(shape) == 2:
+            # lora_A is [r, in_features]: the rank is the ROW count, and
+            # taking the min of the two would silently report `in_features`
+            # for any module narrower than the rank.
+            rank = max(rank, int(shape[0]))
+    if not mods or rank <= 0:
+        raise ValueError(
+            f"{adapter_path} carries no {_LORA_KEY} tensors — it is not a "
+            f"LoRA adapter, so no adapter_config.json can describe it")
+    _alpha = int(alpha) if alpha else rank
+    return {
+        "peft_type": "LORA",
+        "task_type": str(task_type),
+        "r": int(rank),
+        "lora_alpha": _alpha,
+        "lora_dropout": float(dropout or 0.0),
+        "target_modules": sorted(mods),
+        "base_model_name_or_path": str(base or ""),
+        "bias": "none",
+        "fan_in_fan_out": False,
+        "inference_mode": True,
+    }
+
+
+def write_adapter_config(out_dir: str, adapter_path: str, *, base: str,
+                         alpha: Optional[float] = None,
+                         dropout: Optional[float] = None) -> str:
+    """Write `adapter_config.json` beside the adapter. Returns its path."""
+    import json
+    import os
+    cfg = adapter_config_for(adapter_path, base=base,
+                             alpha=alpha, dropout=dropout)
+    dest = os.path.join(out_dir, "adapter_config.json")
+    tmp = dest + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=1, sort_keys=False)
+        fh.write("\n")
+    os.replace(tmp, dest)
+    return dest

@@ -178,16 +178,29 @@ def _install(monkeypatch, fleet, *, pushes, stop_after=0.0, home=None):
         def epochs(self):
             return 1.0
 
+        #: The run derives `adapter_config.json` from the average, so the
+        #: fake supplies the base and the settings it reads for that.
+        base = "stub-base"
+
+        @property
+        def settings(self):
+            return types.SimpleNamespace(alpha=32, dropout=0.0, rank=16)
+
+        def blocks_held(self, shard, rnd):
+            return []
+
         def average_path(self, rnd):
             # A real file: the run copies the last round's average into the
             # adapter and fails if there is none, and that path is not what
-            # these tests are about.
+            # these tests are about. Adapter-SHAPED, because the run now
+            # reads its keys to write the config beside it.
             import os
+            from _fleetfake import _write_tiny_adapter
             d = loras._loras_dir()
             os.makedirs(d, exist_ok=True)
             p = os.path.join(d, f"avg{rnd}.safetensors")
             if not os.path.isfile(p):
-                open(p, "wb").write(b"\0")
+                _write_tiny_adapter(p)
             return p
     monkeypatch.setattr(loras, "_TextTrainCoordinator", _Coord)
 
