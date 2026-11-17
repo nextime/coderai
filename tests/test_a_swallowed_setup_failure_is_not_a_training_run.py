@@ -196,11 +196,11 @@ def test_the_loaded_base_is_described(fake_libs, capsys):
     assert "4-bit=" in said, said
 
 
-def test_an_unquantized_base_says_so_loudly(fake_libs):
-    """`4-bit=NO` is the line that would have ended a four-hour run early."""
-    import inspect
-    src = inspect.getsource(tlt.load_base_and_adapter)
-    assert "the base is NOT quantized" in src, src[-900:]
+# `4-bit=NO` used to be asserted here as a string in
+# `load_base_and_adapter`. It broke the moment the report moved into
+# `describe_loaded_base` -- while the behaviour was unchanged -- which is the
+# third source assertion to fail that way in this work. It is driven instead,
+# in test_the_base_footprint_leaves_the_pod.py.
 
 
 def test_a_base_split_onto_the_cpu_is_a_warning(fake_libs, capsys):

@@ -302,6 +302,60 @@ def load_progress(directory: str) -> Progress:
 # the run
 # --------------------------------------------------------------------------- #
 
+def describe_loaded_base(model) -> Dict[str, Any]:
+    """What the card is actually holding, as data rather than a log line.
+
+    STRUCTURED because the log is the one place this cannot be read. A
+    training pod's stdout is not collected anywhere -- there is no public
+    pod-log API and the orchestrator never sees it -- so a `print` here is
+    written for nobody. The same mistake was made twice in one day: the
+    reason a fleet trained 4 of every 16 examples could not be established
+    from outside the pod, and the first attempt to fix that put the answer
+    straight back into stdout.
+
+    It matters because the training loop turns an OutOfMemoryError into a
+    SKIPPED example. A base that silently failed to quantize, or that
+    `device_map="auto"` spilled onto the CPU because it did not fit, does not
+    announce itself: it looks exactly like a pod that did less work, and
+    answers `done`.
+    """
+    import collections
+
+    import torch
+    dtypes: collections.Counter = collections.Counter()
+    devices: collections.Counter = collections.Counter()
+    n_bytes = 0
+    for p in model.parameters():
+        dtypes[str(p.dtype)] += 1
+        devices[str(p.device)] += 1
+        n_bytes += p.numel() * p.element_size()
+    # bnb keeps 4-bit weights as uint8 blocks, so the dtype is the tell.
+    quantized = any(("uint8" in d) or ("int8" in d) for d in dtypes)
+    out: Dict[str, Any] = {
+        "param_bytes": int(n_bytes),
+        "param_gb": round(n_bytes / 1e9, 2),
+        "dtypes": dict(dtypes),
+        "devices": dict(devices),
+        "quantized_4bit": bool(quantized),
+        "cpu_params": int(sum(v for k, v in devices.items() if "cpu" in k)
+                          if len(devices) > 1 else 0),
+    }
+    if torch.cuda.is_available():
+        out["vram_total_gb"] = round(
+            torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+        out["vram_allocated_gb"] = round(
+            torch.cuda.memory_allocated() / 1e9, 2)
+        out["card"] = str(torch.cuda.get_device_properties(0).name)
+    out["line"] = (
+        f"base loaded: {out['param_gb']}GB of parameters across "
+        f"{out['devices']}, dtypes {out['dtypes']}, 4-bit="
+        + ("yes" if quantized else "NO - THE BASE IS NOT QUANTIZED")
+        + (f", {out.get('card')} has {out.get('vram_total_gb')}GB with "
+           f"{out.get('vram_allocated_gb')}GB allocated"
+           if "vram_total_gb" in out else ""))
+    return out
+
+
 def load_base_and_adapter(base: str, settings: QLoraSettings):
     """The 4-bit base with a LoRA on its language projections.
 
@@ -352,38 +406,14 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
     line = describe_selection(linears, targets)
     print(f"[text-lora] {line}", flush=True)
 
-    # WHAT THE CARD IS ACTUALLY HOLDING, said once at setup. The loop turns
-    # an OutOfMemoryError into a skipped example, so a base that failed to
-    # quantize -- or landed partly on the CPU because it did not fit -- does
-    # not announce itself: it shows up as a pod that trained 3 of the 16
-    # examples it was asked for and still reported `done`. Measured before
-    # this line existed, that took two 16-pod runs and a one-pod probe to
-    # see at all, and the quantization could still only be inferred.
     try:
-        import collections
-        _bits = collections.Counter()
-        _bytes = 0
-        for _p in model.parameters():
-            _bits[str(_p.dtype)] += 1
-            _bytes += _p.numel() * _p.element_size()
-        _devs = collections.Counter(str(_p.device) for _p in model.parameters())
-        _quant = any("uint8" in d or "int8" in d or "Params4bit" in d
-                     for d in _bits)
-        _vram = ""
-        if torch.cuda.is_available():
-            _vram = (f", card has "
-                     f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}"
-                     f"GB and {torch.cuda.memory_allocated() / 1e9:.1f}GB is "
-                     f"allocated")
-        print(f"[text-lora] base loaded: {_bytes / 1e9:.1f}GB of parameters "
-              f"across {dict(_devs)}, dtypes {dict(_bits)}, "
-              f"4-bit={'yes' if _quant else 'NO — the base is NOT quantized'}"
-              f"{_vram}", flush=True)
-        if "cpu" in _devs and len(_devs) > 1:
-            print(f"[text-lora] WARNING: {_devs['cpu']} parameter tensor(s) "
-                  f"are on the CPU, so the base did not fit on the card. "
-                  f"Every long example will OOM and the loop SKIPS an OOM, "
-                  f"so the round will report success having trained almost "
+        _fp = describe_loaded_base(model)
+        print(f"[text-lora] {_fp['line']}", flush=True)
+        if _fp.get("cpu_params"):
+            print(f"[text-lora] WARNING: {_fp['cpu_params']} parameter "
+                  f"tensor(s) are on the CPU, so the base did not fit on the "
+                  f"card. Every long example will OOM and the loop SKIPS an "
+                  f"OOM, so the round reports success having trained almost "
                   f"nothing", flush=True)
     except Exception as exc:
         # Never fatal: this is instrumentation, and refusing to train because
@@ -416,6 +446,21 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
     torch.manual_seed(settings.seed)
 
     model, _line = load_base_and_adapter(base, settings)
+    # REPORTED BEFORE THE FIRST STEP, and through the progress callback rather
+    # than only in the return value: if every example OOMs the run still ends
+    # normally, but if the pod wedges or is killed the return value never
+    # arrives, and this is exactly the case where the footprint is what one
+    # wants to know. The pod puts it in `/status`, which is the only channel
+    # out of a training pod.
+    _footprint: Dict[str, Any] = {}
+    try:
+        _footprint = describe_loaded_base(model)
+        if on_progress is not None:
+            on_progress(step=0, status="loaded", base=_footprint,
+                        message=_footprint.get("line", ""))
+    except Exception as exc:
+        print(f"[text-lora] (could not report the loaded base: {exc})",
+              flush=True)
     if init_adapter:
         # A distributed round starts from the PREVIOUS round's average, not from
         # a fresh adapter: that is the whole mechanism. Loaded into the existing
@@ -529,4 +574,6 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
     mean = sum(losses) / len(losses) if losses else None
     return {"steps": progress.step, "examples_trained": len(losses),
             "skipped_oom": progress.skipped_oom,
+            "asked": len(encoded),
+            "base": _footprint,
             "mean_loss": mean, "final_loss_ema": progress.loss_ema}

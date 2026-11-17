@@ -20,7 +20,7 @@ wrong one cannot strand a fleet.
     POST /round            {round, indices, settings, base} -> start training
     PUT  /adapter/start    the previous round's average, to resume from
     GET  /status           {state, round, step, examples_trained,
-                            asked, skipped_oom, error}
+                            asked, skipped_oom, base, error}
     GET  /adapter          the finished round's adapter
 
 Training runs in a worker thread so ``/status`` keeps answering while the GPU
@@ -41,7 +41,7 @@ DATASET = os.path.join(WORK, "dataset.jsonl")
 
 _lock = threading.Lock()
 _state = {"state": "idle", "round": -1, "step": 0, "examples_trained": 0,
-          "skipped_oom": 0, "error": "", "adapter": "",
+          "skipped_oom": 0, "error": "", "adapter": "", "base": {},
           #: How many examples THIS POD encoded, and how many it was asked
           #: for. The orchestrator cannot otherwise tell whether a slice
           #: landed: it sends indices into its own ordering and had no way to
@@ -143,11 +143,25 @@ def _train(payload):
         _set(state="training", round=rnd, step=0, examples_trained=0,
              skipped_oom=0, adapter="", error="", encoded=_have,
              asked=len(mine))
+        def _on_progress(**kw):
+            # PASSES THE FOOTPRINT THROUGH. This used to be
+            # `lambda **kw: _set(step=...)`, which dropped everything else --
+            # so when the trainer began reporting what the card was actually
+            # holding, the report died here instead of reaching `/status`.
+            # Pod stdout is collected nowhere, so anything this drops is lost
+            # for good.
+            fields = {"step": int(kw.get("step") or 0)}
+            if kw.get("base"):
+                fields["base"] = kw["base"]
+            if kw.get("status"):
+                fields["phase"] = str(kw["status"])
+            _set(**fields)
+
         result = tlt.run_training(
             base=base, encoded=mine, settings=settings, out_dir=out_dir,
             resume=False,
             init_adapter=(start if os.path.isfile(start) else ""),
-            on_progress=lambda **kw: _set(step=int(kw.get("step") or 0)))
+            on_progress=_on_progress)
         adapter = os.path.join(out_dir, "adapter_model.safetensors")
         if not os.path.isfile(adapter):
             raise RuntimeError(f"training produced no adapter in {out_dir}")
@@ -158,7 +172,8 @@ def _train(payload):
         # and the cause had to be inferred from the averaging weights.
         _set(state="done", adapter=adapter,
              examples_trained=int(result.get("examples_trained") or 0),
-             skipped_oom=int(result.get("skipped_oom") or 0))
+             skipped_oom=int(result.get("skipped_oom") or 0),
+             base=result.get("base") or {})
         print(f"[pod] round {rnd} finished: {result}", flush=True)
     except Exception as exc:
         # Reported rather than only logged: the orchestrator is polling, and a

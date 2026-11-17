@@ -4845,6 +4845,9 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         _no_work_said = [False]
         #: Shards already reported for an encode-count disagreement.
         _warned_encode: set = set()
+        #: Shards whose base footprint has been reported, so it is said once
+        #: per pod rather than on every poll.
+        _said_base: set = set()
         #: Shards that have been given work and have not yet been SEEN working.
         #:
         #: `POST /round` starts the pod's worker in a thread and answers 202
@@ -4989,9 +4992,34 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 # another block instead, from the same pushed adapter, and
                 # that contribution is averaged in with its own weight.
                 status = flt.poll_status(pod)
+                # SAID ONCE PER SHARD, as soon as the pod reports it. The
+                # base's real footprint is the fact that decides whether a
+                # fleet can train at all, and it lives only on the pod: the
+                # trainer printed it to a stdout nobody collects, so it had
+                # to come out through `/status`. A base that did not quantize,
+                # or that `device_map="auto"` spilled onto the CPU, OOMs on
+                # every long example -- and the loop SKIPS an OOM, so the
+                # round answers `done` having trained almost nothing.
+                _base = status.get("base") or {}
+                if _base and shard not in _said_base:
+                    _said_base.add(shard)
+                    print(f"[text-lora] {job_id}: shard {shard} "
+                          f"{_base.get('line') or _base}", flush=True)
+                    if _base.get("cpu_params"):
+                        print(f"[text-lora] {job_id}: shard {shard} has "
+                              f"{_base['cpu_params']} parameter tensor(s) on "
+                              f"the CPU — the base did not fit on the card, "
+                              f"so long examples will OOM and be skipped",
+                              flush=True)
+                    if _base.get("quantized_4bit") is False:
+                        print(f"[text-lora] {job_id}: shard {shard} loaded "
+                              f"the base UNQUANTIZED — 4-bit was asked for "
+                              f"and did not happen, which is several times "
+                              f"the memory and will OOM on all but the "
+                              f"shortest examples", flush=True)
                 state = str(status.get("state") or "")
                 if state in ("training", "encoding", "loading-tokenizer",
-                             "starting"):
+                             "starting", "loaded"):
                     # SEEN WORKING, so the next `done` is a new one. Until a
                     # shard has been observed in a working state the `done`
                     # it reports may be the one already collected, left over
