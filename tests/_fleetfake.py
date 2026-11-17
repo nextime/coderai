@@ -258,6 +258,12 @@ def install(monkeypatch, fleet, *, home, pushes=None, finish_after=0.0,
         def blocks_held(self, shard, rnd):
             return []
 
+        def note_started(self, shard, rnd):
+            # The run times each block to size the round deadline, so it
+            # says when it dispatched one.
+            self.started = getattr(self, "started", [])
+            self.started.append((int(shard), int(rnd)))
+
         def average_path(self, rnd):
             p = os.path.join(str(home), f"avg{rnd}.safetensors")
             if not os.path.isfile(p):

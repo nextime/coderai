@@ -194,6 +194,12 @@ def _install(monkeypatch, fleet, *, pushes, stop_after=0.0, home=None):
         def blocks_held(self, shard, rnd):
             return []
 
+        def note_started(self, shard, rnd):
+            # The run times each block to size the round deadline, so it
+            # says when it dispatched one.
+            self.started = getattr(self, "started", [])
+            self.started.append((int(shard), int(rnd)))
+
         def average_path(self, rnd):
             # A real file: the run copies the last round's average into the
             # adapter and fails if there is none, and that path is not what

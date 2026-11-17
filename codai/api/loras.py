@@ -3905,6 +3905,9 @@ class _TextTrainCoordinator:
         #: Every block whose adapter has been submitted, across all exchanges.
         #: This is the progress measure and the terminating condition.
         self._covered: set = set()
+        #: The deadline last reported, so the line is printed when it moves
+        #: rather than on every round.
+        self._said_deadline: float = -1.0
         #: MEASURED work, as reported by the pods that did it, against what
         #: they were asked for. Progress used to be published as
         #: `blocks_done * block_size`, so `examples_done` could not disagree
@@ -4283,6 +4286,21 @@ class _TextTrainCoordinator:
         with self._lock:
             self.tracker.submit(sub)
 
+    def note_started(self, shard: int, rnd: int) -> None:
+        """This pod has been put on a block. The round deadline is sized
+        off how long these take, so the dispatch has to say so."""
+        with self._lock:
+            self.tracker.note_started(shard, rnd)
+
+    def round_deadline_s(self) -> float:
+        """What the open round will wait for a straggler, for logging."""
+        with self._lock:
+            return self.tracker.deadline_for()
+
+    def block_seconds(self):
+        with self._lock:
+            return self.tracker.block_seconds()
+
     def average_path(self, rnd: int) -> str:
         with self._lock:
             return self._averages.get(int(rnd), "")
@@ -4326,6 +4344,24 @@ class _TextTrainCoordinator:
               f"{len(subs)} submission(s) across {_pods} pod(s) "
               f"({_ex} examples)"
               + (f"; absent: {absent}" if absent else ""), flush=True)
+        # WHAT THE NEXT ROUND WILL WAIT, and what sized it. A deadline that
+        # tunes itself off measurements has to say so: the failure it exists
+        # to prevent looked exactly like a healthy run from the outside, and
+        # a round that closes early is only visible as an `absent` list.
+        _seen = self.block_seconds()
+        _dl = self.round_deadline_s()
+        if _dl != self._said_deadline:
+            self._said_deadline = _dl
+            if len(_seen) >= tlr.DEADLINE_MIN_SAMPLES:
+                _how = (f"{tlr.DEADLINE_SLACK:g}x the p90 of "
+                        f"{len(_seen)} measured block(s), "
+                        f"{min(_seen)/60:.1f}-{max(_seen)/60:.1f} min")
+            else:
+                _how = (f"the configured floor; "
+                        f"{len(_seen)} block(s) timed so far, "
+                        f"{tlr.DEADLINE_MIN_SAMPLES} needed to size it")
+            print(f"[text-lora] {self.job_id}: round {rnd + 1} waits up to "
+                  f"{_dl/60:.1f} min for a straggler ({_how})", flush=True)
         return rnd
 
     def reap_the_dead(self) -> List[int]:
@@ -4424,10 +4460,19 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     # (narrow() passes it through: rounds change duration, not fleet size or
     # price), so when y is not what was asked for, the record should say what
     # it is and why rather than leaving it to be inferred.
+    # AN OVERCLAIM, CORRECTED. This said "each one is a checkpoint, so an
+    # interruption costs at most 1/N of the work", which a client read as a
+    # promise that a cancelled job could be picked up again. It cannot: the
+    # round averages are written to disk, but the set of blocks already
+    # covered lives only in this process, so a resubmit reshuffles and starts
+    # from nothing. The averages bound what ONE ROUND's interruption costs
+    # inside a live run; they are not a resume point.
     _update_job(job_id, test_run=False, rounds=rounds,
-                rounds_note=(f"{rounds} averaging round(s); each one is a "
-                             f"checkpoint, so an interruption costs at most "
-                             f"1/{rounds} of the work"))
+                rounds_note=(f"{rounds} averaging round(s); a round that "
+                             f"fails costs at most 1/{rounds} of the work, "
+                             f"but a cancelled job restarts from the "
+                             f"beginning — the averages are not a resume "
+                             f"point"))
     _clouds = flt.clouds_for(cfg)
     # The FIRST is what a single-cloud create falls back to; the candidates
     # carry their own. "SECURE+COMMUNITY" in a log line is the honest
@@ -4478,6 +4523,14 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
 
     out_dir = os.path.join(_loras_dir(), req.name)
     plan = tlr.RoundPlan(n_shards=n_shards, seed=settings.seed)
+    # The FLOOR a round waits for a straggler, and the bootstrap for round
+    # 0. The tracker sizes the real deadline off the block times it measures,
+    # because the floor cannot be guessed: `poll_interval_s * 60` put it at
+    # 20.0 min, and a block of 29 examples measured 13.2 min on an RTX 6000
+    # Ada and 22.0 min on an A40. A deadline on the MEDIAN of that is not a
+    # backstop -- it is how rounds close, and half the fleet's work goes back
+    # on the queue every time. Measured on one job: an exchange averaged from
+    # 3 of 13 pods, with the other ten recycled after paying for the GPU.
     tracker = tlr.RoundTracker(
         plan,
         min_fraction=0.75,
@@ -5153,6 +5206,9 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     # belongs to the block it has already handed in. It is
                     # cleared the first time the pod is seen working, above.
                     _dispatched.add(shard)
+                    # ...and the block's clock starts HERE, which is what the
+                    # round deadline is sized from.
+                    coord.note_started(shard, rnd)
                     fleet.note_checkin(shard)
                 except flt.PodBusy:
                     pass

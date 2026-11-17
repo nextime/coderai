@@ -248,6 +248,20 @@ class RoundPlan:
         return [idx for j, idx in enumerate(chunk) if j % k == pos]
 
 
+#: How many blocks must be timed before the round deadline is sized off
+#: them. Three is enough to have seen more than one card in a mixed fleet,
+#: and until then the configured floor stands.
+DEADLINE_MIN_SAMPLES = 3
+#: Headroom over the p90 block time. A pod is dispatched by the poll that
+#: follows the round opening, not by the opening itself, so the deadline has
+#: to cover one block plus that stagger.
+DEADLINE_SLACK = 1.5
+#: However slow the blocks turn out to be, a round stops waiting here. A
+#: fleet this slow is a problem to report, not one to wait out, and rented
+#: cards bill throughout.
+DEADLINE_CEILING_S = 5400.0
+
+
 class RoundTracker:
     """Who has submitted what, and when a round may be averaged.
 
@@ -284,6 +298,28 @@ class RoundTracker:
         self._expected: Dict[int, int] = {}
         #: The actual shard ids in a round, when the caller knows them.
         self._members: Dict[int, List[int]] = {}
+        #: (shard, round) -> when that pod was last PUT ON a block. A pod
+        #: takes another block the moment it hands one in, so a submission
+        #: both measures the block that just ended and starts the clock on
+        #: the next one.
+        self._started: Dict[Tuple[int, int], float] = {}
+        #: round -> when its FIRST pod was put on a block. The deadline runs
+        #: from here, not from when the round opened: round 0 opens before a
+        #: single pod has booted and quantized the base, and on one measured
+        #: job the pods were dispatched 6 to 13 minutes after the open. Judged
+        #: from the open, round 0 spends a third of its window on a cost that
+        #: buys no training, and no later round does -- an asymmetry first
+        #: papered over by giving round 0 twice the deadline, which doubled
+        #: the dead-pod timeout to fix a clock problem.
+        self._first_started: Dict[int, float] = {}
+        #: Every per-block wall time this job has measured, in seconds. The
+        #: round deadline is sized off these rather than guessed: measured on
+        #: one 16-pod job, a block of 29 examples took 13.2 min on an RTX
+        #: 6000 Ada and 22.0 min on an A40, against a deadline of 20.0 min
+        #: derived from `poll_interval_s * 60`. Sitting on the MEDIAN, the
+        #: deadline stopped being a backstop and became the way rounds
+        #: closed: one exchange averaged 3 of 13 pods and recycled the rest.
+        self._block_s: List[float] = []
 
     # -- submissions ------------------------------------------------------ #
 
@@ -315,6 +351,35 @@ class RoundTracker:
     def open_round(self, rnd: int, now: Optional[float] = None) -> None:
         self._opened_at.setdefault(rnd, now if now is not None else time.time())
 
+    def note_started(self, shard: int, rnd: int,
+                     now: Optional[float] = None) -> None:
+        """This pod has been put on a block of ``rnd``. Starts its clock.
+
+        Called on DISPATCH, not on arrival: the gap between the two is boot
+        and base-load time, which is real but is not block time, and sizing
+        the deadline off it would make every round wait out a cost it only
+        pays once.
+        """
+        at = now if now is not None else time.time()
+        self._started[(int(shard), int(rnd))] = at
+        self._first_started.setdefault(int(rnd), at)
+
+    def block_seconds(self) -> List[float]:
+        """Every per-block wall time measured so far, ascending."""
+        return sorted(self._block_s)
+
+    def _note_block_done(self, shard: int, rnd: int,
+                         now: Optional[float] = None) -> None:
+        key = (int(shard), int(rnd))
+        began = self._started.get(key)
+        now = now if now is not None else time.time()
+        if began is not None and now > began:
+            self._block_s.append(float(now - began))
+        # The pod takes another block immediately, so the clock restarts here
+        # rather than being cleared: a second contribution to the same round
+        # is measured as its own block.
+        self._started[key] = now
+
     def submit(self, sub: Submission) -> None:
         """Record a shard's adapter for a round.
 
@@ -340,6 +405,7 @@ class RoundTracker:
         self.open_round(sub.round)
         self._subs.setdefault(sub.round, {}).setdefault(
             int(sub.shard), []).append(sub)
+        self._note_block_done(sub.shard, sub.round)
 
     def have(self, rnd: Optional[int] = None) -> List[Submission]:
         """Every submission for a round, from every shard that made one."""
@@ -373,6 +439,38 @@ class RoundTracker:
 
     # -- completion ------------------------------------------------------- #
 
+    def deadline_for(self, rnd: Optional[int] = None) -> float:
+        """How long this round waits for a straggler before averaging.
+
+        `deadline_s` is the FLOOR and the bootstrap: until blocks have been
+        timed there is nothing to size against, and round 0 carries the base
+        load besides, so it gets twice the floor.
+
+        Once blocks have been timed the deadline follows them, because the
+        only number that matters is whether a pod put on a block at the start
+        of a round can finish it before the round closes. Sized off the p90
+        rather than the median so the slowest card in a mixed fleet lands
+        inside it, with `DEADLINE_SLACK` of headroom for the stagger between
+        a round opening and the poll that dispatches each pod.
+
+        This does not make a healthy round slower: `min_fraction` closes one
+        as soon as three quarters of the cohort has arrived, and the deadline
+        is what a fleet with a dead pod in it falls back to.
+        """
+        floor = float(self.deadline_s)
+        if floor <= 0:
+            return 0.0
+        seen = self.block_seconds()
+        if len(seen) < DEADLINE_MIN_SAMPLES:
+            # Nothing measured yet, so the configured value stands -- for
+            # every round alike. Round 0 needs no allowance of its own now
+            # that the clock starts when a pod is given work rather than when
+            # the round opened.
+            return floor
+        p90 = seen[min(len(seen) - 1, int(0.9 * len(seen)))]
+        want = DEADLINE_SLACK * float(p90)
+        return max(floor, min(DEADLINE_CEILING_S, want))
+
     def ready(self, now: Optional[float] = None) -> bool:
         """True when this round can be averaged.
 
@@ -389,10 +487,18 @@ class RoundTracker:
             return True
         if got / float(want) >= self.min_fraction:
             return True
-        if self.deadline_s > 0:
-            opened = self._opened_at.get(self.round)
+        wait = self.deadline_for()
+        if wait > 0:
+            # FROM THE FIRST DISPATCH, falling back to the open for a round
+            # that has handed out nothing this process saw -- an adopted
+            # fleet after a restart, where the open is the only stamp there
+            # is. The deadline bounds how long a round waits for pods that
+            # are WORKING, so it has to start when they were given work.
+            began = self._first_started.get(self.round)
+            if began is None:
+                began = self._opened_at.get(self.round)
             now = now if now is not None else time.time()
-            if opened is not None and (now - opened) >= self.deadline_s:
+            if began is not None and (now - began) >= wait:
                 return True
         return False
 
