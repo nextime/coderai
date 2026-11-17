@@ -1009,9 +1009,17 @@ async def validation_error_says_which_field(request: Request,
     try:
         body = getattr(exc, "body", None)
         if isinstance(body, dict):
+            # "EMPTY OBJECT" IN WORDS. An empty join printed `422 body shape:`
+            # and nothing, which reads as a failure to describe the body
+            # rather than as the finding -- and the finding is the whole
+            # answer: a client whose retry sends `{}` after a 502 is reported
+            # as "name: Field required" and looks like a schema disagreement.
+            # Measured: two such retries per restart from a live client.
             shape = ", ".join(f"{k}={_loggable(k, v)}"
                               for k, v in sorted(body.items())[:40])
-            print(f"[http] 422 body shape: {shape}", flush=True)
+            print(f"[http] 422 body shape: "
+                  + (shape or "{} — the body carried NO fields at all"),
+                  flush=True)
         elif body is not None:
             print(f"[http] 422 body was {type(body).__name__}, not an object",
                   flush=True)

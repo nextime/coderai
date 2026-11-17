@@ -363,10 +363,23 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
         res = set_peft_model_state_dict(model, incoming)
         unexpected = sorted(getattr(res, "unexpected_keys", None) or [])
         if unexpected:
+            # DELIBERATELY WORDED DIFFERENTLY from the check this replaced.
+            # That one said "has N key(s) this model has no place for" and so
+            # did this one, which made the two indistinguishable in a log --
+            # so when every pod in a fleet failed with the old message, there
+            # was no way to tell a genuine mismatch from a pod running the
+            # PRE-FIX IMAGE. That is exactly what happened: an explicit image
+            # tag in the config kept serving the old code for five hours
+            # while the message looked like a real key disagreement, and the
+            # time went on a dataset theory instead of on the config.
             raise RuntimeError(
-                f"{init_adapter} has {len(unexpected)} key(s) this model has "
-                f"no place for, e.g. {unexpected[:3]} -- it was trained "
-                f"against a different base or target set")
+                f"PEFT refused {len(unexpected)} of {len(incoming)} tensors "
+                f"from {os.path.basename(init_adapter)}, e.g. "
+                f"{unexpected[:3]} -- this adapter was trained against a "
+                f"different base or a different target_modules/rank. "
+                f"(A failure here reading 'no place for' instead is the "
+                f"pre-0.6.69 loader, which means this pod is running an "
+                f"old trainer image.)")
         print(f"[text-lora] resumed from {os.path.basename(init_adapter)} "
               f"({len(incoming)} tensors)", flush=True)
         del incoming, res

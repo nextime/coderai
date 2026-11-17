@@ -108,7 +108,8 @@ _MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
                   "blocks_done", "blocks_total", "percent",
                   "examples_done", "examples_total",
                   "exchange", "epochs",
-                  "pods", "pods_target", "pods_ceiling", "hourly_usd")
+                  "pods", "pods_target", "pods_ceiling", "hourly_usd",
+                  "trainer_image")
 _last_job_persist = 0.0
 
 
@@ -4329,6 +4330,30 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     print(f"[text-lora] {job_id}: {n_shards} pod(s), {rounds} round(s), "
           f"{cloud_label}, >= {cfg.min_vram_gb:.0f}GB at <= ${ceiling:.2f}/hr; "
           f"candidates: {flt.describe_cards(cards)}", flush=True)
+    # THE IMAGE, SAID OUT LOUD, because the pod-side half of this subsystem
+    # lives in it and nothing here ever named it. The cards were logged, the
+    # prices, the clouds, the regions -- not the one thing that decides which
+    # TRAINER code runs.
+    #
+    # Cost of the omission, measured: the fix for a bug that killed every
+    # distributed run was shipped at 19:45 and the image rebuilt, pushed and
+    # signed three times over the next five hours -- while this block pinned
+    # an explicit `:v0.27.1-r2` tag from before the fix. Every pod all day ran
+    # the old code and failed identically, and the log said only "round 1
+    # failed". Found at 01:00 by reading the config, not the log.
+    #
+    # A floating tag is also worth saying plainly: with `:latest` the code
+    # that runs is whatever was pushed last, so a reader who sees a failure
+    # needs to know the tag was floating before trusting that a rebuild
+    # changed anything.
+    _img = str(cfg.image or "")
+    _floating = _img.endswith(":latest") or ":" not in _img.rsplit("/", 1)[-1]
+    print(f"[text-lora] {job_id}: trainer image {_img or '<unset>'}"
+          + (" (floating tag — the pod runs whatever was pushed last)"
+             if _floating else
+             " (PINNED tag — a rebuilt image will NOT reach these pods "
+             "until this is changed)"), flush=True)
+    _update_job(job_id, trainer_image=_img)
 
     out_dir = os.path.join(_loras_dir(), req.name)
     plan = tlr.RoundPlan(n_shards=n_shards, seed=settings.seed)

@@ -157,3 +157,34 @@ def test_the_real_app_actually_registers_it():
     assert RequestValidationError in handlers, sorted(map(str, handlers))
     assert handlers[RequestValidationError] is \
         app_mod.validation_error_says_which_field
+
+
+def test_an_empty_body_is_reported_as_empty_in_words(capsys):
+    """`422 body shape:` and nothing reads as a failure to describe it.
+
+    The finding IS that the body was empty: a client whose retry wrapper loses
+    the payload after a 502 gets reported as "name: Field required" and looks
+    like a schema disagreement, which is what sent us looking at the wrong
+    thing twice. Measured on a live client: two empty retries per restart.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from pydantic import BaseModel
+
+    class Body(BaseModel):
+        name: str
+
+    probe = FastAPI()
+    probe.add_exception_handler(
+        __import__("fastapi.exceptions", fromlist=["x"]).RequestValidationError,
+        app_mod.validation_error_says_which_field)
+
+    @probe.post("/v1/loras/train/text")
+    def _route(body: Body):
+        return {"ok": True}
+
+    r = TestClient(probe).post("/v1/loras/train/text", json={})
+    assert r.status_code == 422
+    out = capsys.readouterr().out
+    assert "NO fields at all" in out
+    assert "name" in out          # and it still names what was required
