@@ -296,11 +296,24 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
     # alongside its activations on one card, and recomputation is cheaper than
     # the OOM it avoids.
     model.config.use_cache = False
+    # NOT SWALLOWED. Without checkpointing a 27B base at the 8192-token cap
+    # does not fit its own activations on one 48GB card, so this failing
+    # quietly turns every long example into an OOM -- which the loop then
+    # SKIPS, so the run reports "done" having trained a handful of the
+    # examples it was asked for. And without `enable_input_require_grads`
+    # the checkpointed segments take no grad at their input, which costs no
+    # memory and simply trains nothing. Either way the run is worthless and
+    # the operator must be told at setup, not left to infer it from the
+    # averaging weights.
     try:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not enable gradient checkpointing on {base!r}: "
+            f"{type(exc).__name__}: {exc}. Training without it OOMs on every "
+            f"long example and those are skipped, not raised, so the run "
+            f"would look like it worked") from exc
 
     linears = linear_module_names(model)
     targets = select_target_modules(linears)

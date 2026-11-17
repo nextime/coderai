@@ -106,7 +106,8 @@ _JOB_HISTORY_MAX = 200
 _MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
                   "started_at", "path",
                   "blocks_done", "blocks_total", "percent",
-                  "examples_done", "examples_total",
+                  "examples_done", "examples_asked",
+                  "examples_total",
                   "exchange", "epochs",
                   "pods", "pods_target", "pods_ceiling", "hourly_usd",
                   "trainer_image")
@@ -3505,6 +3506,24 @@ _TOPUP_MAX_S = 900.0
 #: Held only for the import, never for the work.
 _TRANSFORMERS_IMPORT_LOCK = threading.Lock()
 
+#: How much of a handout a pod must actually train for the block to count as
+#: covered. `> 0` stood here, and a pod that trained 4 of the 29 examples it
+#: was asked for closed the block anyway: a 16-pod run covered 139/139 blocks
+#: it had been handed and reported `examples_done 4031` -- which was
+#: `139 * 29`, a number DERIVED from the blocks rather than measured -- while
+#: the averaging weights added up to a small fraction of that. The slack is
+#: for the OOM guard, which legitimately skips an example here and there.
+_COVERED_FRACTION = 0.75
+
+#: ...and the other side of it. Recycling a short block is right, but if the
+#: pods cannot train what they are given then every block comes back short
+#: forever: the run would spin, never terminate, and bill the whole time. So
+#: a fleet that is mostly returning short handouts is a FAILURE, raised with
+#: the numbers in it, not a slow run. The minimum is there so one bad pod in
+#: the first exchange cannot abort a healthy fleet.
+_STARVE_MIN_SUBS = 8
+_STARVE_FRACTION = 0.5
+
 
 def _active_text_job_for(name: str, *, exclude: str = "") -> Optional[str]:
     """An already-running text job writing the same adapter, if there is one.
@@ -3886,6 +3905,18 @@ class _TextTrainCoordinator:
         #: Every block whose adapter has been submitted, across all exchanges.
         #: This is the progress measure and the terminating condition.
         self._covered: set = set()
+        #: MEASURED work, as reported by the pods that did it, against what
+        #: they were asked for. Progress used to be published as
+        #: `blocks_done * block_size`, so `examples_done` could not disagree
+        #: with `blocks_done` even in principle -- the one number a client
+        #: could have used to notice undertraining was computed from the very
+        #: thing that was wrong. These two are counted, not derived.
+        self._trained = 0
+        self._asked = 0
+        #: Submissions seen, and how many of them came back short. The ratio
+        #: is what tells a starving fleet from an unlucky pod.
+        self._subs = 0
+        self._short = 0
         #: The next unclaimed block, and blocks freed by pods that died.
         self._next_block = 0
         self._recycle: List[int] = []
@@ -4083,24 +4114,85 @@ class _TextTrainCoordinator:
         with self._lock:
             return list(self._blocks.get(int(rnd), {}).get(int(shard)) or [])
 
+    def examples_in(self, blocks) -> int:
+        """Exactly how many examples those blocks are -- what was ASKED.
+
+        Taken from the plan rather than from anything a pod says, because it
+        is the orchestrator that chose the slice, and the last block of a
+        pass is short.
+        """
+        per = self.plan.block_size(len(self.encoded), self.total_rounds,
+                                   self.planned_pods)
+        n = 0
+        for b in blocks or []:
+            n += len(self.plan.block_at(len(self.encoded), int(b), per))
+        return n
+
+    def examples_trained(self) -> int:
+        """Examples a gradient step actually saw, summed over submissions."""
+        with self._lock:
+            return int(self._trained)
+
+    def examples_asked(self) -> int:
+        """Examples handed to pods whose submissions have come back."""
+        with self._lock:
+            return int(self._asked)
+
+    def starved(self) -> Optional[str]:
+        """Why this fleet cannot train what it is given, or None if it can.
+
+        A short block goes back on the queue, which is right for one pod
+        having a bad time and ruinous as a steady state: the same examples
+        would be handed out, returned short and recycled for as long as the
+        caller let it run, at the fleet's full hourly rate. Past the minimum
+        sample this says so, and the run ends on an error carrying the two
+        numbers that matter instead of on a timeout or a bill.
+        """
+        with self._lock:
+            subs, short = self._subs, self._short
+            asked, trained = self._asked, self._trained
+        if subs < _STARVE_MIN_SUBS:
+            return None
+        if short < subs * _STARVE_FRACTION:
+            return None
+        return (f"{short} of {subs} submissions trained less than "
+                f"{int(_COVERED_FRACTION * 100)}% of the examples they were "
+                f"asked for ({trained} trained of {asked} asked, "
+                f"{(100.0 * trained / max(1, asked)):.0f}%). The pods are "
+                f"not training what they are given, so recycling the blocks "
+                f"would only spend money to cover the same ground again.")
+
     def block_done(self, shard: int, rnd: int,
-                   examples: Optional[int] = None) -> None:
+                   examples: Optional[int] = None,
+                   asked: Optional[int] = None) -> None:
         """The pod submitted its block; it may be given another.
 
-        A block is COVERED only if the submission carried training. That is
-        what ends the run, so it is counted on work done and not on a handout
-        or a bare reply: a block handed to a pod that died was never trained,
-        and a pod that answered with zero examples trained nothing either.
-        Either way it goes back on the FRONT of the queue, exactly as a dead
-        pod's does, and comes out un-issued so the next handout can give it to
-        somebody who will train it.
+        A block is COVERED only if the submission carried MOST of the
+        training it was asked for. That is what ends the run, so it is
+        counted on work done and not on a handout or a bare reply: a block
+        handed to a pod that died was never trained, a pod that answered with
+        zero trained nothing either, and -- the case that actually shipped --
+        a pod that trained 4 of 29 trained almost nothing while closing the
+        block as if it had. Any of those goes back on the FRONT of the queue,
+        exactly as a dead pod's does, and comes out un-issued so the next
+        handout can give it to somebody who will train it.
 
         ``examples=None`` means the caller does not know, and is trusted --
-        every caller inside this module passes the count.
+        every caller inside this module passes the count. ``asked=None``
+        falls back to the plan, so the threshold is never skipped silently.
         """
         with self._lock:
             done = self._blocks.get(int(rnd), {}).pop(int(shard), None) or []
-            if examples is not None and int(examples) <= 0:
+        want = int(asked) if asked is not None else self.examples_in(done)
+        with self._lock:
+            if examples is not None:
+                self._subs += 1
+                self._trained += max(0, int(examples))
+                self._asked += max(0, int(want))
+            enough = (examples is None
+                      or int(examples) >= max(1, int(want * _COVERED_FRACTION)))
+            if not enough:
+                self._short += 1
                 if done:
                     self._recycle = sorted(int(b) for b in done) + self._recycle
                     iss = self._issued.get(int(rnd))
@@ -4753,6 +4845,21 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
         _no_work_said = [False]
         #: Shards already reported for an encode-count disagreement.
         _warned_encode: set = set()
+        #: Shards that have been given work and have not yet been SEEN working.
+        #:
+        #: `POST /round` starts the pod's worker in a thread and answers 202
+        #: without touching the pod's state, so for a moment after dispatch
+        #: `/status` still carries the PREVIOUS block's terminal state:
+        #: `done`, the same round number, and that block's example count. The
+        #: done-branch below matches on exactly those, and by then the shard
+        #: is holding the next block -- so it collected the old adapter again
+        #: and closed a block no gradient step had touched. Gating the branch
+        #: on holding a block closed the handout half of this; this closes
+        #: the rest. Measured on the run that made it necessary: blocks 90
+        #: and 110 passed between four shards for an hour, and 16 rounds
+        #: covering 139 blocks trained 384 of 7,308 examples while reporting
+        #: 55%.
+        _dispatched: set = set()
 
         while not coord.finished():
             _check_train_cancel()
@@ -4883,12 +4990,18 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 # that contribution is averaged in with its own weight.
                 status = flt.poll_status(pod)
                 state = str(status.get("state") or "")
-                if state in ("training", "encoding", "loading-tokenizer"):
+                if state in ("training", "encoding", "loading-tokenizer",
+                             "starting"):
+                    # SEEN WORKING, so the next `done` is a new one. Until a
+                    # shard has been observed in a working state the `done`
+                    # it reports may be the one already collected, left over
+                    # from before the dispatch that gave it this block.
+                    _dispatched.discard(shard)
                     fleet.note_checkin(shard)
                     continue
                 _held = coord.blocks_held(shard, rnd)
                 if state == "done" and int(status.get("round", -1)) == rnd \
-                        and _held:
+                        and _held and shard not in _dispatched:
                     # Finished: pull it and record the submission.
                     # PER BLOCK, not per shard: a pod may contribute more
                     # than once to an exchange and the second file must not
@@ -4908,16 +5021,30 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     flt.fetch_adapter(pod, dest)
                     from codai.api import text_lora_rounds as _tlr
                     _trained = int(status.get("examples_trained") or 0)
+                    _asked = coord.examples_in(_held)
                     coord.submit(_tlr.Submission(
                         shard=shard, round=rnd, path=dest,
                         examples=_trained))
-                    coord.block_done(shard, rnd, examples=_trained)
-                    if _trained <= 0:
-                        print(f"[text-lora] {job_id}: shard {shard} "
-                              f"reported round {rnd} done having trained "
-                              f"NOTHING; block {_held[0]} goes back on the "
-                              f"queue and this reply is not coverage",
-                              flush=True)
+                    coord.block_done(shard, rnd, examples=_trained,
+                                     asked=_asked)
+                    # ASKED AGAINST TRAINED, on every submission. The pod has
+                    # always reported `asked`, and nothing compared it: the
+                    # only published number was `blocks_done * block_size`,
+                    # which cannot disagree with itself, so a fleet training
+                    # 15% of its handouts looked identical to a healthy one
+                    # for four hours and two runs.
+                    if _trained < max(1, int(_asked * _COVERED_FRACTION)):
+                        _oom = status.get("skipped_oom")
+                        print(f"[text-lora] {job_id}: shard {shard} round "
+                              f"{rnd} trained {_trained} of the {_asked} "
+                              f"examples in block {_held[0]}"
+                              + (f", {_oom} skipped for OOM"
+                                 if _oom is not None else "")
+                              + "; the block goes back on the queue and this "
+                              f"reply is not coverage", flush=True)
+                    _why = coord.starved()
+                    if _why:
+                        raise _tlr.RoundError(_why)
                     fleet.note_checkin(shard, rounds_done=rnd + 1)
                     continue
                 if state == "done" and 0 <= int(status.get("round", -1)) < rnd:
@@ -4994,6 +5121,10 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                     continue
                 try:
                     flt.start_round(pod, _payload)
+                    # DISPATCHED, so the `done` this pod is still reporting
+                    # belongs to the block it has already handed in. It is
+                    # cleared the first time the pod is seen working, above.
+                    _dispatched.add(shard)
                     fleet.note_checkin(shard)
                 except flt.PodBusy:
                     pass
@@ -5014,11 +5145,19 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 # two numbers no longer say how far along it is. These do,
                 # and a client should not have to parse the message to get
                 # them.
+                # `examples_done` is MEASURED. It was `_done_b * _per` -- a
+                # restatement of `blocks_done`, which is why no client could
+                # have caught a fleet training 4 of every 29 examples: the
+                # two numbers agreed to the unit by construction
+                # (`139 * 29 == 4031`, reported while the averaging weights
+                # said otherwise). `examples_asked` is published beside it so
+                # the ratio is visible without arithmetic.
                 _update_job(
                     job_id, step=_done_b, total=_want_b,
                     blocks_done=_done_b, blocks_total=_want_b,
                     percent=round(_pct, 1),
-                    examples_done=_done_b * _per,
+                    examples_done=coord.examples_trained(),
+                    examples_asked=coord.examples_asked(),
                     examples_total=_want_b * _per,
                     exchange=closed + 1, epochs=coord.epochs,
                     pods=len(fleet.pods), pods_target=_target,

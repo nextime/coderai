@@ -19,7 +19,8 @@ wrong one cannot strand a fleet.
     POST /dataset          the training set, once
     POST /round            {round, indices, settings, base} -> start training
     PUT  /adapter/start    the previous round's average, to resume from
-    GET  /status           {state, round, step, examples_trained, error}
+    GET  /status           {state, round, step, examples_trained,
+                            asked, skipped_oom, error}
     GET  /adapter          the finished round's adapter
 
 Training runs in a worker thread so ``/status`` keeps answering while the GPU
@@ -40,7 +41,7 @@ DATASET = os.path.join(WORK, "dataset.jsonl")
 
 _lock = threading.Lock()
 _state = {"state": "idle", "round": -1, "step": 0, "examples_trained": 0,
-          "error": "", "adapter": "",
+          "skipped_oom": 0, "error": "", "adapter": "",
           #: How many examples THIS POD encoded, and how many it was asked
           #: for. The orchestrator cannot otherwise tell whether a slice
           #: landed: it sends indices into its own ordering and had no way to
@@ -140,7 +141,8 @@ def _train(payload):
         out_dir = os.path.join(WORK, f"round{rnd}")
         start = os.path.join(WORK, "start.safetensors")
         _set(state="training", round=rnd, step=0, examples_trained=0,
-             adapter="", error="", encoded=_have, asked=len(mine))
+             skipped_oom=0, adapter="", error="", encoded=_have,
+             asked=len(mine))
         result = tlt.run_training(
             base=base, encoded=mine, settings=settings, out_dir=out_dir,
             resume=False,
@@ -149,8 +151,14 @@ def _train(payload):
         adapter = os.path.join(out_dir, "adapter_model.safetensors")
         if not os.path.isfile(adapter):
             raise RuntimeError(f"training produced no adapter in {out_dir}")
+        # `skipped_oom` IS REPORTED. `run_training` has always returned it and
+        # the pod kept it to itself, so the one path that drops an example
+        # without failing the round was invisible to the orchestrator: a fleet
+        # training 4 of every 29 examples it was asked for said only "done",
+        # and the cause had to be inferred from the averaging weights.
         _set(state="done", adapter=adapter,
-             examples_trained=int(result.get("examples_trained") or 0))
+             examples_trained=int(result.get("examples_trained") or 0),
+             skipped_oom=int(result.get("skipped_oom") or 0))
         print(f"[pod] round {rnd} finished: {result}", flush=True)
     except Exception as exc:
         # Reported rather than only logged: the orchestrator is polling, and a
@@ -359,9 +367,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "bytes": len(data)})
         if self.path == "/round":
             snap = _snapshot()
-            if snap.get("state") in ("training", "encoding", "loading-tokenizer"):
+            if snap.get("state") in ("starting", "training", "encoding",
+                                     "loading-tokenizer"):
                 # Refused, not queued: two rounds in flight would hand back an
-                # adapter from the wrong one.
+                # adapter from the wrong one. `starting` counts as working for
+                # the same reason the others do -- it is set below, before the
+                # thread exists, so two overlapping POSTs cannot both start.
                 return self._json(409, {"error": "already working",
                                         "state": snap.get("state"),
                                         "round": snap.get("round")})
@@ -369,6 +380,19 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(self._body() or b"{}")
             except Exception as exc:
                 return self._json(400, {"error": f"bad JSON: {exc}"})
+            # SYNCHRONOUSLY, BEFORE THE THREAD. This used to answer 202 having
+            # touched nothing, so until the worker got as far as its first
+            # `_set` the status still read `state=done, round=<this round>`
+            # with the previous block's example count -- and that is exactly
+            # what the orchestrator collects on. It therefore fetched the
+            # already-collected adapter a second time and credited it to the
+            # block just handed out, which no gradient step had touched.
+            # Measured on the run that found it: blocks 90 and 110 passed
+            # between four shards for an hour, and 139 blocks were reported
+            # covered on 384 of 7,308 examples trained.
+            _set(state="starting", round=int(payload.get("round") or 0),
+                 step=0, examples_trained=0, skipped_oom=0,
+                 adapter="", error="")
             _worker = threading.Thread(target=_train, args=(payload,), daemon=True)
             _worker.start()
             return self._json(202, {"ok": True, "round": payload.get("round")})
