@@ -37,11 +37,38 @@ def test_the_sweep_needs_no_grace_and_says_why():
     assert "definitively gone" in doc
 
 
-def test_a_failed_terminate_keeps_the_record():
-    """Dropping it is how a pod becomes invisible AND billing."""
-    src = inspect.getsource(flt.sweep_orphans)
-    assert "LEFT IN THE RECORD" in src
-    assert "_write_state(job, kept)" in src
+def test_a_failed_terminate_keeps_the_record(tmp_path, monkeypatch):
+    """Dropping it is how a pod becomes invisible AND billing.
+
+    Was a source match on `sweep_orphans`, which broke the moment the
+    terminate body moved into the helper the periodic sweep shares -- while
+    the behaviour was unchanged. Driven instead.
+    """
+    from codai.api import loras
+    d = tmp_path / "loras"
+    d.mkdir()
+    monkeypatch.setattr(loras, "_loras_dir", lambda: str(d))
+    flt._write_state("job-x", [
+        {"pod_id": "ok", "shard": 0, "hourly_usd": 0.59},
+        {"pod_id": "stubborn", "shard": 1, "hourly_usd": 0.59},
+    ])
+
+    class _C:
+        def __init__(self):
+            self.killed = []
+
+        def terminate_pod(self, pid):
+            if pid == "stubborn":
+                raise RuntimeError("RunPod said no")
+            self.killed.append(pid)
+
+    client = _C()
+    out = flt.sweep_orphans(client=client)
+
+    assert client.killed == ["ok"]
+    assert out["failed"] == 1
+    assert [r["pod_id"] for r in flt._read_state("job-x")] == ["stubborn"], \
+        "the one that would not die is kept for the next sweep"
 
 
 def test_the_sweep_terminates_and_forgets(tmp_path, monkeypatch):

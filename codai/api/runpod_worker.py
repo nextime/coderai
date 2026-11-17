@@ -9667,6 +9667,18 @@ def _scaler_loop():
                 reap_orphans()
             except Exception as exc:
                 print(f"[runpod-reaper] {exc}", flush=True)
+        # A TRAINING FLEET whose owner stopped reporting, every ~2 minutes.
+        # The startup sweep above cannot catch these: it only runs once, so a
+        # fleet orphaned by a run that died -- without the container
+        # restarting -- billed until somebody restarted it by hand. Measured
+        # once at 16 pods and ~$9.50/hr. This reads the record's heartbeat, so
+        # it is safe while jobs are running and bounds the bleed at the TTL.
+        if tick % 8 == 0:
+            try:
+                from codai.api import text_lora_fleet as _tlf
+                _tlf.sweep_abandoned()
+            except Exception as exc:
+                print(f"[text-lora-fleet] abandoned sweep: {exc}", flush=True)
 
 
 def _follower_loop():

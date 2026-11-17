@@ -178,6 +178,72 @@ def _read_state(job_id: str) -> List[dict]:
         return []
 
 
+def _read_envelope(job_id: str) -> dict:
+    """The whole record, `at` included. `_read_state` drops everything else."""
+    try:
+        with open(_state_path(job_id), "r", encoding="utf-8") as fh:
+            return dict(json.load(fh) or {})
+    except Exception:
+        return {}
+
+
+#: How long a fleet record may go untouched before its pods are considered
+#: abandoned. The owner stamps `at` every poll slice (~5s) and on every
+#: rental, so this is three orders of magnitude of slack; what it really has
+#: to survive is the gap between the last pod arriving and the first slice of
+#: the round loop, which is the dataset pass -- measured at ~4 minutes for
+#: 7308 examples.
+ABANDONED_AFTER_S = 900.0
+
+
+def touch(job_id: str) -> None:
+    """Say the owner of this record is still alive.
+
+    THE HEARTBEAT THE LEAK NEEDED. `sweep_orphans` is startup-only, and
+    deliberately so: it argues that a record on disk must be abandoned
+    because no job is running yet in this process. That argument holds at
+    startup and nowhere else, so a fleet whose owner died -- a run that threw
+    where its `finally` could not release, a job whose pods outlived it --
+    kept billing until somebody restarted the container. Measured once:
+    16 pods, ~$9.50/hr, swept only by the next boot.
+
+    With `at` refreshed while the run lives, staleness is the signal, and the
+    sweep no longer has to wait for a restart to be sure.
+    """
+    rows = _read_state(job_id)
+    if not rows:
+        return
+    _write_state(job_id, rows)
+
+
+def abandoned(ttl_s: float = ABANDONED_AFTER_S) -> List[dict]:
+    """Recorded pods whose owner has stopped saying it is alive.
+
+    Unlike :func:`orphans` this is safe to call WHILE jobs are running: a
+    live run stamps its record continuously, so anything older than the TTL
+    has no owner. A record with no `at` at all predates the heartbeat and is
+    treated as stale, which is the conservative reading -- it was written by
+    a process that is certainly gone.
+    """
+    cut = time.time() - max(1.0, float(ttl_s))
+    out: List[dict] = []
+    try:
+        names = sorted(os.listdir(_state_dir()))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        job = name[:-5]
+        env = _read_envelope(job)
+        at = float(env.get("at") or 0.0)
+        if at > cut:
+            continue
+        for row in (env.get("pods") or []):
+            out.append({**row, "job": job, "at": at})
+    return out
+
+
 def sweep_orphans(client=None) -> dict:
     """Terminate every pod a dead fleet left behind. Call this at STARTUP.
 
@@ -200,7 +266,28 @@ def sweep_orphans(client=None) -> dict:
     record alone so the next sweep tries again -- dropping it would be how a
     pod becomes invisible AND billing.
     """
-    rows = orphans()
+    return _terminate_recorded(orphans(), client=client, why="sweep")
+
+
+def sweep_abandoned(client=None, ttl_s: float = ABANDONED_AFTER_S) -> dict:
+    """Terminate pods whose owner stopped reporting. Call this PERIODICALLY.
+
+    The companion to :func:`sweep_orphans`, which only runs at startup
+    because its safety argument -- "a record on disk must be abandoned,
+    because no job is running yet" -- is only true then. This one is safe on
+    a timer, because it reads the heartbeat instead: a live run refreshes its
+    record every poll slice, so a record older than `ttl_s` has nobody.
+
+    Without it the bleed had no upper bound but the next restart. With it the
+    worst case is `ttl_s`.
+    """
+    return _terminate_recorded(abandoned(ttl_s), client=client,
+                               why="abandoned sweep")
+
+
+def _terminate_recorded(rows: List[dict], *, client=None,
+                        why: str = "sweep") -> dict:
+    """Terminate every pod in `rows` and clear the records that empty out."""
     out = {"pods": 0, "jobs": 0, "failed": 0}
     if not rows:
         return out
@@ -213,7 +300,7 @@ def sweep_orphans(client=None) -> dict:
                 return out
             client = RunpodClient(acct)
         except Exception as exc:
-            print(f"[text-lora-fleet] sweep: no RunPod client ({exc}); "
+            print(f"[text-lora-fleet] {why}: no RunPod client ({exc}); "
                   f"{len(rows)} recorded pod(s) left for the reaper",
                   flush=True)
             return out
@@ -231,14 +318,18 @@ def sweep_orphans(client=None) -> dict:
             except Exception as exc:
                 out["failed"] += 1
                 kept.append(row)
-                print(f"[text-lora-fleet] sweep: could not terminate {pid} "
+                print(f"[text-lora-fleet] {why}: could not terminate {pid} "
                       f"from {job} ({exc}) — LEFT IN THE RECORD for the next "
                       f"sweep", flush=True)
                 continue
             out["pods"] += 1
             rate = float(row.get("hourly_usd") or 0.0)
-            print(f"[text-lora-fleet] sweep: terminated {pid}, left by "
-                  f"{job} (~${rate:.2f}/hr)", flush=True)
+            _idle = ""
+            if row.get("at"):
+                _idle = (f", unreported for "
+                         f"{int(time.time() - float(row['at']))}s")
+            print(f"[text-lora-fleet] {why}: terminated {pid}, left by "
+                  f"{job} (~${rate:.2f}/hr{_idle})", flush=True)
             try:
                 from codai.api import runpod_worker as rw
                 rw.unregister_pod(pid)
@@ -250,7 +341,7 @@ def sweep_orphans(client=None) -> dict:
             forget(job)
             out["jobs"] += 1
     if out["pods"] or out["failed"]:
-        print(f"[text-lora-fleet] sweep: {out['pods']} pod(s) from "
+        print(f"[text-lora-fleet] {why}: {out['pods']} pod(s) from "
               f"{out['jobs']} abandoned job(s) terminated"
               + (f", {out['failed']} could not be" if out["failed"] else ""),
               flush=True)
@@ -349,6 +440,23 @@ class TrainerFleet:
         with self._lock:
             rows = [dataclasses.asdict(p) for p in self.pods.values()]
         _write_state(self.job_id, rows)
+
+    def heartbeat(self) -> None:
+        """Say this fleet still has an owner.
+
+        Called from every wait the run does -- the boot, the dataset pass,
+        each round slice -- because what the periodic sweep reads is the
+        record's age. A fleet that stops calling this has lost its owner and
+        its pods are terminated within `ABANDONED_AFTER_S`, instead of
+        billing until somebody restarts the container.
+        """
+        with self._lock:
+            if not self.pods:
+                return
+        try:
+            self._flush()
+        except Exception:
+            pass        # a missed beat costs one sweep interval, never a crash
 
     def hourly_rate(self) -> float:
         with self._lock:

@@ -129,6 +129,11 @@ class FakeFleet:
     def note_checkin(self, shard, rounds_done=None):
         pass
 
+    def heartbeat(self):
+        # The run says it is alive from every wait it does, so a fake that
+        # lacks this fails the moment the boot wait ticks.
+        self.beats = getattr(self, "beats", 0) + 1
+
     def release(self, shard, reason=""):
         self.released.append((int(shard), str(reason)))
         self.pods.pop(int(shard), None)

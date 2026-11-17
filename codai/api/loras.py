@@ -4672,6 +4672,10 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 ready.append(_ready_q.get(timeout=2.0))
             except _queue_mod.Empty:
                 _check_train_cancel()
+                # THE HEARTBEAT STARTS AT THE BOOT, not at the first round:
+                # pods are already rented and already billing here, and this
+                # wait is minutes long.
+                fleet.heartbeat()
                 if _boot_done.is_set():
                     break
         if not ready:
@@ -4752,6 +4756,9 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
 
         while not coord.finished():
             _check_train_cancel()
+            # Said once per slice: what the periodic sweep reads is the age of
+            # this fleet's record, so a run that is alive must keep saying so.
+            fleet.heartbeat()
             rnd = coord.tracker.round
             # THIS ROUND'S COHORT: the pods that have an address right now.
             # Fixed for the round, so the slices handed out stay consistent,
