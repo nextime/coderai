@@ -35,6 +35,7 @@ thermal-protection checkpoints.
 import base64
 import io
 import json
+import math
 import os
 import secrets
 import dataclasses
@@ -3253,6 +3254,16 @@ class TextLoraTrainRequest(BaseModel):
     #: optimizer update, few enough to cost nothing.
     test_examples: Optional[int] = 8
 
+    #: Continue a stopped distributed run instead of starting over: the
+    #: `name` of the earlier run, whose output directory holds the
+    #: checkpoint. The round averages were always written to disk and were
+    #: readable by nothing, so a cancelled four-hour job was four hours
+    #: bought twice. A resume adopts the earlier run's COVERAGE as well as
+    #: its adapter, and refuses outright if any input that gives a recorded
+    #: block id its meaning has changed -- see
+    #: :mod:`codai.api.text_lora_resume`.
+    resume_from: Optional[str] = None
+
     wait: Optional[bool] = False
     session: Optional[str] = None
     model_config = ConfigDict(extra="allow")
@@ -3869,9 +3880,14 @@ class _TextTrainCoordinator:
                  out_dir: str, settings, dataset_id: str = "",
                  base: str = "", field_map: Optional[dict] = None,
                  total_rounds: int = 1, planned_pods: int = 0,
-                 epochs: float = 1.0):
+                 epochs: float = 1.0, session: str = ""):
         from codai.api import text_lora_rounds as tlr
         self.job_id = job_id
+        #: Whose run this is. Not a training knob -- `QLoraSettings` has no
+        #: business carrying it -- but it IS an ownership field: a resume must
+        #: not graft one tenant's coverage and weights onto another's run, and
+        #: the checkpoint can only compare what it was told.
+        self.session = str(session or "")
         self.plan = plan
         self.tracker = tracker
         self.fleet = fleet
@@ -3905,6 +3921,14 @@ class _TextTrainCoordinator:
         #: Every block whose adapter has been submitted, across all exchanges.
         #: This is the progress measure and the terminating condition.
         self._covered: set = set()
+        #: How many TIMES each block has been trained and averaged in. The
+        #: set above cannot answer that, and `finished()` compared its length
+        #: against `total_blocks * epochs`: with `epochs=2` the target was
+        #: twice a number the set can never exceed, so the run could not
+        #: terminate -- it wrapped the queue and retrained for ever, and only
+        #: ever stopped by losing its fleet. `epochs` has been on the request
+        #: since the route was written and 1.0 is the only value that works.
+        self._cover_counts: Dict[int, int] = {}
         #: The deadline last reported, so the line is printed when it moves
         #: rather than on every round.
         self._said_deadline: float = -1.0
@@ -3948,12 +3972,32 @@ class _TextTrainCoordinator:
         """
         want = int(self.total_blocks() * self.epochs)
         with self._lock:
-            return len(self._covered) >= max(1, want)
+            return self._cover_units() >= max(1, want)
+
+    def passes_wanted(self) -> int:
+        """How many times each block should be trained. 1 for a single epoch."""
+        return max(1, int(math.ceil(float(self.epochs))))
+
+    def _cover_units(self) -> int:
+        """Blocks trained, counting a block up to :meth:`passes_wanted` times.
+
+        Caller holds the lock. For one epoch this is exactly
+        ``len(self._covered)`` -- every block counts once and the number is
+        the one every log line and progress field has always published. For
+        two it counts a block twice, which is what makes the target reachable.
+        """
+        cap = self.passes_wanted()
+        return sum(min(int(c), cap) for c in self._cover_counts.values())
 
     def coverage(self) -> tuple:
-        """(blocks trained, blocks wanted) -- what progress actually means."""
+        """(blocks trained, blocks wanted) -- what progress actually means.
+
+        The numerator is the same one `finished()` tests, so progress and
+        termination cannot disagree: published coverage that is not the
+        terminating condition is how a 5.3% run once reported 55%.
+        """
         with self._lock:
-            return len(self._covered), max(
+            return self._cover_units(), max(
                 1, int(self.total_blocks() * self.epochs))
 
     def round_payload(self, shard: int) -> dict:
@@ -4075,11 +4119,35 @@ class _TextTrainCoordinator:
                     # would hand a second pod examples a first pod is already
                     # training -- the duplication this design replaced,
                     # through the back door.
-                    for _ in range(total):
-                        cand = self._next_block % total
-                        self._next_block += 1
-                        if cand not in issued:
+                    #
+                    # UNTRAINED WORK FIRST. This took the next block off the
+                    # counter and asked only whether THIS round had issued
+                    # it, never whether it was already trained. The counter
+                    # wraps, so once the walk passed the stragglers the tail
+                    # of every run degenerated: each round handed its pods
+                    # blocks covered hours earlier and had to travel the
+                    # whole cycle again to reach the few that were missing.
+                    # Measured on a 366-block run: rounds 30, 31 and 32
+                    # covered NOTHING -- two hours and about $28 of rented
+                    # A40s to gain one block -- and the run was stopped by
+                    # hand at 364/366 with ~30% of the dataset trained twice.
+                    # So the pass below prefers a block short of the passes
+                    # this run wants, and only when none is left does it fall
+                    # back to any unissued block, which is what keeps a fleet
+                    # that is ahead of the queue busy instead of idle.
+                    cap = self.passes_wanted()
+                    for _hungry in (True, False):
+                        for _ in range(total):
+                            cand = self._next_block % total
+                            self._next_block += 1
+                            if cand in issued:
+                                continue
+                            if _hungry and \
+                                    self._cover_counts.get(cand, 0) >= cap:
+                                continue
                             b = cand
+                            break
+                        if b is not None:
                             break
                 if b is None:
                     break               # nothing unclaimed left this exchange
@@ -4205,6 +4273,8 @@ class _TextTrainCoordinator:
                 return
             for b in done:
                 self._covered.add(int(b))
+                self._cover_counts[int(b)] = \
+                    self._cover_counts.get(int(b), 0) + 1
 
     def blocks_left(self, rnd: Optional[int] = None) -> int:
         """Unissued blocks in this exchange -- 0 means everyone has work."""
@@ -4305,6 +4375,102 @@ class _TextTrainCoordinator:
         with self._lock:
             return self._averages.get(int(rnd), "")
 
+    # -- the resume point -------------------------------------------------- #
+
+    def resume_identity(self) -> dict:
+        """Every input that gives a recorded block id its meaning.
+
+        Used both to WRITE the checkpoint and to validate one: the same dict
+        on both sides is what makes "resumable" a comparison rather than a
+        judgement.
+        """
+        return {
+            "dataset_id": str(self.dataset_id or ""),
+            "base": str(self.base or ""),
+            "target": "text",
+            "session": str(self.session or ""),
+            "rank": int(self.settings.rank or 0),
+            "alpha": int(self.settings.alpha or 0),
+            "dropout": float(self.settings.dropout or 0.0),
+            "max_len": int(self.settings.max_len or 0),
+            "seed": int(self.settings.seed or 0),
+            "n_examples": int(len(self.encoded)),
+            "block_size": int(self.plan.block_size(
+                len(self.encoded), self.total_rounds, self.planned_pods)),
+        }
+
+    def resume_state(self, rnd: int, average: str = ""):
+        """A checkpoint describing this run as of the close of ``rnd``."""
+        from codai.api import text_lora_resume as tlres
+        st = tlres.ResumeState(**self.resume_identity())
+        st.job_id = str(self.job_id)
+        st.name = os.path.basename(self.out_dir.rstrip("/"))
+        st.rounds = int(self.total_rounds)
+        st.planned_pods = int(self.planned_pods)
+        st.epochs = float(self.epochs)
+        # The round to OPEN, which is one past the one just averaged.
+        st.round = int(rnd) + 1
+        with self._lock:
+            st.covered = sorted(int(b) for b in self._covered)
+            st.next_block = int(self._next_block)
+            st.recycle = [int(b) for b in self._recycle]
+            st.trained = int(self._trained)
+            st.asked = int(self._asked)
+            st.subs = int(self._subs)
+            st.short = int(self._short)
+        st.average = os.path.basename(average) if average else ""
+        return st
+
+    def save_resume(self, rnd: int, average: str = "") -> str:
+        """Write the checkpoint for the round just closed.
+
+        NEVER fatal. This is bookkeeping that makes the NEXT run cheaper; a
+        full disk or a read-only mount must not end a run that is training
+        correctly, which is the inverse of the mistake that made this module
+        necessary.
+        """
+        from codai.api import text_lora_resume as tlres
+        try:
+            return tlres.save(self.out_dir, self.resume_state(rnd, average))
+        except Exception as exc:
+            print(f"[text-lora] {self.job_id}: the resume checkpoint could "
+                  f"not be written ({exc}); the run continues, but an "
+                  f"interruption will cost everything since round "
+                  f"{rnd}", flush=True)
+            return ""
+
+    def adopt_resume(self, state, average: str = "") -> None:
+        """Continue from ``state``: its coverage, its counters, its round.
+
+        Called BEFORE any pod is dispatched. The identity has already been
+        checked by the caller -- this method trusts it, and says so, because
+        adopting coverage against a different seed or block size is the one
+        failure the checkpoint format exists to prevent.
+        """
+        with self._lock:
+            self._covered = {int(b) for b in (state.covered or [])}
+            # ONE PASS EACH, not the counts the previous run held. The
+            # checkpoint records WHICH blocks were trained, not how often,
+            # and the only run shape in use trains each once. For a multi-pass
+            # run this under-counts, which is the safe direction: an
+            # under-counted block is trained again, where an over-counted one
+            # is skipped and nothing downstream can tell.
+            self._cover_counts = {int(b): 1 for b in self._covered}
+            self._next_block = max(0, int(state.next_block or 0))
+            self._recycle = [int(b) for b in (state.recycle or [])]
+            self._trained = max(0, int(state.trained or 0))
+            self._asked = max(0, int(state.asked or 0))
+            self._subs = max(0, int(state.subs or 0))
+            self._short = max(0, int(state.short or 0))
+            rnd = max(0, int(state.round or 0))
+            self.tracker.adopt_round(rnd)
+            if average and rnd > 0:
+                # Filed as the PREVIOUS round's average, which is where the
+                # dispatch looks for what to start a pod from. Carried under
+                # its own path: the file lives in the run it was produced by,
+                # which may not be this run's directory.
+                self._averages[rnd - 1] = average
+
     # -- the round boundary ----------------------------------------------- #
 
     def close_round_if_ready(self) -> Optional[int]:
@@ -4362,6 +4528,21 @@ class _TextTrainCoordinator:
                         f"{tlr.DEADLINE_MIN_SAMPLES} needed to size it")
             print(f"[text-lora] {self.job_id}: round {rnd + 1} waits up to "
                   f"{_dl/60:.1f} min for a straggler ({_how})", flush=True)
+        # THE RESUME POINT, written here and only here. The average exists on
+        # disk by now -- the ordering is the point, because a checkpoint that
+        # names a file not yet written is a resume that starts from the bare
+        # base while reporting a continuation. Round close is also the only
+        # moment the coverage set is meaningful to anyone else: between closes
+        # there are blocks issued to pods whose adapters have not been
+        # averaged in, and those are not trained work.
+        _ck = self.save_resume(rnd, out)
+        if _ck:
+            _cov, _want = self.coverage()
+            print(f"[text-lora] {self.job_id}: resume point written — "
+                  f"{_cov}/{_want} block(s) trained; a new run with "
+                  f"resume_from={os.path.basename(self.out_dir.rstrip('/'))!r} "
+                  f"continues from round {rnd + 1} instead of starting over",
+                  flush=True)
         return rnd
 
     def reap_the_dead(self) -> List[int]:
@@ -4460,19 +4641,33 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     # (narrow() passes it through: rounds change duration, not fleet size or
     # price), so when y is not what was asked for, the record should say what
     # it is and why rather than leaving it to be inferred.
-    # AN OVERCLAIM, CORRECTED. This said "each one is a checkpoint, so an
-    # interruption costs at most 1/N of the work", which a client read as a
-    # promise that a cancelled job could be picked up again. It cannot: the
-    # round averages are written to disk, but the set of blocks already
-    # covered lives only in this process, so a resubmit reshuffles and starts
-    # from nothing. The averages bound what ONE ROUND's interruption costs
-    # inside a live run; they are not a resume point.
+    # AN OVERCLAIM, CORRECTED, THEN MADE TRUE. This first said "each one is
+    # a checkpoint, so an interruption costs at most 1/N of the work", which
+    # a client read as a promise that a cancelled job could be picked up
+    # again -- and it could not: the averages were on disk and the set of
+    # blocks already covered lived only in this process, so a resubmit
+    # reshuffled and started from nothing. The note was corrected to say so,
+    # and the gap it described is now closed: a round close writes
+    # `resume.json` beside the averages, and `resume_from` adopts both.
     _update_job(job_id, test_run=False, rounds=rounds,
-                rounds_note=(f"{rounds} averaging round(s); a round that "
-                             f"fails costs at most 1/{rounds} of the work, "
-                             f"but a cancelled job restarts from the "
-                             f"beginning — the averages are not a resume "
-                             f"point"))
+                # `rounds` SIZES THE WORK, it does not count the exchanges.
+                # A block is `ceil(examples / (rounds * pods))` and the run
+                # ends on coverage, so a fleet smaller than planned takes
+                # proportionally more exchanges to walk the dataset. This
+                # said "16 averaging round(s)" flatly; the run it was written
+                # for closed 36 on a fleet that held 16 of the 24 pods it
+                # asked for, and a client told to expect 16 had no way to
+                # read that as anything but overrun.
+                rounds_note=(f"blocks sized for {rounds} round(s) of "
+                             f"{n_shards} pod(s); the run ends when the "
+                             f"dataset is covered, so a smaller fleet takes "
+                             f"more exchanges than {rounds} rather than "
+                             f"training less. A round that fails costs at "
+                             f"most 1/{rounds} of the work, and a run that "
+                             f"stops can be continued with "
+                             f"resume_from={req.name!r} from the last round "
+                             f"that closed — work before that round is not "
+                             f"retrained"))
     _clouds = flt.clouds_for(cfg)
     # The FIRST is what a single-cloud create falls back to; the candidates
     # carry their own. "SECURE+COMMUNITY" in a log line is the honest
@@ -4522,6 +4717,65 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     _update_job(job_id, trainer_image=_img)
 
     out_dir = os.path.join(_loras_dir(), req.name)
+    # A RESUME IS VETTED BEFORE A POD IS RENTED. The full check needs the
+    # encoded example count, which the dataset pass has not produced yet, but
+    # everything a caller is likely to have got wrong is knowable now -- and
+    # discovering it after the fleet is up is discovering it with the meter
+    # running.
+    _resume_dir = ""
+    _resume_state = None
+    _resume_avg = ""
+    if getattr(req, "resume_from", None):
+        from codai.api import text_lora_resume as tlres
+        _resume_dir = os.path.join(_loras_dir(), str(req.resume_from).strip())
+        if not os.path.isdir(_resume_dir):
+            raise RuntimeError(
+                f"resume_from={req.resume_from!r}: no such run — expected its "
+                f"output directory at {_resume_dir}")
+        _resume_state = tlres.load(_resume_dir)
+        _why = tlres.nothing_to_resume(_resume_state)
+        if _why:
+            raise RuntimeError(
+                f"resume_from={req.resume_from!r} cannot be resumed: {_why}")
+        # The arithmetic that gives a block id its meaning, checked first
+        # because it is the one a caller changes without realising: `rounds`
+        # and `pods` both move the block size, and a block id read against a
+        # different block size names examples nobody trained.
+        if int(_resume_state.rounds or 0) != int(rounds) \
+                or int(_resume_state.planned_pods or 0) != int(n_shards):
+            raise RuntimeError(
+                f"resume_from={req.resume_from!r} was planned for "
+                f"{_resume_state.rounds} round(s) on "
+                f"{_resume_state.planned_pods} pod(s), and this request asks "
+                f"for {rounds} round(s) on {n_shards}. Block size is "
+                f"ceil(examples / (rounds * pods)), so every recorded block "
+                f"id would refer to a different set of examples — resume with "
+                f"the original rounds and pods, or start a fresh run")
+        tlres.check(_resume_state, {
+            "dataset_id": str(req.dataset_id or ""),
+            "base": _resolve_text_base(cfg.base_model or req.base_model),
+            "target": "text",
+            "session": str(getattr(req, "session", "") or ""),
+            "rank": int(settings.rank or 0),
+            "alpha": int(settings.alpha or 0),
+            "dropout": float(settings.dropout or 0.0),
+            "max_len": int(settings.max_len or 0),
+            "seed": int(settings.seed or 0),
+        }, where=_resume_dir)
+        _resume_avg = tlres.average_file(_resume_dir, _resume_state)
+        print(f"[text-lora] {job_id}: resuming {req.resume_from!r} — "
+              f"{_resume_state.describe()}", flush=True)
+        if not _resume_avg:
+            # Worth having even so: the coverage saves the GPU hours those
+            # blocks cost. But it is NOT a warm start, and a run that silently
+            # retrained from the base while reporting a resume is exactly the
+            # class of quiet wrongness this path is being built to end.
+            print(f"[text-lora] {job_id}: the checkpoint names no usable "
+                  f"average ({_resume_state.average or 'none recorded'}), so "
+                  f"the pods start from the BARE BASE and only the coverage "
+                  f"is carried — the {_resume_state.blocks_done} block(s) "
+                  f"already trained are not retrained, but the weights they "
+                  f"produced are gone", flush=True)
     plan = tlr.RoundPlan(n_shards=n_shards, seed=settings.seed)
     # The FLOOR a round waits for a straggler, and the bootstrap for round
     # 0. The tracker sizes the real deadline off the block times it measures,
@@ -4846,7 +5100,29 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             planned_pods=n_shards,
             # Carried on the request since the route was written and read by
             # nothing until now.
-            epochs=float(getattr(req, "epochs", None) or 1.0))
+            epochs=float(getattr(req, "epochs", None) or 1.0),
+            # An ownership field for the resume check, not a training knob.
+            session=str(getattr(req, "session", "") or ""))
+        if _resume_state is not None:
+            from codai.api import text_lora_resume as tlres
+            # THE FULL CHECK, now that the dataset pass has run. The example
+            # count and the block size could not be known before it, and they
+            # are the two that decide what a recorded block id points at: a
+            # dataset that gained a row, or an example that stopped being
+            # skipped, renumbers every block.
+            tlres.check(_resume_state, coord.resume_identity(),
+                        where=_resume_dir)
+            coord.adopt_resume(_resume_state, _resume_avg)
+            _cov, _want = coord.coverage()
+            print(f"[text-lora] {job_id}: resumed at round "
+                  f"{coord.tracker.round} with {_cov}/{_want} block(s) "
+                  f"already trained ({100.0 * _cov / max(1, _want):.1f}%)"
+                  + (f", pods start from {os.path.basename(_resume_avg)}"
+                     if _resume_avg else ", pods start from the base"),
+                  flush=True)
+            _update_job(job_id, resumed_from=str(req.resume_from),
+                        resumed_at_round=int(coord.tracker.round),
+                        resumed_blocks=int(_cov))
         with _coord_lock:
             _train_coordinators[job_id] = coord
         floor = max(0, int(req.min_pods or 0))
@@ -5327,9 +5603,19 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
                 break
         if not final:
             raise RuntimeError(f"no round produced an average in {out_dir}")
-        import shutil
         adapter = os.path.join(out_dir, "adapter_model.safetensors")
-        shutil.copyfile(final, adapter)
+        # NOT A COPY. The average carries the pods' float32, which is twice
+        # the size of every adapter this install serves and precision no
+        # inference path uses; this casts it to bf16 and reports the tensor
+        # key layout, which is the one packaging fault the orchestrator cannot
+        # detect for itself. See `write_serving_adapter`.
+        _pack = tlr.write_serving_adapter(final, adapter)
+        print(f"[text-lora] {job_id}: packed {_pack['tensors']} tensor(s) as "
+              f"{_pack['dtype']} ({_pack['cast']} cast, "
+              f"{_pack['bytes'] / 1e6:.0f} MB); tensor keys begin "
+              f"{_pack['key_prefix']!r} — a pod applies the adapter by "
+              f"matching these against the base's own module names",
+              flush=True)
         # AND THE CONFIG, or this directory is not an adapter. The averaging
         # path only ever wrote tensors, so every distributed run produced a
         # directory that PEFT and vLLM both refuse to load -- invisible until

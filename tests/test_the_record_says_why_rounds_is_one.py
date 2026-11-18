@@ -40,9 +40,17 @@ def test_a_real_run_records_its_rounds_too():
 
 
 def test_the_real_run_note_explains_what_a_round_buys():
-    """The operator's own reason for wanting 16: each round is a checkpoint,
-    so a restart costs 1/16 rather than everything."""
-    assert "each one is a " in DIST and "1/{rounds} of the work" in DIST
+    """The operator's own reason for wanting 16, as the record now states it.
+
+    This asserted `"each one is a "`, which by then matched only the COMMENT
+    recording that the note had once overclaimed -- so it passed on a
+    re-wrapped comment and said nothing about what a client is told. It now
+    asserts the two things the note itself must carry: what one round's
+    failure costs, and that a stopped run can be continued, which it could
+    not when the overclaim was first corrected.
+    """
+    assert "1/{rounds} of the work" in DIST
+    assert "resume_from=" in DIST
 
 
 def test_rounds_is_not_clamped_by_narrowing():

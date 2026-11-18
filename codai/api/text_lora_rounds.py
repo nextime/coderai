@@ -351,6 +351,24 @@ class RoundTracker:
     def open_round(self, rnd: int, now: Optional[float] = None) -> None:
         self._opened_at.setdefault(rnd, now if now is not None else time.time())
 
+    def adopt_round(self, rnd: int, now: Optional[float] = None) -> None:
+        """Open round ``rnd`` as the first round of a RESUMED run.
+
+        A resumed run keeps the old numbering rather than restarting at zero,
+        and not for the logs: the loop pushes `average_path(round - 1)` to
+        each pod and skips that push entirely when the round is 0. Numbering
+        a continuation from zero would therefore start every pod from the
+        bare base while the carried average sat unread on disk -- a resume
+        that reports itself as one and trains as if it were not.
+
+        The measured block times are deliberately NOT carried over. They size
+        the round deadline, and a resumed fleet is rented fresh: the cards it
+        gets are not the cards that produced those numbers.
+        """
+        r = max(0, int(rnd))
+        self.round = r
+        self.open_round(r, now=now)
+
     def note_started(self, shard: int, rnd: int,
                      now: Optional[float] = None) -> None:
         """This pod has been put on a block of ``rnd``. Starts its clock.
@@ -613,7 +631,20 @@ def adapter_config_for(adapter_path: str, *, base: str,
                 name = name[len(prefix):]
                 break
         if name:
-            mods.add(name)
+            # THE LEAF NAME, NOT THE PATH. This recorded the fully-qualified
+            # module path -- 256 entries like
+            # `model.layers.0.mlp.down_proj` -- which is a truthful
+            # description of the tensors and still the wrong thing to write.
+            # PEFT and vLLM both resolve `target_modules` by matching each
+            # entry against the SUFFIX of the base's module names, so a path
+            # is only ever right if the orchestrator guessed the base's whole
+            # module tree correctly; the two adapters this install already
+            # serves list the seven leaf names and load, and the first
+            # distributed adapter listed the paths and matched nothing.
+            # Measured live: coderai resolved the name, the gateway taught
+            # the pod, the pod's own model list came back without it, and
+            # generation answered 500 "Model not available".
+            mods.add(name.rsplit(".", 1)[-1])
         shape = (hdr[key] or {}).get("shape") or []
         if len(shape) == 2:
             # lora_A is [r, in_features]: the rank is the ROW count, and
@@ -654,3 +685,50 @@ def write_adapter_config(out_dir: str, adapter_path: str, *, base: str,
         fh.write("\n")
     os.replace(tmp, dest)
     return dest
+
+
+#: What a served LoRA is stored in. The pods hand back float32, because
+#: preparing a 4-bit base for training upcasts the adapter parameters and
+#: nothing casts them down again, and the average preserves whatever dtype the
+#: submissions carried. Float32 doubles the adapter -- 318 MB where the
+#: adapters this install already serves are 159 MB -- for precision no
+#: inference path uses.
+SERVING_DTYPE = "bfloat16"
+
+
+def write_serving_adapter(src: str, dest: str, *,
+                          dtype: str = SERVING_DTYPE) -> Dict[str, Any]:
+    """Copy the final average to ``dest`` as the adapter a pod will load.
+
+    This replaced a `shutil.copyfile`, which shipped the average verbatim:
+    float32 tensors at twice the size of every adapter this install serves.
+    The cast is lossy in the way bf16 is always lossy and in no way that
+    matters -- measured over all 512 tensors of a real run, the worst
+    relative change in tensor norm was 4.7e-05.
+
+    Returns what was written, including ``key_prefix``: the common prefix of
+    the tensor names. THAT IS REPORTED ON PURPOSE. vLLM applies a LoRA by
+    matching tensor names against the base's real modules, and the one failure
+    this function cannot fix is a base whose language tower sits somewhere the
+    trainer did not see -- an adapter whose keys say `model.layers.0` against
+    a base that calls it `model.language_model.layers.0` is a valid file that
+    silently adapts nothing. The orchestrator cannot know the base's module
+    tree without loading the base, so it records what it shipped instead, and
+    the next mismatch is one log line to diagnose rather than a day.
+    """
+    import os
+    import torch
+    from safetensors.torch import load_file, save_file
+    sd = load_file(src)
+    want = getattr(torch, str(dtype))
+    out, cast = {}, 0
+    for k, v in sd.items():
+        if v.is_floating_point() and v.dtype != want:
+            v = v.to(want)
+            cast += 1
+        out[k] = v.contiguous()
+    save_file(out, dest, metadata={"format": "pt"})
+    keys = sorted(out)
+    prefix = os.path.commonprefix(keys) if keys else ""
+    return {"tensors": len(out), "cast": cast, "dtype": str(dtype),
+            "bytes": os.path.getsize(dest), "key_prefix": prefix}

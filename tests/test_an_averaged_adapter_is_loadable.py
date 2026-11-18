@@ -64,15 +64,25 @@ def _write_fake_adapter(path, *, rank=16, layers=2, prefix="base_model.model."):
 
 
 def test_the_config_names_every_adapted_module(tmp_path):
+    """CORRECTED. This asserted the fully-qualified module PATHS.
+
+    It was a faithful description of the tensors and the reason the adapter
+    this file is named for could not be loaded. PEFT and vLLM resolve
+    `target_modules` by matching each entry against the SUFFIX of the base's
+    module names, so a path only ever matches if the orchestrator guessed the
+    base's whole module tree -- and `diogene-alpha`, which this file measures
+    itself against and which actually serves, lists the seven leaf names.
+    Measured live: coderai resolved the name, the gateway taught the pod, the
+    pod's model list came back without it, generation answered 500.
+    """
     p = _write_fake_adapter(str(tmp_path / "adapter_model.safetensors"))
     cfg = tlr.adapter_config_for(p, base="Qwen/Qwen3.8-27B", alpha=32)
 
-    assert cfg["target_modules"] == [
-        "model.layers.0.mlp.down_proj",
-        "model.layers.0.self_attn.q_proj",
-        "model.layers.1.mlp.down_proj",
-        "model.layers.1.self_attn.q_proj",
-    ], "the adapted modules are exactly the ones with lora_A tensors"
+    assert cfg["target_modules"] == ["down_proj", "q_proj"], (
+        "the adapted modules are the LEAF names a loader matches, "
+        "deduplicated across layers")
+    assert not any("." in m for m in cfg["target_modules"]), (
+        "a module path is not a target_modules entry")
 
 
 def test_the_rank_is_read_off_the_tensors(tmp_path):
@@ -121,7 +131,10 @@ def test_the_adapter_name_prefix_is_tolerated(tmp_path):
         fh.write(blob)
         fh.write(b"\0" * off)
     cfg = tlr.adapter_config_for(p, base="b", alpha=32)
-    assert cfg["target_modules"] == ["model.layers.0.mlp.up_proj"]
+    # The leaf name, for the reason given in
+    # `test_the_config_names_every_adapted_module`. What this test is for is
+    # the `.default.` infix, which must still be stripped.
+    assert cfg["target_modules"] == ["up_proj"]
 
 
 def test_the_required_keys_match_a_working_adapter(tmp_path):

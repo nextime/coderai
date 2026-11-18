@@ -269,6 +269,24 @@ def install(monkeypatch, fleet, *, home, pushes=None, finish_after=0.0,
             if not os.path.isfile(p):
                 _write_tiny_adapter(p)
             return p
+
+        #: A resumed run checks the checkpoint against this and then adopts
+        #: it, so the fake has to offer both or every run with `resume_from`
+        #: dies in the wiring rather than in what it is testing. `adopted`
+        #: is what a test asserts on: the real method's effects are internal.
+        def resume_identity(self):
+            # MIRRORS `QLoraSettings()`, which is what `run()` hands the real
+            # run and therefore what the EARLY vet compares against. The
+            # `settings` property above reports dropout 0.0 for the adapter
+            # config and is not this: a fake whose two halves disagree
+            # refuses every resume on a mismatch of its own making.
+            return {"dataset_id": "", "base": "stub-base", "target": "text",
+                    "session": "", "rank": 16, "alpha": 32, "dropout": 0.05,
+                    "max_len": 8192, "seed": 42, "n_examples": 1,
+                    "block_size": 1}
+
+        def adopt_resume(self, state, average=""):
+            self.adopted = (state, average)
     monkeypatch.setattr(loras, "_TextTrainCoordinator", _Coord)
 
 
@@ -285,7 +303,7 @@ def req(name="adapter-fake", **kw):
                 min_pods=None, max_pods=None, rounds=1, test_run=False,
                 distributed=True, dataset_id="", field_map=None,
                 dry_run=False, max_pod_hourly_usd=None,
-                max_fleet_hourly_usd=None)
+                max_fleet_hourly_usd=None, resume_from=None)
     base.update(kw)
     return types.SimpleNamespace(**base)
 

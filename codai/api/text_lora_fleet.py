@@ -59,6 +59,12 @@ DEFAULT_MAX_SILENCE_S = 1800.0
 #: is not a crash but a loop that keeps reporting progress forever.
 DEFAULT_MAX_LIFETIME_S = 86400.0
 
+#: How many pods may be rented and reaped WITHOUT EVER ANSWERING before the
+#: top-up stops growing the fleet. Three rather than one: a single dead
+#: machine is luck, and a fleet that stops growing on the first one would
+#: never assemble on a busy day.
+DOA_STREAK_CAP = 3
+
 
 class FleetError(RuntimeError):
     """Provisioning refused, with the reason."""
@@ -451,6 +457,16 @@ class TrainerFleet:
         self._on_event = on_event
         self.pods: Dict[int, TrainerPod] = {}
         self._lock = threading.RLock()
+        #: Pods rented and reaped WITHOUT EVER ANSWERING, in total and in a
+        #: row. A pod that worked and died is a pod to replace; a pod that
+        #: never once checked in is capacity handing back dead machines, and
+        #: the top-up could not tell the two apart -- it re-rented the slot
+        #: immediately and for ever. Measured on one 15-hour run: 87 such
+        #: releases, about $27 of A40s that trained nothing, five slots
+        #: cycling rent-reap-rent on a ~30 minute period for the whole run.
+        self._doa = 0
+        self._doa_streak = 0
+        self._doa_said = False
         # Anything a previous process left behind for THIS job is adopted rather
         # than abandoned: it is already rented and already being paid for.
         for row in _read_state(job_id):
@@ -652,6 +668,27 @@ class TrainerFleet:
             want = min(want, int(cap))
         if len(have) >= want:
             return []
+        # DEAD CAPACITY IS NOT WORTH RE-RENTING. Every reap used to be
+        # followed straight back here, which is right for a pod that worked
+        # and died and wrong for one that never answered: the slot is re-let
+        # within the minute, the replacement is as dead as the last, and the
+        # job pays the boot of each. After this many consecutive pods that
+        # never once checked in, the fleet holds the size it has instead of
+        # growing -- it does NOT shrink, and the first pod that answers
+        # resets the streak, so a transient shortage costs nothing. On the
+        # run that produced this, it would have stopped about $27 of rentals
+        # that trained nothing without touching the pods that were working.
+        if self._doa_streak >= DOA_STREAK_CAP and have:
+            if not self._doa_said:
+                self._doa_said = True
+                self._say(
+                    f"holding at {len(have)} pod(s) instead of {want}: the "
+                    f"last {self._doa_streak} pod(s) rented never checked in "
+                    f"({self._doa} so far this run). Capacity is handing back "
+                    f"machines that do not answer; the fleet will grow again "
+                    f"as soon as one does")
+            return []
+        self._doa_said = False
         # The SIZE, not the gaps: `provision` fills to the size it is given,
         # so handing it a list of missing ids would ask for that many MORE.
         return self.provision(list(range(want)))
@@ -872,6 +909,14 @@ class TrainerFleet:
                 self._say(f"shard {shard}: could not terminate {pod.pod_id}: "
                           f"{exc} — LEFT IN THE RECORD for a later sweep")
                 return False
+        # Counted on the way out, where the pod's whole life is known: a url
+        # means it answered at least once, so it was a pod that worked and
+        # died. No url and it never answered at all.
+        if str(getattr(pod, "url", "") or ""):
+            self._doa_streak = 0
+        else:
+            self._doa += 1
+            self._doa_streak += 1
         cost = pod.cost_so_far()
         try:
             from codai.api import runpod_ledger
