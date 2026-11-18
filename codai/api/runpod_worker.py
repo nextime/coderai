@@ -6816,15 +6816,40 @@ def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
         elif not shared:
             # refresh config each load so edits take effect
             pool.account, pool.mcfg, pool.served = account_cfg, mcfg, served_name
-        if shared and not pool.seed_entries and str(model_key).startswith("pool:"):
+        if shared and str(model_key).startswith("pool:"):
             # Every name this pod must answer for, not just the one that rented
             # it: the adapters are registered when its engine STARTS, so a model
             # that arrives afterwards would need the engine restarted.
-            pool.seed_entries = shared_pool_seed_entries(
+            #
+            # RECOMPUTED, not cached. The condition here was
+            # `not pool.seed_entries`, so the list was built once -- the first
+            # time it came back non-empty -- and then kept for the life of the
+            # PROCESS. A pool object outlives every pod in it, so an adapter
+            # registered through `/v1/loras/register` after the pool existed
+            # was never seeded into any pod rented afterwards, and the only
+            # cure was restarting the container. Measured live: a freshly
+            # rented pod was sent `digesta-alpha` and `diogene-alpha` and not
+            # the adapter that had been registered 44 minutes earlier, so it
+            # answered under that adapter's name with base weights and
+            # nothing failed. Recycling the pod could not fix it and did not.
+            #
+            # The cost of recomputing is a walk of the in-memory catalogue,
+            # which is what `models_data` already is.
+            fresh = shared_pool_seed_entries(
                 str(model_key)[5:], (entry or {}).get("id") or "")
-            if pool.seed_entries:
-                names = ", ".join(str(e.get("id")) for e in pool.seed_entries)
-                print(f"[runpod] pool {model_key!r} is shared with: {names}", flush=True)
+            was = [str(e.get("id") or "") for e in (pool.seed_entries or [])]
+            now_ids = [str(e.get("id") or "") for e in fresh]
+            # An empty answer is not allowed to erase a good list: the
+            # catalogue can be mid-reload, and a pod seeded with nothing
+            # launches without `--enable-lora` and can never serve an adapter
+            # without a reload of the base.
+            if fresh:
+                pool.seed_entries = fresh
+            if now_ids != was and fresh:
+                names = ", ".join(now_ids)
+                print(f"[runpod] pool {model_key!r} is shared with: {names}"
+                      + (f" (was: {', '.join(was) or 'nothing'})" if was
+                         else ""), flush=True)
     _ensure_scaler()
     return pool
 
