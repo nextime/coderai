@@ -104,6 +104,85 @@ def _from_repo(model_path: str) -> str:
         return ""
 
 
+#: GGUF metadata value types -> the fixed byte width of a scalar, for SKIPPING
+#: a value we are not asked about. Strings (8) and arrays (9) are variable and
+#: handled in the walker.
+_GGUF_SCALAR_WIDTH = {0: 1, 1: 1, 7: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4,
+                      10: 8, 11: 8, 12: 8}
+
+
+def _from_gguf(model_path: str) -> str:
+    """The chat template a GGUF carries in ``tokenizer.chat_template``.
+
+    A GGUF is a FILE -- not a directory and not a repo id -- so neither
+    :func:`_from_dir` nor :func:`_from_repo` can see inside one, and a local
+    ``.gguf`` is the commonest way a model is served here. Left unread, every
+    locally-served GGUF answered "no template", and :func:`thinks` then fell
+    through to matching the model's NAME. The two spellings in this catalogue
+    show what that costs: `qwen38` matches the name regex and `redteam` does
+    not, so the same Qwen3.8 template split its thinking under one alias and
+    streamed raw ``<think>`` into ``content`` under the other.
+
+    Arrays are SEEKED past rather than decoded. ``tokenizer.ggml.tokens`` is a
+    single array of ~250k strings in these files and it sits BEFORE the
+    template, so materialising it to reach the key costs half a million reads
+    per lookup; the walker only needs each element's length to step over it.
+
+    Returns '' for anything that is not a readable GGUF, so a caller cannot
+    tell "no template" from "could not be read" -- deliberate: both mean the
+    detection has to fall back, and neither is an error worth raising while
+    choosing a parser.
+    """
+    import struct
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return ""
+            f.seek(4 + 8, 1)                      # version, tensor_count
+            n_kv = struct.unpack("<Q", f.read(8))[0]
+
+            def _skip_str():
+                n = struct.unpack("<Q", f.read(8))[0]
+                f.seek(n, 1)
+
+            def _read_str():
+                n = struct.unpack("<Q", f.read(8))[0]
+                return f.read(n).decode("utf-8", "replace")
+
+            def _skip_val(vt):
+                if vt == 8:
+                    _skip_str()
+                    return True
+                if vt in _GGUF_SCALAR_WIDTH:
+                    f.seek(_GGUF_SCALAR_WIDTH[vt], 1)
+                    return True
+                if vt == 9:
+                    et = struct.unpack("<I", f.read(4))[0]
+                    cnt = struct.unpack("<Q", f.read(8))[0]
+                    if et == 8:
+                        for _ in range(cnt):
+                            _skip_str()
+                    elif et in _GGUF_SCALAR_WIDTH:
+                        f.seek(_GGUF_SCALAR_WIDTH[et] * cnt, 1)
+                    elif et == 9:
+                        return False       # nested arrays: stop, do not guess
+                    else:
+                        return False
+                    return True
+                return False               # unknown type: offsets are no longer trustworthy
+
+            for _ in range(n_kv):
+                key = _read_str()
+                vt = struct.unpack("<I", f.read(4))[0]
+                if key == "tokenizer.chat_template" and vt == 8:
+                    return _read_str()
+                if not _skip_val(vt):
+                    return ""
+    except Exception:
+        return ""
+    return ""
+
+
 def chat_template_text(model_path: str) -> str:
     """The model's chat template, or '' when it cannot be read.
 
@@ -116,7 +195,15 @@ def chat_template_text(model_path: str) -> str:
     with _LOCK:
         if model_path in _CACHE:
             return _CACHE[model_path]
-    text = _from_dir(model_path) if os.path.isdir(model_path) else _from_repo(model_path)
+    # A GGUF is a file, so it is tried BEFORE the repo lookup -- which would
+    # otherwise ask the Hub for a repo named by a filesystem path, fail, and
+    # report that a model with an embedded template has none.
+    if os.path.isdir(model_path):
+        text = _from_dir(model_path)
+    elif os.path.isfile(model_path):
+        text = _from_gguf(model_path)
+    else:
+        text = _from_repo(model_path)
     with _LOCK:
         _CACHE[model_path] = text
     return text
@@ -152,6 +239,13 @@ def tool_call_style(model_path: str) -> str:
 #: source is Jinja, so the newlines are the two-character escapes ``\n`` as
 #: often as they are real ones.
 _PRECLOSED_EMPTY_THINK = re.compile(r"<think>(?:\\[nrt]|\s)*</think>")
+
+
+#: Thought markers whose CLOSING form the streaming reasoning gate in
+#: codai.api.text._gate_reasoning splits on. A template whose thought is marked
+#: some other way cannot be gated, so it must not be reported as thinking.
+_THOUGHT_TAGS = ("<think>", "</think>", "<thinking>", "</thinking>",
+                 "<thought>", "</thought>", "<|begin_of_thought|>")
 
 
 def _preclosed_empty_think(tpl: str) -> bool:
@@ -212,13 +306,22 @@ def thinks(model_path: str) -> bool:
     tpl = chat_template_text(model_path)
     if not tpl:
         return False
+    # A tag the reasoning gate can actually SPLIT ON has to be in the template,
+    # and it is required before anything else is considered. The switch alone is
+    # not enough: gemma-4's template defines `enable_thinking` (defaulting it to
+    # false) and marks the thought with `<|think|>` / `<|channel>thought`, which
+    # is not the `<think>` form _gate_reasoning closes on. Answering True there
+    # arms a gate whose close tag never arrives, so EVERY token files as
+    # reasoning and `content` comes back empty -- the chandra-ocr-2 failure
+    # again, from the other direction.
+    if not any(t in tpl for t in _THOUGHT_TAGS):
+        return False
     if "enable_thinking" in tpl:
         # Switchable: thinking is the caller's choice, so the parser is needed.
         return True
     if _preclosed_empty_think(tpl):
         return False
-    return any(t in tpl for t in ("<think>", "</think>", "<thinking>",
-                                  "<|begin_of_thought|>", "enable_thinking"))
+    return True
 
 
 def template_path_for_model(model_name: str) -> str:
