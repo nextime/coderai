@@ -4919,7 +4919,7 @@ function _collectLoraTrain(){
   return out;
 }
 
-function _populateAccel(a){
+async function _populateAccel(a){
   await _loadAccelPresets();
   await _loadAccelLoras();
   _refreshAccelVisibility();
