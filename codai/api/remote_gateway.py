@@ -700,6 +700,57 @@ def _capability_sibling_target(cap: str) -> Optional["Target"]:
     return None
 
 
+def adapter_entry_to_send(entry: dict, mcfg, model: str = ""):
+    """The entry whose adapter bytes a pod must be sent, or None.
+
+    A pooled pod is seeded with an adapter's CONTENT ID and the bytes are sent
+    separately -- `seed_model_env` says it outright: "the pod is told the id
+    when it is created and sent the bytes before the first request". Skip the
+    sending and the pod registers the NAME, answers requests for it, and
+    serves the BASE model's weights under it. Nothing fails.
+
+    Measured on a pool whose only member was the adapter itself: the pod came
+    ready, answered in 5.4s, and returned output byte-identical to the base --
+    same md5 over 400 characters -- because it had never received the 159 MB
+    it was named after. There was no `sent adapter` line for it at all. The
+    teach path does push an adapter, but only when a pod 404s on the name, and
+    a pod seeded with the id does not 404, so that net never fires.
+
+    This used to be decided inline under a bare `except Exception: pass`,
+    which is the worst place for it: every reason an adapter might not be sent
+    became silence, and the symptom was a pod quietly serving untuned weights.
+    """
+    try:
+        from codai.api.runpod_worker import resolve_pod_engine
+        from codai.models.text_loras import configured_specs, portable_specs
+        specs = configured_specs(entry or {})
+        if not specs:
+            return None
+        _portable, needs_sending = portable_specs(specs)
+        if not needs_sending:
+            return None             # every adapter is one the pod can fetch
+        engine = resolve_pod_engine(mcfg, model,
+                                    str((entry or {}).get("path") or ""), entry)
+        if engine in ("coderai", "custom"):
+            return entry
+        # A bare vLLM or llama.cpp image has no endpoint to receive the bytes,
+        # so the adapter cannot be served there. Say so: the alternative is a
+        # pod answering under the adapter's name with untuned weights.
+        print(f"[remote-gateway] {model!r}: {len(needs_sending)} adapter(s) "
+              f"cannot be sent to a {engine!r} pod — it has no upload "
+              f"endpoint. The pod will serve the BASE model under this name; "
+              f"use a coderai-* image to serve the adapter", flush=True)
+        return None
+    except Exception as exc:
+        # Not swallowed. A pod serving base weights under an adapter's name is
+        # indistinguishable from a working adapter until someone compares
+        # outputs, so the one clue has to survive.
+        print(f"[remote-gateway] {model!r}: could not work out whether its "
+              f"adapter(s) need sending ({exc}) — the pod may serve the base "
+              f"model under this name", flush=True)
+        return None
+
+
 def resolve_target(path: str, method: str, query: str, body: bytes,
                    content_type: str, force: str = "") -> Optional["Target"]:
     """Decide where this request should go, or None to serve it locally.
@@ -773,18 +824,9 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         kind, _ = resolve_model_source(entry, mcfg)
         if kind == "upload":
             target.upload_entry = entry
-        # Local adapters only reach a coderai pod: vLLM and llama.cpp images have
-        # no endpoint to receive an upload.
-        try:
-            from codai.api.runpod_worker import resolve_pod_engine
-            from codai.models.text_loras import configured_specs, portable_specs
-            if resolve_pod_engine(mcfg, model, str(entry.get("path") or ""), entry) \
-                    in ("coderai", "custom"):
-                _, needs_sending = portable_specs(configured_specs(entry))
-                if needs_sending:
-                    target.lora_entry = entry
-        except Exception:
-            pass
+        # THE MODEL'S OWN ADAPTER, not only its pool siblings'. See
+        # `adapter_entry_to_send` for what went wrong and how it was found.
+        target.lora_entry = adapter_entry_to_send(entry, mcfg, model)
         return target
     if not cap:
         if force == "remote":
