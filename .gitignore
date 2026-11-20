@@ -34,11 +34,20 @@ debug.log
 # source; the working tree is not part of this repo (it has its own .git).
 /GPTQModel/
 
-# Test files
+# Test files. The blanket pattern is for ad-hoc probes dropped anywhere outside
+# the suite -- a test_something.py written at the root to check one thing and
+# not meant to be kept. (The vendored colibri/ds4 tests under
+# packaging/runpod/engines-src are NOT what it is for: that whole tree is
+# ignored on its own further down.)
+#
+# This repo's OWN suite has to be re-included by glob, not file by file:
+# `!tests/` un-ignores the directory but NOT the files inside it that match
+# test_*.py. So every NEW test in tests/ was invisible to `git status` and
+# silently skipped by `git add tests/` -- which is how five real tests in this
+# suite were never committed, and why three more needed `git add -f`.
 test_*.py
 !tests/
-!tests/test_admin_auth.py
-!tests/test_whisper_server_local_models.py
+!tests/test_*.py
 
 # Local git worktrees
 .worktrees/
