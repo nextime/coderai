@@ -233,6 +233,18 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
         # or incompatible, fail (return None → 503) instead of falling back to a
         # different engine.
         if pinned:
+            # Normalised the same way required_capability() above normalises it,
+            # and for the same reason: an entry naming an engine by a former key
+            # must resolve to the engine that answers to it. Without this the
+            # capability check agreed, the assignment handed the model to the
+            # engine, and then THIS lookup found no engine of that name and
+            # failed the request as a bad hard pin -- a model the engine had
+            # already claimed, 503ing with a warning that the pin names nothing.
+            try:
+                from codai.models.manager import normalise_engine_key as _norm_pin
+                pinned = _norm_pin(pinned) or pinned
+            except Exception:
+                pass
             e = registry.by_name(pinned)
             if e is not None and e.can_serve(cap) and e.is_alive():
                 return e

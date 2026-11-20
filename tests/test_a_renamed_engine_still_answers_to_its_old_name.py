@@ -207,3 +207,43 @@ def test_the_old_key_survives_only_where_compatibility_needs_it(path):
             continue
         assert ("LEGACY_ENGINE_KEYS" in line
                 or "_ENGINE_KEY_ALIASES" in line), f"{path}:{n}: {line.strip()}"
+
+
+# --------------------------------------------------------------------------- #
+# the pin has to resolve where it is ENFORCED, not only where it is checked
+
+def test_a_legacy_pin_routes_to_the_engine_that_answers_to_it():
+    """MEASURED ON A LIVE INSTALL, 05:35:33. required_capability agreed and the
+    assignment handed qwen38cyber to 'llamampere', and then pick_engine looked
+    up the raw pin, found no engine of that name, and failed the request:
+
+        [front] WARNING: model 'qwen38cyber' is pinned to 'llamasrv_fork' but no
+        engine named/backed 'llamasrv_fork' is declared; failing the request
+        (the pin is a hard constraint).
+
+    A 503 on a model the engine had already claimed. Normalising in two of the
+    three places is the same as not normalising at all."""
+    from codai.frontproxy.registry import Engine, EngineRegistry
+    from codai.frontproxy.router import pick_engine
+    reg = EngineRegistry()
+    e = Engine(id=0, gpu=None, port=1, name="llamampere", backend="llamampere",
+               primary=True, capabilities={"gguf"})
+    reg.add(e)
+    reg.update_state(0, healthy=True, loaded_models=["qwen38cyber"])
+    assert pick_engine(reg, "/v1/chat/completions", "POST", "qwen38cyber",
+                       "gguf", pinned="llamasrv_fork") is e
+    assert pick_engine(reg, "/v1/chat/completions", "POST", "qwen38cyber",
+                       "gguf", pinned="llamampere") is e
+
+
+def test_a_pin_naming_nothing_still_fails():
+    """The normaliser must not become a way for any pin to match something."""
+    from codai.frontproxy.registry import Engine, EngineRegistry
+    from codai.frontproxy.router import pick_engine
+    reg = EngineRegistry()
+    e = Engine(id=0, gpu=None, port=1, name="llamampere", backend="llamampere",
+               primary=True, capabilities={"gguf"})
+    reg.add(e)
+    reg.update_state(0, healthy=True, loaded_models=["qwen38cyber"])
+    assert pick_engine(reg, "/v1/chat/completions", "POST", "qwen38cyber",
+                       "gguf", pinned="no_such_engine") is None
