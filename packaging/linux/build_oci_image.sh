@@ -311,10 +311,10 @@ SAGEATTENTION_ARCH="${SAGEATTENTION_ARCH:-8.6}"
 # runtime image has no CUDA toolchain, so this is the only place it can be
 # compiled for a published image. ARCHS is baked SASS and is NOT gated at
 # runtime -- override it when targeting a card other than 8.6 (sm_86).
-BUILD_LLAMASRV_FORK="${BUILD_LLAMASRV_FORK:-1}"
-LLAMASRV_FORK_REPO="${LLAMASRV_FORK_REPO:-https://github.com/JakeATX/llamAmpere}"
-LLAMASRV_FORK_REF="${LLAMASRV_FORK_REF:-v0.6.4}"
-LLAMASRV_FORK_ARCHS="${LLAMASRV_FORK_ARCHS:-86}"
+BUILD_LLAMAMPERE="${BUILD_LLAMAMPERE:-1}"
+LLAMAMPERE_REPO="${LLAMAMPERE_REPO:-https://github.com/JakeATX/llamAmpere}"
+LLAMAMPERE_REF="${LLAMAMPERE_REF:-v0.6.4}"
+LLAMAMPERE_ARCHS="${LLAMAMPERE_ARCHS:-86}"
 
 write_build_manifest() {
   local mode="$1"
@@ -767,10 +767,10 @@ else
     --build-arg BUILD_SAGEATTENTION="$BUILD_SAGEATTENTION" \
     --build-arg SAGEATTENTION_REF="$SAGEATTENTION_REF" \
     --build-arg SAGEATTENTION_ARCH="$SAGEATTENTION_ARCH" \
-    --build-arg BUILD_LLAMASRV_FORK="$BUILD_LLAMASRV_FORK" \
-    --build-arg LLAMASRV_FORK_REPO="$LLAMASRV_FORK_REPO" \
-    --build-arg LLAMASRV_FORK_REF="$LLAMASRV_FORK_REF" \
-    --build-arg LLAMASRV_FORK_ARCHS="$LLAMASRV_FORK_ARCHS" \
+    --build-arg BUILD_LLAMAMPERE="$BUILD_LLAMAMPERE" \
+    --build-arg LLAMAMPERE_REPO="$LLAMAMPERE_REPO" \
+    --build-arg LLAMAMPERE_REF="$LLAMAMPERE_REF" \
+    --build-arg LLAMAMPERE_ARCHS="$LLAMAMPERE_ARCHS" \
     -t "$IMAGE_TAG" \
     "$ROOT_DIR"
 fi

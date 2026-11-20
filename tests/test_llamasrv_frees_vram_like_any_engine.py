@@ -20,7 +20,7 @@ import pytest
 
 import codai.api.llamasrv_worker as worker
 from codai.backends.llamasrv import LlamaSrvBackend
-from codai.config import LlamaSrvConfig, LlamaSrvForkConfig
+from codai.config import LlamaSrvConfig, LlamAmpereConfig
 
 
 class FakeProc:
@@ -73,8 +73,8 @@ def test_the_manager_evicting_a_model_stops_its_server(monkeypatch):
     manager knows this model lives in another process."""
     stopped = []
     monkeypatch.setattr(worker, "stop_service", lambda k: stopped.append(k) or True)
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
-    be._svc_key = "llamasrv_fork::/AI/model.gguf"
+    be = LlamaSrvBackend(LlamAmpereConfig())
+    be._svc_key = "llamampere::/AI/model.gguf"
 
     class Wrapper:          # what multi_model_manager holds and _evict_one pops
         def __init__(self, backend): self.backend = backend
@@ -84,7 +84,7 @@ def test_the_manager_evicting_a_model_stops_its_server(monkeypatch):
                 self.backend = None
 
     Wrapper(be).cleanup()
-    assert stopped == ["llamasrv_fork::/AI/model.gguf"]
+    assert stopped == ["llamampere::/AI/model.gguf"]
 
 
 def test_cleanup_without_a_service_key_still_names_its_own_engine(monkeypatch):
@@ -93,12 +93,12 @@ def test_cleanup_without_a_service_key_still_names_its_own_engine(monkeypatch):
     seen = []
     monkeypatch.setattr(worker, "stop_service", lambda k: seen.append(k) or True)
     for cfg, want in ((LlamaSrvConfig(), "llamasrv::"),
-                      (LlamaSrvForkConfig(), "llamasrv_fork::")):
+                      (LlamAmpereConfig(), "llamampere::")):
         cfg.model_id = "mymodel"
         be = LlamaSrvBackend(cfg)
         be._svc_key = None
         be.cleanup()
-    assert seen == ["llamasrv::mymodel", "llamasrv_fork::mymodel"]
+    assert seen == ["llamasrv::mymodel", "llamampere::mymodel"]
 
 
 def test_evicting_one_engines_model_leaves_the_others_server_alone():
@@ -107,8 +107,8 @@ def test_evicting_one_engines_model_leaves_the_others_server_alone():
     comparison halfway through."""
     stock, fork = FakeProc(), FakeProc()
     _register("llamasrv::/AI/m.gguf", stock)
-    _register("llamasrv_fork::/AI/m.gguf", fork)
-    assert worker.stop_service("llamasrv_fork::/AI/m.gguf") is True
+    _register("llamampere::/AI/m.gguf", fork)
+    assert worker.stop_service("llamampere::/AI/m.gguf") is True
     assert fork.signals and not stock.signals
     assert "llamasrv::/AI/m.gguf" in worker._services
 
@@ -168,7 +168,7 @@ def test_a_clean_exit_still_stops_every_server():
     assert "_atexit.register(stop_all)" in src
     a, b = FakeProc(), FakeProc()
     _register("llamasrv::a", a)
-    _register("llamasrv_fork::b", b)
+    _register("llamampere::b", b)
     worker.stop_all()
     assert a.signals and b.signals
     assert worker._services == {}

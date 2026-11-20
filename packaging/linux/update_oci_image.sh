@@ -48,7 +48,7 @@ echo "== done in $(( $(date +%s) - t0 ))s: '$TAG' (base '$BASE_IMAGE' unchanged)
 
 # REBUILD_LLAMA=1: also rebuild llama-cpp-python (with the RPC backend),
 # rpc-server, and BOTH llama-server binaries (stock + fork, for the llamasrv and
-# llamasrv_fork engines) in a CUDA devel stage and lay them over '$TAG' — the
+# llamampere engines) in a CUDA devel stage and lay them over '$TAG' — the
 # part of the bundle the app overlay cannot refresh, because the runtime image
 # carries no CUDA toolchain (Dockerfile.update-llama).
 if [ "${REBUILD_LLAMA:-0}" = "1" ]; then
@@ -59,10 +59,10 @@ if [ "${REBUILD_LLAMA:-0}" = "1" ]; then
     --build-arg BASE_IMAGE="$TAG" \
     ${CUDA_BUILDER:+--build-arg CUDA_BUILDER="$CUDA_BUILDER"} \
     ${CUDA_ARCHS:+--build-arg CUDA_ARCHS="$CUDA_ARCHS"} \
-    ${BUILD_LLAMASRV_FORK:+--build-arg BUILD_LLAMASRV_FORK="$BUILD_LLAMASRV_FORK"} \
-    ${LLAMASRV_FORK_REPO:+--build-arg LLAMASRV_FORK_REPO="$LLAMASRV_FORK_REPO"} \
-    ${LLAMASRV_FORK_REF:+--build-arg LLAMASRV_FORK_REF="$LLAMASRV_FORK_REF"} \
-    ${LLAMASRV_FORK_ARCHS:+--build-arg LLAMASRV_FORK_ARCHS="$LLAMASRV_FORK_ARCHS"} \
+    ${BUILD_LLAMAMPERE:+--build-arg BUILD_LLAMAMPERE="$BUILD_LLAMAMPERE"} \
+    ${LLAMAMPERE_REPO:+--build-arg LLAMAMPERE_REPO="$LLAMAMPERE_REPO"} \
+    ${LLAMAMPERE_REF:+--build-arg LLAMAMPERE_REF="$LLAMAMPERE_REF"} \
+    ${LLAMAMPERE_ARCHS:+--build-arg LLAMAMPERE_ARCHS="$LLAMAMPERE_ARCHS"} \
     -t "$TAG" "$REPO_ROOT"
   echo "== llama runtime rebuilt in $(( $(date +%s) - t1 ))s =="
 fi

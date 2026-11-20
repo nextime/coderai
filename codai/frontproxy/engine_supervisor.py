@@ -172,10 +172,10 @@ class EngineSupervisor:
             kt = getattr(self.config, "ktransformers", None)
             vllm = getattr(self.config, "vllm", None)
             llamasrv = getattr(self.config, "llamasrv", None)
-            llamasrv_fork = getattr(self.config, "llamasrv_fork", None)
+            llamampere = getattr(self.config, "llamampere", None)
             assignment = compute_assignment(engines, self.models_path,
                                             default_engine, ds4, colibri, k3, kt,
-                                            vllm, llamasrv, llamasrv_fork)
+                                            vllm, llamasrv, llamampere)
             for e in engines:
                 owned = assignment.get(e.name, [])
                 e.assigned_models = set(owned)   # the front's router enforces this
@@ -389,7 +389,7 @@ class EngineSupervisor:
         # can be measured rather than believed. Separate nodes also mean one can
         # be restarted (or crash) without touching the other's models.
         for _attr, _name in (("llamasrv", "llamasrv"),
-                             ("llamasrv_fork", "llamasrv_fork")):
+                             ("llamampere", "llamampere")):
             _cfg = getattr(self.config, _attr, None)
             if _cfg is None or not getattr(_cfg, "enabled", False) \
                     or not nvidia_gpus():
@@ -872,10 +872,10 @@ class EngineSupervisor:
                 kt = getattr(self.config, "ktransformers", None)
                 vllm = getattr(self.config, "vllm", None)
                 llamasrv = getattr(self.config, "llamasrv", None)
-                llamasrv_fork = getattr(self.config, "llamasrv_fork", None)
+                llamampere = getattr(self.config, "llamampere", None)
                 assignment = compute_assignment(real, self.models_path,
                                                 default_engine, ds4, colibri, k3, kt,
-                                                vllm, llamasrv, llamasrv_fork)
+                                                vllm, llamasrv, llamampere)
             except Exception as exc:
                 print(f"[front] live reassignment skipped: {exc}", flush=True)
                 assignment = {}

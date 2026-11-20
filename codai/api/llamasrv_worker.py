@@ -123,6 +123,32 @@ def bin_env_var(cfg) -> str:
     return f"CODERAI_{engine_key(cfg).upper()}_BIN"
 
 
+def bin_env_vars(cfg) -> tuple:
+    """Every env var that may name this engine's prebuilt binary, best first.
+
+    An engine that was renamed keeps answering to its old variable: the name is
+    derived from the engine key, so a rename silently stops an IMAGE from being
+    found -- the pod would try to build the fork from source at runtime, in a
+    runtime image with no CUDA toolchain, and fail long after the rename looked
+    successful everywhere else.
+    """
+    names = [bin_env_var(cfg)]
+    for old in getattr(cfg, "LEGACY_ENGINE_KEYS", ()) or ():
+        names.append(f"CODERAI_{str(old).upper()}_BIN")
+    return tuple(names)
+
+
+def _env_bin_for(cfg) -> str:
+    """The prebuilt binary this engine was given, from any of its env vars."""
+    if cfg is None:
+        return ""
+    for var in bin_env_vars(cfg):
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def _server_bin(install_dir: Path, cfg=None) -> Path:
     """Where the binary is.
 
@@ -132,7 +158,7 @@ def _server_bin(install_dir: Path, cfg=None) -> Path:
     path from a tree slug the image's build args chose. With it set, nothing is
     ever fetched or built on the pod.
     """
-    env = (os.environ.get(bin_env_var(cfg)) or "").strip() if cfg is not None else ""
+    env = _env_bin_for(cfg)
     if not env:
         # Back-compat: the single-engine variable, which named the stock server.
         env = (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip() \
@@ -354,7 +380,7 @@ def ensure_built(cfg) -> Path:
     if binary.is_file():
         _log_prebuilt_tree(binary, cfg)
         return binary
-    env_bin = (os.environ.get(bin_env_var(cfg)) or "").strip() or (
+    env_bin = _env_bin_for(cfg) or (
         (os.environ.get("CODERAI_LLAMASRV_BIN") or "").strip()
         if engine_key(cfg) == "llamasrv" else "")
     if env_bin:
@@ -455,7 +481,7 @@ def _health_ok(url: str, key: str = "") -> bool:
 def engine_key(cfg) -> str:
     """Which llama-server engine this config object configures.
 
-    ``llamasrv`` (stock llama.cpp) and ``llamasrv_fork`` are separate engines
+    ``llamasrv`` (stock llama.cpp) and ``llamampere`` are separate engines
     sharing this worker, so everything keyed per running server has to be keyed
     per engine as well."""
     return getattr(cfg, "ENGINE_KEY", "llamasrv") or "llamasrv"

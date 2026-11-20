@@ -255,7 +255,7 @@ server competes for the card on equal terms with a diffusers pipeline or a vLLM 
 
 ## Two engines: stock and a fork
 
-`llamasrv` runs **stock** llama.cpp's `llama-server`. `llamasrv_fork` runs the same server
+`llamasrv` runs **stock** llama.cpp's `llama-server`. `llamampere` runs the same server
 built from a **fork**. They are separate engines, each with its own enable flag, build
 directory, server processes and engine node.
 
@@ -269,7 +269,7 @@ question nobody has.
 // config.json
 {
   "llamasrv":      { "enabled": true, "tree": "bindings" },
-  "llamasrv_fork": { "enabled": true, "tree": "repo",
+  "llamampere": { "enabled": true, "tree": "repo",
                      "repo_url": "https://github.com/JakeATX/llamAmpere",
                      "git_ref": "v0.6.4", "cuda_architectures": "86" }
 }
@@ -277,11 +277,11 @@ question nobody has.
 ```json
 // models.json — the same weights, one on each engine
 { "alias": "coder-stock", "path": "/AI/x.gguf", "backend": "llamasrv" }
-{ "alias": "coder-fork",  "path": "/AI/x.gguf", "backend": "llamasrv_fork" }
+{ "alias": "coder-fork",  "path": "/AI/x.gguf", "backend": "llamampere" }
 ```
 
 A model refines its engine with a block named after that engine — `llamasrv` or
-`llamasrv_fork` — so an override written for the fork cannot rewrite the stock engine's
+`llamampere` — so an override written for the fork cannot rewrite the stock engine's
 launch. The fork's defaults point at llamAmpere, which targets Ampere; its
 `cuda_architectures` deliberately does **not** default to "this host's cards", because
 building a tuned tree for hardware its author never tested yields plausible output rather
@@ -302,10 +302,10 @@ So the image bakes **one binary per engine**:
 | engine | path in the image | built from |
 |---|---|---|
 | `llamasrv` | `/opt/coderai/llamasrv/bin/llama-server` | the llama.cpp vendored in the installed `llama-cpp-python` — the same tree as `rpc-server`, so the server, the RPC server and the in-process path are one llama.cpp |
-| `llamasrv_fork` | `/opt/coderai/llamasrv-fork/bin/llama-server` | `LLAMASRV_FORK_REPO` at `LLAMASRV_FORK_REF` |
+| `llamampere` | `/opt/coderai/llamasrv-fork/bin/llama-server` | `LLAMAMPERE_REPO` at `LLAMAMPERE_REF` |
 
 Each has a `BUILD_INFO` beside it naming the repo, ref and architectures. The launcher
-exports `CODERAI_LLAMASRV_BIN` and `CODERAI_LLAMASRV_FORK_BIN` for those paths when the
+exports `CODERAI_LLAMASRV_BIN` and `CODERAI_LLAMAMPERE_BIN` for those paths when the
 files are there, and exports nothing for one that is absent — so an engine without a binary
 reports itself unavailable instead of pointing at a file that does not exist. One variable
 for both engines would have served whichever binary was baked last to every pinned model.
@@ -318,17 +318,17 @@ the app overlay cannot refresh.
 
 | build arg | default | meaning |
 |---|---|---|
-| `BUILD_LLAMASRV_FORK` | `1` | compile the fork at all |
-| `LLAMASRV_FORK_REPO` | `https://github.com/JakeATX/llamAmpere` | which fork |
-| `LLAMASRV_FORK_REF` | `v0.6.4` | the pinned tag — never a branch |
-| `LLAMASRV_FORK_ARCHS` | `86` | baked SASS targets |
+| `BUILD_LLAMAMPERE` | `1` | compile the fork at all |
+| `LLAMAMPERE_REPO` | `https://github.com/JakeATX/llamAmpere` | which fork |
+| `LLAMAMPERE_REF` | `v0.6.4` | the pinned tag — never a branch |
+| `LLAMAMPERE_ARCHS` | `86` | baked SASS targets |
 
 Two things about a baked binary are worth being blunt about.
 
 **The architecture is not gated.** `require_matching_arch` guards a *build*, and with a
 prebuilt binary there is no build to guard. An image built for `86` and run on another card
 gets "no kernel image is available" from the CUDA runtime. Targeting other hardware means
-rebuilding with your own `LLAMASRV_FORK_ARCHS`, not expecting a fallback.
+rebuilding with your own `LLAMAMPERE_ARCHS`, not expecting a fallback.
 
 **The `tree` / `repo_url` / `git_ref` settings are then not what is serving.** They describe
 a build that did not happen on this machine, and nothing can verify that a prebuilt binary

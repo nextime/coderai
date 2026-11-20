@@ -112,8 +112,8 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
                         vllm_enabled: bool = False,
                         llamasrv_model_id: Optional[str] = None,
                         llamasrv_enabled: bool = False,
-                        llamasrv_fork_model_id: Optional[str] = None,
-                        llamasrv_fork_enabled: bool = False) -> Optional[str]:
+                        llamampere_model_id: Optional[str] = None,
+                        llamampere_enabled: bool = False) -> Optional[str]:
     """The capability an engine must have to serve this request.
 
     * ``whisper``      — whisper.cpp STT (transcription endpoint or a
@@ -124,7 +124,7 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
     * ``kt``           — many families via ktransformers/SGLang. CPU+GPU.
     * ``gguf``         — llama.cpp model, in-process through llama-cpp-python.
                          Runs on CUDA or Vulkan.
-    * ``llamasrv_fork`` — the same, from a FORK of llama.cpp: a second engine so
+    * ``llamampere`` — the same, from a FORK of llama.cpp: a second engine so
                          stock and fork can serve at once and be compared.
     * ``llamasrv``     — a GGUF served by a managed ``llama-server`` subprocess
                          instead of in-process. Pin-only: it serves the SAME
@@ -142,8 +142,16 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
             or (backend or "") == "whisper-server":
         return "whisper"
     # 1. Explicit engine-backend pin wins (authoritative), like the manager resolver.
-    b = (backend or "").lower()
-    if b in ("colibri", "ds4", "k3", "kt", "vllm", "llamasrv", "llamasrv_fork",
+    # Through the same alias table the manager's resolver uses, so a models.json
+    # entry pinned to an engine's former name routes here exactly as it routes
+    # there. Two independent spellings-to-engine mappings is how the front and
+    # the manager come to disagree about who serves a model.
+    try:
+        from codai.models.manager import normalise_engine_key as _norm
+        b = _norm(backend)
+    except Exception:
+        b = (backend or "").strip().lower()
+    if b in ("colibri", "ds4", "k3", "kt", "vllm", "llamasrv", "llamampere",
              "runpod"):
         return b
     m = (model or "").lower()
@@ -153,8 +161,8 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
         return bool(mid) and (m == mid or m.split("/")[-1] == mid)
 
     # 2. An enabled engine's model_id alias.
-    if llamasrv_fork_enabled and _alias(llamasrv_fork_model_id):
-        return "llamasrv_fork"
+    if llamampere_enabled and _alias(llamampere_model_id):
+        return "llamampere"
     if llamasrv_enabled and _alias(llamasrv_model_id):
         return "llamasrv"
     if vllm_enabled and _alias(vllm_model_id):

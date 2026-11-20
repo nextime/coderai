@@ -4306,7 +4306,7 @@ def build_settings_dict(c, gpu_cards):
         # _engine_block): a knob the UI cannot READ looks exactly
         # like one that did not save.
         "llamasrv": _engine_block(c.llamasrv),
-        "llamasrv_fork": _engine_block(c.llamasrv_fork),
+        "llamampere": _engine_block(c.llamampere),
         "vllm": {
             "enabled": c.vllm.enabled,
             "service_url": c.vllm.service_url,
@@ -5061,7 +5061,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 pass
         if lc.attention not in ("xformers", "flash", "sdpa"):
             lc.attention = "xformers"
-    for _ekey, v in (("llamasrv", c.llamasrv), ("llamasrv_fork", c.llamasrv_fork)):
+    for _ekey, v in (("llamasrv", c.llamasrv), ("llamampere", c.llamampere)):
       if _ekey in data:
         d = data[_ekey]
         v.enabled = bool(d.get("enabled", v.enabled))

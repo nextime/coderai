@@ -39,11 +39,25 @@ export LD_LIBRARY_PATH="$LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [ -z "${CODERAI_LLAMASRV_BIN:-}" ] && [ -x /opt/coderai/llamasrv/bin/llama-server ]; then
   export CODERAI_LLAMASRV_BIN=/opt/coderai/llamasrv/bin/llama-server
 fi
-# The fork is a SECOND engine with its own binary and its own variable: one
+# llamAmpere is a SECOND engine with its own binary and its own variable: one
 # variable for both would serve whichever was baked last to every pinned model.
-if [ -z "${CODERAI_LLAMASRV_FORK_BIN:-}" ] && [ -x /opt/coderai/llamasrv-fork/bin/llama-server ]; then
-  export CODERAI_LLAMASRV_FORK_BIN=/opt/coderai/llamasrv-fork/bin/llama-server
+#
+# Both the current path and the one this engine used before it was named are
+# probed, and both variables are exported for whichever is found: a launcher
+# and the image it runs are upgraded together, but an image layer is not always
+# rebuilt in the same step as the launcher script, and either half missing the
+# binary means the engine quietly tries to BUILD a fork at runtime -- in a
+# runtime image with no CUDA toolchain.
+_llamampere_bin=""
+for _c in /opt/coderai/llamampere/bin/llama-server \
+          /opt/coderai/llamasrv-fork/bin/llama-server; do
+  [ -x "$_c" ] && { _llamampere_bin="$_c"; break; }
+done
+if [ -n "$_llamampere_bin" ]; then
+  [ -z "${CODERAI_LLAMAMPERE_BIN:-}" ] && export CODERAI_LLAMAMPERE_BIN="$_llamampere_bin"
+  [ -z "${CODERAI_LLAMASRV_FORK_BIN:-}" ] && export CODERAI_LLAMASRV_FORK_BIN="$_llamampere_bin"
 fi
+unset _llamampere_bin _c
 
 mkdir -p "$CODERAI_CONFIG_DIR/coderai" "$CODERAI_MODELS_DIR/coderai" "$CODERAI_CACHE_DIR/coderai"
 CONFIG_DIR="$CODERAI_CONFIG_DIR/coderai"

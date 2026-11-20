@@ -55,7 +55,7 @@ def _route_key(entry):
 
 
 def _required_cap(entry, ds4_cfg, colibri_cfg=None, k3_cfg=None, kt_cfg=None,
-                  vllm_cfg=None, llamasrv_cfg=None, llamasrv_fork_cfg=None):
+                  vllm_cfg=None, llamasrv_cfg=None, llamampere_cfg=None):
     from codai.frontproxy.router import required_capability
     path = _entry_path(entry) or ""
     backend = entry.get("backend") if isinstance(entry, dict) else None
@@ -73,15 +73,15 @@ def _required_cap(entry, ds4_cfg, colibri_cfg=None, k3_cfg=None, kt_cfg=None,
         vllm_enabled=bool(getattr(vllm_cfg, "enabled", False)) if vllm_cfg else False,
         llamasrv_model_id=getattr(llamasrv_cfg, "model_id", None) if llamasrv_cfg else None,
         llamasrv_enabled=bool(getattr(llamasrv_cfg, "enabled", False)) if llamasrv_cfg else False,
-        llamasrv_fork_model_id=(getattr(llamasrv_fork_cfg, "model_id", None)
-                                if llamasrv_fork_cfg else None),
-        llamasrv_fork_enabled=(bool(getattr(llamasrv_fork_cfg, "enabled", False))
-                               if llamasrv_fork_cfg else False))
+        llamampere_model_id=(getattr(llamampere_cfg, "model_id", None)
+                                if llamampere_cfg else None),
+        llamampere_enabled=(bool(getattr(llamampere_cfg, "enabled", False))
+                               if llamampere_cfg else False))
 
 
 def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
                        colibri_cfg=None, k3_cfg=None, kt_cfg=None, vllm_cfg=None,
-                       llamasrv_cfg=None, llamasrv_fork_cfg=None):
+                       llamasrv_cfg=None, llamampere_cfg=None):
     """Return {engine_name: [model_identifiers]} — each model owned by one engine."""
     assignment = {e.name: [] for e in engines}
     if not engines or not models_path:
@@ -102,13 +102,22 @@ def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
             if not ident or ident in seen:
                 continue
             cap = _required_cap(entry, ds4_cfg, colibri_cfg, k3_cfg, kt_cfg,
-                                vllm_cfg, llamasrv_cfg, llamasrv_fork_cfg)
+                                vllm_cfg, llamasrv_cfg, llamampere_cfg)
             candidates = [e for e in engines if e.can_serve(cap)]
             if not candidates:
                 continue   # nothing can run it — leave unassigned
 
             owner = None
+            # Normalised, so an entry naming an engine by its former key is
+            # still assigned to it rather than falling through to the default
+            # engine or the round-robin -- which would serve the model, on the
+            # wrong engine, with no error.
             pin = ((entry.get("engine") if isinstance(entry, dict) else "") or "").strip().lower()
+            try:
+                from codai.models.manager import normalise_engine_key as _norm
+                pin = _norm(pin)
+            except Exception:
+                pass
             if pin:
                 owner = next((e for e in candidates
                               if e.name.lower() == pin or (e.backend or "").lower() == pin), None)

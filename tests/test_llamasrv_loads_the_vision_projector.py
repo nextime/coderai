@@ -18,7 +18,7 @@ import pytest
 
 import codai.api.llamasrv_worker as worker
 from codai.backends.llamasrv import LlamaSrvBackend
-from codai.config import LlamaSrvConfig, LlamaSrvForkConfig
+from codai.config import LlamaSrvConfig, LlamAmpereConfig
 
 
 def _argv(cfg, mmproj=None):
@@ -86,19 +86,19 @@ def catalogue(monkeypatch, tmp_path):
 
 
 def test_the_projector_comes_from_the_models_entry(catalogue):
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
+    be = LlamaSrvBackend(LlamAmpereConfig())
     assert be._resolve_mmproj("seer") == os.path.abspath(catalogue["proj"])
 
 
 def test_a_text_model_resolves_no_projector(catalogue):
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
+    be = LlamaSrvBackend(LlamAmpereConfig())
     assert be._resolve_mmproj("blind") is None
 
 
 def test_a_declared_but_missing_projector_is_skipped_not_passed(catalogue, capsys):
     """llama-server refuses to start when --mmproj names a file that is not
     there. Serving text is a degradation; refusing to serve is an outage."""
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
+    be = LlamaSrvBackend(LlamAmpereConfig())
     assert be._resolve_mmproj("promised") is None
     out = capsys.readouterr().out
     assert "declared but not on disk" in out
@@ -106,14 +106,14 @@ def test_a_declared_but_missing_projector_is_skipped_not_passed(catalogue, capsy
 
 
 def test_an_unknown_model_resolves_nothing(catalogue):
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
+    be = LlamaSrvBackend(LlamAmpereConfig())
     assert be._resolve_mmproj("nobody") is None
 
 
 def test_the_gguf_and_the_projector_come_from_the_SAME_entry(catalogue):
     """Two independent lookups could match different entries -- one model's
     weights with another's tower, which loads and then answers nonsense."""
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
+    be = LlamaSrvBackend(LlamAmpereConfig())
     entry = be._entry_for("seer")
     assert entry is not None
     assert be._resolve_gguf("seer") == os.path.abspath(catalogue["gguf"])
@@ -133,8 +133,8 @@ def test_loading_a_vision_model_hands_the_projector_to_the_launch(catalogue, mon
 
     monkeypatch.setattr(worker, "ensure_service", _fake_ensure)
     monkeypatch.setattr(worker, "resolve_service_key",
-                        lambda cfg, path=None: (path, "llamasrv_fork::k"))
-    be = LlamaSrvBackend(LlamaSrvForkConfig())
+                        lambda cfg, path=None: (path, "llamampere::k"))
+    be = LlamaSrvBackend(LlamAmpereConfig())
     be.load_model("seer")
     assert seen.get("mmproj") == os.path.abspath(catalogue["proj"])
 

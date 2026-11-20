@@ -1000,78 +1000,78 @@
   </div>
 </div>
 
-<!-- llama-server from a FORK: a second engine, so stock and fork can be compared -->
+<!-- llamAmpere: a second llama-server engine, so stock and a fork can be compared -->
 <div class="card">
-  <div class="card-title">llama-server from a fork (second engine)</div>
-  <p class="form-hint" style="margin-bottom:.6rem">A <b>second</b> managed <code>llama-server</code>, built from a <b>fork</b> of llama.cpp &mdash; a separate engine rather than a setting on the one above, so stock llama.cpp and a fork can serve <em>at the same time</em> and be compared on the same card with the same weights. (One <code>tree</code> switch could only answer "which one is everything using".) Each engine keeps its own build directory and its own server processes. A model reaches this one only by a <code>backend: llamasrv_fork</code> pin or the model id below, and refines it with its own <code>llamasrv_fork</code> block. The default points at <b>llamAmpere</b>, which targets Ampere (sm_86) &mdash; the architecture list is deliberately not "this host's cards": building a tuned tree for hardware its author never tested produces plausible output rather than an error.</p>
+  <div class="card-title">llamAmpere (second llama-server engine)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">A <b>second</b> managed <code>llama-server</code>, built from a <b>fork</b> of llama.cpp &mdash; a separate engine rather than a setting on the one above, so stock llama.cpp and a fork can serve <em>at the same time</em> and be compared on the same card with the same weights. (One <code>tree</code> switch could only answer "which one is everything using".) Each engine keeps its own build directory and its own server processes. A model reaches this one only by a <code>backend: llamampere</code> pin or the model id below, and refines it with its own <code>llamampere</code> block. The default points at <b>llamAmpere</b>, which targets Ampere (sm_86) &mdash; the architecture list is deliberately not "this host's cards": building a tuned tree for hardware its author never tested produces plausible output rather than an error.</p>
   <div class="form-row">
     <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
-      <input type="checkbox" id="s-llamasrv-fork-enabled" onchange="toggleLlamasrvForkFields()">
+      <input type="checkbox" id="s-llamampere-enabled" onchange="toggleLlamasrvForkFields()">
       <span style="font-size:13px;font-weight:500">Enable llama-server</span>
     </label>
   </div>
-  <div id="llamasrv-fork-fields" style="display:none">
+  <div id="llamampere-fields" style="display:none">
     <div class="form-group">
       <label class="form-label">Model id / alias</label>
-      <input type="text" id="s-llamasrv-fork-model-id" class="form-input" placeholder="(blank = per-model pin only)">
-      <span class="form-hint">Leave blank and tag models in the <b>Models</b> list with <code>backend: llamasrv_fork</code>. Each pinned GGUF gets its own server process.</span>
+      <input type="text" id="s-llamampere-model-id" class="form-input" placeholder="(blank = per-model pin only)">
+      <span class="form-hint">Leave blank and tag models in the <b>Models</b> list with <code>backend: llamampere</code>. Each pinned GGUF gets its own server process.</span>
     </div>
     <div class="form-group">
       <label class="form-label">Which llama.cpp to build</label>
-      <select id="s-llamasrv-fork-tree" class="form-input" onchange="toggleLlamasrvForkTree()">
+      <select id="s-llamampere-tree" class="form-input" onchange="toggleLlamasrvForkTree()">
         <option value="bindings">The tree llama-cpp-python was built from (recommended)</option>
         <option value="repo">A git repository (a fork)</option>
       </select>
       <span class="form-hint"><b>bindings</b> builds the very llama.cpp the in-process path already runs, so the server and the library are one engine with two front ends and a GGUF behaves the same through either &mdash; the only difference is batching. Pick a repository for a tuned fork.</span>
     </div>
-    <div id="llamasrv-fork-repo-fields" style="display:none">
+    <div id="llamampere-repo-fields" style="display:none">
       <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
-        <div class="form-group" style="flex:2;min-width:240px"><label class="form-label">Repository URL</label><input type="text" id="s-llamasrv-fork-repo-url" class="form-input" placeholder="https://github.com/owner/fork"></div>
-        <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Git ref (pin it)</label><input type="text" id="s-llamasrv-fork-git-ref" class="form-input" placeholder="v0.0.0 or a full SHA"></div>
+        <div class="form-group" style="flex:2;min-width:240px"><label class="form-label">Repository URL</label><input type="text" id="s-llamampere-repo-url" class="form-input" placeholder="https://github.com/owner/fork"></div>
+        <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Git ref (pin it)</label><input type="text" id="s-llamampere-git-ref" class="form-input" placeholder="v0.0.0 or a full SHA"></div>
       </div>
       <span class="form-hint">Pin a tag or a SHA. A fork's branch moves under you, and the build that breaks next month will look like a broken fork rather than a moved ref &mdash; an empty ref is accepted but warns in the log.</span>
     </div>
     <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
-      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">CUDA architectures</label><input type="text" id="s-llamasrv-fork-arch" class="form-input" placeholder="blank = this host's cards"></div>
-      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Context (-c)</label><input type="number" id="s-llamasrv-fork-ctx" class="form-input" min="0" placeholder="0 = the model's own"></div>
-      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Slots (-np)</label><input type="number" id="s-llamasrv-fork-parallel" class="form-input" min="0" placeholder="0 = auto"></div>
-      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">GPU layers</label><input type="number" id="s-llamasrv-fork-ngl" class="form-input" placeholder="-1 = all"></div>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">CUDA architectures</label><input type="text" id="s-llamampere-arch" class="form-input" placeholder="blank = this host's cards"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Context (-c)</label><input type="number" id="s-llamampere-ctx" class="form-input" min="0" placeholder="0 = the model's own"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Slots (-np)</label><input type="number" id="s-llamampere-parallel" class="form-input" min="0" placeholder="0 = auto"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">GPU layers</label><input type="number" id="s-llamampere-ngl" class="form-input" placeholder="-1 = all"></div>
     </div>
     <div class="form-row">
       <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
-        <input type="checkbox" id="s-llamasrv-fork-require-arch" checked>
+        <input type="checkbox" id="s-llamampere-require-arch" checked>
         <span>Refuse to build when no local card matches those architectures</span>
       </label>
       <span class="form-hint">Leave this on. A tree tuned for one architecture, built for another, does not fail cleanly &mdash; it can compile, load and answer with degraded output.</span>
     </div>
     <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
       <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Flash attention</label>
-        <select id="s-llamasrv-fork-fa" class="form-input"><option value="on">on</option><option value="off">off</option><option value="auto">auto</option></select></div>
-      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">KV cache K (-ctk)</label><input type="text" id="s-llamasrv-fork-ctk" class="form-input" placeholder="default"></div>
-      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">KV cache V (-ctv)</label><input type="text" id="s-llamasrv-fork-ctv" class="form-input" placeholder="default"></div>
-      <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Port</label><input type="number" id="s-llamasrv-fork-port" class="form-input" min="0" placeholder="0 = auto"></div>
+        <select id="s-llamampere-fa" class="form-input"><option value="on">on</option><option value="off">off</option><option value="auto">auto</option></select></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">KV cache K (-ctk)</label><input type="text" id="s-llamampere-ctk" class="form-input" placeholder="default"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">KV cache V (-ctv)</label><input type="text" id="s-llamampere-ctv" class="form-input" placeholder="default"></div>
+      <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Port</label><input type="number" id="s-llamampere-port" class="form-input" min="0" placeholder="0 = auto"></div>
     </div>
     <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
-      <div class="form-group" style="flex:2;min-width:180px"><label class="form-label">Speculative type</label><input type="text" id="s-llamasrv-fork-spec-type" class="form-input" placeholder="blank = the tree's default"></div>
-      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Max draft tokens</label><input type="number" id="s-llamasrv-fork-spec-n-max" class="form-input" min="0" placeholder="0 = default"></div>
+      <div class="form-group" style="flex:2;min-width:180px"><label class="form-label">Speculative type</label><input type="text" id="s-llamampere-spec-type" class="form-input" placeholder="blank = the tree's default"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Max draft tokens</label><input type="number" id="s-llamampere-spec-n-max" class="form-input" min="0" placeholder="0 = default"></div>
     </div>
     <div class="form-group">
       <label class="form-label">Already running elsewhere (service URL)</label>
-      <input type="text" id="s-llamasrv-fork-service-url" class="form-input" placeholder="blank = build and run it here">
+      <input type="text" id="s-llamampere-service-url" class="form-input" placeholder="blank = build and run it here">
       <span class="form-hint">Point this at a <code>llama-server</code> on another host, in a container or on a rented pod and nothing is built or launched here. Set the API key below to the bearer that server requires.</span>
     </div>
     <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
-      <div class="form-group" style="flex:1;min-width:200px"><label class="form-label">Extra flags</label><input type="text" id="s-llamasrv-fork-extra-args" class="form-input" placeholder="--jinja --no-context-shift"></div>
-      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Extra cmake flags</label><input type="text" id="s-llamasrv-fork-cmake" class="form-input" placeholder="-DGGML_CUDA_FA_ALL_QUANTS=ON"></div>
+      <div class="form-group" style="flex:1;min-width:200px"><label class="form-label">Extra flags</label><input type="text" id="s-llamampere-extra-args" class="form-input" placeholder="--jinja --no-context-shift"></div>
+      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Extra cmake flags</label><input type="text" id="s-llamampere-cmake" class="form-input" placeholder="-DGGML_CUDA_FA_ALL_QUANTS=ON"></div>
     </div>
     <div class="form-row" style="display:flex;gap:.6rem;flex-wrap:wrap">
-      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Extra environment</label><input type="text" id="s-llamasrv-fork-extra-env" class="form-input" placeholder="KEY=VALUE KEY2=VALUE2"></div>
-      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">API key</label><input type="text" id="s-llamasrv-fork-api-key" class="form-input" placeholder="blank = a new one each launch"></div>
-      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Load timeout (s)</label><input type="number" id="s-llamasrv-fork-ready" class="form-input" min="60" placeholder="1800"></div>
+      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Extra environment</label><input type="text" id="s-llamampere-extra-env" class="form-input" placeholder="KEY=VALUE KEY2=VALUE2"></div>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">API key</label><input type="text" id="s-llamampere-api-key" class="form-input" placeholder="blank = a new one each launch"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Load timeout (s)</label><input type="number" id="s-llamampere-ready" class="form-input" min="60" placeholder="1800"></div>
     </div>
     <div class="form-row">
       <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
-        <input type="checkbox" id="s-llamasrv-fork-auto-build" checked>
+        <input type="checkbox" id="s-llamampere-auto-build" checked>
         <span>Build <code>llama-server</code> on first use if it is missing (needs cmake)</span>
       </label>
     </div>
@@ -1895,13 +1895,13 @@ function toggleVllmFields(){
     document.getElementById('s-vllm-enabled').checked ? 'block' : 'none';
 }
 function toggleLlamasrvForkFields(){
-  document.getElementById('llamasrv-fork-fields').style.display =
-    document.getElementById('s-llamasrv-fork-enabled').checked ? 'block' : 'none';
+  document.getElementById('llamampere-fields').style.display =
+    document.getElementById('s-llamampere-enabled').checked ? 'block' : 'none';
   toggleLlamasrvForkTree();
 }
 function toggleLlamasrvForkTree(){
-  document.getElementById('llamasrv-fork-repo-fields').style.display =
-    document.getElementById('s-llamasrv-fork-tree').value === 'repo' ? 'block' : 'none';
+  document.getElementById('llamampere-repo-fields').style.display =
+    document.getElementById('s-llamampere-tree').value === 'repo' ? 'block' : 'none';
 }
 function toggleLlamasrvFields(){
   document.getElementById('llamasrv-fields').style.display =
@@ -2494,12 +2494,12 @@ async function loadSettings(){
     // drift -- a field read for one and forgotten for the other looks exactly
     // like a setting that did not save.
     for (const [key, pfx] of [['llamasrv', 's-llamasrv-'],
-                              ['llamasrv_fork', 's-llamasrv-fork-']]) {
+                              ['llamampere', 's-llamampere-']]) {
       const v = d[key] || {};
       const g = (sfx) => document.getElementById(pfx + sfx);
       g('enabled').checked = !!v.enabled;
       g('model-id').value = v.model_id ?? '';
-      g('tree').value = v.tree || (key === 'llamasrv_fork' ? 'repo' : 'bindings');
+      g('tree').value = v.tree || (key === 'llamampere' ? 'repo' : 'bindings');
       g('repo-url').value = v.repo_url ?? '';
       g('git-ref').value = v.git_ref ?? '';
       g('arch').value = v.cuda_architectures ?? '';
@@ -2881,7 +2881,7 @@ async function saveSettings(silent){
       // Both llama-server engines, built the same way they are read.
       const out = {};
       for (const [key, pfx] of [['llamasrv', 's-llamasrv-'],
-                                ['llamasrv_fork', 's-llamasrv-fork-']]) {
+                                ['llamampere', 's-llamampere-']]) {
         const g = (sfx) => document.getElementById(pfx + sfx);
         const num = (sfx, dflt) => { const n = parseInt(g(sfx).value, 10);
                                      return Number.isNaN(n) ? dflt : n; };

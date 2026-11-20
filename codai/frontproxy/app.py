@@ -1521,7 +1521,7 @@ class FrontProxy:
         # configured `model_id` alias (rather than by an explicit backend pin)
         # resolved to no capability here and was left unassigned.
         lsrv = getattr(self.config, "llamasrv", None)
-        lsrv_fork = getattr(self.config, "llamasrv_fork", None)
+        lsrv_fork = getattr(self.config, "llamampere", None)
         info = self._model_info(model)
         cap = _router.required_capability(
             model, path=path,
@@ -1538,9 +1538,9 @@ class FrontProxy:
             vllm_enabled=bool(getattr(vllm, "enabled", False)) if vllm else False,
             llamasrv_model_id=getattr(lsrv, "model_id", None) if lsrv else None,
             llamasrv_enabled=bool(getattr(lsrv, "enabled", False)) if lsrv else False,
-            llamasrv_fork_model_id=(getattr(lsrv_fork, "model_id", None)
+            llamampere_model_id=(getattr(lsrv_fork, "model_id", None)
                                     if lsrv_fork else None),
-            llamasrv_fork_enabled=(bool(getattr(lsrv_fork, "enabled", False))
+            llamampere_enabled=(bool(getattr(lsrv_fork, "enabled", False))
                                    if lsrv_fork else False))
         # The name heuristic can't see that a bare alias (e.g. '…-q4_k_m', no
         # literal 'gguf') backs a .gguf file, so it falls through to

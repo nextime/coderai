@@ -64,16 +64,16 @@ RUN set -eux; \
     /wheels/rpc-server --help | head -3; \
     test -x /wheels/llamasrv/bin/llama-server
 
-# The FORK llama-server: the `llamasrv_fork` engine, a second engine so stock
+# The FORK llama-server: the `llamampere` engine, a second engine so stock
 # llama.cpp and a fork can serve at once and be compared rather than swapped.
 # Non-fatal, like SageAttention in the main build: a fork that moved or failed
 # must not cost the whole overlay. Narrower SASS than the wheel above on
 # purpose -- llamAmpere targets Ampere, and baking a tuned tree for a card its
 # author never tested yields plausible output instead of an error.
-ARG BUILD_LLAMASRV_FORK=1
-ARG LLAMASRV_FORK_REPO=https://github.com/JakeATX/llamAmpere
-ARG LLAMASRV_FORK_REF=v0.6.4
-ARG LLAMASRV_FORK_ARCHS=86
+ARG BUILD_LLAMAMPERE=1
+ARG LLAMAMPERE_REPO=https://github.com/JakeATX/llamAmpere
+ARG LLAMAMPERE_REF=v0.6.4
+ARG LLAMAMPERE_ARCHS=86
 # Static ggml, for the same reason rpc-server is built that way: ONE file is
 # copied into the image, so a shared build would leave libggml-cuda.so behind in
 # the builder and the baked binary would die at startup on a missing library.
@@ -86,23 +86,23 @@ ARG LLAMASRV_FORK_ARCHS=86
 # Measured here twice -- and with a non-fatal build both attempts read as "the
 # image built fine" while the engine quietly had no binary.
 RUN set -eux; \
-    if [ "${BUILD_LLAMASRV_FORK}" = "1" ]; then \
-      ( git clone --depth 1 --branch "${LLAMASRV_FORK_REF}" "${LLAMASRV_FORK_REPO}" /tmp/fork-src \
+    if [ "${BUILD_LLAMAMPERE}" = "1" ]; then \
+      ( git clone --depth 1 --branch "${LLAMAMPERE_REF}" "${LLAMAMPERE_REPO}" /tmp/fork-src \
         && cmake -S /tmp/fork-src -B /tmp/fork-build \
              -DCMAKE_BUILD_TYPE=Release \
              -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
              -DBUILD_SHARED_LIBS=OFF \
              -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON \
-             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${LLAMASRV_FORK_ARCHS}" \
+             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${LLAMAMPERE_ARCHS}" \
              -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
         && cmake --build /tmp/fork-build -j"$(nproc)" --target llama-server \
-        && mkdir -p /wheels/llamasrv-fork/bin \
-        && cp /tmp/fork-build/bin/llama-server /wheels/llamasrv-fork/bin/llama-server \
+        && mkdir -p /wheels/llamampere/bin \
+        && cp /tmp/fork-build/bin/llama-server /wheels/llamampere/bin/llama-server \
         && printf 'repo=%s\nref=%s\ncuda_architectures=%s\n' \
-             "${LLAMASRV_FORK_REPO}" "${LLAMASRV_FORK_REF}" "${LLAMASRV_FORK_ARCHS}" \
-             > /wheels/llamasrv-fork/BUILD_INFO \
+             "${LLAMAMPERE_REPO}" "${LLAMAMPERE_REF}" "${LLAMAMPERE_ARCHS}" \
+             > /wheels/llamampere/BUILD_INFO \
         && rm -rf /tmp/fork-src /tmp/fork-build ) \
-      || echo "WARNING: the fork llama-server was not built; llamasrv_fork unavailable"; \
+      || echo "WARNING: the fork llama-server was not built; llamampere unavailable"; \
     fi
 
 # -------------------------------------------------------------- final stage
@@ -114,16 +114,16 @@ RUN set -eux; \
     install -m 755 /tmp/llama-wheels/rpc-server /opt/coderai/python/bin/rpc-server; \
     # Both llama-server engines. The launcher points each engine at its own
     # binary and exports nothing for one that is absent, so a missing fork
-    # leaves llamasrv_fork unavailable rather than broken.
+    # leaves llamampere unavailable rather than broken.
     if [ -x /tmp/llama-wheels/llamasrv/bin/llama-server ]; then \
       mkdir -p /opt/coderai/llamasrv/bin; \
       install -m 755 /tmp/llama-wheels/llamasrv/bin/llama-server /opt/coderai/llamasrv/bin/llama-server; \
       cp -f /tmp/llama-wheels/llamasrv/BUILD_INFO /opt/coderai/llamasrv/BUILD_INFO 2>/dev/null || true; \
     fi; \
-    if [ -x /tmp/llama-wheels/llamasrv-fork/bin/llama-server ]; then \
-      mkdir -p /opt/coderai/llamasrv-fork/bin; \
-      install -m 755 /tmp/llama-wheels/llamasrv-fork/bin/llama-server /opt/coderai/llamasrv-fork/bin/llama-server; \
-      cp -f /tmp/llama-wheels/llamasrv-fork/BUILD_INFO /opt/coderai/llamasrv-fork/BUILD_INFO 2>/dev/null || true; \
+    if [ -x /tmp/llama-wheels/llamampere/bin/llama-server ]; then \
+      mkdir -p /opt/coderai/llamampere/bin; \
+      install -m 755 /tmp/llama-wheels/llamampere/bin/llama-server /opt/coderai/llamampere/bin/llama-server; \
+      cp -f /tmp/llama-wheels/llamampere/BUILD_INFO /opt/coderai/llamampere/BUILD_INFO 2>/dev/null || true; \
     fi; \
     rm -rf /tmp/llama-wheels; \
     # The engines run with LD_LIBRARY_PATH=/opt/coderai/local-libs FIRST, and

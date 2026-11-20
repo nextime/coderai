@@ -103,8 +103,8 @@ def get_active_llamasrv_config():
         pass
 
 
-def get_active_llamasrv_fork_config():
-    """Return the active LlamaSrvForkConfig (the FORK engine), or None.
+def get_active_llamampere_config():
+    """Return the active LlamAmpereConfig (the FORK engine), or None.
 
     A separate engine from ``llamasrv`` on purpose: both can serve at once, so a
     fork can be measured against stock llama.cpp on the same card instead of
@@ -112,7 +112,7 @@ def get_active_llamasrv_fork_config():
     try:
         from codai.admin.routes import config_manager
         if config_manager is not None and config_manager.config is not None:
-            return config_manager.config.llamasrv_fork
+            return config_manager.config.llamampere
     except Exception:
         pass
     return None
@@ -286,7 +286,7 @@ _EVICT_HEADROOM_FRACTION_KEY = "evict_headroom_fraction"
 _WAIT_IDLE_SAY_EVERY_S = 15.0
 
 _ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv",
-                    "llamasrv_fork", "runpod")
+                    "llamampere", "runpod")
 
 
 def _engine_config(engine: str):
@@ -298,7 +298,7 @@ def _engine_config(engine: str):
         "kt": get_active_ktransformers_config,
         "vllm": get_active_vllm_config,
         "llamasrv": get_active_llamasrv_config,
-        "llamasrv_fork": get_active_llamasrv_fork_config,
+        "llamampere": get_active_llamampere_config,
         "runpod": get_active_runpod_config,
     }.get(engine)
     return getter() if getter else None
@@ -431,10 +431,30 @@ def _model_entry_for(model_name: str):
     return None
 
 
+#: Engine keys that were renamed, old spelling -> current one. A models.json is
+#: written by hand and by the admin UI and then lives for years: an entry
+#: pinned to an engine that has since been renamed must keep being served, or
+#: the rename silently unpins it -- `resolve_engine_backend` would find no
+#: engine, the model would fall back to the ordinary in-process path, and the
+#: only symptom is that a model configured for one engine is quietly answered
+#: by another. Both spellings resolve; nothing has to be migrated.
+_ENGINE_KEY_ALIASES = {"llamasrv_fork": "llamampere"}
+
+
+def normalise_engine_key(key: str) -> str:
+    """An engine key as it is spelled TODAY, from whatever it was spelled as."""
+    k = str(key or "").strip().lower()
+    return _ENGINE_KEY_ALIASES.get(k, k)
+
+
 def _pinned_backend(model_name: str) -> str:
-    """The explicit ``backend`` pin on the model's entry, lowercased, or ''."""
+    """The explicit ``backend`` pin on the model's entry, lowercased, or ''.
+
+    Normalised through `normalise_engine_key`, so an entry pinned to an
+    engine's former name still reaches it.
+    """
     entry = _model_entry_for(model_name)
-    return str(entry.get("backend") or "").lower() if entry else ""
+    return normalise_engine_key(entry.get("backend")) if entry else ""
 
 
 def _engine_id_match(engine: str, model_name: str) -> bool:
@@ -511,10 +531,10 @@ def _llamasrv_name_claims(model_name: str) -> bool:
     return False
 
 
-def _llamasrv_fork_name_claims(model_name: str) -> bool:
+def _llamampere_name_claims(model_name: str) -> bool:
     """Same rule as the stock server, for the same reason: it can serve every
     GGUF, so enabling a fork must not quietly move the catalogue onto it.
-    Routes ONLY via ``backend: "llamasrv_fork"`` or its configured
+    Routes ONLY via ``backend: "llamampere"`` or its configured
     ``model_id``."""
     return False
 
@@ -532,7 +552,7 @@ _ENGINE_NAME_CLAIMS = {
     "kt": _kt_name_claims,
     "vllm": _vllm_name_claims,
     "llamasrv": _llamasrv_name_claims,
-    "llamasrv_fork": _llamasrv_fork_name_claims,
+    "llamampere": _llamampere_name_claims,
     "runpod": _runpod_name_claims,
 }
 
@@ -603,9 +623,9 @@ def llamasrv_should_handle(model_name: str) -> bool:
     return resolve_engine_backend(model_name) == "llamasrv"
 
 
-def llamasrv_fork_should_handle(model_name: str) -> bool:
+def llamampere_should_handle(model_name: str) -> bool:
     """True when the FORK llama-server is the resolved engine."""
-    return resolve_engine_backend(model_name) == "llamasrv_fork"
+    return resolve_engine_backend(model_name) == "llamampere"
 
 
 def runpod_should_handle(model_name: str) -> bool:
@@ -933,11 +953,11 @@ class ModelManager:
         # the server has — speculative decoding (the draft-and-verify loop is in
         # llama.cpp's common/, not in libllama) and real slots with continuous
         # batching. Pin-selected only, so the default GGUF path is untouched.
-        if llamasrv_fork_should_handle(model_name):
+        if llamampere_should_handle(model_name):
             from codai.backends.llamasrv import LlamaSrvBackend
             print(f"Routing '{model_name}' to a managed llama-server (fork)")
-            self.backend_type = "llamasrv_fork"
-            self.backend = LlamaSrvBackend(get_active_llamasrv_fork_config())
+            self.backend_type = "llamampere"
+            self.backend = LlamaSrvBackend(get_active_llamampere_config())
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return

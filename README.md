@@ -72,7 +72,7 @@ model can be served with far higher concurrency.
 | `kt` | [ktransformers](https://github.com/kvcache-ai/ktransformers) via SGLang | CPU+GPU heterogeneous MoE (DeepSeek / Kimi / Qwen / GLM / MiniMax) |
 | `vllm` | [vLLM](https://github.com/vllm-project/vllm) | continuous batching + paged KV for high aggregate throughput; runs in an isolated venv |
 | `llamasrv` | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s own `llama-server` | the **alternative front end for a GGUF**: speculative decoding and real slots (`-np`), which the in-process bindings cannot reach because the draft-and-verify loop lives in llama.cpp's `common/`. Pin-only; builds the bindings' own tree by default, or a pinned fork |
-| `llamasrv_fork` | the same `llama-server`, built from a **fork** of llama.cpp | a *second* engine, not a setting on the first: stock and fork serve at the same time, so a fork can be measured against stock llama.cpp on one card with the same weights instead of swapped in globally. Defaults to [llamAmpere](https://github.com/JakeATX/llamAmpere) (Ampere / sm_86). Pin-only, `backend: llamasrv_fork` |
+| `llamampere` | the same `llama-server`, built from a **fork** of llama.cpp | a *second* engine, not a setting on the first: stock and fork serve at the same time, so a fork can be measured against stock llama.cpp on one card with the same weights instead of swapped in globally. Defaults to [llamAmpere](https://github.com/JakeATX/llamAmpere) (Ampere / sm_86). Pin-only, `backend: llamampere` |
 | `runpod` | RunPod | a **remote rented GPU** — see below |
 | `host` | a machine you have | a capability image on **your own box** — always-on, or started by command |
 

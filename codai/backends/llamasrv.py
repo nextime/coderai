@@ -75,10 +75,21 @@ class LlamaSrvBackend(VllmBackend):
         # a model's `vllm` block refines the vLLM template: the tree to build, the
         # slot count, the KV cache types, the drafting flags.
         # Under the ENGINE's own key: a model pinned to the fork refines it with
-        # a `llamasrv_fork` block. One shared key would mean a per-model override
+        # a `llamampere` block. One shared key would mean a per-model override
         # written for the fork also rewrote the stock engine's launch.
+        # A block written under the engine's FORMER key is still that model's
+        # override. Dropping it would not fail: the launch would fall back to
+        # the engine-wide template and serve the model with another model's
+        # context size and cache types, which looks like a working server.
         _key = llamasrv_worker.engine_key(self._cfg)
         blk = model_block(model_name, _key) or {}
+        for _old in getattr(self._cfg, "LEGACY_ENGINE_KEYS", ()) or ():
+            if blk:
+                break
+            blk = model_block(model_name, _old) or {}
+            if blk:
+                print(f"[{_key}] {model_name!r}: per-model overrides read from "
+                      f"its former {_old!r} block", flush=True)
         if blk:
             self._cfg = apply(self._cfg, blk, _LLAMASRV_FIELDS, _key)
 

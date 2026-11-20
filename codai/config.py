@@ -1021,8 +1021,8 @@ class LlamaSrvConfig:
     A fork is NOT configured by flipping this object's ``tree``: that would move
     every pinned model at once and leave no way to serve one model on stock
     llama.cpp and another on a fork, which is the comparison anybody evaluating
-    a fork needs. The fork is a SECOND engine -- :class:`LlamaSrvForkConfig`,
-    engine key ``llamasrv_fork`` -- with its own enable flag, its own build
+    a fork needs. The fork is a SECOND engine -- :class:`LlamAmpereConfig`,
+    engine key ``llamampere`` -- with its own enable flag, its own build
     directory and its own server processes.
     """
 
@@ -1030,6 +1030,17 @@ class LlamaSrvConfig:
     #: written to config.json: it names the engine this object configures, and
     #: derives the env var that points at a prebuilt binary.
     ENGINE_KEY = "llamasrv"
+
+    #: What this engine is called where a human reads it. Same as the key here;
+    #: a subclass whose project spells its name differently overrides it.
+    ENGINE_LABEL = "llamasrv"
+
+    #: Keys this engine answered to before a rename. Empty for this one.
+    #: Deliberately UNannotated, like ENGINE_KEY above: an annotation makes it a
+    #: dataclass field, and then every instance is constructed with the base's
+    #: empty default -- shadowing the subclass's own list -- and the tuple is
+    #: written into config.json as if it were a setting.
+    LEGACY_ENGINE_KEYS = ()
 
     enabled: bool = False
     # Point this at a llama-server running somewhere else (another host, a
@@ -1085,6 +1096,30 @@ class LlamaSrvConfig:
     api_key: str = ""
     ready_timeout_s: int = 1800          # how long a cold load may take before we give up
 
+def _engine_block(config_data: dict, cls) -> dict:
+    """An engine's block from config.json, honouring the keys it used to have.
+
+    An engine that is renamed has to keep reading the config it was configured
+    with: every released install's config.json carries the old key, and a
+    loader that only knows the new one reads ``{}`` -- which is not a visible
+    failure but a SILENT one, because the defaults load, the engine reports
+    itself disabled, and every model pinned to it stops being served with no
+    error to point at. So the new key wins and the old one is the fallback;
+    the next save writes the new spelling (see ``save_config``).
+    """
+    key = getattr(cls, "ENGINE_KEY", "")
+    blk = (config_data or {}).get(key)
+    if isinstance(blk, dict) and blk:
+        return blk
+    for old in getattr(cls, "LEGACY_ENGINE_KEYS", ()) or ():
+        blk = (config_data or {}).get(old)
+        if isinstance(blk, dict) and blk:
+            print(f"[config] engine {key!r} read from the former key {old!r}; "
+                  f"the next save writes it as {key!r}", flush=True)
+            return blk
+    return {}
+
+
 def _dc_dict(obj) -> dict:
     """A dataclass instance as a plain dict of its own fields, in declared order.
 
@@ -1097,8 +1132,8 @@ def _dc_dict(obj) -> dict:
 
 
 @dataclass
-class LlamaSrvForkConfig(LlamaSrvConfig):
-    """The same managed ``llama-server``, built from a FORK -- engine key ``llamasrv_fork``.
+class LlamAmpereConfig(LlamaSrvConfig):
+    """The same managed ``llama-server``, built from a FORK -- engine key ``llamampere``.
 
     Two engines rather than one switch, because the reason to run a fork is to
     find out whether it is actually better, and that needs both serving at once:
@@ -1111,13 +1146,26 @@ class LlamaSrvForkConfig(LlamaSrvConfig):
     ``repo_url``/``git_ref`` name the fork the published image compiles in --
     llamAmpere, which targets Ampere (sm_86) and is why this exists on a 3090.
 
-    The defaults and the image's LLAMASRV_FORK_* build args MUST move together:
+    The defaults and the image's LLAMAMPERE_* build args MUST move together:
     the image bakes a binary and this config describes it, and nothing at
     runtime can tell that a prebuilt binary is not the tree named here. A test
     pins them to each other.
     """
 
-    ENGINE_KEY = "llamasrv_fork"
+    ENGINE_KEY = "llamampere"
+
+    #: What this engine is CALLED in logs, the admin UI and anything a human
+    #: reads. The key has to be lowercase -- a ``backend`` pin is lowercased
+    #: before it is matched against the engine list -- but "llamampere" is not
+    #: how the project spells itself, and an engine named after an internal key
+    #: reads like a placeholder. These are deliberately two different strings.
+    ENGINE_LABEL = "llamAmpere"
+
+    #: The key this engine used to answer to. A released config.json and every
+    #: models.json entry pinned to it carry the old spelling, so the rename
+    #: cannot be a flag day: both are accepted, the new one is written back,
+    #: and an install that is never re-saved keeps working untouched.
+    LEGACY_ENGINE_KEYS = ("llamasrv_fork",)
 
     tree: str = "repo"
     repo_url: str = "https://github.com/JakeATX/llamAmpere"
@@ -2022,7 +2070,7 @@ class Config:
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
     llamasrv: LlamaSrvConfig = field(default_factory=LlamaSrvConfig)
-    llamasrv_fork: LlamaSrvForkConfig = field(default_factory=LlamaSrvForkConfig)
+    llamampere: LlamAmpereConfig = field(default_factory=LlamAmpereConfig)
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
     k3: K3Config = field(default_factory=K3Config)
     ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
@@ -2268,7 +2316,8 @@ class ConfigManager:
                 cluster=_dc(ClusterConfig, config_data.get("cluster", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
                 llamasrv=_dc(LlamaSrvConfig, config_data.get("llamasrv", {})),
-                llamasrv_fork=_dc(LlamaSrvForkConfig, config_data.get("llamasrv_fork", {})),
+                llamampere=_dc(LlamAmpereConfig,
+                               _engine_block(config_data, LlamAmpereConfig)),
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 k3=_dc(K3Config, config_data.get("k3", {})),
                 ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
@@ -2533,7 +2582,7 @@ class ConfigManager:
             # meant a field added to LlamaSrvConfig could be saved for one
             # engine and silently dropped for the other.
             "llamasrv": _dc_dict(self.config.llamasrv),
-            "llamasrv_fork": _dc_dict(self.config.llamasrv_fork),
+            "llamampere": _dc_dict(self.config.llamampere),
             "colibri": {
                 "enabled": self.config.colibri.enabled,
                 "service_url": self.config.colibri.service_url,
