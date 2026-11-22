@@ -3212,6 +3212,20 @@ class TextLoraTrainRequest(BaseModel):
     enable_thinking: Optional[bool] = False
     seed: Optional[int] = 42
 
+    #: The training objective. ``"sft"`` (default) supervises the answer text;
+    #: ``"decision"`` trains a calibrated classifier by soft cross-entropy over
+    #: the answer-letter logits (every dataset record must carry a ``decision``
+    #: target). A dataset and an objective that disagree fail loudly.
+    objective: Optional[str] = "sft"
+    #: The candidate answer letters for a decision model, for the record and the
+    #: serving contract. The per-example ``decision`` target drives training.
+    decision_letters: Optional[List[str]] = None
+    #: Pin exactly which module-name tails the LoRA adapts, instead of the
+    #: built-in language-projection set. For a base whose projections are named
+    #: unusually (e.g. spark2_5's ``q_k_v_proj``/``out_proj``/``g_proj``), or to
+    #: reproduce a published adapter's target set exactly. Empty = the default.
+    target_modules: Optional[List[str]] = None
+
     #: Refuse rather than train on a dataset that turned out much smaller than
     #: the caller thinks. Skips are legitimate (an example over max_len cannot
     #: be trained) but a large fraction means the length limit, the template or
@@ -3389,7 +3403,8 @@ def _text_dataset_pass(req: TextLoraTrainRequest, dataset_path: str, tokenizer):
     examples = tld.load_jsonl(dataset_path, field_map=req.field_map or None)
     encoded, stats = tld.prepare(
         tokenizer, examples, max_len=int(req.max_len or 8192),
-        enable_thinking=bool(req.enable_thinking))
+        enable_thinking=bool(req.enable_thinking),
+        objective=str(getattr(req, "objective", None) or "sft"))
     total = stats.examples + len(stats.skipped)
     if total == 0:
         raise ValueError(f"{dataset_path} produced no usable examples")
@@ -3714,7 +3729,10 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         max_len=int(req.max_len or 8192),
         accumulation_steps=int(req.accumulation_steps or 8),
         enable_thinking=bool(req.enable_thinking),
-        seed=int(req.seed or 42))
+        seed=int(req.seed or 42),
+        objective=str(getattr(req, "objective", None) or "sft"),
+        decision_letters=tuple(getattr(req, "decision_letters", None) or ()),
+        target_suffixes=tuple(getattr(req, "target_modules", None) or ()))
 
     if req.test_run:
         # One pod, one round, a handful of examples, and a short leash. The
@@ -4349,7 +4367,12 @@ class _TextTrainCoordinator:
                          "max_len": self.settings.max_len,
                          "accumulation_steps": self.settings.accumulation_steps,
                          "enable_thinking": self.settings.enable_thinking,
-                         "seed": self.settings.seed},
+                         "seed": self.settings.seed,
+                         "objective": getattr(self.settings, "objective", "sft"),
+                         "decision_letters": list(
+                             getattr(self.settings, "decision_letters", ()) or ()),
+                         "target_suffixes": list(
+                             getattr(self.settings, "target_suffixes", ()) or ())},
         }
 
     def submit(self, sub) -> None:

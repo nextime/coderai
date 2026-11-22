@@ -54,7 +54,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 #: load time (``field_map``) rather than rewritten -- a 100 MB JSONL should not
 #: have to be regenerated to be trainable, and a renaming pass is a chance to
 #: corrupt it.
-FIELDS = ("messages", "answer", "mask", "weight")
+FIELDS = ("messages", "answer", "mask", "weight", "decision")
 
 
 class DatasetError(ValueError):
@@ -79,6 +79,12 @@ class Example:
     mask: List[Tuple[int, int]] = dataclasses.field(default_factory=list)
     weight: float = 1.0
     line: int = 0
+    #: A decision example instead of a supervised-text one. When set, this maps
+    #: candidate answer-letter strings to a target probability, and training is
+    #: a soft cross-entropy over those letters' logits at the final prompt
+    #: position -- NOT next-token learning of ``answer``. See ``encode_decision``
+    #: and the ``decision`` objective in ``text_lora_trainer``.
+    decision: Optional[Dict[str, float]] = None
 
     def masked_text(self) -> List[str]:
         """The excluded substrings, for a log line or an eyeball check."""
@@ -95,6 +101,13 @@ class Encoded:
     n_trained: int          # positions contributing to the loss
     n_masked: int           # answer positions excluded by the mask
     line: int = 0
+    #: ``"sft"`` (next-token, uses ``labels``) or ``"decision"`` (soft
+    #: cross-entropy over ``letter_token_ids`` with ``target_probs`` at the
+    #: final prompt position; ``labels`` is empty). Kept on the encoded example
+    #: so the step loop needs no second structure to tell them apart.
+    objective: str = "sft"
+    letter_token_ids: List[int] = dataclasses.field(default_factory=list)
+    target_probs: List[float] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -140,6 +153,41 @@ def _coerce_mask(raw: Any, answer_len: int, line: int) -> List[Tuple[int, int]]:
     return out
 
 
+def _coerce_decision(raw: Any, line: int) -> Dict[str, float]:
+    """Validate a decision target: a non-empty map of answer-letter -> weight.
+
+    The values are a distribution over the candidate letters; they need not sum
+    to one here (``encode_decision`` normalises), but they must be non-negative
+    and not all zero -- a target of all-zeros has no gradient and is a dataset
+    bug, not a lesson. The keys are the letter STRINGS as they must tokenize at
+    inference; that each is a single token is checked at encode time, where the
+    tokenizer is in hand.
+    """
+    if not isinstance(raw, dict) or not raw:
+        raise DatasetError(
+            f"line {line}: 'decision' must be a non-empty object mapping an "
+            f"answer letter to its target probability")
+    out: Dict[str, float] = {}
+    for letter, p in raw.items():
+        if not isinstance(letter, str) or not letter:
+            raise DatasetError(
+                f"line {line}: decision keys must be non-empty strings: {letter!r}")
+        try:
+            val = float(p)
+        except (TypeError, ValueError):
+            raise DatasetError(
+                f"line {line}: decision[{letter!r}] must be a number, got {p!r}")
+        if val < 0:
+            raise DatasetError(
+                f"line {line}: decision[{letter!r}] is negative ({val})")
+        out[letter] = val
+    if sum(out.values()) <= 0:
+        raise DatasetError(
+            f"line {line}: decision target is all zeros -- no letter carries any "
+            f"probability, so there is nothing to learn")
+    return out
+
+
 def parse_example(obj: Dict[str, Any], *, line: int = 0,
                   field_map: Optional[Dict[str, str]] = None) -> Example:
     """One JSONL record to an :class:`Example`, or raise :class:`DatasetError`."""
@@ -155,12 +203,6 @@ def parse_example(obj: Dict[str, Any], *, line: int = 0,
         if not isinstance(m, dict) or "role" not in m:
             raise DatasetError(f"line {line}: each message needs a role: {m!r}")
 
-    answer = obj.get(fm["answer"])
-    if isinstance(answer, dict):           # a message object rather than a string
-        answer = answer.get("content")
-    if not isinstance(answer, str) or not answer:
-        raise DatasetError(f"line {line}: {fm['answer']!r} must be a non-empty string")
-
     weight_raw = obj.get(fm["weight"], 1.0)
     try:
         weight = float(1.0 if weight_raw is None else weight_raw)
@@ -168,6 +210,21 @@ def parse_example(obj: Dict[str, Any], *, line: int = 0,
         raise DatasetError(f"line {line}: {fm['weight']!r} must be a number")
     if weight < 0:
         raise DatasetError(f"line {line}: weight {weight} is negative")
+
+    # A decision example carries a letter->probability target and NO supervised
+    # answer text: the lesson is the distribution over the candidate letters,
+    # not a string to reproduce. `answer`/`mask` are not read in this case.
+    decision_raw = obj.get(fm["decision"])
+    if decision_raw is not None:
+        return Example(messages=list(messages), answer="",
+                       weight=weight, line=line,
+                       decision=_coerce_decision(decision_raw, line))
+
+    answer = obj.get(fm["answer"])
+    if isinstance(answer, dict):           # a message object rather than a string
+        answer = answer.get("content")
+    if not isinstance(answer, str) or not answer:
+        raise DatasetError(f"line {line}: {fm['answer']!r} must be a non-empty string")
 
     return Example(messages=list(messages), answer=answer,
                    mask=_coerce_mask(obj.get(fm["mask"]), len(answer), line),
@@ -283,6 +340,69 @@ def encode(tokenizer, ex: Example, *, max_len: int = 8192,
                    line=ex.line), None
 
 
+def _letter_token_id(tokenizer, letter: str, line: int) -> int:
+    """The single token id a candidate answer letter must tokenize to.
+
+    The decision objective reads the logit of ONE token per letter at the final
+    prompt position, and the serving side scores the SAME single token from the
+    model's first generated step. A letter that tokenizes to two ids has no one
+    logit to read and no one logprob to score, so it breaks the contract on both
+    sides -- a loud failure here is far better than a silently-wrong target.
+    """
+    ids = tokenizer(letter, add_special_tokens=False)["input_ids"]
+    if len(ids) != 1:
+        raise DatasetError(
+            f"line {line}: decision letter {letter!r} tokenizes to {len(ids)} "
+            f"tokens ({ids}), not one -- the decision objective scores a single "
+            f"answer-letter token, so each candidate must be exactly one token "
+            f"for this tokenizer (try the letter the model actually emits, e.g. "
+            f"'A' vs ' A')")
+    return int(ids[0])
+
+
+def encode_decision(tokenizer, ex: Example, *, max_len: int = 8192,
+                    enable_thinking: bool = False,
+                    ) -> Tuple[Optional[Encoded], Optional[Skipped]]:
+    """One decision example to a prompt-only encoding. Exactly one of two is None.
+
+    The prompt is rendered with ``add_generation_prompt=True`` and NOTHING is
+    appended -- no answer token, no EOS. The scored position is therefore the
+    last prompt token: ``logits[:, -1, :]`` is the model's distribution over the
+    token it would generate first, which is exactly the answer letter. The loss
+    (in ``text_lora_trainer.decision_distillation_loss``) is a soft cross-entropy
+    between ``target_probs`` and the softmax over ``letter_token_ids`` there.
+
+    An example longer than ``max_len`` is SKIPPED, never truncated, for the same
+    reason as :func:`encode`: a prompt inference will not send teaches nothing.
+    """
+    prompt = tokenizer.apply_chat_template(
+        ex.messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=enable_thinking)
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
+    if len(prompt_ids) > max_len:
+        return None, Skipped(line=ex.line, n_tokens=len(prompt_ids),
+                             reason=(f"{len(prompt_ids)} prompt tokens over the "
+                                     f"{max_len} limit"))
+
+    letters = list((ex.decision or {}).keys())
+    token_ids = [_letter_token_id(tokenizer, l, ex.line) for l in letters]
+    if len(set(token_ids)) != len(token_ids):
+        # Two letters sharing a token id would have their targets summed into one
+        # logit, quietly training a different distribution than the record states.
+        raise DatasetError(
+            f"line {ex.line}: two decision letters map to the same token id "
+            f"({dict(zip(letters, token_ids))}) -- their targets cannot be told "
+            f"apart at the scored position")
+    total = float(sum((ex.decision or {}).values()))
+    probs = [float(ex.decision[l]) / total for l in letters]
+
+    return Encoded(input_ids=list(prompt_ids), labels=[], weight=ex.weight,
+                   n_trained=1, n_masked=0, line=ex.line,
+                   objective="decision", letter_token_ids=token_ids,
+                   target_probs=probs), None
+
+
 def loss_scale(weight: float, accumulation_steps: int) -> float:
     """What to multiply an example's mean loss by before ``backward()``.
 
@@ -302,6 +422,7 @@ class Stats:
     """What a pass over the dataset actually prepared."""
 
     examples: int = 0
+    decision_examples: int = 0   # of `examples`, those encoded as decisions
     skipped: List[Skipped] = dataclasses.field(default_factory=list)
     trained_tokens: int = 0
     masked_tokens: int = 0
@@ -326,24 +447,50 @@ class Stats:
             parts.append(f"{self.seq_tokens // max(1, self.examples)} tokens "
                          f"per sequence on average, longest "
                          f"{self.seq_tokens_max}")
+        if self.decision_examples:
+            parts.append(f"{self.decision_examples} decision example(s)")
         if self.skipped:
             parts.append(f"{len(self.skipped)} SKIPPED")
         return ", ".join(parts)
 
 
 def prepare(tokenizer, examples: Iterable[Example], *, max_len: int = 8192,
-            enable_thinking: bool = False) -> Tuple[List[Encoded], Stats]:
-    """Encode a whole dataset, collecting what was skipped rather than dropping it."""
+            enable_thinking: bool = False,
+            objective: str = "sft") -> Tuple[List[Encoded], Stats]:
+    """Encode a whole dataset, collecting what was skipped rather than dropping it.
+
+    ``objective`` selects how every example is encoded: ``"sft"`` supervises the
+    answer text (``encode``), ``"decision"`` scores the answer-letter logits
+    (``encode_decision``). A ``decision`` record carried under an ``"sft"`` job,
+    or an ``"sft"`` record (no ``decision`` key) under a ``"decision"`` job, is a
+    configuration error and fails loudly rather than being skipped.
+    """
+    if objective not in ("sft", "decision"):
+        raise ValueError(f"unknown objective {objective!r}; expected 'sft' or 'decision'")
     out: List[Encoded] = []
     st = Stats()
     for ex in examples:
-        enc, skip = encode(tokenizer, ex, max_len=max_len,
-                           enable_thinking=enable_thinking)
+        if objective == "decision":
+            if ex.decision is None:
+                raise DatasetError(
+                    f"line {ex.line}: a decision job needs a 'decision' target on "
+                    f"every example, and this one has none")
+            enc, skip = encode_decision(tokenizer, ex, max_len=max_len,
+                                        enable_thinking=enable_thinking)
+        else:
+            if ex.decision is not None:
+                raise DatasetError(
+                    f"line {ex.line}: this example has a 'decision' target but the "
+                    f"job objective is 'sft'; set objective='decision' to train on it")
+            enc, skip = encode(tokenizer, ex, max_len=max_len,
+                               enable_thinking=enable_thinking)
         if skip is not None:
             st.skipped.append(skip)
             continue
         out.append(enc)
         st.examples += 1
+        if enc.objective == "decision":
+            st.decision_examples += 1
         st.trained_tokens += enc.n_trained
         st.masked_tokens += enc.n_masked
         st.seq_tokens += len(enc.input_ids)

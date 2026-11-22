@@ -41,7 +41,7 @@ from codai.queue.manager import QueueManager, queue_manager
 from codai.api import admission as _admission
 from codai.tasks import task_registry
 from codai.api.prompt_cache import prompt_cache_manager
-from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
+from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool, DecisionRequest
 from codai.models.parser import filter_malformed_content, filter_repetition, format_tools_for_prompt, cleanup_control_tokens, OpenAIFormatter, ModelParserAdapter, ToolCallParser
 
 # Import global state from state module
@@ -3905,6 +3905,79 @@ async def generate_chat_response(
         if _ctx:
             raise HTTPException(status_code=400, detail=_ctx)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+
+# =============================================================================
+# Decision Endpoint (/v1/decision)
+# =============================================================================
+
+
+@router.post("/v1/decision", summary="Score a decision model's answer letters")
+async def decision(request: DecisionRequest):
+    """Read a decision model's probability over a few answer letters.
+
+    A thin wrapper over the chat path: ask for ONE token with logprobs, then
+    turn the first-token top-logprobs into a renormalised distribution over the
+    candidate letters. This is how rizzo-flow and Spark-X2.5 decision models are
+    meant to be read -- the answer is the distribution and its argmax/confidence,
+    not a generated string. The prompt in ``messages`` is rendered through the
+    model's own chat template, the same one the decision training data used.
+    """
+    from codai.pydantic.textrequest import ChatCompletionRequest
+    from codai.api.spark_decisions import distribution_from_logprobs, summarize
+
+    letters = [str(x) for x in (request.letters or [])]
+    if not letters:
+        raise HTTPException(status_code=400,
+                            detail="`letters` must list at least one candidate")
+    # Comfortably above the letter count so each option can appear among the
+    # returned candidates even when the model also considers punctuation/space.
+    top_k = int(request.top_logprobs or 0) or max(20, 4 * len(letters))
+
+    chat_req = ChatCompletionRequest(
+        model=request.model,
+        messages=list(request.messages or []),
+        max_tokens=1,
+        temperature=float(request.temperature or 0.0),
+        stream=False,
+        logprobs=True,
+        top_logprobs=top_k,
+        enable_thinking=bool(request.enable_thinking) if request.enable_thinking is not None else False,
+    )
+    try:
+        result = await chat_completions(chat_req, None)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"decision call failed: {e}")
+
+    # chat_completions returns the formatted dict on the non-stream path; a
+    # JSONResponse would carry it in `.body`.
+    payload = result
+    if hasattr(result, "body"):
+        import json as _json
+        try:
+            payload = _json.loads(result.body)
+        except Exception:
+            payload = {}
+    logprobs = None
+    try:
+        logprobs = (payload.get("choices") or [{}])[0].get("logprobs")
+    except Exception:
+        logprobs = None
+
+    try:
+        dist = distribution_from_logprobs(logprobs, letters)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    argmax, confidence = summarize(dist)
+    return {
+        "object": "decision",
+        "model": request.model,
+        "distribution": dist,
+        "argmax": argmax,
+        "confidence": confidence,
+    }
+
 
 # =============================================================================
 # Legacy Text Completions Endpoint (/v1/completions)

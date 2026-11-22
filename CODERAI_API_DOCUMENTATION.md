@@ -3214,7 +3214,7 @@ print(response.choices[0].message.content)
 
 ## Endpoint Index
 
-Every HTTP route the server defines — **260** of them — generated from the
+Every HTTP route the server defines — **261** of them — generated from the
 decorators in `codai/` by [`tools/gen_endpoint_index.py`](tools/gen_endpoint_index.py).
 `Source` names the module(s) that own the route: one owned by `frontproxy/*` is served
 by the torch-free front, one owned by `api/*` by an engine process, and a route listed
@@ -3268,6 +3268,7 @@ They are still part of the HTTP surface, which is why they are listed here.
 | `POST` | `/v1/chunk/file` | Split an uploaded document into chunks | `api/chunking` |
 | `GET` | `/v1/chunk/templates` | List the structure templates on offer | `api/chunking` |
 | `POST` | `/v1/completions` | Legacy text completions | `api/text` |
+| `POST` | `/v1/decision` | Score a decision model's answer letters | `api/text` |
 | `POST` | `/v1/embeddings` | Create embeddings | `api/embeddings` |
 | `GET` | `/v1/environments` | List environment profiles | `api/environments` |
 | `POST` | `/v1/environments` | Create or replace an environment profile | `api/environments` |

@@ -64,6 +64,11 @@ LANGUAGE_SUFFIXES = (
     "gate_proj", "up_proj", "down_proj",
     # Fused variants, for bases that pack qkv or the MLP gate+up together.
     "qkv_proj", "gate_up_proj", "qkv", "wqkv",
+    # spark2_5 (Spark-X2.5): fused QKV, attention output, head-wise attention
+    # gate. Without these only the MLP would be adapted and attention left
+    # untouched -- a materially weaker adapter, and `select_target_modules`
+    # would not even see the self-attention block.
+    "q_k_v_proj", "out_proj", "g_proj",
 )
 
 
@@ -140,6 +145,19 @@ class QLoraSettings:
     compute_dtype: str = "bfloat16"
     enable_thinking: bool = False
     seed: int = 42
+    #: ``"sft"`` (next-token supervised learning of the answer) or ``"decision"``
+    #: (soft cross-entropy over the answer-letter logits at the final prompt
+    #: position -- a calibrated classifier, no generation). The dataset must be
+    #: encoded for the SAME objective; `text_lora_dataset.prepare` enforces it.
+    objective: str = "sft"
+    #: The candidate answer letters a decision model chooses between, for the
+    #: record and for the serving contract. The per-example ``decision`` target
+    #: is authoritative for training; this is the default/declared set.
+    decision_letters: tuple = ()
+    #: An explicit override of which module-name tails to adapt, instead of
+    #: :data:`LANGUAGE_SUFFIXES`. Empty means the default. Lets an operator pin a
+    #: base's exact projection set (e.g. a spark2_5 adapter's target list).
+    target_suffixes: tuple = ()
 
 
 def bnb_config(st: QLoraSettings):
@@ -223,6 +241,46 @@ def scaled_backward(logits, labels, weight: float, accumulation_steps: int):
     """
     from codai.api.text_lora_dataset import loss_scale
     loss = masked_cross_entropy(logits, labels)
+    (loss * loss_scale(weight, accumulation_steps)).backward()
+    return float(loss.detach())
+
+
+def decision_distillation_loss(logits, letter_token_ids, target_probs):
+    """Soft cross-entropy over the answer-letter logits at the LAST position.
+
+    ``logits`` is ``[1, seq, vocab]``. The decision example is prompt-only and
+    scored at the final prompt token, so ``logits[0, -1, :]`` is the model's
+    distribution over the token it would generate first -- the answer letter.
+    The loss is ``-sum(p_i * log_softmax(logits)[id_i])``: a cross-entropy from
+    the target distribution to the model's, which is the KL to the target up to
+    the target's own (constant) entropy, so minimising it matches the model's
+    answer-letter probabilities to ``target_probs``.
+
+    log_softmax is taken over the FULL vocabulary and then gathered at the letter
+    ids, not over the letters alone: the probability of a letter is its share of
+    the whole distribution, and renormalising over a handful of ids first would
+    train a quantity the serving side never computes.
+    """
+    import torch
+    import torch.nn.functional as F
+    last = logits[0, -1, :].float()                      # [vocab]
+    ids = torch.as_tensor(letter_token_ids, device=last.device, dtype=torch.long)
+    logp = F.log_softmax(last, dim=-1).index_select(0, ids)   # [n_letters]
+    p = torch.as_tensor(target_probs, device=last.device, dtype=logp.dtype)
+    p = p / p.sum()
+    return -(p * logp).sum()
+
+
+def scaled_backward_decision(logits, letter_token_ids, target_probs,
+                             weight: float, accumulation_steps: int):
+    """The decision counterpart of :func:`scaled_backward`.
+
+    Same weight/accumulation scaling so a decision run mixes with the rest of the
+    fleet machinery unchanged; returns the unscaled soft cross-entropy for the
+    log.
+    """
+    from codai.api.text_lora_dataset import loss_scale
+    loss = decision_distillation_loss(logits, letter_token_ids, target_probs)
     (loss * loss_scale(weight, accumulation_steps)).backward()
     return float(loss.detach())
 
@@ -427,13 +485,22 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
             f"would look like it worked") from exc
 
     linears = linear_module_names(model)
-    targets = select_target_modules(linears)
+    # Only pass `suffixes` when the request pinned an override: the default call
+    # uses select_target_modules' own LANGUAGE_SUFFIXES default, which is the
+    # historical signature.
+    if settings.target_suffixes:
+        suffixes = tuple(settings.target_suffixes)
+        targets = select_target_modules(linears, suffixes=suffixes)
+    else:
+        suffixes = LANGUAGE_SUFFIXES
+        targets = select_target_modules(linears)
     if not targets:
         raise RuntimeError(
             f"no language projections found to adapt in {base!r}: "
             f"{len(linears)} linear modules, none matching "
-            f"{', '.join(LANGUAGE_SUFFIXES[:4])}… — this base names its layers "
-            "differently and needs an explicit target list")
+            f"{', '.join(suffixes[:4])}… — this base names its layers "
+            "differently and needs an explicit target list (set "
+            "`target_modules` on the request)")
     line = describe_selection(linears, targets)
     print(f"[text-lora] {line}", flush=True)
 
@@ -559,11 +626,22 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
             check()
         ex = encoded[idx]
         ids = torch.tensor([ex.input_ids], device=model.device)
-        labels = torch.tensor([ex.labels], device=model.device)
 
-        def _one():
-            out = model(input_ids=ids)
-            return scaled_backward(out.logits, labels, ex.weight, accum)
+        if getattr(ex, "objective", "sft") == "decision":
+            # Prompt-only: no labels tensor, scored at the final position.
+            _letters = ex.letter_token_ids
+            _probs = ex.target_probs
+
+            def _one():
+                out = model(input_ids=ids)
+                return scaled_backward_decision(
+                    out.logits, _letters, _probs, ex.weight, accum)
+        else:
+            labels = torch.tensor([ex.labels], device=model.device)
+
+            def _one():
+                out = model(input_ids=ids)
+                return scaled_backward(out.logits, labels, ex.weight, accum)
 
         try:
             loss = step_with_oom_guard(

@@ -392,6 +392,15 @@ PUBLISHED_CAPABILITY_IMAGES = (
     # slots with continuous batching. The binary is compiled in the image's
     # toolchain stage, so nothing is built on a rented pod.
     "llamasrv",
+    # The llamAmpere FORK of llama-server, compiled into a coderai pod the same
+    # way `llamasrv` is, but from the fork tree rather than the bindings' vendored
+    # llama.cpp. It exists because the fork carries arches and a KV cache the
+    # stock server does not: the `spark2_5` graph (Spark-X2.5 / rizzo-flow
+    # decision models) and the SJ-KVaRN `sjkvarn*` caches every local `llamampere`
+    # entry already uses. Serving a spark2_5 GGUF on a pod needs this image, not
+    # `llamasrv`, so a pod serves byte-identically to the local `llamampere`
+    # engine. Built for one CUDA arch per tag, like a tuned llamasrv fork.
+    "llamampere",
     # The same vLLM pod pinned to 0.20.1 — the version `surya-ocr` spawns and
     # validates against — because serving surya-ocr-2 on 0.27.1 loses every
     # accented character while the model's own bytes decode cleanly. Rent it for
@@ -422,7 +431,11 @@ _ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm",
 #: loop is in llama.cpp's common/, not in libllama) or real slots.
 _CODERAI_SERVER_ENGINES = {"coderai-vllm": "vllm", "coderai-llama": "llama",
                            "coderai-vllm-ocr": "vllm-ocr",
-                           "coderai-llamasrv": "llamasrv"}
+                           "coderai-llamasrv": "llamasrv",
+                           # The llamAmpere fork as a coderai pod: the image a
+                           # spark2_5 GGUF (or any sjkvarn* model) is served from,
+                           # so a pod matches the local `llamampere` engine.
+                           "coderai-llamampere": "llamampere"}
 
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {

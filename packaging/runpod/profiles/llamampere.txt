@@ -1,0 +1,17 @@
+# llamAmpere FORK of llama.cpp's `llama-server` as a coderai pod. Same light-core
+# runtime as `llamasrv` (nothing here needs torch); the fork binary is compiled
+# in the toolchain stage of Dockerfile.capability-llamampere from the fork tree
+# staged by build_capability_image.sh, and coderai drives it as a managed
+# subprocess under the `llamampere` engine.
+#
+# This image exists beside `llamasrv` because the fork has what the stock server
+# lacks: the `spark2_5` model graph (Spark-X2.5 / rizzo-flow decision models) and
+# the SJ-KVaRN `sjkvarn*` KV caches every local `llamampere` entry already uses.
+# Build it (one CUDA arch per tag, like a tuned llamasrv fork):
+#   CODERAI_LLAMAMPERE_DIR=/storage/dot_coderai/llamasrv/llamAmpere-v0.6.4 \
+#     CUDA_ARCHS=86 packaging/runpod/build_capability_image.sh llamampere
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cublas-cu12==12.8.4.1
+nvidia-ml-py>=12.0.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0

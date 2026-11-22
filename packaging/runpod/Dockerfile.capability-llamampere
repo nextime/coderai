@@ -1,0 +1,129 @@
+# CoderAI llamAmpere pod — the llamAmpere FORK of llama.cpp's `llama-server`,
+# compiled in, driven by coderai as a managed subprocess under the `llamampere`
+# engine.
+#
+# How this differs from `coderai-llamasrv`: that image builds the server from the
+# llama-cpp-python bindings' vendored llama.cpp (or any git fork). This one builds
+# from the LOCAL fork tree, staged into the build context by
+# build_capability_image.sh exactly as the native engines (ds4/colibri/k3) are —
+# because the fork is not a published git repo, it is the working tree the local
+# `llamampere` engine already builds from. The result is a pod that serves
+# byte-identically to that local engine, including:
+#   * the `spark2_5` model graph — Spark-X2.5 / rizzo-flow decision models;
+#   * the SJ-KVaRN `sjkvarn*` KV caches every local `llamampere` entry uses,
+#     which neither the stock server nor llama-cpp-python can load.
+#
+# LIGHT core, like coderai-llamasrv: nothing here needs torch. The GGUF path asks
+# NVML about the card (codai/backends/gpu_probe.py) and the binary links only the
+# CUDA runtime.
+#
+# ---------------------------------------------------------------------------
+# Build args:
+#   CUDA_ARCHS   the SASS targets. The default spans every pod GPU generation;
+#                a tuned build usually wants exactly one (e.g. `86` for GA102 —
+#                RTX 30-series and the A40) under its own tag, because an image
+#                built for one architecture must not be rented onto another card.
+#
+# Build (the script stages the fork tree first):
+#   CODERAI_LLAMAMPERE_DIR=/storage/dot_coderai/llamasrv/llamAmpere-v0.6.4 \
+#     CUDA_ARCHS=86 packaging/runpod/build_capability_image.sh llamampere
+# The staged tree lands at packaging/runpod/llamampere-src (the fork's `src/`,
+# which holds CMakeLists.txt); this Dockerfile COPYs it as /src.
+# ---------------------------------------------------------------------------
+
+ARG CORE_BASE=coderai-capability-base-light:latest
+ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04
+ARG CUDA_ARCHS=80;86;89;90;120
+
+# ---------------------------------------------------------------- build stage
+FROM ${CUDA_DEVEL} AS server
+ARG CUDA_ARCHS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git python3 python3-pip python3-venv \
+        ca-certificates libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# The fork source, staged by build_capability_image.sh (no build/, no .git, no
+# weights). This is the `src/` of the local fork tree — the llama.cpp CMake root.
+COPY packaging/runpod/llamampere-src /src
+RUN set -eux; \
+    test -f /src/CMakeLists.txt; \
+    cat /src/SOURCE_STAMP 2>/dev/null || echo "(no stamp)" > /src-commit; \
+    cp -f /src/SOURCE_STAMP /src-commit 2>/dev/null || true
+
+# GGML_NATIVE=OFF on purpose: a -march baked in from the builder would SIGILL on
+# an older pod CPU. AVX2 is the floor every rentable host clears. These are the
+# same flags coderai-llamasrv builds with, so the fork's own CMake options
+# (spark2_5 graph, SJ-KVaRN) compile in exactly as they do for the local engine.
+RUN --mount=type=cache,target=/root/.cache/ccache set -eux; \
+    cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DBUILD_SHARED_LIBS=OFF; \
+    cmake --build /build -j"$(nproc)" --target llama-server; \
+    find /build -name llama-server -type f -exec cp {} /llama-server \; ; \
+    test -x /llama-server; \
+    /llama-server --version 2>&1 | head -5 || true
+
+# -------------------------------------------------------------- runtime stage
+FROM ${CORE_BASE}
+
+ARG PROFILE=llamampere
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ENV PROFILE=${PROFILE}
+ARG IMAGE_TAG=unknown
+ENV CODERAI_IMAGE_TAG=${IMAGE_TAG}
+
+WORKDIR /opt/coderai/app
+COPY packaging/runpod/profiles/ /tmp/profiles/
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
+    if python -c "import torch" 2>/dev/null; then \
+        echo "ERROR: llamampere is a light-core image but torch reached its main venv" >&2; \
+        exit 1; \
+    fi; echo "main venv: no torch (light core, as intended)"; \
+    rm -rf /tmp/profiles
+
+COPY --from=server /llama-server /opt/coderai/llamampere/bin/llama-server
+COPY --from=server /src-commit /opt/coderai/llamampere/SOURCE_COMMIT
+RUN chmod 755 /opt/coderai/llamampere/bin/llama-server
+
+# The worker reads this instead of deriving a path from the configured tree: the
+# binary was compiled at image build time. With it set, a pod never fetches a
+# source tree and never needs a compiler. The legacy name is also exported, so an
+# entry still pinned to the old `llamasrv_fork` key resolves too (see
+# codai/api/llamasrv_worker.bin_env_vars).
+ENV CODERAI_LLAMAMPERE_BIN=/opt/coderai/llamampere/bin/llama-server
+ENV CODERAI_LLAMASRV_FORK_BIN=/opt/coderai/llamampere/bin/llama-server
+ENV CODERAI_LLAMAMPERE_DIR=/opt/coderai/llamampere
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}
+RUN set -eux; \
+    ldd /opt/coderai/llamampere/bin/llama-server | tee /tmp/ldd.txt; \
+    if grep -q "not found" /tmp/ldd.txt; then \
+        echo "ERROR: llama-server has unresolved libraries (see above)" >&2; exit 1; \
+    fi; \
+    rm /tmp/ldd.txt; \
+    /opt/coderai/llamampere/bin/llama-server --help >/dev/null 2>&1 \
+        || { echo "ERROR: llama-server will not run in this image" >&2; exit 1; }; \
+    echo "llama-server (llamAmpere fork): links resolved and runs"
+
+COPY . /opt/coderai/app
+RUN python -c "import codai.api.app; print('coderai imports OK for profile ${PROFILE}')"
+RUN python -c "\
+import os;\
+from codai.api import llamasrv_worker as w;\
+from codai.config import LlamAmpereConfig;\
+b = w._env_bin_for(LlamAmpereConfig());\
+assert b == os.environ['CODERAI_LLAMAMPERE_BIN'], b;\
+assert os.path.isfile(b), b;\
+print('llamampere worker resolves the compiled-in fork binary:', b)"
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || curl -fsSk https://127.0.0.1:8000/healthz || exit 1
+
+COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
+RUN chmod +x /opt/coderai/boot.sh
+CMD ["/opt/coderai/boot.sh"]

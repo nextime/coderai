@@ -96,6 +96,31 @@ if [[ "$PROFILE" == "engines" ]]; then
     done
 fi
 
+# The llamAmpere fork tree, staged like an engine source: the local `llamampere`
+# engine builds from it, and it is not a published git repo, so the pod image
+# builds the SAME code rather than cloning. Stage the fork's `src/` (the CMake
+# root), without build/, git history or any weights.
+if [[ "$PROFILE" == "llamampere" ]]; then
+    FORK_DIR="${CODERAI_LLAMAMPERE_DIR:-/storage/dot_coderai/llamasrv/llamAmpere-v0.6.4}"
+    SRC_ROOT="$FORK_DIR/src"
+    DST=packaging/runpod/llamampere-src
+    if [[ ! -f "$SRC_ROOT/CMakeLists.txt" ]]; then
+        echo "llamAmpere fork source not found: $SRC_ROOT/CMakeLists.txt" >&2
+        echo "  set CODERAI_LLAMAMPERE_DIR to the fork root (the dir holding src/)" >&2
+        exit 2
+    fi
+    rm -rf "$DST"; mkdir -p "$DST"
+    rsync -a --exclude '.git/' --exclude 'build/' --exclude '*.o' --exclude '*.a' \
+          --exclude '*.gguf' --exclude '*.gguf.*' --exclude '*.safetensors' \
+          --exclude '*.bin' --exclude '__pycache__/' \
+          "$SRC_ROOT/" "$DST/"
+    # A stamp so the image can say what it was built from, the way the git path
+    # records a commit. Best-effort; the build does not depend on it.
+    { echo "llamAmpere fork staged from $SRC_ROOT"; date -u +%Y-%m-%dT%H:%M:%SZ; } \
+        > "$DST/SOURCE_STAMP" 2>/dev/null || true
+    echo "    staged llamampere fork from $SRC_ROOT ($(du -sh "$DST" | cut -f1))"
+fi
+
 echo "==> building $TAG from profile '$PROFILE' ($DOCKERFILE)"
 # BuildKit for the pip cache mount: nine profiles, one torch download.
 DOCKER_BUILDKIT=1 docker build -f "$DOCKERFILE" \

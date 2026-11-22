@@ -244,3 +244,32 @@ class ModelInfo(BaseModel):
 class ModelList(BaseModel):
     object: str = "list"
     data: List[ModelInfo]
+
+
+class DecisionRequest(BaseModel):
+    """Score a decision model's choice among a few answer letters.
+
+    The model is asked for ONE token with logprobs, and the probability it put
+    on each candidate letter is read back and renormalised over the options.
+    ``messages`` is the already-formed prompt (rendered through the model's own
+    chat template at serving time, exactly as the training data was), so the
+    prompt contract lives with the dataset, not here. See
+    ``codai/api/spark_decisions.py``.
+    """
+
+    model: str = Field(..., description="Decision model id (e.g. a Spark-X2.5 "
+                                        "LoRA or rizzo-flow).")
+    messages: List[Dict] = Field(..., description="The prompt messages, as for "
+                                                  "/v1/chat/completions.")
+    letters: List[str] = Field(..., description="Candidate answer letters to "
+                                                "score, e.g. ['A','B','C','D']. "
+                                                "Each must be a single token.")
+    top_logprobs: Optional[int] = Field(None, description="How many first-token "
+                                        "candidates to ask for; defaults to a "
+                                        "value comfortably above len(letters).")
+    temperature: float = Field(0.0, description="Scoring is deterministic by "
+                                                "default; logprobs are read raw.")
+    enable_thinking: Optional[bool] = Field(False, description="A decision model "
+                                            "answers in one token, so thinking "
+                                            "is off by default.")
+    model_config = ConfigDict(extra="allow")

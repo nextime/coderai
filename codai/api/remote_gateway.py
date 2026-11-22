@@ -139,7 +139,12 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
                # front serves /v1/files from, and the existence check answers for
                # this store. Forwarding either would put the bytes on a pod that
                # is gone an hour later.
-               "/v1/files/upload", "/v1/files/blob/{hash}")
+               "/v1/files/upload", "/v1/files/blob/{hash}",
+               # /v1/decision is a thin local wrapper: it calls /v1/chat/completions
+               # itself (which IS routed to the model, wherever it runs) and only
+               # turns the first-token logprobs into a letter distribution. The
+               # model call travels; this scoring step stays on the front.
+               "/v1/decision")
 
 #: Paths that are this install's own, matched by prefix at run time (the literal
 #: route templates above are what the coverage test reads).

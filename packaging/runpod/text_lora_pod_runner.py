@@ -80,7 +80,10 @@ def _train(payload):
             max_len=int(st.get("max_len", 8192)),
             accumulation_steps=int(st.get("accumulation_steps", 8)),
             enable_thinking=bool(st.get("enable_thinking", False)),
-            seed=int(st.get("seed", 42)))
+            seed=int(st.get("seed", 42)),
+            objective=str(st.get("objective", "sft")),
+            decision_letters=tuple(st.get("decision_letters") or ()),
+            target_suffixes=tuple(st.get("target_suffixes") or ()))
         base = payload.get("base") or _cache["base"]
         if not base:
             raise RuntimeError("no base model was given")
@@ -101,7 +104,8 @@ def _train(payload):
                                        field_map=payload.get("field_map") or None))
             enc, stats = tld.prepare(_cache["tokenizer"], rows,
                                      max_len=settings.max_len,
-                                     enable_thinking=settings.enable_thinking)
+                                     enable_thinking=settings.enable_thinking,
+                                     objective=settings.objective)
             _cache["examples"] = enc
             _set(encoded=len(enc))
             print(f"[pod] encoded: {stats.describe()}", flush=True)
