@@ -413,9 +413,10 @@ PUBLISHED_CAPABILITY_IMAGES = (
 #: and k3 are C binaries and share one image. ktransformers is a Python stack
 #: (kt-kernel + SGLang, pinning their own torch) that takes a venv of its own,
 #: so it has an image of its own rather than doubling the first.
-_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv")
+_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "llamasrv",
+                        "llamampere")
 _ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm",
-                     "llamasrv": "llamasrv"}
+                     "llamasrv": "llamasrv", "llamampere": "llamampere"}
 #: runpod-block `engine` values that mean "a coderai pod running THIS server",
 #: as opposed to `vllm`/`llamacpp`, which mean the upstream images.
 #:
@@ -737,6 +738,8 @@ def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
         return want
     if want == "coderai-llamasrv":
         return "llamasrv"
+    if want == "coderai-llamampere":
+        return "llamampere"
     if want in ("coderai-vllm", "coderai-vllm-ocr"):
         # Both are coderai's vLLM backend; they differ only in which vLLM the
         # image carries, which is the image's business and not the engine's.
@@ -1168,6 +1171,13 @@ _ENGINE_FORWARDED_FIELDS = {
                  "cache_type_k", "cache_type_v", "spec_type",
                  "spec_draft_n_max", "extra_args", "extra_env", "model_id",
                  "ready_timeout_s"),
+    # The llamAmpere fork server: the same RUN levers as llamasrv (ctx, GPU
+    # layers, flash, the KV cache types, the verbatim extra_args that carry
+    # `--jinja` for the spark2_5 template), minus speculative decoding. The
+    # fork tree and CUDA arch are baked into the image, so they never forward.
+    "llamampere": ("ctx", "n_gpu_layers", "parallel", "flash_attn",
+                   "cache_type_k", "cache_type_v", "extra_args", "extra_env",
+                   "model_id", "ready_timeout_s"),
 }
 #: The config attribute behind each engine name (ktransformers is the odd one).
 _ENGINE_CONFIG_ATTR = {"kt": "ktransformers"}
@@ -1997,7 +2007,7 @@ def seed_model_env(entry: dict, served: str = "", source: str = "",
             # block — what makes the pod run ds4-server for it rather than try
             # to load a 154 GB GGUF with transformers. Other backend pins are
             # stripped below: vulkan/opencl say something about THIS machine.
-            "backend", "ds4", "colibri", "k3", "llamasrv",
+            "backend", "ds4", "colibri", "k3", "llamasrv", "llamampere",
             # …and the vLLM block, for the same reason: tool-call syntax,
             # context and memory shape describe the MODEL, and a pod that does
             # not get them serves it differently from this install.
