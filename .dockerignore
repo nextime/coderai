@@ -57,3 +57,10 @@ logs
 video_editor_output
 .dev-code
 coderai-requirements.md
+
+# The coderai-llamampere pod image stages a prebuilt web-UI bundle under a dir
+# named `dist` (packaging/runpod/llamampere-src/tools/ui/dist). The bare `dist`
+# and `build` rules above must not strip it from the build context, or the fork
+# falls back to the broken HF fetch.
+!packaging/runpod/llamampere-src/tools/ui/dist
+!packaging/runpod/llamampere-src/tools/ui/dist/**

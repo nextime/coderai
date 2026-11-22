@@ -12,6 +12,10 @@
 #     CUDA_ARCHS=86 packaging/runpod/build_capability_image.sh llamampere
 nvidia-cuda-runtime-cu12==12.8.90
 nvidia-cublas-cu12==12.8.4.1
+# The fork binary links libnccl.so.2 as a direct NEEDED (the stock llamasrv
+# server does not), so unlike llamasrv this image must ship NCCL. Pinned to the
+# version the local `llamampere` engine runs against, so the pod loads the same.
+nvidia-nccl-cu12==2.27.5
 nvidia-ml-py>=12.0.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0

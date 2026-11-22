@@ -55,11 +55,16 @@ RUN set -eux; \
 # an older pod CPU. AVX2 is the floor every rentable host clears. These are the
 # same flags coderai-llamasrv builds with, so the fork's own CMake options
 # (spark2_5 graph, SJ-KVaRN) compile in exactly as they do for the local engine.
+# LLAMA_BUILD_UI=OFF matches the local engine's build (CMakeCache): the fork's
+# web-UI step fetches a llama-ui bundle from HF and fatally fails validation when
+# the "latest" bundle lacks files it expects — and a pod serves the API, not a
+# browser UI, so the UI is dead weight anyway.
 RUN --mount=type=cache,target=/root/.cache/ccache set -eux; \
     cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_UI=OFF \
         -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DBUILD_SHARED_LIBS=OFF; \
     cmake --build /build -j"$(nproc)" --target llama-server; \
     find /build -name llama-server -type f -exec cp {} /llama-server \; ; \
@@ -98,16 +103,27 @@ ENV CODERAI_LLAMAMPERE_BIN=/opt/coderai/llamampere/bin/llama-server
 ENV CODERAI_LLAMASRV_FORK_BIN=/opt/coderai/llamampere/bin/llama-server
 ENV CODERAI_LLAMAMPERE_DIR=/opt/coderai/llamampere
 
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
+# Verify the compiled-in fork binary's dynamic links resolve. Two sonames need
+# care, both because the fork links the CUDA DRIVER API directly (the stock
+# llamasrv server does not, which is why its identical check passes without this):
+#   * libcuda.so.1 is the driver stub, injected by the container runtime at
+#     `docker run --gpus` and never present in the image — so it is the one
+#     soname EXPECTED to be unresolved here, and must not fail the build.
+#   * because the binary NEEDs libcuda.so.1, it cannot be executed at build time
+#     (no driver, no GPU in the builder), so there is no `--help` smoke run here;
+#     the pod exercises it only when it actually loads a model on a rented GPU.
+# Everything else (libcudart/libcublas/libnccl from the wheels above) must resolve.
 RUN set -eux; \
     ldd /opt/coderai/llamampere/bin/llama-server | tee /tmp/ldd.txt; \
-    if grep -q "not found" /tmp/ldd.txt; then \
-        echo "ERROR: llama-server has unresolved libraries (see above)" >&2; exit 1; \
+    if grep "not found" /tmp/ldd.txt | grep -qv 'libcuda\.so\.1'; then \
+        echo "ERROR: llama-server has unresolved libraries (other than the runtime-injected driver):" >&2; \
+        grep "not found" /tmp/ldd.txt | grep -v 'libcuda\.so\.1' >&2; exit 1; \
     fi; \
+    grep -q 'libnccl\.so\.2 =>.*/nccl/' /tmp/ldd.txt \
+        || { echo "ERROR: libnccl.so.2 did not resolve to the bundled nvidia-nccl wheel" >&2; exit 1; }; \
     rm /tmp/ldd.txt; \
-    /opt/coderai/llamampere/bin/llama-server --help >/dev/null 2>&1 \
-        || { echo "ERROR: llama-server will not run in this image" >&2; exit 1; }; \
-    echo "llama-server (llamAmpere fork): links resolved and runs"
+    echo "llama-server (llamAmpere fork): links resolved (CUDA driver injected at runtime)"
 
 COPY . /opt/coderai/app
 RUN python -c "import codai.api.app; print('coderai imports OK for profile ${PROFILE}')"

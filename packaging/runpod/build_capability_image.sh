@@ -114,9 +114,30 @@ if [[ "$PROFILE" == "llamampere" ]]; then
           --exclude '*.gguf' --exclude '*.gguf.*' --exclude '*.safetensors' \
           --exclude '*.bin' --exclude '__pycache__/' \
           "$SRC_ROOT/" "$DST/"
+    # The fork's web-UI build fetches a prebuilt bundle from HF and fatally
+    # fails validation when the "latest" bundle drops a file it expects. The
+    # local engine built past that because it had already fetched a GOOD bundle
+    # into its build tree; stage that same bundle as PRE-BUILT assets
+    # (tools/ui/dist), which the UI script prefers over any fetch — so the pod
+    # image builds the UI the local engine serves and never touches HF.
+    PREBUILT_UI="$FORK_DIR/build/tools/ui/dist"
+    if [[ -f "$PREBUILT_UI/index.html" ]]; then
+        mkdir -p "$DST/tools/ui/dist"
+        cp -a "$PREBUILT_UI/." "$DST/tools/ui/dist/"
+        echo "    staged prebuilt UI assets ($(find "$DST/tools/ui/dist" -type f | wc -l) files)"
+    else
+        echo "    WARNING: no prebuilt UI dist at $PREBUILT_UI — the image build may" >&2
+        echo "             fail at the UI step; build the fork locally once first." >&2
+    fi
     # A stamp so the image can say what it was built from, the way the git path
-    # records a commit. Best-effort; the build does not depend on it.
-    { echo "llamAmpere fork staged from $SRC_ROOT"; date -u +%Y-%m-%dT%H:%M:%SZ; } \
+    # records a commit. DETERMINISTIC — a content hash of the staged tree, not a
+    # wall-clock date: an unchanged fork tree must produce a byte-identical stamp
+    # so the Docker COPY (and the ~hours CUDA compile layer behind it) stays
+    # cached across rebuilds. A timestamp here silently recompiled everything.
+    stamp_hash=$(cd "$DST" && find . -type f ! -name SOURCE_STAMP -printf '%P\n' \
+        | LC_ALL=C sort | xargs -r sha256sum | sha256sum | cut -d' ' -f1)
+    { echo "llamAmpere fork staged from $SRC_ROOT"; \
+      echo "tree-sha256: ${stamp_hash:-unknown}"; } \
         > "$DST/SOURCE_STAMP" 2>/dev/null || true
     echo "    staged llamampere fork from $SRC_ROOT ($(du -sh "$DST" | cut -f1))"
 fi
@@ -128,6 +149,7 @@ DOCKER_BUILDKIT=1 docker build -f "$DOCKERFILE" \
     --build-arg "IMAGE_TAG=$TAG" \
     --build-arg "GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     --build-arg "CORE_BASE=$CORE_BASE" \
+    ${CUDA_ARCHS:+--build-arg "CUDA_ARCHS=$CUDA_ARCHS"} \
     -t "$TAG" .
 
 # The Dockerfile already proves the app imports. This proves it SERVES: a pod is
