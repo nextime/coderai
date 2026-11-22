@@ -618,6 +618,16 @@ def ensure_service(cfg, model_file: Optional[str] = None,
 
         cmd = build_argv(cfg, binary, resolved, port, host, key, ctx, mmproj)
         env = os.environ.copy()
+        # The fork server's CUDA runtime/cublas/NCCL libs (the pip CUDA 12 stack)
+        # are scoped to THIS subprocess, not the whole container: the pod image
+        # exports their dirs as CODERAI_LLAMAMPERE_LD_PATH rather than putting them
+        # on a container-wide LD_LIBRARY_PATH, because loading that pip CUDA stack
+        # into coderai's own Python at boot crashed startup on a real pod GPU
+        # (EXITED at uptime 0s). Prepend it for the binary that actually needs it.
+        _ld_extra = os.environ.get("CODERAI_LLAMAMPERE_LD_PATH", "").strip()
+        if _ld_extra:
+            _cur_ld = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = _ld_extra + (":" + _cur_ld if _cur_ld else "")
         applied = {}
         extra_env = (getattr(cfg, "extra_env", "") or "").strip()
         if extra_env:

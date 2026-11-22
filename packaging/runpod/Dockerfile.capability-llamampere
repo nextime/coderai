@@ -103,18 +103,30 @@ ENV CODERAI_LLAMAMPERE_BIN=/opt/coderai/llamampere/bin/llama-server
 ENV CODERAI_LLAMASRV_FORK_BIN=/opt/coderai/llamampere/bin/llama-server
 ENV CODERAI_LLAMAMPERE_DIR=/opt/coderai/llamampere
 
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
-# Verify the compiled-in fork binary's dynamic links resolve. Two sonames need
-# care, both because the fork links the CUDA DRIVER API directly (the stock
-# llamasrv server does not, which is why its identical check passes without this):
+# The fork binary's runtime libs (the pip CUDA 12 runtime/cublas + NCCL) are
+# NOT put on a container-wide LD_LIBRARY_PATH: that would load them into every
+# process, including coderai's own Python at boot, and the pip CUDA 12.8 stack
+# clashing with a real pod driver crashed startup before uvicorn was reached —
+# the pod EXITED at uptime 0s while the image booted fine locally. They belong
+# to the llama-server subprocess alone, so they travel in this dedicated
+# variable, which codai/api/llamasrv_worker reads and prepends onto that
+# subprocess's LD_LIBRARY_PATH at launch. coderai itself never sees them.
+ENV CODERAI_LLAMAMPERE_LD_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib
+
+# Verify the compiled-in fork binary's dynamic links resolve. The check sets
+# LD_LIBRARY_PATH inline (from the dedicated var above) for this RUN only — it is
+# not a persistent image env. Two sonames need care, both because the fork links
+# the CUDA DRIVER API directly (the stock llamasrv server does not, which is why
+# its identical check passes without this):
 #   * libcuda.so.1 is the driver stub, injected by the container runtime at
 #     `docker run --gpus` and never present in the image — so it is the one
 #     soname EXPECTED to be unresolved here, and must not fail the build.
 #   * because the binary NEEDs libcuda.so.1, it cannot be executed at build time
 #     (no driver, no GPU in the builder), so there is no `--help` smoke run here;
 #     the pod exercises it only when it actually loads a model on a rented GPU.
-# Everything else (libcudart/libcublas/libnccl from the wheels above) must resolve.
+# Everything else (libcudart/libcublas/libnccl from the wheels) must resolve.
 RUN set -eux; \
+    export LD_LIBRARY_PATH="$CODERAI_LLAMAMPERE_LD_PATH"; \
     ldd /opt/coderai/llamampere/bin/llama-server | tee /tmp/ldd.txt; \
     if grep "not found" /tmp/ldd.txt | grep -qv 'libcuda\.so\.1'; then \
         echo "ERROR: llama-server has unresolved libraries (other than the runtime-injected driver):" >&2; \
