@@ -3112,7 +3112,7 @@ class ConfigManager:
         # (CODERAI_<ENGINE>_DIR, read by the worker itself), not this block's.
         for name, attr in (("ds4", "ds4"), ("colibri", "colibri"), ("k3", "k3"),
                            ("kt", "ktransformers"), ("vllm", "vllm"),
-                           ("llamasrv", "llamasrv")):
+                           ("llamasrv", "llamasrv"), ("llamampere", "llamampere")):
             if not _flag(f"CODERAI_{name.upper()}_ENABLED"):
                 continue
             eng = getattr(self.config, attr, None)
