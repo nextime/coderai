@@ -658,7 +658,16 @@ def ensure_service(cfg, model_file: Optional[str] = None,
             except Exception:
                 pass
 
-        proc = subprocess.Popen(cmd, cwd=str(_install_dir(cfg)),
+        # The working directory must EXIST. `_install_dir` is the source/build
+        # tree, which is absent in a capability image: the binary was compiled in
+        # at build time and no tree was ever cloned, so cwd'ing there is a fatal
+        # FileNotFoundError ("No such file or directory: .../llamAmpere-v0.6.4").
+        # When the binary came from the env (baked), run from its own directory,
+        # which always exists; fall back to the tree only when it is really there.
+        _tree_dir = _install_dir(cfg)
+        _svc_cwd = (os.path.dirname(binary) if (_env_bin_for(cfg) or not _tree_dir.is_dir())
+                    else str(_tree_dir)) or "/"
+        proc = subprocess.Popen(cmd, cwd=_svc_cwd,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1, env=env,
                                 preexec_fn=_die_with_parent)
