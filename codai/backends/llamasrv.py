@@ -123,9 +123,14 @@ class LlamaSrvBackend(VllmBackend):
     def _resolve_gguf(self, model_name: str) -> Optional[str]:
         """The local ``.gguf`` for this model, from the model list.
 
-        No download path on purpose. The in-process backend already owns fetching
-        and caching GGUFs, and a second downloader would race it into the same
-        cache directory for the same file.
+        A model pinned to this engine never ALSO runs the in-process backend, so
+        the old "no download, it would race the in-process downloader" worry does
+        not apply to it: this engine is its only loader. That matters on a rented
+        pod, where the weights live on HuggingFace, not on local disk — without a
+        fetch here the fork would answer "none resolved" for every HF/URL model
+        and never serve. So: find a local file first, and only if none resolves,
+        fetch the URL/HF source through the in-process backend's OWN cache (not a
+        second cache) and hand the fork the resolved local file.
         """
         import os
 
@@ -147,11 +152,30 @@ class LlamaSrvBackend(VllmBackend):
         if direct:
             return direct
         entry = self._entry_for(model_name)
+        cand = model_name
         if entry:
             path = str(entry.get("path") or "").strip()
             if path:
-                return _usable(path) or path
-        return None
+                u = _usable(path)
+                if u:
+                    return u
+                cand = path
+        # Nothing local yet. If the model names a URL or an HF repo, fetch it
+        # through the in-process backend's resolver, which downloads once into the
+        # shared GGUF cache and returns the local path — exactly what a rented
+        # fork pod needs, since the fork server takes a file, not a repo.
+        if cand and (cand.startswith(("http://", "https://"))
+                     or (not os.path.isabs(cand) and "/" in cand and " " not in cand)):
+            try:
+                from codai.models.cache import load_model as _fetch_gguf
+                fetched = _fetch_gguf(cand)
+                u = _usable(fetched)
+                if u:
+                    return u
+            except Exception as exc:
+                print(f"[llamampere] could not fetch weights for {cand!r}: {exc}",
+                      flush=True)
+        return _usable(cand) or (cand if entry else None)
 
     def _entry_for(self, model_name: str) -> Optional[dict]:
         """This model's models.json entry, matched by path/basename/alias/id.
