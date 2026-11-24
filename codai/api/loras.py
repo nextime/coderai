@@ -3396,19 +3396,27 @@ async def _detached_text_train(req: TextLoraTrainRequest, job_id: str,
                     message=f"training failed: {e}"[:300])
 
 
-def _text_dataset_pass(req: TextLoraTrainRequest, dataset_path: str, tokenizer):
+def _text_dataset_pass(req: TextLoraTrainRequest, dataset_path: str, tokenizer,
+                       enable_thinking: Optional[bool] = None):
     """Encode the dataset and decide whether it is fit to train on.
 
     Split out from the training so it can run without a GPU (``dry_run``) and
     be tested: this is where a bad mask, a wrong field name or a too-small
     length limit shows up, and all three are cheaper to find here than after a
     pod boots.
+
+    ``enable_thinking`` is the EFFECTIVE value (the model's pinned one if it has
+    one, else the request's). It reaches the chat template here, so the dry run
+    encodes the same prompt the real run trains on and the real run serves --
+    passing it in rather than reading ``req`` keeps a pinned value from being
+    bypassed on the free pass.
     """
     from codai.api import text_lora_dataset as tld
+    _et = bool(req.enable_thinking) if enable_thinking is None else bool(enable_thinking)
     examples = tld.load_jsonl(dataset_path, field_map=req.field_map or None)
     encoded, stats = tld.prepare(
         tokenizer, examples, max_len=int(req.max_len or 8192),
-        enable_thinking=bool(req.enable_thinking),
+        enable_thinking=_et,
         objective=str(getattr(req, "objective", None) or "sft"))
     total = stats.examples + len(stats.skipped)
     if total == 0:
@@ -3425,6 +3433,55 @@ def _text_dataset_pass(req: TextLoraTrainRequest, dataset_path: str, tokenizer):
             f"({frac:.1%} > the {limit:.1%} limit). Raise max_skipped_fraction "
             f"to train anyway, or fix the cause: {worst}")
     return encoded, stats
+
+
+def _write_text_lora_meta(out_dir: str, *, base: str, settings) -> None:
+    """Record a text LoRA's training contract beside the adapter.
+
+    Text LoRAs wrote no ``meta.json`` before, so a trained adapter carried no
+    record of HOW it was trained -- and for a decision model that record is a
+    serving contract, not a note: it must be SERVED with the same
+    ``enable_thinking`` it was TRAINED with (the two render different prompts and
+    so different letter distributions), and read with the same answer letters.
+    Written into ``out_dir`` (which is the served LoRA's own directory), so
+    ``GET /v1/loras/{name}`` and the serving default both find it. Merged, never
+    clobbered: an image/video ``_write_meta`` or an earlier run's fields stay.
+    """
+    import json as _json
+    import os as _os
+    meta_path = _os.path.join(out_dir, "meta.json")
+    meta = {}
+    try:
+        if _os.path.isfile(meta_path):
+            with open(meta_path) as _f:
+                meta = _json.load(_f) or {}
+    except Exception:
+        meta = {}
+    obj = str(getattr(settings, "objective", "sft") or "sft")
+    et = bool(getattr(settings, "enable_thinking", False))
+    meta.update({
+        "base_model": base,
+        "objective": obj,
+        "enable_thinking": et,
+        # The served-side spelling of the same fact, so a served entry that
+        # leaves `thinking` unset still renders the trained prompt: the serving
+        # default reads this when the catalogue entry says nothing.
+        "thinking": "on" if et else "off",
+    })
+    if obj == "decision":
+        meta["decision_letters"] = list(
+            getattr(settings, "decision_letters", ()) or ())
+        meta["decision_loss_scope"] = str(
+            getattr(settings, "decision_loss_scope", "letters") or "letters")
+    try:
+        _os.makedirs(out_dir, exist_ok=True)
+        tmp = meta_path + ".tmp"
+        with open(tmp, "w") as _f:
+            _json.dump(meta, _f, indent=1)
+        _os.replace(tmp, meta_path)
+    except Exception as exc:
+        print(f"[text-lora] could not write meta.json for {out_dir}: {exc}",
+              flush=True)
 
 
 def _looks_like_error(msg: object) -> bool:
@@ -3642,6 +3699,14 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         rounds=req.rounds,
         max_pod_hourly_usd=req.max_pod_hourly_usd,
         max_fleet_hourly_usd=req.max_fleet_hourly_usd)
+    # The EFFECTIVE thinking setting: the model's pinned value wins over the
+    # request so a catalogue that declares the contract cannot be overridden by
+    # a caller that forgot it; only an unpinned model defers to the request.
+    # Used for BOTH the dataset pass and the trained settings, so training,
+    # the dry run and serving all render the one prompt.
+    _eff_thinking = (_train_cfg.enable_thinking
+                     if getattr(_train_cfg, "enable_thinking", None) is not None
+                     else bool(req.enable_thinking))
     # Anything that ASKS for pods must refuse when the model has no block --
     # not fall through to training here. That fall-through is what turned a
     # test run into tens of gigabytes of download on a GPU-less orchestrator
@@ -3706,7 +3771,8 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         with _TRANSFORMERS_IMPORT_LOCK:
             from transformers import AutoTokenizer
         _tok = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
-        _enc, _st = _text_dataset_pass(req, dataset_path, _tok)
+        _enc, _st = _text_dataset_pass(req, dataset_path, _tok,
+                                       enable_thinking=_eff_thinking)
         _sum = {"examples": _st.examples, "skipped": len(_st.skipped),
                 "trained_tokens": _st.trained_tokens,
                 "masked_tokens": _st.masked_tokens}
@@ -3733,7 +3799,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         learning_rate=float(req.learning_rate or 1e-4),
         max_len=int(req.max_len or 8192),
         accumulation_steps=int(req.accumulation_steps or 8),
-        enable_thinking=bool(req.enable_thinking),
+        enable_thinking=bool(_eff_thinking),
         seed=int(req.seed or 42),
         objective=str(getattr(req, "objective", None) or "sft"),
         decision_letters=tuple(getattr(req, "decision_letters", None) or ()),
@@ -3859,6 +3925,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         raise
     finally:
         _active_job_id = None
+    _write_text_lora_meta(out_dir, base=base, settings=st)
     _update_job(job_id, status="done", active=False, force=True,
                 path=out_dir, message=f"saved {req.name}")
     return {**summary, **result, "path": out_dir, "name": req.name}
@@ -5659,6 +5726,11 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
             dropout=getattr(coord.settings, "dropout", None))
         print(f"[text-lora] {job_id}: wrote {os.path.basename(_acfg)}",
               flush=True)
+        # The training contract beside the adapter: base, objective, answer
+        # letters, and the enable_thinking the fleet trained with -- so serving
+        # renders the identical prompt. coord.settings is the QLoraSettings the
+        # pods used, so this records what actually happened, not what was asked.
+        _write_text_lora_meta(out_dir, base=coord.base, settings=coord.settings)
         _cov, _cwant = coord.coverage()
         print(f"[text-lora] {job_id}: finished {coord.tracker.round} "
               f"exchange(s), {_cov}/{_cwant} blocks trained; "

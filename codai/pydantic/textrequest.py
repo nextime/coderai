@@ -269,7 +269,13 @@ class DecisionRequest(BaseModel):
                                         "value comfortably above len(letters).")
     temperature: float = Field(0.0, description="Scoring is deterministic by "
                                                 "default; logprobs are read raw.")
-    enable_thinking: Optional[bool] = Field(False, description="A decision model "
-                                            "answers in one token, so thinking "
-                                            "is off by default.")
+    enable_thinking: Optional[bool] = Field(None, description="Leave unset to "
+                                            "use the model's trained contract "
+                                            "(the enable_thinking it was trained "
+                                            "with, recorded beside the adapter) "
+                                            "-- a decision model must be served "
+                                            "the way it was trained or its "
+                                            "distribution shifts. An explicit "
+                                            "true/false overrides; an unpinned "
+                                            "model with nothing recorded is off.")
     model_config = ConfigDict(extra="allow")

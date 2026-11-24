@@ -2812,6 +2812,28 @@ def _model_thinking_default(model_name: str):
         return True
     if val in _THINKING_OFF:
         return False
+    # Nothing on the served entry: fall back to the adapter's OWN recorded
+    # contract (meta.json written at train time), so a decision/text LoRA served
+    # without an explicit `thinking` still renders the prompt it was trained
+    # with. A served name that is not a LoRA directory just misses and returns
+    # None (the model's own default) exactly as before.
+    try:
+        from codai.api.loras import _lora_dir as _ld
+        import os as _os
+        import json as _json
+        mp = _os.path.join(_ld(model_name), "meta.json")
+        if _os.path.isfile(mp):
+            with open(mp) as _f:
+                m = _json.load(_f) or {}
+            if isinstance(m.get("enable_thinking"), bool):
+                return m["enable_thinking"]
+            mt = str(m.get("thinking") or "").strip().lower()
+            if mt in _THINKING_ON:
+                return True
+            if mt in _THINKING_OFF:
+                return False
+    except Exception:
+        pass
     return None
 
 
@@ -3941,7 +3963,12 @@ async def decision(request: DecisionRequest):
         stream=False,
         logprobs=True,
         top_logprobs=top_k,
-        enable_thinking=bool(request.enable_thinking) if request.enable_thinking is not None else False,
+        # Pass it THROUGH, do not force False: None lets the chat path resolve
+        # the model's recorded thinking default (`_model_thinking_default`,
+        # which reads the served entry's `thinking` and falls back to the
+        # adapter's own meta.json), so a decision model is served the way it was
+        # trained. An explicit true/false from the caller still wins.
+        enable_thinking=request.enable_thinking,
     )
     try:
         result = await chat_completions(chat_req, None)

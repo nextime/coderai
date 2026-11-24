@@ -1034,6 +1034,13 @@ class LoraTrainConfig:
     learning_rate: float = 1e-4
     max_len: int = 8192
     accumulation_steps: int = 8
+    #: Whether the chat template renders a thinking turn during training. None
+    #: leaves the request's value; set here it PINS the value for this model and
+    #: is recorded beside the trained adapter, so serving (/v1/decision) renders
+    #: the identical prompt. A decision model served with a different thinking
+    #: setting than it trained with gives a different, wrong letter distribution
+    #: -- so this is part of the adapter's contract, not a free knob.
+    enable_thinking: Optional[bool] = None
     #: A Hugging Face token for the pods to pull the base with. Empty means the
     #: orchestrator's own environment is used instead (see hf_token_for_pods),
     #: and empty in both places means every pod pulls anonymously -- which is a
@@ -1053,7 +1060,12 @@ def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
             continue
         raw = block[f.name]
         try:
-            if f.type is bool or f.name == "enabled":
+            if f.name == "enable_thinking":
+                # Optional[bool]: None stays None (not pinned), anything else is
+                # a real boolean. The generic float() branch would turn it into
+                # 1.0/0.0 and silently pin it.
+                setattr(cfg, f.name, None if raw is None else bool(raw))
+            elif f.type is bool or f.name == "enabled":
                 setattr(cfg, f.name, bool(raw))
             elif f.name in ("gpu_types", "cloud_type", "image",
                             "network_volume_id", "base_model"):
