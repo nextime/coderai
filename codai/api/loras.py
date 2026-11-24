@@ -3209,6 +3209,15 @@ class TextLoraTrainRequest(BaseModel):
     max_len: Optional[int] = 8192
     accumulation_steps: Optional[int] = 8
     epochs: Optional[float] = 1.0
+    #: LR schedule. ``"constant"`` (default, a flat lr -- unchanged behaviour) or
+    #: ``"cosine"``/``"linear"`` warming linearly over ``warmup_ratio`` of the
+    #: run's steps to the peak ``learning_rate``, then decaying to zero. The
+    #: schedule spans the whole run, not each distributed block.
+    lr_scheduler_type: Optional[str] = "constant"
+    warmup_ratio: Optional[float] = 0.0
+    #: AdamW weight decay. Default 0.01 (torch's, and the historical behaviour);
+    #: pass 0.0 for a recipe that uses none.
+    weight_decay: Optional[float] = 0.01
     enable_thinking: Optional[bool] = False
     seed: Optional[int] = 42
 
@@ -3467,6 +3476,11 @@ def _write_text_lora_meta(out_dir: str, *, base: str, settings) -> None:
         # leaves `thinking` unset still renders the trained prompt: the serving
         # default reads this when the catalogue entry says nothing.
         "thinking": "on" if et else "off",
+        "lr_scheduler_type": str(
+            getattr(settings, "lr_scheduler_type", "constant") or "constant"),
+        "warmup_ratio": float(getattr(settings, "warmup_ratio", 0.0) or 0.0),
+        "learning_rate": float(getattr(settings, "learning_rate", 0.0) or 0.0),
+        "weight_decay": float(getattr(settings, "weight_decay", 0.01)),
     })
     if obj == "decision":
         meta["decision_letters"] = list(
@@ -3805,7 +3819,12 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         decision_letters=tuple(getattr(req, "decision_letters", None) or ()),
         decision_loss_scope=str(
             getattr(req, "decision_loss_scope", None) or "letters"),
-        target_suffixes=tuple(getattr(req, "target_modules", None) or ()))
+        target_suffixes=tuple(getattr(req, "target_modules", None) or ()),
+        lr_scheduler_type=str(
+            getattr(req, "lr_scheduler_type", None) or "constant"),
+        warmup_ratio=float(getattr(req, "warmup_ratio", None) or 0.0),
+        weight_decay=(0.01 if getattr(req, "weight_decay", None) is None
+                      else float(req.weight_decay)))
 
     if req.test_run:
         # One pod, one round, a handful of examples, and a short leash. The
@@ -3832,9 +3851,12 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # real run, and the rounds path was investigated instead. The record
         # has to say which kind of run it is, next to the number it explains.
         _update_job(job_id, test_run=True, rounds=1,
-                    rounds_note=(f"test run: rounds forced to 1 and the set "
-                                 f"truncated to at most {n} example(s), "
-                                 f"whatever the request asked for"))
+                    rounds_note=(f"test run: 1 pod, 1 round. The {n}-example "
+                                 f"cap applies to LOCAL training; on a POD run "
+                                 f"the pods encode the full dataset themselves, "
+                                 f"so the cap does not reach them — for a cheap "
+                                 f"pod chain-test, point at a small dataset_id "
+                                 f"instead. (Pod-side cap is a tracked TODO.)"))
     # ASKING FOR A POD IS ASKING FOR A POD. This used to require
     # `max_pods > 1 or test_run`, so a request for exactly ONE pod -- `pods: 1,
     # min_pods: 1` -- fell through to the local path and tried to train on an
@@ -4448,7 +4470,13 @@ class _TextTrainCoordinator:
                          "decision_loss_scope": getattr(
                              self.settings, "decision_loss_scope", "letters"),
                          "target_suffixes": list(
-                             getattr(self.settings, "target_suffixes", ()) or ())},
+                             getattr(self.settings, "target_suffixes", ()) or ()),
+                         "lr_scheduler_type": getattr(
+                             self.settings, "lr_scheduler_type", "constant"),
+                         "warmup_ratio": getattr(
+                             self.settings, "warmup_ratio", 0.0),
+                         "weight_decay": getattr(
+                             self.settings, "weight_decay", 0.01)},
         }
 
     def submit(self, sub) -> None:
@@ -4748,7 +4776,12 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
     # reshuffled and started from nothing. The note was corrected to say so,
     # and the gap it described is now closed: a round close writes
     # `resume.json` beside the averages, and `resume_from` adopts both.
-    _update_job(job_id, test_run=False, rounds=rounds,
+    # Record what was actually launched, not a flat False: a distributed run
+    # that carried `test_run: true` used to end up recorded `test_run: false`,
+    # which read as "this was the full run" when it was meant to be a probe --
+    # the single worst kind of record, one that lies about what you started.
+    _update_job(job_id, test_run=bool(getattr(req, "test_run", False)),
+                rounds=rounds,
                 # `rounds` SIZES THE WORK, it does not count the exchanges.
                 # A block is `ceil(examples / (rounds * pods))` and the run
                 # ends on coverage, so a fleet smaller than planned takes

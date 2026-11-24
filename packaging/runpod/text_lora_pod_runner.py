@@ -84,7 +84,12 @@ def _train(payload):
             objective=str(st.get("objective", "sft")),
             decision_letters=tuple(st.get("decision_letters") or ()),
             decision_loss_scope=str(st.get("decision_loss_scope", "letters")),
-            target_suffixes=tuple(st.get("target_suffixes") or ()))
+            target_suffixes=tuple(st.get("target_suffixes") or ()),
+            lr_scheduler_type=str(st.get("lr_scheduler_type", "constant")),
+            warmup_ratio=float(st.get("warmup_ratio", 0.0) or 0.0),
+            lr_total_steps=int(st.get("lr_total_steps", 0) or 0),
+            lr_step_offset=int(st.get("lr_step_offset", 0) or 0),
+            weight_decay=float(st.get("weight_decay", 0.01)))
         base = payload.get("base") or _cache["base"]
         if not base:
             raise RuntimeError("no base model was given")

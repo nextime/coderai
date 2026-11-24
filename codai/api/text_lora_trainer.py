@@ -164,6 +164,23 @@ class QLoraSettings:
     #: :data:`LANGUAGE_SUFFIXES`. Empty means the default. Lets an operator pin a
     #: base's exact projection set (e.g. a spark2_5 adapter's target list).
     target_suffixes: tuple = ()
+    #: LR schedule over the run. ``"constant"`` (default -- the historical
+    #: behaviour, a flat lr) or ``"cosine"``/``"linear"`` with ``warmup_ratio``
+    #: of the steps spent warming linearly to the peak ``learning_rate`` and the
+    #: rest decaying to zero. The schedule spans the WHOLE run: in a distributed
+    #: run the orchestrator passes ``lr_total_steps`` (all rounds) and
+    #: ``lr_step_offset`` (steps already done), so the cosine does not restart
+    #: each block into a sawtooth that never really decays.
+    lr_scheduler_type: str = "constant"
+    warmup_ratio: float = 0.0
+    #: Steps the schedule spans, and where this invocation starts within it.
+    #: 0 total = use this call's own step count (the single-block case, where
+    #: one invocation IS the whole run).
+    lr_total_steps: int = 0
+    lr_step_offset: int = 0
+    #: AdamW weight decay. Default 0.01 is torch's and the historical behaviour;
+    #: a distillation recipe that uses none passes 0.0.
+    weight_decay: float = 0.01
 
 
 def bnb_config(st: QLoraSettings):
@@ -552,6 +569,42 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
     return peft_model, line
 
 
+def build_lr_schedule(optimizer, settings: QLoraSettings, *, examples: int,
+                      accum: int, resumed_step: int = 0):
+    """The LR scheduler for a run, or ``None`` for a flat (constant) lr.
+
+    The schedule spans the WHOLE run, not this call. In a distributed run the
+    orchestrator passes ``lr_total_steps`` (optimizer steps across every round)
+    as the horizon and ``lr_step_offset`` as the steps already done, so the
+    returned scheduler is advanced to our true position: a cosine keeps
+    descending across blocks instead of resetting to the peak each block into a
+    sawtooth that never really decays. With no ``lr_total_steps`` the horizon is
+    this call's own ``ceil(examples / accum)`` -- correct for the single-block
+    case where one invocation IS the whole run.
+
+    ``"constant"`` with no warmup returns ``None`` (the historical flat lr).
+    """
+    import math as _math
+    steps_here = max(1, _math.ceil(int(examples) / max(1, int(accum))))
+    horizon = int(getattr(settings, "lr_total_steps", 0) or 0) or steps_here
+    sched_type = str(getattr(settings, "lr_scheduler_type", "constant")
+                     or "constant").lower()
+    warmup = int(round(float(getattr(settings, "warmup_ratio", 0.0) or 0.0)
+                       * horizon))
+    if sched_type not in ("cosine", "linear") and warmup <= 0:
+        return None
+    from transformers import get_scheduler
+    name = (sched_type if sched_type in ("cosine", "linear")
+            else "constant_with_warmup")
+    sched = get_scheduler(name, optimizer=optimizer, num_warmup_steps=warmup,
+                          num_training_steps=horizon)
+    start = max(0, int(getattr(settings, "lr_step_offset", 0) or 0)
+                + int(resumed_step or 0))
+    for _ in range(start):
+        sched.step()
+    return sched
+
+
 def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
                  out_dir: str, on_progress=None, check=None,
                  resume: bool = True, init_adapter: str = "") -> Dict[str, Any]:
@@ -636,7 +689,9 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
               f"({progress.examples_seen} examples already seen)", flush=True)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=settings.learning_rate)
+    optimizer = torch.optim.AdamW(
+        trainable, lr=settings.learning_rate,
+        weight_decay=float(getattr(settings, "weight_decay", 0.01)))
 
     order = list(range(len(encoded)))
     random.Random(settings.seed).shuffle(order)
@@ -645,6 +700,17 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
     order = order[progress.examples_seen:]
 
     accum = max(1, int(settings.accumulation_steps))
+
+    # LR schedule spanning the whole run (see build_lr_schedule). "constant"
+    # with no warmup returns None -> the historical flat lr, unchanged.
+    scheduler = build_lr_schedule(optimizer, settings, examples=len(encoded),
+                                  accum=accum, resumed_step=progress.step)
+    if scheduler is not None:
+        print(f"[text-lora] lr schedule: {settings.lr_scheduler_type}, peak "
+              f"{settings.learning_rate}, warmup_ratio {settings.warmup_ratio}, "
+              f"weight_decay {getattr(settings, 'weight_decay', 0.01)}",
+              flush=True)
+
     losses: List[float] = []
     model.train()
     for i, idx in enumerate(order, 1):
@@ -695,6 +761,8 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
         if i % accum == 0:
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             progress.step += 1
             if on_progress is not None and progress.step % 5 == 0:
@@ -711,6 +779,8 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
     if len(losses) % accum:
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         progress.step += 1
 
