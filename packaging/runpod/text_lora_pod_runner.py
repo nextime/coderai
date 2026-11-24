@@ -83,6 +83,7 @@ def _train(payload):
             seed=int(st.get("seed", 42)),
             objective=str(st.get("objective", "sft")),
             decision_letters=tuple(st.get("decision_letters") or ()),
+            decision_loss_scope=str(st.get("decision_loss_scope", "letters")),
             target_suffixes=tuple(st.get("target_suffixes") or ()))
         base = payload.get("base") or _cache["base"]
         if not base:

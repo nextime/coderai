@@ -154,6 +154,12 @@ class QLoraSettings:
     #: record and for the serving contract. The per-example ``decision`` target
     #: is authoritative for training; this is the default/declared set.
     decision_letters: tuple = ()
+    #: Which distribution the ``decision`` loss trains: ``"letters"`` (default --
+    #: softmax over the answer-letter logits alone, the quantity ``/v1/decision``
+    #: renormalises to and a gate thresholds on) or ``"vocab"`` (full-vocabulary
+    #: softmax gathered at the letters, the pre-``"letters"`` behaviour). See
+    #: :func:`decision_distillation_loss`.
+    decision_loss_scope: str = "letters"
     #: An explicit override of which module-name tails to adapt, instead of
     #: :data:`LANGUAGE_SUFFIXES`. Empty means the default. Lets an operator pin a
     #: base's exact projection set (e.g. a spark2_5 adapter's target list).
@@ -245,42 +251,62 @@ def scaled_backward(logits, labels, weight: float, accumulation_steps: int):
     return float(loss.detach())
 
 
-def decision_distillation_loss(logits, letter_token_ids, target_probs):
+def decision_distillation_loss(logits, letter_token_ids, target_probs,
+                               scope: str = "letters"):
     """Soft cross-entropy over the answer-letter logits at the LAST position.
 
-    ``logits`` is ``[1, seq, vocab]``. The decision example is prompt-only and
-    scored at the final prompt token, so ``logits[0, -1, :]`` is the model's
+    ``logits`` is ``[1, seq, vocab]`` -- or ``[1, 1, vocab]`` when the forward
+    was told to keep only the last position. The decision example is prompt-only
+    and scored at the final prompt token, so ``logits[0, -1, :]`` is the model's
     distribution over the token it would generate first -- the answer letter.
-    The loss is ``-sum(p_i * log_softmax(logits)[id_i])``: a cross-entropy from
-    the target distribution to the model's, which is the KL to the target up to
-    the target's own (constant) entropy, so minimising it matches the model's
-    answer-letter probabilities to ``target_probs``.
+    The loss is ``-sum(p_i * log q_i)``: the cross-entropy from the target ``p``
+    to the model's letter distribution ``q``, equal to ``KL(p || q)`` up to the
+    target's own (constant) entropy, so minimising it matches ``q`` to
+    ``target_probs`` and bottoms out at ``H(target)`` when they coincide.
 
-    log_softmax is taken over the FULL vocabulary and then gathered at the letter
-    ids, not over the letters alone: the probability of a letter is its share of
-    the whole distribution, and renormalising over a handful of ids first would
-    train a quantity the serving side never computes.
+    ``scope`` chooses WHICH ``q`` is trained, and it has to be the one the
+    serving side reads back, or the run optimises one quantity while the gate
+    thresholds another:
+
+    * ``"letters"`` (default) -- softmax over the letter logits ALONE. This is
+      exactly what ``/v1/decision`` computes: it takes each letter's probability
+      and renormalises over the letters that were found, and renormalising a
+      softmax over a subset is identically the softmax restricted to that subset.
+      So this trains the calibrated letter ratios a confidence gate uses, and a
+      perfect fit reaches ``H(target)`` -- the clean "aligned" signal.
+    * ``"vocab"`` -- softmax over the FULL vocabulary, gathered at the letters.
+      That also drives the off-menu mass toward zero, so it never reaches
+      ``H(target)`` even in theory and spends some of a low rank's capacity on
+      "emit only letters" instead of the ratios. Kept so an adapter trained
+      before ``"letters"`` existed can be reproduced unchanged.
     """
     import torch
     import torch.nn.functional as F
     last = logits[0, -1, :].float()                      # [vocab]
     ids = torch.as_tensor(letter_token_ids, device=last.device, dtype=torch.long)
-    logp = F.log_softmax(last, dim=-1).index_select(0, ids)   # [n_letters]
+    if str(scope) == "vocab":
+        logp = F.log_softmax(last, dim=-1).index_select(0, ids)   # [n_letters]
+    else:
+        # The letters alone -- the quantity /v1/decision renormalises to.
+        letter_logits = last.index_select(0, ids)                 # [n_letters]
+        logp = F.log_softmax(letter_logits, dim=-1)               # [n_letters]
     p = torch.as_tensor(target_probs, device=last.device, dtype=logp.dtype)
     p = p / p.sum()
     return -(p * logp).sum()
 
 
 def scaled_backward_decision(logits, letter_token_ids, target_probs,
-                             weight: float, accumulation_steps: int):
+                             weight: float, accumulation_steps: int,
+                             scope: str = "letters"):
     """The decision counterpart of :func:`scaled_backward`.
 
     Same weight/accumulation scaling so a decision run mixes with the rest of the
     fleet machinery unchanged; returns the unscaled soft cross-entropy for the
-    log.
+    log. ``scope`` is forwarded to :func:`decision_distillation_loss`.
     """
     from codai.api.text_lora_dataset import loss_scale
-    loss = decision_distillation_loss(logits, letter_token_ids, target_probs)
+    loss = decision_distillation_loss(logits, letter_token_ids, target_probs,
+                                      scope=scope)
     (loss * loss_scale(weight, accumulation_steps)).backward()
     return float(loss.detach())
 
@@ -631,11 +657,20 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
             # Prompt-only: no labels tensor, scored at the final position.
             _letters = ex.letter_token_ids
             _probs = ex.target_probs
+            _scope = getattr(settings, "decision_loss_scope", "letters")
 
             def _one():
-                out = model(input_ids=ids)
+                # Only the last position's logits matter for a decision, so ask
+                # the head to compute that one row instead of seq x vocab (a
+                # 3.4k-token prompt is 3.4k x 131k logits otherwise). A base
+                # whose forward does not accept the hint raises TypeError or
+                # ignores it; either way the slice below stays correct.
+                try:
+                    out = model(input_ids=ids, logits_to_keep=1)
+                except TypeError:
+                    out = model(input_ids=ids)
                 return scaled_backward_decision(
-                    out.logits, _letters, _probs, ex.weight, accum)
+                    out.logits, _letters, _probs, ex.weight, accum, _scope)
         else:
             labels = torch.tensor([ex.labels], device=model.device)
 

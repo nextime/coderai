@@ -3220,6 +3220,11 @@ class TextLoraTrainRequest(BaseModel):
     #: The candidate answer letters for a decision model, for the record and the
     #: serving contract. The per-example ``decision`` target drives training.
     decision_letters: Optional[List[str]] = None
+    #: Which distribution the ``decision`` loss trains: ``"letters"`` (default --
+    #: softmax over the answer-letter logits alone, matching what ``/v1/decision``
+    #: reads) or ``"vocab"`` (full-vocabulary softmax, the pre-``"letters"``
+    #: behaviour, for reproducing an older adapter). Ignored for ``sft``.
+    decision_loss_scope: Optional[str] = None
     #: Pin exactly which module-name tails the LoRA adapts, instead of the
     #: built-in language-projection set. For a base whose projections are named
     #: unusually (e.g. spark2_5's ``q_k_v_proj``/``out_proj``/``g_proj``), or to
@@ -3732,6 +3737,8 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         seed=int(req.seed or 42),
         objective=str(getattr(req, "objective", None) or "sft"),
         decision_letters=tuple(getattr(req, "decision_letters", None) or ()),
+        decision_loss_scope=str(
+            getattr(req, "decision_loss_scope", None) or "letters"),
         target_suffixes=tuple(getattr(req, "target_modules", None) or ()))
 
     if req.test_run:
@@ -4371,6 +4378,8 @@ class _TextTrainCoordinator:
                          "objective": getattr(self.settings, "objective", "sft"),
                          "decision_letters": list(
                              getattr(self.settings, "decision_letters", ()) or ()),
+                         "decision_loss_scope": getattr(
+                             self.settings, "decision_loss_scope", "letters"),
                          "target_suffixes": list(
                              getattr(self.settings, "target_suffixes", ()) or ())},
         }
