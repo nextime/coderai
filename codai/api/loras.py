@@ -111,7 +111,9 @@ _MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
                   "examples_total",
                   "exchange", "epochs",
                   "pods", "pods_target", "pods_ceiling", "hourly_usd",
-                  "trainer_image", "quantization", "quantization_note")
+                  "trainer_image", "quantization", "quantization_note",
+                  "enable_thinking", "max_pod_hourly_usd", "min_vram_gb",
+                  "gpu_types")
 _last_job_persist = 0.0
 
 
@@ -3835,24 +3837,39 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         _rounds = max(1, int(getattr(_train_cfg, "rounds", 1) or 1))
         _bsize = max(1, -(-int(stats.examples) // (_rounds * _n_shards)))
         _blocks_total = max(1, -(-int(stats.examples) // _bsize))
+        # gpu_types is stored on the block as the comma-separated STRING from
+        # models.json (not a list), so `list(...)` of it would be a list of
+        # CHARACTERS. Split it into the ordered card list a caller can read.
+        _gt_raw = getattr(_train_cfg, "gpu_types", "") or ""
+        _gpu_list = ([x.strip() for x in _gt_raw.split(",") if x.strip()]
+                     if isinstance(_gt_raw, str) else list(_gt_raw))
+        _ceiling = float(getattr(_train_cfg, "max_pod_hourly_usd", 0.0) or 0.0)
+        _vram_floor = float(getattr(_train_cfg, "min_vram_gb", 0.0) or 0.0)
         resolution = {
             "trainer_image": str(getattr(_train_cfg, "image", "") or ""),
             "quantization": _eff_quantization,
             "quantization_note": _q_note,
             "enable_thinking": bool(_eff_thinking),
             "objective": str(getattr(req, "objective", None) or "sft"),
-            "max_pod_hourly_usd": float(
-                getattr(_train_cfg, "max_pod_hourly_usd", 0.0) or 0.0),
-            "gpu_types": list(getattr(_train_cfg, "gpu_types", []) or []),
-            "min_vram_gb": float(getattr(_train_cfg, "min_vram_gb", 0.0) or 0.0),
+            "max_pod_hourly_usd": _ceiling,
+            "gpu_types": _gpu_list,
+            "min_vram_gb": _vram_floor,
             "pods": _n_shards, "rounds": _rounds,
             "blocks_total": _blocks_total,
         }
+        # Mirror the WHOLE resolution to the status, not a subset: a caller who
+        # reads the job status (not the response body) must still be able to
+        # verify every pinned value against what was declared -- the fields left
+        # out were exactly the ones a pre-flight could not check.
         _update_job(job_id, status="done", active=False, force=True,
                     trainer_image=resolution["trainer_image"],
                     quantization=_eff_quantization,
                     quantization_note=_q_note,
                     blocks_total=_blocks_total,
+                    enable_thinking=bool(_eff_thinking),
+                    max_pod_hourly_usd=_ceiling,
+                    min_vram_gb=_vram_floor,
+                    gpu_types=_gpu_list,
                     message=f"dry run: {stats.describe()}")
         print(f"[text-lora] {job_id}: dry-run resolution -> image "
               f"{resolution['trainer_image'] or '<unset>'}, quantization "
@@ -4917,6 +4934,20 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
           + (" (4-bit QLoRA)" if _is_4bit(settings)
              else " (unquantized — full-dtype LoRA)"), flush=True)
     _update_job(job_id, quantization=_quant)
+    # The same pinned values the dry run reports, mirrored on the REAL run too,
+    # so the status a caller watches while it trains carries every one it could
+    # verify at pre-flight -- not just the image and quantization.
+    _gt_raw = getattr(cfg, "gpu_types", "") or ""
+    _gpu_list = ([x.strip() for x in _gt_raw.split(",") if x.strip()]
+                 if isinstance(_gt_raw, str) else list(_gt_raw))
+    _update_job(job_id,
+                enable_thinking=bool(getattr(cfg, "enable_thinking", None)
+                                     if getattr(cfg, "enable_thinking", None)
+                                     is not None else req.enable_thinking),
+                max_pod_hourly_usd=float(
+                    getattr(cfg, "max_pod_hourly_usd", 0.0) or 0.0),
+                min_vram_gb=float(getattr(cfg, "min_vram_gb", 0.0) or 0.0),
+                gpu_types=_gpu_list)
     # DECLARE a disagreement, don't swallow it. `quantization` (and
     # enable_thinking) let the MODEL block win over the request, while
     # learning_rate/accumulation let the REQUEST win over the block -- two
