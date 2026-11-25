@@ -111,7 +111,7 @@ _MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
                   "examples_total",
                   "exchange", "epochs",
                   "pods", "pods_target", "pods_ceiling", "hourly_usd",
-                  "trainer_image")
+                  "trainer_image", "quantization", "quantization_note")
 _last_job_persist = 0.0
 
 
@@ -3239,6 +3239,13 @@ class TextLoraTrainRequest(BaseModel):
     #: unusually (e.g. spark2_5's ``q_k_v_proj``/``out_proj``/``g_proj``), or to
     #: reproduce a published adapter's target set exactly. Empty = the default.
     target_modules: Optional[List[str]] = None
+    #: Base quantization for training. ``"nf4"`` (default) / ``"fp4"`` = 4-bit
+    #: QLoRA via bitsandbytes. ``"none"`` (aliases ``"off"``/``"bf16"``/
+    #: ``"full"``) = no quantization, a LoRA on the full ``compute_dtype`` base
+    #: -- higher fidelity and the path for a base the installed bitsandbytes
+    #: cannot 4-bit (e.g. spark2_5 under transformers 4.57.1). The memory cost
+    #: is the full base; fine on an 80GB card for a small base.
+    quantization: Optional[str] = None
 
     #: Refuse rather than train on a dataset that turned out much smaller than
     #: the caller thinks. Skips are legitimate (an example over max_len cannot
@@ -3481,6 +3488,7 @@ def _write_text_lora_meta(out_dir: str, *, base: str, settings) -> None:
         "warmup_ratio": float(getattr(settings, "warmup_ratio", 0.0) or 0.0),
         "learning_rate": float(getattr(settings, "learning_rate", 0.0) or 0.0),
         "weight_decay": float(getattr(settings, "weight_decay", 0.01)),
+        "quantization": str(getattr(settings, "quantization", "nf4") or "nf4"),
     })
     if obj == "decision":
         meta["decision_letters"] = list(
@@ -3721,6 +3729,13 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
     _eff_thinking = (_train_cfg.enable_thinking
                      if getattr(_train_cfg, "enable_thinking", None) is not None
                      else bool(req.enable_thinking))
+    # The EFFECTIVE quantization, same contract as thinking: the model's pinned
+    # value wins over the request, so a base that MUST train unquantized (its
+    # custom code the image's bitsandbytes cannot 4-bit) cannot be sent into a
+    # 4-bit run by a caller that omits the field. Only an unpinned model (block
+    # leaves it "") defers to the request, which itself defaults to "nf4".
+    _eff_quantization = (str(getattr(_train_cfg, "quantization", "") or "").strip()
+                         or str(getattr(req, "quantization", None) or "nf4"))
     # Anything that ASKS for pods must refuse when the model has no block --
     # not fall through to training here. That fall-through is what turned a
     # test run into tens of gigabytes of download on a GPU-less orchestrator
@@ -3802,9 +3817,49 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         # Inline: a dry run is the dataset pass and nothing else, and it must
         # not rent anything to do it.
         _, stats, summary = _prepare()
+        # THE BLOCK RESOLUTION, before any pod exists. A dry run proves the
+        # dataset; this makes it also prove what the real run WOULD be told --
+        # the image, the quantization (and whether request and block
+        # disagreed), the price ceiling, the card order, and the single-
+        # invocation block count -- so a caller can read it against what was
+        # declared and refuse to light a pod if a line is not what they expect.
+        # It closes the gap between "I was told" and "it is so" at zero cost.
+        _req_q = (str(req.quantization).strip()
+                  if getattr(req, "quantization", None) else "")
+        _blk_q = str(getattr(_train_cfg, "quantization", "") or "").strip()
+        _q_note = (f"quantization: request {_req_q!r}, block {_blk_q!r} (pinned) "
+                   f"-> {_eff_quantization!r}"
+                   if _req_q and _blk_q and _req_q.lower() != _blk_q.lower()
+                   else "")
+        _n_shards = max(1, int(getattr(_train_cfg, "max_pods", 1) or 1))
+        _rounds = max(1, int(getattr(_train_cfg, "rounds", 1) or 1))
+        _bsize = max(1, -(-int(stats.examples) // (_rounds * _n_shards)))
+        _blocks_total = max(1, -(-int(stats.examples) // _bsize))
+        resolution = {
+            "trainer_image": str(getattr(_train_cfg, "image", "") or ""),
+            "quantization": _eff_quantization,
+            "quantization_note": _q_note,
+            "enable_thinking": bool(_eff_thinking),
+            "objective": str(getattr(req, "objective", None) or "sft"),
+            "max_pod_hourly_usd": float(
+                getattr(_train_cfg, "max_pod_hourly_usd", 0.0) or 0.0),
+            "gpu_types": list(getattr(_train_cfg, "gpu_types", []) or []),
+            "min_vram_gb": float(getattr(_train_cfg, "min_vram_gb", 0.0) or 0.0),
+            "pods": _n_shards, "rounds": _rounds,
+            "blocks_total": _blocks_total,
+        }
         _update_job(job_id, status="done", active=False, force=True,
+                    trainer_image=resolution["trainer_image"],
+                    quantization=_eff_quantization,
+                    quantization_note=_q_note,
+                    blocks_total=_blocks_total,
                     message=f"dry run: {stats.describe()}")
-        return {"dry_run": True, **summary}
+        print(f"[text-lora] {job_id}: dry-run resolution -> image "
+              f"{resolution['trainer_image'] or '<unset>'}, quantization "
+              f"{_eff_quantization}, blocks_total {_blocks_total}, ceiling "
+              f"${resolution['max_pod_hourly_usd']:.2f}/hr"
+              + (f"; {_q_note}" if _q_note else ""), flush=True)
+        return {"dry_run": True, **summary, "resolution": resolution}
 
     st = tlt.QLoraSettings(
         rank=int(req.rank or 16),
@@ -3820,6 +3875,7 @@ def _text_train_blocking(req: TextLoraTrainRequest, job_id: str,
         decision_loss_scope=str(
             getattr(req, "decision_loss_scope", None) or "letters"),
         target_suffixes=tuple(getattr(req, "target_modules", None) or ()),
+        quantization=_eff_quantization,
         lr_scheduler_type=str(
             getattr(req, "lr_scheduler_type", None) or "constant"),
         warmup_ratio=float(getattr(req, "warmup_ratio", None) or 0.0),
@@ -4471,6 +4527,8 @@ class _TextTrainCoordinator:
                              self.settings, "decision_loss_scope", "letters"),
                          "target_suffixes": list(
                              getattr(self.settings, "target_suffixes", ()) or ()),
+                         "quantization": getattr(
+                             self.settings, "quantization", "nf4"),
                          "lr_scheduler_type": getattr(
                              self.settings, "lr_scheduler_type", "constant"),
                          "warmup_ratio": getattr(
@@ -4847,6 +4905,36 @@ def _text_train_distributed(req: "TextLoraTrainRequest", job_id: str,
              " (PINNED tag — a rebuilt image will NOT reach these pods "
              "until this is changed)"), flush=True)
     _update_job(job_id, trainer_image=_img)
+
+    # The quantization that actually drives the run, reported like the image so
+    # no one can believe they launched something other than what runs. Same
+    # lesson as test_run: the record is the authoritative settings object the
+    # pods receive, not what the request happened to say. A base pinned to
+    # "none" trains a full-dtype LoRA; the default "nf4" is 4-bit QLoRA.
+    from codai.api.text_lora_trainer import is_4bit as _is_4bit
+    _quant = str(getattr(settings, "quantization", "nf4") or "nf4")
+    print(f"[text-lora] {job_id}: quantization {_quant}"
+          + (" (4-bit QLoRA)" if _is_4bit(settings)
+             else " (unquantized — full-dtype LoRA)"), flush=True)
+    _update_job(job_id, quantization=_quant)
+    # DECLARE a disagreement, don't swallow it. `quantization` (and
+    # enable_thinking) let the MODEL block win over the request, while
+    # learning_rate/accumulation let the REQUEST win over the block -- two
+    # opposite precedences live in one trainer, and a caller who wrote an
+    # explicit body cannot see which of their values was overruled. So when the
+    # request asked for one quantization and the block pinned another, SAY which
+    # won: not an error, a statement, beside the value itself -- otherwise the
+    # day someone puts "nf4" back in the block, an explicit "none" is ignored in
+    # silence and the caller believes a thing that is not what ran (the
+    # test_run:false defect by another name).
+    _req_quant = (str(req.quantization).strip()
+                  if getattr(req, "quantization", None) else "")
+    _blk_quant = str(getattr(cfg, "quantization", "") or "").strip()
+    if _req_quant and _blk_quant and _req_quant.lower() != _blk_quant.lower():
+        _recon = (f"quantization: request {_req_quant!r}, block {_blk_quant!r} "
+                  f"(pinned) -> ran {_quant!r}")
+        print(f"[text-lora] {job_id}: {_recon}", flush=True)
+        _update_job(job_id, quantization_note=_recon)
 
     out_dir = os.path.join(_loras_dir(), req.name)
     # A RESUME IS VETTED BEFORE A POD IS RENTED. The full check needs the

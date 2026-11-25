@@ -1041,6 +1041,14 @@ class LoraTrainConfig:
     #: setting than it trained with gives a different, wrong letter distribution
     #: -- so this is part of the adapter's contract, not a free knob.
     enable_thinking: Optional[bool] = None
+    #: Base quantization for training, PINNED for this model. ``""`` (default)
+    #: leaves the request's value; ``"nf4"``/``"fp4"`` = 4-bit QLoRA, ``"none"``
+    #: = a full-dtype bf16 LoRA. Like ``enable_thinking`` this is part of the
+    #: adapter's contract, not a free knob: a base whose custom code the image's
+    #: bitsandbytes cannot 4-bit (e.g. spark2_5 under transformers 4.57.1) MUST
+    #: pin ``"none"`` here, so a request body that forgets it does not fall back
+    #: to 4-bit and train a silently-wrong (or crashing) run.
+    quantization: str = ""
     #: A Hugging Face token for the pods to pull the base with. Empty means the
     #: orchestrator's own environment is used instead (see hf_token_for_pods),
     #: and empty in both places means every pod pulls anonymously -- which is a
@@ -1068,7 +1076,7 @@ def parse_model_lora_train(block: Optional[dict]) -> LoraTrainConfig:
             elif f.type is bool or f.name == "enabled":
                 setattr(cfg, f.name, bool(raw))
             elif f.name in ("gpu_types", "cloud_type", "image",
-                            "network_volume_id", "base_model"):
+                            "network_volume_id", "base_model", "quantization"):
                 setattr(cfg, f.name, str(raw or "").strip())
             elif f.name in ("max_pods", "rounds", "container_disk_gb", "rank",
                             "alpha", "accumulation_steps", "max_len"):

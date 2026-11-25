@@ -26,6 +26,21 @@ RUN python3 -m pip install --no-cache-dir \
         "peft>=0.14" "bitsandbytes>=0.50.2" "accelerate>=1.0" "safetensors>=0.4" \
  && python3 -m pip uninstall -y tilelang || true
 
+# A base whose custom modeling code was written for an OLDER transformers can
+# fail to load on the base image's transformers -- e.g. spark2_5, whose
+# `_tied_weights_keys` is a list (the 4.x convention) that transformers 5.x's
+# post_init calls `.keys()` on, an AttributeError before a single step. This
+# arg pins transformers for THIS image only; the shared trainer image leaves it
+# empty and keeps the base's transformers. It is a build-time choice per base,
+# not a downgrade of the shared trainer. Such a base trains UNQUANTIZED
+# (`quantization: "none"`), because the base image's bitsandbytes does not
+# consume an older transformers' 4-bit quant_state -- a LoRA on the full
+# bf16 base is the working path and is a few GB for a small base.
+ARG TRANSFORMERS_PIN=
+RUN if [ -n "$TRANSFORMERS_PIN" ]; then \
+        python3 -m pip install --no-cache-dir "transformers==${TRANSFORMERS_PIN}"; \
+    fi
+
 # coderai's dataset and trainer modules, so the pod can run THIS repo's trainer
 # (the masking, the per-example weight scaling, the target selection) rather
 # than a copy that drifts from it. Pure Python, no coderai runtime needed.

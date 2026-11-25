@@ -143,6 +143,16 @@ class QLoraSettings:
     quant_type: str = "nf4"
     double_quant: bool = True
     compute_dtype: str = "bfloat16"
+    #: Base quantization for training. ``"nf4"``/``"fp4"`` = 4-bit QLoRA via
+    #: bitsandbytes (the default -- what a 27B-class base on one card needs).
+    #: ``"none"`` (aliases ``"off"``/``"bf16"``/``"full"``) = no quantization, a
+    #: LoRA on the full ``compute_dtype`` base. Higher fidelity, and the only
+    #: working path for a base whose custom code or transformers version the
+    #: installed bitsandbytes cannot 4-bit -- e.g. spark2_5 on transformers
+    #: 4.57.1, where the 4-bit quant_state is never consumed and raw uint8
+    #: weights reach the matmul. The memory cost is the full base in
+    #: ``compute_dtype`` (a <=8B base is a few GB -- nothing on an 80GB card).
+    quantization: str = "nf4"
     enable_thinking: bool = False
     seed: int = 42
     #: ``"sft"`` (next-token supervised learning of the answer) or ``"decision"``
@@ -181,6 +191,18 @@ class QLoraSettings:
     #: AdamW weight decay. Default 0.01 is torch's and the historical behaviour;
     #: a distillation recipe that uses none passes 0.0.
     weight_decay: float = 0.01
+
+
+#: ``quantization`` values that mean "do not quantize -- train a full-dtype LoRA".
+# A blank/None value never reaches this set -- it falls back to the "nf4"
+# default in `is_4bit` -- so unquantizing is always an explicit choice.
+_UNQUANTIZED = {"none", "off", "no", "false", "bf16", "fp16", "f16", "full"}
+
+
+def is_4bit(st: QLoraSettings) -> bool:
+    """Whether training 4-bit-quantizes the base (QLoRA) vs a full-dtype LoRA."""
+    return str(getattr(st, "quantization", "nf4") or "nf4").strip().lower() \
+        not in _UNQUANTIZED
 
 
 def bnb_config(st: QLoraSettings):
@@ -403,8 +425,14 @@ def load_progress(directory: str) -> Progress:
 # the run
 # --------------------------------------------------------------------------- #
 
-def describe_loaded_base(model) -> Dict[str, Any]:
+def describe_loaded_base(model, *, expected_4bit: bool = True) -> Dict[str, Any]:
     """What the card is actually holding, as data rather than a log line.
+
+    ``expected_4bit`` says whether a 4-bit base was asked for. When it was and
+    the base is NOT quantized, that is the silent-failure this report exists to
+    catch and the line shouts it. When an unquantized (``quantization="none"``)
+    run was asked for, a full-dtype base is correct and the line says so plainly
+    instead of crying failure.
 
     STRUCTURED because the log is the one place this cannot be read. A
     training pod's stdout is not collected anywhere -- there is no public
@@ -438,6 +466,7 @@ def describe_loaded_base(model) -> Dict[str, Any]:
         "dtypes": dict(dtypes),
         "devices": dict(devices),
         "quantized_4bit": bool(quantized),
+        "expected_4bit": bool(expected_4bit),
         "cpu_params": int(sum(v for k, v in devices.items() if "cpu" in k)
                           if len(devices) > 1 else 0),
     }
@@ -450,7 +479,9 @@ def describe_loaded_base(model) -> Dict[str, Any]:
     out["line"] = (
         f"base loaded: {out['param_gb']}GB of parameters across "
         f"{out['devices']}, dtypes {out['dtypes']}, 4-bit="
-        + ("yes" if quantized else "NO - THE BASE IS NOT QUANTIZED")
+        + ("yes" if quantized
+           else ("no (unquantized LoRA, as requested)" if not expected_4bit
+                 else "NO - THE BASE IS NOT QUANTIZED"))
         + (f", {out.get('card')} has {out.get('vram_total_gb')}GB with "
            f"{out.get('vram_allocated_gb')}GB allocated"
            if "vram_total_gb" in out else ""))
@@ -468,11 +499,24 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
     from peft import get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM
 
+    _four_bit = is_4bit(settings)
     model = AutoModelForCausalLM.from_pretrained(
-        base, quantization_config=bnb_config(settings),
+        base,
+        quantization_config=(bnb_config(settings) if _four_bit else None),
         dtype=getattr(torch, settings.compute_dtype),
         device_map="auto", trust_remote_code=True)
-    model = prepare_model_for_kbit_training(model)
+    if not _four_bit:
+        # Unquantized (``quantization="none"``): a LoRA on the full
+        # ``compute_dtype`` base. There is no kbit prepare to run and nothing
+        # was upcast to fp32, so the recast below is skipped too; the base is
+        # already in ``compute_dtype`` from ``from_pretrained``. Gradient
+        # checkpointing + ``enable_input_require_grads`` (further down) are
+        # still required, exactly as in the 4-bit path.
+        print(f"[text-lora] loaded {base!r} UNQUANTIZED "
+              f"({settings.compute_dtype} LoRA, quantization="
+              f"{settings.quantization!r})", flush=True)
+    else:
+        model = prepare_model_for_kbit_training(model)
     # PUT THE BIG TENSORS BACK IN THE COMPUTE DTYPE. `prepare_model_for_kbit_
     # training` does, in its own words, "cast all non INT8 parameters to
     # fp32" -- every parameter that is not a `Params4bit`, whatever its size.
@@ -548,7 +592,7 @@ def load_base_and_adapter(base: str, settings: QLoraSettings):
     print(f"[text-lora] {line}", flush=True)
 
     try:
-        _fp = describe_loaded_base(model)
+        _fp = describe_loaded_base(model, expected_4bit=is_4bit(settings))
         print(f"[text-lora] {_fp['line']}", flush=True)
         if _fp.get("cpu_params"):
             print(f"[text-lora] WARNING: {_fp['cpu_params']} parameter "
@@ -631,7 +675,7 @@ def run_training(*, base: str, encoded: Sequence[Any], settings: QLoraSettings,
     # out of a training pod.
     _footprint: Dict[str, Any] = {}
     try:
-        _footprint = describe_loaded_base(model)
+        _footprint = describe_loaded_base(model, expected_4bit=is_4bit(settings))
         if on_progress is not None:
             on_progress(step=0, status="loaded", base=_footprint,
                         message=_footprint.get("line", ""))
