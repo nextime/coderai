@@ -1201,6 +1201,8 @@ def sync_loras(base: str, api_key: str, body: bytes) -> bytes:
 #: check is worth skipping on the second request. A new pod has a new URL, so it
 #: pays the upload again: pod storage is disposable.
 _UPLOADED: set = set()
+#: Where each of those landed on its pod, for callers that need the pod path.
+_UPLOADED_PATHS: dict = {}
 
 
 #: (base, path, size, mtime) -> blob id, for adapters this process has already
@@ -1471,23 +1473,82 @@ def teach_pod(base: str, api_key: str, model: str) -> bool:
     return teach_model(base, api_key, model)
 
 
-def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
+def _upload_seed(entry: dict, name: str) -> str:
+    """The entry a pod should register for an uploaded file, as seed JSON.
+
+    The upload used to register only ``{path, model_type, alias}``. Everything
+    else that describes the model stayed behind: its ENGINE (a RunPod model
+    carries ``backend: "runpod"``, which is this install's placement, so the pod
+    fell through to its own default -- "cpu" on a GPU pod -- and answered
+    ``Unknown backend: cpu``), its per-engine block (llamampere's ctx, slots,
+    ``--jinja``), ``thinking``, ``n_ctx``. The hf/url path has sent all of that
+    through ``seed_model_env`` since the same fault bit diogene-alpha; upload
+    never did, so an engine model sourced by upload could not be served at all.
+
+    The row is built exactly as teach_model builds the hf/url one, with the
+    uploaded file's NAME as its path; the pod puts its own location there.
+    """
+    try:
+        from codai.api.runpod_worker import (engine_pod_backend, parse_model_runpod,
+                                             seed_model_env)
+        block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+        mcfg = parse_model_runpod(block)
+        served = ((getattr(mcfg, "served_model", "") or "").strip()
+                  or str(entry.get("id") or "").strip()
+                  or str(entry.get("alias") or "").strip())
+        return seed_model_env(entry, served, source=name,
+                              engine=engine_pod_backend(entry, mcfg)) or ""
+    except Exception as exc:
+        print(f"[remote-gateway] could not build the upload entry for {name}: {exc}",
+              flush=True)
+        return ""
+
+
+def _register_uploaded(base: str, headers: dict, seed: str, pod_path: str) -> bool:
+    """Register ``seed`` on the pod against the file it already holds."""
+    try:
+        rows = json.loads(seed)
+    except Exception:
+        return False
+    rows = rows if isinstance(rows, list) else [rows]
+    stem = os.path.basename(str(pod_path or "").rstrip("/"))
+    for row in rows:
+        if isinstance(row, dict) and \
+                os.path.basename(str(row.get("path") or "").rstrip("/")) == stem:
+            row["path"] = pod_path
+    try:
+        r = pod_http.post(f"{base}/v1/models/register", data=json.dumps(rows),
+                          headers={**headers, "Content-Type": "application/json"},
+                          timeout=60)
+        return bool(r.ok)
+    except Exception as exc:
+        print(f"[remote-gateway] could not register uploaded {stem} on {base}: {exc}",
+              flush=True)
+        return False
+
+
+def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> str:
     """Push a model's weights to a remote that cannot fetch them itself.
 
     Only for `source: "upload"` — coderai resolves a HuggingFace repo id or a URL
     first, because those cost nothing here and run at datacenter speed. Uploading
     is the deliberate fallback for weights that exist nowhere else: a local merge,
     a file whose host is gone, something you are not going to publish.
+
+    The model's full entry travels with the bytes (see ``_upload_seed``), so the
+    pod serves it on the right engine with this install's settings. Returns the
+    path the weights have on the pod, or "" when they are not there.
     """
     import requests
 
     path = str((entry or {}).get("path") or "")
     if not path or not os.path.exists(path):
-        return
+        return ""
     name = os.path.basename(path.rstrip("/"))
     if (base, name) in _UPLOADED:
-        return
+        return _UPLOADED_PATHS.get((base, name), "") or name
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    seed = _upload_seed(entry, name)
     is_dir = os.path.isdir(path)
     size = (os.path.getsize(path) if not is_dir else
             sum(os.path.getsize(os.path.join(r, f))
@@ -1497,16 +1558,28 @@ def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
                             params={"name": name, "bytes": 0 if is_dir else size},
                             headers=headers, timeout=30)
         if have.status_code == 200:
+            # The bytes are there already (an earlier request, or a pod adopted
+            # across a restart). The ENTRY may not be: register it against the
+            # file the pod holds, or a warm pod serves it engine-less forever.
+            try:
+                pod_path = str((have.json() or {}).get("path") or "")
+            except Exception:
+                pod_path = ""
+            if seed and pod_path:
+                _register_uploaded(base, headers, seed, pod_path)
             _UPLOADED.add((base, name))
-            return
+            _UPLOADED_PATHS[(base, name)] = pod_path
+            return pod_path or name
     except Exception as exc:
         print(f"[remote-gateway] upload check failed for {name}: {exc}", flush=True)
-        return
+        return ""
 
     section = (entry.get("model_type") or "text_models")
     params = {"name": name, "model_type": section, "tar": 1 if is_dir else 0}
     if entry.get("alias"):
         params["alias"] = entry["alias"]
+    if seed:
+        params["entry"] = seed
     print(f"[remote-gateway] uploading {name} ({size / 1e9:.1f} GB) to {base} — "
           "this is the cold cost of `source: upload`", flush=True)
     try:
@@ -1524,12 +1597,32 @@ def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
                 resp = pod_http.post(f"{base}/v1/models/upload", params=params,
                                      data=fh, headers=headers, timeout=None)
         resp.raise_for_status()
+        try:
+            body = resp.json() or {}
+        except Exception:
+            body = {}
+        pod_path = str(body.get("path") or "")
+        if seed and body.get("registered") != "entry":
+            # A pod image from before the upload carried its entry registers the
+            # bare file and ignores `entry`. Its catalogue then treats any later
+            # registration at that path as "already known", so this cannot be
+            # repaired from here -- say so, rather than leave a 503 that reads
+            # like a broken model.
+            print(f"[remote-gateway] {base} registered {name} WITHOUT its entry "
+                  "(engine, per-engine settings) — its image predates upload "
+                  "carrying the entry; an engine model will fail to load there. "
+                  "Republish the pod image.", flush=True)
+            if pod_path:
+                _register_uploaded(base, headers, seed, pod_path)
         _UPLOADED.add((base, name))
+        _UPLOADED_PATHS[(base, name)] = pod_path
         print(f"[remote-gateway] uploaded {name} to {base}", flush=True)
+        return pod_path or name
     except Exception as exc:
         # Don't cache a failure: the next request retries rather than serving
         # from a pod that has half a model.
         print(f"[remote-gateway] upload of {name} to {base} failed: {exc}", flush=True)
+        return ""
 
 
 #: What a coderai says when a model is not in its catalogue.

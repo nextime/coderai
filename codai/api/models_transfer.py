@@ -31,6 +31,7 @@ every NEW pod pays the upload again. A RunPod network volume is the better answe
 for weights you will use repeatedly.
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -283,12 +284,18 @@ def _register_entry(entry: dict, section: str) -> str:
 async def upload_model(request: Request, name: str = Query(...),
                        model_type: str = Query("text_models"),
                        alias: str = Query(""), tar: int = Query(0),
+                       entry: str = Query(""),
                        _auth=Depends(_require_api_auth)):
     """Stream model weights to this instance and register them.
 
     Streamed straight to disk in chunks — these are multi-GB files and must never
     be held in memory. A tar stream (``tar=1``) is extracted, which is how a
     multi-file model directory travels.
+
+    ``entry`` is the sender's full seed entry for the model (JSON, the shape
+    /v1/models/register takes). When given, THAT is registered -- with its
+    engine and per-engine settings -- against the file just written, instead of
+    a bare ``{path, model_type, alias}`` (see ``_register_upload``).
     """
     if model_type not in _SECTIONS:
         raise HTTPException(status_code=400, detail=f"unknown model_type {model_type!r}")
@@ -323,8 +330,62 @@ async def upload_model(request: Request, name: str = Query(...),
         _cleanup(tmp)
         raise HTTPException(status_code=500, detail=f"upload failed: {exc}")
 
-    _register(target, model_type, alias)
-    return {"path": target, "bytes": total, "model_type": model_type}
+    registered = _register_upload(target, model_type, alias, entry)
+    return {"path": target, "bytes": total, "model_type": model_type,
+            "registered": registered}
+
+
+def _register_upload(target: str, model_type: str, alias: str = "",
+                     entry: str = "") -> str:
+    """Register an uploaded file: with its sender's entry when one came along.
+
+    Returns "entry" when the sender's entry was registered, "bare" otherwise.
+
+    The bare form registered ``{path, model_type, alias}`` and nothing else, so an
+    engine model (llamampere, ds4…) reached the manager with no ``backend`` and a
+    GPU pod fell through to its default: ``Unknown backend: cpu``. And because a
+    catalogue entry at a path counts as "already known" to any later
+    registration there, the sender could not correct it afterwards -- the first
+    registration has to be the right one, which is why it travels WITH the bytes.
+
+    Rows whose path names the uploaded file get this pod's location; any other
+    row is held to the rule /v1/models/register applies (a local path must
+    exist here).
+    """
+    rows = []
+    if entry:
+        try:
+            parsed = json.loads(entry)
+            rows = [r for r in (parsed if isinstance(parsed, list) else [parsed])
+                    if isinstance(r, dict)]
+        except Exception as exc:
+            print(f"[upload] ignoring an unreadable entry for {target}: {exc}",
+                  flush=True)
+            rows = []
+    stem = os.path.basename(target.rstrip("/"))
+    main = [r for r in rows
+            if os.path.basename(str(r.get("path") or "").rstrip("/")) == stem]
+    if not main:
+        _register(target, model_type, alias)
+        return "bare"
+    for row in rows:
+        if row in main:
+            row["path"] = target
+            if alias and not row.get("alias"):
+                row["alias"] = alias
+        section = str(row.get("model_type") or model_type)
+        path = str(row.get("path") or "")
+        if section not in _SECTIONS or not path:
+            continue
+        if row not in main and path.startswith("/") and not os.path.exists(path):
+            continue
+        try:
+            register_model_runtime(row, section)
+        except Exception as exc:
+            print(f"[upload] could not register {path}: {exc}", flush=True)
+    print(f"[upload] registered {target} with its sender's entry "
+          f"(backend={main[0].get('backend') or 'default'})", flush=True)
+    return "entry"
 
 
 def _cleanup(path: str) -> None:
